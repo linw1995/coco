@@ -31,15 +31,15 @@ rec {
         devShells = {
           default = pkgs.mkShell {
             nativeBuildInputs = with pkgs.fenix; [
-              (combine [
-                stable.cargo
-                stable.clippy
-                stable.rust-src
-                stable.rustc
-                stable.rustfmt
-                latest.rust-analyzer
-                stable.llvm-tools
-              ])
+              (combine (with stable;[
+                cargo
+                clippy
+                rust-src
+                rustc
+                rustfmt
+                rust-analyzer
+                llvm-tools
+              ]))
             ];
             packages = with pkgs; [
               prek
