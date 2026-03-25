@@ -42,6 +42,7 @@ pub struct Anchor {
     pub tools: Vec<Tool>,
     pub system_prompt: String,
     pub prompt: String,
+    pub merge_parents: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -116,7 +117,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, NewNode, Node, Role, Tool, ToolResult};
+    use super::{Anchor, Kind, NewNode, Node, Role, Tool, ToolResult};
     use jiff::Timestamp;
     use serde_json::json;
 
@@ -133,6 +134,23 @@ mod tests {
         )
     }
 
+    fn make_anchor(merge_parents: &[&str]) -> Anchor {
+        Anchor {
+            model: "gpt-5.4".to_owned(),
+            tools: vec![Tool {
+                name: "search".to_owned(),
+                description: "Search docs".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }],
+            system_prompt: "system".to_owned(),
+            prompt: "prompt".to_owned(),
+            merge_parents: merge_parents
+                .iter()
+                .map(|parent| (*parent).to_owned())
+                .collect(),
+        }
+    }
+
     #[test]
     fn node_id_is_stable_for_same_payload() {
         let left = make_text_node("parent", "hello", fixed_timestamp());
@@ -145,6 +163,24 @@ mod tests {
     fn node_id_changes_when_created_at_changes() {
         let left = make_text_node("parent", "hello", "2026-03-25T09:10:11Z".parse().unwrap());
         let right = make_text_node("parent", "hello", "2026-03-25T09:10:12Z".parse().unwrap());
+
+        assert_ne!(left.id, right.id);
+    }
+
+    #[test]
+    fn node_id_changes_when_anchor_merge_parents_change() {
+        let left = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            Kind::Anchor(make_anchor(&["merge-a"])),
+            fixed_timestamp(),
+        );
+        let right = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            Kind::Anchor(make_anchor(&["merge-b"])),
+            fixed_timestamp(),
+        );
 
         assert_ne!(left.id, right.id);
     }
@@ -183,21 +219,30 @@ mod tests {
         let node = NewNode {
             parent: "parent".to_owned(),
             role: Role::System,
-            kind: Kind::Anchor(super::Anchor {
-                model: "gpt-5.4".to_owned(),
-                tools: vec![Tool {
-                    name: "search".to_owned(),
-                    description: "Search docs".to_owned(),
-                    input_schema: json!({"type": "object"}),
-                }],
-                system_prompt: "system".to_owned(),
-                prompt: "prompt".to_owned(),
-            }),
+            kind: Kind::Anchor(make_anchor(&["merge-a", "merge-b"])),
         };
 
         let encoded = serde_json::to_value(&node).unwrap();
 
         assert!(encoded.get("id").is_none());
         assert!(encoded.get("created_at").is_none());
+    }
+
+    #[test]
+    fn anchor_round_trip_preserves_merge_parents() {
+        let node = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            Kind::Anchor(make_anchor(&["merge-a", "merge-b"])),
+            fixed_timestamp(),
+        );
+
+        let encoded = serde_json::to_string(&node).unwrap();
+        let decoded: Node = serde_json::from_str(&encoded).unwrap();
+        let Kind::Anchor(anchor) = decoded.kind else {
+            panic!("expected anchor node");
+        };
+
+        assert_eq!(anchor.merge_parents, vec!["merge-a", "merge-b"]);
     }
 }

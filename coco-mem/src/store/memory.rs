@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use jiff::Timestamp;
 use snafu::prelude::*;
 
-use crate::{NewNode, Node};
+use crate::{Kind, NewNode, Node};
 
 pub struct Store {
     pub nodes: HashMap<String, Node>,
@@ -17,6 +17,12 @@ pub struct Store {
 pub enum Error {
     #[snafu(display("Parent ID {id:?} not found"))]
     ParentNotFound { id: String },
+
+    #[snafu(display("Merge parent ID {id:?} is duplicated"))]
+    DuplicateMergeParent { id: String },
+
+    #[snafu(display("Merge parent ID {id:?} matches the primary parent"))]
+    MergeParentMatchesParent { id: String },
 
     #[snafu(display("ID {id:?} not found"))]
     NotFound { id: String },
@@ -38,12 +44,17 @@ impl Store {
                 id: node.parent.clone()
             }
         );
+        self.validate_anchor_merge_parents(&node.parent, &node.kind)?;
 
         let node = Node::new(node.parent, node.role, node.kind, Timestamp::now());
-        let parent = node.parent.clone();
         let id = node.id.clone();
 
-        self.children.entry(parent).or_default().insert(id.clone());
+        for parent in parent_ids(&node) {
+            self.children
+                .entry(parent.to_owned())
+                .or_default()
+                .insert(id.clone());
+        }
         self.nodes.insert(id.clone(), node);
 
         Ok(id)
@@ -104,10 +115,48 @@ impl Store {
         }
         .fail()
     }
+
+    fn validate_anchor_merge_parents(&self, parent: &str, kind: &Kind) -> Result<()> {
+        let Kind::Anchor(anchor) = kind else {
+            return Ok(());
+        };
+
+        let mut seen = HashSet::new();
+        for merge_parent in &anchor.merge_parents {
+            ensure!(
+                merge_parent != parent,
+                MergeParentMatchesParentSnafu {
+                    id: merge_parent.clone(),
+                }
+            );
+            ensure!(
+                seen.insert(merge_parent.as_str()),
+                DuplicateMergeParentSnafu {
+                    id: merge_parent.clone(),
+                }
+            );
+            ensure!(
+                self.nodes.contains_key(merge_parent),
+                ParentNotFoundSnafu {
+                    id: merge_parent.clone(),
+                }
+            );
+        }
+
+        Ok(())
+    }
 }
 
 fn is_node_id(reference: &str) -> bool {
     reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn parent_ids(node: &Node) -> Vec<&str> {
+    let mut parents = vec![node.parent.as_str()];
+    if let Kind::Anchor(anchor) = &node.kind {
+        parents.extend(anchor.merge_parents.iter().map(String::as_str));
+    }
+    parents
 }
 
 #[cfg(test)]
@@ -115,7 +164,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{Error, Store};
-    use crate::{Kind, NewNode, Node, Role};
+    use crate::{Anchor, Kind, NewNode, Node, Role};
     use jiff::Timestamp;
 
     fn fixed_timestamp() -> Timestamp {
@@ -127,6 +176,20 @@ mod tests {
             parent: parent.to_owned(),
             role: Role::User,
             kind: Kind::Text(text.to_owned()),
+        }
+    }
+
+    fn make_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
+        NewNode {
+            parent: parent.to_owned(),
+            role: Role::System,
+            kind: Kind::Anchor(Anchor {
+                model: "gpt-5.4".to_owned(),
+                tools: vec![],
+                system_prompt: "system".to_owned(),
+                prompt: "prompt".to_owned(),
+                merge_parents: merge_parents.iter().map(|id| (*id).to_owned()).collect(),
+            }),
         }
     }
 
@@ -185,6 +248,66 @@ mod tests {
         let err = store.append(node).unwrap_err();
 
         assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
+    }
+
+    #[test]
+    fn append_anchor_indexes_merge_parents_as_children() {
+        let (mut store, root_id) = make_store_with_root();
+        let merge_parent_id = store
+            .append(make_text_node(&root_id, "merge-parent"))
+            .unwrap();
+
+        let anchor_id = store
+            .append(make_anchor_node(&root_id, &[&merge_parent_id]))
+            .unwrap();
+
+        assert!(store.children.get(&root_id).unwrap().contains(&anchor_id));
+        assert!(
+            store
+                .children
+                .get(&merge_parent_id)
+                .unwrap()
+                .contains(&anchor_id)
+        );
+    }
+
+    #[test]
+    fn append_anchor_rejects_missing_merge_parent() {
+        let (mut store, root_id) = make_store_with_root();
+        let node = make_anchor_node(&root_id, &["missing"]);
+
+        let err = store.append(node).unwrap_err();
+
+        assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
+    }
+
+    #[test]
+    fn append_anchor_rejects_duplicate_merge_parents() {
+        let (mut store, root_id) = make_store_with_root();
+        let merge_parent_id = store
+            .append(make_text_node(&root_id, "merge-parent"))
+            .unwrap();
+        let node = make_anchor_node(&root_id, &[&merge_parent_id, &merge_parent_id]);
+
+        let err = store.append(node).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::DuplicateMergeParent { id } if id == merge_parent_id
+        ));
+    }
+
+    #[test]
+    fn append_anchor_rejects_merge_parent_matching_primary_parent() {
+        let (mut store, root_id) = make_store_with_root();
+        let node = make_anchor_node(&root_id, &[&root_id]);
+
+        let err = store.append(node).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::MergeParentMatchesParent { id } if id == root_id
+        ));
     }
 
     #[test]
@@ -247,6 +370,27 @@ mod tests {
                 base_ref,
                 head_ref,
             } if base_ref == sibling_id && head_ref == b_id
+        ));
+    }
+
+    #[test]
+    fn log_ignores_anchor_merge_parents() {
+        let (mut store, root_id) = make_store_with_root();
+        let merge_parent_id = store
+            .append(make_text_node(&root_id, "merge-parent"))
+            .unwrap();
+        let anchor_id = store
+            .append(make_anchor_node(&root_id, &[&merge_parent_id]))
+            .unwrap();
+
+        let err = store.log(&merge_parent_id, &anchor_id).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::RefsNotConnected {
+                base_ref,
+                head_ref,
+            } if base_ref == merge_parent_id && head_ref == anchor_id
         ));
     }
 
