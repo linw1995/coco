@@ -35,6 +35,7 @@ pub enum Kind {
     ToolUse(ToolUse),
     ToolResult(ToolResult),
     Text(String),
+    Failure(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -265,6 +266,16 @@ mod tests {
         )
     }
 
+    fn make_failure_node(parent: &str, text: &str, created_at: Timestamp) -> Node {
+        Node::new(
+            parent.to_owned(),
+            Role::System,
+            None,
+            Kind::Failure(text.to_owned()),
+            created_at,
+        )
+    }
+
     fn make_session_anchor() -> SessionAnchor {
         SessionAnchor {
             provider: "openai".to_owned(),
@@ -400,6 +411,14 @@ mod tests {
     }
 
     #[test]
+    fn node_id_changes_when_text_kind_changes_to_failure_kind() {
+        let left = make_text_node("parent", "hello", fixed_timestamp());
+        let right = make_failure_node("parent", "hello", fixed_timestamp());
+
+        assert_ne!(left.id, right.id);
+    }
+
+    #[test]
     fn node_id_is_lower_hex_sha256() {
         let node = make_text_node("parent", "hello", fixed_timestamp());
 
@@ -427,6 +446,20 @@ mod tests {
         assert_eq!(decoded.id, node.id);
         assert_eq!(decoded.parent, node.parent);
         assert_eq!(decoded.created_at, node.created_at);
+    }
+
+    #[test]
+    fn failure_node_round_trip_preserves_message() {
+        let node = make_failure_node("parent", "rate limited", fixed_timestamp());
+
+        let encoded = serde_json::to_string(&node).unwrap();
+        let decoded: Node = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.id, node.id);
+        assert!(matches!(
+            decoded.kind,
+            Kind::Failure(message) if message == "rate limited"
+        ));
     }
 
     #[test]

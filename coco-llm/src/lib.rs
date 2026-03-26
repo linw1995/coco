@@ -385,7 +385,7 @@ where
                         parent: original_head.clone(),
                         role: Role::System,
                         metadata: Some(metadata),
-                        kind: Kind::Text(message.clone()),
+                        kind: Kind::Failure(message.clone()),
                     })
                     .context(MemorySnafu)?;
                 Err(Error::Backend {
@@ -495,7 +495,7 @@ where
                         });
                     }
                 }
-                Kind::ToolUse(_) | Kind::ToolResult(_) => {}
+                Kind::Failure(_) | Kind::ToolUse(_) | Kind::ToolResult(_) => {}
             }
         }
 
@@ -870,7 +870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_completion_persists_system_text_but_not_prompt_history() {
+    async fn failed_completion_persists_failure_kind_but_not_prompt_history() {
         let store = SharedStore::new();
         let backend = FakeBackend::with_responses(&[(
             "main",
@@ -903,7 +903,7 @@ mod tests {
 
         let failure = store.get_node(&error_node_id).unwrap();
         assert_eq!(failure.role, Role::System);
-        assert!(matches!(&failure.kind, Kind::Text(text) if text == "rate limited"));
+        assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
         assert_eq!(
             failure
                 .metadata
@@ -1116,7 +1116,7 @@ mod tests {
         };
         let failure = store.get_node(&error_node_id).unwrap();
         assert_eq!(failure.role, Role::System);
-        assert!(matches!(&failure.kind, Kind::Text(text) if text == "rate limited"));
+        assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
         let prompt_anchor_id = retry_from_node_id.clone();
         assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
 
