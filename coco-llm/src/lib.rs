@@ -130,7 +130,7 @@ pub struct BackendCompletion {
 #[derive(Debug, Snafu, Clone, PartialEq, Eq)]
 pub enum BackendError {
     #[snafu(display("{message}"))]
-    Failed { message: String, retryable: bool },
+    Failed { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,7 +561,6 @@ impl CompletionBackend for RigBackend {
         let Some((prompt, history)) = history.split_last() else {
             return Err(BackendError::Failed {
                 message: "completion requires history".to_owned(),
-                retryable: false,
             });
         };
         let prompt = prompt.clone();
@@ -585,7 +584,6 @@ impl CompletionBackend for RigBackend {
                         .await
                         .map_err(|source| BackendError::Failed {
                             message: source.to_string(),
-                            retryable: false,
                         })?;
 
                 Ok(BackendCompletion {
@@ -609,7 +607,6 @@ impl CompletionBackend for RigBackend {
                         .await
                         .map_err(|source| BackendError::Failed {
                             message: source.to_string(),
-                            retryable: false,
                         })?;
 
                 Ok(BackendCompletion {
@@ -879,7 +876,6 @@ mod tests {
             "main",
             &[Err(BackendError::Failed {
                 message: "rate limited".to_owned(),
-                retryable: true,
             })],
         )]);
         let service = LlmService::new(store.clone(), backend);
@@ -1097,7 +1093,6 @@ mod tests {
             &[
                 Err(BackendError::Failed {
                     message: "rate limited".to_owned(),
-                    retryable: true,
                 }),
                 Ok("recovered"),
             ],
