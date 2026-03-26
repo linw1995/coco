@@ -94,7 +94,7 @@ impl Store {
         let node = Node::new(
             node.parent,
             node.role,
-            node.turn,
+            node.metadata,
             node.kind,
             Timestamp::now(),
         );
@@ -241,7 +241,7 @@ impl Store {
             let new_id = self.insert_node(Node::new(
                 parent,
                 node.role,
-                node.turn,
+                node.metadata,
                 kind,
                 node.created_at,
             ))?;
@@ -482,7 +482,7 @@ mod tests {
         NewNode {
             parent: parent.to_owned(),
             role: Role::User,
-            turn: None,
+            metadata: None,
             kind: Kind::Text(text.to_owned()),
         }
     }
@@ -491,7 +491,7 @@ mod tests {
         NewNode {
             parent: parent.to_owned(),
             role: Role::System,
-            turn: None,
+            metadata: None,
             kind: Kind::Anchor(Anchor::session(
                 vec![],
                 SessionAnchor {
@@ -512,7 +512,7 @@ mod tests {
         NewNode {
             parent: parent.to_owned(),
             role: Role::System,
-            turn: None,
+            metadata: None,
             kind: Kind::Anchor(Anchor::prompt(
                 merge_parents.iter().map(|id| (*id).to_owned()).collect(),
                 PromptAnchor {
@@ -608,7 +608,7 @@ mod tests {
             .append(NewNode {
                 parent: root_id,
                 role: Role::System,
-                turn: None,
+                metadata: None,
                 kind: Kind::Anchor(Anchor::session(
                     vec![merge_parent_id.clone()],
                     SessionAnchor {

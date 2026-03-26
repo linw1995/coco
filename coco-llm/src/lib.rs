@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, Kind, NewNode, PromptAnchor, Role, SessionAnchor, SharedStore,
-    Tool as MemoryTool, Turn,
+    Anchor, AnchorPayload, Kind, NewNode, NodeMetadata, PromptAnchor, Role, SessionAnchor,
+    SharedStore, Tool as MemoryTool,
 };
 use serde_json::Value;
 use snafu::prelude::*;
@@ -79,7 +79,7 @@ pub struct CompletionRequest {
 pub struct CompletionResult {
     pub branch: String,
     pub anchor_id: String,
-    pub turn_id: String,
+    pub execution_id: String,
     pub response_node_id: String,
     pub branch_head: String,
     pub text: String,
@@ -234,7 +234,7 @@ where
             .append(NewNode {
                 parent: root_id,
                 role: Role::System,
-                turn: None,
+                metadata: None,
                 kind: Kind::Anchor(Anchor::session(
                     merge_parents,
                     SessionAnchor {
@@ -300,7 +300,7 @@ where
             .append(NewNode {
                 parent: original_head.clone(),
                 role: Role::System,
-                turn: None,
+                metadata: None,
                 kind: Kind::Anchor(Anchor::prompt(
                     merge_parents,
                     PromptAnchor {
@@ -334,10 +334,8 @@ where
             .context(MemorySnafu)?;
         let session = self.resolve_session(&request.branch)?;
         let resolved = self.resolve_request(&session, request.clone());
-        let turn_id = format!("turn-{}", nanoid::nanoid!());
-        let response_turn = Turn {
-            id: turn_id.clone(),
-        };
+        let execution_id = format!("execution-{}", nanoid::nanoid!());
+        let metadata = NodeMetadata::execution(execution_id.clone());
 
         match self
             .backend
@@ -351,7 +349,7 @@ where
                     .append(NewNode {
                         parent: original_head.clone(),
                         role: Role::LLM,
-                        turn: Some(response_turn.clone()),
+                        metadata: Some(metadata.clone()),
                         kind: Kind::Text(response_text.clone()),
                     })
                     .context(MemorySnafu)?;
@@ -362,7 +360,7 @@ where
                 Ok(CompletionResult {
                     branch: resolved.branch,
                     anchor_id: session.anchor_id,
-                    turn_id,
+                    execution_id,
                     response_node_id: response_node_id.clone(),
                     branch_head: response_node_id,
                     text: response_text,
@@ -375,7 +373,7 @@ where
                     .append(NewNode {
                         parent: original_head.clone(),
                         role: Role::System,
-                        turn: Some(response_turn),
+                        metadata: Some(metadata),
                         kind: Kind::Text(message.clone()),
                     })
                     .context(MemorySnafu)?;
@@ -746,7 +744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_persists_turn_metadata_on_assistant_node() {
+    async fn complete_persists_execution_metadata_on_assistant_node() {
         let store = SharedStore::new();
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello")])]);
         let service = LlmService::new(store.clone(), backend);
@@ -765,7 +763,10 @@ mod tests {
 
         assert_eq!(assistant.role, Role::LLM);
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "hello"));
-        assert_eq!(assistant.turn.as_ref().unwrap().id, result.turn_id);
+        assert_eq!(
+            assistant.metadata.as_ref().unwrap().execution_id.as_deref(),
+            Some(result.execution_id.as_str())
+        );
 
         assert!(matches!(
             &prompt.kind,
@@ -886,7 +887,17 @@ mod tests {
         let failure = &ancestry[0];
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Text(text) if text == "rate limited"));
-        assert_eq!(failure.turn.as_ref().unwrap().id.len(), 26);
+        assert_eq!(
+            failure
+                .metadata
+                .as_ref()
+                .unwrap()
+                .execution_id
+                .as_ref()
+                .unwrap()
+                .len(),
+            31
+        );
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(

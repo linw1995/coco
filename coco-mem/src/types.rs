@@ -10,7 +10,7 @@ pub struct Node {
     pub parent: String,
     pub created_at: Timestamp,
     pub role: Role,
-    pub turn: Option<Turn>,
+    pub metadata: Option<NodeMetadata>,
     pub kind: Kind,
 }
 
@@ -18,7 +18,7 @@ pub struct Node {
 pub struct NewNode {
     pub parent: String,
     pub role: Role,
-    pub turn: Option<Turn>,
+    pub metadata: Option<NodeMetadata>,
     pub kind: Kind,
 }
 
@@ -79,8 +79,8 @@ pub struct PromptAnchor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Turn {
-    pub id: String,
+pub struct NodeMetadata {
+    pub execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -161,9 +161,11 @@ impl SessionAnchor {
     }
 }
 
-impl Turn {
-    pub fn ref_only(id: String) -> Self {
-        Self { id }
+impl NodeMetadata {
+    pub fn execution(execution_id: String) -> Self {
+        Self {
+            execution_id: Some(execution_id),
+        }
     }
 }
 
@@ -171,18 +173,18 @@ impl Node {
     pub fn new(
         parent: String,
         role: Role,
-        turn: Option<Turn>,
+        metadata: Option<NodeMetadata>,
         kind: Kind,
         created_at: Timestamp,
     ) -> Self {
-        let id = compute_node_id(&parent, &role, turn.as_ref(), &kind, &created_at);
+        let id = compute_node_id(&parent, &role, metadata.as_ref(), &kind, &created_at);
 
         Self {
             id,
             parent,
             created_at,
             role,
-            turn,
+            metadata,
             kind,
         }
     }
@@ -196,7 +198,7 @@ impl Node {
 struct NodeHashPayload<'a> {
     parent: &'a str,
     role: &'a Role,
-    turn: Option<&'a Turn>,
+    metadata: Option<&'a NodeMetadata>,
     kind: &'a Kind,
     created_at: &'a Timestamp,
 }
@@ -204,14 +206,14 @@ struct NodeHashPayload<'a> {
 fn compute_node_id(
     parent: &str,
     role: &Role,
-    turn: Option<&Turn>,
+    metadata: Option<&NodeMetadata>,
     kind: &Kind,
     created_at: &Timestamp,
 ) -> String {
     let payload = serde_json::to_vec(&NodeHashPayload {
         parent,
         role,
-        turn,
+        metadata,
         kind,
         created_at,
     })
@@ -239,8 +241,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchor, Kind, NewNode, Node, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, Tool,
-        ToolResult, Turn,
+        Anchor, Kind, NewNode, Node, NodeMetadata, PromptAnchor, Role, SessionAnchor,
+        SessionAnchorPatch, Tool, ToolResult,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -249,8 +251,8 @@ mod tests {
         "2026-03-25T09:10:11Z".parse().unwrap()
     }
 
-    fn make_turn() -> Turn {
-        Turn::ref_only("turn-1".to_owned())
+    fn make_metadata() -> NodeMetadata {
+        NodeMetadata::execution("execution-1".to_owned())
     }
 
     fn make_text_node(parent: &str, text: &str, created_at: Timestamp) -> Node {
@@ -378,18 +380,18 @@ mod tests {
     }
 
     #[test]
-    fn node_id_changes_when_turn_metadata_changes() {
+    fn node_id_changes_when_execution_metadata_changes() {
         let left = Node::new(
             "parent".to_owned(),
             Role::User,
-            Some(Turn::ref_only("turn-1".to_owned())),
+            Some(NodeMetadata::execution("execution-1".to_owned())),
             Kind::Text("hello".to_owned()),
             fixed_timestamp(),
         );
         let right = Node::new(
             "parent".to_owned(),
             Role::User,
-            Some(Turn::ref_only("turn-2".to_owned())),
+            Some(NodeMetadata::execution("execution-2".to_owned())),
             Kind::Text("hello".to_owned()),
             fixed_timestamp(),
         );
@@ -432,7 +434,7 @@ mod tests {
         let node = NewNode {
             parent: "parent".to_owned(),
             role: Role::System,
-            turn: Some(Turn::ref_only("turn-1".to_owned())),
+            metadata: Some(NodeMetadata::execution("execution-1".to_owned())),
             kind: Kind::Anchor(Anchor::prompt(
                 vec!["merge-a".to_owned(), "merge-b".to_owned()],
                 make_prompt_anchor(),
@@ -494,20 +496,20 @@ mod tests {
     }
 
     #[test]
-    fn turn_round_trip_preserves_id() {
+    fn node_metadata_round_trip_preserves_execution_id() {
         let node = Node::new(
             "parent".to_owned(),
             Role::User,
-            Some(make_turn()),
+            Some(make_metadata()),
             Kind::Text("hello".to_owned()),
             fixed_timestamp(),
         );
 
         let encoded = serde_json::to_string(&node).unwrap();
         let decoded: Node = serde_json::from_str(&encoded).unwrap();
-        let turn = decoded.turn.expect("expected turn metadata");
+        let metadata = decoded.metadata.expect("expected node metadata");
 
-        assert_eq!(turn.id, "turn-1");
+        assert_eq!(metadata.execution_id.as_deref(), Some("execution-1"));
     }
 
     #[test]
