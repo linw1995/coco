@@ -133,6 +133,14 @@ pub enum BackendError {
     Failed { message: String, retryable: bool },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendFailureContext {
+    pub branch: String,
+    pub execution_id: String,
+    pub error_node_id: String,
+    pub retry_from_node_id: String,
+}
+
 #[async_trait]
 pub trait CompletionBackend: Send + Sync {
     async fn complete(
@@ -165,7 +173,10 @@ pub enum Error {
     UnknownProvider { provider: String },
 
     #[snafu(display("Backend call failed: {source}"))]
-    Backend { source: BackendError },
+    Backend {
+        source: BackendError,
+        context: Box<BackendFailureContext>,
+    },
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -377,10 +388,15 @@ where
                         kind: Kind::Text(message.clone()),
                     })
                     .context(MemorySnafu)?;
-                self.store
-                    .set_branch_head(&resolved.branch, &original_head, &error_node_id)
-                    .context(MemorySnafu)?;
-                Err(Error::Backend { source })
+                Err(Error::Backend {
+                    source,
+                    context: Box::new(BackendFailureContext {
+                        branch: resolved.branch,
+                        execution_id,
+                        error_node_id,
+                        retry_from_node_id: original_head,
+                    }),
+                })
             }
         }
     }
@@ -876,15 +892,20 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
-            err,
+        let (execution_id, error_node_id, retry_from_node_id) = match err {
             Error::Backend {
-                source: BackendError::Failed { .. }
-            }
-        ));
+                source: BackendError::Failed { .. },
+                context,
+                ..
+            } => (
+                context.execution_id,
+                context.error_node_id,
+                context.retry_from_node_id,
+            ),
+            other => panic!("expected backend error, got {other:?}"),
+        };
 
-        let ancestry = store.ancestry("main").unwrap();
-        let failure = &ancestry[0];
+        let failure = store.get_node(&error_node_id).unwrap();
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Text(text) if text == "rate limited"));
         assert_eq!(
@@ -894,10 +915,10 @@ mod tests {
                 .unwrap()
                 .execution_id
                 .as_ref()
-                .unwrap()
-                .len(),
-            31
+                .unwrap(),
+            &execution_id
         );
+        assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
@@ -1090,16 +1111,19 @@ mod tests {
             .prompt(prompt_request("main", "retry prompt"))
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
+        let (error_node_id, retry_from_node_id) = match err {
             Error::Backend {
-                source: BackendError::Failed { .. }
-            }
-        ));
-        let ancestry = store.ancestry("main").unwrap();
-        assert_eq!(ancestry[0].role, Role::System);
-        assert!(matches!(&ancestry[0].kind, Kind::Text(text) if text == "rate limited"));
-        let prompt_anchor_id = ancestry[1].id.clone();
+                source: BackendError::Failed { .. },
+                context,
+                ..
+            } => (context.error_node_id, context.retry_from_node_id),
+            other => panic!("expected backend error, got {other:?}"),
+        };
+        let failure = store.get_node(&error_node_id).unwrap();
+        assert_eq!(failure.role, Role::System);
+        assert!(matches!(&failure.kind, Kind::Text(text) if text == "rate limited"));
+        let prompt_anchor_id = retry_from_node_id.clone();
+        assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
@@ -1119,6 +1143,8 @@ mod tests {
         let recovered = service.complete(request("main")).await.unwrap();
         assert_eq!(recovered.text, "recovered");
         assert_eq!(recovered.anchor_id, prompt_anchor_id);
+        let recovered_node = store.get_node(&recovered.response_node_id).unwrap();
+        assert_eq!(recovered_node.parent, prompt_anchor_id);
     }
 
     #[tokio::test]
