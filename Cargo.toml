@@ -1,5 +1,5 @@
 [workspace]
-members = ["coco-mem"]
+members = ["coco-llm", "coco-mem"]
 resolver = "2"
 
 [workspace.package]
