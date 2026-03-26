@@ -61,6 +61,18 @@ pub struct SessionAnchor {
     pub additional_params: Option<Value>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SessionAnchorPatch {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub tools: Option<Vec<Tool>>,
+    pub system_prompt: Option<String>,
+    pub prompt: Option<String>,
+    pub temperature: Option<Option<f64>>,
+    pub max_tokens: Option<Option<u64>>,
+    pub additional_params: Option<Option<Value>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PromptAnchor {
     pub prompt: String,
@@ -69,17 +81,6 @@ pub struct PromptAnchor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Turn {
     pub id: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub request: Option<TurnRequest>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TurnRequest {
-    pub user_input: String,
-    pub temperature: Option<f64>,
-    pub max_tokens: Option<u64>,
-    pub additional_params: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -136,23 +137,33 @@ impl Anchor {
     }
 }
 
-impl Turn {
-    pub fn full(id: String, provider: String, model: String, request: TurnRequest) -> Self {
+impl SessionAnchor {
+    pub fn apply_patch(&self, patch: &SessionAnchorPatch) -> Self {
         Self {
-            id,
-            provider: Some(provider),
-            model: Some(model),
-            request: Some(request),
+            provider: patch
+                .provider
+                .clone()
+                .unwrap_or_else(|| self.provider.clone()),
+            model: patch.model.clone().unwrap_or_else(|| self.model.clone()),
+            tools: patch.tools.clone().unwrap_or_else(|| self.tools.clone()),
+            system_prompt: patch
+                .system_prompt
+                .clone()
+                .unwrap_or_else(|| self.system_prompt.clone()),
+            prompt: patch.prompt.clone().unwrap_or_else(|| self.prompt.clone()),
+            temperature: patch.temperature.unwrap_or(self.temperature),
+            max_tokens: patch.max_tokens.unwrap_or(self.max_tokens),
+            additional_params: patch
+                .additional_params
+                .clone()
+                .unwrap_or_else(|| self.additional_params.clone()),
         }
     }
+}
 
+impl Turn {
     pub fn ref_only(id: String) -> Self {
-        Self {
-            id,
-            provider: None,
-            model: None,
-            request: None,
-        }
+        Self { id }
     }
 }
 
@@ -228,8 +239,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchor, Kind, NewNode, Node, PromptAnchor, Role, SessionAnchor, Tool, ToolResult, Turn,
-        TurnRequest,
+        Anchor, Kind, NewNode, Node, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, Tool,
+        ToolResult, Turn,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -238,18 +249,8 @@ mod tests {
         "2026-03-25T09:10:11Z".parse().unwrap()
     }
 
-    fn make_turn_full() -> Turn {
-        Turn::full(
-            "turn-1".to_owned(),
-            "openai".to_owned(),
-            "gpt-4.1-mini".to_owned(),
-            TurnRequest {
-                user_input: "hello".to_owned(),
-                temperature: Some(0.2),
-                max_tokens: Some(32),
-                additional_params: Some(json!({"reasoning_effort": "low"})),
-            },
-        )
+    fn make_turn() -> Turn {
+        Turn::ref_only("turn-1".to_owned())
     }
 
     fn make_text_node(parent: &str, text: &str, created_at: Timestamp) -> Node {
@@ -493,11 +494,11 @@ mod tests {
     }
 
     #[test]
-    fn turn_round_trip_preserves_optional_metadata() {
+    fn turn_round_trip_preserves_id() {
         let node = Node::new(
             "parent".to_owned(),
             Role::User,
-            Some(make_turn_full()),
+            Some(make_turn()),
             Kind::Text("hello".to_owned()),
             fixed_timestamp(),
         );
@@ -507,10 +508,31 @@ mod tests {
         let turn = decoded.turn.expect("expected turn metadata");
 
         assert_eq!(turn.id, "turn-1");
-        assert_eq!(turn.provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn session_anchor_patch_updates_selected_fields() {
+        let updated = make_session_anchor().apply_patch(&SessionAnchorPatch {
+            provider: Some("anthropic".to_owned()),
+            model: Some("claude-sonnet-4-20250514".to_owned()),
+            tools: Some(vec![]),
+            system_prompt: Some("new system".to_owned()),
+            prompt: Some("new prompt".to_owned()),
+            temperature: Some(None),
+            max_tokens: Some(Some(256)),
+            additional_params: Some(Some(json!({"service_tier": "priority"}))),
+        });
+
+        assert_eq!(updated.provider, "anthropic");
+        assert_eq!(updated.model, "claude-sonnet-4-20250514");
+        assert!(updated.tools.is_empty());
+        assert_eq!(updated.system_prompt, "new system");
+        assert_eq!(updated.prompt, "new prompt");
+        assert_eq!(updated.temperature, None);
+        assert_eq!(updated.max_tokens, Some(256));
         assert_eq!(
-            turn.request.expect("expected request metadata").user_input,
-            "hello"
+            updated.additional_params,
+            Some(json!({"service_tier": "priority"}))
         );
     }
 }

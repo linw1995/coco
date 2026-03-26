@@ -10,6 +10,8 @@ use serde_json::Value;
 use snafu::prelude::*;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+pub use coco_mem::SessionAnchorPatch as SessionConfigPatch;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     OpenAi,
@@ -201,6 +203,13 @@ where
         &self.store
     }
 
+    pub async fn rebase_session(&self, branch: &str, patch: SessionConfigPatch) -> Result<String> {
+        let _guard = self.lock_branch(branch).await;
+        self.store
+            .rebase_session(branch, &patch)
+            .context(MemorySnafu)
+    }
+
     pub async fn create_session(&self, config: SessionConfig) -> Result<BranchSession> {
         let _guard = self.lock_branch(&config.branch).await;
         let root_id = self.store.root_id();
@@ -328,9 +337,6 @@ where
         let turn_id = format!("turn-{}", nanoid::nanoid!());
         let response_turn = Turn {
             id: turn_id.clone(),
-            provider: Some(resolved.provider.as_str().to_owned()),
-            model: Some(resolved.model.clone()),
-            request: None,
         };
 
         match self
@@ -610,6 +616,7 @@ mod tests {
     use coco_mem::SharedStore;
     use tokio::sync::Barrier;
 
+    type RecordedCalls = Arc<Mutex<Vec<(SessionSnapshot, ResolvedCompletionRequest)>>>;
     type FakeResponseQueue =
         Arc<Mutex<HashMap<String, VecDeque<std::result::Result<String, BackendError>>>>>;
 
@@ -617,6 +624,7 @@ mod tests {
     struct FakeBackend {
         responses: FakeResponseQueue,
         barrier: Option<Arc<Barrier>>,
+        calls: RecordedCalls,
     }
 
     impl FakeBackend {
@@ -642,6 +650,7 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(responses)),
                 barrier: None,
+                calls: Arc::new(Mutex::new(vec![])),
             }
         }
 
@@ -659,6 +668,7 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(responses)),
                 barrier: Some(barrier),
+                calls: Arc::new(Mutex::new(vec![])),
             }
         }
     }
@@ -667,9 +677,11 @@ mod tests {
     impl CompletionBackend for FakeBackend {
         async fn complete(
             &self,
-            _session: SessionSnapshot,
+            session: SessionSnapshot,
             request: ResolvedCompletionRequest,
         ) -> std::result::Result<BackendCompletion, BackendError> {
+            self.calls.lock().await.push((session, request.clone()));
+
             if let Some(barrier) = &self.barrier {
                 barrier.wait().await;
             }
@@ -720,6 +732,19 @@ mod tests {
         }
     }
 
+    fn session_patch() -> SessionConfigPatch {
+        SessionConfigPatch {
+            provider: None,
+            model: None,
+            system_prompt: None,
+            prompt: None,
+            tools: None,
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+        }
+    }
+
     #[tokio::test]
     async fn complete_persists_turn_metadata_on_assistant_node() {
         let store = SharedStore::new();
@@ -741,15 +766,6 @@ mod tests {
         assert_eq!(assistant.role, Role::LLM);
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "hello"));
         assert_eq!(assistant.turn.as_ref().unwrap().id, result.turn_id);
-        assert!(assistant.turn.as_ref().unwrap().request.is_none());
-        assert_eq!(
-            assistant.turn.as_ref().unwrap().provider.as_deref(),
-            Some("openai")
-        );
-        assert_eq!(
-            assistant.turn.as_ref().unwrap().model.as_deref(),
-            Some("gpt-4.1-mini")
-        );
 
         assert!(matches!(
             &prompt.kind,
@@ -870,7 +886,7 @@ mod tests {
         let failure = &ancestry[0];
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Text(text) if text == "rate limited"));
-        assert!(failure.turn.as_ref().unwrap().request.is_none());
+        assert_eq!(failure.turn.as_ref().unwrap().id.len(), 26);
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
@@ -1122,5 +1138,114 @@ mod tests {
             service.store().get_branch_head("main").unwrap(),
             service.store().get_branch_head("draft").unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn rebase_session_changes_defaults_for_future_turns() {
+        let store = SharedStore::new();
+        let backend = FakeBackend::with_responses(&[("main", &[Ok("hello"), Ok("updated")])]);
+        let calls = backend.calls.clone();
+        let service = LlmService::new(store, backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        service
+            .prompt(prompt_request("main", "before rebase"))
+            .await
+            .unwrap();
+
+        service
+            .rebase_session(
+                "main",
+                SessionConfigPatch {
+                    provider: Some("anthropic".to_owned()),
+                    model: Some("claude-sonnet-4-20250514".to_owned()),
+                    system_prompt: Some("You are strict.".to_owned()),
+                    temperature: Some(None),
+                    max_tokens: Some(Some(128)),
+                    additional_params: Some(Some(serde_json::json!({"service_tier": "priority"}))),
+                    ..session_patch()
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = service
+            .prompt(prompt_request("main", "after rebase"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "updated");
+        let session = service.resolve_session("main").unwrap();
+        assert_eq!(session.provider, Provider::Anthropic);
+        assert_eq!(session.model, "claude-sonnet-4-20250514");
+        assert_eq!(session.system_prompt, "You are strict.");
+        assert_eq!(session.temperature, None);
+        assert_eq!(session.max_tokens, Some(128));
+        assert_eq!(
+            session.additional_params,
+            Some(serde_json::json!({"service_tier": "priority"}))
+        );
+
+        let calls = calls.lock().await;
+        let last = calls.last().expect("expected backend call");
+        assert_eq!(last.0.system_prompt, "You are strict.");
+        assert_eq!(last.1.provider, Provider::Anthropic);
+        assert_eq!(last.1.model, "claude-sonnet-4-20250514");
+        assert_eq!(last.1.temperature, None);
+        assert_eq!(last.1.max_tokens, Some(128));
+        assert_eq!(
+            last.1.additional_params,
+            Some(serde_json::json!({"service_tier": "priority"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_session_keeps_sibling_branch_defaults_unchanged() {
+        let store = SharedStore::new();
+        let backend = FakeBackend::with_responses(&[
+            ("main", &[Ok("main"), Ok("main updated")]),
+            ("draft", &[Ok("draft")]),
+        ]);
+        let calls = backend.calls.clone();
+        let service = LlmService::new(store, backend);
+        let main_session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        service.fork("draft", &main_session.anchor_id).unwrap();
+        service
+            .rebase_session(
+                "main",
+                SessionConfigPatch {
+                    model: Some("gpt-5.4".to_owned()),
+                    ..session_patch()
+                },
+            )
+            .await
+            .unwrap();
+
+        service
+            .prompt(prompt_request("draft", "draft prompt"))
+            .await
+            .unwrap();
+        service
+            .prompt(prompt_request("main", "main prompt"))
+            .await
+            .unwrap();
+
+        let calls = calls.lock().await;
+        let draft_call = calls
+            .iter()
+            .find(|(_, request)| request.branch == "draft")
+            .expect("expected draft call");
+        let main_call = calls
+            .iter()
+            .rev()
+            .find(|(_, request)| request.branch == "main")
+            .expect("expected main call");
+        assert_eq!(draft_call.1.model, "gpt-4.1-mini");
+        assert_eq!(main_call.1.model, "gpt-5.4");
     }
 }

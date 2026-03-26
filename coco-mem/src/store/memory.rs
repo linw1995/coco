@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use jiff::Timestamp;
 use snafu::prelude::*;
 
-use crate::{Kind, NewNode, Node, Role};
+use crate::{Anchor, AnchorPayload, Kind, NewNode, Node, Role, SessionAnchorPatch};
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -49,6 +49,9 @@ pub enum Error {
 
     #[snafu(display("Ref {base_ref:?} is not an ancestor of {head_ref:?}"))]
     RefsNotConnected { base_ref: String, head_ref: String },
+
+    #[snafu(display("Branch {branch:?} has no session anchor"))]
+    MissingSessionAnchor { branch: String },
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -88,14 +91,6 @@ impl Store {
     }
 
     pub fn append(&mut self, node: NewNode) -> Result<String> {
-        ensure!(
-            self.nodes.contains_key(&node.parent),
-            ParentNotFoundSnafu {
-                id: node.parent.clone()
-            }
-        );
-        self.validate_anchor_merge_parents(&node.parent, &node.kind)?;
-
         let node = Node::new(
             node.parent,
             node.role,
@@ -103,17 +98,7 @@ impl Store {
             node.kind,
             Timestamp::now(),
         );
-        let id = node.id.clone();
-
-        for parent in parent_ids(&node) {
-            self.children
-                .entry(parent.to_owned())
-                .or_default()
-                .insert(id.clone());
-        }
-        self.nodes.insert(id.clone(), node);
-
-        Ok(id)
+        self.insert_node(node)
     }
 
     pub fn fork(&mut self, name: impl Into<String>, from_ref: &str) -> Result<String> {
@@ -205,6 +190,122 @@ impl Store {
         }
 
         Ok(ans)
+    }
+
+    pub fn rebase_session(&mut self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
+        let branch = name.to_owned();
+        let chain_ids = self
+            .session_chain_ids(name)?
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let session_node = self
+            .nodes
+            .get(
+                chain_ids
+                    .first()
+                    .expect("session chain should not be empty"),
+            )
+            .expect("session chain node should exist");
+        let session_anchor = match &session_node.kind {
+            Kind::Anchor(anchor) => anchor
+                .as_session()
+                .expect("session chain should start with session anchor"),
+            _ => unreachable!("session chain should start with anchor"),
+        }
+        .clone();
+
+        let mut previous_new_id = None;
+        let mut new_head = String::new();
+
+        for (index, node_id) in chain_ids.into_iter().enumerate() {
+            let node = self
+                .nodes
+                .get(&node_id)
+                .cloned()
+                .context(NotFoundSnafu { id: node_id })?;
+            let parent = previous_new_id
+                .clone()
+                .unwrap_or_else(|| node.parent.clone());
+            let kind = if index == 0 {
+                let Kind::Anchor(anchor) = &node.kind else {
+                    unreachable!("session chain should start with anchor");
+                };
+                Kind::Anchor(Anchor::session(
+                    anchor.merge_parents().to_vec(),
+                    session_anchor.apply_patch(patch),
+                ))
+            } else {
+                node.kind.clone()
+            };
+            let new_id = self.insert_node(Node::new(
+                parent,
+                node.role,
+                node.turn,
+                kind,
+                node.created_at,
+            ))?;
+            previous_new_id = Some(new_id.clone());
+            new_head = new_id;
+        }
+
+        self.branches.insert(branch, new_head.clone());
+
+        Ok(new_head)
+    }
+
+    fn session_chain_ids(&self, reference: &str) -> Result<Vec<String>> {
+        let branch = reference.to_owned();
+        let mut node = self.resolve_ref(reference)?;
+        let mut chain_ids = vec![];
+
+        loop {
+            chain_ids.push(node.id.clone());
+            if matches!(
+                node.kind,
+                Kind::Anchor(Anchor {
+                    payload: AnchorPayload::Session(_),
+                    ..
+                })
+            ) {
+                break;
+            }
+
+            ensure!(
+                !node.is_root(),
+                MissingSessionAnchorSnafu {
+                    branch: branch.clone(),
+                }
+            );
+
+            node = self.nodes.get(&node.parent).context(ParentNotFoundSnafu {
+                id: node.parent.clone(),
+            })?;
+        }
+
+        Ok(chain_ids)
+    }
+
+    fn insert_node(&mut self, node: Node) -> Result<String> {
+        ensure!(
+            self.nodes.contains_key(&node.parent),
+            ParentNotFoundSnafu {
+                id: node.parent.clone()
+            }
+        );
+        self.validate_anchor_merge_parents(&node.parent, &node.kind)?;
+
+        let id = node.id.clone();
+
+        for parent in parent_ids(&node) {
+            self.children
+                .entry(parent.to_owned())
+                .or_default()
+                .insert(id.clone());
+        }
+        self.nodes.insert(id.clone(), node);
+
+        Ok(id)
     }
 
     fn resolve_ref_id<'a>(&'a self, reference: &str) -> Result<&'a str> {
@@ -350,6 +451,13 @@ impl SharedStore {
             .cloned()
             .context(NotFoundSnafu { id: id.to_owned() })
     }
+
+    pub fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .rebase_session(name, patch)
+    }
 }
 
 fn is_node_id(reference: &str) -> bool {
@@ -367,7 +475,7 @@ fn parent_ids(node: &Node) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::{Error, SharedStore, Store};
-    use crate::{Anchor, Kind, NewNode, PromptAnchor, Role, SessionAnchor};
+    use crate::{Anchor, Kind, NewNode, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch};
     use serde_json::json;
 
     fn make_text_node(parent: &str, text: &str) -> NewNode {
@@ -821,5 +929,154 @@ mod tests {
 
         assert_eq!(shared.get_branch_head("main").unwrap(), child_id);
         assert_eq!(shared.log(&root_id, "main").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rebase_session_rewrites_branch_chain_with_updated_config() {
+        let (mut store, root_id) = make_store_with_root();
+        let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+        let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+        let old_child = store.nodes.get(&child_id).unwrap().clone();
+        store.fork("main", &child_id).unwrap();
+
+        let new_head = store
+            .rebase_session(
+                "main",
+                &SessionAnchorPatch {
+                    provider: Some("anthropic".to_owned()),
+                    model: Some("claude-sonnet-4-20250514".to_owned()),
+                    temperature: Some(None),
+                    ..SessionAnchorPatch::default()
+                },
+            )
+            .unwrap();
+
+        assert_ne!(new_head, child_id);
+        let ancestry = store.ancestry("main").unwrap();
+        assert_eq!(ancestry[0].id, new_head);
+        assert!(matches!(&ancestry[0].kind, Kind::Text(text) if text == "child"));
+        assert_ne!(ancestry[0].id, child_id);
+        assert_eq!(ancestry[0].created_at, old_child.created_at);
+        assert_ne!(ancestry[1].id, session_id);
+        let Kind::Anchor(anchor) = &ancestry[1].kind else {
+            panic!("expected session anchor");
+        };
+        let session = anchor.as_session().expect("expected session anchor");
+        assert_eq!(session.provider, "anthropic");
+        assert_eq!(session.model, "claude-sonnet-4-20250514");
+        assert_eq!(session.temperature, None);
+        assert_eq!(
+            ancestry[1].created_at,
+            store.nodes.get(&session_id).unwrap().created_at
+        );
+        assert_eq!(ancestry[2].id, root_id);
+
+        let old_session = store.nodes.get(&session_id).unwrap();
+        let Kind::Anchor(old_anchor) = &old_session.kind else {
+            panic!("expected original session anchor");
+        };
+        assert_eq!(old_anchor.as_session().unwrap().provider, "openai");
+    }
+
+    #[test]
+    fn rebase_session_keeps_merge_parents_pointing_to_original_nodes() {
+        let (mut store, root_id) = make_store_with_root();
+        let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+        let merge_source_id = store
+            .append(make_text_node(&session_id, "merge-source"))
+            .unwrap();
+        let anchor_id = store
+            .append(make_prompt_anchor_node(&merge_source_id, &[&session_id]))
+            .unwrap();
+        store.fork("main", &anchor_id).unwrap();
+
+        store
+            .rebase_session(
+                "main",
+                &SessionAnchorPatch {
+                    model: Some("claude-sonnet-4-20250514".to_owned()),
+                    ..SessionAnchorPatch::default()
+                },
+            )
+            .unwrap();
+
+        let ancestry = store.ancestry("main").unwrap();
+        let rebased_prompt = &ancestry[0];
+        let rebased_merge_source = &ancestry[1];
+        let rebased_session = &ancestry[2];
+        let Kind::Anchor(anchor) = &rebased_prompt.kind else {
+            panic!("expected prompt anchor");
+        };
+        assert_eq!(rebased_prompt.parent, rebased_merge_source.id);
+        assert_ne!(rebased_session.id, session_id);
+        assert_eq!(anchor.merge_parents(), [session_id.as_str()]);
+    }
+
+    #[test]
+    fn rebase_session_keeps_other_branches_on_old_chain() {
+        let (mut store, root_id) = make_store_with_root();
+        let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+        let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+        store.fork("main", &child_id).unwrap();
+        store.fork("draft", &child_id).unwrap();
+
+        let new_head = store
+            .rebase_session(
+                "main",
+                &SessionAnchorPatch {
+                    provider: Some("anthropic".to_owned()),
+                    ..SessionAnchorPatch::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.get_branch_head("draft").unwrap(), child_id);
+        assert_eq!(store.get_branch_head("main").unwrap(), new_head);
+        let draft_ancestry = store.ancestry("draft").unwrap();
+        let Kind::Anchor(anchor) = &draft_ancestry[1].kind else {
+            panic!("expected session anchor");
+        };
+        assert_eq!(anchor.as_session().unwrap().provider, "openai");
+        assert_eq!(draft_ancestry[1].id, session_id);
+    }
+
+    #[test]
+    fn rebase_session_requires_visible_session_anchor() {
+        let (mut store, root_id) = make_store_with_root();
+        store.fork("main", &root_id).unwrap();
+
+        let err = store
+            .rebase_session("main", &SessionAnchorPatch::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::MissingSessionAnchor { branch } if branch == "main"
+        ));
+    }
+
+    #[test]
+    fn rebase_session_preserves_created_at_across_rewritten_chain() {
+        let (mut store, root_id) = make_store_with_root();
+        let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+        let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+        let session_created_at = store.nodes.get(&session_id).unwrap().created_at;
+        let child_created_at = store.nodes.get(&child_id).unwrap().created_at;
+        store.fork("main", &child_id).unwrap();
+
+        store
+            .rebase_session(
+                "main",
+                &SessionAnchorPatch {
+                    provider: Some("anthropic".to_owned()),
+                    ..SessionAnchorPatch::default()
+                },
+            )
+            .unwrap();
+
+        let ancestry = store.ancestry("main").unwrap();
+        assert_eq!(ancestry[0].created_at, child_created_at);
+        assert_eq!(ancestry[1].created_at, session_created_at);
+        assert_eq!(ancestry[2].id, root_id);
     }
 }
