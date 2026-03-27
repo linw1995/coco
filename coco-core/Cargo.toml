@@ -1,0 +1,10 @@
+[package]
+name = "coco-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+coco-llm = { path = "../coco-llm" }
+snafu.workspace = true
+tokio.workspace = true

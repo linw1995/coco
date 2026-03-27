@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
 use crate::{Anchor, AnchorPayload, Kind, NewNode, Node, Role, SessionAnchorPatch};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Store {
     pub nodes: HashMap<String, Node>,
     pub children: HashMap<String, HashSet<String>>,
@@ -457,6 +458,10 @@ impl SharedStore {
             .write()
             .expect("store lock poisoned")
             .rebase_session(name, patch)
+    }
+
+    pub fn snapshot(&self) -> Store {
+        self.inner.read().expect("store lock poisoned").clone()
     }
 }
 

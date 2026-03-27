@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ use serde_json::Value;
 use snafu::prelude::*;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+pub use coco_mem;
 pub use coco_mem::SessionAnchorPatch as SessionConfigPatch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,14 +21,14 @@ pub enum Provider {
 }
 
 impl Provider {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
         match value {
             "openai" => Ok(Self::OpenAi),
             "anthropic" => Ok(Self::Anthropic),
@@ -35,6 +37,14 @@ impl Provider {
             }
             .fail(),
         }
+    }
+}
+
+impl FromStr for Provider {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse(s)
     }
 }
 
@@ -529,11 +539,34 @@ impl CompletionBackend for RigBackend {
         session: SessionSnapshot,
         request: ResolvedCompletionRequest,
     ) -> std::result::Result<BackendCompletion, BackendError> {
-        use rig::client::{CompletionClient, ProviderClient};
+        use rig::client::CompletionClient;
         use rig::completion::CompletionModel;
         use rig::completion::message::Message;
         use rig::message::AssistantContent;
         use rig::providers::{anthropic, openai};
+
+        fn resolve_api_key(provider: Provider) -> std::result::Result<String, BackendError> {
+            let generic = std::env::var("COCO_API_KEY").ok();
+            let provider_specific = match provider {
+                Provider::OpenAi => std::env::var("OPENAI_API_KEY").ok(),
+                Provider::Anthropic => std::env::var("ANTHROPIC_API_KEY").ok(),
+            };
+
+            generic
+                .or(provider_specific)
+                .ok_or_else(|| BackendError::Failed {
+                    message: format!("missing API key for provider {}", provider.as_str()),
+                })
+        }
+
+        fn resolve_base_url(provider: Provider) -> Option<String> {
+            std::env::var("COCO_BASE_URL")
+                .ok()
+                .or_else(|| match provider {
+                    Provider::OpenAi => std::env::var("OPENAI_BASE_URL").ok(),
+                    Provider::Anthropic => None,
+                })
+        }
 
         fn to_messages(history: &[ConversationMessage]) -> Vec<Message> {
             history
@@ -568,7 +601,14 @@ impl CompletionBackend for RigBackend {
 
         match request.provider {
             Provider::OpenAi => {
-                let client = openai::Client::from_env();
+                let api_key = resolve_api_key(request.provider)?;
+                let mut builder = openai::Client::builder().api_key(&api_key);
+                if let Some(base_url) = resolve_base_url(request.provider) {
+                    builder = builder.base_url(&base_url);
+                }
+                let client = builder.build().map_err(|source| BackendError::Failed {
+                    message: source.to_string(),
+                })?;
                 let model = client.completion_model(&request.model);
                 let request = model
                     .completion_request(prompt.clone())
@@ -591,7 +631,14 @@ impl CompletionBackend for RigBackend {
                 })
             }
             Provider::Anthropic => {
-                let client = anthropic::Client::from_env();
+                let api_key = resolve_api_key(request.provider)?;
+                let mut builder = anthropic::Client::builder().api_key(api_key);
+                if let Some(base_url) = resolve_base_url(request.provider) {
+                    builder = builder.base_url(&base_url);
+                }
+                let client = builder.build().map_err(|source| BackendError::Failed {
+                    message: source.to_string(),
+                })?;
                 let model = client.completion_model(&request.model);
                 let request = model
                     .completion_request(prompt)

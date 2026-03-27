@@ -1,13 +1,17 @@
 [package]
-name = "coco-llm"
+name = "coco-cli"
 edition.workspace = true
 version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+clap.workspace = true
+coco-core = { path = "../coco-core" }
+coco-llm = { path = "../coco-llm" }
 coco-mem = { path = "../coco-mem" }
-nanoid = "0.4.0"
-rig = { package = "rig-core", version = "0.32.0", features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"
