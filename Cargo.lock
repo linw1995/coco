@@ -252,6 +252,8 @@ dependencies = [
  "coco-core",
  "coco-llm",
  "coco-mem",
+ "serde",
+ "serde_json",
  "snafu",
  "tempfile",
  "tokio",

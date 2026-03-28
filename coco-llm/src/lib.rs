@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, Kind, MemoryStore, NewNode, NodeMetadata, PromptAnchor, Role,
-    SessionAnchor, Store, Tool,
+    Anchor, AnchorPayload, Kind, MemoryStore, NewNode, NodeMetadata, PauseReason, PromptAnchor,
+    Role, SessionAnchor, SessionState, Store, StoreError, Tool,
 };
 use serde_json::Value;
 use snafu::IntoError;
@@ -74,6 +74,30 @@ pub struct PromptRequest {
 pub struct BranchSession {
     pub branch: String,
     pub anchor_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    pub branch: String,
+    pub target_branch: String,
+    pub base_head_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMerge {
+    pub branch: String,
+    pub target_branch: String,
+    pub source_head_id: String,
+    pub merged_anchor_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFeedback {
+    pub branch: String,
+    pub target_branch: String,
+    pub base_head_id: String,
+    pub source_anchor_id: String,
+    pub feedback_anchor_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +186,7 @@ pub trait CompletionBackend: Send + Sync {
 }
 
 type BranchLockTable = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+type WorkflowLock = Arc<Mutex<()>>;
 
 pub struct LlmService<B = RigBackend, S = MemoryStore>
 where
@@ -170,6 +195,7 @@ where
     store: S,
     backend: B,
     branch_locks: BranchLockTable,
+    workflow_lock: WorkflowLock,
 }
 
 #[derive(Debug, Snafu)]
@@ -185,6 +211,27 @@ pub enum Error {
 
     #[snafu(display("Unknown provider {provider:?}"))]
     UnknownProvider { provider: String },
+
+    #[snafu(display("Session {branch:?} is not attached to a target branch"))]
+    SessionNotAttached { branch: String },
+
+    #[snafu(display(
+        "Session {branch:?} target branch mismatch: expected {expected:?}, got {actual:?}"
+    ))]
+    TargetBranchMismatch {
+        branch: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[snafu(display(
+        "Feedback source {source_anchor_id:?} must not move behind base head {base_head_id:?} on target branch {target_branch:?}"
+    ))]
+    FeedbackSourceNotAhead {
+        target_branch: String,
+        base_head_id: String,
+        source_anchor_id: String,
+    },
 
     #[snafu(display("Backend call failed: {source}"))]
     Backend {
@@ -222,6 +269,7 @@ where
             store,
             backend,
             branch_locks: Arc::new(Mutex::new(HashMap::new())),
+            workflow_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -286,9 +334,141 @@ where
         })
     }
 
+    pub async fn open_pull_request(
+        &self,
+        branch: &str,
+        target_branch: &str,
+    ) -> Result<PullRequest> {
+        let _workflow = self.lock_workflow().await;
+        let _guards = self.lock_branch_pair(branch, target_branch).await;
+        let base_head_id = self
+            .store
+            .get_branch_head(target_branch)
+            .context(MemorySnafu)?;
+        self.store
+            .set_session_state(
+                branch,
+                None,
+                SessionState::Attached {
+                    target_branch: target_branch.to_owned(),
+                    base_head_id: base_head_id.clone(),
+                },
+            )
+            .context(MemorySnafu)?;
+
+        Ok(PullRequest {
+            branch: branch.to_owned(),
+            target_branch: target_branch.to_owned(),
+            base_head_id,
+        })
+    }
+
+    pub async fn merge_session(
+        &self,
+        branch: &str,
+        target_branch: Option<&str>,
+        prompt: &str,
+    ) -> Result<SessionMerge> {
+        let _workflow = self.lock_workflow().await;
+        let _branch_guard = self.lock_branch(branch).await;
+        let resolved_target_branch = self.resolve_target_branch(branch, target_branch)?;
+        let _target_guard = if resolved_target_branch == branch {
+            None
+        } else {
+            Some(self.lock_branch(&resolved_target_branch).await)
+        };
+
+        let source_head_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let merged_anchor_id = self.append_prompt_anchor_to_branch(
+            &resolved_target_branch,
+            prompt,
+            std::slice::from_ref(&source_head_id),
+        )?;
+        self.store
+            .set_session_state(
+                branch,
+                None,
+                SessionState::Paused {
+                    target_branch: resolved_target_branch.clone(),
+                    reason: PauseReason::Merged {
+                        merged_anchor_id: merged_anchor_id.clone(),
+                    },
+                },
+            )
+            .context(MemorySnafu)?;
+
+        Ok(SessionMerge {
+            branch: branch.to_owned(),
+            target_branch: resolved_target_branch,
+            source_head_id,
+            merged_anchor_id,
+        })
+    }
+
+    pub async fn apply_feedback(
+        &self,
+        branch: &str,
+        prompt: &str,
+        from_ref: Option<&str>,
+    ) -> Result<SessionFeedback> {
+        let _workflow = self.lock_workflow().await;
+        let _branch_guard = self.lock_branch(branch).await;
+        let (target_branch, base_head_id) = self.attached_state(branch)?;
+        let _target_guard = if target_branch == branch {
+            None
+        } else {
+            Some(self.lock_branch(&target_branch).await)
+        };
+
+        let source_anchor_id = self.resolve_reference_id(from_ref.unwrap_or(&target_branch))?;
+        self.ensure_ref_visible_on_branch(&target_branch, &source_anchor_id)?;
+        if source_anchor_id != base_head_id {
+            match self.store.log(&base_head_id, &source_anchor_id) {
+                Ok(_) => {}
+                Err(StoreError::RefsNotConnected { .. }) => {
+                    return FeedbackSourceNotAheadSnafu {
+                        target_branch,
+                        base_head_id,
+                        source_anchor_id,
+                    }
+                    .fail();
+                }
+                Err(source) => return Err(Error::Memory { source }),
+            }
+        }
+
+        let feedback_anchor_id = self.append_prompt_anchor_to_branch(
+            branch,
+            prompt,
+            std::slice::from_ref(&source_anchor_id),
+        )?;
+        self.store
+            .set_session_state(
+                branch,
+                None,
+                SessionState::Attached {
+                    target_branch: target_branch.clone(),
+                    base_head_id: source_anchor_id.clone(),
+                },
+            )
+            .context(MemorySnafu)?;
+
+        Ok(SessionFeedback {
+            branch: branch.to_owned(),
+            target_branch,
+            base_head_id: source_anchor_id.clone(),
+            source_anchor_id,
+            feedback_anchor_id,
+        })
+    }
+
     pub async fn prompt(&self, request: PromptRequest) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
-        self.append_prompt_anchor(&request)?;
+        self.append_prompt_anchor_to_branch(
+            &request.branch,
+            &request.prompt,
+            &request.merge_parents,
+        )?;
         self.complete_locked(CompletionRequest {
             branch: request.branch,
             provider: None,
@@ -300,13 +480,14 @@ where
         .await
     }
 
-    fn append_prompt_anchor(&self, config: &PromptRequest) -> Result<String> {
-        let original_head = self
-            .store
-            .get_branch_head(&config.branch)
-            .context(MemorySnafu)?;
-        let merge_parents = config
-            .merge_parents
+    fn append_prompt_anchor_to_branch(
+        &self,
+        branch: &str,
+        prompt: &str,
+        merge_parents: &[String],
+    ) -> Result<String> {
+        let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let merge_parents = merge_parents
             .iter()
             .map(|reference| {
                 self.store
@@ -330,13 +511,13 @@ where
                 kind: Kind::Anchor(Anchor::prompt(
                     merge_parents,
                     PromptAnchor {
-                        prompt: config.prompt.clone(),
+                        prompt: prompt.to_owned(),
                     },
                 )),
             })
             .context(MemorySnafu)?;
         self.store
-            .set_branch_head(&config.branch, &original_head, &anchor_id)
+            .set_branch_head(branch, &original_head, &anchor_id)
             .context(MemorySnafu)?;
 
         Ok(anchor_id)
@@ -425,6 +606,24 @@ where
         };
 
         branch_lock.lock_owned().await
+    }
+
+    async fn lock_workflow(&self) -> OwnedMutexGuard<()> {
+        self.workflow_lock.clone().lock_owned().await
+    }
+
+    async fn lock_branch_pair(&self, left: &str, right: &str) -> Vec<OwnedMutexGuard<()>> {
+        let mut branches = vec![left.to_owned()];
+        if left != right {
+            branches.push(right.to_owned());
+            branches.sort();
+        }
+
+        let mut guards = Vec::with_capacity(branches.len());
+        for branch in branches {
+            guards.push(self.lock_branch(&branch).await);
+        }
+        guards
     }
 
     fn resolve_session(&self, branch: &str) -> Result<SessionSnapshot> {
@@ -533,6 +732,79 @@ where
                 .additional_params
                 .or_else(|| session.additional_params.clone()),
         }
+    }
+
+    fn resolve_target_branch(&self, branch: &str, explicit_target: Option<&str>) -> Result<String> {
+        let state = self.store.get_session_state(branch).context(MemorySnafu)?;
+
+        if let Some(target_branch) = explicit_target {
+            match state {
+                SessionState::Attached {
+                    target_branch: expected,
+                    ..
+                }
+                | SessionState::Paused {
+                    target_branch: expected,
+                    ..
+                } if !expected.is_empty() && expected != target_branch => {
+                    return TargetBranchMismatchSnafu {
+                        branch: branch.to_owned(),
+                        expected,
+                        actual: target_branch.to_owned(),
+                    }
+                    .fail();
+                }
+                _ => return Ok(target_branch.to_owned()),
+            }
+        }
+
+        match state {
+            SessionState::Attached { target_branch, .. }
+            | SessionState::Paused { target_branch, .. }
+                if !target_branch.is_empty() =>
+            {
+                Ok(target_branch)
+            }
+            SessionState::Active | SessionState::Attached { .. } | SessionState::Paused { .. } => {
+                SessionNotAttachedSnafu {
+                    branch: branch.to_owned(),
+                }
+                .fail()
+            }
+        }
+    }
+
+    fn attached_state(&self, branch: &str) -> Result<(String, String)> {
+        match self.store.get_session_state(branch).context(MemorySnafu)? {
+            SessionState::Attached {
+                target_branch,
+                base_head_id,
+            } => Ok((target_branch, base_head_id)),
+            SessionState::Active | SessionState::Paused { .. } => SessionNotAttachedSnafu {
+                branch: branch.to_owned(),
+            }
+            .fail(),
+        }
+    }
+
+    fn resolve_reference_id(&self, reference: &str) -> Result<String> {
+        self.store
+            .ancestry(reference)
+            .context(MemorySnafu)
+            .map(|nodes| {
+                nodes
+                    .into_iter()
+                    .next()
+                    .expect("ancestry should always include the head node")
+                    .id
+            })
+    }
+
+    fn ensure_ref_visible_on_branch(&self, branch: &str, node_id: &str) -> Result<()> {
+        self.store
+            .log(node_id, branch)
+            .context(MemorySnafu)
+            .map(|_| ())
     }
 }
 
@@ -1221,6 +1493,207 @@ mod tests {
             service.store().get_branch_head("main").unwrap(),
             service.store().get_branch_head("draft").unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn open_pull_request_uses_target_head_as_base() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[]);
+        let service = LlmService::new(store.clone(), backend);
+        let base_session = service
+            .create_session(session_config("base"))
+            .await
+            .unwrap();
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let review_anchor_id = store
+            .append(NewNode {
+                parent: base_session.anchor_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![],
+                    PromptAnchor {
+                        prompt: "review".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        store
+            .set_branch_head("base", &base_session.anchor_id, &review_anchor_id)
+            .unwrap();
+
+        let pr = service.open_pull_request("main", "base").await.unwrap();
+
+        assert_eq!(pr.target_branch, "base");
+        assert_eq!(pr.base_head_id, review_anchor_id);
+        assert_eq!(
+            store.get_session_state("main").unwrap(),
+            SessionState::Attached {
+                target_branch: "base".to_owned(),
+                base_head_id: pr.base_head_id,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_session_appends_target_prompt_anchor_and_pauses_source() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[]);
+        let service = LlmService::new(store.clone(), backend);
+        service
+            .create_session(session_config("base"))
+            .await
+            .unwrap();
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let pr = service.open_pull_request("main", "base").await.unwrap();
+        let source_head_id = store.get_branch_head("main").unwrap();
+
+        let merged = service
+            .merge_session("main", None, "handoff to base")
+            .await
+            .unwrap();
+
+        assert_eq!(merged.branch, "main");
+        assert_eq!(merged.target_branch, "base");
+        assert_eq!(merged.source_head_id, source_head_id);
+        assert_ne!(merged.merged_anchor_id, pr.base_head_id);
+
+        let merged_anchor = store.get_node(&merged.merged_anchor_id).unwrap();
+        let Kind::Anchor(anchor) = merged_anchor.kind else {
+            panic!("expected anchor node");
+        };
+        let prompt_anchor = anchor.as_prompt().expect("expected prompt anchor");
+        assert_eq!(merged_anchor.parent, pr.base_head_id);
+        assert_eq!(prompt_anchor.prompt, "handoff to base");
+        assert_eq!(anchor.merge_parents(), [source_head_id.as_str()]);
+        assert_eq!(
+            store.get_branch_head("base").unwrap(),
+            merged.merged_anchor_id
+        );
+        assert_eq!(
+            store.get_session_state("main").unwrap(),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Merged {
+                    merged_anchor_id: merged.merged_anchor_id,
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_appends_session_prompt_anchor_and_advances_base_head() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[]);
+        let service = LlmService::new(store.clone(), backend);
+        let base_session = service
+            .create_session(session_config("base"))
+            .await
+            .unwrap();
+        let main_session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        service.open_pull_request("main", "base").await.unwrap();
+
+        let base_feedback_id = store
+            .append(NewNode {
+                parent: base_session.anchor_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![],
+                    PromptAnchor {
+                        prompt: "base feedback".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        store
+            .set_branch_head("base", &base_session.anchor_id, &base_feedback_id)
+            .unwrap();
+
+        let feedback = service
+            .apply_feedback("main", "address review comments", None)
+            .await
+            .unwrap();
+
+        assert_eq!(feedback.target_branch, "base");
+        assert_eq!(feedback.base_head_id, base_feedback_id);
+        assert_eq!(feedback.source_anchor_id, base_feedback_id);
+        let feedback_anchor = store.get_node(&feedback.feedback_anchor_id).unwrap();
+        let Kind::Anchor(anchor) = feedback_anchor.kind else {
+            panic!("expected anchor node");
+        };
+        let prompt_anchor = anchor.as_prompt().expect("expected prompt anchor");
+        assert_eq!(feedback_anchor.parent, main_session.anchor_id);
+        assert_eq!(prompt_anchor.prompt, "address review comments");
+        assert_eq!(anchor.merge_parents(), [base_feedback_id.as_str()]);
+        assert_eq!(
+            store.get_branch_head("main").unwrap(),
+            feedback.feedback_anchor_id
+        );
+        assert_eq!(
+            store.get_session_state("main").unwrap(),
+            SessionState::Attached {
+                target_branch: "base".to_owned(),
+                base_head_id: base_feedback_id,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_rejects_source_behind_attached_base_head() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[]);
+        let service = LlmService::new(store.clone(), backend);
+        let base_session = service
+            .create_session(session_config("base"))
+            .await
+            .unwrap();
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let newer_feedback_id = store
+            .append(NewNode {
+                parent: base_session.anchor_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![],
+                    PromptAnchor {
+                        prompt: "new review".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        store
+            .set_branch_head("base", &base_session.anchor_id, &newer_feedback_id)
+            .unwrap();
+        service.open_pull_request("main", "base").await.unwrap();
+
+        let err = service
+            .apply_feedback("main", "stale feedback", Some(&base_session.anchor_id))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::FeedbackSourceNotAhead {
+                target_branch,
+                base_head_id,
+                source_anchor_id,
+            } if target_branch == "base"
+                && base_head_id == newer_feedback_id
+                && source_anchor_id == base_session.anchor_id
+        ));
     }
 
     #[tokio::test]
