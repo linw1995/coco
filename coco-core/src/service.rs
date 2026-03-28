@@ -2,7 +2,7 @@ use snafu::prelude::*;
 
 use crate::{
     BranchResolver, ConversationEngine, EngineError, Error, InboundMessage, OutboundMessage,
-    error::InvalidInputSnafu,
+    error::{BranchResolveFailedSnafu, InvalidInputSnafu},
 };
 
 type Result<T> = std::result::Result<T, Error>;
@@ -32,13 +32,13 @@ where
             }
         );
 
-        let branch = self.resolver.resolve_branch(&message).map_err(|source| {
-            Error::BranchResolveFailed {
+        let branch = self
+            .resolver
+            .resolve_branch(&message)
+            .context(BranchResolveFailedSnafu {
                 channel_kind: message.channel_kind,
                 conversation_id: message.conversation_id.clone(),
-                source,
-            }
-        })?;
+            })?;
 
         match self.engine.complete(&branch, text).await {
             Ok(text) => Ok(OutboundMessage { text }),

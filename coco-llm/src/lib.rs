@@ -8,6 +8,7 @@ use coco_mem::{
     SessionAnchor, Store, Tool,
 };
 use serde_json::Value;
+use snafu::IntoError;
 use snafu::prelude::*;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -401,15 +402,15 @@ where
                         kind: Kind::Failure(message.clone()),
                     })
                     .context(MemorySnafu)?;
-                Err(Error::Backend {
-                    source,
+                Err(BackendSnafu {
                     context: Box::new(BackendFailureContext {
                         branch: resolved.branch,
                         execution_id,
                         error_node_id,
                         retry_from_node_id: original_head,
                     }),
-                })
+                }
+                .into_error(source))
             }
         }
     }

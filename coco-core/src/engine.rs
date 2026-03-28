@@ -49,14 +49,15 @@ where
         branch: &str,
         prompt: &str,
     ) -> std::result::Result<String, EngineError> {
-        self.service
+        let result = self
+            .service
             .prompt(PromptRequest {
                 branch: branch.to_owned(),
                 prompt: prompt.to_owned(),
                 merge_parents: vec![],
             })
-            .await
-            .map(|result| result.text)
-            .map_err(EngineError::from)
+            .await?;
+
+        Ok(result.text)
     }
 }
