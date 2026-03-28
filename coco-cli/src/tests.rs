@@ -3,18 +3,19 @@ use std::future::Future;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use coco_llm::coco_mem::Store;
 use coco_llm::{
     BackendCompletion, BackendError, CompletionBackend, Provider, ResolvedCompletionRequest,
     SessionSnapshot,
 };
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     Cli,
     app::{resolve_session_config, run_with_backend},
     cli::{Command, PromptCommand, SessionCommand, SessionCreateCommand, SessionSubcommand},
-    store::load_store,
+    store::open_store,
 };
 
 type FakeResponseQueue =
@@ -92,6 +93,12 @@ fn session_create_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
     }
 }
 
+fn temp_store_path() -> (TempDir, std::path::PathBuf) {
+    let tempdir = tempdir().unwrap();
+    let store_path = tempdir.path().join("store");
+    (tempdir, store_path)
+}
+
 async fn with_coco_env_async<T, F, Fut>(entries: &[(&str, &str)], run: F) -> T
 where
     F: FnOnce() -> Fut,
@@ -129,8 +136,7 @@ where
 
 #[tokio::test]
 async fn prompt_uses_main_branch_by_default() {
-    let tempdir = tempdir().unwrap();
-    let store_path = tempdir.path().join("store.json");
+    let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
@@ -158,8 +164,7 @@ async fn prompt_uses_main_branch_by_default() {
 
 #[tokio::test]
 async fn prompt_supports_explicit_branch_override() {
-    let tempdir = tempdir().unwrap();
-    let store_path = tempdir.path().join("store.json");
+    let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
@@ -187,8 +192,7 @@ async fn prompt_supports_explicit_branch_override() {
 
 #[tokio::test]
 async fn prompt_reads_text_from_stdin() {
-    let tempdir = tempdir().unwrap();
-    let store_path = tempdir.path().join("store.json");
+    let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
@@ -216,8 +220,7 @@ async fn prompt_reads_text_from_stdin() {
 
 #[tokio::test]
 async fn prompt_returns_missing_session_when_branch_does_not_exist() {
-    let tempdir = tempdir().unwrap();
-    let store_path = tempdir.path().join("store.json");
+    let (_tempdir, store_path) = temp_store_path();
 
     let error = run_with_backend(
         prompt_cli(store_path, None, &["hello"]),
@@ -234,8 +237,7 @@ async fn prompt_returns_missing_session_when_branch_does_not_exist() {
 
 #[tokio::test]
 async fn session_create_persists_branch_for_future_prompt_calls() {
-    let tempdir = tempdir().unwrap();
-    let store_path = tempdir.path().join("store.json");
+    let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
@@ -250,7 +252,7 @@ async fn session_create_persists_branch_for_future_prompt_calls() {
     )
     .await;
 
-    let store = load_store(&store_path).unwrap();
+    let store = open_store(&store_path).unwrap();
     assert_eq!(store.get_branch_head("main").unwrap().len(), 64);
 
     let output = run_with_backend(

@@ -9,7 +9,6 @@ clap.workspace = true
 coco-core = { path = "../coco-core" }
 coco-llm = { path = "../coco-llm" }
 coco-mem = { path = "../coco-mem" }
-serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 

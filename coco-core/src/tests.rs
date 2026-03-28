@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use coco_llm::coco_mem::SharedStore;
+use coco_llm::coco_mem::MemoryStore;
 use coco_llm::{
     BackendCompletion, BackendError, CompletionBackend, LlmService, Provider, SessionConfig,
     SessionSnapshot,
@@ -167,7 +167,7 @@ async fn core_service_returns_branch_resolution_error_context() {
 
 #[tokio::test]
 async fn llm_engine_calls_prompt_and_returns_text() {
-    let store = SharedStore::new();
+    let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[("main", &[Ok("hello from llm")])]);
     let llm = Arc::new(LlmService::new(store, backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -180,7 +180,7 @@ async fn llm_engine_calls_prompt_and_returns_text() {
 
 #[tokio::test]
 async fn llm_engine_maps_missing_session_error() {
-    let store = SharedStore::new();
+    let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let engine = LlmConversationEngine::new(llm);

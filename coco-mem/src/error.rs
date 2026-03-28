@@ -1,0 +1,83 @@
+use std::path::PathBuf;
+
+use snafu::prelude::*;
+
+#[derive(Snafu, Debug)]
+#[snafu(visibility(pub(crate)))]
+pub enum StoreError {
+    #[snafu(display("Parent ID {id:?} not found"))]
+    ParentNotFound { id: String },
+
+    #[snafu(display("Merge parent ID {id:?} is duplicated"))]
+    DuplicateMergeParent { id: String },
+
+    #[snafu(display("Merge parent ID {id:?} matches the primary parent"))]
+    MergeParentMatchesParent { id: String },
+
+    #[snafu(display("ID {id:?} not found"))]
+    NotFound { id: String },
+
+    #[snafu(display("Branch {name:?} not found"))]
+    BranchNotFound { name: String },
+
+    #[snafu(display("Branch {name:?} already exists"))]
+    BranchExists { name: String },
+
+    #[snafu(display("Branch {name:?} moved from {expected:?} to {actual:?}"))]
+    BranchHeadMoved {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[snafu(display("Ref {base_ref:?} is not an ancestor of {head_ref:?}"))]
+    RefsNotConnected { base_ref: String, head_ref: String },
+
+    #[snafu(display("Branch {branch:?} has no session anchor"))]
+    MissingSessionAnchor { branch: String },
+
+    #[snafu(display("Store path {path:?} is not a directory"))]
+    StorePathIsNotDirectory { path: PathBuf },
+
+    #[snafu(display("Failed to create or access store directory {path:?}: {source}"))]
+    WriteStoreDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to read or write store metadata {path:?}: {source}"))]
+    WriteStoreMeta {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to parse store metadata {path:?}: {source}"))]
+    ParseStoreMeta {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("Failed to read or write store log {path:?}: {source}"))]
+    WriteStoreLog {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to parse store log {path:?} at line {line}: {source}"))]
+    ParseStoreLog {
+        path: PathBuf,
+        line: usize,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("Failed to serialize store record for {path:?}: {source}"))]
+    SerializeStoreRecord {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("Corrupted store at {path:?}: {message}"))]
+    CorruptedStore { path: PathBuf, message: String },
+}
+
+pub type StoreResult<T> = std::result::Result<T, StoreError>;

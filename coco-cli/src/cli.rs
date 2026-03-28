@@ -6,7 +6,7 @@ use coco_llm::Provider;
 #[derive(Debug, Parser)]
 #[command(name = "coco-cli")]
 pub struct Cli {
-    #[arg(long, global = true, default_value = ".coco-store.json")]
+    #[arg(long, global = true, default_value = ".coco-store")]
     pub store_path: PathBuf,
 
     #[command(subcommand)]

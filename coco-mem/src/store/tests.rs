@@ -1,0 +1,994 @@
+use std::fs;
+use std::path::Path;
+
+use super::fs::FsStore;
+use super::memory::MemoryStore;
+use super::state::StoreState;
+use crate::Store as StoreTrait;
+use crate::{
+    Anchor, Kind, NewNode, Node, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch,
+    StoreError as Error,
+};
+use serde_json::json;
+
+fn make_text_node(parent: &str, text: &str) -> NewNode {
+    NewNode {
+        parent: parent.to_owned(),
+        role: Role::User,
+        metadata: None,
+        kind: Kind::Text(text.to_owned()),
+    }
+}
+
+fn make_session_anchor_node(parent: &str) -> NewNode {
+    NewNode {
+        parent: parent.to_owned(),
+        role: Role::System,
+        metadata: None,
+        kind: Kind::Anchor(Anchor::session(
+            vec![],
+            SessionAnchor {
+                provider: "openai".to_owned(),
+                model: "gpt-5.4".to_owned(),
+                tools: vec![],
+                system_prompt: "system".to_owned(),
+                prompt: "prompt".to_owned(),
+                temperature: Some(0.1),
+                max_tokens: Some(64),
+                additional_params: Some(json!({"reasoning_effort": "low"})),
+            },
+        )),
+    }
+}
+
+fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> NewNode {
+    NewNode {
+        parent: parent.to_owned(),
+        role: Role::System,
+        metadata: None,
+        kind: Kind::Anchor(Anchor::session(
+            vec![merge_parent.to_owned()],
+            SessionAnchor {
+                provider: "openai".to_owned(),
+                model: "gpt-5.4".to_owned(),
+                tools: vec![],
+                system_prompt: "system".to_owned(),
+                prompt: "prompt".to_owned(),
+                temperature: Some(0.1),
+                max_tokens: Some(64),
+                additional_params: Some(json!({"reasoning_effort": "low"})),
+            },
+        )),
+    }
+}
+
+fn make_prompt_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
+    NewNode {
+        parent: parent.to_owned(),
+        role: Role::System,
+        metadata: None,
+        kind: Kind::Anchor(Anchor::prompt(
+            merge_parents.iter().map(|id| (*id).to_owned()).collect(),
+            PromptAnchor {
+                prompt: "merge prompt".to_owned(),
+            },
+        )),
+    }
+}
+
+fn read_jsonl_nodes(path: &Path) -> Vec<Node> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn temp_store_path() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    (tempdir, path)
+}
+
+trait InspectableStore {
+    fn snapshot_state(&self) -> StoreState;
+}
+
+trait TestStoreFactory {
+    type Store: StoreTrait + InspectableStore;
+
+    fn create() -> Self::Store;
+}
+
+impl InspectableStore for MemoryStore {
+    fn snapshot_state(&self) -> StoreState {
+        self.snapshot_state()
+    }
+}
+
+impl InspectableStore for FsStore {
+    fn snapshot_state(&self) -> StoreState {
+        self.snapshot_state()
+    }
+}
+
+struct MemoryFactory;
+
+impl TestStoreFactory for MemoryFactory {
+    type Store = MemoryStore;
+
+    fn create() -> Self::Store {
+        MemoryStore::new()
+    }
+}
+
+struct FsFactory;
+
+impl TestStoreFactory for FsFactory {
+    type Store = FsStore;
+
+    fn create() -> Self::Store {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let path = tempdir.path().join("store");
+        let store = FsStore::open(&path).expect("file system store should open");
+        std::mem::forget(tempdir);
+        store
+    }
+}
+
+fn assert_new_store_exposes_root_text_node<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let snapshot = store.snapshot_state();
+    let root = snapshot.nodes.get(snapshot.root_id()).unwrap();
+
+    let Kind::Text(text) = &root.kind else {
+        panic!("expected text root node");
+    };
+    assert_eq!(text, "The Big Bang");
+    assert!(root.is_root());
+}
+
+fn assert_append_inserts_node_and_updates_children_index<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+
+    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+
+    let snapshot = store.snapshot_state();
+    let stored = snapshot.nodes.get(&child_id).unwrap();
+    assert_eq!(stored.parent, session_id);
+    assert!(
+        snapshot
+            .children
+            .get(&stored.parent)
+            .unwrap()
+            .contains(&child_id)
+    );
+}
+
+fn assert_append_rejects_missing_parent<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let err = store
+        .append(make_text_node("missing", "child"))
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
+}
+
+fn assert_append_prompt_anchor_indexes_merge_parents_as_children<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let merge_parent_id = store
+        .append(make_text_node(&session_id, "merge-parent"))
+        .unwrap();
+
+    let anchor_id = store
+        .append(make_prompt_anchor_node(&session_id, &[&merge_parent_id]))
+        .unwrap();
+
+    let snapshot = store.snapshot_state();
+    assert!(
+        snapshot
+            .children
+            .get(&session_id)
+            .unwrap()
+            .contains(&anchor_id)
+    );
+    assert!(
+        snapshot
+            .children
+            .get(&merge_parent_id)
+            .unwrap()
+            .contains(&anchor_id)
+    );
+}
+
+fn assert_append_session_anchor_indexes_merge_parents_as_children<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let merge_parent_id = store
+        .append(make_text_node(&root_id, "merge-parent"))
+        .unwrap();
+
+    let anchor_id = store
+        .append(make_session_anchor_with_merge_parent(
+            &root_id,
+            &merge_parent_id,
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot_state();
+    assert!(
+        snapshot
+            .children
+            .get(&merge_parent_id)
+            .unwrap()
+            .contains(&anchor_id)
+    );
+}
+
+fn assert_append_prompt_anchor_rejects_missing_merge_parent<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let err = store
+        .append(make_prompt_anchor_node(&session_id, &["missing"]))
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
+}
+
+fn assert_append_prompt_anchor_rejects_duplicate_merge_parents<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let merge_parent_id = store
+        .append(make_text_node(&session_id, "merge-parent"))
+        .unwrap();
+    let err = store
+        .append(make_prompt_anchor_node(
+            &session_id,
+            &[&merge_parent_id, &merge_parent_id],
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::DuplicateMergeParent { id } if id == merge_parent_id
+    ));
+}
+
+fn assert_append_prompt_anchor_rejects_merge_parent_matching_primary_parent<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let err = store
+        .append(make_prompt_anchor_node(&session_id, &[&session_id]))
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::MergeParentMatchesParent { id } if id == session_id
+    ));
+}
+
+fn assert_append_prompt_anchor_allows_merge_parent_from_other_session_root<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let left_root = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let right_root = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let left_leaf = store.append(make_text_node(&left_root, "left")).unwrap();
+    let right_leaf = store.append(make_text_node(&right_root, "right")).unwrap();
+
+    let merge_id = store
+        .append(make_prompt_anchor_node(&left_leaf, &[&right_leaf]))
+        .unwrap();
+
+    let snapshot = store.snapshot_state();
+    assert!(
+        snapshot
+            .children
+            .get(&right_leaf)
+            .is_some_and(|children| children.contains(&merge_id))
+    );
+}
+
+fn assert_ancestry_returns_nodes_back_to_root<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let a_id = store.append(make_text_node(&session_id, "a")).unwrap();
+    let b_id = store.append(make_text_node(&a_id, "b")).unwrap();
+
+    let ancestry = store.ancestry(&b_id).unwrap();
+    let ids: Vec<_> = ancestry.into_iter().map(|node| node.id).collect();
+
+    assert_eq!(ids, vec![b_id, a_id, session_id, root_id]);
+}
+
+fn assert_log_returns_nodes_from_head_back_to_base_inclusive<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let a_id = store.append(make_text_node(&session_id, "a")).unwrap();
+    let b_id = store.append(make_text_node(&a_id, "b")).unwrap();
+    let c_id = store.append(make_text_node(&b_id, "c")).unwrap();
+
+    let log = store.log(&a_id, &c_id).unwrap();
+    let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
+
+    assert_eq!(ids, vec![c_id, b_id, a_id]);
+}
+
+fn assert_log_returns_single_node_when_base_equals_head<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+
+    let log = store.log(&root_id, &root_id).unwrap();
+    let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
+
+    assert_eq!(ids, vec![root_id]);
+}
+
+fn assert_log_returns_not_found_when_head_is_missing<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let missing_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let err = store.log(&root_id, missing_id).unwrap_err();
+
+    assert!(matches!(err, Error::NotFound { id } if id == missing_id));
+}
+
+fn assert_log_ignores_prompt_anchor_parents<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let merge_parent_id = store
+        .append(make_text_node(&session_id, "merge-parent"))
+        .unwrap();
+    let anchor_id = store
+        .append(make_prompt_anchor_node(&session_id, &[&merge_parent_id]))
+        .unwrap();
+
+    let err = store.log(&merge_parent_id, &anchor_id).unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::RefsNotConnected {
+            base_ref,
+            head_ref,
+        } if base_ref == merge_parent_id && head_ref == anchor_id
+    ));
+}
+
+fn assert_branch_creation_resolves_refs<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+
+    let head_id = store.fork("main", &root_id).unwrap();
+
+    assert_eq!(head_id, root_id);
+    assert_eq!(store.get_branch_head("main").unwrap(), root_id);
+}
+
+fn assert_fork_rejects_duplicates<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+
+    let err = store.fork("main", &root_id).unwrap_err();
+
+    assert!(matches!(err, Error::BranchExists { name } if name == "main"));
+}
+
+fn assert_set_branch_head_requires_matching_expected_head<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
+    let next_id = store.append(make_text_node(&child_id, "next")).unwrap();
+    store.fork("main", &child_id).unwrap();
+
+    let err = store
+        .set_branch_head("main", &root_id, &next_id)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::BranchHeadMoved {
+            name,
+            expected,
+            actual,
+        } if name == "main" && expected == root_id && actual == child_id
+    ));
+}
+
+fn assert_log_supports_branch_name_on_head_ref<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
+    store.fork("main", &child_id).unwrap();
+
+    let log = store.log(&root_id, "main").unwrap();
+    let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
+
+    assert_eq!(ids, vec![child_id, root_id]);
+}
+
+fn assert_log_supports_branch_name_on_base_ref<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
+    let leaf_id = store.append(make_text_node(&child_id, "leaf")).unwrap();
+    store.fork("base", &child_id).unwrap();
+
+    let log = store.log("base", &leaf_id).unwrap();
+    let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
+
+    assert_eq!(ids, vec![leaf_id, child_id]);
+}
+
+fn assert_log_supports_branch_name_on_both_sides<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
+    let leaf_id = store.append(make_text_node(&child_id, "leaf")).unwrap();
+    store.fork("base", &child_id).unwrap();
+    store.fork("main", &leaf_id).unwrap();
+
+    let log = store.log("base", "main").unwrap();
+    let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
+
+    assert_eq!(ids, vec![leaf_id, child_id]);
+}
+
+fn assert_log_returns_branch_not_found_when_branch_is_missing<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+
+    let err = store.log(&root_id, "main").unwrap_err();
+
+    assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
+}
+
+fn assert_rebase_session_rewrites_branch_chain_with_updated_config<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let old_child = store.snapshot_state().nodes.get(&child_id).unwrap().clone();
+    store.fork("main", &child_id).unwrap();
+
+    let new_head = store
+        .rebase_session(
+            "main",
+            &SessionAnchorPatch {
+                provider: Some("anthropic".to_owned()),
+                model: Some("claude-sonnet-4-20250514".to_owned()),
+                temperature: Some(None),
+                ..SessionAnchorPatch::default()
+            },
+        )
+        .unwrap();
+
+    assert_ne!(new_head, child_id);
+    let ancestry = store.ancestry("main").unwrap();
+    assert_eq!(ancestry[0].id, new_head);
+    assert!(matches!(&ancestry[0].kind, Kind::Text(text) if text == "child"));
+    assert_ne!(ancestry[0].id, child_id);
+    assert_eq!(ancestry[0].created_at, old_child.created_at);
+    assert_ne!(ancestry[1].id, session_id);
+    let Kind::Anchor(anchor) = &ancestry[1].kind else {
+        panic!("expected session anchor");
+    };
+    let session = anchor.as_session().expect("expected session anchor");
+    assert_eq!(session.provider, "anthropic");
+    assert_eq!(session.model, "claude-sonnet-4-20250514");
+    assert_eq!(session.temperature, None);
+    assert_eq!(
+        ancestry[1].created_at,
+        store
+            .snapshot_state()
+            .nodes
+            .get(&session_id)
+            .unwrap()
+            .created_at
+    );
+    assert_eq!(ancestry[2].id, root_id);
+
+    let snapshot = store.snapshot_state();
+    let old_session = snapshot.nodes.get(&session_id).unwrap();
+    let Kind::Anchor(old_anchor) = &old_session.kind else {
+        panic!("expected original session anchor");
+    };
+    assert_eq!(old_anchor.as_session().unwrap().provider, "openai");
+}
+
+fn assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let merge_source_id = store
+        .append(make_text_node(&session_id, "merge-source"))
+        .unwrap();
+    let anchor_id = store
+        .append(make_prompt_anchor_node(&merge_source_id, &[&session_id]))
+        .unwrap();
+    store.fork("main", &anchor_id).unwrap();
+
+    store
+        .rebase_session(
+            "main",
+            &SessionAnchorPatch {
+                model: Some("claude-sonnet-4-20250514".to_owned()),
+                ..SessionAnchorPatch::default()
+            },
+        )
+        .unwrap();
+
+    let ancestry = store.ancestry("main").unwrap();
+    let rebased_prompt = &ancestry[0];
+    let rebased_merge_source = &ancestry[1];
+    let rebased_session = &ancestry[2];
+    let Kind::Anchor(anchor) = &rebased_prompt.kind else {
+        panic!("expected prompt anchor");
+    };
+    assert_eq!(rebased_prompt.parent, rebased_merge_source.id);
+    assert_ne!(rebased_session.id, session_id);
+    assert_eq!(anchor.merge_parents(), [session_id.as_str()]);
+}
+
+fn assert_rebase_session_keeps_other_branches_on_old_chain<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    store.fork("main", &child_id).unwrap();
+    store.fork("draft", &child_id).unwrap();
+
+    let new_head = store
+        .rebase_session(
+            "main",
+            &SessionAnchorPatch {
+                provider: Some("anthropic".to_owned()),
+                ..SessionAnchorPatch::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(store.get_branch_head("draft").unwrap(), child_id);
+    assert_eq!(store.get_branch_head("main").unwrap(), new_head);
+    let draft_ancestry = store.ancestry("draft").unwrap();
+    let Kind::Anchor(anchor) = &draft_ancestry[1].kind else {
+        panic!("expected session anchor");
+    };
+    assert_eq!(anchor.as_session().unwrap().provider, "openai");
+    assert_eq!(draft_ancestry[1].id, session_id);
+}
+
+fn assert_rebase_session_requires_visible_session_anchor<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+
+    let err = store
+        .rebase_session("main", &SessionAnchorPatch::default())
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::MissingSessionAnchor { branch } if branch == "main"
+    ));
+}
+
+fn assert_rebase_session_preserves_created_at_across_rewritten_chain<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let snapshot = store.snapshot_state();
+    let session_created_at = snapshot.nodes.get(&session_id).unwrap().created_at;
+    let child_created_at = snapshot.nodes.get(&child_id).unwrap().created_at;
+    store.fork("main", &child_id).unwrap();
+
+    store
+        .rebase_session(
+            "main",
+            &SessionAnchorPatch {
+                provider: Some("anthropic".to_owned()),
+                ..SessionAnchorPatch::default()
+            },
+        )
+        .unwrap();
+
+    let ancestry = store.ancestry("main").unwrap();
+    assert_eq!(ancestry[0].created_at, child_created_at);
+    assert_eq!(ancestry[1].created_at, session_created_at);
+    assert_eq!(ancestry[2].id, root_id);
+}
+
+macro_rules! define_common_store_tests {
+    ($module:ident, $factory:ty) => {
+        mod $module {
+            use super::*;
+
+            #[test]
+            fn new_store_exposes_root_text_node() {
+                assert_new_store_exposes_root_text_node::<$factory>();
+            }
+
+            #[test]
+            fn append_inserts_node_and_updates_children_index() {
+                assert_append_inserts_node_and_updates_children_index::<$factory>();
+            }
+
+            #[test]
+            fn append_rejects_missing_parent() {
+                assert_append_rejects_missing_parent::<$factory>();
+            }
+
+            #[test]
+            fn append_prompt_anchor_indexes_merge_parents_as_children() {
+                assert_append_prompt_anchor_indexes_merge_parents_as_children::<$factory>();
+            }
+
+            #[test]
+            fn append_session_anchor_indexes_merge_parents_as_children() {
+                assert_append_session_anchor_indexes_merge_parents_as_children::<$factory>();
+            }
+
+            #[test]
+            fn append_prompt_anchor_rejects_missing_merge_parent() {
+                assert_append_prompt_anchor_rejects_missing_merge_parent::<$factory>();
+            }
+
+            #[test]
+            fn append_prompt_anchor_rejects_duplicate_merge_parents() {
+                assert_append_prompt_anchor_rejects_duplicate_merge_parents::<$factory>();
+            }
+
+            #[test]
+            fn append_prompt_anchor_rejects_merge_parent_matching_primary_parent() {
+                assert_append_prompt_anchor_rejects_merge_parent_matching_primary_parent::<$factory>();
+            }
+
+            #[test]
+            fn append_prompt_anchor_allows_merge_parent_from_other_session_root() {
+                assert_append_prompt_anchor_allows_merge_parent_from_other_session_root::<$factory>();
+            }
+
+            #[test]
+            fn ancestry_returns_nodes_back_to_root() {
+                assert_ancestry_returns_nodes_back_to_root::<$factory>();
+            }
+
+            #[test]
+            fn log_returns_nodes_from_head_back_to_base_inclusive() {
+                assert_log_returns_nodes_from_head_back_to_base_inclusive::<$factory>();
+            }
+
+            #[test]
+            fn log_returns_single_node_when_base_equals_head() {
+                assert_log_returns_single_node_when_base_equals_head::<$factory>();
+            }
+
+            #[test]
+            fn log_returns_not_found_when_head_is_missing() {
+                assert_log_returns_not_found_when_head_is_missing::<$factory>();
+            }
+
+            #[test]
+            fn log_ignores_prompt_anchor_parents() {
+                assert_log_ignores_prompt_anchor_parents::<$factory>();
+            }
+
+            #[test]
+            fn branch_creation_resolves_refs() {
+                assert_branch_creation_resolves_refs::<$factory>();
+            }
+
+            #[test]
+            fn fork_rejects_duplicates() {
+                assert_fork_rejects_duplicates::<$factory>();
+            }
+
+            #[test]
+            fn set_branch_head_requires_matching_expected_head() {
+                assert_set_branch_head_requires_matching_expected_head::<$factory>();
+            }
+
+            #[test]
+            fn log_supports_branch_name_on_head_ref() {
+                assert_log_supports_branch_name_on_head_ref::<$factory>();
+            }
+
+            #[test]
+            fn log_supports_branch_name_on_base_ref() {
+                assert_log_supports_branch_name_on_base_ref::<$factory>();
+            }
+
+            #[test]
+            fn log_supports_branch_name_on_both_sides() {
+                assert_log_supports_branch_name_on_both_sides::<$factory>();
+            }
+
+            #[test]
+            fn log_returns_branch_not_found_when_branch_is_missing() {
+                assert_log_returns_branch_not_found_when_branch_is_missing::<$factory>();
+            }
+
+            #[test]
+            fn rebase_session_rewrites_branch_chain_with_updated_config() {
+                assert_rebase_session_rewrites_branch_chain_with_updated_config::<$factory>();
+            }
+
+            #[test]
+            fn rebase_session_keeps_merge_parents_pointing_to_original_nodes() {
+                assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes::<$factory>();
+            }
+
+            #[test]
+            fn rebase_session_keeps_other_branches_on_old_chain() {
+                assert_rebase_session_keeps_other_branches_on_old_chain::<$factory>();
+            }
+
+            #[test]
+            fn rebase_session_requires_visible_session_anchor() {
+                assert_rebase_session_requires_visible_session_anchor::<$factory>();
+            }
+
+            #[test]
+            fn rebase_session_preserves_created_at_across_rewritten_chain() {
+                assert_rebase_session_preserves_created_at_across_rewritten_chain::<$factory>();
+            }
+        }
+    };
+}
+
+define_common_store_tests!(memory_store, MemoryFactory);
+define_common_store_tests!(fs_store, FsFactory);
+
+#[test]
+fn log_returns_parent_not_found_when_chain_is_broken() {
+    let mut store = StoreState::new();
+    let root_id = store.root_id().to_owned();
+    let mut broken = store
+        .plan_append_node(make_session_anchor_node(&root_id))
+        .map(|_| {
+            crate::Node::new(
+                "missing".to_owned(),
+                Role::User,
+                None,
+                Kind::Text("broken".to_owned()),
+                "2026-03-25T09:10:11Z".parse().unwrap(),
+            )
+        })
+        .unwrap();
+    let broken_id = broken.id.clone();
+    store.nodes.insert(broken.id.clone(), broken.clone());
+
+    let err = store.log(&root_id, &broken_id).unwrap_err();
+
+    assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
+    broken.parent = root_id;
+}
+
+#[test]
+fn log_returns_not_found_when_branch_head_is_missing() {
+    let mut store = StoreState::new();
+    let root_id = store.root_id().to_owned();
+    let missing_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    store
+        .branches
+        .insert("main".to_owned(), missing_id.to_owned());
+
+    let err = store.log(&root_id, "main").unwrap_err();
+
+    assert!(matches!(err, Error::NotFound { id } if id == missing_id));
+}
+
+#[test]
+fn open_creates_jsonl_store_directory_with_root_node() {
+    let (_tempdir, path) = temp_store_path();
+
+    let store = FsStore::open(&path).unwrap();
+
+    assert!(path.join("meta.json").is_file());
+    assert!(path.join("nodes.jsonl").is_file());
+    assert!(path.join("branches").is_dir());
+
+    let nodes = fs::read_to_string(path.join("nodes.jsonl")).unwrap();
+    assert!(nodes.lines().count() >= 1);
+    assert_eq!(store.ancestry(&store.root_id()).unwrap().len(), 1);
+}
+
+#[test]
+fn open_replays_nodes_and_branch_updates_from_jsonl_logs() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    store.fork("main", &child_id).unwrap();
+    let next_id = store.append(make_text_node(&child_id, "next")).unwrap();
+    store.set_branch_head("main", &child_id, &next_id).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.get_branch_head("main").unwrap(), next_id);
+    let ancestry = reopened.ancestry("main").unwrap();
+    assert_eq!(ancestry[0].id, next_id);
+    assert_eq!(ancestry[1].id, child_id);
+    assert_eq!(ancestry[2].id, session_id);
+    assert_eq!(ancestry[3].id, root_id);
+}
+
+#[test]
+fn open_replays_branch_view_after_head_rewind() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
+    let next_id = store.append(make_text_node(&child_id, "next")).unwrap();
+    store.fork("main", &next_id).unwrap();
+    store.set_branch_head("main", &next_id, &child_id).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+    let branch_nodes = read_jsonl_nodes(&path.join("branches/main.jsonl"));
+    let global_nodes = read_jsonl_nodes(&path.join("nodes.jsonl"));
+
+    assert_eq!(reopened.get_branch_head("main").unwrap(), child_id);
+    let ancestry = reopened.ancestry("main").unwrap();
+    assert_eq!(ancestry[0].id, child_id);
+    assert_eq!(ancestry[1].id, root_id);
+    assert_eq!(
+        branch_nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![root_id.as_str(), child_id.as_str()]
+    );
+    assert!(global_nodes.iter().any(|node| node.id == next_id));
+}
+
+#[test]
+fn open_replays_encoded_branch_names() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
+    let branch = "draft/review 你好";
+    store.fork(branch, &child_id).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.get_branch_head(branch).unwrap(), child_id);
+}
+
+#[test]
+fn open_rejects_corrupted_jsonl_logs() {
+    let (_tempdir, path) = temp_store_path();
+    let _store = FsStore::open(&path).unwrap();
+    fs::write(path.join("nodes.jsonl"), "not-json\n").unwrap();
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::ParseStoreLog { line: 1, .. }));
+}
+
+#[test]
+fn rebase_rewrites_branch_view_but_preserves_dangling_nodes() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    store.fork("main", &child_id).unwrap();
+
+    let new_head = store
+        .rebase_session(
+            "main",
+            &SessionAnchorPatch {
+                provider: Some("anthropic".to_owned()),
+                ..SessionAnchorPatch::default()
+            },
+        )
+        .unwrap();
+
+    let branch_nodes = read_jsonl_nodes(&path.join("branches/main.jsonl"));
+    let global_nodes = read_jsonl_nodes(&path.join("nodes.jsonl"));
+    let new_chain = store.ancestry("main").unwrap();
+    let new_session_id = new_chain[1].id.clone();
+
+    assert_eq!(
+        branch_nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![root_id.as_str(), new_session_id.as_str(), new_head.as_str()]
+    );
+    assert!(global_nodes.iter().any(|node| node.id == session_id));
+    assert!(global_nodes.iter().any(|node| node.id == child_id));
+    assert!(global_nodes.iter().any(|node| node.id == new_session_id));
+    assert!(global_nodes.iter().any(|node| node.id == new_head));
+}

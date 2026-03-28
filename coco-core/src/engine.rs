@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use coco_llm::coco_mem::{MemoryStore, Store};
 use coco_llm::{CompletionBackend, LlmService, PromptRequest, RigBackend};
 
 use crate::EngineError;
@@ -15,26 +16,33 @@ pub trait ConversationEngine: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct LlmConversationEngine<B = RigBackend> {
-    service: Arc<LlmService<B>>,
+pub struct LlmConversationEngine<B = RigBackend, S = MemoryStore>
+where
+    S: Store,
+{
+    service: Arc<LlmService<B, S>>,
 }
 
-impl LlmConversationEngine<RigBackend> {
-    pub fn with_service(service: Arc<LlmService<RigBackend>>) -> Self {
+impl LlmConversationEngine<RigBackend, MemoryStore> {
+    pub fn with_service(service: Arc<LlmService<RigBackend, MemoryStore>>) -> Self {
         Self::new(service)
     }
 }
 
-impl<B> LlmConversationEngine<B> {
-    pub fn new(service: Arc<LlmService<B>>) -> Self {
+impl<B, S> LlmConversationEngine<B, S>
+where
+    S: Store,
+{
+    pub fn new(service: Arc<LlmService<B, S>>) -> Self {
         Self { service }
     }
 }
 
 #[async_trait]
-impl<B> ConversationEngine for LlmConversationEngine<B>
+impl<B, S> ConversationEngine for LlmConversationEngine<B, S>
 where
     B: CompletionBackend,
+    S: Store,
 {
     async fn complete(
         &self,

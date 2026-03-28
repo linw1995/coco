@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use coco_core::{CoreService, FixedBranchResolver, InboundMessage, LlmConversationEngine};
 use coco_llm::{CompletionBackend, LlmService, RigBackend, SessionConfig};
-use coco_mem::SharedStore;
 use snafu::prelude::*;
 
 use crate::{
@@ -11,7 +10,7 @@ use crate::{
     cli::{Cli, Command, PromptCommand, SessionCommand, SessionCreateCommand, SessionSubcommand},
     env::{read_env, resolve_env_provider},
     error::{CoreSnafu, EmptyPromptSnafu, LlmSnafu, MissingConfigurationSnafu, ReadStdinSnafu},
-    store::{load_store, save_store},
+    store::open_store,
 };
 
 pub async fn run<R>(cli: Cli, reader: &mut R) -> Result<Option<String>>
@@ -26,8 +25,7 @@ where
     B: CompletionBackend,
     R: Read,
 {
-    let store = load_store(&cli.store_path)?;
-    let shared_store = SharedStore::from_store(store);
+    let shared_store = open_store(&cli.store_path)?;
     let llm = Arc::new(LlmService::new(shared_store.clone(), backend));
 
     match cli.command {
@@ -41,7 +39,6 @@ where
                 .handle_message(InboundMessage::cli("cli", "cli", input))
                 .await
                 .context(CoreSnafu)?;
-            save_store(&cli.store_path, &shared_store.snapshot())?;
             Ok(Some(response.text))
         }
         Command::Session(SessionCommand {
@@ -49,7 +46,6 @@ where
         }) => {
             let config = resolve_session_config(command)?;
             llm.create_session(config).await.context(LlmSnafu)?;
-            save_store(&cli.store_path, &shared_store.snapshot())?;
             Ok(None)
         }
     }

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, Kind, NewNode, NodeMetadata, PromptAnchor, Role, SessionAnchor,
-    SharedStore, Tool as MemoryTool,
+    Anchor, AnchorPayload, Kind, MemoryStore, NewNode, NodeMetadata, PromptAnchor, Role,
+    SessionAnchor, Store, Tool,
 };
 use serde_json::Value;
 use snafu::prelude::*;
@@ -56,7 +56,7 @@ pub struct SessionConfig {
     pub model: String,
     pub system_prompt: String,
     pub prompt: String,
-    pub tools: Vec<MemoryTool>,
+    pub tools: Vec<Tool>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
@@ -115,7 +115,7 @@ pub struct SessionSnapshot {
     pub provider: Provider,
     pub model: String,
     pub system_prompt: String,
-    pub tools: Vec<MemoryTool>,
+    pub tools: Vec<Tool>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
@@ -162,8 +162,11 @@ pub trait CompletionBackend: Send + Sync {
 
 type BranchLockTable = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
-pub struct LlmService<B = RigBackend> {
-    store: SharedStore,
+pub struct LlmService<B = RigBackend, S = MemoryStore>
+where
+    S: Store,
+{
+    store: S,
     backend: B,
     branch_locks: BranchLockTable,
 }
@@ -202,17 +205,18 @@ struct ResolvedContext {
 #[derive(Debug, Clone, Default)]
 pub struct RigBackend;
 
-impl LlmService<RigBackend> {
-    pub fn with_store(store: SharedStore) -> Self {
+impl LlmService<RigBackend, MemoryStore> {
+    pub fn with_store(store: MemoryStore) -> Self {
         Self::new(store, RigBackend)
     }
 }
 
-impl<B> LlmService<B>
+impl<B, S> LlmService<B, S>
 where
     B: CompletionBackend,
+    S: Store,
 {
-    pub fn new(store: SharedStore, backend: B) -> Self {
+    pub fn new(store: S, backend: B) -> Self {
         Self {
             store,
             backend,
@@ -220,7 +224,7 @@ where
         }
     }
 
-    pub fn store(&self) -> &SharedStore {
+    pub fn store(&self) -> &S {
         &self.store
     }
 
@@ -272,7 +276,7 @@ where
             })
             .context(MemorySnafu)?;
         self.store
-            .fork(config.branch.clone(), &anchor_id)
+            .fork(&config.branch, &anchor_id)
             .context(MemorySnafu)?;
 
         Ok(BranchSession {
@@ -338,9 +342,8 @@ where
     }
 
     pub fn fork(&self, branch: impl Into<String>, from_ref: &str) -> Result<String> {
-        self.store
-            .fork(branch.into(), from_ref)
-            .context(MemorySnafu)
+        let branch = branch.into();
+        self.store.fork(&branch, from_ref).context(MemorySnafu)
     }
 
     pub async fn complete(&self, request: CompletionRequest) -> Result<CompletionResult> {
@@ -671,7 +674,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
-    use coco_mem::SharedStore;
+    use coco_mem::MemoryStore;
     use tokio::sync::Barrier;
 
     type RecordedCalls = Arc<Mutex<Vec<(SessionSnapshot, ResolvedCompletionRequest)>>>;
@@ -805,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_persists_execution_metadata_on_assistant_node() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -836,7 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_resolves_session_anchor_merge_parents() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let main_session = service
@@ -870,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_turn_uses_previous_assistant_text_in_history() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[("main", &[Ok("first"), Ok("second")])]);
         let service = LlmService::new(store, backend);
         service
@@ -918,7 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_completion_persists_failure_kind_but_not_prompt_history() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[(
             "main",
             &[Err(BackendError::Failed {
@@ -981,7 +984,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_keeps_session_config_without_importing_merge_parent_history() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[
             ("main", &[Ok("main answer"), Ok("merge answer")]),
             ("draft", &[Ok("draft answer")]),
@@ -1057,7 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_advances_branch_head_to_completion_node() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[("main", &[Ok("prompted")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -1087,7 +1090,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_uses_prompt_anchor_history() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[("main", &[Ok("prompted")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -1134,7 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_can_retry_after_prompt_failure() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[(
             "main",
             &[
@@ -1191,7 +1194,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_branches_can_complete_concurrently() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_barrier(
             &[("main", "main"), ("draft", "draft")],
             Arc::new(Barrier::new(2)),
@@ -1221,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebase_session_changes_defaults_for_future_turns() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello"), Ok("updated")])]);
         let calls = backend.calls.clone();
         let service = LlmService::new(store, backend);
@@ -1282,7 +1285,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebase_session_keeps_sibling_branch_defaults_unchanged() {
-        let store = SharedStore::new();
+        let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[
             ("main", &[Ok("main"), Ok("main updated")]),
             ("draft", &[Ok("draft")]),
