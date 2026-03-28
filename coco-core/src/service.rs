@@ -1,5 +1,8 @@
 use snafu::prelude::*;
 
+use coco_llm::CompletionBackend;
+use coco_llm::coco_mem::Store;
+
 use crate::{
     BranchResolver, ConversationEngine, EngineError, Error, InboundMessage, OutboundMessage,
     error::{BranchResolveFailedSnafu, InvalidInputSnafu},
@@ -7,21 +10,30 @@ use crate::{
 
 type Result<T> = std::result::Result<T, Error>;
 
-pub struct CoreService<R, E> {
+pub struct CoreService<R, B, S>
+where
+    B: CompletionBackend,
+    S: Store,
+{
     resolver: R,
-    engine: E,
+    engine: ConversationEngine<B, S>,
 }
 
-impl<R, E> CoreService<R, E> {
-    pub fn new(resolver: R, engine: E) -> Self {
+impl<R, B, S> CoreService<R, B, S>
+where
+    B: CompletionBackend,
+    S: Store,
+{
+    pub fn new(resolver: R, engine: ConversationEngine<B, S>) -> Self {
         Self { resolver, engine }
     }
 }
 
-impl<R, E> CoreService<R, E>
+impl<R, B, S> CoreService<R, B, S>
 where
     R: BranchResolver,
-    E: ConversationEngine,
+    B: CompletionBackend,
+    S: Store,
 {
     pub async fn handle_message(&self, message: InboundMessage) -> Result<OutboundMessage> {
         let text = message.text.trim();

@@ -17,6 +17,9 @@ pub enum StoreError {
     #[snafu(display("ID {id:?} not found"))]
     NotFound { id: String },
 
+    #[snafu(display("ID {id:?} is not an anchor"))]
+    InvalidAnchor { id: String },
+
     #[snafu(display("Branch {name:?} not found"))]
     BranchNotFound { name: String },
 
@@ -25,6 +28,13 @@ pub enum StoreError {
 
     #[snafu(display("Branch {name:?} moved from {expected:?} to {actual:?}"))]
     BranchHeadMoved {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[snafu(display("Session state for branch {name:?} moved from {expected:?} to {actual:?}"))]
+    SessionStateMoved {
         name: String,
         expected: String,
         actual: String,

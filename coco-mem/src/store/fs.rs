@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -14,11 +14,12 @@ use crate::error::{
     StorePathIsNotDirectorySnafu, WriteStoreDirectorySnafu, WriteStoreLogSnafu,
     WriteStoreMetaSnafu,
 };
-use crate::{NewNode, Node, SessionAnchorPatch, StoreError, StoreResult as Result};
+use crate::{NewNode, Node, SessionAnchorPatch, SessionState, StoreError, StoreResult as Result};
 
-const STORE_FORMAT_VERSION: u64 = 1;
+const STORE_FORMAT_VERSION: u64 = 4;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
+const SESSIONS_FILE_NAME: &str = "sessions.json";
 const BRANCHES_DIR_NAME: &str = "branches";
 
 #[derive(Clone, Debug)]
@@ -32,6 +33,7 @@ pub(crate) struct Persistence {
     dir: PathBuf,
     meta_path: PathBuf,
     nodes_path: PathBuf,
+    sessions_path: PathBuf,
     branches_dir: PathBuf,
 }
 
@@ -76,6 +78,7 @@ impl Persistence {
         );
         let nodes = branch_view_nodes(head_id, state)?;
         write_jsonl_file_create_new(&branch_path, &nodes)?;
+        self.persist_sessions(state)?;
         Ok(())
     }
 
@@ -99,12 +102,15 @@ impl Persistence {
             Ok(path) => {
                 let nodes = path.into_iter().rev().skip(1).cloned().collect::<Vec<_>>();
                 if nodes.is_empty() {
+                    self.persist_sessions(state)?;
                     return Ok(());
                 }
-                append_jsonl_records(&branch_path, &nodes)
+                append_jsonl_records(&branch_path, &nodes)?;
+                self.persist_sessions(state)
             }
             Err(StoreError::RefsNotConnected { .. }) => {
-                self.rewrite_branch_view(branch, new_head, state)
+                self.rewrite_branch_view(branch, new_head, state)?;
+                self.persist_sessions(state)
             }
             Err(source) => Err(source),
         }
@@ -133,6 +139,7 @@ impl Persistence {
             dir: path.to_owned(),
             meta_path: path.join(META_FILE_NAME),
             nodes_path: path.join(NODES_FILE_NAME),
+            sessions_path: path.join(SESSIONS_FILE_NAME),
             branches_dir: path.join(BRANCHES_DIR_NAME),
         }
     }
@@ -159,6 +166,7 @@ impl Persistence {
 
         write_json_file(&self.meta_path, &meta)?;
         write_jsonl_file(&self.nodes_path, &[root])?;
+        write_json_file(&self.sessions_path, &HashMap::<String, SessionState>::new())?;
 
         Ok((self.clone(), store))
     }
@@ -261,7 +269,21 @@ impl Persistence {
             store.apply_fork(branch, head_id)?;
         }
 
+        ensure!(
+            self.sessions_path.is_file(),
+            CorruptedStoreSnafu {
+                path: self.sessions_path.clone(),
+                message: "missing sessions metadata file".to_owned(),
+            }
+        );
+        store.sessions = read_json_file::<HashMap<String, SessionState>>(&self.sessions_path)?;
+        map_session_validation_error(&self.sessions_path, store.validate_session_records())?;
+
         Ok((self.clone(), store))
+    }
+
+    pub fn persist_sessions(&self, state: &StoreState) -> Result<()> {
+        write_json_file(&self.sessions_path, &state.list_session_states())
     }
 }
 
@@ -298,10 +320,12 @@ impl Store for FsStore {
 
     fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
         let mut state = self.inner.write().expect("store lock poisoned");
-        let head_id = state.plan_fork(name, from_ref)?;
-        self.persistence.persist_fork(name, &head_id, &state)?;
-        state.apply_fork(name.to_owned(), head_id.clone())?;
-        Ok(head_id)
+        let plan = state.plan_fork(name, from_ref)?;
+        let mut temp = state.clone();
+        temp.apply_fork(name.to_owned(), plan.head_id.clone())?;
+        self.persistence.persist_fork(name, &plan.head_id, &temp)?;
+        state.apply_fork(name.to_owned(), plan.head_id.clone())?;
+        Ok(plan.head_id)
     }
 
     fn get_branch_head(&self, name: &str) -> Result<String> {
@@ -341,6 +365,34 @@ impl Store for FsStore {
         self.inner.read().expect("store lock poisoned").get_node(id)
     }
 
+    fn list_session_states(&self) -> Result<HashMap<String, SessionState>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_session_states())
+    }
+
+    fn get_session_state(&self, name: &str) -> Result<SessionState> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_session_state(name)
+    }
+
+    fn set_session_state(
+        &self,
+        name: &str,
+        expected: Option<&SessionState>,
+        next: SessionState,
+    ) -> Result<SessionState> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.set_session_state(name, expected, next)?;
+        self.persistence.persist_sessions(&temp)?;
+        state.set_session_state(name, expected, updated)
+    }
+
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
         let mut state = self.inner.write().expect("store lock poisoned");
         let plan = state.plan_rebase_session(name, patch)?;
@@ -359,6 +411,7 @@ impl Store for FsStore {
         }
         self.persistence
             .rewrite_branch_view(&plan.branch, &plan.new_head, &persisted_state)?;
+        self.persistence.persist_sessions(&persisted_state)?;
 
         for node in plan.nodes {
             state.insert_existing_node(node)?;
@@ -431,6 +484,16 @@ fn validate_branch_view(
     }
 
     Ok(nodes.last().expect("nodes should not be empty").id.clone())
+}
+
+fn map_session_validation_error<T>(path: &Path, result: Result<T>) -> Result<T> {
+    result.map_err(|source| match source {
+        StoreError::CorruptedStore { .. } => source,
+        _ => StoreError::CorruptedStore {
+            path: path.to_owned(),
+            message: source.to_string(),
+        },
+    })
 }
 
 fn encode_branch_name(branch: &str) -> String {

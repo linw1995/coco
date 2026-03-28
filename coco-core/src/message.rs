@@ -23,7 +23,7 @@ impl fmt::Display for ChannelKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InboundMessage {
     pub channel_kind: ChannelKind,
     pub conversation_id: String,
@@ -71,7 +71,7 @@ impl InboundMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutboundMessage {
     pub text: String,
 }

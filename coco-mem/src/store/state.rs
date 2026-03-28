@@ -7,10 +7,12 @@ use snafu::prelude::*;
 use crate::StoreResult as Result;
 use crate::error::{
     BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu, DuplicateMergeParentSnafu,
-    MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu,
-    RefsNotConnectedSnafu,
+    InvalidAnchorSnafu, MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, NotFoundSnafu,
+    ParentNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
 };
-use crate::{Anchor, AnchorPayload, Kind, NewNode, Node, Role, SessionAnchorPatch};
+use crate::{
+    Anchor, AnchorPayload, Kind, NewNode, Node, PauseReason, Role, SessionAnchorPatch, SessionState,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StoreState {
@@ -18,6 +20,7 @@ pub(crate) struct StoreState {
     pub children: HashMap<String, HashSet<String>>,
     pub root: String,
     pub branches: HashMap<String, String>,
+    pub sessions: HashMap<String, SessionState>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +29,11 @@ pub(crate) struct RebasePlan {
     pub expected_old_head: String,
     pub new_head: String,
     pub nodes: Vec<Node>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ForkPlan {
+    pub head_id: String,
 }
 
 impl Default for StoreState {
@@ -55,6 +63,7 @@ impl StoreState {
             children: HashMap::new(),
             root: root_id,
             branches: HashMap::new(),
+            sessions: HashMap::new(),
         }
     }
 
@@ -68,6 +77,7 @@ impl StoreState {
             children: HashMap::new(),
             root: root_id,
             branches: HashMap::new(),
+            sessions: HashMap::new(),
         }
     }
 
@@ -98,14 +108,16 @@ impl StoreState {
         self.insert_existing_node_unchecked(node)
     }
 
-    pub fn plan_fork(&self, name: &str, from_ref: &str) -> Result<String> {
+    pub fn plan_fork(&self, name: &str, from_ref: &str) -> Result<ForkPlan> {
         ensure!(
             !self.branches.contains_key(name),
             BranchExistsSnafu {
                 name: name.to_owned(),
             }
         );
-        self.resolve_ref_id(from_ref).map(str::to_owned)
+        Ok(ForkPlan {
+            head_id: self.resolve_ref_id(from_ref)?.to_owned(),
+        })
     }
 
     pub fn apply_fork(&mut self, name: String, head_id: String) -> Result<()> {
@@ -119,7 +131,8 @@ impl StoreState {
                 id: head_id.clone(),
             }
         );
-        self.branches.insert(name, head_id);
+        self.branches.insert(name.clone(), head_id);
+        self.sessions.insert(name, SessionState::Active);
         Ok(())
     }
 
@@ -208,6 +221,46 @@ impl StoreState {
             .get(id)
             .cloned()
             .context(NotFoundSnafu { id: id.to_owned() })
+    }
+
+    pub fn list_session_states(&self) -> HashMap<String, SessionState> {
+        self.sessions.clone()
+    }
+
+    pub fn get_session_state(&self, name: &str) -> Result<SessionState> {
+        self.sessions
+            .get(name)
+            .cloned()
+            .context(BranchNotFoundSnafu {
+                name: name.to_owned(),
+            })
+    }
+
+    pub fn set_session_state(
+        &mut self,
+        name: &str,
+        expected: Option<&SessionState>,
+        next: SessionState,
+    ) -> Result<SessionState> {
+        let state = self.sessions.get(name).context(BranchNotFoundSnafu {
+            name: name.to_owned(),
+        })?;
+        if let Some(expected) = expected {
+            ensure!(
+                state == expected,
+                SessionStateMovedSnafu {
+                    name: name.to_owned(),
+                    expected: format!("{expected:?}"),
+                    actual: format!("{state:?}"),
+                }
+            );
+        }
+        self.validate_session_state(&next)?;
+        let state = self.sessions.get_mut(name).context(BranchNotFoundSnafu {
+            name: name.to_owned(),
+        })?;
+        *state = next;
+        Ok(state.clone())
     }
 
     pub fn plan_rebase_session(
@@ -323,6 +376,24 @@ impl StoreState {
         Ok(())
     }
 
+    pub fn validate_session_records(&self) -> Result<()> {
+        for (branch, state) in &self.sessions {
+            self.get_branch_head(branch)?;
+            self.validate_session_state(state)?;
+        }
+
+        for branch in self.branches.keys() {
+            ensure!(
+                self.sessions.contains_key(branch),
+                BranchNotFoundSnafu {
+                    name: branch.clone(),
+                }
+            );
+        }
+
+        Ok(())
+    }
+
     fn insert_existing_node_unchecked(&mut self, node: Node) -> Result<String> {
         let id = node.id.clone();
 
@@ -393,6 +464,62 @@ impl StoreState {
         }
 
         Ok(())
+    }
+
+    fn validate_session_state(&self, state: &SessionState) -> Result<()> {
+        match state {
+            SessionState::Active => Ok(()),
+            SessionState::Attached {
+                target_branch,
+                base_head_id,
+            } => self.validate_ref_on_branch(target_branch, base_head_id),
+            SessionState::Paused {
+                target_branch,
+                reason,
+            } => match reason {
+                PauseReason::Merged { merged_anchor_id } => {
+                    self.validate_anchor_on_branch(target_branch, merged_anchor_id)
+                }
+                PauseReason::Closed => {
+                    if target_branch.is_empty() {
+                        return Ok(());
+                    }
+                    self.get_branch_head(target_branch).map(|_| ())
+                }
+            },
+        }
+    }
+
+    fn validate_ref_on_branch(&self, branch: &str, node_id: &str) -> Result<()> {
+        self.get_branch_head(branch)?;
+        self.nodes.get(node_id).context(NotFoundSnafu {
+            id: node_id.to_owned(),
+        })?;
+        let visible = self
+            .ancestry(branch)?
+            .into_iter()
+            .any(|node| node.id == node_id);
+        ensure!(
+            visible,
+            RefsNotConnectedSnafu {
+                base_ref: node_id.to_owned(),
+                head_ref: branch.to_owned(),
+            }
+        );
+        Ok(())
+    }
+
+    fn validate_anchor_on_branch(&self, branch: &str, node_id: &str) -> Result<()> {
+        let node = self.nodes.get(node_id).context(NotFoundSnafu {
+            id: node_id.to_owned(),
+        })?;
+        ensure!(
+            matches!(node.kind, Kind::Anchor(_)),
+            InvalidAnchorSnafu {
+                id: node_id.to_owned()
+            }
+        );
+        self.validate_ref_on_branch(branch, node_id)
     }
 }
 

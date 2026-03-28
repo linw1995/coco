@@ -6,8 +6,8 @@ use super::memory::MemoryStore;
 use super::state::StoreState;
 use crate::Store as StoreTrait;
 use crate::{
-    Anchor, Kind, NewNode, Node, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch,
-    StoreError as Error,
+    Anchor, Kind, NewNode, Node, PauseReason, PromptAnchor, Role, SessionAnchor,
+    SessionAnchorPatch, SessionState, StoreError as Error,
 };
 use serde_json::json;
 
@@ -425,11 +425,374 @@ where
 {
     let store = F::create();
     let root_id = store.root_id();
+    store.fork("base", &root_id).unwrap();
     store.fork("main", &root_id).unwrap();
 
     let err = store.fork("main", &root_id).unwrap_err();
 
     assert!(matches!(err, Error::BranchExists { name } if name == "main"));
+}
+
+fn assert_fork_initializes_session_state<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let state = store.get_session_state("main").unwrap();
+
+    assert_eq!(state, SessionState::Active);
+}
+
+fn assert_set_branch_head_keeps_session_state_untouched<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
+    let next_id = store.append(make_text_node(&child_id, "next")).unwrap();
+    store.fork("main", &child_id).unwrap();
+
+    store.set_branch_head("main", &child_id, &next_id).unwrap();
+    let state = store.get_session_state("main").unwrap();
+
+    assert_eq!(store.get_branch_head("main").unwrap(), next_id);
+    assert_eq!(state, SessionState::Active);
+}
+
+fn assert_set_session_state_updates_value<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("base", &root_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+
+    let state = store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Attached {
+                target_branch: "base".to_owned(),
+                base_head_id: root_id.clone(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        state,
+        SessionState::Attached {
+            target_branch: "base".to_owned(),
+            base_head_id: root_id,
+        }
+    );
+}
+
+fn assert_set_session_state_requires_matching_expected<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("base", &root_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+    store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Closed,
+            },
+        )
+        .unwrap();
+
+    let err = store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Attached {
+                target_branch: "base".to_owned(),
+                base_head_id: root_id,
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::SessionStateMoved {
+            name,
+            expected,
+            actual,
+        } if name == "main" && expected == "Active" && actual.contains("Paused")
+    ));
+}
+
+fn assert_set_branch_head_preserves_attached_state<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("base", &base_anchor_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+
+    store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Attached {
+                target_branch: "base".to_owned(),
+                base_head_id: base_anchor_id,
+            },
+        )
+        .unwrap();
+
+    let feedback_id = store.append(make_text_node(&root_id, "feedback")).unwrap();
+    store
+        .set_branch_head("main", &root_id, &feedback_id)
+        .unwrap();
+
+    let state = store.get_session_state("main").unwrap();
+    assert_eq!(store.get_branch_head("main").unwrap(), feedback_id);
+    assert_eq!(
+        state,
+        SessionState::Attached {
+            target_branch: "base".to_owned(),
+            base_head_id: store.get_branch_head("base").unwrap(),
+        }
+    );
+}
+
+fn assert_set_session_state_accepts_merged_anchor_on_target_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("base", &base_anchor_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+
+    let state = store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Merged {
+                    merged_anchor_id: base_anchor_id.clone(),
+                },
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        state,
+        SessionState::Paused {
+            target_branch: "base".to_owned(),
+            reason: PauseReason::Merged {
+                merged_anchor_id: base_anchor_id,
+            },
+        }
+    );
+}
+
+fn assert_set_session_state_rejects_merged_anchor_outside_target_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let other_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("base", &base_anchor_id).unwrap();
+    store.fork("other", &other_anchor_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+
+    let err = store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Merged {
+                    merged_anchor_id: other_anchor_id.clone(),
+                },
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::RefsNotConnected { base_ref, head_ref }
+            if base_ref == other_anchor_id && head_ref == "base"
+    ));
+}
+
+fn assert_set_session_state_rejects_non_anchor_merged_node<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let base_text_id = store.append(make_text_node(&root_id, "base text")).unwrap();
+    store.fork("base", &base_text_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+
+    let err = store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Merged {
+                    merged_anchor_id: base_text_id.clone(),
+                },
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, Error::InvalidAnchor { id } if id == base_text_id));
+}
+
+fn assert_paused_merged_state_can_resume_as_attached<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("base", &base_anchor_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+
+    store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Merged {
+                    merged_anchor_id: base_anchor_id.clone(),
+                },
+            },
+        )
+        .unwrap();
+
+    let next_base_anchor_id = store
+        .append(make_prompt_anchor_node(&base_anchor_id, &[]))
+        .unwrap();
+    store
+        .set_branch_head("base", &base_anchor_id, &next_base_anchor_id)
+        .unwrap();
+    let state = store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Merged {
+                    merged_anchor_id: base_anchor_id,
+                },
+            }),
+            SessionState::Attached {
+                target_branch: "base".to_owned(),
+                base_head_id: next_base_anchor_id.clone(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        state,
+        SessionState::Attached {
+            target_branch: "base".to_owned(),
+            base_head_id: next_base_anchor_id,
+        }
+    );
+}
+
+fn assert_paused_closed_state_can_resume_as_attached<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("base", &base_anchor_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+
+    store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Closed,
+            },
+        )
+        .unwrap();
+
+    let next_base_anchor_id = store
+        .append(make_prompt_anchor_node(&base_anchor_id, &[]))
+        .unwrap();
+    store
+        .set_branch_head("base", &base_anchor_id, &next_base_anchor_id)
+        .unwrap();
+    let state = store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Closed,
+            }),
+            SessionState::Attached {
+                target_branch: "base".to_owned(),
+                base_head_id: next_base_anchor_id.clone(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        state,
+        SessionState::Attached {
+            target_branch: "base".to_owned(),
+            base_head_id: next_base_anchor_id,
+        }
+    );
+}
+
+fn assert_list_session_states_returns_branch_state_map<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("base", &root_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+    store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Attached {
+                target_branch: "base".to_owned(),
+                base_head_id: root_id.clone(),
+            },
+        )
+        .unwrap();
+
+    let states = store.list_session_states().unwrap();
+
+    assert_eq!(states.get("base"), Some(&SessionState::Active));
+    assert_eq!(
+        states.get("main"),
+        Some(&SessionState::Attached {
+            target_branch: "base".to_owned(),
+            base_head_id: root_id,
+        })
+    );
 }
 
 fn assert_set_branch_head_requires_matching_expected_head<F>()
@@ -773,8 +1136,63 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
+            fn fork_initializes_session_state() {
+                assert_fork_initializes_session_state::<$factory>();
+            }
+
+            #[test]
             fn set_branch_head_requires_matching_expected_head() {
                 assert_set_branch_head_requires_matching_expected_head::<$factory>();
+            }
+
+            #[test]
+            fn set_branch_head_keeps_session_state_untouched() {
+                assert_set_branch_head_keeps_session_state_untouched::<$factory>();
+            }
+
+            #[test]
+            fn set_session_state_updates_value() {
+                assert_set_session_state_updates_value::<$factory>();
+            }
+
+            #[test]
+            fn set_session_state_requires_matching_expected() {
+                assert_set_session_state_requires_matching_expected::<$factory>();
+            }
+
+            #[test]
+            fn set_branch_head_preserves_attached_state() {
+                assert_set_branch_head_preserves_attached_state::<$factory>();
+            }
+
+            #[test]
+            fn set_session_state_accepts_merged_anchor_on_target_branch() {
+                assert_set_session_state_accepts_merged_anchor_on_target_branch::<$factory>();
+            }
+
+            #[test]
+            fn set_session_state_rejects_merged_anchor_outside_target_branch() {
+                assert_set_session_state_rejects_merged_anchor_outside_target_branch::<$factory>();
+            }
+
+            #[test]
+            fn set_session_state_rejects_non_anchor_merged_node() {
+                assert_set_session_state_rejects_non_anchor_merged_node::<$factory>();
+            }
+
+            #[test]
+            fn paused_merged_state_can_resume_as_attached() {
+                assert_paused_merged_state_can_resume_as_attached::<$factory>();
+            }
+
+            #[test]
+            fn paused_closed_state_can_resume_as_attached() {
+                assert_paused_closed_state_can_resume_as_attached::<$factory>();
+            }
+
+            #[test]
+            fn list_session_states_returns_branch_state_map() {
+                assert_list_session_states_returns_branch_state_map::<$factory>();
             }
 
             #[test]
@@ -875,6 +1293,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     assert!(path.join("meta.json").is_file());
     assert!(path.join("nodes.jsonl").is_file());
+    assert!(path.join("sessions.json").is_file());
     assert!(path.join("branches").is_dir());
 
     let nodes = fs::read_to_string(path.join("nodes.jsonl")).unwrap();
@@ -896,11 +1315,102 @@ fn open_replays_nodes_and_branch_updates_from_jsonl_logs() {
     let reopened = FsStore::open(&path).unwrap();
 
     assert_eq!(reopened.get_branch_head("main").unwrap(), next_id);
+    assert_eq!(
+        reopened.get_session_state("main").unwrap(),
+        SessionState::Active
+    );
     let ancestry = reopened.ancestry("main").unwrap();
     assert_eq!(ancestry[0].id, next_id);
     assert_eq!(ancestry[1].id, child_id);
     assert_eq!(ancestry[2].id, session_id);
     assert_eq!(ancestry[3].id, root_id);
+}
+
+#[test]
+fn open_rejects_missing_session_metadata_file() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    fs::remove_file(path.join("sessions.json")).unwrap();
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_replays_paused_merged_state_with_base_handoff_anchor() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("base", &base_anchor_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+    let merged_anchor_id = store
+        .append(make_prompt_anchor_node(&base_anchor_id, &[]))
+        .unwrap();
+    store
+        .set_branch_head("base", &base_anchor_id, &merged_anchor_id)
+        .unwrap();
+    store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Merged {
+                    merged_anchor_id: merged_anchor_id.clone(),
+                },
+            },
+        )
+        .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+    let state = reopened.get_session_state("main").unwrap();
+
+    assert_eq!(
+        state,
+        SessionState::Paused {
+            target_branch: "base".to_owned(),
+            reason: PauseReason::Merged {
+                merged_anchor_id: merged_anchor_id.clone(),
+            },
+        }
+    );
+    let ancestry = reopened.ancestry("base").unwrap();
+    assert!(ancestry.iter().any(|node| node.id == merged_anchor_id));
+}
+
+#[test]
+fn open_replays_paused_closed_state() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("base", &base_anchor_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+    store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Closed,
+            },
+        )
+        .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+    let state = reopened.get_session_state("main").unwrap();
+
+    assert_eq!(
+        state,
+        SessionState::Paused {
+            target_branch: "base".to_owned(),
+            reason: PauseReason::Closed,
+        }
+    );
 }
 
 #[test]
@@ -954,6 +1464,50 @@ fn open_rejects_corrupted_jsonl_logs() {
     let err = FsStore::open(&path).unwrap_err();
 
     assert!(matches!(err, Error::ParseStoreLog { line: 1, .. }));
+}
+
+#[test]
+fn open_rejects_paused_merged_state_with_anchor_outside_target_branch() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let other_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("base", &base_anchor_id).unwrap();
+    store.fork("other", &other_anchor_id).unwrap();
+    store.fork("main", &root_id).unwrap();
+    store
+        .set_session_state(
+            "main",
+            Some(&SessionState::Active),
+            SessionState::Paused {
+                target_branch: "base".to_owned(),
+                reason: PauseReason::Merged {
+                    merged_anchor_id: base_anchor_id.clone(),
+                },
+            },
+        )
+        .unwrap();
+
+    let sessions_path = path.join("sessions.json");
+    let mut sessions: std::collections::HashMap<String, SessionState> =
+        serde_json::from_str(&fs::read_to_string(&sessions_path).unwrap()).unwrap();
+    let state = sessions.get_mut("main").unwrap();
+    *state = SessionState::Paused {
+        target_branch: "base".to_owned(),
+        reason: PauseReason::Merged {
+            merged_anchor_id: other_anchor_id,
+        },
+    };
+    fs::write(
+        &sessions_path,
+        serde_json::to_vec_pretty(&sessions).unwrap(),
+    )
+    .unwrap();
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
 }
 
 #[test]

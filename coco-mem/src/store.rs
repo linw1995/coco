@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 pub(crate) mod fs;
 pub mod memory;
 pub(crate) mod state;
@@ -5,7 +7,7 @@ pub(crate) mod state;
 #[cfg(test)]
 mod tests;
 
-use crate::{NewNode, Node, SessionAnchorPatch, StoreResult};
+use crate::{NewNode, Node, SessionAnchorPatch, SessionState, StoreResult};
 
 /// Thread-safe node graph storage used by CoCo services.
 pub trait Store: Clone + Send + Sync + 'static {
@@ -37,6 +39,20 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Returns a single node by identifier.
     fn get_node(&self, id: &str) -> StoreResult<Node>;
+
+    /// Returns all persisted branch workflow states keyed by branch.
+    fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>>;
+
+    /// Returns the workflow state for a branch.
+    fn get_session_state(&self, name: &str) -> StoreResult<SessionState>;
+
+    /// Updates the persisted session workflow state.
+    fn set_session_state(
+        &self,
+        name: &str,
+        expected: Option<&SessionState>,
+        next: SessionState,
+    ) -> StoreResult<SessionState>;
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;

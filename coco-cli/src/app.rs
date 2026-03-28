@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::sync::Arc;
 
-use coco_core::{CoreService, FixedBranchResolver, InboundMessage, LlmConversationEngine};
+use coco_core::{ConversationEngine, CoreService, FixedBranchResolver, InboundMessage};
 use coco_llm::{CompletionBackend, LlmService, RigBackend, SessionConfig};
 use snafu::prelude::*;
 
@@ -33,7 +33,7 @@ where
             let input = resolve_prompt_input(&command, reader)?;
             let service = CoreService::new(
                 FixedBranchResolver::new(command.branch),
-                LlmConversationEngine::new(llm),
+                ConversationEngine::new(llm),
             );
             let response = service
                 .handle_message(InboundMessage::cli("cli", "cli", input))

@@ -35,6 +35,18 @@ impl From<coco_llm::Error> for EngineError {
     }
 }
 
+impl From<StoreError> for EngineError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::BranchNotFound { name } => Self::SessionMissing { branch: name },
+            StoreError::MissingSessionAnchor { branch } => Self::SessionMissing { branch },
+            other => Self::EngineFailed {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Snafu, Clone, PartialEq, Eq)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {

@@ -4,7 +4,7 @@ mod message;
 mod resolver;
 mod service;
 
-pub use engine::{ConversationEngine, LlmConversationEngine};
+pub use engine::ConversationEngine;
 pub use error::{BranchResolveError, EngineError, Error};
 pub use message::{ChannelKind, InboundMessage, OutboundMessage};
 pub use resolver::{BranchResolver, FixedBranchResolver};

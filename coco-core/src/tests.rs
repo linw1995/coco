@@ -10,7 +10,7 @@ use coco_llm::{
 
 use crate::{
     BranchResolveError, BranchResolver, ChannelKind, ConversationEngine, CoreService, EngineError,
-    Error, FixedBranchResolver, InboundMessage, LlmConversationEngine,
+    Error, FixedBranchResolver, InboundMessage,
 };
 
 type FakeResponseQueue =
@@ -26,36 +26,6 @@ impl BranchResolver for FailingResolver {
     ) -> std::result::Result<String, BranchResolveError> {
         Err(BranchResolveError::ResolveFailed {
             message: "resolver failed".to_owned(),
-        })
-    }
-}
-
-#[derive(Debug)]
-struct EchoEngine;
-
-#[async_trait]
-impl ConversationEngine for EchoEngine {
-    async fn complete(
-        &self,
-        branch: &str,
-        prompt: &str,
-    ) -> std::result::Result<String, EngineError> {
-        Ok(format!("{branch}:{prompt}"))
-    }
-}
-
-#[derive(Debug)]
-struct MissingSessionEngine;
-
-#[async_trait]
-impl ConversationEngine for MissingSessionEngine {
-    async fn complete(
-        &self,
-        branch: &str,
-        _prompt: &str,
-    ) -> std::result::Result<String, EngineError> {
-        Err(EngineError::SessionMissing {
-            branch: branch.to_owned(),
         })
     }
 }
@@ -124,19 +94,32 @@ fn session_config(branch: &str) -> SessionConfig {
 
 #[tokio::test]
 async fn core_service_routes_message_to_engine() {
-    let service = CoreService::new(FixedBranchResolver::new("main"), EchoEngine);
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[("main", &[Ok("hello from llm")])]);
+    let llm = Arc::new(LlmService::new(store, backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let service = CoreService::new(
+        FixedBranchResolver::new("main"),
+        ConversationEngine::new(llm),
+    );
 
     let response = service
         .handle_message(InboundMessage::cli("conversation", "user", "hello"))
         .await
         .unwrap();
 
-    assert_eq!(response.text, "main:hello");
+    assert_eq!(response.text, "hello from llm");
 }
 
 #[tokio::test]
 async fn core_service_returns_missing_session() {
-    let service = CoreService::new(FixedBranchResolver::new("main"), MissingSessionEngine);
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[]);
+    let llm = Arc::new(LlmService::new(store, backend));
+    let service = CoreService::new(
+        FixedBranchResolver::new("main"),
+        ConversationEngine::new(llm),
+    );
 
     let error = service
         .handle_message(InboundMessage::cli("conversation", "user", "hello"))
@@ -148,7 +131,10 @@ async fn core_service_returns_missing_session() {
 
 #[tokio::test]
 async fn core_service_returns_branch_resolution_error_context() {
-    let service = CoreService::new(FailingResolver, EchoEngine);
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[]);
+    let llm = Arc::new(LlmService::new(store, backend));
+    let service = CoreService::new(FailingResolver, ConversationEngine::new(llm));
 
     let error = service
         .handle_message(InboundMessage::telegram("chat-1", "user-1", "hello"))
@@ -171,7 +157,7 @@ async fn llm_engine_calls_prompt_and_returns_text() {
     let backend = FakeBackend::with_responses(&[("main", &[Ok("hello from llm")])]);
     let llm = Arc::new(LlmService::new(store, backend));
     llm.create_session(session_config("main")).await.unwrap();
-    let engine = LlmConversationEngine::new(llm);
+    let engine = ConversationEngine::new(llm);
 
     let response = engine.complete("main", "hello").await.unwrap();
 
@@ -183,7 +169,7 @@ async fn llm_engine_maps_missing_session_error() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
-    let engine = LlmConversationEngine::new(llm);
+    let engine = ConversationEngine::new(llm);
 
     let error = engine.complete("main", "hello").await.unwrap_err();
 
@@ -192,7 +178,13 @@ async fn llm_engine_maps_missing_session_error() {
 
 #[tokio::test]
 async fn core_service_rejects_empty_message_text() {
-    let service = CoreService::new(FixedBranchResolver::new("main"), EchoEngine);
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[]);
+    let llm = Arc::new(LlmService::new(store, backend));
+    let service = CoreService::new(
+        FixedBranchResolver::new("main"),
+        ConversationEngine::new(llm),
+    );
 
     let error = service
         .handle_message(InboundMessage::discord("channel", "user", "   "))

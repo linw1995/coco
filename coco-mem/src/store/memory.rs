@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use super::Store;
 use super::state::StoreState;
 use crate::StoreResult as Result;
-use crate::{NewNode, Node, SessionAnchorPatch};
+use crate::{NewNode, Node, SessionAnchorPatch, SessionState};
 
 #[derive(Clone, Debug)]
 pub struct MemoryStore {
@@ -46,9 +47,9 @@ impl Store for MemoryStore {
 
     fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
         let mut state = self.inner.write().expect("store lock poisoned");
-        let head_id = state.plan_fork(name, from_ref)?;
-        state.apply_fork(name.to_owned(), head_id.clone())?;
-        Ok(head_id)
+        let plan = state.plan_fork(name, from_ref)?;
+        state.apply_fork(name.to_owned(), plan.head_id.clone())?;
+        Ok(plan.head_id)
     }
 
     fn get_branch_head(&self, name: &str) -> Result<String> {
@@ -84,6 +85,33 @@ impl Store for MemoryStore {
 
     fn get_node(&self, id: &str) -> Result<Node> {
         self.inner.read().expect("store lock poisoned").get_node(id)
+    }
+
+    fn list_session_states(&self) -> Result<HashMap<String, SessionState>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_session_states())
+    }
+
+    fn get_session_state(&self, name: &str) -> Result<SessionState> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_session_state(name)
+    }
+
+    fn set_session_state(
+        &self,
+        name: &str,
+        expected: Option<&SessionState>,
+        next: SessionState,
+    ) -> Result<SessionState> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .set_session_state(name, expected, next)
     }
 
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {

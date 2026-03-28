@@ -62,6 +62,25 @@ pub struct SessionAnchor {
     pub additional_params: Option<Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PauseReason {
+    Merged { merged_anchor_id: String },
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionState {
+    Active,
+    Attached {
+        target_branch: String,
+        base_head_id: String,
+    },
+    Paused {
+        target_branch: String,
+        reason: PauseReason,
+    },
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchorPatch {
     pub provider: Option<String>,
@@ -242,8 +261,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchor, Kind, NewNode, Node, NodeMetadata, PromptAnchor, Role, SessionAnchor,
-        SessionAnchorPatch, Tool, ToolResult,
+        Anchor, Kind, NewNode, Node, NodeMetadata, PauseReason, PromptAnchor, Role, SessionAnchor,
+        SessionAnchorPatch, SessionState, Tool, ToolResult,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -569,5 +588,20 @@ mod tests {
             updated.additional_params,
             Some(json!({"service_tier": "priority"}))
         );
+    }
+
+    #[test]
+    fn session_state_round_trip_preserves_paused_reason() {
+        let state = SessionState::Paused {
+            target_branch: "base".to_owned(),
+            reason: PauseReason::Merged {
+                merged_anchor_id: "anchor-1".to_owned(),
+            },
+        };
+
+        let encoded = serde_json::to_string(&state).unwrap();
+        let decoded: SessionState = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded, state);
     }
 }
