@@ -6,14 +6,14 @@ use coco_llm::{
     CompletionBackend, LlmService, RigBackend, SessionConfig, SessionConfigPatch, SessionFeedback,
     SessionMerge,
 };
-use coco_mem::{AnchorPayload, FsStore, PauseReason, SessionAnchor, SessionState, Store};
+use coco_mem::{AnchorPayload, FsStore, PauseReason, SessionAnchor, SessionState, Store, Tool};
 use serde::Serialize;
 use snafu::prelude::*;
 
 use crate::{
     Result,
     cli::{Cli, Command, PromptCommand, SessionCommand, SessionCreateCommand, SessionSubcommand},
-    env::{read_env, resolve_env_provider},
+    env::{read_env, resolve_env_provider, resolve_env_tools},
     error::{
         CoreSnafu, EmptyPromptSnafu, LlmSnafu, MissingConfigurationSnafu, ReadStdinSnafu,
         StoreSnafu,
@@ -56,6 +56,14 @@ where
 pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionConfig> {
     let provider = resolve_env_provider()?;
     let model = read_env("COCO_MODEL").context(MissingConfigurationSnafu { name: "COCO_MODEL" })?;
+    let tools = if command.tools.is_empty() {
+        resolve_env_tools()?
+            .into_iter()
+            .map(crate::cli::CliTool::to_tool)
+            .collect()
+    } else {
+        resolve_cli_tools(&command.tools)
+    };
 
     Ok(SessionConfig {
         branch: command.branch,
@@ -64,7 +72,7 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
         model,
         system_prompt: command.system_prompt,
         prompt: command.prompt,
-        tools: vec![],
+        tools,
         temperature: command.temperature,
         max_tokens: command.max_tokens,
         additional_params: None,
@@ -343,7 +351,13 @@ fn resolve_session_patch(command: crate::cli::SessionRebaseCommand) -> SessionCo
             .provider
             .map(|provider| coco_llm::Provider::from(provider).as_str().to_owned()),
         model: command.model,
-        tools: None,
+        tools: if command.clear_tools {
+            Some(vec![])
+        } else if command.tools.is_empty() {
+            None
+        } else {
+            Some(resolve_cli_tools(&command.tools))
+        },
         system_prompt: command.system_prompt,
         prompt: command.prompt,
         temperature: if command.clear_temperature {
@@ -358,6 +372,14 @@ fn resolve_session_patch(command: crate::cli::SessionRebaseCommand) -> SessionCo
         },
         additional_params: None,
     }
+}
+
+fn resolve_cli_tools(tools: &[crate::cli::CliTool]) -> Vec<Tool> {
+    tools
+        .iter()
+        .copied()
+        .map(crate::cli::CliTool::to_tool)
+        .collect()
 }
 
 fn render_json<T>(value: T) -> String

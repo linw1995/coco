@@ -16,6 +16,12 @@ pub enum Error {
         value: String,
     },
 
+    #[snafu(display("Invalid tool value {value:?} from {source_name:?}"))]
+    InvalidToolConfiguration {
+        source_name: &'static str,
+        value: String,
+    },
+
     #[snafu(display("Failed to read stdin: {source}"))]
     ReadStdin { source: io::Error },
 

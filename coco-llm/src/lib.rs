@@ -1,3 +1,5 @@
+mod bash_tool;
+
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -5,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use coco_mem::{
     Anchor, AnchorPayload, Kind, MemoryStore, NewNode, NodeMetadata, PauseReason, PromptAnchor,
-    Role, SessionAnchor, SessionState, Store, StoreError, Tool,
+    Role, SessionAnchor, SessionState, Store, StoreError, Tool, ToolResult, ToolUse,
 };
 use serde_json::Value;
 use snafu::IntoError;
@@ -132,11 +134,21 @@ pub struct ConversationMessage {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConversationEntry {
+    Message(ConversationMessage),
+    ToolUse(ToolUse),
+    ToolResult(ToolResult),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TrackedConversationEntry {
+    execution_id: Option<String>,
+    entry: ConversationEntry,
+}
+
 #[derive(Debug, Clone)]
-pub struct SessionSnapshot {
-    pub branch: String,
-    pub anchor_id: String,
-    pub session_anchor_id: String,
+pub struct SessionModelConfig {
     pub provider: Provider,
     pub model: String,
     pub system_prompt: String,
@@ -144,7 +156,15 @@ pub struct SessionSnapshot {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
-    pub history: Vec<ConversationMessage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedSession {
+    pub branch: String,
+    pub anchor_id: String,
+    pub config: SessionModelConfig,
+    pub conversation: Vec<ConversationEntry>,
+    pub provider_history: Vec<rig::completion::message::Message>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,15 +177,84 @@ pub struct ResolvedCompletionRequest {
     pub additional_params: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendCompletion {
-    pub text: String,
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackendEvent {
+    AssistantText(String),
+    ToolUse(ToolUse),
+    ToolResult(ToolResult),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendStep {
+    pub execution_id: String,
+    pub events: Vec<BackendEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendRun {
+    pub steps: Vec<BackendStep>,
+    pub outcome: BackendOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackendOutcome {
+    Succeeded { text: String },
+    Failed { message: String },
+}
+
+impl BackendRun {
+    pub fn succeeded_with_steps(text: impl Into<String>, steps: Vec<BackendStep>) -> Self {
+        Self {
+            steps,
+            outcome: BackendOutcome::Succeeded { text: text.into() },
+        }
+    }
+
+    pub fn succeeded(text: impl Into<String>, events: Vec<BackendEvent>) -> Self {
+        Self::succeeded_with_steps(
+            text,
+            vec![BackendStep {
+                execution_id: format!("execution-{}", nanoid::nanoid!()),
+                events,
+            }],
+        )
+    }
+
+    pub fn failed_with_steps(message: impl Into<String>, steps: Vec<BackendStep>) -> Self {
+        Self {
+            steps,
+            outcome: BackendOutcome::Failed {
+                message: message.into(),
+            },
+        }
+    }
+
+    pub fn failed(message: impl Into<String>, events: Vec<BackendEvent>) -> Self {
+        Self::failed_with_steps(
+            message,
+            vec![BackendStep {
+                execution_id: format!("execution-{}", nanoid::nanoid!()),
+                events,
+            }],
+        )
+    }
 }
 
 #[derive(Debug, Snafu, Clone, PartialEq, Eq)]
 pub enum BackendError {
     #[snafu(display("{message}"))]
     Failed { message: String },
+
+    #[snafu(display("{message}"))]
+    BashTool { message: String },
+}
+
+impl BackendError {
+    fn failed(message: impl Into<String>) -> Self {
+        Self::Failed {
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,9 +269,9 @@ pub struct BackendFailureContext {
 pub trait CompletionBackend: Send + Sync {
     async fn complete(
         &self,
-        session: SessionSnapshot,
+        session: ResolvedSession,
         request: ResolvedCompletionRequest,
-    ) -> std::result::Result<BackendCompletion, BackendError>;
+    ) -> std::result::Result<BackendRun, BackendError>;
 }
 
 type BranchLockTable = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
@@ -245,9 +334,8 @@ type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone)]
 struct ResolvedContext {
     active_anchor_id: String,
-    session_anchor_id: String,
     session_anchor: SessionAnchor,
-    tail_history: Vec<ConversationMessage>,
+    tail_entries: Vec<TrackedConversationEntry>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -540,47 +628,66 @@ where
             .context(MemorySnafu)?;
         let session = self.resolve_session(&request.branch)?;
         let resolved = self.resolve_request(&session, request.clone());
-        let execution_id = format!("execution-{}", nanoid::nanoid!());
-        let metadata = NodeMetadata::execution(execution_id.clone());
 
         match self
             .backend
             .complete(session.clone(), resolved.clone())
             .await
         {
-            Ok(completion) => {
-                let response_text = completion.text;
-                let response_node_id = self
-                    .store
-                    .append(NewNode {
-                        parent: original_head.clone(),
-                        role: Role::LLM,
-                        metadata: Some(metadata.clone()),
-                        kind: Kind::Text(response_text.clone()),
-                    })
-                    .context(MemorySnafu)?;
-                self.store
-                    .set_branch_head(&resolved.branch, &original_head, &response_node_id)
-                    .context(MemorySnafu)?;
+            Ok(run) => match run.outcome {
+                BackendOutcome::Succeeded { text } => {
+                    let (last_execution_id, steps) =
+                        normalize_backend_steps(run.steps, Some(text.clone()));
+                    let parent_id = self
+                        .append_backend_steps(original_head.clone(), &steps)
+                        .context(MemorySnafu)?;
+                    self.store
+                        .set_branch_head(&resolved.branch, &original_head, &parent_id)
+                        .context(MemorySnafu)?;
 
-                Ok(CompletionResult {
-                    branch: resolved.branch,
-                    anchor_id: session.anchor_id,
-                    execution_id,
-                    response_node_id: response_node_id.clone(),
-                    branch_head: response_node_id,
-                    text: response_text,
-                })
-            }
+                    Ok(CompletionResult {
+                        branch: resolved.branch,
+                        anchor_id: session.anchor_id,
+                        execution_id: last_execution_id,
+                        response_node_id: parent_id.clone(),
+                        branch_head: parent_id,
+                        text,
+                    })
+                }
+                BackendOutcome::Failed { message } => {
+                    let (execution_id, steps) = normalize_backend_steps(run.steps, None);
+                    let partial_history_tail = self
+                        .append_backend_steps(original_head.clone(), &steps)
+                        .context(MemorySnafu)?;
+                    let error_node_id = self
+                        .store
+                        .append(NewNode {
+                            parent: partial_history_tail,
+                            role: Role::System,
+                            metadata: Some(NodeMetadata::execution(execution_id.clone())),
+                            kind: Kind::Failure(message.clone()),
+                        })
+                        .context(MemorySnafu)?;
+                    Err(BackendSnafu {
+                        context: Box::new(BackendFailureContext {
+                            branch: resolved.branch,
+                            execution_id,
+                            error_node_id,
+                            retry_from_node_id: original_head,
+                        }),
+                    }
+                    .into_error(BackendError::failed(message)))
+                }
+            },
             Err(source) => {
-                let message = source.to_string();
+                let execution_id = format!("execution-{}", nanoid::nanoid!());
                 let error_node_id = self
                     .store
                     .append(NewNode {
                         parent: original_head.clone(),
                         role: Role::System,
-                        metadata: Some(metadata),
-                        kind: Kind::Failure(message.clone()),
+                        metadata: Some(NodeMetadata::execution(execution_id.clone())),
+                        kind: Kind::Failure(source.to_string()),
                     })
                     .context(MemorySnafu)?;
                 Err(BackendSnafu {
@@ -608,6 +715,45 @@ where
         branch_lock.lock_owned().await
     }
 
+    fn append_backend_events(
+        &self,
+        parent_id: String,
+        metadata: &NodeMetadata,
+        events: &[BackendEvent],
+    ) -> std::result::Result<String, StoreError> {
+        let mut parent_id = parent_id;
+        for event in events {
+            let (role, kind) = match event.clone() {
+                BackendEvent::AssistantText(text) => (Role::LLM, Kind::Text(text)),
+                BackendEvent::ToolUse(tool_use) => (Role::LLM, Kind::ToolUse(tool_use)),
+                BackendEvent::ToolResult(tool_result) => {
+                    (Role::User, Kind::ToolResult(tool_result))
+                }
+            };
+            parent_id = self.store.append(NewNode {
+                parent: parent_id,
+                role,
+                metadata: Some(metadata.clone()),
+                kind,
+            })?;
+        }
+
+        Ok(parent_id)
+    }
+
+    fn append_backend_steps(
+        &self,
+        mut parent_id: String,
+        steps: &[BackendStep],
+    ) -> std::result::Result<String, StoreError> {
+        for step in steps {
+            let metadata = NodeMetadata::execution(step.execution_id.clone());
+            parent_id = self.append_backend_events(parent_id, &metadata, &step.events)?;
+        }
+
+        Ok(parent_id)
+    }
+
     async fn lock_workflow(&self) -> OwnedMutexGuard<()> {
         self.workflow_lock.clone().lock_owned().await
     }
@@ -626,29 +772,38 @@ where
         guards
     }
 
-    fn resolve_session(&self, branch: &str) -> Result<SessionSnapshot> {
+    fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
         let context = self.resolve_context(branch)?;
-        let mut history = Vec::new();
+        let mut conversation = Vec::new();
+        let mut tracked_entries = Vec::new();
         if !context.session_anchor.prompt.is_empty() {
-            history.push(ConversationMessage {
+            let entry = ConversationEntry::Message(ConversationMessage {
                 role: MessageRole::User,
                 text: context.session_anchor.prompt.clone(),
             });
+            conversation.push(entry.clone());
+            tracked_entries.push(TrackedConversationEntry {
+                execution_id: None,
+                entry,
+            });
         }
-        history.extend(context.tail_history);
+        conversation.extend(context.tail_entries.iter().map(|entry| entry.entry.clone()));
+        tracked_entries.extend(context.tail_entries);
 
-        Ok(SessionSnapshot {
+        Ok(ResolvedSession {
             branch: branch.to_owned(),
             anchor_id: context.active_anchor_id,
-            session_anchor_id: context.session_anchor_id,
-            provider: Provider::parse(&context.session_anchor.provider)?,
-            model: context.session_anchor.model.clone(),
-            system_prompt: context.session_anchor.system_prompt.clone(),
-            tools: context.session_anchor.tools.clone(),
-            temperature: context.session_anchor.temperature,
-            max_tokens: context.session_anchor.max_tokens,
-            additional_params: context.session_anchor.additional_params.clone(),
-            history,
+            config: SessionModelConfig {
+                provider: Provider::parse(&context.session_anchor.provider)?,
+                model: context.session_anchor.model.clone(),
+                system_prompt: context.session_anchor.system_prompt.clone(),
+                tools: context.session_anchor.tools.clone(),
+                temperature: context.session_anchor.temperature,
+                max_tokens: context.session_anchor.max_tokens,
+                additional_params: context.session_anchor.additional_params.clone(),
+            },
+            conversation,
+            provider_history: rig_messages_from_tracked_entries(&tracked_entries),
         })
     }
 
@@ -669,9 +824,8 @@ where
                     AnchorPayload::Session(session_anchor) => {
                         state = Some(ResolvedContext {
                             active_anchor_id: node.id.clone(),
-                            session_anchor_id: node.id.clone(),
                             session_anchor: session_anchor.clone(),
-                            tail_history: vec![],
+                            tail_entries: vec![],
                         });
                     }
                     AnchorPayload::Prompt(prompt_anchor) => {
@@ -683,9 +837,12 @@ where
                         };
 
                         if !prompt_anchor.prompt.is_empty() {
-                            context.tail_history.push(ConversationMessage {
-                                role: MessageRole::User,
-                                text: prompt_anchor.prompt.clone(),
+                            context.tail_entries.push(TrackedConversationEntry {
+                                execution_id: None,
+                                entry: ConversationEntry::Message(ConversationMessage {
+                                    role: MessageRole::User,
+                                    text: prompt_anchor.prompt.clone(),
+                                }),
                             });
                         }
                         context.active_anchor_id = node.id.clone();
@@ -702,13 +859,43 @@ where
                         Role::System => None,
                     };
                     if let Some(role) = role {
-                        context.tail_history.push(ConversationMessage {
-                            role,
-                            text: text.clone(),
+                        context.tail_entries.push(TrackedConversationEntry {
+                            execution_id: node
+                                .metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.execution_id.clone()),
+                            entry: ConversationEntry::Message(ConversationMessage {
+                                role,
+                                text: text.clone(),
+                            }),
                         });
                     }
                 }
-                Kind::Failure(_) | Kind::ToolUse(_) | Kind::ToolResult(_) => {}
+                Kind::ToolUse(tool_use) => {
+                    let Some(context) = state.as_mut() else {
+                        continue;
+                    };
+                    context.tail_entries.push(TrackedConversationEntry {
+                        execution_id: node
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.execution_id.clone()),
+                        entry: ConversationEntry::ToolUse(tool_use.clone()),
+                    });
+                }
+                Kind::ToolResult(tool_result) => {
+                    let Some(context) = state.as_mut() else {
+                        continue;
+                    };
+                    context.tail_entries.push(TrackedConversationEntry {
+                        execution_id: node
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.execution_id.clone()),
+                        entry: ConversationEntry::ToolResult(tool_result.clone()),
+                    });
+                }
+                Kind::Failure(_) => {}
             }
         }
 
@@ -719,18 +906,20 @@ where
 
     fn resolve_request(
         &self,
-        session: &SessionSnapshot,
+        session: &ResolvedSession,
         request: CompletionRequest,
     ) -> ResolvedCompletionRequest {
         ResolvedCompletionRequest {
             branch: request.branch,
-            provider: request.provider.unwrap_or(session.provider),
-            model: request.model.unwrap_or_else(|| session.model.clone()),
-            temperature: request.temperature.or(session.temperature),
-            max_tokens: request.max_tokens.or(session.max_tokens),
+            provider: request.provider.unwrap_or(session.config.provider),
+            model: request
+                .model
+                .unwrap_or_else(|| session.config.model.clone()),
+            temperature: request.temperature.or(session.config.temperature),
+            max_tokens: request.max_tokens.or(session.config.max_tokens),
             additional_params: request
                 .additional_params
-                .or_else(|| session.additional_params.clone()),
+                .or_else(|| session.config.additional_params.clone()),
         }
     }
 
@@ -808,17 +997,405 @@ where
     }
 }
 
+const DEFAULT_AGENT_MAX_TURNS: usize = 100;
+
+fn build_runtime_tool_set(
+    tools: &[Tool],
+    workspace_root: std::path::PathBuf,
+) -> std::result::Result<rig::tool::ToolSet, BackendError> {
+    let runtime_tools = tools
+        .iter()
+        .map(|tool| match tool.name.as_str() {
+            "bash" => Ok(bash_tool::runtime_tool(
+                tool.clone(),
+                workspace_root.clone(),
+            )),
+            other => Err(BackendError::failed(format!(
+                "unsupported tool {other:?}; only \"bash\" is implemented"
+            ))),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(rig::tool::ToolSet::from_tools_boxed(runtime_tools))
+}
+
+fn configure_completion_request_builder<M>(
+    mut builder: rig::completion::CompletionRequestBuilder<M>,
+    session: &ResolvedSession,
+    request: &ResolvedCompletionRequest,
+    tool_definitions: Vec<rig::completion::ToolDefinition>,
+) -> rig::completion::CompletionRequestBuilder<M>
+where
+    M: rig::completion::CompletionModel,
+{
+    if !session.config.system_prompt.is_empty() {
+        builder = builder.preamble(session.config.system_prompt.clone());
+    }
+    if !tool_definitions.is_empty() {
+        builder = builder.tools(tool_definitions);
+    }
+    if let Some(temperature) = request.temperature {
+        builder = builder.temperature(temperature);
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        builder = builder.max_tokens(max_tokens);
+    }
+    if let Some(additional_params) = request.additional_params.clone() {
+        builder = builder.additional_params(additional_params);
+    }
+    builder
+}
+
+fn assistant_text_from_choice(
+    choice: &rig::OneOrMany<rig::message::AssistantContent>,
+) -> Option<String> {
+    let text = choice
+        .iter()
+        .filter_map(|item| match item {
+            rig::message::AssistantContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn tool_calls_from_choice(
+    choice: &rig::OneOrMany<rig::message::AssistantContent>,
+) -> Vec<rig::completion::message::ToolCall> {
+    choice
+        .iter()
+        .filter_map(|item| match item {
+            rig::message::AssistantContent::ToolCall(tool_call) => Some(tool_call.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_result_message(
+    tool_results: Vec<rig::completion::message::UserContent>,
+) -> rig::completion::message::Message {
+    rig::completion::message::Message::User {
+        content: rig::OneOrMany::many(tool_results).expect("there is atleast one tool result"),
+    }
+}
+
+fn rig_messages_from_tracked_entries(
+    entries: &[TrackedConversationEntry],
+) -> Vec<rig::completion::message::Message> {
+    fn flush_assistant_contents(
+        messages: &mut Vec<rig::completion::message::Message>,
+        assistant_contents: &mut Vec<rig::completion::message::AssistantContent>,
+        assistant_execution_id: &mut Option<String>,
+    ) {
+        if assistant_contents.is_empty() {
+            return;
+        }
+        messages.push(rig::completion::message::Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::many(std::mem::take(assistant_contents))
+                .expect("assistant content buffer is non-empty"),
+        });
+        *assistant_execution_id = None;
+    }
+
+    fn flush_tool_results(
+        messages: &mut Vec<rig::completion::message::Message>,
+        tool_results: &mut Vec<rig::completion::message::UserContent>,
+        tool_result_execution_id: &mut Option<String>,
+    ) {
+        if tool_results.is_empty() {
+            return;
+        }
+        messages.push(rig::completion::message::Message::User {
+            content: rig::OneOrMany::many(std::mem::take(tool_results))
+                .expect("tool result buffer is non-empty"),
+        });
+        *tool_result_execution_id = None;
+    }
+
+    let mut messages = Vec::new();
+    let mut assistant_contents = Vec::new();
+    let mut assistant_execution_id = None;
+    let mut tool_results = Vec::new();
+    let mut tool_result_execution_id = None;
+
+    for tracked_entry in entries {
+        match &tracked_entry.entry {
+            ConversationEntry::Message(message) => match message.role {
+                MessageRole::User => {
+                    flush_assistant_contents(
+                        &mut messages,
+                        &mut assistant_contents,
+                        &mut assistant_execution_id,
+                    );
+                    flush_tool_results(
+                        &mut messages,
+                        &mut tool_results,
+                        &mut tool_result_execution_id,
+                    );
+                    messages.push(rig::completion::message::Message::user(
+                        message.text.clone(),
+                    ));
+                }
+                MessageRole::Assistant => {
+                    flush_tool_results(
+                        &mut messages,
+                        &mut tool_results,
+                        &mut tool_result_execution_id,
+                    );
+                    if !assistant_contents.is_empty()
+                        && assistant_execution_id != tracked_entry.execution_id
+                    {
+                        flush_assistant_contents(
+                            &mut messages,
+                            &mut assistant_contents,
+                            &mut assistant_execution_id,
+                        );
+                    }
+                    assistant_execution_id = tracked_entry.execution_id.clone();
+                    assistant_contents
+                        .push(rig::message::AssistantContent::text(message.text.clone()));
+                }
+            },
+            ConversationEntry::ToolUse(tool_use) => {
+                flush_tool_results(
+                    &mut messages,
+                    &mut tool_results,
+                    &mut tool_result_execution_id,
+                );
+                if !assistant_contents.is_empty()
+                    && assistant_execution_id != tracked_entry.execution_id
+                {
+                    flush_assistant_contents(
+                        &mut messages,
+                        &mut assistant_contents,
+                        &mut assistant_execution_id,
+                    );
+                }
+                assistant_execution_id = tracked_entry.execution_id.clone();
+                assistant_contents.push(rig::message::AssistantContent::tool_call(
+                    tool_use.id.clone(),
+                    tool_use.name.clone(),
+                    tool_use.input.clone(),
+                ));
+            }
+            ConversationEntry::ToolResult(tool_result) => {
+                flush_assistant_contents(
+                    &mut messages,
+                    &mut assistant_contents,
+                    &mut assistant_execution_id,
+                );
+                if !tool_results.is_empty()
+                    && tool_result_execution_id != tracked_entry.execution_id
+                {
+                    flush_tool_results(
+                        &mut messages,
+                        &mut tool_results,
+                        &mut tool_result_execution_id,
+                    );
+                }
+                tool_result_execution_id = tracked_entry.execution_id.clone();
+                tool_results.push(rig::completion::message::UserContent::tool_result(
+                    tool_result.id.clone(),
+                    rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
+                        tool_result.output.clone(),
+                    )),
+                ));
+            }
+        }
+    }
+
+    flush_assistant_contents(
+        &mut messages,
+        &mut assistant_contents,
+        &mut assistant_execution_id,
+    );
+    flush_tool_results(
+        &mut messages,
+        &mut tool_results,
+        &mut tool_result_execution_id,
+    );
+
+    messages
+}
+
+fn push_assistant_text_event(buffer: &mut Vec<String>, events: &mut Vec<BackendEvent>) {
+    if !buffer.is_empty() {
+        events.push(BackendEvent::AssistantText(buffer.join("\n")));
+        buffer.clear();
+    }
+}
+
+fn backend_events_from_choice(
+    choice: &rig::OneOrMany<rig::message::AssistantContent>,
+) -> Vec<BackendEvent> {
+    let mut events = Vec::new();
+    let mut text_buffer = Vec::new();
+
+    for item in choice.iter() {
+        match item {
+            rig::message::AssistantContent::Text(text) => {
+                text_buffer.push(text.text.clone());
+            }
+            rig::message::AssistantContent::ToolCall(tool_call) => {
+                push_assistant_text_event(&mut text_buffer, &mut events);
+                events.push(BackendEvent::ToolUse(ToolUse {
+                    id: tool_call.id.clone(),
+                    name: tool_call.function.name.clone(),
+                    input: tool_call.function.arguments.clone(),
+                }));
+            }
+            rig::message::AssistantContent::Reasoning(_)
+            | rig::message::AssistantContent::Image(_) => {}
+        }
+    }
+
+    push_assistant_text_event(&mut text_buffer, &mut events);
+    events
+}
+
+fn normalize_backend_steps(
+    mut steps: Vec<BackendStep>,
+    final_text: Option<String>,
+) -> (String, Vec<BackendStep>) {
+    if steps.is_empty() {
+        steps.push(BackendStep {
+            execution_id: format!("execution-{}", nanoid::nanoid!()),
+            events: vec![],
+        });
+    }
+
+    let last_step = steps.last_mut().expect("steps is non-empty");
+
+    if let Some(text) = final_text
+        && !matches!(
+            last_step.events.last(),
+            Some(BackendEvent::AssistantText(last_text)) if last_text == &text
+        )
+    {
+        last_step.events.push(BackendEvent::AssistantText(text));
+    }
+
+    (last_step.execution_id.clone(), steps)
+}
+
+async fn execute_completion_loop<M>(
+    model: M,
+    session: &ResolvedSession,
+    request: &ResolvedCompletionRequest,
+    prompt: rig::completion::message::Message,
+    mut history: Vec<rig::completion::message::Message>,
+    toolset: rig::tool::ToolSet,
+) -> std::result::Result<BackendRun, BackendError>
+where
+    M: rig::completion::CompletionModel,
+{
+    fn next_execution_id() -> String {
+        format!("execution-{}", nanoid::nanoid!())
+    }
+
+    let tool_definitions = toolset
+        .get_tool_definitions()
+        .await
+        .map_err(|source| BackendError::failed(source.to_string()))?;
+    let mut steps = Vec::new();
+    let mut pending_tool_result_events = Vec::new();
+    let mut prompt = prompt;
+
+    for _ in 0..DEFAULT_AGENT_MAX_TURNS {
+        let execution_id = next_execution_id();
+        let builder = model
+            .completion_request(prompt.clone())
+            .messages(history.clone());
+        let response = configure_completion_request_builder(
+            builder,
+            session,
+            request,
+            tool_definitions.clone(),
+        )
+        .send()
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(source) => {
+                steps.push(BackendStep {
+                    execution_id,
+                    events: vec![],
+                });
+                return Ok(BackendRun::failed_with_steps(source.to_string(), steps));
+            }
+        };
+
+        let mut step_events = std::mem::take(&mut pending_tool_result_events);
+        let choice_events = backend_events_from_choice(&response.choice);
+        let tool_calls = tool_calls_from_choice(&response.choice);
+        let final_text = assistant_text_from_choice(&response.choice);
+
+        step_events.extend(choice_events);
+
+        if tool_calls.is_empty() {
+            let text = final_text.ok_or_else(|| {
+                BackendError::failed("completion response did not include assistant text")
+            })?;
+            steps.push(BackendStep {
+                execution_id,
+                events: step_events,
+            });
+            return Ok(BackendRun::succeeded_with_steps(text, steps));
+        }
+
+        history.push(prompt);
+        history.push(rig::completion::message::Message::Assistant {
+            id: response.message_id,
+            content: response.choice,
+        });
+
+        let mut tool_results = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            let args = serde_json::to_string(&tool_call.function.arguments)
+                .map_err(|source| BackendError::failed(source.to_string()))?;
+            let output = match toolset.call(&tool_call.function.name, args).await {
+                Ok(output) => output,
+                Err(source) => source.to_string(),
+            };
+            pending_tool_result_events.push(BackendEvent::ToolResult(ToolResult {
+                id: tool_call.id.clone(),
+                output: output.clone(),
+            }));
+            tool_results.push(rig::completion::message::UserContent::tool_result(
+                tool_call.id,
+                rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(output)),
+            ));
+        }
+        steps.push(BackendStep {
+            execution_id,
+            events: step_events,
+        });
+        prompt = tool_result_message(tool_results);
+    }
+
+    if !pending_tool_result_events.is_empty() {
+        steps.push(BackendStep {
+            execution_id: next_execution_id(),
+            events: pending_tool_result_events,
+        });
+    }
+
+    Ok(BackendRun::failed_with_steps(
+        format!("MaxTurnError: (reached max turn limit: {DEFAULT_AGENT_MAX_TURNS})"),
+        steps,
+    ))
+}
+
 #[async_trait]
 impl CompletionBackend for RigBackend {
     async fn complete(
         &self,
-        session: SessionSnapshot,
+        session: ResolvedSession,
         request: ResolvedCompletionRequest,
-    ) -> std::result::Result<BackendCompletion, BackendError> {
+    ) -> std::result::Result<BackendRun, BackendError> {
         use rig::client::CompletionClient;
-        use rig::completion::CompletionModel;
-        use rig::completion::message::Message;
-        use rig::message::AssistantContent;
         use rig::providers::{anthropic, openai};
 
         fn resolve_api_key(provider: Provider) -> std::result::Result<String, BackendError> {
@@ -828,11 +1405,12 @@ impl CompletionBackend for RigBackend {
                 Provider::Anthropic => std::env::var("ANTHROPIC_API_KEY").ok(),
             };
 
-            generic
-                .or(provider_specific)
-                .ok_or_else(|| BackendError::Failed {
-                    message: format!("missing API key for provider {}", provider.as_str()),
-                })
+            generic.or(provider_specific).ok_or_else(|| {
+                BackendError::failed(format!(
+                    "missing API key for provider {}",
+                    provider.as_str()
+                ))
+            })
         }
 
         fn resolve_base_url(provider: Provider) -> Option<String> {
@@ -844,33 +1422,19 @@ impl CompletionBackend for RigBackend {
                 })
         }
 
-        fn to_messages(history: &[ConversationMessage]) -> Vec<Message> {
-            history
-                .iter()
-                .map(|message| match message.role {
-                    MessageRole::User => Message::user(message.text.clone()),
-                    MessageRole::Assistant => Message::assistant(message.text.clone()),
-                })
-                .collect()
-        }
-
-        fn extract_text<T>(response: rig::completion::CompletionResponse<T>) -> String {
-            response
-                .choice
-                .iter()
-                .filter_map(|content| match content {
-                    AssistantContent::Text(text) => Some(text.text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-
-        let history = to_messages(&session.history);
+        let workspace_root = match bash_tool::resolve_workspace_root() {
+            Ok(path) => path,
+            Err(source) => {
+                return BashToolSnafu {
+                    message: source.to_string(),
+                }
+                .fail();
+            }
+        };
+        let toolset = build_runtime_tool_set(&session.config.tools, workspace_root)?;
+        let history = session.provider_history.clone();
         let Some((prompt, history)) = history.split_last() else {
-            return Err(BackendError::Failed {
-                message: "completion requires history".to_owned(),
-            });
+            return Err(BackendError::failed("completion requires history"));
         };
         let prompt = prompt.clone();
         let history = history.to_vec();
@@ -882,29 +1446,18 @@ impl CompletionBackend for RigBackend {
                 if let Some(base_url) = resolve_base_url(request.provider) {
                     builder = builder.base_url(&base_url);
                 }
-                let client = builder.build().map_err(|source| BackendError::Failed {
-                    message: source.to_string(),
-                })?;
-                let model = client.completion_model(&request.model);
-                let request = model
-                    .completion_request(prompt.clone())
-                    .messages(history)
-                    .preamble(session.system_prompt)
-                    .temperature_opt(request.temperature)
-                    .max_tokens_opt(request.max_tokens)
-                    .additional_params_opt(request.additional_params)
-                    .build();
-                let response =
-                    model
-                        .completion(request)
-                        .await
-                        .map_err(|source| BackendError::Failed {
-                            message: source.to_string(),
-                        })?;
-
-                Ok(BackendCompletion {
-                    text: extract_text(response),
-                })
+                let client = builder
+                    .build()
+                    .map_err(|source| BackendError::failed(source.to_string()))?;
+                execute_completion_loop(
+                    client.completion_model(&request.model),
+                    &session,
+                    &request,
+                    prompt.clone(),
+                    history.clone(),
+                    toolset,
+                )
+                .await
             }
             Provider::Anthropic => {
                 let api_key = resolve_api_key(request.provider)?;
@@ -912,29 +1465,18 @@ impl CompletionBackend for RigBackend {
                 if let Some(base_url) = resolve_base_url(request.provider) {
                     builder = builder.base_url(&base_url);
                 }
-                let client = builder.build().map_err(|source| BackendError::Failed {
-                    message: source.to_string(),
-                })?;
-                let model = client.completion_model(&request.model);
-                let request = model
-                    .completion_request(prompt)
-                    .messages(history)
-                    .preamble(session.system_prompt)
-                    .temperature_opt(request.temperature)
-                    .max_tokens_opt(request.max_tokens)
-                    .additional_params_opt(request.additional_params)
-                    .build();
-                let response =
-                    model
-                        .completion(request)
-                        .await
-                        .map_err(|source| BackendError::Failed {
-                            message: source.to_string(),
-                        })?;
-
-                Ok(BackendCompletion {
-                    text: extract_text(response),
-                })
+                let client = builder
+                    .build()
+                    .map_err(|source| BackendError::failed(source.to_string()))?;
+                execute_completion_loop(
+                    client.completion_model(&request.model),
+                    &session,
+                    &request,
+                    prompt,
+                    history,
+                    toolset,
+                )
+                .await
             }
         }
     }
@@ -950,9 +1492,9 @@ mod tests {
     use coco_mem::MemoryStore;
     use tokio::sync::Barrier;
 
-    type RecordedCalls = Arc<Mutex<Vec<(SessionSnapshot, ResolvedCompletionRequest)>>>;
+    type RecordedCalls = Arc<Mutex<Vec<(ResolvedSession, ResolvedCompletionRequest)>>>;
     type FakeResponseQueue =
-        Arc<Mutex<HashMap<String, VecDeque<std::result::Result<String, BackendError>>>>>;
+        Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendRun, BackendError>>>>>;
 
     #[derive(Clone)]
     struct FakeBackend {
@@ -973,10 +1515,35 @@ mod tests {
                             .map(|response| {
                                 response
                                     .as_ref()
-                                    .map(|text| (*text).to_owned())
+                                    .map(|text| {
+                                        BackendRun::succeeded(
+                                            (*text).to_owned(),
+                                            vec![BackendEvent::AssistantText((*text).to_owned())],
+                                        )
+                                    })
                                     .map_err(Clone::clone)
                             })
                             .collect(),
+                    )
+                })
+                .collect();
+
+            Self {
+                responses: Arc::new(Mutex::new(responses)),
+                barrier: None,
+                calls: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn with_completions(
+            entries: &[(&str, &[std::result::Result<BackendRun, BackendError>])],
+        ) -> Self {
+            let responses = entries
+                .iter()
+                .map(|(branch, responses)| {
+                    (
+                        (*branch).to_owned(),
+                        responses.iter().cloned().collect::<VecDeque<_>>(),
                     )
                 })
                 .collect();
@@ -994,7 +1561,10 @@ mod tests {
                 .map(|(branch, response)| {
                     (
                         (*branch).to_owned(),
-                        VecDeque::from([Ok((*response).to_owned())]),
+                        VecDeque::from([Ok(BackendRun::succeeded(
+                            (*response).to_owned(),
+                            vec![BackendEvent::AssistantText((*response).to_owned())],
+                        ))]),
                     )
                 })
                 .collect();
@@ -1011,9 +1581,9 @@ mod tests {
     impl CompletionBackend for FakeBackend {
         async fn complete(
             &self,
-            session: SessionSnapshot,
+            session: ResolvedSession,
             request: ResolvedCompletionRequest,
-        ) -> std::result::Result<BackendCompletion, BackendError> {
+        ) -> std::result::Result<BackendRun, BackendError> {
             self.calls.lock().await.push((session, request.clone()));
 
             if let Some(barrier) = &self.barrier {
@@ -1028,7 +1598,7 @@ mod tests {
             drop(responses);
 
             tokio::time::sleep(Duration::from_millis(5)).await;
-            next.map(|text| BackendCompletion { text })
+            next
         }
     }
 
@@ -1077,6 +1647,32 @@ mod tests {
             max_tokens: None,
             additional_params: None,
         }
+    }
+
+    fn bash_tool() -> Tool {
+        Tool {
+            name: "bash".to_owned(),
+            description: "Run a bash command".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "workdir": {"type": "string"},
+                    "timeout_ms": {"type": "integer"}
+                },
+                "required": ["command"]
+            }),
+        }
+    }
+
+    fn text_messages_from_entries(entries: &[ConversationEntry]) -> Vec<ConversationMessage> {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ConversationEntry::Message(message) => Some(message.clone()),
+                ConversationEntry::ToolUse(_) | ConversationEntry::ToolResult(_) => None,
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -1166,7 +1762,7 @@ mod tests {
         assert_eq!(result.text, "second");
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            session.history,
+            text_messages_from_entries(&session.conversation),
             vec![
                 ConversationMessage {
                     role: MessageRole::User,
@@ -1195,11 +1791,9 @@ mod tests {
     #[tokio::test]
     async fn failed_completion_persists_failure_kind_but_not_prompt_history() {
         let store = MemoryStore::new();
-        let backend = FakeBackend::with_responses(&[(
+        let backend = FakeBackend::with_completions(&[(
             "main",
-            &[Err(BackendError::Failed {
-                message: "rate limited".to_owned(),
-            })],
+            &[Ok(BackendRun::failed("rate limited", vec![]))],
         )]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -1241,7 +1835,7 @@ mod tests {
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            session.history,
+            text_messages_from_entries(&session.conversation),
             vec![
                 ConversationMessage {
                     role: MessageRole::User,
@@ -1263,7 +1857,7 @@ mod tests {
             ("draft", &[Ok("draft answer")]),
         ]);
         let service = LlmService::new(store, backend);
-        let main_session = service
+        service
             .create_session(session_config("main"))
             .await
             .unwrap();
@@ -1289,11 +1883,10 @@ mod tests {
             .unwrap();
         let session = service.resolve_session("main").unwrap();
         assert_eq!(result.text, "merge answer");
-        assert_eq!(session.session_anchor_id, main_session.anchor_id);
-        assert_eq!(session.model, "gpt-4.1-mini");
-        assert_eq!(session.system_prompt, "You are helpful.");
+        assert_eq!(session.config.model, "gpt-4.1-mini");
+        assert_eq!(session.config.system_prompt, "You are helpful.");
         assert_eq!(
-            session.history,
+            text_messages_from_entries(&session.conversation),
             vec![
                 ConversationMessage {
                     role: MessageRole::User,
@@ -1390,7 +1983,7 @@ mod tests {
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            session.history,
+            text_messages_from_entries(&session.conversation),
             vec![
                 ConversationMessage {
                     role: MessageRole::User,
@@ -1411,13 +2004,14 @@ mod tests {
     #[tokio::test]
     async fn complete_can_retry_after_prompt_failure() {
         let store = MemoryStore::new();
-        let backend = FakeBackend::with_responses(&[(
+        let backend = FakeBackend::with_completions(&[(
             "main",
             &[
-                Err(BackendError::Failed {
-                    message: "rate limited".to_owned(),
-                }),
-                Ok("recovered"),
+                Ok(BackendRun::failed("rate limited", vec![])),
+                Ok(BackendRun::succeeded(
+                    "recovered",
+                    vec![BackendEvent::AssistantText("recovered".to_owned())],
+                )),
             ],
         )]);
         let service = LlmService::new(store.clone(), backend);
@@ -1445,7 +2039,7 @@ mod tests {
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            session.history,
+            text_messages_from_entries(&session.conversation),
             vec![
                 ConversationMessage {
                     role: MessageRole::User,
@@ -1734,19 +2328,19 @@ mod tests {
 
         assert_eq!(result.text, "updated");
         let session = service.resolve_session("main").unwrap();
-        assert_eq!(session.provider, Provider::Anthropic);
-        assert_eq!(session.model, "claude-sonnet-4-20250514");
-        assert_eq!(session.system_prompt, "You are strict.");
-        assert_eq!(session.temperature, None);
-        assert_eq!(session.max_tokens, Some(128));
+        assert_eq!(session.config.provider, Provider::Anthropic);
+        assert_eq!(session.config.model, "claude-sonnet-4-20250514");
+        assert_eq!(session.config.system_prompt, "You are strict.");
+        assert_eq!(session.config.temperature, None);
+        assert_eq!(session.config.max_tokens, Some(128));
         assert_eq!(
-            session.additional_params,
+            session.config.additional_params,
             Some(serde_json::json!({"service_tier": "priority"}))
         );
 
         let calls = calls.lock().await;
         let last = calls.last().expect("expected backend call");
-        assert_eq!(last.0.system_prompt, "You are strict.");
+        assert_eq!(last.0.config.system_prompt, "You are strict.");
         assert_eq!(last.1.provider, Provider::Anthropic);
         assert_eq!(last.1.model, "claude-sonnet-4-20250514");
         assert_eq!(last.1.temperature, None);
@@ -1803,5 +2397,494 @@ mod tests {
             .expect("expected main call");
         assert_eq!(draft_call.1.model, "gpt-4.1-mini");
         assert_eq!(main_call.1.model, "gpt-5.4");
+    }
+
+    #[tokio::test]
+    async fn prompt_persists_tool_trace_before_final_assistant_text() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_completions(&[(
+            "main",
+            &[Ok(BackendRun::succeeded_with_steps(
+                "done",
+                vec![
+                    BackendStep {
+                        execution_id: "execution-step-1".to_owned(),
+                        events: vec![BackendEvent::ToolUse(ToolUse {
+                            id: "tool-call-1".to_owned(),
+                            name: "bash".to_owned(),
+                            input: serde_json::json!({"command": "rg --files"}),
+                        })],
+                    },
+                    BackendStep {
+                        execution_id: "execution-step-2".to_owned(),
+                        events: vec![
+                            BackendEvent::ToolResult(ToolResult {
+                                id: "tool-call-1".to_owned(),
+                                output: "Cargo.toml".to_owned(),
+                            }),
+                            BackendEvent::AssistantText("done".to_owned()),
+                        ],
+                    },
+                ],
+            ))],
+        )]);
+        let service = LlmService::new(store.clone(), backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let result = service
+            .prompt(prompt_request("main", "list files"))
+            .await
+            .unwrap();
+
+        let ancestry = store.ancestry("main").unwrap();
+        let assistant = &ancestry[0];
+        let tool_result = &ancestry[1];
+        let tool_use = &ancestry[2];
+
+        assert_eq!(assistant.role, Role::LLM);
+        assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
+        assert_eq!(
+            assistant.metadata.as_ref().unwrap().execution_id.as_deref(),
+            Some(result.execution_id.as_str())
+        );
+
+        assert_eq!(tool_result.role, Role::User);
+        assert!(matches!(
+            &tool_result.kind,
+            Kind::ToolResult(ToolResult { id, output })
+                if id == "tool-call-1" && output == "Cargo.toml"
+        ));
+        assert_eq!(
+            tool_result
+                .metadata
+                .as_ref()
+                .unwrap()
+                .execution_id
+                .as_deref(),
+            Some("execution-step-2")
+        );
+
+        assert_eq!(tool_use.role, Role::LLM);
+        assert!(matches!(
+            &tool_use.kind,
+            Kind::ToolUse(ToolUse { id, name, input })
+                if id == "tool-call-1"
+                    && name == "bash"
+                    && input == &serde_json::json!({"command": "rg --files"})
+        ));
+        assert_eq!(
+            tool_use.metadata.as_ref().unwrap().execution_id.as_deref(),
+            Some("execution-step-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_session_keeps_tool_entries_but_text_history_stays_text_only() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_completions(&[(
+            "main",
+            &[Ok(BackendRun::succeeded_with_steps(
+                "done",
+                vec![
+                    BackendStep {
+                        execution_id: "execution-step-1".to_owned(),
+                        events: vec![BackendEvent::ToolUse(ToolUse {
+                            id: "tool-call-1".to_owned(),
+                            name: "bash".to_owned(),
+                            input: serde_json::json!({"command": "rg --files"}),
+                        })],
+                    },
+                    BackendStep {
+                        execution_id: "execution-step-2".to_owned(),
+                        events: vec![
+                            BackendEvent::ToolResult(ToolResult {
+                                id: "tool-call-1".to_owned(),
+                                output: "Cargo.toml".to_owned(),
+                            }),
+                            BackendEvent::AssistantText("done".to_owned()),
+                        ],
+                    },
+                ],
+            ))],
+        )]);
+        let service = LlmService::new(store, backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        service
+            .prompt(prompt_request("main", "list files"))
+            .await
+            .unwrap();
+
+        let session = service.resolve_session("main").unwrap();
+        assert_eq!(
+            text_messages_from_entries(&session.conversation),
+            vec![
+                ConversationMessage {
+                    role: MessageRole::User,
+                    text: "Conversation start.".to_owned(),
+                },
+                ConversationMessage {
+                    role: MessageRole::User,
+                    text: "list files".to_owned(),
+                },
+                ConversationMessage {
+                    role: MessageRole::Assistant,
+                    text: "done".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            session.conversation,
+            vec![
+                ConversationEntry::Message(ConversationMessage {
+                    role: MessageRole::User,
+                    text: "Conversation start.".to_owned(),
+                }),
+                ConversationEntry::Message(ConversationMessage {
+                    role: MessageRole::User,
+                    text: "list files".to_owned(),
+                }),
+                ConversationEntry::ToolUse(ToolUse {
+                    id: "tool-call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    input: serde_json::json!({"command": "rg --files"}),
+                }),
+                ConversationEntry::ToolResult(ToolResult {
+                    id: "tool-call-1".to_owned(),
+                    output: "Cargo.toml".to_owned(),
+                }),
+                ConversationEntry::Message(ConversationMessage {
+                    role: MessageRole::Assistant,
+                    text: "done".to_owned(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn rig_messages_from_entries_groups_tool_calls_and_results_by_turn() {
+        let messages = rig_messages_from_tracked_entries(&[
+            TrackedConversationEntry {
+                execution_id: None,
+                entry: ConversationEntry::Message(ConversationMessage {
+                    role: MessageRole::User,
+                    text: "list files".to_owned(),
+                }),
+            },
+            TrackedConversationEntry {
+                execution_id: Some("execution-1".to_owned()),
+                entry: ConversationEntry::Message(ConversationMessage {
+                    role: MessageRole::Assistant,
+                    text: "checking".to_owned(),
+                }),
+            },
+            TrackedConversationEntry {
+                execution_id: Some("execution-1".to_owned()),
+                entry: ConversationEntry::ToolUse(ToolUse {
+                    id: "tool-call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    input: serde_json::json!({"command": "ls"}),
+                }),
+            },
+            TrackedConversationEntry {
+                execution_id: Some("execution-1".to_owned()),
+                entry: ConversationEntry::ToolUse(ToolUse {
+                    id: "tool-call-2".to_owned(),
+                    name: "bash".to_owned(),
+                    input: serde_json::json!({"command": "pwd"}),
+                }),
+            },
+            TrackedConversationEntry {
+                execution_id: Some("execution-1".to_owned()),
+                entry: ConversationEntry::ToolResult(ToolResult {
+                    id: "tool-call-1".to_owned(),
+                    output: "Cargo.toml".to_owned(),
+                }),
+            },
+            TrackedConversationEntry {
+                execution_id: Some("execution-1".to_owned()),
+                entry: ConversationEntry::ToolResult(ToolResult {
+                    id: "tool-call-2".to_owned(),
+                    output: "/tmp".to_owned(),
+                }),
+            },
+            TrackedConversationEntry {
+                execution_id: Some("execution-2".to_owned()),
+                entry: ConversationEntry::Message(ConversationMessage {
+                    role: MessageRole::Assistant,
+                    text: "done".to_owned(),
+                }),
+            },
+        ]);
+
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            &messages[0],
+            rig::completion::message::Message::User { content }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::UserContent::Text(text) if text.text == "list files"
+                )
+        ));
+        assert!(matches!(
+            &messages[1],
+            rig::completion::message::Message::Assistant { content, .. }
+                if {
+                    let items = content.iter().collect::<Vec<_>>();
+                    items.len() == 3
+                    && matches!(
+                        items[0],
+                        rig::completion::message::AssistantContent::Text(text)
+                            if text.text == "checking"
+                    )
+                    && matches!(
+                        items[1],
+                        rig::completion::message::AssistantContent::ToolCall(tool_call)
+                            if tool_call.id == "tool-call-1"
+                    )
+                    && matches!(
+                        items[2],
+                        rig::completion::message::AssistantContent::ToolCall(tool_call)
+                            if tool_call.id == "tool-call-2"
+                    )
+                }
+        ));
+        assert!(matches!(
+            &messages[2],
+            rig::completion::message::Message::User { content }
+                if {
+                    let items = content.iter().collect::<Vec<_>>();
+                    items.len() == 2
+                    && matches!(
+                        items[0],
+                        rig::completion::message::UserContent::ToolResult(tool_result)
+                            if tool_result.id == "tool-call-1"
+                    )
+                    && matches!(
+                        items[1],
+                        rig::completion::message::UserContent::ToolResult(tool_result)
+                            if tool_result.id == "tool-call-2"
+                    )
+                }
+        ));
+        assert!(matches!(
+            &messages[3],
+            rig::completion::message::Message::Assistant { content, .. }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::AssistantContent::Text(text) if text.text == "done"
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn multi_step_completion_uses_distinct_execution_ids_per_completion_call() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_completions(&[(
+            "main",
+            &[Ok(BackendRun::succeeded_with_steps(
+                "done",
+                vec![
+                    BackendStep {
+                        execution_id: "execution-step-1".to_owned(),
+                        events: vec![
+                            BackendEvent::ToolUse(ToolUse {
+                                id: "tool-call-1".to_owned(),
+                                name: "bash".to_owned(),
+                                input: serde_json::json!({"command": "ls"}),
+                            }),
+                            BackendEvent::ToolResult(ToolResult {
+                                id: "tool-call-1".to_owned(),
+                                output: "Cargo.toml".to_owned(),
+                            }),
+                        ],
+                    },
+                    BackendStep {
+                        execution_id: "execution-step-2".to_owned(),
+                        events: vec![BackendEvent::AssistantText("done".to_owned())],
+                    },
+                ],
+            ))],
+        )]);
+        let service = LlmService::new(store.clone(), backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let result = service
+            .prompt(prompt_request("main", "list files"))
+            .await
+            .unwrap();
+
+        let ancestry = store.ancestry("main").unwrap();
+        let assistant = &ancestry[0];
+        let tool_result = &ancestry[1];
+        let tool_use = &ancestry[2];
+
+        assert_eq!(
+            assistant.metadata.as_ref().unwrap().execution_id.as_deref(),
+            Some("execution-step-2")
+        );
+        assert_eq!(
+            tool_result
+                .metadata
+                .as_ref()
+                .unwrap()
+                .execution_id
+                .as_deref(),
+            Some("execution-step-1")
+        );
+        assert_eq!(
+            tool_use.metadata.as_ref().unwrap().execution_id.as_deref(),
+            Some("execution-step-1")
+        );
+        assert_eq!(result.execution_id, "execution-step-2");
+
+        let session = service.resolve_session("main").unwrap();
+        assert_eq!(session.provider_history.len(), 5);
+        assert!(matches!(
+            &session.provider_history[2],
+            rig::completion::message::Message::Assistant { content, .. }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::AssistantContent::ToolCall(tool_call)
+                        if tool_call.id == "tool-call-1"
+                )
+        ));
+        assert!(matches!(
+            &session.provider_history[3],
+            rig::completion::message::Message::User { content }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::UserContent::ToolResult(tool_result)
+                        if tool_result.id == "tool-call-1"
+                )
+        ));
+        assert!(matches!(
+            &session.provider_history[4],
+            rig::completion::message::Message::Assistant { content, .. }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::AssistantContent::Text(text) if text.text == "done"
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_completion_persists_partial_trace_as_orphan_chain() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_completions(&[(
+            "main",
+            &[Ok(BackendRun::failed_with_steps(
+                "MaxTurnError: (reached max turn limit: 8)",
+                vec![
+                    BackendStep {
+                        execution_id: "execution-step-1".to_owned(),
+                        events: vec![BackendEvent::ToolUse(ToolUse {
+                            id: "tool-call-1".to_owned(),
+                            name: "bash".to_owned(),
+                            input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
+                        })],
+                    },
+                    BackendStep {
+                        execution_id: "execution-step-2".to_owned(),
+                        events: vec![
+                            BackendEvent::ToolResult(ToolResult {
+                                id: "tool-call-1".to_owned(),
+                                output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
+                            }),
+                            BackendEvent::AssistantText("trying again".to_owned()),
+                        ],
+                    },
+                ],
+            ))],
+        )]);
+        let service = LlmService::new(store.clone(), backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let err = service
+            .prompt(prompt_request("main", "keep going"))
+            .await
+            .unwrap_err();
+        let context = match err {
+            Error::Backend { context, .. } => context,
+            other => panic!("expected backend error, got {other:?}"),
+        };
+
+        assert_eq!(
+            store.get_branch_head("main").unwrap(),
+            context.retry_from_node_id
+        );
+
+        let failure = store.get_node(&context.error_node_id).unwrap();
+        assert!(matches!(
+            &failure.kind,
+            Kind::Failure(text) if text == "MaxTurnError: (reached max turn limit: 8)"
+        ));
+
+        let assistant = store.get_node(&failure.parent).unwrap();
+        assert!(matches!(&assistant.kind, Kind::Text(text) if text == "trying again"));
+
+        let tool_result = store.get_node(&assistant.parent).unwrap();
+        assert!(matches!(
+            &tool_result.kind,
+            Kind::ToolResult(ToolResult { id, output, .. })
+                if id == "tool-call-1"
+                    && output == "exit_status: 0\nstdout:\n\nstderr:\n"
+        ));
+
+        let tool_use = store.get_node(&tool_result.parent).unwrap();
+        assert!(matches!(
+            &tool_use.kind,
+            Kind::ToolUse(ToolUse { id, name, .. })
+                if id == "tool-call-1" && name == "bash"
+        ));
+        assert_eq!(tool_use.parent, context.retry_from_node_id);
+
+        let session = service.resolve_session("main").unwrap();
+        assert_eq!(
+            text_messages_from_entries(&session.conversation),
+            vec![
+                ConversationMessage {
+                    role: MessageRole::User,
+                    text: "Conversation start.".to_owned(),
+                },
+                ConversationMessage {
+                    role: MessageRole::User,
+                    text: "keep going".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_tool_runtime_allows_writes_and_outside_workdir() {
+        let runtime = bash_tool::runtime_tool(
+            bash_tool(),
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+        );
+        let temp_root = tempfile::tempdir().unwrap();
+        let output = runtime
+            .call(format!(
+                r#"{{"command":"printf 'hello' > trace.txt; cat trace.txt","workdir":"{}"}}"#,
+                temp_root.path().display()
+            ))
+            .await
+            .unwrap();
+        assert!(output.contains("exit_status: 0"));
+        assert!(output.contains("stdout:\nhello"));
+        assert_eq!(
+            std::fs::read_to_string(temp_root.path().join("trace.txt")).unwrap(),
+            "hello"
+        );
     }
 }

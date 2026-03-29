@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use coco_llm::coco_mem::MemoryStore;
 use coco_llm::{
-    BackendCompletion, BackendError, CompletionBackend, LlmService, Provider, SessionConfig,
-    SessionSnapshot,
+    BackendError, BackendEvent, BackendRun, CompletionBackend, LlmService, Provider,
+    ResolvedSession, SessionConfig,
 };
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
 };
 
 type FakeResponseQueue =
-    Arc<Mutex<HashMap<String, VecDeque<std::result::Result<String, BackendError>>>>>;
+    Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendRun, BackendError>>>>>;
 
 #[derive(Debug)]
 struct FailingResolver;
@@ -47,7 +47,12 @@ impl FakeBackend {
                         .map(|response| {
                             response
                                 .as_ref()
-                                .map(|text| (*text).to_owned())
+                                .map(|text| {
+                                    BackendRun::succeeded(
+                                        (*text).to_owned(),
+                                        vec![BackendEvent::AssistantText((*text).to_owned())],
+                                    )
+                                })
                                 .map_err(Clone::clone)
                         })
                         .collect(),
@@ -65,15 +70,14 @@ impl FakeBackend {
 impl CompletionBackend for FakeBackend {
     async fn complete(
         &self,
-        _session: SessionSnapshot,
+        _session: ResolvedSession,
         request: coco_llm::ResolvedCompletionRequest,
-    ) -> std::result::Result<BackendCompletion, BackendError> {
+    ) -> std::result::Result<BackendRun, BackendError> {
         let mut responses = self.responses.lock().unwrap();
         let queue = responses
             .get_mut(&request.branch)
             .expect("missing fake backend queue");
-        let next = queue.pop_front().expect("missing fake backend response");
-        next.map(|text| BackendCompletion { text })
+        queue.pop_front().expect("missing fake backend response")
     }
 }
 

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use coco_llm::Provider;
+use coco_mem::Tool;
 
 #[derive(Debug, Parser)]
 #[command(name = "coco-cli")]
@@ -68,6 +69,9 @@ pub struct SessionCreateCommand {
 
     #[arg(long)]
     pub max_tokens: Option<u64>,
+
+    #[arg(long = "tool", value_enum)]
+    pub tools: Vec<CliTool>,
 }
 
 #[derive(Debug, Args)]
@@ -113,6 +117,12 @@ pub struct SessionRebaseCommand {
 
     #[arg(long)]
     pub clear_max_tokens: bool,
+
+    #[arg(long = "tool", value_enum, conflicts_with = "clear_tools")]
+    pub tools: Vec<CliTool>,
+
+    #[arg(long)]
+    pub clear_tools: bool,
 }
 
 #[derive(Debug, Args)]
@@ -178,6 +188,48 @@ impl From<CliProvider> for Provider {
         match value {
             CliProvider::Openai => Provider::OpenAi,
             CliProvider::Anthropic => Provider::Anthropic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum CliTool {
+    Bash,
+}
+
+impl CliTool {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "bash" => Some(Self::Bash),
+            _ => None,
+        }
+    }
+
+    pub fn to_tool(self) -> Tool {
+        match self {
+            Self::Bash => Tool {
+                name: "bash".to_owned(),
+                description: "Run a bash command.".to_owned(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The bash command to execute."
+                        },
+                        "workdir": {
+                            "type": "string",
+                            "description": "Optional working directory."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Optional timeout in milliseconds."
+                        }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }),
+            },
         }
     }
 }

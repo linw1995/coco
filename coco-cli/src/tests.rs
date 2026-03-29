@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use coco_llm::coco_mem::{Anchor, Kind, NewNode, PromptAnchor, Role, Store};
 use coco_llm::{
-    BackendCompletion, BackendError, CompletionBackend, Provider, ResolvedCompletionRequest,
-    SessionSnapshot,
+    BackendError, BackendEvent, BackendRun, CompletionBackend, Provider, ResolvedCompletionRequest,
+    ResolvedSession,
 };
 use coco_mem::SessionState;
 use serde_json::{Value, json};
@@ -25,7 +25,7 @@ use crate::{
 };
 
 type FakeResponseQueue =
-    Arc<Mutex<HashMap<String, VecDeque<std::result::Result<String, BackendError>>>>>;
+    Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendRun, BackendError>>>>>;
 
 #[derive(Debug, Clone)]
 struct FakeBackend {
@@ -44,7 +44,12 @@ impl FakeBackend {
                         .map(|response| {
                             response
                                 .as_ref()
-                                .map(|text| (*text).to_owned())
+                                .map(|text| {
+                                    BackendRun::succeeded(
+                                        (*text).to_owned(),
+                                        vec![BackendEvent::AssistantText((*text).to_owned())],
+                                    )
+                                })
                                 .map_err(Clone::clone)
                         })
                         .collect(),
@@ -62,15 +67,14 @@ impl FakeBackend {
 impl CompletionBackend for FakeBackend {
     async fn complete(
         &self,
-        _session: SessionSnapshot,
+        _session: ResolvedSession,
         request: ResolvedCompletionRequest,
-    ) -> std::result::Result<BackendCompletion, BackendError> {
+    ) -> std::result::Result<BackendRun, BackendError> {
         let mut responses = self.responses.lock().unwrap();
         let queue = responses
             .get_mut(&request.branch)
             .expect("missing fake backend queue");
-        let next = queue.pop_front().expect("missing fake backend response");
-        next.map(|text| BackendCompletion { text })
+        queue.pop_front().expect("missing fake backend response")
     }
 }
 
@@ -94,6 +98,7 @@ fn session_create_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
                 prompt: "".to_owned(),
                 temperature: Some(0.2),
                 max_tokens: Some(64),
+                tools: vec![],
             }),
         }),
     }
@@ -145,6 +150,8 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
                 clear_temperature: true,
                 max_tokens: Some(256),
                 clear_max_tokens: false,
+                tools: vec![],
+                clear_tools: false,
             }),
         }),
     }
@@ -573,6 +580,7 @@ async fn session_get_returns_state_and_visible_anchor() {
     assert_eq!(value["anchor"]["prompt"], "");
     assert_eq!(value["anchor"]["temperature"], json!(0.2));
     assert_eq!(value["anchor"]["max_tokens"], json!(64));
+    assert_eq!(value["anchor"]["tools"], json!([]));
 
     let store = open_store(&store_path).unwrap();
     assert_eq!(
@@ -632,6 +640,7 @@ async fn session_rebase_updates_visible_session_config() {
     assert_eq!(value["anchor"]["prompt"], "Start with a plan.");
     assert_eq!(value["anchor"]["temperature"], Value::Null);
     assert_eq!(value["anchor"]["max_tokens"], json!(256));
+    assert_eq!(value["anchor"]["tools"], json!([]));
 }
 
 #[tokio::test]
@@ -875,6 +884,7 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
                     max_tokens: Some(64),
+                    tools: vec![],
                 })
                 .unwrap()
             },
@@ -882,4 +892,33 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
 
     assert_eq!(config.provider, Provider::Anthropic);
     assert_eq!(config.model, "claude-sonnet-4-20250514");
+}
+
+#[test]
+fn resolve_session_config_reads_tools_from_env() {
+    let config = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(with_coco_env_async(
+            &[
+                ("COCO_PROVIDER", "openai"),
+                ("COCO_MODEL", "gpt-4.1-mini"),
+                ("COCO_TOOLS", "bash"),
+            ],
+            || async {
+                resolve_session_config(SessionCreateCommand {
+                    branch: "main".to_owned(),
+                    system_prompt: "You are helpful.".to_owned(),
+                    prompt: "".to_owned(),
+                    temperature: Some(0.2),
+                    max_tokens: Some(64),
+                    tools: vec![],
+                })
+                .unwrap()
+            },
+        ));
+
+    assert_eq!(config.tools.len(), 1);
+    assert_eq!(config.tools[0].name, "bash");
 }
