@@ -2867,19 +2867,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_tool_runtime_allows_writes_and_outside_workdir() {
-        let runtime = bash_tool::runtime_tool(
-            bash_tool(),
-            std::env::current_dir().unwrap().canonicalize().unwrap(),
-        );
+    async fn bash_tool_runtime_allows_writes_within_configured_workspace() {
         let temp_root = tempfile::tempdir().unwrap();
+        let runtime = bash_tool::runtime_tool(bash_tool(), temp_root.path().to_path_buf());
+        let previous = std::env::var_os("COCO_BASH_SANDBOX");
+        unsafe {
+            std::env::set_var("COCO_BASH_SANDBOX", "off");
+        }
         let output = runtime
             .call(format!(
                 r#"{{"command":"printf 'hello' > trace.txt; cat trace.txt","workdir":"{}"}}"#,
                 temp_root.path().display()
             ))
-            .await
-            .unwrap();
+            .await;
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("COCO_BASH_SANDBOX", value);
+            },
+            None => unsafe {
+                std::env::remove_var("COCO_BASH_SANDBOX");
+            },
+        }
+        let output = output.unwrap();
         assert!(output.contains("exit_status: 0"));
         assert!(output.contains("stdout:\nhello"));
         assert_eq!(

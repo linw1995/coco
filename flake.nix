@@ -46,6 +46,8 @@ rec {
               grcov
 
               cargo-nextest
+
+              nono
             ];
           };
         };
