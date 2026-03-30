@@ -60,6 +60,13 @@ impl Store for MemoryStore {
             .map(str::to_owned)
     }
 
+    fn delete_branch(&self, name: &str) -> Result<()> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .delete_branch(name)
+    }
+
     fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {
         self.inner
             .write()

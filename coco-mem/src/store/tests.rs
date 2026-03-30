@@ -462,6 +462,34 @@ where
     assert_eq!(state, SessionState::Active);
 }
 
+fn assert_delete_branch_removes_branch_and_session_state<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let branch_head = store.fork("main", &root_id).unwrap();
+
+    store.delete_branch("main").unwrap();
+
+    let err = store.get_branch_head("main").unwrap_err();
+    assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
+    let err = store.get_session_state("main").unwrap_err();
+    assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
+    assert_eq!(store.get_node(&branch_head).unwrap().id, branch_head);
+}
+
+fn assert_delete_branch_rejects_missing_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+
+    let err = store.delete_branch("missing").unwrap_err();
+
+    assert!(matches!(err, Error::BranchNotFound { name } if name == "missing"));
+}
+
 fn assert_set_session_state_updates_value<F>()
 where
     F: TestStoreFactory,
@@ -1151,6 +1179,16 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
+            fn delete_branch_removes_branch_and_session_state() {
+                assert_delete_branch_removes_branch_and_session_state::<$factory>();
+            }
+
+            #[test]
+            fn delete_branch_rejects_missing_branch() {
+                assert_delete_branch_rejects_missing_branch::<$factory>();
+            }
+
+            #[test]
             fn set_session_state_updates_value() {
                 assert_set_session_state_updates_value::<$factory>();
             }
@@ -1411,6 +1449,23 @@ fn open_replays_paused_closed_state() {
             reason: PauseReason::Closed,
         }
     );
+}
+
+#[test]
+fn open_does_not_restore_deleted_branch() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    let branch_head = store.fork("main", &root_id).unwrap();
+
+    store.delete_branch("main").unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+    let err = reopened.get_branch_head("main").unwrap_err();
+    assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
+    let err = reopened.get_session_state("main").unwrap_err();
+    assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
+    assert_eq!(reopened.get_node(&branch_head).unwrap().id, branch_head);
 }
 
 #[test]

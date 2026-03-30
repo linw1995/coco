@@ -24,6 +24,9 @@ pub trait Store: Clone + Send + Sync + 'static {
     /// Returns the current head node identifier for a branch.
     fn get_branch_head(&self, name: &str) -> StoreResult<String>;
 
+    /// Deletes a branch head and its session state.
+    fn delete_branch(&self, name: &str) -> StoreResult<()>;
+
     /// Moves a branch head when the expected current head matches.
     fn set_branch_head(
         &self,

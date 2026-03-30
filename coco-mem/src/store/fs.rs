@@ -116,6 +116,19 @@ impl Persistence {
         }
     }
 
+    pub fn persist_branch_deletion(&self, branch: &str, state: &StoreState) -> Result<()> {
+        let branch_path = self.branch_path(branch);
+        ensure!(
+            branch_path.is_file(),
+            CorruptedStoreSnafu {
+                path: branch_path.clone(),
+                message: "missing branch view file".to_owned(),
+            }
+        );
+        fs::remove_file(&branch_path).context(WriteStoreDirectorySnafu { path: branch_path })?;
+        self.persist_sessions(state)
+    }
+
     pub fn rewrite_branch_view(
         &self,
         branch: &str,
@@ -338,6 +351,14 @@ impl Store for FsStore {
             .expect("store lock poisoned")
             .get_branch_head(name)
             .map(str::to_owned)
+    }
+
+    fn delete_branch(&self, name: &str) -> Result<()> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        temp.delete_branch(name)?;
+        self.persistence.persist_branch_deletion(name, &temp)?;
+        state.delete_branch(name)
     }
 
     fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {

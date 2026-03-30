@@ -170,6 +170,16 @@ impl StoreState {
             })
     }
 
+    pub fn delete_branch(&mut self, name: &str) -> Result<()> {
+        self.branches.remove(name).context(BranchNotFoundSnafu {
+            name: name.to_owned(),
+        })?;
+        self.sessions.remove(name).context(BranchNotFoundSnafu {
+            name: name.to_owned(),
+        })?;
+        Ok(())
+    }
+
     pub fn ancestry(&self, head_ref: &str) -> Result<Vec<&Node>> {
         let mut node = self.resolve_ref(head_ref)?;
         let mut ancestry = vec![];
