@@ -7,7 +7,12 @@ use coco_mem::Tool;
 #[derive(Debug, Parser)]
 #[command(name = "coco-cli")]
 pub struct Cli {
-    #[arg(long, global = true, default_value = ".coco-store")]
+    #[arg(
+        long,
+        global = true,
+        env = "COCO_STORE_PATH",
+        default_value = ".coco-store"
+    )]
     pub store_path: PathBuf,
 
     #[command(subcommand)]
@@ -22,7 +27,7 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct PromptCommand {
-    #[arg(long, default_value = "main")]
+    #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
 
     #[arg(value_name = "TEXT")]
@@ -55,7 +60,7 @@ pub enum SessionSubcommand {
 
 #[derive(Debug, Args)]
 pub struct SessionCreateCommand {
-    #[arg(long, default_value = "main")]
+    #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
 
     #[arg(long)]
@@ -85,13 +90,13 @@ pub struct SessionForkCommand {
 
 #[derive(Debug, Args)]
 pub struct SessionBranchCommand {
-    #[arg(long, default_value = "main")]
+    #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
 }
 
 #[derive(Debug, Args)]
 pub struct SessionRebaseCommand {
-    #[arg(long, default_value = "main")]
+    #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
 
     #[arg(long)]
@@ -127,7 +132,7 @@ pub struct SessionRebaseCommand {
 
 #[derive(Debug, Args)]
 pub struct SessionPrCommand {
-    #[arg(long, default_value = "main")]
+    #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
 
     #[arg(long)]
@@ -136,7 +141,7 @@ pub struct SessionPrCommand {
 
 #[derive(Debug, Args)]
 pub struct SessionCloseCommand {
-    #[arg(long, default_value = "main")]
+    #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
 
     #[arg(long, default_value = "")]
@@ -145,7 +150,7 @@ pub struct SessionCloseCommand {
 
 #[derive(Debug, Args)]
 pub struct SessionMergeCommand {
-    #[arg(long, default_value = "main")]
+    #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
 
     #[arg(long)]
@@ -157,7 +162,7 @@ pub struct SessionMergeCommand {
 
 #[derive(Debug, Args)]
 pub struct SessionFeedbackCommand {
-    #[arg(long, default_value = "main")]
+    #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
 
     #[arg(long)]

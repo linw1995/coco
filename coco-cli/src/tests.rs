@@ -15,7 +15,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     Cli,
-    app::{resolve_session_config, run_with_backend},
+    app::{resolve_session_config, run_forwarded_with_services, run_with_backend},
     cli::{
         Command, PromptCommand, SessionBranchCommand, SessionCloseCommand, SessionCommand,
         SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand, SessionMergeCommand,
@@ -864,6 +864,87 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         anchor.as_prompt().expect("expected prompt anchor").prompt,
         "address review note"
     );
+}
+
+#[tokio::test]
+async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("draft")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let llm = Arc::new(coco_llm::LlmService::new(
+        store.clone(),
+        FakeBackend::with_responses(&[("draft", &[Ok("world")])]),
+    ));
+
+    let response = run_forwarded_with_services(
+        &["prompt".to_owned(), "hello".to_owned()],
+        &[],
+        Some("draft"),
+        None,
+        &store,
+        &llm,
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 0);
+    assert_eq!(response.stdout, "world\n");
+    assert!(response.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let llm = Arc::new(coco_llm::LlmService::new(
+        store.clone(),
+        FakeBackend::with_responses(&[("main", &[Ok("main-response")])]),
+    ));
+
+    let response = run_forwarded_with_services(
+        &[
+            "prompt".to_owned(),
+            "--branch".to_owned(),
+            "main".to_owned(),
+            "hello".to_owned(),
+        ],
+        &[],
+        Some("draft"),
+        None,
+        &store,
+        &llm,
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 0);
+    assert_eq!(response.stdout, "main-response\n");
+    assert!(response.stderr.is_empty());
 }
 
 #[test]

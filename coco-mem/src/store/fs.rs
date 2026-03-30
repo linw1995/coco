@@ -296,6 +296,10 @@ impl FsStore {
         })
     }
 
+    pub fn path(&self) -> &Path {
+        &self.persistence.dir
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot_state(&self) -> StoreState {
         self.inner.read().expect("store lock poisoned").clone()
@@ -418,6 +422,10 @@ impl Store for FsStore {
         }
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
+    }
+
+    fn runtime_store_path(&self) -> Option<PathBuf> {
+        Some(self.path().to_path_buf())
     }
 }
 

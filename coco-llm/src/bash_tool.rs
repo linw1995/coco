@@ -6,13 +6,20 @@ use std::process::Stdio;
 use coco_mem::Tool;
 use serde_json::Value;
 use snafu::prelude::*;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
 use tokio::process::Command;
+
+use crate::{
+    BashToolContext, COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_STORE_PATH_ENV,
+    CocoCliRuntimeRequest, CocoCliRuntimeResponse,
+};
 
 #[derive(Debug, Clone)]
 pub struct BashToolRuntime {
     definition: Tool,
     workspace_root: PathBuf,
+    context: BashToolContext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +36,14 @@ struct BashCommandRequest {
     workspace_root: PathBuf,
     sandbox_mode: BashSandboxMode,
     timeout_ms: Option<u64>,
+    context: BashToolContext,
+}
+
+#[derive(Debug)]
+struct CocoCliRuntimeServer {
+    socket_dir: PathBuf,
+    socket_path: PathBuf,
+    task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Snafu)]
@@ -38,6 +53,9 @@ pub enum BashToolError {
 
     #[snafu(display("failed to canonicalize workspace root: {source}"))]
     CanonicalizeWorkspaceRoot { source: io::Error },
+
+    #[snafu(display("failed to resolve runtime root: {source}"))]
+    ResolveRuntimeRoot { source: io::Error },
 
     #[snafu(display(
         "bash tool sandbox mode must be one of \"auto\", \"nono\", or \"off\", got {value:?}"
@@ -49,6 +67,9 @@ pub enum BashToolError {
 
     #[snafu(display("bash tool workspace override must point to an existing directory"))]
     InvalidWorkspaceOverride,
+
+    #[snafu(display("bash tool runtime root must stay isolated from the configured workspace"))]
+    RuntimeRootOverlapsWorkspace,
 
     #[snafu(display("bash tool expects a JSON object input"))]
     InvalidInputType,
@@ -88,6 +109,12 @@ pub enum BashToolError {
 
     #[snafu(display("bash tool could not read stderr: {source}"))]
     ReadStderr { source: io::Error },
+
+    #[snafu(display("bash tool could not bind coco-cli runtime socket: {source}"))]
+    BindRuntimeSocket { source: io::Error },
+
+    #[snafu(display("bash tool runtime socket server task failed: {source}"))]
+    JoinRuntimeSocketTask { source: tokio::task::JoinError },
 }
 
 pub fn resolve_workspace_root() -> std::result::Result<PathBuf, BashToolError> {
@@ -119,10 +146,15 @@ pub fn resolve_workspace_root() -> std::result::Result<PathBuf, BashToolError> {
     Ok(path)
 }
 
-pub fn runtime_tool(definition: Tool, workspace_root: PathBuf) -> Box<dyn rig::tool::ToolDyn> {
+pub fn runtime_tool(
+    definition: Tool,
+    workspace_root: PathBuf,
+    context: BashToolContext,
+) -> Box<dyn rig::tool::ToolDyn> {
     Box::new(BashToolRuntime {
         definition,
         workspace_root,
+        context,
     })
 }
 
@@ -145,9 +177,36 @@ fn path_is_within_workspace(path: &Path, workspace_root: &Path) -> bool {
     path == workspace_root || path.starts_with(workspace_root)
 }
 
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn resolve_runtime_root(workspace_root: &Path) -> std::result::Result<PathBuf, BashToolError> {
+    let current_dir = std::env::current_dir().context(ResolveRuntimeRootSnafu)?;
+    let runtime_root = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                path
+            } else {
+                current_dir.join(path)
+            }
+        }
+        None => std::env::temp_dir(),
+    }
+    .join("coco");
+
+    if paths_overlap(&runtime_root, workspace_root) {
+        return RuntimeRootOverlapsWorkspaceSnafu.fail();
+    }
+
+    Ok(runtime_root)
+}
+
 fn resolve_bash_request(
     args: &Value,
     workspace_root: &Path,
+    context: BashToolContext,
 ) -> std::result::Result<BashCommandRequest, BashToolError> {
     let object = args.as_object().context(InvalidInputTypeSnafu)?;
     let command = object
@@ -178,6 +237,7 @@ fn resolve_bash_request(
         workspace_root: workspace_root.to_path_buf(),
         sandbox_mode: resolve_sandbox_mode()?,
         timeout_ms,
+        context,
     })
 }
 
@@ -242,50 +302,157 @@ fn bash_execution_spec(command: &str) -> ExecutionSpec {
     }
 }
 
-fn nono_execution_spec(nono: PathBuf, request: &BashCommandRequest) -> ExecutionSpec {
+fn nono_execution_spec(
+    nono: PathBuf,
+    request: &BashCommandRequest,
+    extra_allow_path: Option<&Path>,
+) -> ExecutionSpec {
+    let mut args = vec![
+        OsString::from("run"),
+        OsString::from("--allow"),
+        request.workspace_root.as_os_str().to_owned(),
+    ];
+    if let Some(extra_allow_path) = extra_allow_path {
+        args.push(OsString::from("--allow"));
+        args.push(extra_allow_path.as_os_str().to_owned());
+    }
+    args.extend([
+        OsString::from("--"),
+        OsString::from("bash"),
+        OsString::from("-lc"),
+        OsString::from(request.command.to_owned()),
+    ]);
     ExecutionSpec {
         program: nono,
-        args: vec![
-            OsString::from("run"),
-            OsString::from("--allow"),
-            request.workspace_root.as_os_str().to_owned(),
-            OsString::from("--"),
-            OsString::from("bash"),
-            OsString::from("-lc"),
-            OsString::from(request.command.to_owned()),
-        ],
+        args,
     }
 }
 
 fn resolve_execution_spec(
     request: &BashCommandRequest,
     path_env: Option<&OsStr>,
+    extra_allow_path: Option<&Path>,
 ) -> std::result::Result<ExecutionSpec, BashToolError> {
     match request.sandbox_mode {
         BashSandboxMode::Off => Ok(bash_execution_spec(&request.command)),
         BashSandboxMode::Auto => match find_program_in_path("nono", path_env) {
-            Some(nono) => Ok(nono_execution_spec(nono, request)),
+            Some(nono) => Ok(nono_execution_spec(nono, request, extra_allow_path)),
             None => Ok(bash_execution_spec(&request.command)),
         },
         BashSandboxMode::Nono => {
             let nono = find_program_in_path("nono", path_env).context(NonoNotFoundSnafu)?;
-            Ok(nono_execution_spec(nono, request))
+            Ok(nono_execution_spec(nono, request, extra_allow_path))
         }
+    }
+}
+
+fn next_runtime_socket_dir(runtime_root: &Path) -> PathBuf {
+    runtime_root.join(nanoid::nanoid!(10))
+}
+
+async fn start_coco_cli_runtime_server(
+    workspace_root: &Path,
+    context: &BashToolContext,
+) -> std::result::Result<Option<CocoCliRuntimeServer>, BashToolError> {
+    let Some(cli_bridge) = context.cli_bridge.clone() else {
+        return Ok(None);
+    };
+
+    let runtime_root = resolve_runtime_root(workspace_root)?;
+    std::fs::create_dir_all(&runtime_root).context(BindRuntimeSocketSnafu)?;
+    let socket_dir = next_runtime_socket_dir(&runtime_root);
+    std::fs::create_dir_all(&socket_dir).context(BindRuntimeSocketSnafu)?;
+    let socket_path = socket_dir.join("coco-cli.sock");
+    let listener = UnixListener::bind(&socket_path).context(BindRuntimeSocketSnafu)?;
+    let task = tokio::spawn(async move {
+        loop {
+            let accepted = listener.accept().await;
+            let Ok((mut stream, _)) = accepted else {
+                break;
+            };
+            let cli_bridge = cli_bridge.clone();
+            tokio::spawn(async move {
+                let mut input = Vec::new();
+                let response = match stream.read_to_end(&mut input).await {
+                    Ok(_) => match serde_json::from_slice::<CocoCliRuntimeRequest>(&input) {
+                        Ok(request) => match cli_bridge.execute_coco_cli(request).await {
+                            Ok(response) => response,
+                            Err(error) => CocoCliRuntimeResponse {
+                                exit_code: 1,
+                                stdout: String::new(),
+                                stderr: error.to_string(),
+                            },
+                        },
+                        Err(error) => CocoCliRuntimeResponse {
+                            exit_code: 2,
+                            stdout: String::new(),
+                            stderr: format!("invalid coco-cli runtime request: {error}"),
+                        },
+                    },
+                    Err(error) => CocoCliRuntimeResponse {
+                        exit_code: 2,
+                        stdout: String::new(),
+                        stderr: format!("failed to read coco-cli runtime request: {error}"),
+                    },
+                };
+                if let Ok(payload) = serde_json::to_vec(&response) {
+                    let _ = stream.write_all(&payload).await;
+                }
+            });
+        }
+    });
+
+    Ok(Some(CocoCliRuntimeServer {
+        socket_dir,
+        socket_path,
+        task,
+    }))
+}
+
+impl CocoCliRuntimeServer {
+    async fn shutdown(self) -> std::result::Result<(), BashToolError> {
+        self.task.abort();
+        match self.task.await {
+            Ok(()) => {}
+            Err(source) if source.is_cancelled() => {}
+            Err(source) => return Err(BashToolError::JoinRuntimeSocketTask { source }),
+        }
+        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_dir(&self.socket_dir);
+        Ok(())
     }
 }
 
 async fn execute_bash_command(
     request: BashCommandRequest,
 ) -> std::result::Result<String, BashToolError> {
-    let execution = resolve_execution_spec(&request, None)?;
-    let mut child = Command::new(&execution.program)
+    let runtime_server =
+        start_coco_cli_runtime_server(&request.workspace_root, &request.context).await?;
+    let execution = resolve_execution_spec(
+        &request,
+        None,
+        runtime_server
+            .as_ref()
+            .map(|runtime_server| runtime_server.socket_dir.as_path()),
+    )?;
+    let mut command = Command::new(&execution.program);
+    command
         .args(&execution.args)
         .current_dir(&request.workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .context(SpawnProcessSnafu)?;
+        .env_remove(COCO_SESSION_BRANCH_ENV)
+        .env_remove(COCO_STORE_PATH_ENV)
+        .env_remove(COCO_CLI_RUNTIME_SOCKET_ENV)
+        .env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch);
+    if let Some(store_path) = &request.context.store_path {
+        command.env(COCO_STORE_PATH_ENV, store_path);
+    }
+    if let Some(runtime_server) = &runtime_server {
+        command.env(COCO_CLI_RUNTIME_SOCKET_ENV, &runtime_server.socket_path);
+    }
+    let mut child = command.spawn().context(SpawnProcessSnafu)?;
 
     let stdout_handle = tokio::spawn(read_child_pipe(child.stdout.take()));
     let stderr_handle = tokio::spawn(read_child_pipe(child.stderr.take()));
@@ -310,6 +477,9 @@ async fn execute_bash_command(
     let stdout = stdout.context(ReadStdoutSnafu)?;
     let stderr = stderr_handle.await.context(JoinStderrSnafu)?;
     let stderr = stderr.context(ReadStderrSnafu)?;
+    if let Some(runtime_server) = runtime_server {
+        runtime_server.shutdown().await?;
+    }
 
     Ok(format_bash_result(
         status.as_ref().and_then(std::process::ExitStatus::code),
@@ -344,10 +514,11 @@ impl rig::tool::ToolDyn for BashToolRuntime {
         use rig::tool::ToolError;
 
         let workspace_root = self.workspace_root.clone();
+        let context = self.context.clone();
         Box::pin(async move {
             let result = async {
                 let args: Value = serde_json::from_str(&args).context(ParseArgsSnafu)?;
-                let request = resolve_bash_request(&args, &workspace_root)?;
+                let request = resolve_bash_request(&args, &workspace_root, context)?;
                 execute_bash_command(request).await
             }
             .await;
@@ -363,11 +534,41 @@ impl rig::tool::ToolDyn for BashToolRuntime {
 mod tests {
     use std::future::Future;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
 
+    use async_trait::async_trait;
+    use tokio::net::UnixStream;
     use tokio::sync::Mutex;
 
     use super::*;
+
+    fn test_context() -> BashToolContext {
+        BashToolContext {
+            session_branch: "main".to_owned(),
+            store_path: None,
+            cli_bridge: None,
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeCliBridge {
+        requests: Arc<Mutex<Vec<CocoCliRuntimeRequest>>>,
+    }
+
+    #[async_trait]
+    impl crate::BashToolCliBridge for FakeCliBridge {
+        async fn execute_coco_cli(
+            &self,
+            request: CocoCliRuntimeRequest,
+        ) -> std::result::Result<CocoCliRuntimeResponse, crate::BashToolCliBridgeError> {
+            self.requests.lock().await.push(request);
+            Ok(CocoCliRuntimeResponse {
+                exit_code: 0,
+                stdout: "delegated".to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
 
     async fn with_env_async<T, F, Fut>(entries: &[(&str, Option<&OsStr>)], run: F) -> T
     where
@@ -457,6 +658,50 @@ mod tests {
         assert_eq!(resolved, nested.canonicalize().unwrap());
     }
 
+    #[tokio::test]
+    async fn resolve_runtime_root_prefers_xdg_runtime_dir() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+
+        let resolved = with_env_async(
+            &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],
+            || async { resolve_runtime_root(workspace.path()) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, runtime.path().join("coco"));
+    }
+
+    #[tokio::test]
+    async fn resolve_runtime_root_falls_back_to_temp_dir() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let resolved = with_env_async(&[("XDG_RUNTIME_DIR", None)], || async {
+            resolve_runtime_root(workspace.path())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, std::env::temp_dir().join("coco"));
+    }
+
+    #[tokio::test]
+    async fn resolve_runtime_root_rejects_overlap_with_workspace() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let workspace = temp_root.path().join("coco");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let error = with_env_async(
+            &[("XDG_RUNTIME_DIR", Some(temp_root.path().as_os_str()))],
+            || async { resolve_runtime_root(&workspace) },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, BashToolError::RuntimeRootOverlapsWorkspace));
+    }
+
     #[test]
     fn resolve_execution_spec_uses_nono_when_available_in_nono_mode() {
         let temp_root = tempfile::tempdir().unwrap();
@@ -466,10 +711,43 @@ mod tests {
             workspace_root: temp_root.path().to_path_buf(),
             sandbox_mode: BashSandboxMode::Nono,
             timeout_ms: None,
+            context: test_context(),
         };
         let path_env = OsString::from("/tmp/nono-bin:/tmp/bash-bin");
-        let spec = resolve_execution_spec(&request, Some(path_env.as_os_str()));
+        let spec = resolve_execution_spec(&request, Some(path_env.as_os_str()), None);
         assert!(matches!(spec, Err(BashToolError::NonoNotFound)));
+    }
+
+    #[test]
+    fn resolve_execution_spec_adds_runtime_socket_allow_path() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let request = BashCommandRequest {
+            command: "pwd".to_owned(),
+            workdir: temp_root.path().to_path_buf(),
+            workspace_root: temp_root.path().to_path_buf(),
+            sandbox_mode: BashSandboxMode::Off,
+            timeout_ms: None,
+            context: test_context(),
+        };
+        let nono = PathBuf::from("/bin/nono");
+        let runtime_dir = temp_root.path().join(".coco-runtime").join("socket-dir");
+        let spec = nono_execution_spec(nono.clone(), &request, Some(&runtime_dir));
+
+        assert_eq!(spec.program, nono);
+        assert_eq!(
+            spec.args,
+            vec![
+                OsString::from("run"),
+                OsString::from("--allow"),
+                temp_root.path().as_os_str().to_owned(),
+                OsString::from("--allow"),
+                runtime_dir.as_os_str().to_owned(),
+                OsString::from("--"),
+                OsString::from("bash"),
+                OsString::from("-lc"),
+                OsString::from("pwd"),
+            ]
+        );
     }
 
     #[test]
@@ -481,14 +759,14 @@ mod tests {
             "workdir": outside.path(),
         });
 
-        let error = resolve_bash_request(&args, workspace.path()).unwrap_err();
+        let error = resolve_bash_request(&args, workspace.path(), test_context()).unwrap_err();
         assert!(matches!(error, BashToolError::WorkdirOutsideWorkspace));
     }
 
     #[tokio::test]
     async fn bash_runtime_off_mode_allows_writes_inside_workspace() {
         let workspace = tempfile::tempdir().unwrap();
-        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf());
+        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
 
         let output = with_env_async(
             &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
@@ -519,7 +797,7 @@ mod tests {
         let bash_path = resolve_bash_path();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
-        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf());
+        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
         let output = with_env_async(
@@ -550,7 +828,7 @@ mod tests {
         let bash_path = resolve_bash_path();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
-        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf());
+        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
         let error = with_env_async(
@@ -588,7 +866,7 @@ mod tests {
                 observed_args.display()
             ),
         );
-        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf());
+        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
         let output = with_env_async(
@@ -617,5 +895,92 @@ mod tests {
         assert!(args.contains("--"));
         assert!(args.contains("bash"));
         assert!(args.contains("-lc"));
+    }
+
+    #[tokio::test]
+    async fn bash_runtime_clears_stale_runtime_env_before_injecting_context() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = runtime_tool(
+            temp_tool(),
+            workspace.path().to_path_buf(),
+            BashToolContext {
+                session_branch: "draft".to_owned(),
+                store_path: None,
+                cli_bridge: None,
+            },
+        );
+
+        let output = with_env_async(
+            &[
+                (COCO_SESSION_BRANCH_ENV, Some(OsStr::new("stale-branch"))),
+                (COCO_STORE_PATH_ENV, Some(OsStr::new("/tmp/stale-store"))),
+                (
+                    COCO_CLI_RUNTIME_SOCKET_ENV,
+                    Some(OsStr::new("/tmp/stale-runtime.sock")),
+                ),
+                ("COCO_BASH_SANDBOX", Some(OsStr::new("off"))),
+            ],
+            || async {
+                runtime
+                    .call(format!(
+                        r#"{{"command":"printf '%s|%s|%s' \"$COCO_BRANCH\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\"","workdir":"{}"}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("stdout:\ndraft||"));
+    }
+
+    #[tokio::test]
+    async fn coco_cli_runtime_socket_forwards_requests_to_bridge() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let bridge = crate::BashToolCliBridgeHandle::new(Arc::new(FakeCliBridge {
+            requests: requests.clone(),
+        }));
+        let runtime_store = workspace.path().join("runtime-store");
+        let context = BashToolContext {
+            session_branch: "draft".to_owned(),
+            store_path: Some(runtime_store.clone()),
+            cli_bridge: Some(bridge),
+        };
+        let server = with_env_async(
+            &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],
+            || async { start_coco_cli_runtime_server(workspace.path(), &context).await },
+        )
+        .await
+        .unwrap()
+        .expect("runtime server should be started");
+
+        let request = CocoCliRuntimeRequest {
+            args: vec!["prompt".to_owned(), "hello".to_owned()],
+            stdin: b"stdin".to_vec(),
+            branch_env: Some("draft".to_owned()),
+            store_path_env: Some(runtime_store.display().to_string()),
+        };
+        let payload = serde_json::to_vec(&request).unwrap();
+
+        let mut stream = UnixStream::connect(&server.socket_path).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output).await.unwrap();
+        let response = serde_json::from_slice::<CocoCliRuntimeResponse>(&output).unwrap();
+
+        assert_eq!(response.exit_code, 0);
+        assert_eq!(response.stdout, "delegated");
+        assert!(response.stderr.is_empty());
+
+        let forwarded = requests.lock().await;
+        assert_eq!(forwarded.as_slice(), &[request]);
+        assert!(server.socket_path.starts_with(runtime.path().join("coco")));
+        assert!(!server.socket_path.starts_with(workspace.path()));
+
+        server.shutdown().await.unwrap();
     }
 }

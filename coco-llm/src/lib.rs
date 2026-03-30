@@ -1,6 +1,7 @@
 mod bash_tool;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ use coco_mem::{
     Anchor, AnchorPayload, Kind, MemoryStore, NewNode, NodeMetadata, PauseReason, PromptAnchor,
     Role, SessionAnchor, SessionState, Store, StoreError, Tool, ToolResult, ToolUse,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::IntoError;
 use snafu::prelude::*;
@@ -16,6 +18,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use coco_mem;
 pub use coco_mem::SessionAnchorPatch as SessionConfigPatch;
+
+pub const COCO_SESSION_BRANCH_ENV: &str = "COCO_BRANCH";
+pub const COCO_STORE_PATH_ENV: &str = "COCO_STORE_PATH";
+pub const COCO_CLI_RUNTIME_SOCKET_ENV: &str = "COCO_CLI_RUNTIME_SOCKET";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -165,6 +171,7 @@ pub struct ResolvedSession {
     pub config: SessionModelConfig,
     pub conversation: Vec<ConversationEntry>,
     pub provider_history: Vec<rig::completion::message::Message>,
+    pub bash_tool_context: BashToolContext,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +182,66 @@ pub struct ResolvedCompletionRequest {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CocoCliRuntimeRequest {
+    pub args: Vec<String>,
+    pub stdin: Vec<u8>,
+    pub branch_env: Option<String>,
+    pub store_path_env: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CocoCliRuntimeResponse {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Snafu, Clone, PartialEq, Eq)]
+pub enum BashToolCliBridgeError {
+    #[snafu(display("coco-cli runtime bridge is unavailable"))]
+    Unavailable,
+}
+
+#[async_trait]
+pub trait BashToolCliBridge: Send + Sync {
+    async fn execute_coco_cli(
+        &self,
+        request: CocoCliRuntimeRequest,
+    ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError>;
+}
+
+#[derive(Clone)]
+pub struct BashToolCliBridgeHandle {
+    inner: Arc<dyn BashToolCliBridge>,
+}
+
+impl BashToolCliBridgeHandle {
+    pub fn new(inner: Arc<dyn BashToolCliBridge>) -> Self {
+        Self { inner }
+    }
+
+    pub async fn execute_coco_cli(
+        &self,
+        request: CocoCliRuntimeRequest,
+    ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError> {
+        self.inner.execute_coco_cli(request).await
+    }
+}
+
+impl std::fmt::Debug for BashToolCliBridgeHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BashToolCliBridgeHandle(..)")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BashToolContext {
+    pub session_branch: String,
+    pub store_path: Option<PathBuf>,
+    pub cli_bridge: Option<BashToolCliBridgeHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -283,6 +350,7 @@ where
 {
     store: S,
     backend: B,
+    bash_tool_cli_bridge: Option<BashToolCliBridgeHandle>,
     branch_locks: BranchLockTable,
     workflow_lock: WorkflowLock,
 }
@@ -356,9 +424,15 @@ where
         Self {
             store,
             backend,
+            bash_tool_cli_bridge: None,
             branch_locks: Arc::new(Mutex::new(HashMap::new())),
             workflow_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub fn with_bash_tool_cli_bridge(mut self, bridge: BashToolCliBridgeHandle) -> Self {
+        self.bash_tool_cli_bridge = Some(bridge);
+        self
     }
 
     pub fn store(&self) -> &S {
@@ -804,6 +878,11 @@ where
             },
             conversation,
             provider_history: rig_messages_from_tracked_entries(&tracked_entries),
+            bash_tool_context: BashToolContext {
+                session_branch: branch.to_owned(),
+                store_path: self.store.runtime_store_path(),
+                cli_bridge: self.bash_tool_cli_bridge.clone(),
+            },
         })
     }
 
@@ -1000,15 +1079,18 @@ where
 const DEFAULT_AGENT_MAX_TURNS: usize = 100;
 
 fn build_runtime_tool_set(
-    tools: &[Tool],
+    session: &ResolvedSession,
     workspace_root: std::path::PathBuf,
 ) -> std::result::Result<rig::tool::ToolSet, BackendError> {
-    let runtime_tools = tools
+    let runtime_tools = session
+        .config
+        .tools
         .iter()
         .map(|tool| match tool.name.as_str() {
             "bash" => Ok(bash_tool::runtime_tool(
                 tool.clone(),
                 workspace_root.clone(),
+                session.bash_tool_context.clone(),
             )),
             other => Err(BackendError::failed(format!(
                 "unsupported tool {other:?}; only \"bash\" is implemented"
@@ -1431,7 +1513,7 @@ impl CompletionBackend for RigBackend {
                 .fail();
             }
         };
-        let toolset = build_runtime_tool_set(&session.config.tools, workspace_root)?;
+        let toolset = build_runtime_tool_set(&session, workspace_root)?;
         let history = session.provider_history.clone();
         let Some((prompt, history)) = history.split_last() else {
             return Err(BackendError::failed("completion requires history"));
@@ -2869,7 +2951,15 @@ mod tests {
     #[tokio::test]
     async fn bash_tool_runtime_allows_writes_within_configured_workspace() {
         let temp_root = tempfile::tempdir().unwrap();
-        let runtime = bash_tool::runtime_tool(bash_tool(), temp_root.path().to_path_buf());
+        let runtime = bash_tool::runtime_tool(
+            bash_tool(),
+            temp_root.path().to_path_buf(),
+            BashToolContext {
+                session_branch: "main".to_owned(),
+                store_path: None,
+                cli_bridge: None,
+            },
+        );
         let previous = std::env::var_os("COCO_BASH_SANDBOX");
         unsafe {
             std::env::set_var("COCO_BASH_SANDBOX", "off");

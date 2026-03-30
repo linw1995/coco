@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub(crate) mod fs;
 pub mod memory;
@@ -56,4 +57,9 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+
+    /// Returns the backing store directory when the store is process-shareable.
+    fn runtime_store_path(&self) -> Option<PathBuf> {
+        None
+    }
 }
