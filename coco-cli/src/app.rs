@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -9,7 +10,10 @@ use coco_llm::{
     CocoCliRuntimeResponse, CompletionBackend, LlmService, RigBackend, SessionConfig,
     SessionConfigPatch, SessionFeedback, SessionMerge,
 };
-use coco_mem::{AnchorPayload, FsStore, PauseReason, SessionAnchor, SessionState, Store, Tool};
+use coco_mem::{
+    AnchorPayload, FsStore, Kind, Node, PauseReason, SessionAnchor, SessionState, Store,
+    StoreError, Tool,
+};
 use serde::Serialize;
 use snafu::prelude::*;
 
@@ -18,8 +22,8 @@ use crate::{
     cli::{Cli, Command, PromptCommand, SessionCommand, SessionCreateCommand, SessionSubcommand},
     env::{read_env, resolve_env_provider, resolve_env_tools},
     error::{
-        CoreSnafu, EmptyPromptSnafu, LlmSnafu, MissingConfigurationSnafu, ReadStdinSnafu,
-        StoreSnafu,
+        AmbiguousNodePrefixSnafu, CoreSnafu, EmptyPromptSnafu, LlmSnafu, MissingConfigurationSnafu,
+        ReadStdinSnafu, StoreSnafu, UnknownShowReferenceSnafu,
     },
     store::open_store,
 };
@@ -198,6 +202,8 @@ fn apply_forwarded_defaults(
             SessionSubcommand::Fork(_) => {}
             SessionSubcommand::List => {}
             SessionSubcommand::Get(command) => command.branch = branch,
+            SessionSubcommand::Graph(_) => {}
+            SessionSubcommand::Show(_) => {}
             SessionSubcommand::Rebase(command) => command.branch = branch,
             SessionSubcommand::Reopen(command) => command.branch = branch,
             SessionSubcommand::Pr(command) => command.branch = branch,
@@ -312,6 +318,34 @@ struct SessionFeedbackResult {
     state: SessionState,
 }
 
+#[derive(Debug, Clone)]
+struct GraphBranchLabel {
+    branch: String,
+    state: SessionState,
+}
+
+#[derive(Debug, Clone)]
+struct GraphNodeEntry {
+    node: Node,
+    primary_parent: Option<String>,
+    merge_parents: Vec<String>,
+    labels: Vec<GraphBranchLabel>,
+}
+
+#[derive(Debug)]
+struct GraphTransition {
+    next_columns: Vec<String>,
+    connector_row: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct NodeShowResult {
+    #[serde(rename = "ref")]
+    reference: String,
+    resolved_id: String,
+    node: Node,
+}
+
 async fn run_session_command<B>(
     command: SessionCommand,
     store: &FsStore,
@@ -342,6 +376,12 @@ where
             store,
             &command.branch,
         )?))),
+        SessionSubcommand::Graph(_) => Ok(Some(render_session_graph(store)?)),
+        SessionSubcommand::Show(command) => Ok(Some(render_session_show(
+            store,
+            &command.reference,
+            command.json,
+        )?)),
         SessionSubcommand::Rebase(command) => {
             let branch = command.branch.clone();
             let head_id = llm
@@ -434,6 +474,549 @@ fn read_session_details(store: &FsStore, branch: &str) -> Result<SessionDetails>
         state,
         anchor,
     })
+}
+
+fn render_session_graph(store: &FsStore) -> Result<String> {
+    let states = store.list_session_states().context(StoreSnafu)?;
+    if states.is_empty() {
+        return Ok("No sessions found.".to_owned());
+    }
+
+    let mut branches = states.into_iter().collect::<Vec<_>>();
+    branches.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut visible_node_ids = BTreeSet::new();
+    let mut visible_nodes = HashMap::new();
+    let mut labels_by_node = HashMap::<String, Vec<GraphBranchLabel>>::new();
+
+    for (branch, state) in branches {
+        let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
+        let ancestry = store.ancestry(&head_id).context(StoreSnafu)?;
+
+        for node in ancestry {
+            if node.is_root() {
+                continue;
+            }
+            visible_node_ids.insert(node.id.clone());
+            visible_nodes.insert(node.id.clone(), node.clone());
+        }
+
+        labels_by_node
+            .entry(head_id)
+            .or_default()
+            .push(GraphBranchLabel { branch, state });
+    }
+
+    let mut entries = visible_nodes
+        .into_values()
+        .map(|node| {
+            let primary_parent = resolve_visible_parent(&visible_node_ids, node.parent.as_str());
+            let merge_parents = match &node.kind {
+                Kind::Anchor(anchor) => {
+                    let mut parents = Vec::new();
+                    for merge_parent in anchor.merge_parents() {
+                        let Some(parent_id) =
+                            resolve_visible_parent(&visible_node_ids, merge_parent)
+                        else {
+                            continue;
+                        };
+                        if primary_parent.as_ref() == Some(&parent_id)
+                            || parents.iter().any(|existing| existing == &parent_id)
+                        {
+                            continue;
+                        }
+                        parents.push(parent_id);
+                    }
+                    parents
+                }
+                _ => vec![],
+            };
+
+            Ok(GraphNodeEntry {
+                labels: labels_by_node.remove(&node.id).unwrap_or_default(),
+                node,
+                primary_parent,
+                merge_parents,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    entries.sort_by(|left, right| {
+        let left_ts = left.node.created_at.to_string();
+        let right_ts = right.node.created_at.to_string();
+        right_ts
+            .cmp(&left_ts)
+            .then_with(|| right.node.id.cmp(&left.node.id))
+    });
+
+    Ok(render_graph_entries(&entries))
+}
+
+fn render_session_show(store: &FsStore, reference: &str, json_output: bool) -> Result<String> {
+    let resolved_id = resolve_show_reference(store, reference)?;
+    let node = store.get_node(&resolved_id).context(StoreSnafu)?;
+    let result = NodeShowResult {
+        reference: reference.to_owned(),
+        resolved_id,
+        node,
+    };
+
+    if json_output {
+        Ok(render_json(result))
+    } else {
+        Ok(render_node_show_text(&result))
+    }
+}
+
+fn resolve_show_reference(store: &FsStore, reference: &str) -> Result<String> {
+    match store.get_branch_head(reference) {
+        Ok(head_id) => Ok(head_id),
+        Err(StoreError::BranchNotFound { .. }) => match store.get_node(reference) {
+            Ok(_) => Ok(reference.to_owned()),
+            Err(StoreError::NotFound { .. }) => {
+                let matches = collect_known_node_ids(store)?
+                    .into_iter()
+                    .filter(|node_id| node_id.starts_with(reference))
+                    .collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [matched] => Ok(matched.clone()),
+                    [] => UnknownShowReferenceSnafu {
+                        reference: reference.to_owned(),
+                    }
+                    .fail(),
+                    _ => AmbiguousNodePrefixSnafu {
+                        prefix: reference.to_owned(),
+                        matches,
+                    }
+                    .fail(),
+                }
+            }
+            Err(source) => Err(crate::Error::Store { source }),
+        },
+        Err(source) => Err(crate::Error::Store { source }),
+    }
+}
+
+fn collect_known_node_ids(store: &FsStore) -> Result<BTreeSet<String>> {
+    let mut node_ids = BTreeSet::new();
+    for branch in store
+        .list_session_states()
+        .context(StoreSnafu)?
+        .into_keys()
+        .collect::<Vec<_>>()
+    {
+        for node in store.ancestry(&branch).context(StoreSnafu)? {
+            node_ids.insert(node.id);
+        }
+    }
+    Ok(node_ids)
+}
+
+fn resolve_visible_parent(visible_node_ids: &BTreeSet<String>, start_id: &str) -> Option<String> {
+    if start_id.is_empty() {
+        return None;
+    }
+
+    if visible_node_ids.contains(start_id) {
+        Some(start_id.to_owned())
+    } else {
+        None
+    }
+}
+
+fn render_graph_entries(entries: &[GraphNodeEntry]) -> String {
+    let mut output = String::new();
+    let mut active_columns = Vec::<String>::new();
+
+    for entry in entries {
+        let current_col = active_columns
+            .iter()
+            .position(|node_id| node_id == &entry.node.id)
+            .unwrap_or_else(|| {
+                active_columns.push(entry.node.id.clone());
+                active_columns.len() - 1
+            });
+
+        let prefix = render_graph_prefix(&active_columns, current_col);
+        let summary = render_graph_summary(entry);
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&prefix);
+        output.push(' ');
+        output.push_str(&summary);
+
+        let transition = build_graph_transition(&active_columns, current_col, entry);
+        if let Some(connector_row) = transition.connector_row {
+            output.push('\n');
+            output.push_str(&connector_row);
+        }
+        active_columns = transition.next_columns;
+    }
+
+    output
+}
+
+fn render_graph_prefix(active_columns: &[String], current_col: usize) -> String {
+    let mut parts = Vec::with_capacity(active_columns.len());
+    for index in 0..active_columns.len() {
+        if index == current_col {
+            parts.push("*".to_owned());
+        } else {
+            parts.push("|".to_owned());
+        }
+    }
+    parts.join(" ")
+}
+
+fn build_graph_transition(
+    active_columns: &[String],
+    current_col: usize,
+    entry: &GraphNodeEntry,
+) -> GraphTransition {
+    let mut next = active_columns.to_vec();
+
+    match &entry.primary_parent {
+        Some(primary_parent) => {
+            if let Some(existing_idx) = next.iter().position(|node_id| node_id == primary_parent) {
+                if existing_idx != current_col {
+                    next.remove(current_col);
+                }
+            } else {
+                next[current_col] = primary_parent.clone();
+            }
+        }
+        None => {
+            next.remove(current_col);
+        }
+    }
+
+    let mut insert_at = current_col.min(next.len());
+    for merge_parent in &entry.merge_parents {
+        if next.iter().any(|node_id| node_id == merge_parent) {
+            continue;
+        }
+        next.insert(insert_at, merge_parent.clone());
+        insert_at += 1;
+    }
+
+    let next_columns = dedupe_columns(next);
+    let connector_row =
+        render_graph_connector_row(active_columns, &next_columns, current_col, entry);
+
+    GraphTransition {
+        next_columns,
+        connector_row,
+    }
+}
+
+fn dedupe_columns(columns: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    columns
+        .into_iter()
+        .filter(|node_id| seen.insert(node_id.clone()))
+        .collect()
+}
+
+fn render_graph_connector_row(
+    active_columns: &[String],
+    next_columns: &[String],
+    current_col: usize,
+    entry: &GraphNodeEntry,
+) -> Option<String> {
+    let primary_parent_col = entry.primary_parent.as_ref().and_then(|node_id| {
+        next_columns
+            .iter()
+            .position(|candidate| candidate == node_id)
+    });
+    let merge_parent_cols = entry
+        .merge_parents
+        .iter()
+        .filter_map(|node_id| {
+            next_columns
+                .iter()
+                .position(|candidate| candidate == node_id)
+        })
+        .collect::<Vec<_>>();
+
+    let should_render = !merge_parent_cols.is_empty()
+        || primary_parent_col != Some(current_col)
+        || active_columns.len() != next_columns.len();
+    if !should_render {
+        return None;
+    }
+
+    let width = active_columns.len().max(next_columns.len());
+    if width == 0 {
+        return None;
+    }
+
+    let mut chars = vec![' '; width * 2 - 1];
+    for col in 0..width {
+        if col == current_col {
+            continue;
+        }
+        if active_columns.get(col).is_some() && next_columns.get(col).is_some() {
+            chars[col * 2] = '|';
+        }
+    }
+
+    let mut target_cols = Vec::new();
+    if let Some(primary_parent_col) = primary_parent_col {
+        target_cols.push(primary_parent_col);
+    }
+    target_cols.extend(merge_parent_cols);
+
+    if target_cols.is_empty() {
+        return None;
+    }
+
+    let current_pos = current_col * 2;
+    chars[current_pos] = '|';
+
+    for target_col in target_cols {
+        let target_pos = target_col * 2;
+        if target_pos == current_pos {
+            chars[current_pos] = '|';
+            continue;
+        }
+
+        let range = if target_pos < current_pos {
+            (target_pos + 1)..current_pos
+        } else {
+            (current_pos + 1)..target_pos
+        };
+        for idx in range {
+            if chars[idx] == ' ' {
+                chars[idx] = '-';
+            }
+        }
+
+        chars[target_pos] = if target_pos < current_pos { '/' } else { '\\' };
+    }
+
+    let connector_row = chars.into_iter().collect::<String>();
+    Some(connector_row.trim_end().to_owned())
+}
+
+fn render_graph_summary(entry: &GraphNodeEntry) -> String {
+    let kind = graph_kind_name(&entry.node);
+    let short_id = shorten_id(&entry.node.id);
+    let created_at = entry.node.created_at.to_string();
+    let labels = render_graph_labels(&entry.labels);
+    let summary = summarize_node(&entry.node);
+    let merge_suffix = if entry.merge_parents.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " merge=[{}]",
+            entry
+                .merge_parents
+                .iter()
+                .map(|node_id| shorten_id(node_id))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+
+    if labels.is_empty() {
+        format!("{short_id} {kind} {created_at} {summary}{merge_suffix}")
+    } else {
+        format!("{short_id} {kind} {created_at} [{labels}] {summary}{merge_suffix}")
+    }
+}
+
+fn render_graph_labels(labels: &[GraphBranchLabel]) -> String {
+    let mut by_branch = BTreeMap::new();
+    for label in labels {
+        by_branch.insert(label.branch.clone(), label);
+    }
+
+    by_branch
+        .into_values()
+        .map(|label| format!("{}{}", label.branch, format_state_suffix(&label.state)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_state_suffix(state: &SessionState) -> String {
+    match state {
+        SessionState::Active => String::new(),
+        SessionState::Attached { target_branch, .. } => {
+            format!("@Attached({target_branch})")
+        }
+        SessionState::Paused {
+            target_branch,
+            reason,
+        } => match reason {
+            PauseReason::Merged { .. } => {
+                format!("@Paused({target_branch},merged)")
+            }
+            PauseReason::Closed => format!("@Paused({target_branch},closed)"),
+        },
+    }
+}
+
+fn graph_kind_name(node: &Node) -> &'static str {
+    match &node.kind {
+        Kind::Anchor(anchor) => match &anchor.payload {
+            AnchorPayload::Session(_) => "session",
+            AnchorPayload::Prompt(_) => "prompt",
+        },
+        Kind::ToolUse(_) => "tool_use",
+        Kind::ToolResult(_) => "tool_result",
+        Kind::Text(_) => "text",
+        Kind::Failure(_) => "failure",
+    }
+}
+
+fn summarize_node(node: &Node) -> String {
+    let raw = match &node.kind {
+        Kind::Anchor(anchor) => match &anchor.payload {
+            AnchorPayload::Session(session) => {
+                if session.prompt.trim().is_empty() {
+                    session.system_prompt.clone()
+                } else {
+                    session.prompt.clone()
+                }
+            }
+            AnchorPayload::Prompt(prompt) => prompt.prompt.clone(),
+        },
+        Kind::ToolUse(tool_use) => tool_use.input.to_string(),
+        Kind::ToolResult(tool_result) => tool_result.output.clone(),
+        Kind::Text(text) => text.clone(),
+        Kind::Failure(message) => message.clone(),
+    };
+
+    truncate_summary(&raw)
+}
+
+fn render_node_show_text(result: &NodeShowResult) -> String {
+    let mut lines = vec![
+        format!("ref: {}", result.reference),
+        format!("resolved_id: {}", result.resolved_id),
+        format!("id: {}", result.node.id),
+        format!("parent: {}", result.node.parent),
+        format!("created_at: {}", result.node.created_at),
+        format!("role: {:?}", result.node.role),
+        format!("kind: {}", graph_kind_name(&result.node)),
+    ];
+
+    if let Some(execution_id) = result
+        .node
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.execution_id.as_deref())
+    {
+        lines.push(format!("execution_id: {execution_id}"));
+    }
+
+    match &result.node.kind {
+        Kind::Anchor(anchor) => {
+            lines.push(format!(
+                "merge_parents: {}",
+                if anchor.merge_parents.is_empty() {
+                    "[]".to_owned()
+                } else {
+                    format!("[{}]", anchor.merge_parents.join(", "))
+                }
+            ));
+            match &anchor.payload {
+                AnchorPayload::Session(session) => {
+                    lines.extend([
+                        format!("provider: {}", session.provider),
+                        format!("model: {}", session.model),
+                        format!(
+                            "temperature: {}",
+                            session
+                                .temperature
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "null".to_owned())
+                        ),
+                        format!(
+                            "max_tokens: {}",
+                            session
+                                .max_tokens
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "null".to_owned())
+                        ),
+                        format!(
+                            "tools: {}",
+                            if session.tools.is_empty() {
+                                "[]".to_owned()
+                            } else {
+                                format!(
+                                    "[{}]",
+                                    session
+                                        .tools
+                                        .iter()
+                                        .map(|tool| tool.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            }
+                        ),
+                        "system_prompt:".to_owned(),
+                        session.system_prompt.clone(),
+                        "prompt:".to_owned(),
+                        session.prompt.clone(),
+                    ]);
+
+                    if let Some(additional_params) = &session.additional_params {
+                        lines.push("additional_params:".to_owned());
+                        lines.push(
+                            serde_json::to_string_pretty(additional_params)
+                                .expect("additional params should serialize"),
+                        );
+                    }
+                }
+                AnchorPayload::Prompt(prompt) => {
+                    lines.push("prompt:".to_owned());
+                    lines.push(prompt.prompt.clone());
+                }
+            }
+        }
+        Kind::ToolUse(tool_use) => {
+            lines.push(format!("tool_id: {}", tool_use.id));
+            lines.push(format!("tool_name: {}", tool_use.name));
+            lines.push("input:".to_owned());
+            lines.push(
+                serde_json::to_string_pretty(&tool_use.input).expect("tool input should serialize"),
+            );
+        }
+        Kind::ToolResult(tool_result) => {
+            lines.push(format!("tool_id: {}", tool_result.id));
+            lines.push("output:".to_owned());
+            lines.push(tool_result.output.clone());
+        }
+        Kind::Text(text) => {
+            lines.push("text:".to_owned());
+            lines.push(text.clone());
+        }
+        Kind::Failure(message) => {
+            lines.push("message:".to_owned());
+            lines.push(message.clone());
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn truncate_summary(text: &str) -> String {
+    const MAX_CHARS: usize = 48;
+
+    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = trimmed.chars();
+    let shortened = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
+    }
+}
+
+fn shorten_id(node_id: &str) -> &str {
+    &node_id[..node_id.len().min(8)]
 }
 
 fn build_pull_request_result(

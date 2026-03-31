@@ -22,6 +22,15 @@ pub enum Error {
         value: String,
     },
 
+    #[snafu(display("Reference {reference:?} did not match any branch or node ID"))]
+    UnknownShowReference { reference: String },
+
+    #[snafu(display("Node prefix {prefix:?} matched multiple node IDs: {matches:?}"))]
+    AmbiguousNodePrefix {
+        prefix: String,
+        matches: Vec<String>,
+    },
+
     #[snafu(display("Failed to read stdin: {source}"))]
     ReadStdin { source: io::Error },
 

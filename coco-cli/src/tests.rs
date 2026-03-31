@@ -3,7 +3,8 @@ use std::future::Future;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use coco_llm::coco_mem::{Anchor, Kind, NewNode, PromptAnchor, Role, Store};
+use clap::Parser;
+use coco_llm::coco_mem::{Anchor, Kind, NewNode, PromptAnchor, Role, Store, ToolResult, ToolUse};
 use coco_llm::{
     BackendError, BackendEvent, BackendRun, CompletionBackend, Provider, ResolvedCompletionRequest,
     ResolvedSession,
@@ -18,8 +19,9 @@ use crate::{
     app::{resolve_session_config, run_forwarded_with_services, run_with_backend},
     cli::{
         Command, PromptCommand, SessionBranchCommand, SessionCloseCommand, SessionCommand,
-        SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand, SessionMergeCommand,
-        SessionPrCommand, SessionRebaseCommand, SessionSubcommand,
+        SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand, SessionGraphCommand,
+        SessionMergeCommand, SessionPrCommand, SessionRebaseCommand, SessionShowCommand,
+        SessionSubcommand,
     },
     store::open_store,
 };
@@ -131,6 +133,27 @@ fn session_get_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli 
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Get(SessionBranchCommand {
                 branch: branch.unwrap_or("main").to_owned(),
+            }),
+        }),
+    }
+}
+
+fn session_graph_cli(store_path: std::path::PathBuf) -> Cli {
+    Cli {
+        store_path,
+        command: Command::Session(SessionCommand {
+            command: SessionSubcommand::Graph(SessionGraphCommand {}),
+        }),
+    }
+}
+
+fn session_show_cli(store_path: std::path::PathBuf, reference: &str, json: bool) -> Cli {
+    Cli {
+        store_path,
+        command: Command::Session(SessionCommand {
+            command: SessionSubcommand::Show(SessionShowCommand {
+                reference: reference.to_owned(),
+                json,
             }),
         }),
     }
@@ -259,6 +282,48 @@ fn append_prompt_anchor(
                     prompt: prompt.to_owned(),
                 },
             )),
+        })
+        .unwrap()
+}
+
+fn append_tool_use_node(store: &impl Store, parent: &str, id: &str, name: &str) -> String {
+    store
+        .append(NewNode {
+            parent: parent.to_owned(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::ToolUse(ToolUse {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                input: json!({
+                    "cmd": "echo hello",
+                }),
+            }),
+        })
+        .unwrap()
+}
+
+fn append_tool_result_node(store: &impl Store, parent: &str, id: &str, output: &str) -> String {
+    store
+        .append(NewNode {
+            parent: parent.to_owned(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::ToolResult(ToolResult {
+                id: id.to_owned(),
+                output: output.to_owned(),
+            }),
+        })
+        .unwrap()
+}
+
+fn append_failure_node(store: &impl Store, parent: &str, message: &str) -> String {
+    store
+        .append(NewNode {
+            parent: parent.to_owned(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Failure(message.to_owned()),
         })
         .unwrap()
 }
@@ -590,6 +655,68 @@ async fn session_get_returns_state_and_visible_anchor() {
 }
 
 #[tokio::test]
+async fn session_graph_reports_empty_store() {
+    let (_tempdir, store_path) = temp_store_path();
+
+    let output = run_with_backend(
+        session_graph_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(output, "No sessions found.");
+}
+
+#[tokio::test]
+async fn session_graph_shows_branch_labels_on_head_node() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    run_with_backend(
+        prompt_cli(store_path.clone(), Some("main"), &["hello", "world"]),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[("main", &[Ok("assistant reply")])]),
+    )
+    .await
+    .unwrap();
+
+    run_with_backend(
+        session_fork_cli(store_path.clone(), "draft", Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let output = run_with_backend(
+        session_graph_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains("[draft, main] assistant reply"));
+    assert!(output.contains("* "));
+}
+
+#[tokio::test]
 async fn session_rebase_updates_visible_session_config() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
@@ -864,6 +991,211 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         anchor.as_prompt().expect("expected prompt anchor").prompt,
         "address review note"
     );
+}
+
+#[tokio::test]
+async fn session_graph_renders_global_dag_with_non_anchor_merge_parent() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("base")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    run_with_backend(
+        prompt_cli(store_path.clone(), Some("main"), &["hello", "world"]),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[("main", &[Ok("assistant reply")])]),
+    )
+    .await
+    .unwrap();
+
+    run_with_backend(
+        session_pr_cli(store_path.clone(), Some("main"), "base"),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+    run_with_backend(
+        session_merge_cli(store_path.clone(), Some("main"), None, "handoff to base"),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let output = run_with_backend(
+        session_graph_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains("handoff to base merge=["));
+    assert!(output.contains("base] handoff to base"));
+    assert!(output.contains("main@Paused(base,merged)] assistant reply"));
+    assert!(output.contains('\\') || output.contains('/'));
+}
+
+#[tokio::test]
+async fn session_graph_shows_tool_and_failure_nodes() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_head = store.get_branch_head("main").unwrap();
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "bash");
+    store
+        .set_branch_head("main", &session_head, &tool_use_id)
+        .unwrap();
+    let tool_result_id = append_tool_result_node(&store, &tool_use_id, "tool-1", "hello");
+    store
+        .set_branch_head("main", &tool_use_id, &tool_result_id)
+        .unwrap();
+    let failure_id = append_failure_node(&store, &tool_result_id, "command failed");
+    store
+        .set_branch_head("main", &tool_result_id, &failure_id)
+        .unwrap();
+
+    let output = run_with_backend(
+        session_graph_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains("tool_use"));
+    assert!(output.contains("tool_result"));
+    assert!(output.contains("[main] command failed"));
+}
+
+#[tokio::test]
+async fn session_show_resolves_branch_to_head_node_text_output() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    run_with_backend(
+        prompt_cli(store_path.clone(), Some("main"), &["hello"]),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[("main", &[Ok("assistant reply")])]),
+    )
+    .await
+    .unwrap();
+
+    let head_id = open_store(&store_path)
+        .unwrap()
+        .get_branch_head("main")
+        .unwrap();
+    let output = run_with_backend(
+        session_show_cli(store_path, "main", false),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains("ref: main"));
+    assert!(output.contains(&format!("resolved_id: {head_id}")));
+    assert!(output.contains("kind: text"));
+    assert!(output.contains("assistant reply"));
+}
+
+#[tokio::test]
+async fn session_show_outputs_json_for_node_id_reference() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let head_id = open_store(&store_path)
+        .unwrap()
+        .get_branch_head("main")
+        .unwrap();
+    let prefix = &head_id[..12];
+    let output = run_with_backend(
+        session_show_cli(store_path, prefix, true),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value = serde_json::from_str::<Value>(&output).unwrap();
+
+    assert_eq!(value["ref"], json!(prefix));
+    assert_eq!(value["resolved_id"], value["node"]["id"]);
+    assert_eq!(value["resolved_id"], json!(head_id));
+    assert!(matches!(&value["node"]["kind"], Value::Object(_)));
+}
+
+#[test]
+fn session_show_parses_reference_as_positional_argument() {
+    let cli = Cli::try_parse_from(["coco-cli", "session", "show", "main", "--json"]).unwrap();
+
+    let Command::Session(command) = cli.command else {
+        panic!("expected session command");
+    };
+    let SessionSubcommand::Show(command) = command.command else {
+        panic!("expected show command");
+    };
+
+    assert_eq!(command.reference, "main");
+    assert!(command.json);
 }
 
 #[tokio::test]

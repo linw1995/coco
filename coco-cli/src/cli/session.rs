@@ -1,38 +1,6 @@
-use std::path::PathBuf;
+use clap::{Args, Subcommand};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use coco_llm::Provider;
-use coco_mem::Tool;
-
-#[derive(Debug, Parser)]
-#[command(name = "coco-cli")]
-pub struct Cli {
-    #[arg(
-        long,
-        global = true,
-        env = "COCO_STORE_PATH",
-        default_value = ".coco-store"
-    )]
-    pub store_path: PathBuf,
-
-    #[command(subcommand)]
-    pub command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum Command {
-    Prompt(PromptCommand),
-    Session(SessionCommand),
-}
-
-#[derive(Debug, Args)]
-pub struct PromptCommand {
-    #[arg(long, env = "COCO_BRANCH", default_value = "main")]
-    pub branch: String,
-
-    #[arg(value_name = "TEXT")]
-    pub text: Vec<String>,
-}
+use super::{CliProvider, CliTool};
 
 #[derive(Debug, Args)]
 pub struct SessionCommand {
@@ -46,6 +14,8 @@ pub enum SessionSubcommand {
     Fork(SessionForkCommand),
     List,
     Get(SessionBranchCommand),
+    Graph(SessionGraphCommand),
+    Show(SessionShowCommand),
     Rebase(SessionRebaseCommand),
     #[command(name = "reopen")]
     Reopen(SessionBranchCommand),
@@ -92,6 +62,18 @@ pub struct SessionForkCommand {
 pub struct SessionBranchCommand {
     #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionGraphCommand {}
+
+#[derive(Debug, Args)]
+pub struct SessionShowCommand {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -170,71 +152,4 @@ pub struct SessionFeedbackCommand {
 
     #[arg(long)]
     pub from_ref: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CliProvider {
-    Openai,
-    Anthropic,
-}
-
-impl CliProvider {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "openai" => Some(Self::Openai),
-            "anthropic" => Some(Self::Anthropic),
-            _ => None,
-        }
-    }
-}
-
-impl From<CliProvider> for Provider {
-    fn from(value: CliProvider) -> Self {
-        match value {
-            CliProvider::Openai => Provider::OpenAi,
-            CliProvider::Anthropic => Provider::Anthropic,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum CliTool {
-    Bash,
-}
-
-impl CliTool {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "bash" => Some(Self::Bash),
-            _ => None,
-        }
-    }
-
-    pub fn to_tool(self) -> Tool {
-        match self {
-            Self::Bash => Tool {
-                name: "bash".to_owned(),
-                description: "Run a bash command.".to_owned(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The bash command to execute."
-                        },
-                        "workdir": {
-                            "type": "string",
-                            "description": "Optional working directory."
-                        },
-                        "timeout_ms": {
-                            "type": "integer",
-                            "description": "Optional timeout in milliseconds."
-                        }
-                    },
-                    "required": ["command"],
-                    "additionalProperties": false
-                }),
-            },
-        }
-    }
 }
