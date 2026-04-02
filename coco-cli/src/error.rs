@@ -1,4 +1,5 @@
 use snafu::prelude::*;
+use std::fmt;
 use std::io;
 
 #[derive(Debug, Snafu)]
@@ -21,6 +22,15 @@ pub enum Error {
         source_name: &'static str,
         value: String,
     },
+
+    #[snafu(display("Failed to parse session additional params JSON: {source}"))]
+    ParseSessionAdditionalParams { source: serde_json::Error },
+
+    #[snafu(display(
+        "Session additional params must be a JSON object, got {kind}",
+        kind = JsonValueKind(value)
+    ))]
+    InvalidSessionAdditionalParamsType { value: serde_json::Value },
 
     #[snafu(display("Reference {reference:?} did not match any branch or node ID"))]
     UnknownShowReference { reference: String },
@@ -45,3 +55,19 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+struct JsonValueKind<'a>(&'a serde_json::Value);
+
+impl fmt::Display for JsonValueKind<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.0 {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        };
+        f.write_str(kind)
+    }
+}

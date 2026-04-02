@@ -10,6 +10,7 @@ use coco_mem::{
     StoreError, Tool,
 };
 use serde::Serialize;
+use serde_json::Value;
 use snafu::prelude::*;
 
 use crate::{
@@ -17,8 +18,8 @@ use crate::{
     cli::{CliTool, SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand},
     env::{read_env, resolve_env_provider, resolve_env_tools},
     error::{
-        AmbiguousNodePrefixSnafu, LlmSnafu, MissingConfigurationSnafu, StoreSnafu,
-        UnknownShowReferenceSnafu,
+        AmbiguousNodePrefixSnafu, LlmSnafu, MissingConfigurationSnafu,
+        ParseSessionAdditionalParamsSnafu, StoreSnafu, UnknownShowReferenceSnafu,
     },
 };
 
@@ -250,6 +251,7 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
     } else {
         resolve_cli_tools(&command.tools)
     };
+    let additional_params = parse_session_additional_params(command.additional_params)?;
 
     Ok(SessionConfig {
         branch: command.branch,
@@ -261,7 +263,7 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
         tools,
         temperature: command.temperature,
         max_tokens: command.max_tokens,
-        additional_params: None,
+        additional_params,
     })
 }
 
@@ -863,6 +865,14 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
                         session.prompt.clone(),
                     ]);
 
+                    if let Some(additional_params) = &session.additional_params {
+                        lines.push("additional_params:".to_owned());
+                        lines.push(
+                            serde_json::to_string_pretty(additional_params)
+                                .expect("additional params should serialize"),
+                        );
+                    }
+
                 }
                 AnchorPayload::Prompt(prompt) => {
                     lines.push("prompt:".to_owned());
@@ -1036,6 +1046,20 @@ fn cli_tool_definition(tool: CliTool) -> Tool {
             }),
         },
     }
+}
+
+fn parse_session_additional_params(additional_params: Option<String>) -> Result<Option<Value>> {
+    let Some(additional_params) = additional_params else {
+        return Ok(None);
+    };
+
+    let value: Value =
+        serde_json::from_str(&additional_params).context(ParseSessionAdditionalParamsSnafu)?;
+    ensure!(
+        value.is_object(),
+        crate::error::InvalidSessionAdditionalParamsTypeSnafu { value }
+    );
+    Ok(Some(value))
 }
 
 fn render_json<T>(value: T) -> String

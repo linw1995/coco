@@ -46,6 +46,9 @@ pub struct SessionCreateCommand {
     #[arg(long)]
     pub max_tokens: Option<u64>,
 
+    #[arg(long, value_name = "JSON")]
+    pub additional_params: Option<String>,
+
     #[arg(long = "tool", value_enum)]
     pub tools: Vec<CliTool>,
 }

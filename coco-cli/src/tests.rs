@@ -102,6 +102,7 @@ fn session_create_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
                 prompt: "".to_owned(),
                 temperature: Some(0.2),
                 max_tokens: Some(64),
+                additional_params: None,
                 tools: vec![],
             }),
         }),
@@ -664,6 +665,56 @@ async fn session_get_returns_state_and_visible_anchor() {
     assert_eq!(
         value["head_id"],
         json!(store.get_branch_head("main").unwrap())
+    );
+}
+
+#[tokio::test]
+async fn session_create_persists_additional_params() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            let cli = Cli {
+                store_path: store_path.clone(),
+                command: Command::Session(SessionCommand {
+                    command: SessionSubcommand::Create(SessionCreateCommand {
+                        branch: "main".to_owned(),
+                        system_prompt: "You are helpful.".to_owned(),
+                        prompt: "".to_owned(),
+                        temperature: Some(0.2),
+                        max_tokens: Some(64),
+                        additional_params: Some(
+                            "{\"service_tier\":\"priority\",\"reasoning_effort\":\"medium\"}"
+                                .to_owned(),
+                        ),
+                        tools: vec![],
+                    }),
+                }),
+            };
+
+            run_with_backend(cli, &mut Cursor::new(""), FakeBackend::with_responses(&[]))
+                .await
+                .unwrap();
+        },
+    )
+    .await;
+
+    let output = run_with_backend(
+        session_get_cli(store_path, Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let value: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(
+        value["anchor"]["additional_params"],
+        json!({
+            "service_tier": "priority",
+            "reasoning_effort": "medium",
+        })
     );
 }
 
@@ -1533,6 +1584,7 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
                     max_tokens: Some(64),
+                    additional_params: None,
                     tools: vec![],
                 })
                 .unwrap()
@@ -1562,6 +1614,7 @@ fn resolve_session_config_reads_tools_from_env() {
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
                     max_tokens: Some(64),
+                    additional_params: None,
                     tools: vec![],
                 })
                 .unwrap()
@@ -1576,4 +1629,65 @@ fn resolve_session_config_reads_tools_from_env() {
             .collect::<Vec<_>>(),
         vec!["bash"]
     );
+}
+
+#[test]
+fn resolve_session_config_parses_additional_params_json_object() {
+    let config = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(with_coco_env_async(
+            &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+            || async {
+                resolve_session_config(SessionCreateCommand {
+                    branch: "main".to_owned(),
+                    system_prompt: "You are helpful.".to_owned(),
+                    prompt: "".to_owned(),
+                    temperature: Some(0.2),
+                    max_tokens: Some(64),
+                    additional_params: Some(
+                        "{\"service_tier\":\"priority\",\"reasoning_effort\":\"low\"}".to_owned(),
+                    ),
+                    tools: vec![],
+                })
+                .unwrap()
+            },
+        ));
+
+    assert_eq!(
+        config.additional_params,
+        Some(json!({
+            "service_tier": "priority",
+            "reasoning_effort": "low",
+        }))
+    );
+}
+
+#[test]
+fn resolve_session_config_rejects_non_object_additional_params() {
+    let error = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(with_coco_env_async(
+            &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+            || async {
+                resolve_session_config(SessionCreateCommand {
+                    branch: "main".to_owned(),
+                    system_prompt: "You are helpful.".to_owned(),
+                    prompt: "".to_owned(),
+                    temperature: Some(0.2),
+                    max_tokens: Some(64),
+                    additional_params: Some("[1,2,3]".to_owned()),
+                    tools: vec![],
+                })
+                .unwrap_err()
+            },
+        ));
+
+    assert!(matches!(
+        error,
+        crate::Error::InvalidSessionAdditionalParamsType { value } if value == json!([1, 2, 3])
+    ));
 }
