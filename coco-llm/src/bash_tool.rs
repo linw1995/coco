@@ -331,6 +331,7 @@ fn nono_execution_spec(
 ) -> ExecutionSpec {
     let mut args = vec![
         OsString::from("run"),
+        OsString::from("--silent"),
         OsString::from("--allow"),
         request.workspace_root.as_os_str().to_owned(),
     ];
@@ -916,6 +917,7 @@ mod tests {
         let args = std::fs::read_to_string(&observed_args).unwrap();
         let expected_workspace = workspace.path().display().to_string();
         assert!(args.contains("run"));
+        assert!(args.contains("--silent"));
         assert!(args.contains("--allow"));
         assert!(args.contains(&expected_workspace));
         assert!(args.contains("--"));
