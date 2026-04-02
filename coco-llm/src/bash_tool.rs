@@ -578,37 +578,6 @@ mod tests {
         }
     }
 
-    async fn with_env_async<T, F, Fut>(entries: &[(&str, Option<&OsStr>)], run: F) -> T
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T>,
-    {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
-        let previous: Vec<_> = entries
-            .iter()
-            .map(|(name, _)| ((*name).to_owned(), std::env::var_os(name)))
-            .collect();
-
-        for (name, value) in entries {
-            match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-
-        let output = run().await;
-
-        for (name, value) in previous {
-            match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-
-        output
-    }
 
     fn temp_tool() -> Tool {
         Tool {
@@ -636,6 +605,10 @@ mod tests {
         PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
     }
 
+    async fn resolve_bash_path_locked() -> PathBuf {
+        crate::with_process_env_async(&[], || async { resolve_bash_path() }).await
+    }
+
     fn write_executable_script(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
@@ -651,7 +624,7 @@ mod tests {
         let previous_dir = std::env::current_dir().unwrap();
         let relative = OsString::from("workspace");
 
-        let resolved = with_env_async(
+        let resolved = crate::with_process_env_async(
             &[("COCO_BASH_WORKSPACE", Some(relative.as_os_str()))],
             || async {
                 std::env::set_current_dir(temp_root.path()).unwrap();
@@ -671,7 +644,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
 
-        let resolved = with_env_async(
+        let resolved = crate::with_process_env_async(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],
             || async { resolve_runtime_root(workspace.path()) },
         )
@@ -685,7 +658,7 @@ mod tests {
     async fn resolve_runtime_root_falls_back_to_temp_dir() {
         let workspace = tempfile::tempdir().unwrap();
 
-        let resolved = with_env_async(&[("XDG_RUNTIME_DIR", None)], || async {
+        let resolved = crate::with_process_env_async(&[("XDG_RUNTIME_DIR", None)], || async {
             resolve_runtime_root(workspace.path())
         })
         .await
@@ -700,7 +673,7 @@ mod tests {
         let workspace = temp_root.path().join("coco");
         std::fs::create_dir(&workspace).unwrap();
 
-        let error = with_env_async(
+        let error = crate::with_process_env_async(
             &[("XDG_RUNTIME_DIR", Some(temp_root.path().as_os_str()))],
             || async { resolve_runtime_root(&workspace) },
         )
@@ -776,7 +749,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
 
-        let output = with_env_async(
+        let output = crate::with_process_env_async(
             &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 runtime
@@ -802,13 +775,13 @@ mod tests {
     async fn bash_runtime_auto_mode_falls_back_without_nono() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
-        let bash_path = resolve_bash_path();
+        let bash_path = resolve_bash_path_locked().await;
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
         let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
-        let output = with_env_async(
+        let output = crate::with_process_env_async(
             &[
                 ("COCO_BASH_SANDBOX", Some(OsStr::new("auto"))),
                 ("PATH", Some(path_env.as_os_str())),
@@ -833,13 +806,13 @@ mod tests {
     async fn bash_runtime_nono_mode_errors_when_binary_missing() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
-        let bash_path = resolve_bash_path();
+        let bash_path = resolve_bash_path_locked().await;
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
         let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
-        let error = with_env_async(
+        let error = crate::with_process_env_async(
             &[
                 ("COCO_BASH_SANDBOX", Some(OsStr::new("nono"))),
                 ("PATH", Some(path_env.as_os_str())),
@@ -864,7 +837,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
         let observed_args = workspace.path().join("nono-args.txt");
-        let bash_path = resolve_bash_path();
+        let bash_path = resolve_bash_path_locked().await;
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
         write_executable_script(
@@ -877,7 +850,7 @@ mod tests {
         let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
-        let output = with_env_async(
+        let output = crate::with_process_env_async(
             &[
                 ("COCO_BASH_SANDBOX", Some(OsStr::new("nono"))),
                 ("PATH", Some(path_env.as_os_str())),
@@ -918,7 +891,7 @@ mod tests {
             },
         );
 
-        let output = with_env_async(
+        let output = crate::with_process_env_async(
             &[
                 (COCO_SESSION_BRANCH_ENV, Some(OsStr::new("stale-branch"))),
                 (COCO_STORE_PATH_ENV, Some(OsStr::new("/tmp/stale-store"))),
@@ -957,7 +930,7 @@ mod tests {
             store_path: Some(runtime_store.clone()),
             cli_bridge: Some(bridge),
         };
-        let server = with_env_async(
+        let server = crate::with_process_env_async(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],
             || async { start_coco_cli_runtime_server(workspace.path(), &context).await },
         )

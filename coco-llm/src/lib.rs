@@ -1,8 +1,12 @@
 mod bash_tool;
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::str::FromStr;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,6 +26,39 @@ pub use coco_mem::SessionAnchorPatch as SessionConfigPatch;
 pub const COCO_SESSION_BRANCH_ENV: &str = "COCO_BRANCH";
 pub const COCO_STORE_PATH_ENV: &str = "COCO_STORE_PATH";
 pub const COCO_CLI_RUNTIME_SOCKET_ENV: &str = "COCO_CLI_RUNTIME_SOCKET";
+
+#[cfg(test)]
+async fn with_process_env_async<T, F, Fut>(entries: &[(&str, Option<&OsStr>)], run: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let previous: Vec<_> = entries
+        .iter()
+        .map(|(name, _)| ((*name).to_owned(), std::env::var_os(name)))
+        .collect();
+
+    for (name, value) in entries {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+
+    let output = run().await;
+
+    for (name, value) in previous {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+
+    output
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
