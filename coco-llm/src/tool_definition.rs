@@ -25,6 +25,43 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                 "additionalProperties": false
             }),
         }),
+        "search_skill" => Some(Tool {
+            name: "search_skill".to_owned(),
+            description: "Search installed skills.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional search query matched against skill name, description, and body."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional maximum number of matches to return."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        }),
+        "use_skill" => Some(Tool {
+            name: "use_skill".to_owned(),
+            description: "Run an installed skill on an isolated child branch.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The exact skill name returned by search_skill."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "Optional task specialization for the skill run."
+                    }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        }),
         _ => None,
     }
 }

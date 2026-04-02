@@ -48,6 +48,7 @@ pub struct Anchor {
 pub enum AnchorPayload {
     Session(SessionAnchor),
     Prompt(PromptAnchor),
+    SkillResult(SkillResultAnchor),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -99,6 +100,13 @@ pub struct PromptAnchor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillResultAnchor {
+    pub tool_id: String,
+    pub skill_name: String,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeMetadata {
     pub execution_id: Option<String>,
 }
@@ -138,6 +146,13 @@ impl Anchor {
         }
     }
 
+    pub fn skill_result(merge_parents: Vec<String>, anchor: SkillResultAnchor) -> Self {
+        Self {
+            merge_parents,
+            payload: AnchorPayload::SkillResult(anchor),
+        }
+    }
+
     pub fn merge_parents(&self) -> &[String] {
         &self.merge_parents
     }
@@ -145,14 +160,21 @@ impl Anchor {
     pub fn as_session(&self) -> Option<&SessionAnchor> {
         match &self.payload {
             AnchorPayload::Session(anchor) => Some(anchor),
-            AnchorPayload::Prompt(_) => None,
+            AnchorPayload::Prompt(_) | AnchorPayload::SkillResult(_) => None,
         }
     }
 
     pub fn as_prompt(&self) -> Option<&PromptAnchor> {
         match &self.payload {
-            AnchorPayload::Session(_) => None,
+            AnchorPayload::Session(_) | AnchorPayload::SkillResult(_) => None,
             AnchorPayload::Prompt(anchor) => Some(anchor),
+        }
+    }
+
+    pub fn as_skill_result(&self) -> Option<&SkillResultAnchor> {
+        match &self.payload {
+            AnchorPayload::Session(_) | AnchorPayload::Prompt(_) => None,
+            AnchorPayload::SkillResult(anchor) => Some(anchor),
         }
     }
 }
@@ -262,7 +284,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         Anchor, Kind, NewNode, Node, NodeMetadata, PauseReason, PromptAnchor, Role, SessionAnchor,
-        SessionAnchorPatch, SessionState, Tool, ToolResult,
+        SessionAnchorPatch, SessionState, SkillResultAnchor, Tool, ToolResult,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -315,6 +337,14 @@ mod tests {
     fn make_prompt_anchor() -> PromptAnchor {
         PromptAnchor {
             prompt: "merge prompt".to_owned(),
+        }
+    }
+
+    fn make_skill_result_anchor() -> SkillResultAnchor {
+        SkillResultAnchor {
+            tool_id: "tool-call-1".to_owned(),
+            skill_name: "find-skills".to_owned(),
+            output: "child result".to_owned(),
         }
     }
 
@@ -402,6 +432,61 @@ mod tests {
             Kind::Anchor(Anchor::session(
                 vec!["merge-b".to_owned()],
                 make_session_anchor(),
+            )),
+            fixed_timestamp(),
+        );
+
+        assert_ne!(left.id, right.id);
+    }
+
+    #[test]
+    fn node_id_changes_when_skill_result_anchor_output_changes() {
+        let left = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_result(
+                vec!["merge-a".to_owned()],
+                make_skill_result_anchor(),
+            )),
+            fixed_timestamp(),
+        );
+        let right = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_result(
+                vec!["merge-a".to_owned()],
+                SkillResultAnchor {
+                    output: "different result".to_owned(),
+                    ..make_skill_result_anchor()
+                },
+            )),
+            fixed_timestamp(),
+        );
+
+        assert_ne!(left.id, right.id);
+    }
+
+    #[test]
+    fn node_id_changes_when_skill_result_anchor_merge_parents_change() {
+        let left = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_result(
+                vec!["merge-a".to_owned()],
+                make_skill_result_anchor(),
+            )),
+            fixed_timestamp(),
+        );
+        let right = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_result(
+                vec!["merge-b".to_owned()],
+                make_skill_result_anchor(),
             )),
             fixed_timestamp(),
         );
@@ -545,6 +630,34 @@ mod tests {
 
         assert_eq!(anchor.merge_parents, vec!["merge-a", "merge-b"]);
         assert_eq!(prompt_anchor.prompt, "merge prompt");
+    }
+
+    #[test]
+    fn skill_result_anchor_round_trip_preserves_fields() {
+        let node = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_result(
+                vec!["merge-a".to_owned()],
+                make_skill_result_anchor(),
+            )),
+            fixed_timestamp(),
+        );
+
+        let encoded = serde_json::to_string(&node).unwrap();
+        let decoded: Node = serde_json::from_str(&encoded).unwrap();
+        let Kind::Anchor(anchor) = decoded.kind else {
+            panic!("expected anchor node");
+        };
+        let skill_result = anchor
+            .as_skill_result()
+            .expect("expected skill result anchor");
+
+        assert_eq!(anchor.merge_parents, vec!["merge-a"]);
+        assert_eq!(skill_result.tool_id, "tool-call-1");
+        assert_eq!(skill_result.skill_name, "find-skills");
+        assert_eq!(skill_result.output, "child result");
     }
 
     #[test]

@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 async-trait.workspace = true
 coco-mem = { path = "../coco-mem" }
+indoc = "2.0.6"
 nanoid = "0.4.0"
 rig = { package = "rig-core", version = "0.32.0", features = ["derive"] }
 serde.workspace = true

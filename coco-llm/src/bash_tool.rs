@@ -400,6 +400,28 @@ fn validate_runtime_socket_path(path: &Path) -> std::result::Result<(), BashTool
     Ok(())
 }
 
+fn runtime_error_response(exit_code: i32, stderr: impl Into<String>) -> CocoCliRuntimeResponse {
+    CocoCliRuntimeResponse {
+        exit_code,
+        stdout: String::new(),
+        stderr: stderr.into(),
+    }
+}
+
+fn encode_runtime_response(response: &CocoCliRuntimeResponse) -> Vec<u8> {
+    match serde_json::to_vec(response) {
+        Ok(payload) => payload,
+        Err(error) => serde_json::to_vec(&runtime_error_response(
+            2,
+            format!("failed to serialize coco-cli runtime response: {error}"),
+        ))
+        .unwrap_or_else(|_| {
+            br#"{"exit_code":2,"stdout":"","stderr":"failed to serialize coco-cli runtime response"}"#
+                .to_vec()
+        }),
+    }
+}
+
 async fn start_coco_cli_runtime_server(
     workspace_root: &Path,
     context: &BashToolContext,
@@ -428,26 +450,21 @@ async fn start_coco_cli_runtime_server(
                     Ok(_) => match serde_json::from_slice::<CocoCliRuntimeRequest>(&input) {
                         Ok(request) => match cli_bridge.execute_coco_cli(request).await {
                             Ok(response) => response,
-                            Err(error) => CocoCliRuntimeResponse {
-                                exit_code: 1,
-                                stdout: String::new(),
-                                stderr: error.to_string(),
-                            },
+                            Err(error) => runtime_error_response(1, error.to_string()),
                         },
-                        Err(error) => CocoCliRuntimeResponse {
-                            exit_code: 2,
-                            stdout: String::new(),
-                            stderr: format!("invalid coco-cli runtime request: {error}"),
-                        },
+                        Err(error) => runtime_error_response(
+                            2,
+                            format!("invalid coco-cli runtime request: {error}"),
+                        ),
                     },
-                    Err(error) => CocoCliRuntimeResponse {
-                        exit_code: 2,
-                        stdout: String::new(),
-                        stderr: format!("failed to read coco-cli runtime request: {error}"),
-                    },
+                    Err(error) => runtime_error_response(
+                        2,
+                        format!("failed to read coco-cli runtime request: {error}"),
+                    ),
                 };
-                if let Ok(payload) = serde_json::to_vec(&response) {
-                    let _ = stream.write_all(&payload).await;
+                let payload = encode_runtime_response(&response);
+                if let Err(error) = stream.write_all(&payload).await {
+                    eprintln!("failed to write coco-cli runtime response: {error}");
                 }
             });
         }
@@ -583,9 +600,8 @@ impl rig::tool::ToolDyn for BashToolRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use tokio::net::UnixStream;
@@ -598,6 +614,8 @@ mod tests {
             session_branch: "main".to_owned(),
             store_path: None,
             cli_bridge: None,
+            skill_executor: None,
+            skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
         }
     }
 
@@ -620,7 +638,6 @@ mod tests {
             })
         }
     }
-
 
     fn temp_tool() -> Tool {
         Tool {
@@ -977,6 +994,8 @@ mod tests {
                 session_branch: "draft".to_owned(),
                 store_path: None,
                 cli_bridge: None,
+                skill_executor: None,
+                skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
             },
         );
 
@@ -1018,6 +1037,8 @@ mod tests {
             session_branch: "draft".to_owned(),
             store_path: Some(runtime_store.clone()),
             cli_bridge: Some(bridge),
+            skill_executor: None,
+            skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
         };
         let server = crate::with_process_env_async(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],

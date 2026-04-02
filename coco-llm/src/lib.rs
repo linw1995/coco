@@ -1,4 +1,7 @@
 mod bash_tool;
+mod runtime_bridge;
+mod skill;
+mod skill_tool;
 mod tool_definition;
 
 use std::collections::HashMap;
@@ -8,12 +11,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use coco_mem::{
     Anchor, AnchorPayload, Kind, MemoryStore, NewNode, NodeMetadata, PauseReason, PromptAnchor,
-    Role, SessionAnchor, SessionState, Store, StoreError, Tool, ToolResult, ToolUse,
+    Role, SessionAnchor, SessionState, SkillResultAnchor, Store, StoreError, Tool, ToolResult,
+    ToolUse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,8 +25,15 @@ use snafu::IntoError;
 use snafu::prelude::*;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+pub use skill::{
+    BranchHandoff, SkillToolExecutionResult, SkillToolExecutor, SkillToolExecutorError,
+    SkillToolHandoff, SkillToolHandoffRecorder, SkillToolRequest, SkillToolRunResult,
+    WorkflowFailedSnafu,
+};
+
 pub use coco_mem;
 pub use coco_mem::SessionAnchorPatch as SessionConfigPatch;
+pub use runtime_bridge::LlmRuntimeBridge;
 pub use tool_definition::builtin_tool_definition;
 
 pub const COCO_SESSION_BRANCH_ENV: &str = "COCO_BRANCH";
@@ -221,6 +232,108 @@ pub struct ResolvedCompletionRequest {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
+    trace_recorder: Option<BackendTraceRecorderHandle>,
+}
+
+trait TraceAppender: Send + Sync {
+    fn append(&self, node: NewNode) -> std::result::Result<String, StoreError>;
+}
+
+#[derive(Debug)]
+struct StoreTraceAppender<S> {
+    store: S,
+}
+
+impl<S> TraceAppender for StoreTraceAppender<S>
+where
+    S: Store,
+{
+    fn append(&self, node: NewNode) -> std::result::Result<String, StoreError> {
+        self.store.append(node)
+    }
+}
+
+#[derive(Debug)]
+struct BackendTraceRecorderState {
+    current_tail_id: String,
+    persisted_any: bool,
+}
+
+struct BackendTraceRecorderInner {
+    appender: Arc<dyn TraceAppender>,
+    state: StdMutex<BackendTraceRecorderState>,
+}
+
+#[derive(Clone)]
+struct BackendTraceRecorderHandle {
+    inner: Arc<BackendTraceRecorderInner>,
+}
+
+impl BackendTraceRecorderHandle {
+    fn new(
+        appender: Arc<dyn TraceAppender>,
+        initial_parent_id: String,
+    ) -> BackendTraceRecorderHandle {
+        Self {
+            inner: Arc::new(BackendTraceRecorderInner {
+                appender,
+                state: StdMutex::new(BackendTraceRecorderState {
+                    current_tail_id: initial_parent_id,
+                    persisted_any: false,
+                }),
+            }),
+        }
+    }
+
+    fn append_events(
+        &self,
+        execution_id: &str,
+        events: &[BackendEvent],
+    ) -> std::result::Result<(), BackendError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let metadata = NodeMetadata::execution(execution_id.to_owned());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("trace recorder lock poisoned");
+
+        for event in events {
+            let (role, metadata, kind) =
+                persisted_node_from_backend_event(event.clone(), &metadata);
+            state.current_tail_id = self
+                .inner
+                .appender
+                .append(NewNode {
+                    parent: state.current_tail_id.clone(),
+                    role,
+                    metadata,
+                    kind,
+                })
+                .map_err(|source| BackendError::failed(source.to_string()))?;
+            state.persisted_any = true;
+        }
+
+        Ok(())
+    }
+
+    fn current_tail_id(&self) -> Option<String> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("trace recorder lock poisoned");
+        state.persisted_any.then(|| state.current_tail_id.clone())
+    }
+}
+
+impl std::fmt::Debug for BackendTraceRecorderHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BackendTraceRecorderHandle(..)")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,11 +389,32 @@ impl std::fmt::Debug for BashToolCliBridgeHandle {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BashToolContext {
     pub session_branch: String,
     pub store_path: Option<PathBuf>,
     pub cli_bridge: Option<BashToolCliBridgeHandle>,
+    pub skill_executor: Option<Arc<dyn SkillToolExecutor>>,
+    pub(crate) skill_handoff_recorder: SkillToolHandoffRecorder,
+}
+
+impl std::fmt::Debug for BashToolContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BashToolContext")
+            .field("session_branch", &self.session_branch)
+            .field("store_path", &self.store_path)
+            .field("cli_bridge", &self.cli_bridge)
+            .field(
+                "skill_executor",
+                &self
+                    .skill_executor
+                    .as_ref()
+                    .map(|_| "SkillToolExecutor(..)"),
+            )
+            .field("skill_handoff_recorder", &"SkillToolHandoffRecorder(..)")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,6 +422,7 @@ pub enum BackendEvent {
     AssistantText(String),
     ToolUse(ToolUse),
     ToolResult(ToolResult),
+    BranchHandoff(BranchHandoff),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -390,6 +525,7 @@ where
     store: S,
     backend: B,
     bash_tool_cli_bridge: Option<BashToolCliBridgeHandle>,
+    skill_tool_executor: Option<Arc<dyn SkillToolExecutor>>,
     branch_locks: BranchLockTable,
     workflow_lock: WorkflowLock,
 }
@@ -434,6 +570,21 @@ pub enum Error {
         source: BackendError,
         context: Box<BackendFailureContext>,
     },
+
+    #[snafu(display("Failed to clean up temporary use_skill branch {branch:?}: {source}"))]
+    UseSkillCleanup {
+        branch: String,
+        source: coco_mem::StoreError,
+    },
+
+    #[snafu(display(
+        "use_skill workflow failed and cleanup of temporary branch {branch:?} also failed: workflow={workflow}; cleanup={cleanup}"
+    ))]
+    UseSkillWorkflowFailedCleanup {
+        branch: String,
+        workflow: Box<Error>,
+        cleanup: coco_mem::StoreError,
+    },
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -464,6 +615,7 @@ where
             store,
             backend,
             bash_tool_cli_bridge: None,
+            skill_tool_executor: None,
             branch_locks: Arc::new(Mutex::new(HashMap::new())),
             workflow_lock: Arc::new(Mutex::new(())),
         }
@@ -471,6 +623,11 @@ where
 
     pub fn with_bash_tool_cli_bridge(mut self, bridge: BashToolCliBridgeHandle) -> Self {
         self.bash_tool_cli_bridge = Some(bridge);
+        self
+    }
+
+    pub fn with_skill_tool_executor(mut self, executor: Arc<dyn SkillToolExecutor>) -> Self {
+        self.skill_tool_executor = Some(executor);
         self
     }
 
@@ -740,7 +897,13 @@ where
             .get_branch_head(&request.branch)
             .context(MemorySnafu)?;
         let session = self.resolve_session(&request.branch)?;
-        let resolved = self.resolve_request(&session, request.clone());
+        let trace_recorder = BackendTraceRecorderHandle::new(
+            Arc::new(StoreTraceAppender {
+                store: self.store.clone(),
+            }),
+            original_head.clone(),
+        );
+        let resolved = self.resolve_request(&session, request.clone(), Some(trace_recorder));
 
         match self
             .backend
@@ -751,12 +914,20 @@ where
                 BackendOutcome::Succeeded { text } => {
                     let (last_execution_id, steps) =
                         normalize_backend_steps(run.steps, Some(text.clone()));
-                    let parent_id = self
-                        .append_backend_steps(original_head.clone(), &steps)
-                        .context(MemorySnafu)?;
+                    let parent_id = match resolved
+                        .trace_recorder
+                        .as_ref()
+                        .and_then(BackendTraceRecorderHandle::current_tail_id)
+                    {
+                        Some(parent_id) => parent_id,
+                        None => self
+                            .append_backend_steps(original_head.clone(), &steps)
+                            .context(MemorySnafu)?,
+                    };
                     self.store
                         .set_branch_head(&resolved.branch, &original_head, &parent_id)
                         .context(MemorySnafu)?;
+                    self.finalize_branch_handoffs(&resolved.branch)?;
 
                     Ok(CompletionResult {
                         branch: resolved.branch,
@@ -769,9 +940,16 @@ where
                 }
                 BackendOutcome::Failed { message } => {
                     let (execution_id, steps) = normalize_backend_steps(run.steps, None);
-                    let partial_history_tail = self
-                        .append_backend_steps(original_head.clone(), &steps)
-                        .context(MemorySnafu)?;
+                    let partial_history_tail = match resolved
+                        .trace_recorder
+                        .as_ref()
+                        .and_then(BackendTraceRecorderHandle::current_tail_id)
+                    {
+                        Some(parent_id) => parent_id,
+                        None => self
+                            .append_backend_steps(original_head.clone(), &steps)
+                            .context(MemorySnafu)?,
+                    };
                     let error_node_id = self
                         .store
                         .append(NewNode {
@@ -794,10 +972,15 @@ where
             },
             Err(source) => {
                 let execution_id = format!("execution-{}", nanoid::nanoid!());
+                let failure_parent = resolved
+                    .trace_recorder
+                    .as_ref()
+                    .and_then(BackendTraceRecorderHandle::current_tail_id)
+                    .unwrap_or_else(|| original_head.clone());
                 let error_node_id = self
                     .store
                     .append(NewNode {
-                        parent: original_head.clone(),
+                        parent: failure_parent,
                         role: Role::System,
                         metadata: Some(NodeMetadata::execution(execution_id.clone())),
                         kind: Kind::Failure(source.to_string()),
@@ -836,17 +1019,11 @@ where
     ) -> std::result::Result<String, StoreError> {
         let mut parent_id = parent_id;
         for event in events {
-            let (role, kind) = match event.clone() {
-                BackendEvent::AssistantText(text) => (Role::LLM, Kind::Text(text)),
-                BackendEvent::ToolUse(tool_use) => (Role::LLM, Kind::ToolUse(tool_use)),
-                BackendEvent::ToolResult(tool_result) => {
-                    (Role::User, Kind::ToolResult(tool_result))
-                }
-            };
+            let (role, metadata, kind) = persisted_node_from_backend_event(event.clone(), metadata);
             parent_id = self.store.append(NewNode {
                 parent: parent_id,
                 role,
-                metadata: Some(metadata.clone()),
+                metadata,
                 kind,
             })?;
         }
@@ -865,6 +1042,54 @@ where
         }
 
         Ok(parent_id)
+    }
+
+    fn finalize_branch_handoffs(&self, branch: &str) -> Result<()> {
+        let ancestry = self.store.ancestry(branch).context(MemorySnafu)?;
+        for node in ancestry {
+            let Kind::Anchor(anchor) = &node.kind else {
+                continue;
+            };
+            let Some(merge_parent) = anchor.merge_parents().first() else {
+                continue;
+            };
+
+            let branches = self.store.list_session_states().context(MemorySnafu)?;
+            for (source_branch, state) in branches {
+                let SessionState::Attached {
+                    target_branch,
+                    base_head_id: _,
+                } = state
+                else {
+                    continue;
+                };
+                if target_branch != branch {
+                    continue;
+                }
+                if self
+                    .store
+                    .get_branch_head(&source_branch)
+                    .context(MemorySnafu)?
+                    != *merge_parent
+                {
+                    continue;
+                }
+                self.store
+                    .set_session_state(
+                        &source_branch,
+                        None,
+                        SessionState::Paused {
+                            target_branch: branch.to_owned(),
+                            reason: PauseReason::Merged {
+                                merged_anchor_id: node.id.clone(),
+                            },
+                        },
+                    )
+                    .context(MemorySnafu)?;
+            }
+        }
+
+        Ok(())
     }
 
     async fn lock_workflow(&self) -> OwnedMutexGuard<()> {
@@ -921,6 +1146,8 @@ where
                 session_branch: branch.to_owned(),
                 store_path: self.store.runtime_store_path(),
                 cli_bridge: self.bash_tool_cli_bridge.clone(),
+                skill_executor: self.skill_tool_executor.clone(),
+                skill_handoff_recorder: SkillToolHandoffRecorder::default(),
             },
         })
     }
@@ -963,6 +1190,26 @@ where
                                 }),
                             });
                         }
+                        context.active_anchor_id = node.id.clone();
+                    }
+                    AnchorPayload::SkillResult(skill_result) => {
+                        let Some(context) = state.as_mut() else {
+                            return MissingAnchorSnafu {
+                                branch: reference.to_owned(),
+                            }
+                            .fail();
+                        };
+
+                        context.tail_entries.push(TrackedConversationEntry {
+                            execution_id: node
+                                .metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.execution_id.clone()),
+                            entry: ConversationEntry::ToolResult(ToolResult {
+                                id: skill_result.tool_id.clone(),
+                                output: skill_result.output.clone(),
+                            }),
+                        });
                         context.active_anchor_id = node.id.clone();
                     }
                 },
@@ -1026,6 +1273,7 @@ where
         &self,
         session: &ResolvedSession,
         request: CompletionRequest,
+        trace_recorder: Option<BackendTraceRecorderHandle>,
     ) -> ResolvedCompletionRequest {
         ResolvedCompletionRequest {
             branch: request.branch,
@@ -1038,6 +1286,7 @@ where
             additional_params: request
                 .additional_params
                 .or_else(|| session.config.additional_params.clone()),
+            trace_recorder,
         }
     }
 
@@ -1131,8 +1380,17 @@ fn build_runtime_tool_set(
                 workspace_root.clone(),
                 session.bash_tool_context.clone(),
             )),
+            "search_skill" => Ok(skill_tool::search_runtime_tool(
+                tool.clone(),
+                workspace_root.clone(),
+            )),
+            "use_skill" => Ok(skill_tool::run_runtime_tool(
+                tool.clone(),
+                workspace_root.clone(),
+                session.bash_tool_context.clone(),
+            )),
             other => Err(BackendError::failed(format!(
-                "unsupported tool {other:?}; only \"bash\" is implemented"
+                "unsupported tool {other:?}; only \"bash\", \"search_skill\", and \"use_skill\" are implemented"
             ))),
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1198,6 +1456,35 @@ fn tool_result_message(
 ) -> rig::completion::message::Message {
     rig::completion::message::Message::User {
         content: rig::OneOrMany::many(tool_results).expect("there is atleast one tool result"),
+    }
+}
+
+fn persisted_node_from_backend_event(
+    event: BackendEvent,
+    metadata: &NodeMetadata,
+) -> (Role, Option<NodeMetadata>, Kind) {
+    match event {
+        BackendEvent::AssistantText(text) => (Role::LLM, Some(metadata.clone()), Kind::Text(text)),
+        BackendEvent::ToolUse(tool_use) => {
+            (Role::LLM, Some(metadata.clone()), Kind::ToolUse(tool_use))
+        }
+        BackendEvent::ToolResult(tool_result) => (
+            Role::User,
+            Some(metadata.clone()),
+            Kind::ToolResult(tool_result),
+        ),
+        BackendEvent::BranchHandoff(handoff) => (
+            Role::System,
+            Some(metadata.clone()),
+            Kind::Anchor(Anchor::skill_result(
+                vec![handoff.merge_parent.clone()],
+                SkillResultAnchor {
+                    tool_id: handoff.tool_id,
+                    skill_name: handoff.skill_name,
+                    output: handoff.output,
+                },
+            )),
+        ),
     }
 }
 
@@ -1421,11 +1708,18 @@ where
         .await
         .map_err(|source| BackendError::failed(source.to_string()))?;
     let mut steps = Vec::new();
-    let mut pending_tool_result_events = Vec::new();
+    let mut pending_step: Option<BackendStep> = None;
     let mut prompt = prompt;
 
     for _ in 0..DEFAULT_AGENT_MAX_TURNS {
-        let execution_id = next_execution_id();
+        let execution_id = pending_step
+            .as_ref()
+            .map(|step| step.execution_id.clone())
+            .unwrap_or_else(next_execution_id);
+        let mut step_events = pending_step
+            .take()
+            .map(|step| step.events)
+            .unwrap_or_default();
         let builder = model
             .completion_request(prompt.clone())
             .messages(history.clone());
@@ -1442,18 +1736,20 @@ where
             Err(source) => {
                 steps.push(BackendStep {
                     execution_id,
-                    events: vec![],
+                    events: step_events,
                 });
                 return Ok(BackendRun::failed_with_steps(source.to_string(), steps));
             }
         };
 
-        let mut step_events = std::mem::take(&mut pending_tool_result_events);
         let choice_events = backend_events_from_choice(&response.choice);
         let tool_calls = tool_calls_from_choice(&response.choice);
         let final_text = assistant_text_from_choice(&response.choice);
 
-        step_events.extend(choice_events);
+        if let Some(trace_recorder) = request.trace_recorder.as_ref() {
+            trace_recorder.append_events(&execution_id, &choice_events)?;
+        }
+        step_events.extend(choice_events.clone());
 
         if tool_calls.is_empty() {
             let text = final_text.ok_or_else(|| {
@@ -1472,7 +1768,9 @@ where
             content: response.choice,
         });
 
+        let next_execution_id = next_execution_id();
         let mut tool_results = Vec::with_capacity(tool_calls.len());
+        let mut next_events = Vec::with_capacity(tool_calls.len());
         for tool_call in tool_calls {
             let args = serde_json::to_string(&tool_call.function.arguments)
                 .map_err(|source| BackendError::failed(source.to_string()))?;
@@ -1480,10 +1778,38 @@ where
                 Ok(output) => output,
                 Err(source) => source.to_string(),
             };
-            pending_tool_result_events.push(BackendEvent::ToolResult(ToolResult {
-                id: tool_call.id.clone(),
-                output: output.clone(),
-            }));
+            let handoff = session.bash_tool_context.skill_handoff_recorder.take_next();
+            let event = if tool_call.function.name == "use_skill" {
+                handoff.map_or_else(
+                    || {
+                        BackendEvent::ToolResult(ToolResult {
+                            id: tool_call.id.clone(),
+                            output: output.clone(),
+                        })
+                    },
+                    |handoff| {
+                        BackendEvent::BranchHandoff(BranchHandoff {
+                            tool_id: tool_call.id.clone(),
+                            skill_name: handoff.skill_name,
+                            merge_parent: handoff.merge_parent,
+                            output: handoff.output,
+                        })
+                    },
+                )
+            } else {
+                debug_assert!(
+                    handoff.is_none(),
+                    "only use_skill should record branch handoff metadata"
+                );
+                BackendEvent::ToolResult(ToolResult {
+                    id: tool_call.id.clone(),
+                    output: output.clone(),
+                })
+            };
+            if let Some(trace_recorder) = request.trace_recorder.as_ref() {
+                trace_recorder.append_events(&next_execution_id, std::slice::from_ref(&event))?;
+            }
+            next_events.push(event);
             tool_results.push(rig::completion::message::UserContent::tool_result(
                 tool_call.id,
                 rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(output)),
@@ -1493,14 +1819,15 @@ where
             execution_id,
             events: step_events,
         });
+        pending_step = Some(BackendStep {
+            execution_id: next_execution_id,
+            events: next_events,
+        });
         prompt = tool_result_message(tool_results);
     }
 
-    if !pending_tool_result_events.is_empty() {
-        steps.push(BackendStep {
-            execution_id: next_execution_id(),
-            events: pending_tool_result_events,
-        });
+    if let Some(pending_step) = pending_step {
+        steps.push(pending_step);
     }
 
     Ok(BackendRun::failed_with_steps(
@@ -1608,6 +1935,7 @@ mod tests {
     use super::*;
 
     use std::collections::VecDeque;
+    use std::ffi::OsStr;
     use std::time::Duration;
 
     use coco_mem::MemoryStore;
@@ -1723,6 +2051,273 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct AnyBranchBackend {
+        calls: RecordedCalls,
+        text: String,
+    }
+
+    impl AnyBranchBackend {
+        fn new(text: &str) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(vec![])),
+                text: text.to_owned(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CompletionBackend for AnyBranchBackend {
+        async fn complete(
+            &self,
+            session: ResolvedSession,
+            request: ResolvedCompletionRequest,
+        ) -> std::result::Result<BackendRun, BackendError> {
+            self.calls.lock().await.push((session, request));
+            Ok(BackendRun::succeeded(
+                self.text.clone(),
+                vec![BackendEvent::AssistantText(self.text.clone())],
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct StreamingBackend {
+        calls: RecordedCalls,
+    }
+
+    impl StreamingBackend {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(vec![])),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CompletionBackend for StreamingBackend {
+        async fn complete(
+            &self,
+            session: ResolvedSession,
+            request: ResolvedCompletionRequest,
+        ) -> std::result::Result<BackendRun, BackendError> {
+            self.calls.lock().await.push((session, request.clone()));
+            let trace_recorder = request
+                .trace_recorder
+                .clone()
+                .expect("streaming backend requires trace recorder");
+
+            let step_one_events = vec![BackendEvent::ToolUse(ToolUse {
+                id: "tool-call-1".to_owned(),
+                name: "use_skill".to_owned(),
+                input: serde_json::json!({"name": "find-skills"}),
+            })];
+            trace_recorder.append_events("execution-step-1", &step_one_events)?;
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            let step_two_result = BackendEvent::ToolResult(ToolResult {
+                id: "tool-call-1".to_owned(),
+                output: "delegated output".to_owned(),
+            });
+            trace_recorder
+                .append_events("execution-step-2", std::slice::from_ref(&step_two_result))?;
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            let step_two_text = BackendEvent::AssistantText("done".to_owned());
+            trace_recorder
+                .append_events("execution-step-2", std::slice::from_ref(&step_two_text))?;
+
+            Ok(BackendRun::succeeded_with_steps(
+                "done",
+                vec![
+                    BackendStep {
+                        execution_id: "execution-step-1".to_owned(),
+                        events: step_one_events,
+                    },
+                    BackendStep {
+                        execution_id: "execution-step-2".to_owned(),
+                        events: vec![step_two_result, step_two_text],
+                    },
+                ],
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct StreamingFailBackend;
+
+    #[async_trait]
+    impl CompletionBackend for StreamingFailBackend {
+        async fn complete(
+            &self,
+            _session: ResolvedSession,
+            request: ResolvedCompletionRequest,
+        ) -> std::result::Result<BackendRun, BackendError> {
+            let trace_recorder = request
+                .trace_recorder
+                .clone()
+                .expect("streaming backend requires trace recorder");
+
+            let step_one_events = vec![BackendEvent::ToolUse(ToolUse {
+                id: "tool-call-1".to_owned(),
+                name: "bash".to_owned(),
+                input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
+            })];
+            trace_recorder.append_events("execution-step-1", &step_one_events)?;
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            let step_two_events = vec![
+                BackendEvent::ToolResult(ToolResult {
+                    id: "tool-call-1".to_owned(),
+                    output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
+                }),
+                BackendEvent::AssistantText("trying again".to_owned()),
+            ];
+            trace_recorder.append_events("execution-step-2", &step_two_events)?;
+
+            Ok(BackendRun::failed_with_steps(
+                "MaxTurnError: (reached max turn limit: 8)",
+                vec![
+                    BackendStep {
+                        execution_id: "execution-step-1".to_owned(),
+                        events: step_one_events,
+                    },
+                    BackendStep {
+                        execution_id: "execution-step-2".to_owned(),
+                        events: step_two_events,
+                    },
+                ],
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct AlwaysFailBackend {
+        calls: RecordedCalls,
+    }
+
+    impl AlwaysFailBackend {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(vec![])),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CompletionBackend for AlwaysFailBackend {
+        async fn complete(
+            &self,
+            session: ResolvedSession,
+            request: ResolvedCompletionRequest,
+        ) -> std::result::Result<BackendRun, BackendError> {
+            self.calls.lock().await.push((session, request));
+            Err(BackendError::failed("backend failed"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingDeleteStore {
+        inner: MemoryStore,
+    }
+
+    impl FailingDeleteStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+            }
+        }
+    }
+
+    impl Store for FailingDeleteStore {
+        fn root_id(&self) -> String {
+            self.inner.root_id()
+        }
+
+        fn append(&self, node: NewNode) -> coco_mem::StoreResult<String> {
+            self.inner.append(node)
+        }
+
+        fn fork(&self, name: &str, from_ref: &str) -> coco_mem::StoreResult<String> {
+            self.inner.fork(name, from_ref)
+        }
+
+        fn get_branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {
+            self.inner.get_branch_head(name)
+        }
+
+        fn delete_branch(&self, _name: &str) -> coco_mem::StoreResult<()> {
+            Err(coco_mem::StoreError::CorruptedStore {
+                path: std::path::PathBuf::from("/tmp/use-skill-cleanup"),
+                message: "injected delete failure".to_owned(),
+            })
+        }
+
+        fn set_branch_head(
+            &self,
+            name: &str,
+            expected_old_head: &str,
+            new_head: &str,
+        ) -> coco_mem::StoreResult<()> {
+            self.inner
+                .set_branch_head(name, expected_old_head, new_head)
+        }
+
+        fn ancestry(&self, head_ref: &str) -> coco_mem::StoreResult<Vec<coco_mem::Node>> {
+            self.inner.ancestry(head_ref)
+        }
+
+        fn log(
+            &self,
+            base_ref: &str,
+            head_ref: &str,
+        ) -> coco_mem::StoreResult<Vec<coco_mem::Node>> {
+            self.inner.log(base_ref, head_ref)
+        }
+
+        fn get_node(&self, id: &str) -> coco_mem::StoreResult<coco_mem::Node> {
+            self.inner.get_node(id)
+        }
+
+        fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<coco_mem::Node>> {
+            self.inner.list_children(node_id)
+        }
+
+        fn list_session_states(
+            &self,
+        ) -> coco_mem::StoreResult<HashMap<String, coco_mem::SessionState>> {
+            self.inner.list_session_states()
+        }
+
+        fn get_session_state(&self, name: &str) -> coco_mem::StoreResult<coco_mem::SessionState> {
+            self.inner.get_session_state(name)
+        }
+
+        fn set_session_state(
+            &self,
+            name: &str,
+            expected: Option<&coco_mem::SessionState>,
+            next: coco_mem::SessionState,
+        ) -> coco_mem::StoreResult<coco_mem::SessionState> {
+            self.inner.set_session_state(name, expected, next)
+        }
+
+        fn rebase_session(
+            &self,
+            name: &str,
+            patch: &SessionConfigPatch,
+        ) -> coco_mem::StoreResult<String> {
+            self.inner.rebase_session(name, patch)
+        }
+
+        fn runtime_store_path(&self) -> Option<std::path::PathBuf> {
+            self.inner.runtime_store_path()
+        }
+    }
+
     fn session_config(branch: &str) -> SessionConfig {
         SessionConfig {
             branch: branch.to_owned(),
@@ -1771,19 +2366,7 @@ mod tests {
     }
 
     fn bash_tool() -> Tool {
-        Tool {
-            name: "bash".to_owned(),
-            description: "Run a bash command".to_owned(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "workdir": {"type": "string"},
-                    "timeout_ms": {"type": "integer"}
-                },
-                "required": ["command"]
-            }),
-        }
+        crate::builtin_tool_definition("bash").expect("builtin tool should exist")
     }
 
     fn text_messages_from_entries(entries: &[ConversationEntry]) -> Vec<ConversationMessage> {
@@ -2603,6 +3186,262 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_tool_trace_preserves_event_timestamps() {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), StreamingBackend::new());
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let result = service
+            .prompt(prompt_request("main", "list files"))
+            .await
+            .unwrap();
+
+        let ancestry = store.ancestry("main").unwrap();
+        let assistant = &ancestry[0];
+        let tool_result = &ancestry[1];
+        let tool_use = &ancestry[2];
+
+        assert_eq!(assistant.id, result.response_node_id);
+        assert!(tool_use.created_at < tool_result.created_at);
+        assert!(tool_result.created_at < assistant.created_at);
+        assert!(matches!(
+            &tool_use.kind,
+            Kind::ToolUse(ToolUse { id, name, .. }) if id == "tool-call-1" && name == "use_skill"
+        ));
+        assert!(matches!(
+            &tool_result.kind,
+            Kind::ToolResult(ToolResult { id, output })
+                if id == "tool-call-1" && output == "delegated output"
+        ));
+        assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
+    }
+
+    #[tokio::test]
+    async fn use_skill_workflow_executes_on_child_branch_and_prepares_handoff() {
+        let store = MemoryStore::new();
+        let backend = AnyBranchBackend::new("child result");
+        let service = LlmService::new(store.clone(), backend.clone());
+        let base_session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let result = service
+            .use_skill_workflow(SkillToolRequest {
+                base_branch: "main".to_owned(),
+                skill_name: "find-skills".to_owned(),
+                skill_description: "Find relevant skills.".to_owned(),
+                skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
+                skill_body: "# Find Skills".to_owned(),
+                task: Some("Search the ecosystem".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.result.text, "child result");
+        assert_eq!(result.handoff.skill_name, "find-skills");
+        assert_eq!(result.handoff.output, "child result");
+
+        let calls = backend.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        let child_branch = calls[0].1.branch.clone();
+        drop(calls);
+
+        assert!(child_branch.starts_with("main/skill/find-skills-"));
+        let err = store.get_branch_head(&child_branch).unwrap_err();
+        assert!(
+            matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == child_branch)
+        );
+        let err = store.get_session_state(&child_branch).unwrap_err();
+        assert!(
+            matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == child_branch)
+        );
+        let ancestry = store.ancestry(&result.handoff.merge_parent).unwrap();
+        assert!(
+            ancestry
+                .iter()
+                .any(|node| node.id == base_session.anchor_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn use_skill_workflow_deletes_temp_branch_when_workflow_fails() {
+        let store = MemoryStore::new();
+        let backend = AlwaysFailBackend::new();
+        let service = LlmService::new(store.clone(), backend.clone());
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let err = service
+            .use_skill_workflow(SkillToolRequest {
+                base_branch: "main".to_owned(),
+                skill_name: "find-skills".to_owned(),
+                skill_description: "Find relevant skills.".to_owned(),
+                skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
+                skill_body: "# Find Skills".to_owned(),
+                task: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Backend { .. }));
+        let calls = backend.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        let child_branch = calls[0].1.branch.clone();
+        drop(calls);
+
+        let err = store.get_branch_head(&child_branch).unwrap_err();
+        assert!(
+            matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == child_branch)
+        );
+    }
+
+    #[tokio::test]
+    async fn use_skill_workflow_returns_cleanup_error_when_branch_deletion_fails() {
+        let store = FailingDeleteStore::new();
+        let service = LlmService::new(store, AnyBranchBackend::new("child result"));
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let err = service
+            .use_skill_workflow(SkillToolRequest {
+                base_branch: "main".to_owned(),
+                skill_name: "find-skills".to_owned(),
+                skill_description: "Find relevant skills.".to_owned(),
+                skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
+                skill_body: "# Find Skills".to_owned(),
+                task: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::UseSkillCleanup { branch, .. }
+                if branch.starts_with("main/skill/find-skills-")
+        ));
+    }
+
+    #[tokio::test]
+    async fn use_skill_workflow_reports_cleanup_failure_after_workflow_error() {
+        let store = FailingDeleteStore::new();
+        let service = LlmService::new(store, AlwaysFailBackend::new());
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let err = service
+            .use_skill_workflow(SkillToolRequest {
+                base_branch: "main".to_owned(),
+                skill_name: "find-skills".to_owned(),
+                skill_description: "Find relevant skills.".to_owned(),
+                skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
+                skill_body: "# Find Skills".to_owned(),
+                task: None,
+            })
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::UseSkillWorkflowFailedCleanup {
+                branch,
+                workflow,
+                cleanup,
+            } => {
+                assert!(branch.starts_with("main/skill/find-skills-"));
+                assert!(matches!(*workflow, Error::Backend { .. }));
+                assert!(matches!(
+                    cleanup,
+                    coco_mem::StoreError::CorruptedStore { .. }
+                ));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_handoff_event_persists_prompt_anchor_and_pauses_child_branch() {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), FakeBackend::with_completions(&[]));
+        let base_session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        service.fork("draft", &base_session.anchor_id).unwrap();
+        let draft_head = store.get_branch_head("draft").unwrap();
+        assert_eq!(draft_head, base_session.anchor_id);
+        store
+            .set_session_state(
+                "draft",
+                None,
+                SessionState::Attached {
+                    target_branch: "main".to_owned(),
+                    base_head_id: base_session.anchor_id.clone(),
+                },
+            )
+            .unwrap();
+        let backend = FakeBackend::with_completions(&[(
+            "main",
+            &[Ok(BackendRun::succeeded_with_steps(
+                "base done",
+                vec![BackendStep {
+                    execution_id: "execution-step-1".to_owned(),
+                    events: vec![
+                        BackendEvent::BranchHandoff(BranchHandoff {
+                            tool_id: "tool-call-1".to_owned(),
+                            skill_name: "find-skills".to_owned(),
+                            merge_parent: draft_head.clone(),
+                            output: "Skill handoff".to_owned(),
+                        }),
+                        BackendEvent::AssistantText("base done".to_owned()),
+                    ],
+                }],
+            ))],
+        )]);
+        let service = LlmService::new(store.clone(), backend);
+
+        let result = service
+            .prompt(prompt_request("main", "use delegated skill"))
+            .await
+            .unwrap();
+
+        let ancestry = store.ancestry("main").unwrap();
+        let assistant = &ancestry[0];
+        let handoff_anchor = &ancestry[1];
+
+        assert!(matches!(&assistant.kind, Kind::Text(text) if text == "base done"));
+        let Kind::Anchor(anchor) = &handoff_anchor.kind else {
+            panic!("expected handoff skill result anchor");
+        };
+        let skill_result = anchor
+            .as_skill_result()
+            .expect("expected skill result anchor");
+        assert_eq!(skill_result.tool_id, "tool-call-1");
+        assert_eq!(skill_result.skill_name, "find-skills");
+        assert_eq!(skill_result.output, "Skill handoff");
+        assert_eq!(anchor.merge_parents(), [draft_head.as_str()]);
+        assert_eq!(
+            store.get_session_state("draft").unwrap(),
+            SessionState::Paused {
+                target_branch: "main".to_owned(),
+                reason: PauseReason::Merged {
+                    merged_anchor_id: handoff_anchor.id.clone(),
+                },
+            }
+        );
+        assert_eq!(assistant.parent, handoff_anchor.id);
+        assert_eq!(result.text, "base done");
+    }
+
+    #[tokio::test]
     async fn resolve_session_keeps_tool_entries_but_text_history_stays_text_only() {
         let store = MemoryStore::new();
         let backend = FakeBackend::with_completions(&[(
@@ -2988,6 +3827,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_failure_keeps_branch_head_at_retry_point() {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), StreamingFailBackend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let err = service
+            .prompt(prompt_request("main", "keep going"))
+            .await
+            .unwrap_err();
+        let context = match err {
+            Error::Backend { context, .. } => context,
+            other => panic!("expected backend error, got {other:?}"),
+        };
+
+        assert_eq!(
+            store.get_branch_head("main").unwrap(),
+            context.retry_from_node_id
+        );
+
+        let failure = store.get_node(&context.error_node_id).unwrap();
+        let assistant = store.get_node(&failure.parent).unwrap();
+        let tool_result = store.get_node(&assistant.parent).unwrap();
+        let tool_use = store.get_node(&tool_result.parent).unwrap();
+
+        assert!(tool_use.created_at < tool_result.created_at);
+        assert!(tool_result.created_at < assistant.created_at);
+        assert!(assistant.created_at < failure.created_at);
+        assert_eq!(tool_use.parent, context.retry_from_node_id);
+    }
+
+    #[tokio::test]
     async fn bash_tool_runtime_allows_writes_within_configured_workspace() {
         let temp_root = tempfile::tempdir().unwrap();
         let runtime = bash_tool::runtime_tool(
@@ -2997,27 +3870,23 @@ mod tests {
                 session_branch: "main".to_owned(),
                 store_path: None,
                 cli_bridge: None,
+                skill_executor: None,
+                skill_handoff_recorder: SkillToolHandoffRecorder::default(),
             },
         );
-        let previous = std::env::var_os("COCO_BASH_SANDBOX");
-        unsafe {
-            std::env::set_var("COCO_BASH_SANDBOX", "off");
-        }
-        let output = runtime
-            .call(format!(
-                r#"{{"command":"printf 'hello' > trace.txt; cat trace.txt","workdir":"{}"}}"#,
-                temp_root.path().display()
-            ))
-            .await;
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("COCO_BASH_SANDBOX", value);
+        let output = with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                runtime
+                .call(format!(
+                    r#"{{"command":"printf 'hello' > trace.txt; cat trace.txt","workdir":"{}"}}"#,
+                    temp_root.path().display()
+                ))
+                .await
             },
-            None => unsafe {
-                std::env::remove_var("COCO_BASH_SANDBOX");
-            },
-        }
-        let output = output.unwrap();
+        )
+        .await
+        .unwrap();
         assert!(output.contains("exit_status: 0"));
         assert!(output.contains("stdout:\nhello"));
         assert_eq!(
