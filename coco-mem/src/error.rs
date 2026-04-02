@@ -17,6 +17,12 @@ pub enum StoreError {
     #[snafu(display("ID {id:?} not found"))]
     NotFound { id: String },
 
+    #[snafu(display("Node prefix {prefix:?} matched multiple node IDs: {matches:?}"))]
+    AmbiguousNodePrefix {
+        prefix: String,
+        matches: Vec<String>,
+    },
+
     #[snafu(display("ID {id:?} is not an anchor"))]
     InvalidAnchor { id: String },
 

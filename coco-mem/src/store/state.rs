@@ -6,9 +6,10 @@ use snafu::prelude::*;
 
 use crate::StoreResult as Result;
 use crate::error::{
-    BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu, DuplicateMergeParentSnafu,
-    InvalidAnchorSnafu, MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, NotFoundSnafu,
-    ParentNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
+    AmbiguousNodePrefixSnafu, BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu,
+    DuplicateMergeParentSnafu, InvalidAnchorSnafu, MergeParentMatchesParentSnafu,
+    MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu, RefsNotConnectedSnafu,
+    SessionStateMovedSnafu,
 };
 use crate::{
     Anchor, AnchorPayload, Kind, NewNode, Node, PauseReason, Role, SessionAnchorPatch, SessionState,
@@ -227,10 +228,7 @@ impl StoreState {
     }
 
     pub fn get_node(&self, id: &str) -> Result<Node> {
-        self.nodes
-            .get(id)
-            .cloned()
-            .context(NotFoundSnafu { id: id.to_owned() })
+        self.resolve_node_ref(id).cloned()
     }
 
     pub fn list_session_states(&self) -> HashMap<String, SessionState> {
@@ -444,6 +442,39 @@ impl StoreState {
             id: reference.to_owned(),
         }
         .fail()
+    }
+
+    fn resolve_node_ref<'a>(&'a self, reference: &str) -> Result<&'a Node> {
+        if let Some(head_id) = self.branches.get(reference) {
+            return self.nodes.get(head_id).context(NotFoundSnafu {
+                id: head_id.clone(),
+            });
+        }
+
+        if let Some(node) = self.nodes.get(reference) {
+            return Ok(node);
+        }
+
+        let matches = self
+            .nodes
+            .keys()
+            .filter(|node_id| node_id.starts_with(reference))
+            .cloned()
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [matched] => self.nodes.get(matched).context(NotFoundSnafu {
+                id: matched.clone(),
+            }),
+            [] => NotFoundSnafu {
+                id: reference.to_owned(),
+            }
+            .fail(),
+            _ => AmbiguousNodePrefixSnafu {
+                prefix: reference.to_owned(),
+                matches,
+            }
+            .fail(),
+        }
     }
 
     fn validate_anchor_merge_parents(&self, parent: &str, kind: &Kind) -> Result<()> {

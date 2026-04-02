@@ -1,14 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Read;
-use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::sync::Arc;
 
-use clap::Parser;
-use coco_core::{ConversationEngine, CoreService, FixedBranchResolver, InboundMessage};
 use coco_llm::{
-    BashToolCliBridge, BashToolCliBridgeError, BashToolCliBridgeHandle, CocoCliRuntimeRequest,
-    CocoCliRuntimeResponse, CompletionBackend, LlmService, RigBackend, SessionConfig,
-    SessionConfigPatch, SessionFeedback, SessionMerge,
+    CompletionBackend, LlmService, SessionConfig, SessionConfigPatch, SessionFeedback, SessionMerge,
 };
 use coco_mem::{
     AnchorPayload, FsStore, Kind, Node, PauseReason, SessionAnchor, SessionState, Store,
@@ -19,242 +14,13 @@ use snafu::prelude::*;
 
 use crate::{
     Result,
-    cli::{Cli, Command, PromptCommand, SessionCommand, SessionCreateCommand, SessionSubcommand},
+    cli::{CliTool, SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand},
     env::{read_env, resolve_env_provider, resolve_env_tools},
     error::{
-        AmbiguousNodePrefixSnafu, CoreSnafu, EmptyPromptSnafu, LlmSnafu, MissingConfigurationSnafu,
-        ReadStdinSnafu, StoreSnafu, UnknownShowReferenceSnafu,
+        AmbiguousNodePrefixSnafu, LlmSnafu, MissingConfigurationSnafu, StoreSnafu,
+        UnknownShowReferenceSnafu,
     },
-    store::open_store,
 };
-
-pub async fn run<R>(cli: Cli, reader: &mut R) -> Result<Option<String>>
-where
-    R: Read,
-{
-    run_with_backend(cli, reader, RigBackend).await
-}
-
-pub async fn run_with_backend<B, R>(cli: Cli, reader: &mut R, backend: B) -> Result<Option<String>>
-where
-    B: CompletionBackend + 'static,
-    R: Read,
-{
-    let shared_store = open_store(&cli.store_path)?;
-    let llm = Arc::new_cyclic(|weak_llm| {
-        let bridge = BashToolCliBridgeHandle::new(Arc::new(CocoCliRuntimeBridge {
-            store: shared_store.clone(),
-            llm: weak_llm.clone(),
-        }));
-        LlmService::new(shared_store.clone(), backend).with_bash_tool_cli_bridge(bridge)
-    });
-
-    run_with_services(cli, reader, &shared_store, &llm).await
-}
-
-pub async fn run_with_services<B, R>(
-    cli: Cli,
-    reader: &mut R,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
-) -> Result<Option<String>>
-where
-    B: CompletionBackend,
-    R: Read,
-{
-    match cli.command {
-        Command::Prompt(command) => {
-            let input = resolve_prompt_input(&command, reader)?;
-            let service = CoreService::new(
-                FixedBranchResolver::new(command.branch),
-                ConversationEngine::new(llm.clone()),
-            );
-            let response = service
-                .handle_message(InboundMessage::cli("cli", "cli", input))
-                .await
-                .context(CoreSnafu)?;
-            Ok(Some(response.text))
-        }
-        Command::Session(command) => run_session_command(command, shared_store, llm).await,
-    }
-}
-
-pub async fn run_forwarded_with_services<B>(
-    args: &[String],
-    stdin: &[u8],
-    branch_env: Option<&str>,
-    store_path_env: Option<&str>,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
-) -> CocoCliRuntimeResponse
-where
-    B: CompletionBackend,
-{
-    let argv = std::iter::once("coco-cli".to_owned())
-        .chain(args.iter().cloned())
-        .collect::<Vec<_>>();
-    let mut cli = match Cli::try_parse_from(argv) {
-        Ok(cli) => cli,
-        Err(error) => {
-            let output = error.to_string();
-            return if error.use_stderr() {
-                CocoCliRuntimeResponse {
-                    exit_code: error.exit_code(),
-                    stdout: String::new(),
-                    stderr: output,
-                }
-            } else {
-                CocoCliRuntimeResponse {
-                    exit_code: error.exit_code(),
-                    stdout: output,
-                    stderr: String::new(),
-                }
-            };
-        }
-    };
-
-    apply_forwarded_defaults(&mut cli, args, branch_env, store_path_env);
-
-    match run_with_services(cli, &mut std::io::Cursor::new(stdin), shared_store, llm).await {
-        Ok(Some(output)) => CocoCliRuntimeResponse {
-            exit_code: 0,
-            stdout: format!("{output}\n"),
-            stderr: String::new(),
-        },
-        Ok(None) => CocoCliRuntimeResponse {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        },
-        Err(error) => CocoCliRuntimeResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: format!("{error}\n"),
-        },
-    }
-}
-
-#[derive(Debug)]
-struct CocoCliRuntimeBridge<B>
-where
-    B: CompletionBackend,
-{
-    store: FsStore,
-    llm: Weak<LlmService<B, FsStore>>,
-}
-
-#[async_trait::async_trait]
-impl<B> BashToolCliBridge for CocoCliRuntimeBridge<B>
-where
-    B: CompletionBackend,
-{
-    async fn execute_coco_cli(
-        &self,
-        request: CocoCliRuntimeRequest,
-    ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError> {
-        let llm = self
-            .llm
-            .upgrade()
-            .ok_or(BashToolCliBridgeError::Unavailable)?;
-        Ok(run_forwarded_with_services(
-            &request.args,
-            &request.stdin,
-            request.branch_env.as_deref(),
-            request.store_path_env.as_deref(),
-            &self.store,
-            &llm,
-        )
-        .await)
-    }
-}
-
-fn has_explicit_flag(args: &[String], name: &str) -> bool {
-    let long = format!("--{name}");
-    let long_eq = format!("--{name}=");
-    args.iter()
-        .any(|arg| arg == &long || arg.starts_with(&long_eq))
-}
-
-fn apply_forwarded_defaults(
-    cli: &mut Cli,
-    args: &[String],
-    branch_env: Option<&str>,
-    store_path_env: Option<&str>,
-) {
-    if !has_explicit_flag(args, "store-path")
-        && let Some(store_path_env) = store_path_env
-    {
-        cli.store_path = PathBuf::from(store_path_env);
-    }
-
-    if has_explicit_flag(args, "branch") {
-        return;
-    }
-    let Some(branch_env) = branch_env else {
-        return;
-    };
-    let branch = branch_env.to_owned();
-
-    match &mut cli.command {
-        Command::Prompt(command) => command.branch = branch,
-        Command::Session(command) => match &mut command.command {
-            SessionSubcommand::Create(command) => command.branch = branch,
-            SessionSubcommand::Fork(_) => {}
-            SessionSubcommand::List => {}
-            SessionSubcommand::Get(command) => command.branch = branch,
-            SessionSubcommand::Graph(_) => {}
-            SessionSubcommand::Show(_) => {}
-            SessionSubcommand::Rebase(command) => command.branch = branch,
-            SessionSubcommand::Reopen(command) => command.branch = branch,
-            SessionSubcommand::Pr(command) => command.branch = branch,
-            SessionSubcommand::Close(command) => command.branch = branch,
-            SessionSubcommand::Merge(command) => command.branch = branch,
-            SessionSubcommand::Feedback(command) => command.branch = branch,
-        },
-    }
-}
-
-pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionConfig> {
-    let provider = resolve_env_provider()?;
-    let model = read_env("COCO_MODEL").context(MissingConfigurationSnafu { name: "COCO_MODEL" })?;
-    let tools = if command.tools.is_empty() {
-        resolve_env_tools()?
-            .into_iter()
-            .map(crate::cli::CliTool::to_tool)
-            .collect()
-    } else {
-        resolve_cli_tools(&command.tools)
-    };
-
-    Ok(SessionConfig {
-        branch: command.branch,
-        merge_parents: vec![],
-        provider: provider.into(),
-        model,
-        system_prompt: command.system_prompt,
-        prompt: command.prompt,
-        tools,
-        temperature: command.temperature,
-        max_tokens: command.max_tokens,
-        additional_params: None,
-    })
-}
-
-pub fn resolve_prompt_input<R>(command: &PromptCommand, reader: &mut R) -> Result<String>
-where
-    R: Read,
-{
-    let text = if command.text.is_empty() {
-        let mut buffer = String::new();
-        reader.read_to_string(&mut buffer).context(ReadStdinSnafu)?;
-        buffer.trim_end_matches(['\r', '\n']).to_owned()
-    } else {
-        command.text.join(" ")
-    };
-
-    ensure!(!text.trim().is_empty(), EmptyPromptSnafu);
-    Ok(text)
-}
 
 #[derive(Debug, Serialize, PartialEq)]
 struct SessionSummary {
@@ -276,6 +42,11 @@ struct SessionDetails {
 struct SessionMutationResult {
     branch: String,
     state: SessionState,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct SessionDeleteResult {
+    branch: String,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -338,6 +109,26 @@ struct GraphTransition {
     connector_row: Option<String>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ReadyGraphEntry {
+    created_at: String,
+    node_id: String,
+}
+
+impl Ord for ReadyGraphEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.created_at
+            .cmp(&other.created_at)
+            .then_with(|| self.node_id.cmp(&other.node_id))
+    }
+}
+
+impl PartialOrd for ReadyGraphEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Serialize, PartialEq)]
 struct NodeShowResult {
     #[serde(rename = "ref")]
@@ -346,7 +137,7 @@ struct NodeShowResult {
     node: Node,
 }
 
-async fn run_session_command<B>(
+pub(super) async fn run_session_command<B>(
     command: SessionCommand,
     store: &FsStore,
     llm: &Arc<LlmService<B, FsStore>>,
@@ -382,6 +173,12 @@ where
             &command.reference,
             command.json,
         )?)),
+        SessionSubcommand::Delete(command) => {
+            store.delete_branch(&command.branch).context(StoreSnafu)?;
+            Ok(Some(render_json(SessionDeleteResult {
+                branch: command.branch,
+            })))
+        }
         SessionSubcommand::Rebase(command) => {
             let branch = command.branch.clone();
             let head_id = llm
@@ -445,6 +242,29 @@ where
     }
 }
 
+pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionConfig> {
+    let provider = resolve_env_provider()?;
+    let model = read_env("COCO_MODEL").context(MissingConfigurationSnafu { name: "COCO_MODEL" })?;
+    let tools = if command.tools.is_empty() {
+        resolve_cli_tools(&resolve_env_tools()?)
+    } else {
+        resolve_cli_tools(&command.tools)
+    };
+
+    Ok(SessionConfig {
+        branch: command.branch,
+        merge_parents: vec![],
+        provider: provider.into(),
+        model,
+        system_prompt: command.system_prompt,
+        prompt: command.prompt,
+        tools,
+        temperature: command.temperature,
+        max_tokens: command.max_tokens,
+        additional_params: None,
+    })
+}
+
 fn list_sessions(store: &FsStore) -> Result<Vec<SessionSummary>> {
     let states = store.list_session_states().context(StoreSnafu)?;
     let mut branches = states.into_iter().collect::<Vec<_>>();
@@ -491,15 +311,7 @@ fn render_session_graph(store: &FsStore) -> Result<String> {
 
     for (branch, state) in branches {
         let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
-        let ancestry = store.ancestry(&head_id).context(StoreSnafu)?;
-
-        for node in ancestry {
-            if node.is_root() {
-                continue;
-            }
-            visible_node_ids.insert(node.id.clone());
-            visible_nodes.insert(node.id.clone(), node.clone());
-        }
+        collect_visible_graph_nodes(store, &head_id, &mut visible_node_ids, &mut visible_nodes)?;
 
         labels_by_node
             .entry(head_id)
@@ -541,23 +353,135 @@ fn render_session_graph(store: &FsStore) -> Result<String> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    entries.sort_by(|left, right| {
-        let left_ts = left.node.created_at.to_string();
-        let right_ts = right.node.created_at.to_string();
-        right_ts
-            .cmp(&left_ts)
-            .then_with(|| right.node.id.cmp(&left.node.id))
-    });
+    entries = topologically_sort_graph_entries(entries);
 
     Ok(render_graph_entries(&entries))
 }
 
+fn topologically_sort_graph_entries(entries: Vec<GraphNodeEntry>) -> Vec<GraphNodeEntry> {
+    fn ready_graph_entry(entry: &GraphNodeEntry) -> ReadyGraphEntry {
+        ReadyGraphEntry {
+            created_at: entry.node.created_at.to_string(),
+            node_id: entry.node.id.clone(),
+        }
+    }
+
+    let mut pending_children = HashMap::<String, usize>::new();
+    let mut entries_by_id = HashMap::<String, GraphNodeEntry>::new();
+
+    for entry in entries {
+        pending_children.insert(entry.node.id.clone(), 0);
+        entries_by_id.insert(entry.node.id.clone(), entry);
+    }
+
+    for entry in entries_by_id.values() {
+        if let Some(primary_parent) = &entry.primary_parent
+            && let Some(count) = pending_children.get_mut(primary_parent)
+        {
+            *count += 1;
+        }
+        for merge_parent in &entry.merge_parents {
+            if let Some(count) = pending_children.get_mut(merge_parent) {
+                *count += 1;
+            }
+        }
+    }
+
+    let mut ready = pending_children
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(node_id, _)| {
+            ready_graph_entry(
+                entries_by_id
+                    .get(node_id)
+                    .expect("ready node should exist in graph entries"),
+            )
+        })
+        .collect::<BinaryHeap<_>>();
+    let mut ordered = Vec::with_capacity(entries_by_id.len());
+
+    while let Some(ready_entry) = ready.pop() {
+        let node_id = ready_entry.node_id;
+        let entry = entries_by_id
+            .remove(&node_id)
+            .expect("ready node should still exist in graph entries");
+
+        let mut parents = Vec::with_capacity(1 + entry.merge_parents.len());
+        if let Some(primary_parent) = &entry.primary_parent {
+            parents.push(primary_parent.clone());
+        }
+        parents.extend(entry.merge_parents.iter().cloned());
+
+        for parent_id in parents {
+            let Some(count) = pending_children.get_mut(&parent_id) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                ready.push(ready_graph_entry(
+                    entries_by_id
+                        .get(&parent_id)
+                        .expect("newly ready node should exist in graph entries"),
+                ));
+            }
+        }
+
+        ordered.push(entry);
+    }
+
+    if !entries_by_id.is_empty() {
+        let mut remaining = entries_by_id.into_values().collect::<Vec<_>>();
+        remaining.sort_by(compare_graph_entries_desc);
+        ordered.extend(remaining);
+    }
+
+    ordered
+}
+
+fn compare_graph_entries_desc(left: &GraphNodeEntry, right: &GraphNodeEntry) -> Ordering {
+    let left_ts = left.node.created_at.to_string();
+    let right_ts = right.node.created_at.to_string();
+    right_ts
+        .cmp(&left_ts)
+        .then_with(|| right.node.id.cmp(&left.node.id))
+}
+
+fn collect_visible_graph_nodes(
+    store: &FsStore,
+    head_id: &str,
+    visible_node_ids: &mut BTreeSet<String>,
+    visible_nodes: &mut HashMap<String, Node>,
+) -> Result<()> {
+    let mut pending = vec![head_id.to_owned()];
+    let mut visited = BTreeSet::new();
+
+    while let Some(node_id) = pending.pop() {
+        if node_id.is_empty() || !visited.insert(node_id.clone()) {
+            continue;
+        }
+
+        let node = store.get_node(&node_id).context(StoreSnafu)?;
+        if node.is_root() {
+            continue;
+        }
+
+        pending.push(node.parent.clone());
+        if let Kind::Anchor(anchor) = &node.kind {
+            pending.extend(anchor.merge_parents().iter().cloned());
+        }
+
+        visible_node_ids.insert(node.id.clone());
+        visible_nodes.insert(node.id.clone(), node);
+    }
+
+    Ok(())
+}
+
 fn render_session_show(store: &FsStore, reference: &str, json_output: bool) -> Result<String> {
-    let resolved_id = resolve_show_reference(store, reference)?;
-    let node = store.get_node(&resolved_id).context(StoreSnafu)?;
+    let node = resolve_show_reference(store, reference)?;
     let result = NodeShowResult {
         reference: reference.to_owned(),
-        resolved_id,
+        resolved_id: node.id.clone(),
         node,
     };
 
@@ -568,48 +492,18 @@ fn render_session_show(store: &FsStore, reference: &str, json_output: bool) -> R
     }
 }
 
-fn resolve_show_reference(store: &FsStore, reference: &str) -> Result<String> {
-    match store.get_branch_head(reference) {
-        Ok(head_id) => Ok(head_id),
-        Err(StoreError::BranchNotFound { .. }) => match store.get_node(reference) {
-            Ok(_) => Ok(reference.to_owned()),
-            Err(StoreError::NotFound { .. }) => {
-                let matches = collect_known_node_ids(store)?
-                    .into_iter()
-                    .filter(|node_id| node_id.starts_with(reference))
-                    .collect::<Vec<_>>();
-                match matches.as_slice() {
-                    [matched] => Ok(matched.clone()),
-                    [] => UnknownShowReferenceSnafu {
-                        reference: reference.to_owned(),
-                    }
-                    .fail(),
-                    _ => AmbiguousNodePrefixSnafu {
-                        prefix: reference.to_owned(),
-                        matches,
-                    }
-                    .fail(),
-                }
-            }
-            Err(source) => Err(crate::Error::Store { source }),
-        },
+fn resolve_show_reference(store: &FsStore, reference: &str) -> Result<Node> {
+    match store.get_node(reference) {
+        Ok(node) => Ok(node),
+        Err(StoreError::NotFound { .. }) => UnknownShowReferenceSnafu {
+            reference: reference.to_owned(),
+        }
+        .fail(),
+        Err(StoreError::AmbiguousNodePrefix { prefix, matches }) => {
+            AmbiguousNodePrefixSnafu { prefix, matches }.fail()
+        }
         Err(source) => Err(crate::Error::Store { source }),
     }
-}
-
-fn collect_known_node_ids(store: &FsStore) -> Result<BTreeSet<String>> {
-    let mut node_ids = BTreeSet::new();
-    for branch in store
-        .list_session_states()
-        .context(StoreSnafu)?
-        .into_keys()
-        .collect::<Vec<_>>()
-    {
-        for node in store.ancestry(&branch).context(StoreSnafu)? {
-            node_ids.insert(node.id);
-        }
-    }
-    Ok(node_ids)
 }
 
 fn resolve_visible_parent(visible_node_ids: &BTreeSet<String>, start_id: &str) -> Option<String> {
@@ -772,7 +666,9 @@ fn render_graph_connector_row(
     }
 
     let current_pos = current_col * 2;
-    chars[current_pos] = '|';
+    if target_cols.contains(&current_col) {
+        chars[current_pos] = '|';
+    }
 
     for target_col in target_cols {
         let target_pos = target_col * 2;
@@ -781,18 +677,23 @@ fn render_graph_connector_row(
             continue;
         }
 
-        let range = if target_pos < current_pos {
-            (target_pos + 1)..current_pos
+        let connector_pos = if target_pos < current_pos {
+            current_pos - 1
         } else {
-            (current_pos + 1)..target_pos
+            current_pos + 1
+        };
+        chars[connector_pos] = if target_pos < current_pos { '/' } else { '\\' };
+
+        let range = if target_pos < current_pos {
+            (target_pos + 1)..connector_pos
+        } else {
+            (connector_pos + 1)..target_pos
         };
         for idx in range {
             if chars[idx] == ' ' {
                 chars[idx] = '-';
             }
         }
-
-        chars[target_pos] = if target_pos < current_pos { '/' } else { '\\' };
     }
 
     let connector_row = chars.into_iter().collect::<String>();
@@ -962,13 +863,6 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
                         session.prompt.clone(),
                     ]);
 
-                    if let Some(additional_params) = &session.additional_params {
-                        lines.push("additional_params:".to_owned());
-                        lines.push(
-                            serde_json::to_string_pretty(additional_params)
-                                .expect("additional params should serialize"),
-                        );
-                    }
                 }
                 AnchorPayload::Prompt(prompt) => {
                     lines.push("prompt:".to_owned());
@@ -1083,7 +977,7 @@ fn resolve_visible_session_anchor(
     })
 }
 
-fn resolve_session_patch(command: crate::cli::SessionRebaseCommand) -> SessionConfigPatch {
+fn resolve_session_patch(command: SessionRebaseCommand) -> SessionConfigPatch {
     SessionConfigPatch {
         provider: command
             .provider
@@ -1112,12 +1006,36 @@ fn resolve_session_patch(command: crate::cli::SessionRebaseCommand) -> SessionCo
     }
 }
 
-fn resolve_cli_tools(tools: &[crate::cli::CliTool]) -> Vec<Tool> {
-    tools
-        .iter()
-        .copied()
-        .map(crate::cli::CliTool::to_tool)
-        .collect()
+fn resolve_cli_tools(tools: &[CliTool]) -> Vec<Tool> {
+    tools.iter().copied().map(cli_tool_definition).collect()
+}
+
+fn cli_tool_definition(tool: CliTool) -> Tool {
+    match tool {
+        CliTool::Bash => Tool {
+            name: "bash".to_owned(),
+            description: "Run a bash command.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The bash command to execute."
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Optional working directory."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Optional timeout in milliseconds."
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        },
+    }
 }
 
 fn render_json<T>(value: T) -> String
@@ -1125,4 +1043,39 @@ where
     T: Serialize,
 {
     serde_json::to_string_pretty(&value).expect("session output should serialize")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GraphNodeEntry, render_graph_connector_row};
+    use coco_mem::{Kind, Role};
+    use serde_json::json;
+
+    fn graph_entry(node_id: &str, primary_parent: Option<&str>) -> GraphNodeEntry {
+        GraphNodeEntry {
+            node: serde_json::from_value(json!({
+                "id": node_id,
+                "parent": primary_parent.unwrap_or_default(),
+                "created_at": "1970-01-01T00:00:00Z",
+                "role": Role::User,
+                "metadata": null,
+                "kind": Kind::Text("graph".to_owned()),
+            }))
+            .expect("graph test node should deserialize"),
+            primary_parent: primary_parent.map(str::to_owned),
+            merge_parents: Vec::new(),
+            labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn graph_connector_row_places_left_diagonal_between_columns() {
+        let active_columns = vec!["left".to_owned(), "current".to_owned()];
+        let next_columns = vec!["left".to_owned()];
+        let entry = graph_entry("current", Some("left"));
+
+        let connector_row = render_graph_connector_row(&active_columns, &next_columns, 1, &entry);
+
+        assert_eq!(connector_row.as_deref(), Some("|/"));
+    }
 }

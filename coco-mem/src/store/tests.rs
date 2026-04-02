@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -823,6 +824,74 @@ where
     );
 }
 
+fn assert_get_node_supports_branch_name<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let branch_head = store.fork("draft", &root_id).unwrap();
+
+    let node = store.get_node("draft").unwrap();
+
+    assert_eq!(node.id, branch_head);
+}
+
+fn assert_get_node_supports_prefix_after_branch_delete<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("draft", &root_id).unwrap();
+    let draft_node = store
+        .append(make_text_node(&root_id, "draft only"))
+        .unwrap();
+    store
+        .set_branch_head("draft", &root_id, &draft_node)
+        .unwrap();
+    store.delete_branch("draft").unwrap();
+
+    let prefix = &draft_node[..8];
+    let node = store.get_node(prefix).unwrap();
+
+    assert_eq!(node.id, draft_node);
+}
+
+fn assert_get_node_rejects_ambiguous_prefix<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let mut ids = vec![root_id.clone()];
+    for index in 0..32 {
+        ids.push(
+            store
+                .append(make_text_node(&root_id, &format!("node-{index}")))
+                .unwrap(),
+        );
+    }
+
+    let ambiguous = ids
+        .into_iter()
+        .fold(HashMap::<String, Vec<String>>::new(), |mut groups, id| {
+            groups.entry(id[..1].to_owned()).or_default().push(id);
+            groups
+        })
+        .into_iter()
+        .find_map(|(prefix, matches)| (matches.len() > 1).then_some((prefix, matches)))
+        .expect("expected at least one ambiguous one-character prefix");
+
+    let err = store.get_node(&ambiguous.0).unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::AmbiguousNodePrefix { prefix, matches }
+            if prefix == ambiguous.0 && matches.len() == ambiguous.1.len()
+    ));
+}
+
 fn assert_set_branch_head_requires_matching_expected_head<F>()
 where
     F: TestStoreFactory,
@@ -1231,6 +1300,21 @@ macro_rules! define_common_store_tests {
             #[test]
             fn list_session_states_returns_branch_state_map() {
                 assert_list_session_states_returns_branch_state_map::<$factory>();
+            }
+
+            #[test]
+            fn get_node_supports_branch_name() {
+                assert_get_node_supports_branch_name::<$factory>();
+            }
+
+            #[test]
+            fn get_node_supports_prefix_after_branch_delete() {
+                assert_get_node_supports_prefix_after_branch_delete::<$factory>();
+            }
+
+            #[test]
+            fn get_node_rejects_ambiguous_prefix() {
+                assert_get_node_rejects_ambiguous_prefix::<$factory>();
             }
 
             #[test]

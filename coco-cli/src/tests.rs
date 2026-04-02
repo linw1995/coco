@@ -4,7 +4,9 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::Parser;
-use coco_llm::coco_mem::{Anchor, Kind, NewNode, PromptAnchor, Role, Store, ToolResult, ToolUse};
+use coco_llm::coco_mem::{
+    Anchor, Kind, NewNode, PromptAnchor, Role, Store, ToolResult, ToolUse,
+};
 use coco_llm::{
     BackendError, BackendEvent, BackendRun, CompletionBackend, Provider, ResolvedCompletionRequest,
     ResolvedSession,
@@ -154,6 +156,17 @@ fn session_show_cli(store_path: std::path::PathBuf, reference: &str, json: bool)
             command: SessionSubcommand::Show(SessionShowCommand {
                 reference: reference.to_owned(),
                 json,
+            }),
+        }),
+    }
+}
+
+fn session_delete_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli {
+    Cli {
+        store_path,
+        command: Command::Session(SessionCommand {
+            command: SessionSubcommand::Delete(SessionBranchCommand {
+                branch: branch.unwrap_or("main").to_owned(),
             }),
         }),
     }
@@ -717,6 +730,51 @@ async fn session_graph_shows_branch_labels_on_head_node() {
 }
 
 #[tokio::test]
+async fn session_delete_removes_branch_and_session_state() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+            run_with_backend(
+                session_fork_cli(store_path.clone(), "draft", Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let output = run_with_backend(
+        session_delete_cli(store_path.clone(), Some("draft")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&output).unwrap(),
+        json!({"branch": "draft"})
+    );
+
+    let store = open_store(&store_path).unwrap();
+    let err = store.get_branch_head("draft").unwrap_err();
+    assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
+    let err = store.get_session_state("draft").unwrap_err();
+    assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
+}
+
+#[tokio::test]
 async fn session_rebase_updates_visible_session_config() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
@@ -1056,6 +1114,75 @@ async fn session_graph_renders_global_dag_with_non_anchor_merge_parent() {
 }
 
 #[tokio::test]
+async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+            run_with_backend(
+                session_fork_cli(store_path.clone(), "draft", Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let draft_head = append_prompt_anchor(
+        &store,
+        &store.get_branch_head("draft").unwrap(),
+        "draft merge parent",
+        &[],
+    );
+    store
+        .set_branch_head(
+            "draft",
+            &store.get_branch_head("draft").unwrap(),
+            &draft_head,
+        )
+        .unwrap();
+
+    run_with_backend(
+        session_delete_cli(store_path.clone(), Some("draft")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let store = open_store(&store_path).unwrap();
+    let main_head = store.get_branch_head("main").unwrap();
+    let merged_head =
+        append_prompt_anchor(&store, &main_head, "merge after delete", &[&draft_head]);
+    store
+        .set_branch_head("main", &main_head, &merged_head)
+        .unwrap();
+
+    let output = run_with_backend(
+        session_graph_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains("merge after delete merge=["));
+    assert!(output.contains("draft merge parent"));
+    assert!(output.contains('\\') || output.contains('/'));
+}
+
+#[tokio::test]
 async fn session_graph_shows_tool_and_failure_nodes() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
@@ -1181,6 +1308,115 @@ async fn session_show_outputs_json_for_node_id_reference() {
     assert_eq!(value["resolved_id"], value["node"]["id"]);
     assert_eq!(value["resolved_id"], json!(head_id));
     assert!(matches!(&value["node"]["kind"], Value::Object(_)));
+}
+
+#[tokio::test]
+async fn session_show_resolves_short_node_prefix_after_source_branch_delete() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+            run_with_backend(
+                session_fork_cli(store_path.clone(), "draft", Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let draft_head = store.get_branch_head("draft").unwrap();
+    let draft_node_id = append_prompt_anchor(&store, &draft_head, "deleted branch node", &[]);
+    store
+        .set_branch_head("draft", &draft_head, &draft_node_id)
+        .unwrap();
+
+    run_with_backend(
+        session_delete_cli(store_path.clone(), Some("draft")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let prefix = &draft_node_id[..8];
+    let output = run_with_backend(
+        session_show_cli(store_path, prefix, false),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains(&format!("ref: {prefix}")));
+    assert!(output.contains(&format!("resolved_id: {draft_node_id}")));
+    assert!(output.contains("deleted branch node"));
+}
+
+#[tokio::test]
+async fn session_show_reports_ambiguous_short_node_prefix() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let root_id = store.root_id();
+    let mut ids = vec![root_id];
+    for index in 0..32 {
+        ids.push(append_prompt_anchor(
+            &store,
+            &store.get_branch_head("main").unwrap(),
+            &format!("node-{index}"),
+            &[],
+        ));
+    }
+    let (prefix, matches) = ids
+        .into_iter()
+        .fold(HashMap::<String, Vec<String>>::new(), |mut groups, id| {
+            groups.entry(id[..1].to_owned()).or_default().push(id);
+            groups
+        })
+        .into_iter()
+        .find_map(|(prefix, matches)| (matches.len() > 1).then_some((prefix, matches)))
+        .expect("expected at least one ambiguous one-character prefix");
+
+    let err = run_with_backend(
+        session_show_cli(store_path, &prefix, false),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        crate::Error::AmbiguousNodePrefix {
+            prefix: actual_prefix,
+            matches: actual_matches,
+        } if actual_prefix == prefix && actual_matches.len() == matches.len()
+    ));
 }
 
 #[test]
@@ -1332,6 +1568,12 @@ fn resolve_session_config_reads_tools_from_env() {
             },
         ));
 
-    assert_eq!(config.tools.len(), 1);
-    assert_eq!(config.tools[0].name, "bash");
+    assert_eq!(
+        config
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bash"]
+    );
 }

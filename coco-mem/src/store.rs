@@ -41,7 +41,7 @@ pub trait Store: Clone + Send + Sync + 'static {
     /// Returns the main-parent chain from `head_ref` back to `base_ref`, inclusive.
     fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>>;
 
-    /// Returns a single node by identifier.
+    /// Returns a single node by branch name, full node ID, or node ID prefix.
     fn get_node(&self, id: &str) -> StoreResult<Node>;
 
     /// Returns all persisted branch workflow states keyed by branch.

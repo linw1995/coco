@@ -16,6 +16,7 @@ pub enum SessionSubcommand {
     Get(SessionBranchCommand),
     Graph(SessionGraphCommand),
     Show(SessionShowCommand),
+    Delete(SessionBranchCommand),
     Rebase(SessionRebaseCommand),
     #[command(name = "reopen")]
     Reopen(SessionBranchCommand),
