@@ -10,6 +10,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
 use crate::{
     BashToolContext, COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_STORE_PATH_ENV,
     CocoCliRuntimeRequest, CocoCliRuntimeResponse,
@@ -45,6 +48,8 @@ struct CocoCliRuntimeServer {
     socket_path: PathBuf,
     task: tokio::task::JoinHandle<()>,
 }
+
+const MAX_RUNTIME_SOCKET_PATH_LEN: usize = 107;
 
 #[derive(Debug, Snafu)]
 pub enum BashToolError {
@@ -112,6 +117,15 @@ pub enum BashToolError {
 
     #[snafu(display("bash tool could not bind coco-cli runtime socket: {source}"))]
     BindRuntimeSocket { source: io::Error },
+
+    #[snafu(display(
+        "bash tool runtime socket path is too long for a Unix socket: {path:?} ({length} bytes, max {max})"
+    ))]
+    RuntimeSocketPathTooLong {
+        path: PathBuf,
+        length: usize,
+        max: usize,
+    },
 
     #[snafu(display("bash tool runtime socket server task failed: {source}"))]
     JoinRuntimeSocketTask { source: tokio::task::JoinError },
@@ -358,6 +372,23 @@ fn next_runtime_socket_dir(runtime_root: &Path) -> PathBuf {
     runtime_root.join(nanoid::nanoid!(6))
 }
 
+fn validate_runtime_socket_path(path: &Path) -> std::result::Result<(), BashToolError> {
+    #[cfg(unix)]
+    {
+        let length = path.as_os_str().as_bytes().len();
+        ensure!(
+            length <= MAX_RUNTIME_SOCKET_PATH_LEN,
+            RuntimeSocketPathTooLongSnafu {
+                path: path.to_path_buf(),
+                length,
+                max: MAX_RUNTIME_SOCKET_PATH_LEN,
+            }
+        );
+    }
+
+    Ok(())
+}
+
 async fn start_coco_cli_runtime_server(
     workspace_root: &Path,
     context: &BashToolContext,
@@ -371,6 +402,7 @@ async fn start_coco_cli_runtime_server(
     let socket_dir = next_runtime_socket_dir(&runtime_root);
     std::fs::create_dir_all(&socket_dir).context(BindRuntimeSocketSnafu)?;
     let socket_path = socket_dir.join("coco-cli.sock");
+    validate_runtime_socket_path(&socket_path)?;
     let listener = UnixListener::bind(&socket_path).context(BindRuntimeSocketSnafu)?;
     let task = tokio::spawn(async move {
         loop {
@@ -681,6 +713,19 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, BashToolError::RuntimeRootOverlapsWorkspace));
+    }
+
+    #[test]
+    fn validate_runtime_socket_path_rejects_long_paths() {
+        let long_dir = "a".repeat(MAX_RUNTIME_SOCKET_PATH_LEN);
+        let path = PathBuf::from("/tmp").join(long_dir).join("coco-cli.sock");
+
+        let error = validate_runtime_socket_path(&path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BashToolError::RuntimeSocketPathTooLong { .. }
+        ));
     }
 
     #[test]
