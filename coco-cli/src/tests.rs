@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::Parser;
 use coco_llm::coco_mem::{
-    Anchor, Kind, NewNode, PromptAnchor, Role, Store, ToolResult, ToolUse,
+    Anchor, Kind, NewNode, PromptAnchor, Role, SkillResultAnchor, Store, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEvent, BackendRun, CompletionBackend, Provider, ResolvedCompletionRequest,
@@ -338,6 +338,31 @@ fn append_failure_node(store: &impl Store, parent: &str, message: &str) -> Strin
             role: Role::System,
             metadata: None,
             kind: Kind::Failure(message.to_owned()),
+        })
+        .unwrap()
+}
+
+fn append_skill_result_anchor(
+    store: &impl Store,
+    parent: &str,
+    merge_parent: &str,
+    tool_id: &str,
+    skill_name: &str,
+    output: &str,
+) -> String {
+    store
+        .append(NewNode {
+            parent: parent.to_owned(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_result(
+                vec![merge_parent.to_owned()],
+                SkillResultAnchor {
+                    tool_id: tool_id.to_owned(),
+                    skill_name: skill_name.to_owned(),
+                    output: output.to_owned(),
+                },
+            )),
         })
         .unwrap()
 }
@@ -1280,6 +1305,75 @@ async fn session_graph_shows_tool_and_failure_nodes() {
 }
 
 #[tokio::test]
+async fn session_graph_and_show_render_skill_result_anchor() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_head = store.get_branch_head("main").unwrap();
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "use_skill");
+    store
+        .set_branch_head("main", &session_head, &tool_use_id)
+        .unwrap();
+    let skill_result_id = append_skill_result_anchor(
+        &store,
+        &tool_use_id,
+        &session_head,
+        "tool-1",
+        "find-skills",
+        "Delegated result",
+    );
+    store
+        .set_branch_head("main", &tool_use_id, &skill_result_id)
+        .unwrap();
+
+    let graph_output = run_with_backend(
+        session_graph_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(graph_output.contains("skill_result"));
+    assert!(graph_output.contains("Delegated result"));
+    let skill_result_line = graph_output
+        .lines()
+        .position(|line| line.contains("skill_result"))
+        .expect("expected skill_result line");
+    let tool_use_line = graph_output
+        .lines()
+        .position(|line| line.contains("tool_use"))
+        .expect("expected tool_use line");
+    assert!(skill_result_line < tool_use_line);
+
+    let show_output = run_with_backend(
+        session_show_cli(store_path, "main", false),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(show_output.contains("kind: skill_result"));
+    assert!(show_output.contains("tool_id: tool-1"));
+    assert!(show_output.contains("skill_name: find-skills"));
+    assert!(show_output.contains("Delegated result"));
+}
+
+#[tokio::test]
 async fn session_show_resolves_branch_to_head_node_text_output() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
@@ -1679,7 +1773,7 @@ fn resolve_session_config_reads_tools_from_env() {
             &[
                 ("COCO_PROVIDER", "openai"),
                 ("COCO_MODEL", "gpt-4.1-mini"),
-                ("COCO_TOOLS", "bash"),
+                ("COCO_TOOLS", "bash,search_skill,use_skill"),
             ],
             || async {
                 resolve_session_config(SessionCreateCommand {
@@ -1701,7 +1795,7 @@ fn resolve_session_config_reads_tools_from_env() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["bash"]
+        vec!["bash", "search_skill", "use_skill"]
     );
 }
 

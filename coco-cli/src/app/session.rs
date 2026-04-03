@@ -773,6 +773,7 @@ fn graph_kind_name(node: &Node) -> &'static str {
         Kind::Anchor(anchor) => match &anchor.payload {
             AnchorPayload::Session(_) => "session",
             AnchorPayload::Prompt(_) => "prompt",
+            AnchorPayload::SkillResult(_) => "skill_result",
         },
         Kind::ToolUse(_) => "tool_use",
         Kind::ToolResult(_) => "tool_result",
@@ -792,6 +793,7 @@ fn summarize_node(node: &Node) -> String {
                 }
             }
             AnchorPayload::Prompt(prompt) => prompt.prompt.clone(),
+            AnchorPayload::SkillResult(skill_result) => skill_result.output.clone(),
         },
         Kind::ToolUse(tool_use) => tool_use.input.to_string(),
         Kind::ToolResult(tool_result) => tool_result.output.clone(),
@@ -892,6 +894,12 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
                 AnchorPayload::Prompt(prompt) => {
                     lines.push("prompt:".to_owned());
                     lines.push(prompt.prompt.clone());
+                }
+                AnchorPayload::SkillResult(skill_result) => {
+                    lines.push(format!("tool_id: {}", skill_result.tool_id));
+                    lines.push(format!("skill_name: {}", skill_result.skill_name));
+                    lines.push("output:".to_owned());
+                    lines.push(skill_result.output.clone());
                 }
             }
         }

@@ -30,12 +30,18 @@ impl From<CliProvider> for Provider {
 pub enum CliTool {
     #[value(name = "bash")]
     Bash,
+    #[value(name = "search_skill")]
+    SearchSkill,
+    #[value(name = "use_skill")]
+    UseSkill,
 }
 
 impl CliTool {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "bash" => Some(Self::Bash),
+            "search_skill" => Some(Self::SearchSkill),
+            "use_skill" => Some(Self::UseSkill),
             _ => None,
         }
     }
@@ -43,6 +49,8 @@ impl CliTool {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bash => "bash",
+            Self::SearchSkill => "search_skill",
+            Self::UseSkill => "use_skill",
         }
     }
 }
