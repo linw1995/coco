@@ -51,6 +51,12 @@ struct CocoCliRuntimeServer {
 
 const MAX_RUNTIME_SOCKET_PATH_LEN: usize = 107;
 
+#[cfg(unix)]
+const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
+
+#[cfg(not(unix))]
+const NONO_DEFAULT_ALLOW_FILES: &[&str] = &[];
+
 #[derive(Debug, Snafu)]
 pub enum BashToolError {
     #[snafu(display("failed to resolve workspace root: {source}"))]
@@ -335,6 +341,10 @@ fn nono_execution_spec(
         OsString::from("--allow"),
         request.workspace_root.as_os_str().to_owned(),
     ];
+    for default_allow_file in NONO_DEFAULT_ALLOW_FILES {
+        args.push(OsString::from("--allow-file"));
+        args.push(OsString::from(default_allow_file));
+    }
     if let Some(extra_allow_path) = extra_allow_path {
         args.push(OsString::from("--allow"));
         args.push(extra_allow_path.as_os_str().to_owned());
@@ -761,19 +771,47 @@ mod tests {
         let spec = nono_execution_spec(nono.clone(), &request, Some(&runtime_dir));
 
         assert_eq!(spec.program, nono);
-        assert_eq!(
-            spec.args,
-            vec![
-                OsString::from("run"),
-                OsString::from("--allow"),
-                temp_root.path().as_os_str().to_owned(),
-                OsString::from("--allow"),
-                runtime_dir.as_os_str().to_owned(),
-                OsString::from("--"),
-                OsString::from("bash"),
-                OsString::from("-lc"),
-                OsString::from("pwd"),
-            ]
+        let mut expected_args = vec![
+            OsString::from("run"),
+            OsString::from("--silent"),
+            OsString::from("--allow"),
+            temp_root.path().as_os_str().to_owned(),
+        ];
+        for default_allow_file in NONO_DEFAULT_ALLOW_FILES {
+            expected_args.push(OsString::from("--allow-file"));
+            expected_args.push(OsString::from(default_allow_file));
+        }
+        expected_args.extend([
+            OsString::from("--allow"),
+            runtime_dir.as_os_str().to_owned(),
+            OsString::from("--"),
+            OsString::from("bash"),
+            OsString::from("-lc"),
+            OsString::from("pwd"),
+        ]);
+
+        assert_eq!(spec.args, expected_args);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_execution_spec_allows_dev_null_by_default() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let request = BashCommandRequest {
+            command: "pwd".to_owned(),
+            workdir: temp_root.path().to_path_buf(),
+            workspace_root: temp_root.path().to_path_buf(),
+            sandbox_mode: BashSandboxMode::Off,
+            timeout_ms: None,
+            context: test_context(),
+        };
+        let spec = nono_execution_spec(PathBuf::from("/bin/nono"), &request, None);
+
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|window| window
+                    == [OsString::from("--allow-file"), OsString::from("/dev/null")])
         );
     }
 
@@ -889,7 +927,7 @@ mod tests {
         write_executable_script(
             &fake_bin.path().join("nono"),
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nshift 4\nexec \"$@\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--\" ]; then\n    shift\n    break\n  fi\n  shift\ndone\nexec \"$@\"\n",
                 observed_args.display()
             ),
         );
@@ -920,6 +958,10 @@ mod tests {
         assert!(args.contains("--silent"));
         assert!(args.contains("--allow"));
         assert!(args.contains(&expected_workspace));
+        #[cfg(unix)]
+        assert!(args.contains("--allow-file"));
+        #[cfg(unix)]
+        assert!(args.contains("/dev/null"));
         assert!(args.contains("--"));
         assert!(args.contains("bash"));
         assert!(args.contains("-lc"));
