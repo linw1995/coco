@@ -339,6 +339,50 @@ where
     assert_eq!(ids, vec![b_id, a_id, session_id, root_id]);
 }
 
+fn assert_list_children_returns_primary_and_merge_children_in_stable_order<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let left_id = store.append(make_text_node(&session_id, "left")).unwrap();
+    let right_id = store
+        .append(make_prompt_anchor_node(&left_id, &[&session_id]))
+        .unwrap();
+
+    let nodes = store.list_children(&session_id).unwrap();
+    let ids = nodes.into_iter().map(|node| node.id).collect::<Vec<_>>();
+
+    assert_eq!(ids, vec![left_id, right_id]);
+}
+
+fn assert_list_children_returns_empty_for_leaf_node<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let leaf_id = store.append(make_text_node(&session_id, "leaf")).unwrap();
+
+    let children = store.list_children(&leaf_id).unwrap();
+
+    assert!(children.is_empty());
+}
+
+fn assert_list_children_returns_not_found_for_missing_node<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let missing_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let err = store.list_children(missing_id).unwrap_err();
+
+    assert!(matches!(err, Error::NotFound { id } if id == missing_id));
+}
+
 fn assert_log_returns_nodes_from_head_back_to_base_inclusive<F>()
 where
     F: TestStoreFactory,
@@ -1200,6 +1244,21 @@ macro_rules! define_common_store_tests {
             #[test]
             fn ancestry_returns_nodes_back_to_root() {
                 assert_ancestry_returns_nodes_back_to_root::<$factory>();
+            }
+
+            #[test]
+            fn list_children_returns_primary_and_merge_children_in_stable_order() {
+                assert_list_children_returns_primary_and_merge_children_in_stable_order::<$factory>();
+            }
+
+            #[test]
+            fn list_children_returns_empty_for_leaf_node() {
+                assert_list_children_returns_empty_for_leaf_node::<$factory>();
+            }
+
+            #[test]
+            fn list_children_returns_not_found_for_missing_node() {
+                assert_list_children_returns_not_found_for_missing_node::<$factory>();
             }
 
             #[test]

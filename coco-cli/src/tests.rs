@@ -1319,6 +1319,7 @@ async fn session_show_resolves_branch_to_head_node_text_output() {
 
     assert!(output.contains("ref: main"));
     assert!(output.contains(&format!("resolved_id: {head_id}")));
+    assert!(output.contains("children: []"));
     assert!(output.contains("kind: text"));
     assert!(output.contains("assistant reply"));
 }
@@ -1358,7 +1359,79 @@ async fn session_show_outputs_json_for_node_id_reference() {
     assert_eq!(value["ref"], json!(prefix));
     assert_eq!(value["resolved_id"], value["node"]["id"]);
     assert_eq!(value["resolved_id"], json!(head_id));
+    assert_eq!(value["children"], json!([]));
     assert!(matches!(&value["node"]["kind"], Value::Object(_)));
+}
+
+#[tokio::test]
+async fn session_show_outputs_children_ids_for_primary_and_merge_edges() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_id = store.get_branch_head("main").unwrap();
+    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]);
+    let merge_child_id =
+        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]);
+
+    let output = run_with_backend(
+        session_show_cli(store_path, &session_id, false),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains(&format!("children: [{primary_child_id}, {merge_child_id}]")));
+}
+
+#[tokio::test]
+async fn session_show_json_includes_children_ids() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_id = store.get_branch_head("main").unwrap();
+    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]);
+    let merge_child_id =
+        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]);
+
+    let output = run_with_backend(
+        session_show_cli(store_path, &session_id[..12], true),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value = serde_json::from_str::<Value>(&output).unwrap();
+
+    assert_eq!(value["children"], json!([primary_child_id, merge_child_id]));
 }
 
 #[tokio::test]
@@ -1434,7 +1507,8 @@ async fn session_show_reports_ambiguous_short_node_prefix() {
 
     let store = open_store(&store_path).unwrap();
     let root_id = store.root_id();
-    let mut ids = vec![root_id];
+    let session_id = store.get_branch_head("main").unwrap();
+    let mut ids = vec![root_id, session_id];
     for index in 0..32 {
         ids.push(append_prompt_anchor(
             &store,

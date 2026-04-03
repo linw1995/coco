@@ -44,6 +44,9 @@ pub trait Store: Clone + Send + Sync + 'static {
     /// Returns a single node by branch name, full node ID, or node ID prefix.
     fn get_node(&self, id: &str) -> StoreResult<Node>;
 
+    /// Returns all direct children for a node, including merge-parent edges.
+    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>>;
+
     /// Returns all persisted branch workflow states keyed by branch.
     fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>>;
 

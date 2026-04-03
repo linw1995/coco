@@ -135,6 +135,7 @@ struct NodeShowResult {
     #[serde(rename = "ref")]
     reference: String,
     resolved_id: String,
+    children: Vec<String>,
     node: Node,
 }
 
@@ -481,9 +482,16 @@ fn collect_visible_graph_nodes(
 
 fn render_session_show(store: &FsStore, reference: &str, json_output: bool) -> Result<String> {
     let node = resolve_show_reference(store, reference)?;
+    let children = store
+        .list_children(&node.id)
+        .context(StoreSnafu)?
+        .into_iter()
+        .map(|node| node.id)
+        .collect();
     let result = NodeShowResult {
         reference: reference.to_owned(),
         resolved_id: node.id.clone(),
+        children,
         node,
     };
 
@@ -800,6 +808,14 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
         format!("resolved_id: {}", result.resolved_id),
         format!("id: {}", result.node.id),
         format!("parent: {}", result.node.parent),
+        format!(
+            "children: {}",
+            if result.children.is_empty() {
+                "[]".to_owned()
+            } else {
+                format!("[{}]", result.children.join(", "))
+            }
+        ),
         format!("created_at: {}", result.node.created_at),
         format!("role: {:?}", result.node.role),
         format!("kind: {}", graph_kind_name(&result.node)),
@@ -872,7 +888,6 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
                                 .expect("additional params should serialize"),
                         );
                     }
-
                 }
                 AnchorPayload::Prompt(prompt) => {
                     lines.push("prompt:".to_owned());

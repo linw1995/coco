@@ -390,6 +390,13 @@ impl Store for FsStore {
         self.inner.read().expect("store lock poisoned").get_node(id)
     }
 
+    fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .list_children(node_id)
+    }
+
     fn list_session_states(&self) -> Result<HashMap<String, SessionState>> {
         Ok(self
             .inner

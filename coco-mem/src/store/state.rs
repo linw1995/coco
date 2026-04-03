@@ -231,6 +231,30 @@ impl StoreState {
         self.resolve_node_ref(id).cloned()
     }
 
+    pub fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
+        self.nodes.get(node_id).context(NotFoundSnafu {
+            id: node_id.to_owned(),
+        })?;
+
+        let mut nodes = self
+            .children
+            .get(node_id)
+            .into_iter()
+            .flat_map(|children| children.iter())
+            .map(|child_id| {
+                self.nodes.get(child_id).cloned().context(NotFoundSnafu {
+                    id: child_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        nodes.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(nodes)
+    }
+
     pub fn list_session_states(&self) -> HashMap<String, SessionState> {
         self.sessions.clone()
     }
