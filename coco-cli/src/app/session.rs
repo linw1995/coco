@@ -1032,35 +1032,15 @@ fn resolve_session_patch(command: SessionRebaseCommand) -> SessionConfigPatch {
 }
 
 fn resolve_cli_tools(tools: &[CliTool]) -> Vec<Tool> {
-    tools.iter().copied().map(cli_tool_definition).collect()
-}
-
-fn cli_tool_definition(tool: CliTool) -> Tool {
-    match tool {
-        CliTool::Bash => Tool {
-            name: "bash".to_owned(),
-            description: "Run a bash command.".to_owned(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The bash command to execute."
-                    },
-                    "workdir": {
-                        "type": "string",
-                        "description": "Optional working directory."
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "description": "Optional timeout in milliseconds."
-                    }
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-        },
-    }
+    tools
+        .iter()
+        .copied()
+        .map(CliTool::as_str)
+        .map(|name| {
+            coco_llm::builtin_tool_definition(name)
+                .expect("CliTool names should always map to built-in tool definitions")
+        })
+        .collect()
 }
 
 fn parse_session_additional_params(additional_params: Option<String>) -> Result<Option<Value>> {

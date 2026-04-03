@@ -1,4 +1,5 @@
 mod bash_tool;
+mod tool_definition;
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -22,6 +23,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use coco_mem;
 pub use coco_mem::SessionAnchorPatch as SessionConfigPatch;
+pub use tool_definition::builtin_tool_definition;
 
 pub const COCO_SESSION_BRANCH_ENV: &str = "COCO_BRANCH";
 pub const COCO_STORE_PATH_ENV: &str = "COCO_STORE_PATH";
