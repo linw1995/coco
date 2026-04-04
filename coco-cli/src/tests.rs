@@ -8,8 +8,7 @@ use coco_llm::coco_mem::{
     Anchor, Kind, NewNode, PromptAnchor, Role, SkillResultAnchor, Store, ToolResult, ToolUse,
 };
 use coco_llm::{
-    BackendError, BackendEvent, BackendRun, CompletionBackend, Provider, ResolvedCompletionRequest,
-    ResolvedSession,
+    BackendError, BackendTurn, CompletionBackend, CompletionMessage, Provider, StepContext,
 };
 use coco_mem::SessionState;
 use serde_json::{Value, json};
@@ -29,7 +28,7 @@ use crate::{
 };
 
 type FakeResponseQueue =
-    Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendRun, BackendError>>>>>;
+    Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
 #[derive(Debug, Clone)]
 struct FakeBackend {
@@ -37,6 +36,16 @@ struct FakeBackend {
 }
 
 impl FakeBackend {
+    fn finished_turn(text: &str) -> BackendTurn {
+        BackendTurn {
+            message: CompletionMessage::assistant(text.to_owned()),
+            events: vec![],
+            tool_calls: vec![],
+            final_text: Some(text.to_owned()),
+            trace_persisted: false,
+        }
+    }
+
     fn with_responses(entries: &[(&str, &[std::result::Result<&str, BackendError>])]) -> Self {
         let responses = entries
             .iter()
@@ -48,12 +57,7 @@ impl FakeBackend {
                         .map(|response| {
                             response
                                 .as_ref()
-                                .map(|text| {
-                                    BackendRun::succeeded(
-                                        (*text).to_owned(),
-                                        vec![BackendEvent::AssistantText((*text).to_owned())],
-                                    )
-                                })
+                                .map(|text| Self::finished_turn(text))
                                 .map_err(Clone::clone)
                         })
                         .collect(),
@@ -69,14 +73,10 @@ impl FakeBackend {
 
 #[async_trait::async_trait]
 impl CompletionBackend for FakeBackend {
-    async fn complete(
-        &self,
-        _session: ResolvedSession,
-        request: ResolvedCompletionRequest,
-    ) -> std::result::Result<BackendRun, BackendError> {
+    async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
         let mut responses = self.responses.lock().unwrap();
         let queue = responses
-            .get_mut(&request.branch)
+            .get_mut(&ctx.request.branch)
             .expect("missing fake backend queue");
         queue.pop_front().expect("missing fake backend response")
     }

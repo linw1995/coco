@@ -52,7 +52,7 @@ where
                 conversation_id: message.conversation_id.clone(),
             })?;
 
-        match self.engine.complete(&branch, text).await {
+        match self.engine.reply(&branch, text).await {
             Ok(text) => Ok(OutboundMessage { text }),
             Err(EngineError::SessionMissing { branch }) => Err(Error::MissingSession { branch }),
             Err(source @ EngineError::EngineFailed { .. }) => {

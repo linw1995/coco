@@ -28,7 +28,7 @@ where
         Self { service }
     }
 
-    pub async fn complete(
+    pub async fn reply(
         &self,
         branch: &str,
         prompt: &str,

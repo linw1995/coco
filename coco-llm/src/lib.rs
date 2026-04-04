@@ -40,6 +40,19 @@ pub const COCO_SESSION_BRANCH_ENV: &str = "COCO_BRANCH";
 pub const COCO_STORE_PATH_ENV: &str = "COCO_STORE_PATH";
 pub const COCO_CLI_RUNTIME_SOCKET_ENV: &str = "COCO_CLI_RUNTIME_SOCKET";
 
+pub type CompletionMessage = rig::completion::message::Message;
+pub type CompletionToolCall = rig::completion::message::ToolCall;
+pub type CompletionToolDefinition = rig::completion::ToolDefinition;
+
+#[derive(Debug, Clone, Copy)]
+pub struct StepContext<'a> {
+    pub session: &'a ResolvedSession,
+    pub request: &'a ResolvedCompletionRequest,
+    pub prompt: &'a CompletionMessage,
+    pub history: &'a [CompletionMessage],
+    pub tool_definitions: &'a [CompletionToolDefinition],
+}
+
 #[cfg(test)]
 async fn with_process_env_async<T, F, Fut>(entries: &[(&str, Option<&OsStr>)], run: F) -> T
 where
@@ -438,6 +451,15 @@ pub struct BackendRun {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct BackendTurn {
+    pub message: CompletionMessage,
+    pub events: Vec<BackendEvent>,
+    pub tool_calls: Vec<CompletionToolCall>,
+    pub final_text: Option<String>,
+    pub trace_persisted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum BackendOutcome {
     Succeeded { text: String },
     Failed { message: String },
@@ -481,6 +503,36 @@ impl BackendRun {
     }
 }
 
+impl BackendTurn {
+    #[cfg(test)]
+    fn finished(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            message: CompletionMessage::assistant(text.clone()),
+            events: vec![BackendEvent::AssistantText(text.clone())],
+            tool_calls: vec![],
+            final_text: Some(text),
+            trace_persisted: false,
+        }
+    }
+
+    fn from_assistant_choice(
+        message_id: Option<String>,
+        choice: rig::OneOrMany<rig::message::AssistantContent>,
+    ) -> Self {
+        Self {
+            message: CompletionMessage::Assistant {
+                id: message_id,
+                content: choice.clone(),
+            },
+            events: backend_events_from_choice(&choice),
+            tool_calls: tool_calls_from_choice(&choice),
+            final_text: assistant_text_from_choice(&choice),
+            trace_persisted: false,
+        }
+    }
+}
+
 #[derive(Debug, Snafu, Clone, PartialEq, Eq)]
 pub enum BackendError {
     #[snafu(display("{message}"))]
@@ -508,11 +560,20 @@ pub struct BackendFailureContext {
 
 #[async_trait]
 pub trait CompletionBackend: Send + Sync {
+    async fn step(&self, _ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
+        Err(BackendError::failed("backend step is not implemented"))
+    }
+
     async fn complete(
         &self,
         session: ResolvedSession,
         request: ResolvedCompletionRequest,
-    ) -> std::result::Result<BackendRun, BackendError>;
+    ) -> std::result::Result<BackendRun, BackendError> {
+        CompletionRunner::new(session, request)
+            .await?
+            .run(self)
+            .await
+    }
 }
 
 type BranchLockTable = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
@@ -827,7 +888,7 @@ where
             &request.prompt,
             &request.merge_parents,
         )?;
-        self.complete_locked(CompletionRequest {
+        self.run_locked(CompletionRequest {
             branch: request.branch,
             provider: None,
             model: None,
@@ -886,12 +947,12 @@ where
         self.store.fork(&branch, from_ref).context(MemorySnafu)
     }
 
-    pub async fn complete(&self, request: CompletionRequest) -> Result<CompletionResult> {
+    pub async fn run(&self, request: CompletionRequest) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
-        self.complete_locked(request).await
+        self.run_locked(request).await
     }
 
-    async fn complete_locked(&self, request: CompletionRequest) -> Result<CompletionResult> {
+    async fn run_locked(&self, request: CompletionRequest) -> Result<CompletionResult> {
         let original_head = self
             .store
             .get_branch_head(&request.branch)
@@ -1398,11 +1459,21 @@ fn build_runtime_tool_set(
     Ok(rig::tool::ToolSet::from_tools_boxed(runtime_tools))
 }
 
+fn build_runtime_tool_set_for_session(
+    session: &ResolvedSession,
+) -> std::result::Result<rig::tool::ToolSet, BackendError> {
+    let workspace_root =
+        bash_tool::resolve_workspace_root().map_err(|source| BackendError::BashTool {
+            message: source.to_string(),
+        })?;
+    build_runtime_tool_set(session, workspace_root)
+}
+
 fn configure_completion_request_builder<M>(
     mut builder: rig::completion::CompletionRequestBuilder<M>,
     session: &ResolvedSession,
     request: &ResolvedCompletionRequest,
-    tool_definitions: Vec<rig::completion::ToolDefinition>,
+    tool_definitions: &[CompletionToolDefinition],
 ) -> rig::completion::CompletionRequestBuilder<M>
 where
     M: rig::completion::CompletionModel,
@@ -1411,7 +1482,7 @@ where
         builder = builder.preamble(session.config.system_prompt.clone());
     }
     if !tool_definitions.is_empty() {
-        builder = builder.tools(tool_definitions);
+        builder = builder.tools(tool_definitions.to_vec());
     }
     if let Some(temperature) = request.temperature {
         builder = builder.temperature(temperature);
@@ -1441,7 +1512,7 @@ fn assistant_text_from_choice(
 
 fn tool_calls_from_choice(
     choice: &rig::OneOrMany<rig::message::AssistantContent>,
-) -> Vec<rig::completion::message::ToolCall> {
+) -> Vec<CompletionToolCall> {
     choice
         .iter()
         .filter_map(|item| match item {
@@ -1453,8 +1524,8 @@ fn tool_calls_from_choice(
 
 fn tool_result_message(
     tool_results: Vec<rig::completion::message::UserContent>,
-) -> rig::completion::message::Message {
-    rig::completion::message::Message::User {
+) -> CompletionMessage {
+    CompletionMessage::User {
         content: rig::OneOrMany::many(tool_results).expect("there is atleast one tool result"),
     }
 }
@@ -1688,161 +1759,297 @@ fn normalize_backend_steps(
     (last_step.execution_id.clone(), steps)
 }
 
-async fn execute_completion_loop<M>(
-    model: M,
-    session: &ResolvedSession,
-    request: &ResolvedCompletionRequest,
-    prompt: rig::completion::message::Message,
-    mut history: Vec<rig::completion::message::Message>,
+struct CompletionRunner {
+    session: ResolvedSession,
+    request: ResolvedCompletionRequest,
+    prompt: CompletionMessage,
+    history: Vec<CompletionMessage>,
     toolset: rig::tool::ToolSet,
-) -> std::result::Result<BackendRun, BackendError>
-where
-    M: rig::completion::CompletionModel,
-{
+    tool_definitions: Vec<CompletionToolDefinition>,
+    steps: Vec<BackendStep>,
+    pending_step: Option<BackendStep>,
+}
+
+struct StepState {
+    execution_id: String,
+    step_events: Vec<BackendEvent>,
+}
+
+enum RunControl {
+    Continue,
+    Completed(BackendRun),
+}
+
+impl CompletionRunner {
+    async fn new(
+        session: ResolvedSession,
+        request: ResolvedCompletionRequest,
+    ) -> std::result::Result<Self, BackendError> {
+        let history = session.provider_history.clone();
+        let Some((prompt, history)) = history.split_last() else {
+            return Err(BackendError::failed("completion requires history"));
+        };
+        let toolset = build_runtime_tool_set_for_session(&session)?;
+        let tool_definitions = toolset
+            .get_tool_definitions()
+            .await
+            .map_err(|source| BackendError::failed(source.to_string()))?;
+
+        Ok(Self {
+            session,
+            request,
+            prompt: prompt.clone(),
+            history: history.to_vec(),
+            toolset,
+            tool_definitions,
+            steps: vec![],
+            pending_step: None,
+        })
+    }
+
+    fn step_context(&self) -> StepContext<'_> {
+        StepContext {
+            session: &self.session,
+            request: &self.request,
+            prompt: &self.prompt,
+            history: &self.history,
+            tool_definitions: &self.tool_definitions,
+        }
+    }
+
     fn next_execution_id() -> String {
         format!("execution-{}", nanoid::nanoid!())
     }
 
-    let tool_definitions = toolset
-        .get_tool_definitions()
-        .await
-        .map_err(|source| BackendError::failed(source.to_string()))?;
-    let mut steps = Vec::new();
-    let mut pending_step: Option<BackendStep> = None;
-    let mut prompt = prompt;
-
-    for _ in 0..DEFAULT_AGENT_MAX_TURNS {
-        let execution_id = pending_step
-            .as_ref()
-            .map(|step| step.execution_id.clone())
-            .unwrap_or_else(next_execution_id);
-        let mut step_events = pending_step
-            .take()
-            .map(|step| step.events)
-            .unwrap_or_default();
-        let builder = model
-            .completion_request(prompt.clone())
-            .messages(history.clone());
-        let response = configure_completion_request_builder(
-            builder,
-            session,
-            request,
-            tool_definitions.clone(),
-        )
-        .send()
-        .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(source) => {
-                steps.push(BackendStep {
-                    execution_id,
-                    events: step_events,
-                });
-                return Ok(BackendRun::failed_with_steps(source.to_string(), steps));
-            }
-        };
-
-        let choice_events = backend_events_from_choice(&response.choice);
-        let tool_calls = tool_calls_from_choice(&response.choice);
-        let final_text = assistant_text_from_choice(&response.choice);
-
-        if let Some(trace_recorder) = request.trace_recorder.as_ref() {
-            trace_recorder.append_events(&execution_id, &choice_events)?;
+    fn begin_step(&mut self) -> StepState {
+        StepState {
+            execution_id: self
+                .pending_step
+                .as_ref()
+                .map(|step| step.execution_id.clone())
+                .unwrap_or_else(Self::next_execution_id),
+            step_events: self
+                .pending_step
+                .take()
+                .map(|step| step.events)
+                .unwrap_or_default(),
         }
-        step_events.extend(choice_events.clone());
+    }
 
-        if tool_calls.is_empty() {
-            let text = final_text.ok_or_else(|| {
-                BackendError::failed("completion response did not include assistant text")
-            })?;
-            steps.push(BackendStep {
-                execution_id,
-                events: step_events,
-            });
-            return Ok(BackendRun::succeeded_with_steps(text, steps));
+    async fn execute_step<B>(&self, backend: &B) -> std::result::Result<BackendTurn, BackendError>
+    where
+        B: CompletionBackend + ?Sized,
+    {
+        backend.step(self.step_context()).await
+    }
+
+    fn record_turn_events(
+        &self,
+        execution_id: &str,
+        step_events: &mut Vec<BackendEvent>,
+        turn: &BackendTurn,
+    ) -> std::result::Result<(), BackendError> {
+        if let Some(trace_recorder) = self.request.trace_recorder.as_ref()
+            && !turn.trace_persisted
+        {
+            trace_recorder.append_events(execution_id, &turn.events)?;
         }
+        step_events.extend(turn.events.clone());
+        Ok(())
+    }
 
-        history.push(prompt);
-        history.push(rig::completion::message::Message::Assistant {
-            id: response.message_id,
-            content: response.choice,
+    fn fail_current_run(&mut self, state: StepState, error: BackendError) -> BackendRun {
+        self.steps.push(BackendStep {
+            execution_id: state.execution_id,
+            events: state.step_events,
         });
+        BackendRun::failed_with_steps(error.to_string(), std::mem::take(&mut self.steps))
+    }
 
-        let next_execution_id = next_execution_id();
-        let mut tool_results = Vec::with_capacity(tool_calls.len());
-        let mut next_events = Vec::with_capacity(tool_calls.len());
-        for tool_call in tool_calls {
-            let args = serde_json::to_string(&tool_call.function.arguments)
-                .map_err(|source| BackendError::failed(source.to_string()))?;
-            let output = match toolset.call(&tool_call.function.name, args).await {
-                Ok(output) => output,
-                Err(source) => source.to_string(),
-            };
-            let handoff = session.bash_tool_context.skill_handoff_recorder.take_next();
-            let event = if tool_call.function.name == "use_skill" {
-                handoff.map_or_else(
-                    || {
-                        BackendEvent::ToolResult(ToolResult {
-                            id: tool_call.id.clone(),
-                            output: output.clone(),
-                        })
-                    },
-                    |handoff| {
-                        BackendEvent::BranchHandoff(BranchHandoff {
-                            tool_id: tool_call.id.clone(),
-                            skill_name: handoff.skill_name,
-                            merge_parent: handoff.merge_parent,
-                            output: handoff.output,
-                        })
-                    },
-                )
-            } else {
-                debug_assert!(
-                    handoff.is_none(),
-                    "only use_skill should record branch handoff metadata"
-                );
-                BackendEvent::ToolResult(ToolResult {
-                    id: tool_call.id.clone(),
-                    output: output.clone(),
-                })
-            };
-            if let Some(trace_recorder) = request.trace_recorder.as_ref() {
-                trace_recorder.append_events(&next_execution_id, std::slice::from_ref(&event))?;
-            }
-            next_events.push(event);
-            tool_results.push(rig::completion::message::UserContent::tool_result(
+    fn complete_terminal_step(
+        &mut self,
+        state: StepState,
+        turn: BackendTurn,
+    ) -> std::result::Result<BackendRun, BackendError> {
+        let text = turn.final_text.ok_or_else(|| {
+            BackendError::failed("completion response did not include assistant text")
+        })?;
+        self.steps.push(BackendStep {
+            execution_id: state.execution_id,
+            events: state.step_events,
+        });
+        Ok(BackendRun::succeeded_with_steps(
+            text,
+            std::mem::take(&mut self.steps),
+        ))
+    }
+
+    async fn execute_tool_call(
+        &self,
+        next_execution_id: &str,
+        tool_call: CompletionToolCall,
+    ) -> std::result::Result<(BackendEvent, rig::completion::message::UserContent), BackendError>
+    {
+        let args = serde_json::to_string(&tool_call.function.arguments)
+            .map_err(|source| BackendError::failed(source.to_string()))?;
+        let output = match self.toolset.call(&tool_call.function.name, args).await {
+            Ok(output) => output,
+            Err(source) => source.to_string(),
+        };
+        let handoff = self
+            .session
+            .bash_tool_context
+            .skill_handoff_recorder
+            .take_next();
+        let event = if tool_call.function.name == "use_skill" {
+            handoff.map_or_else(
+                || {
+                    BackendEvent::ToolResult(ToolResult {
+                        id: tool_call.id.clone(),
+                        output: output.clone(),
+                    })
+                },
+                |handoff| {
+                    BackendEvent::BranchHandoff(BranchHandoff {
+                        tool_id: tool_call.id.clone(),
+                        skill_name: handoff.skill_name,
+                        merge_parent: handoff.merge_parent,
+                        output: handoff.output,
+                    })
+                },
+            )
+        } else {
+            debug_assert!(
+                handoff.is_none(),
+                "only use_skill should record branch handoff metadata"
+            );
+            BackendEvent::ToolResult(ToolResult {
+                id: tool_call.id.clone(),
+                output: output.clone(),
+            })
+        };
+        if let Some(trace_recorder) = self.request.trace_recorder.as_ref() {
+            trace_recorder.append_events(next_execution_id, std::slice::from_ref(&event))?;
+        }
+
+        Ok((
+            event,
+            rig::completion::message::UserContent::tool_result(
                 tool_call.id,
                 rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(output)),
-            ));
+            ),
+        ))
+    }
+
+    async fn advance_with_tool_calls(
+        &mut self,
+        state: StepState,
+        turn: BackendTurn,
+    ) -> std::result::Result<(), BackendError> {
+        self.history.push(self.prompt.clone());
+        self.history.push(turn.message);
+
+        let next_execution_id = Self::next_execution_id();
+        let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
+        let mut next_events = Vec::with_capacity(turn.tool_calls.len());
+        for tool_call in turn.tool_calls {
+            let (event, tool_result) = self
+                .execute_tool_call(&next_execution_id, tool_call)
+                .await?;
+            next_events.push(event);
+            tool_results.push(tool_result);
         }
-        steps.push(BackendStep {
-            execution_id,
-            events: step_events,
+
+        self.steps.push(BackendStep {
+            execution_id: state.execution_id,
+            events: state.step_events,
         });
-        pending_step = Some(BackendStep {
+        self.pending_step = Some(BackendStep {
             execution_id: next_execution_id,
             events: next_events,
         });
-        prompt = tool_result_message(tool_results);
+        self.prompt = tool_result_message(tool_results);
+        Ok(())
     }
 
-    if let Some(pending_step) = pending_step {
-        steps.push(pending_step);
+    async fn finish_step(
+        &mut self,
+        state: StepState,
+        turn: BackendTurn,
+    ) -> std::result::Result<RunControl, BackendError> {
+        if turn.tool_calls.is_empty() {
+            return self
+                .complete_terminal_step(state, turn)
+                .map(RunControl::Completed);
+        }
+
+        self.advance_with_tool_calls(state, turn).await?;
+        Ok(RunControl::Continue)
     }
 
-    Ok(BackendRun::failed_with_steps(
-        format!("MaxTurnError: (reached max turn limit: {DEFAULT_AGENT_MAX_TURNS})"),
-        steps,
+    fn max_turn_failure(&mut self) -> BackendRun {
+        if let Some(pending_step) = self.pending_step.take() {
+            self.steps.push(pending_step);
+        }
+
+        BackendRun::failed_with_steps(
+            format!("MaxTurnError: (reached max turn limit: {DEFAULT_AGENT_MAX_TURNS})"),
+            std::mem::take(&mut self.steps),
+        )
+    }
+
+    async fn run<B>(mut self, backend: &B) -> std::result::Result<BackendRun, BackendError>
+    where
+        B: CompletionBackend + ?Sized,
+    {
+        for _ in 0..DEFAULT_AGENT_MAX_TURNS {
+            let mut state = self.begin_step();
+            let turn = match self.execute_step(backend).await {
+                Ok(turn) => turn,
+                Err(source) => return Ok(self.fail_current_run(state, source)),
+            };
+
+            self.record_turn_events(&state.execution_id, &mut state.step_events, &turn)?;
+
+            match self.finish_step(state, turn).await? {
+                RunControl::Continue => {}
+                RunControl::Completed(run) => return Ok(run),
+            }
+        }
+
+        Ok(self.max_turn_failure())
+    }
+}
+
+async fn send_completion_turn<M>(
+    model: M,
+    ctx: StepContext<'_>,
+) -> std::result::Result<BackendTurn, BackendError>
+where
+    M: rig::completion::CompletionModel,
+{
+    let builder = model
+        .completion_request(ctx.prompt.clone())
+        .messages(ctx.history.to_vec());
+    let response = configure_completion_request_builder(
+        builder,
+        ctx.session,
+        ctx.request,
+        ctx.tool_definitions,
+    )
+    .send()
+    .await
+    .map_err(|source| BackendError::failed(source.to_string()))?;
+
+    Ok(BackendTurn::from_assistant_choice(
+        response.message_id,
+        response.choice,
     ))
 }
 
 #[async_trait]
 impl CompletionBackend for RigBackend {
-    async fn complete(
-        &self,
-        session: ResolvedSession,
-        request: ResolvedCompletionRequest,
-    ) -> std::result::Result<BackendRun, BackendError> {
+    async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
         use rig::client::CompletionClient;
         use rig::providers::{anthropic, openai};
 
@@ -1870,61 +2077,28 @@ impl CompletionBackend for RigBackend {
                 })
         }
 
-        let workspace_root = match bash_tool::resolve_workspace_root() {
-            Ok(path) => path,
-            Err(source) => {
-                return BashToolSnafu {
-                    message: source.to_string(),
-                }
-                .fail();
-            }
-        };
-        let toolset = build_runtime_tool_set(&session, workspace_root)?;
-        let history = session.provider_history.clone();
-        let Some((prompt, history)) = history.split_last() else {
-            return Err(BackendError::failed("completion requires history"));
-        };
-        let prompt = prompt.clone();
-        let history = history.to_vec();
-
-        match request.provider {
+        match ctx.request.provider {
             Provider::OpenAi => {
-                let api_key = resolve_api_key(request.provider)?;
+                let api_key = resolve_api_key(ctx.request.provider)?;
                 let mut builder = openai::Client::builder().api_key(&api_key);
-                if let Some(base_url) = resolve_base_url(request.provider) {
+                if let Some(base_url) = resolve_base_url(ctx.request.provider) {
                     builder = builder.base_url(&base_url);
                 }
                 let client = builder
                     .build()
                     .map_err(|source| BackendError::failed(source.to_string()))?;
-                execute_completion_loop(
-                    client.completion_model(&request.model),
-                    &session,
-                    &request,
-                    prompt.clone(),
-                    history.clone(),
-                    toolset,
-                )
-                .await
+                send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
             }
             Provider::Anthropic => {
-                let api_key = resolve_api_key(request.provider)?;
+                let api_key = resolve_api_key(ctx.request.provider)?;
                 let mut builder = anthropic::Client::builder().api_key(api_key);
-                if let Some(base_url) = resolve_base_url(request.provider) {
+                if let Some(base_url) = resolve_base_url(ctx.request.provider) {
                     builder = builder.base_url(&base_url);
                 }
                 let client = builder
                     .build()
                     .map_err(|source| BackendError::failed(source.to_string()))?;
-                execute_completion_loop(
-                    client.completion_model(&request.model),
-                    &session,
-                    &request,
-                    prompt,
-                    history,
-                    toolset,
-                )
-                .await
+                send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
             }
         }
     }
@@ -1942,19 +2116,22 @@ mod tests {
     use tokio::sync::Barrier;
 
     type RecordedCalls = Arc<Mutex<Vec<(ResolvedSession, ResolvedCompletionRequest)>>>;
-    type FakeResponseQueue =
+    type FakeTurnQueue =
+        Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
+    type FakeRunQueue =
         Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendRun, BackendError>>>>>;
 
     #[derive(Clone)]
     struct FakeBackend {
-        responses: FakeResponseQueue,
+        turns: FakeTurnQueue,
+        runs: FakeRunQueue,
         barrier: Option<Arc<Barrier>>,
         calls: RecordedCalls,
     }
 
     impl FakeBackend {
         fn with_responses(entries: &[(&str, &[std::result::Result<&str, BackendError>])]) -> Self {
-            let responses = entries
+            let turns = entries
                 .iter()
                 .map(|(branch, responses)| {
                     (
@@ -1964,12 +2141,7 @@ mod tests {
                             .map(|response| {
                                 response
                                     .as_ref()
-                                    .map(|text| {
-                                        BackendRun::succeeded(
-                                            (*text).to_owned(),
-                                            vec![BackendEvent::AssistantText((*text).to_owned())],
-                                        )
-                                    })
+                                    .map(|text| BackendTurn::finished((*text).to_owned()))
                                     .map_err(Clone::clone)
                             })
                             .collect(),
@@ -1978,7 +2150,8 @@ mod tests {
                 .collect();
 
             Self {
-                responses: Arc::new(Mutex::new(responses)),
+                turns: Arc::new(Mutex::new(turns)),
+                runs: Arc::new(Mutex::new(HashMap::new())),
                 barrier: None,
                 calls: Arc::new(Mutex::new(vec![])),
             }
@@ -1987,7 +2160,7 @@ mod tests {
         fn with_completions(
             entries: &[(&str, &[std::result::Result<BackendRun, BackendError>])],
         ) -> Self {
-            let responses = entries
+            let runs = entries
                 .iter()
                 .map(|(branch, responses)| {
                     (
@@ -1998,28 +2171,27 @@ mod tests {
                 .collect();
 
             Self {
-                responses: Arc::new(Mutex::new(responses)),
+                turns: Arc::new(Mutex::new(HashMap::new())),
+                runs: Arc::new(Mutex::new(runs)),
                 barrier: None,
                 calls: Arc::new(Mutex::new(vec![])),
             }
         }
 
         fn with_barrier(branches: &[(&str, &str)], barrier: Arc<Barrier>) -> Self {
-            let responses = branches
+            let turns = branches
                 .iter()
                 .map(|(branch, response)| {
                     (
                         (*branch).to_owned(),
-                        VecDeque::from([Ok(BackendRun::succeeded(
-                            (*response).to_owned(),
-                            vec![BackendEvent::AssistantText((*response).to_owned())],
-                        ))]),
+                        VecDeque::from([Ok(BackendTurn::finished((*response).to_owned()))]),
                     )
                 })
                 .collect();
 
             Self {
-                responses: Arc::new(Mutex::new(responses)),
+                turns: Arc::new(Mutex::new(turns)),
+                runs: Arc::new(Mutex::new(HashMap::new())),
                 barrier: Some(barrier),
                 calls: Arc::new(Mutex::new(vec![])),
             }
@@ -2028,23 +2200,60 @@ mod tests {
 
     #[async_trait]
     impl CompletionBackend for FakeBackend {
+        async fn step(
+            &self,
+            ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            self.calls
+                .lock()
+                .await
+                .push((ctx.session.clone(), ctx.request.clone()));
+
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
+
+            let mut turns = self.turns.lock().await;
+            let queue = turns
+                .get_mut(&ctx.request.branch)
+                .expect("missing fake backend response queue");
+            let next = queue.pop_front().expect("missing fake backend response");
+            drop(turns);
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            next
+        }
+
         async fn complete(
             &self,
             session: ResolvedSession,
             request: ResolvedCompletionRequest,
         ) -> std::result::Result<BackendRun, BackendError> {
+            let has_run_queue = {
+                let runs = self.runs.lock().await;
+                runs.contains_key(&request.branch)
+            };
+            if !has_run_queue {
+                return CompletionRunner::new(session, request)
+                    .await?
+                    .run(self)
+                    .await;
+            }
+
             self.calls.lock().await.push((session, request.clone()));
 
             if let Some(barrier) = &self.barrier {
                 barrier.wait().await;
             }
 
-            let mut responses = self.responses.lock().await;
-            let queue = responses
+            let mut runs = self.runs.lock().await;
+            let queue = runs
                 .get_mut(&request.branch)
-                .expect("missing fake backend response queue");
-            let next = queue.pop_front().expect("missing fake backend response");
-            drop(responses);
+                .expect("missing fake backend completion queue");
+            let next = queue
+                .pop_front()
+                .expect("missing fake backend completion response");
+            drop(runs);
 
             tokio::time::sleep(Duration::from_millis(5)).await;
             next
@@ -2068,16 +2277,15 @@ mod tests {
 
     #[async_trait]
     impl CompletionBackend for AnyBranchBackend {
-        async fn complete(
+        async fn step(
             &self,
-            session: ResolvedSession,
-            request: ResolvedCompletionRequest,
-        ) -> std::result::Result<BackendRun, BackendError> {
-            self.calls.lock().await.push((session, request));
-            Ok(BackendRun::succeeded(
-                self.text.clone(),
-                vec![BackendEvent::AssistantText(self.text.clone())],
-            ))
+            ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            self.calls
+                .lock()
+                .await
+                .push((ctx.session.clone(), ctx.request.clone()));
+            Ok(BackendTurn::finished(self.text.clone()))
         }
     }
 
@@ -2209,12 +2417,14 @@ mod tests {
 
     #[async_trait]
     impl CompletionBackend for AlwaysFailBackend {
-        async fn complete(
+        async fn step(
             &self,
-            session: ResolvedSession,
-            request: ResolvedCompletionRequest,
-        ) -> std::result::Result<BackendRun, BackendError> {
-            self.calls.lock().await.push((session, request));
+            ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            self.calls
+                .lock()
+                .await
+                .push((ctx.session.clone(), ctx.request.clone()));
             Err(BackendError::failed("backend failed"))
         }
     }
@@ -2756,7 +2966,7 @@ mod tests {
             ]
         );
 
-        let recovered = service.complete(request("main")).await.unwrap();
+        let recovered = service.run(request("main")).await.unwrap();
         assert_eq!(recovered.text, "recovered");
         assert_eq!(recovered.anchor_id, prompt_anchor_id);
         let recovered_node = store.get_node(&recovered.response_node_id).unwrap();
@@ -2779,8 +2989,8 @@ mod tests {
 
         let main_service = service.clone();
         let draft_service = service.clone();
-        let main = tokio::spawn(async move { main_service.complete(request("main")).await });
-        let draft = tokio::spawn(async move { draft_service.complete(request("draft")).await });
+        let main = tokio::spawn(async move { main_service.run(request("main")).await });
+        let draft = tokio::spawn(async move { draft_service.run(request("draft")).await });
 
         let main_result = main.await.unwrap().unwrap();
         let draft_result = draft.await.unwrap().unwrap();

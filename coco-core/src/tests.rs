@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use coco_llm::coco_mem::MemoryStore;
 use coco_llm::{
-    BackendError, BackendEvent, BackendRun, CompletionBackend, LlmService, Provider,
-    ResolvedSession, SessionConfig,
+    BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
+    SessionConfig, StepContext,
 };
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
 };
 
 type FakeResponseQueue =
-    Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendRun, BackendError>>>>>;
+    Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
 #[derive(Debug)]
 struct FailingResolver;
@@ -36,6 +36,16 @@ struct FakeBackend {
 }
 
 impl FakeBackend {
+    fn finished_turn(text: &str) -> BackendTurn {
+        BackendTurn {
+            message: CompletionMessage::assistant(text.to_owned()),
+            events: vec![],
+            tool_calls: vec![],
+            final_text: Some(text.to_owned()),
+            trace_persisted: false,
+        }
+    }
+
     fn with_responses(entries: &[(&str, &[std::result::Result<&str, BackendError>])]) -> Self {
         let responses = entries
             .iter()
@@ -47,12 +57,7 @@ impl FakeBackend {
                         .map(|response| {
                             response
                                 .as_ref()
-                                .map(|text| {
-                                    BackendRun::succeeded(
-                                        (*text).to_owned(),
-                                        vec![BackendEvent::AssistantText((*text).to_owned())],
-                                    )
-                                })
+                                .map(|text| Self::finished_turn(text))
                                 .map_err(Clone::clone)
                         })
                         .collect(),
@@ -68,14 +73,10 @@ impl FakeBackend {
 
 #[async_trait]
 impl CompletionBackend for FakeBackend {
-    async fn complete(
-        &self,
-        _session: ResolvedSession,
-        request: coco_llm::ResolvedCompletionRequest,
-    ) -> std::result::Result<BackendRun, BackendError> {
+    async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
         let mut responses = self.responses.lock().unwrap();
         let queue = responses
-            .get_mut(&request.branch)
+            .get_mut(&ctx.request.branch)
             .expect("missing fake backend queue");
         queue.pop_front().expect("missing fake backend response")
     }
@@ -163,7 +164,7 @@ async fn llm_engine_calls_prompt_and_returns_text() {
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
 
-    let response = engine.complete("main", "hello").await.unwrap();
+    let response = engine.reply("main", "hello").await.unwrap();
 
     assert_eq!(response, "hello from llm");
 }
@@ -175,7 +176,7 @@ async fn llm_engine_maps_missing_session_error() {
     let llm = Arc::new(LlmService::new(store, backend));
     let engine = ConversationEngine::new(llm);
 
-    let error = engine.complete("main", "hello").await.unwrap_err();
+    let error = engine.reply("main", "hello").await.unwrap_err();
 
     assert!(matches!(error, EngineError::SessionMissing { branch } if branch == "main"));
 }
