@@ -1,9 +1,9 @@
 use std::io::Read;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use coco_llm::{
-    BashToolCliBridge, BashToolCliBridgeError, BashToolCliBridgeHandle, CocoCliRuntimeRequest,
-    CocoCliRuntimeResponse, CompletionBackend, LlmService, RigBackend, SessionConfig,
+    BashToolCliBridgeHandle, CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge,
+    LlmService, RigBackend, SessionConfig,
 };
 use coco_mem::FsStore;
 
@@ -27,11 +27,28 @@ where
 {
     let shared_store = open_store(&cli.store_path)?;
     let llm = Arc::new_cyclic(|weak_llm| {
-        let bridge = BashToolCliBridgeHandle::new(Arc::new(CocoCliRuntimeBridge {
-            store: shared_store.clone(),
-            llm: weak_llm.clone(),
+        let bridge_impl = Arc::new(LlmRuntimeBridge::new(weak_llm.clone(), {
+            let shared_store = shared_store.clone();
+            move |request, llm| {
+                let shared_store = shared_store.clone();
+                async move {
+                    run_forwarded_with_services(
+                        &request.args,
+                        &request.stdin,
+                        request.branch_env.as_deref(),
+                        request.store_path_env.as_deref(),
+                        &shared_store,
+                        &llm,
+                    )
+                    .await
+                }
+            }
         }));
-        LlmService::new(shared_store.clone(), backend).with_bash_tool_cli_bridge(bridge)
+        let bridge = BashToolCliBridgeHandle::new(bridge_impl.clone());
+        LlmService::builder(shared_store.clone(), backend)
+            .with_bash_tool_cli_bridge(bridge)
+            .with_skill_tool_executor(bridge_impl)
+            .build()
     });
 
     run_with_services(cli, reader, &shared_store, &llm).await
@@ -63,40 +80,6 @@ where
 {
     runtime::run_forwarded_with_services(args, stdin, branch_env, store_path_env, shared_store, llm)
         .await
-}
-
-#[derive(Debug)]
-struct CocoCliRuntimeBridge<B>
-where
-    B: CompletionBackend,
-{
-    store: FsStore,
-    llm: Weak<LlmService<B, FsStore>>,
-}
-
-#[async_trait::async_trait]
-impl<B> BashToolCliBridge for CocoCliRuntimeBridge<B>
-where
-    B: CompletionBackend,
-{
-    async fn execute_coco_cli(
-        &self,
-        request: CocoCliRuntimeRequest,
-    ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError> {
-        let llm = self
-            .llm
-            .upgrade()
-            .ok_or(BashToolCliBridgeError::Unavailable)?;
-        Ok(run_forwarded_with_services(
-            &request.args,
-            &request.stdin,
-            request.branch_env.as_deref(),
-            request.store_path_env.as_deref(),
-            &self.store,
-            &llm,
-        )
-        .await)
-    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

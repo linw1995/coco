@@ -111,8 +111,8 @@ pub fn search_runtime_tool(
         context: BashToolContext {
             session_branch: String::new(),
             store_path: None,
-            cli_bridge: None,
-            skill_executor: None,
+            cli_bridge: crate::BashToolCliBridgeHandle::default(),
+            skill_executor: crate::SkillToolExecutorHandle::default(),
             skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
         },
         kind: SkillToolKind::Search,
@@ -455,17 +455,13 @@ impl rig::tool::ToolDyn for SkillToolRuntime {
                     SkillToolKind::Search => search_skills(&args, &workspace_root),
                     SkillToolKind::Use => {
                         let request = resolve_use_skill_request(&args, &workspace_root, &context)?;
-                        let executor = context
+                        let result = context
                             .skill_executor
-                            .clone()
-                            .context(ExecutorUnavailableSnafu)?;
-                        let result =
-                            executor
-                                .execute_skill_tool(request)
-                                .await
-                                .map_err(|source| SkillToolError::ExecuteSkill {
-                                    message: source.to_string(),
-                                })?;
+                            .execute_skill_tool(request)
+                            .await
+                            .map_err(|source| SkillToolError::ExecuteSkill {
+                                message: source.to_string(),
+                            })?;
                         context.skill_handoff_recorder.record(result.handoff);
                         serde_json::to_string_pretty(&result.result).context(SerializeOutputSnafu)
                     }
@@ -537,8 +533,8 @@ mod tests {
         BashToolContext {
             session_branch: "main".to_owned(),
             store_path: None,
-            cli_bridge: None,
-            skill_executor: Some(executor),
+            cli_bridge: crate::BashToolCliBridgeHandle::default(),
+            skill_executor: crate::SkillToolExecutorHandle::new(executor),
             skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
         }
     }

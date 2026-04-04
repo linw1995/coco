@@ -372,10 +372,31 @@ pub enum BashToolCliBridgeError {
 
 #[async_trait]
 pub trait BashToolCliBridge: Send + Sync {
+    fn is_available(&self) -> bool {
+        true
+    }
+
     async fn execute_coco_cli(
         &self,
         request: CocoCliRuntimeRequest,
     ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError>;
+}
+
+#[derive(Debug)]
+struct UnavailableBashToolCliBridge;
+
+#[async_trait]
+impl BashToolCliBridge for UnavailableBashToolCliBridge {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    async fn execute_coco_cli(
+        &self,
+        _request: CocoCliRuntimeRequest,
+    ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError> {
+        Err(BashToolCliBridgeError::Unavailable)
+    }
 }
 
 #[derive(Clone)]
@@ -386,6 +407,14 @@ pub struct BashToolCliBridgeHandle {
 impl BashToolCliBridgeHandle {
     pub fn new(inner: Arc<dyn BashToolCliBridge>) -> Self {
         Self { inner }
+    }
+
+    pub fn unavailable() -> Self {
+        Self::new(Arc::new(UnavailableBashToolCliBridge))
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.inner.is_available()
     }
 
     pub async fn execute_coco_cli(
@@ -402,12 +431,65 @@ impl std::fmt::Debug for BashToolCliBridgeHandle {
     }
 }
 
+impl Default for BashToolCliBridgeHandle {
+    fn default() -> Self {
+        Self::unavailable()
+    }
+}
+
+#[derive(Debug)]
+struct UnavailableSkillToolExecutor;
+
+#[async_trait]
+impl SkillToolExecutor for UnavailableSkillToolExecutor {
+    async fn execute_skill_tool(
+        &self,
+        _request: SkillToolRequest,
+    ) -> std::result::Result<SkillToolExecutionResult, SkillToolExecutorError> {
+        Err(SkillToolExecutorError::ExecutorUnavailable)
+    }
+}
+
+#[derive(Clone)]
+pub struct SkillToolExecutorHandle {
+    inner: Arc<dyn SkillToolExecutor>,
+}
+
+impl SkillToolExecutorHandle {
+    pub fn new(inner: Arc<dyn SkillToolExecutor>) -> Self {
+        Self { inner }
+    }
+
+    pub fn unavailable() -> Self {
+        Self::new(Arc::new(UnavailableSkillToolExecutor))
+    }
+
+    pub async fn execute_skill_tool(
+        &self,
+        request: SkillToolRequest,
+    ) -> std::result::Result<SkillToolExecutionResult, SkillToolExecutorError> {
+        self.inner.execute_skill_tool(request).await
+    }
+}
+
+impl std::fmt::Debug for SkillToolExecutorHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SkillToolExecutorHandle(..)")
+    }
+}
+
+impl Default for SkillToolExecutorHandle {
+    fn default() -> Self {
+        Self::unavailable()
+    }
+}
+
 #[derive(Clone)]
 pub struct BashToolContext {
     pub session_branch: String,
     pub store_path: Option<PathBuf>,
-    pub cli_bridge: Option<BashToolCliBridgeHandle>,
-    pub skill_executor: Option<Arc<dyn SkillToolExecutor>>,
+    pub cli_bridge: BashToolCliBridgeHandle,
+    pub skill_executor: SkillToolExecutorHandle,
     pub(crate) skill_handoff_recorder: SkillToolHandoffRecorder,
 }
 
@@ -418,13 +500,7 @@ impl std::fmt::Debug for BashToolContext {
             .field("session_branch", &self.session_branch)
             .field("store_path", &self.store_path)
             .field("cli_bridge", &self.cli_bridge)
-            .field(
-                "skill_executor",
-                &self
-                    .skill_executor
-                    .as_ref()
-                    .map(|_| "SkillToolExecutor(..)"),
-            )
+            .field("skill_executor", &self.skill_executor)
             .field("skill_handoff_recorder", &"SkillToolHandoffRecorder(..)")
             .finish()
     }
@@ -579,16 +655,31 @@ pub trait CompletionBackend: Send + Sync {
 type BranchLockTable = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 type WorkflowLock = Arc<Mutex<()>>;
 
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeCapabilities {
+    pub bash_tool_cli_bridge: BashToolCliBridgeHandle,
+    pub skill_tool_executor: SkillToolExecutorHandle,
+}
+
 pub struct LlmService<B = RigBackend, S = MemoryStore>
 where
     S: Store,
 {
     store: S,
     backend: B,
-    bash_tool_cli_bridge: Option<BashToolCliBridgeHandle>,
-    skill_tool_executor: Option<Arc<dyn SkillToolExecutor>>,
+    runtime: RuntimeCapabilities,
     branch_locks: BranchLockTable,
     workflow_lock: WorkflowLock,
+}
+
+pub struct LlmServiceBuilder<B, S>
+where
+    S: Store,
+{
+    store: S,
+    backend: B,
+    bash_tool_cli_bridge: Option<BashToolCliBridgeHandle>,
+    skill_tool_executor: Option<SkillToolExecutorHandle>,
 }
 
 #[derive(Debug, Snafu)]
@@ -666,30 +757,51 @@ impl LlmService<RigBackend, MemoryStore> {
     }
 }
 
-impl<B, S> LlmService<B, S>
+impl<B, S> LlmServiceBuilder<B, S>
 where
     B: CompletionBackend,
     S: Store,
 {
-    pub fn new(store: S, backend: B) -> Self {
-        Self {
-            store,
-            backend,
-            bash_tool_cli_bridge: None,
-            skill_tool_executor: None,
-            branch_locks: Arc::new(Mutex::new(HashMap::new())),
-            workflow_lock: Arc::new(Mutex::new(())),
-        }
-    }
-
     pub fn with_bash_tool_cli_bridge(mut self, bridge: BashToolCliBridgeHandle) -> Self {
         self.bash_tool_cli_bridge = Some(bridge);
         self
     }
 
     pub fn with_skill_tool_executor(mut self, executor: Arc<dyn SkillToolExecutor>) -> Self {
-        self.skill_tool_executor = Some(executor);
+        self.skill_tool_executor = Some(SkillToolExecutorHandle::new(executor));
         self
+    }
+
+    pub fn build(self) -> LlmService<B, S> {
+        LlmService {
+            store: self.store,
+            backend: self.backend,
+            runtime: RuntimeCapabilities {
+                bash_tool_cli_bridge: self.bash_tool_cli_bridge.unwrap_or_default(),
+                skill_tool_executor: self.skill_tool_executor.unwrap_or_default(),
+            },
+            branch_locks: Arc::new(Mutex::new(HashMap::new())),
+            workflow_lock: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
+    B: CompletionBackend,
+    S: Store,
+{
+    pub fn builder(store: S, backend: B) -> LlmServiceBuilder<B, S> {
+        LlmServiceBuilder {
+            store,
+            backend,
+            bash_tool_cli_bridge: None,
+            skill_tool_executor: None,
+        }
+    }
+
+    pub fn new(store: S, backend: B) -> Self {
+        Self::builder(store, backend).build()
     }
 
     pub fn store(&self) -> &S {
@@ -1206,8 +1318,8 @@ where
             bash_tool_context: BashToolContext {
                 session_branch: branch.to_owned(),
                 store_path: self.store.runtime_store_path(),
-                cli_bridge: self.bash_tool_cli_bridge.clone(),
-                skill_executor: self.skill_tool_executor.clone(),
+                cli_bridge: self.runtime.bash_tool_cli_bridge.clone(),
+                skill_executor: self.runtime.skill_tool_executor.clone(),
                 skill_handoff_recorder: SkillToolHandoffRecorder::default(),
             },
         })
@@ -4079,8 +4191,8 @@ mod tests {
             BashToolContext {
                 session_branch: "main".to_owned(),
                 store_path: None,
-                cli_bridge: None,
-                skill_executor: None,
+                cli_bridge: BashToolCliBridgeHandle::default(),
+                skill_executor: SkillToolExecutorHandle::default(),
                 skill_handoff_recorder: SkillToolHandoffRecorder::default(),
             },
         );

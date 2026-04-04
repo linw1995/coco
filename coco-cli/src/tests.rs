@@ -8,7 +8,8 @@ use coco_llm::coco_mem::{
     Anchor, Kind, NewNode, PromptAnchor, Role, SkillResultAnchor, Store, ToolResult, ToolUse,
 };
 use coco_llm::{
-    BackendError, BackendTurn, CompletionBackend, CompletionMessage, Provider, StepContext,
+    BackendError, BackendEvent, BackendTurn, CompletionBackend, CompletionMessage,
+    CompletionToolCall, Provider, StepContext,
 };
 use coco_mem::SessionState;
 use serde_json::{Value, json};
@@ -79,6 +80,59 @@ impl CompletionBackend for FakeBackend {
             .get_mut(&ctx.request.branch)
             .expect("missing fake backend queue");
         queue.pop_front().expect("missing fake backend response")
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct UseSkillBackend {
+    main_turn: Arc<Mutex<usize>>,
+}
+
+#[async_trait::async_trait]
+impl CompletionBackend for UseSkillBackend {
+    async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
+        if ctx.request.branch == "main" {
+            let mut main_turn = self.main_turn.lock().unwrap();
+            let current_turn = *main_turn;
+            *main_turn += 1;
+            return match current_turn {
+                0 => {
+                    let tool_call: CompletionToolCall = serde_json::from_value(json!({
+                        "id": "tool-call-1",
+                        "call_id": null,
+                        "function": {
+                            "name": "use_skill",
+                            "arguments": {
+                                "name": "fast-rust",
+                                "task": "Review the change"
+                            }
+                        },
+                        "signature": null,
+                        "additional_params": null
+                    }))
+                    .unwrap();
+                    Ok(BackendTurn {
+                        message: CompletionMessage::assistant("delegating".to_owned()),
+                        events: vec![BackendEvent::ToolUse(ToolUse {
+                            id: tool_call.id.clone(),
+                            name: tool_call.function.name.clone(),
+                            input: tool_call.function.arguments.clone(),
+                        })],
+                        tool_calls: vec![tool_call],
+                        final_text: None,
+                        trace_persisted: false,
+                    })
+                }
+                1 => Ok(FakeBackend::finished_turn("base done")),
+                other => panic!("unexpected main turn {other}"),
+            };
+        }
+
+        if ctx.request.branch.starts_with("main/skill/fast-rust-") {
+            return Ok(FakeBackend::finished_turn("delegated output"));
+        }
+
+        panic!("unexpected branch {:?}", ctx.request.branch);
     }
 }
 
@@ -456,6 +510,66 @@ async fn prompt_supports_explicit_branch_override() {
     .unwrap();
 
     assert_eq!(output, Some("world".to_owned()));
+}
+
+#[tokio::test]
+async fn prompt_wires_skill_executor_for_use_skill() {
+    let (tempdir, store_path) = temp_store_path();
+    let skills_root = tempdir.path().join("skills");
+    let skill_dir = skills_root.join("fast-rust");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: "fast-rust"
+description: "Review Rust changes."
+---
+
+# Fast Rust
+"#,
+    )
+    .unwrap();
+    let skills_env = std::env::join_paths([skills_root.as_path()]).unwrap();
+
+    with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "openai"),
+            ("COCO_MODEL", "gpt-4.1-mini"),
+            ("COCO_TOOLS", "use_skill"),
+            ("COCO_SKILLS_DIRS", skills_env.to_str().unwrap()),
+        ],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                UseSkillBackend::default(),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let output = with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "openai"),
+            ("COCO_MODEL", "gpt-4.1-mini"),
+            ("COCO_TOOLS", "use_skill"),
+            ("COCO_SKILLS_DIRS", skills_env.to_str().unwrap()),
+        ],
+        || async {
+            run_with_backend(
+                prompt_cli(store_path.clone(), Some("main"), &["delegate"]),
+                &mut Cursor::new(""),
+                UseSkillBackend::default(),
+            )
+            .await
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output, Some("base done".to_owned()));
 }
 
 #[tokio::test]

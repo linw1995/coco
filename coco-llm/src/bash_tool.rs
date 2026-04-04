@@ -426,9 +426,10 @@ async fn start_coco_cli_runtime_server(
     workspace_root: &Path,
     context: &BashToolContext,
 ) -> std::result::Result<Option<CocoCliRuntimeServer>, BashToolError> {
-    let Some(cli_bridge) = context.cli_bridge.clone() else {
+    if !context.cli_bridge.is_available() {
         return Ok(None);
-    };
+    }
+    let cli_bridge = context.cli_bridge.clone();
 
     let runtime_root = resolve_runtime_root(workspace_root)?;
     std::fs::create_dir_all(&runtime_root).context(BindRuntimeSocketSnafu)?;
@@ -613,8 +614,8 @@ mod tests {
         BashToolContext {
             session_branch: "main".to_owned(),
             store_path: None,
-            cli_bridge: None,
-            skill_executor: None,
+            cli_bridge: crate::BashToolCliBridgeHandle::default(),
+            skill_executor: crate::SkillToolExecutorHandle::default(),
             skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
         }
     }
@@ -993,8 +994,8 @@ mod tests {
             BashToolContext {
                 session_branch: "draft".to_owned(),
                 store_path: None,
-                cli_bridge: None,
-                skill_executor: None,
+                cli_bridge: crate::BashToolCliBridgeHandle::default(),
+                skill_executor: crate::SkillToolExecutorHandle::default(),
                 skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
             },
         );
@@ -1036,8 +1037,8 @@ mod tests {
         let context = BashToolContext {
             session_branch: "draft".to_owned(),
             store_path: Some(runtime_store.clone()),
-            cli_bridge: Some(bridge),
-            skill_executor: None,
+            cli_bridge: bridge,
+            skill_executor: crate::SkillToolExecutorHandle::default(),
             skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
         };
         let server = crate::with_process_env_async(
