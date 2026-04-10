@@ -151,6 +151,7 @@ pub fn runtime_tool(
     workspace_root: PathBuf,
     context: BashToolContext,
 ) -> Box<dyn rig::tool::ToolDyn> {
+    let workspace_root = canonicalize_existing_path(&workspace_root);
     Box::new(BashToolRuntime {
         definition,
         workspace_root,
@@ -181,6 +182,10 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
 
+fn canonicalize_existing_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn resolve_runtime_root(workspace_root: &Path) -> std::result::Result<PathBuf, BashToolError> {
     let current_dir = std::env::current_dir().context(ResolveRuntimeRootSnafu)?;
     let runtime_root = match std::env::var_os("XDG_RUNTIME_DIR") {
@@ -195,8 +200,10 @@ fn resolve_runtime_root(workspace_root: &Path) -> std::result::Result<PathBuf, B
         None => std::env::temp_dir(),
     }
     .join("coco");
+    let runtime_root = canonicalize_existing_path(&runtime_root);
+    let workspace_root = canonicalize_existing_path(workspace_root);
 
-    if paths_overlap(&runtime_root, workspace_root) {
+    if paths_overlap(&runtime_root, &workspace_root) {
         return RuntimeRootOverlapsWorkspaceSnafu.fail();
     }
 
@@ -208,6 +215,7 @@ fn resolve_bash_request(
     workspace_root: &Path,
     context: BashToolContext,
 ) -> std::result::Result<BashCommandRequest, BashToolError> {
+    let workspace_root = canonicalize_existing_path(workspace_root);
     let object = args.as_object().context(InvalidInputTypeSnafu)?;
     let command = object
         .get("command")
@@ -227,14 +235,14 @@ fn resolve_bash_request(
     if !workdir.is_dir() {
         return InvalidWorkdirSnafu.fail();
     }
-    if !path_is_within_workspace(&workdir, workspace_root) {
+    if !path_is_within_workspace(&workdir, &workspace_root) {
         return WorkdirOutsideWorkspaceSnafu.fail();
     }
 
     Ok(BashCommandRequest {
         command: command.to_owned(),
         workdir,
-        workspace_root: workspace_root.to_path_buf(),
+        workspace_root,
         sandbox_mode: resolve_sandbox_mode()?,
         timeout_ms,
         context,
@@ -347,7 +355,7 @@ fn resolve_execution_spec(
 }
 
 fn next_runtime_socket_dir(runtime_root: &Path) -> PathBuf {
-    runtime_root.join(nanoid::nanoid!(10))
+    runtime_root.join(nanoid::nanoid!(6))
 }
 
 async fn start_coco_cli_runtime_server(
