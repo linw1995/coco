@@ -95,6 +95,8 @@ pub enum JobStatus {
 pub struct Job {
     pub job_id: String,
     pub created_at: Timestamp,
+    #[serde(default)]
+    pub finished_at: Option<Timestamp>,
     pub branch: String,
     /// The node where this job starts execution.
     ///
@@ -234,6 +236,7 @@ impl Job {
         Self {
             job_id: job_id.into(),
             created_at: Timestamp::now(),
+            finished_at: None,
             branch: branch.into(),
             base: base.into(),
             status: JobStatus::Queued,

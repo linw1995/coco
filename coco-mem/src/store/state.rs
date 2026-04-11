@@ -338,6 +338,10 @@ impl StoreState {
             }
         );
         job.status = next;
+        job.finished_at = match next {
+            JobStatus::Finished => Some(Timestamp::now()),
+            _ => None,
+        };
         Ok(job.clone())
     }
 

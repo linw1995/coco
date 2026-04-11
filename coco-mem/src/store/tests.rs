@@ -7,7 +7,7 @@ use super::memory::MemoryStore;
 use super::state::StoreState;
 use crate::Store as StoreTrait;
 use crate::{
-    Anchor, Kind, NewNode, Node, PauseReason, PromptAnchor, Role, SessionAnchor,
+    Anchor, JobStatus, Kind, NewNode, Node, PauseReason, PromptAnchor, Role, SessionAnchor,
     SessionAnchorPatch, SessionState, StoreError as Error,
 };
 use serde_json::json;
@@ -1237,6 +1237,26 @@ where
     assert_ne!(first.job_id, second.job_id);
 }
 
+fn assert_finished_job_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    let running = store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    assert!(running.finished_at.is_none());
+    let finished = store
+        .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+        .unwrap();
+
+    assert!(finished.finished_at.is_some());
+    assert_eq!(store.get_job(&job.job_id).unwrap(), finished);
+}
+
 macro_rules! define_common_store_tests {
     ($module:ident, $factory:ty) => {
         mod $module {
@@ -1477,6 +1497,11 @@ macro_rules! define_common_store_tests {
                 assert_create_job_generates_unique_ids::<$factory>();
             }
 
+            #[test]
+            fn finished_job_round_trip() {
+                assert_finished_job_round_trip::<$factory>();
+            }
+
         }
     };
 }
@@ -1575,6 +1600,30 @@ fn open_rejects_missing_session_metadata_file() {
     let err = FsStore::open(&path).unwrap_err();
 
     assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_reads_legacy_jobs_without_finished_at() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    let jobs_path = path.join("jobs.json");
+    let mut jobs: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(&jobs_path).unwrap()).unwrap();
+    let entry = jobs
+        .get_mut(&job.job_id)
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    entry.remove("finished_at");
+    fs::write(&jobs_path, serde_json::to_vec_pretty(&jobs).unwrap()).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+    let reopened_job = reopened.get_job(&job.job_id).unwrap();
+
+    assert!(reopened_job.finished_at.is_none());
 }
 
 #[test]
