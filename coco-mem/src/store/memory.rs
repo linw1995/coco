@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use super::Store;
 use super::state::StoreState;
 use crate::StoreResult as Result;
-use crate::{NewNode, Node, SessionAnchorPatch, SessionState};
+use crate::{Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState};
 
 #[derive(Clone, Debug)]
 pub struct MemoryStore {
@@ -137,5 +137,30 @@ impl Store for MemoryStore {
         }
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
+    }
+
+    fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .submit_job(branch, base)
+    }
+
+    fn get_job(&self, job_id: &str) -> Result<Job> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_job(job_id)
+    }
+
+    fn list_jobs(&self) -> Result<HashMap<String, Job>> {
+        Ok(self.inner.read().expect("store lock poisoned").list_jobs())
+    }
+
+    fn set_job_status(&self, job_id: &str, expected: JobStatus, next: JobStatus) -> Result<Job> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .set_job_status(job_id, expected, next)
     }
 }

@@ -2635,6 +2635,27 @@ mod tests {
             self.inner.rebase_session(name, patch)
         }
 
+        fn submit_job(&self, branch: &str, base: &str) -> coco_mem::StoreResult<coco_mem::Job> {
+            self.inner.submit_job(branch, base)
+        }
+
+        fn get_job(&self, job_id: &str) -> coco_mem::StoreResult<coco_mem::Job> {
+            self.inner.get_job(job_id)
+        }
+
+        fn list_jobs(&self) -> coco_mem::StoreResult<HashMap<String, coco_mem::Job>> {
+            self.inner.list_jobs()
+        }
+
+        fn set_job_status(
+            &self,
+            job_id: &str,
+            expected: coco_mem::JobStatus,
+            next: coco_mem::JobStatus,
+        ) -> coco_mem::StoreResult<coco_mem::Job> {
+            self.inner.set_job_status(job_id, expected, next)
+        }
+
         fn runtime_store_path(&self) -> Option<std::path::PathBuf> {
             self.inner.runtime_store_path()
         }

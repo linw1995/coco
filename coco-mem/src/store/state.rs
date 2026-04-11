@@ -8,11 +8,12 @@ use crate::StoreResult as Result;
 use crate::error::{
     AmbiguousNodePrefixSnafu, BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu,
     DuplicateMergeParentSnafu, InvalidAnchorSnafu, MergeParentMatchesParentSnafu,
-    MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu, RefsNotConnectedSnafu,
-    SessionStateMovedSnafu,
+    MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu, PromptJobMovedSnafu,
+    PromptJobNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
 };
 use crate::{
-    Anchor, AnchorPayload, Kind, NewNode, Node, PauseReason, Role, SessionAnchorPatch, SessionState,
+    Anchor, AnchorPayload, Job, JobStatus, Kind, NewNode, Node, PauseReason, Role,
+    SessionAnchorPatch, SessionState,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,7 @@ pub(crate) struct StoreState {
     pub root: String,
     pub branches: HashMap<String, String>,
     pub sessions: HashMap<String, SessionState>,
+    pub jobs: HashMap<String, Job>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +67,7 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
+            jobs: HashMap::new(),
         }
     }
 
@@ -79,6 +82,7 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
+            jobs: HashMap::new(),
         }
     }
 
@@ -293,6 +297,57 @@ impl StoreState {
         })?;
         *state = next;
         Ok(state.clone())
+    }
+
+    pub fn submit_job(&mut self, branch: &str, base: &str) -> Result<Job> {
+        self.get_branch_head(branch)?;
+        self.get_node(base)?;
+        let job = Job::new(self.next_job_id(), branch, base);
+        self.jobs.insert(job.job_id.clone(), job.clone());
+        Ok(job)
+    }
+
+    pub fn get_job(&self, job_id: &str) -> Result<Job> {
+        self.jobs
+            .get(job_id)
+            .cloned()
+            .context(PromptJobNotFoundSnafu {
+                job_id: job_id.to_owned(),
+            })
+    }
+
+    pub fn list_jobs(&self) -> HashMap<String, Job> {
+        self.jobs.clone()
+    }
+
+    pub fn set_job_status(
+        &mut self,
+        job_id: &str,
+        expected: JobStatus,
+        next: JobStatus,
+    ) -> Result<Job> {
+        let job = self.jobs.get_mut(job_id).context(PromptJobNotFoundSnafu {
+            job_id: job_id.to_owned(),
+        })?;
+        ensure!(
+            job.status == expected,
+            PromptJobMovedSnafu {
+                job_id: job_id.to_owned(),
+                expected: format!("{expected:?}"),
+                actual: format!("{:?}", job.status),
+            }
+        );
+        job.status = next;
+        Ok(job.clone())
+    }
+
+    fn next_job_id(&self) -> String {
+        loop {
+            let candidate = format!("job-{}", nanoid::nanoid!());
+            if !self.jobs.contains_key(&candidate) {
+                return candidate;
+            }
+        }
     }
 
     pub fn plan_rebase_session(

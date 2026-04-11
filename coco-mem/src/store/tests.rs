@@ -77,6 +77,24 @@ fn make_prompt_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
     }
 }
 
+fn submit_prompt_job<S: StoreTrait>(store: &S, branch: &str, prompt: &str) -> crate::Job {
+    let parent = store.get_branch_head(branch).unwrap();
+    let prompt_anchor_id = store
+        .append(NewNode {
+            parent,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![],
+                PromptAnchor {
+                    prompt: prompt.to_owned(),
+                },
+            )),
+        })
+        .unwrap();
+    store.submit_job(branch, &prompt_anchor_id).unwrap()
+}
+
 fn read_jsonl_nodes(path: &Path) -> Vec<Node> {
     fs::read_to_string(path)
         .unwrap()
@@ -1191,6 +1209,34 @@ where
     assert_eq!(ancestry[2].id, root_id);
 }
 
+fn assert_job_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    assert_eq!(store.get_job(&job.job_id).unwrap(), job);
+}
+
+fn assert_create_job_generates_unique_ids<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("draft", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    let second = submit_prompt_job(&store, "draft", "world");
+
+    assert!(!first.job_id.is_empty());
+    assert!(!second.job_id.is_empty());
+    assert_ne!(first.job_id, second.job_id);
+}
+
 macro_rules! define_common_store_tests {
     ($module:ident, $factory:ty) => {
         mod $module {
@@ -1420,6 +1466,17 @@ macro_rules! define_common_store_tests {
             fn rebase_session_preserves_created_at_across_rewritten_chain() {
                 assert_rebase_session_preserves_created_at_across_rewritten_chain::<$factory>();
             }
+
+            #[test]
+            fn job_round_trip() {
+                assert_job_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn create_job_generates_unique_ids() {
+                assert_create_job_generates_unique_ids::<$factory>();
+            }
+
         }
     };
 }

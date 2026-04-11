@@ -46,6 +46,16 @@ pub enum StoreError {
         actual: String,
     },
 
+    #[snafu(display("Prompt job {job_id:?} not found"))]
+    PromptJobNotFound { job_id: String },
+
+    #[snafu(display("Prompt job {job_id:?} moved from {expected:?} to {actual:?}"))]
+    PromptJobMoved {
+        job_id: String,
+        expected: String,
+        actual: String,
+    },
+
     #[snafu(display("Ref {base_ref:?} is not an ancestor of {head_ref:?}"))]
     RefsNotConnected { base_ref: String, head_ref: String },
 

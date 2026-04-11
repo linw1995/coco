@@ -290,6 +290,7 @@ name = "coco-mem"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "nanoid",
  "serde",
  "serde_json",
  "sha2",

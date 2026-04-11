@@ -8,7 +8,7 @@ pub(crate) mod state;
 #[cfg(test)]
 mod tests;
 
-use crate::{NewNode, Node, SessionAnchorPatch, SessionState, StoreResult};
+use crate::{Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState, StoreResult};
 
 /// Thread-safe node graph storage used by CoCo services.
 pub trait Store: Clone + Send + Sync + 'static {
@@ -63,6 +63,23 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+
+    /// Creates a new single-task prompt job record.
+    fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job>;
+
+    /// Returns a persisted prompt job.
+    fn get_job(&self, job_id: &str) -> StoreResult<Job>;
+
+    /// Returns all persisted prompt jobs keyed by job id.
+    fn list_jobs(&self) -> StoreResult<HashMap<String, Job>>;
+
+    /// Updates a prompt job lifecycle state when the current state matches.
+    fn set_job_status(
+        &self,
+        job_id: &str,
+        expected: JobStatus,
+        next: JobStatus,
+    ) -> StoreResult<Job>;
 
     /// Returns the backing store directory when the store is process-shareable.
     fn runtime_store_path(&self) -> Option<PathBuf> {

@@ -14,12 +14,16 @@ use crate::error::{
     StorePathIsNotDirectorySnafu, WriteStoreDirectorySnafu, WriteStoreLogSnafu,
     WriteStoreMetaSnafu,
 };
-use crate::{NewNode, Node, SessionAnchorPatch, SessionState, StoreError, StoreResult as Result};
+use crate::{
+    Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState, StoreError,
+    StoreResult as Result,
+};
 
-const STORE_FORMAT_VERSION: u64 = 4;
+const STORE_FORMAT_VERSION: u64 = 6;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
+const JOBS_FILE_NAME: &str = "jobs.json";
 const BRANCHES_DIR_NAME: &str = "branches";
 
 #[derive(Clone, Debug)]
@@ -34,6 +38,7 @@ pub(crate) struct Persistence {
     meta_path: PathBuf,
     nodes_path: PathBuf,
     sessions_path: PathBuf,
+    jobs_path: PathBuf,
     branches_dir: PathBuf,
 }
 
@@ -153,6 +158,7 @@ impl Persistence {
             meta_path: path.join(META_FILE_NAME),
             nodes_path: path.join(NODES_FILE_NAME),
             sessions_path: path.join(SESSIONS_FILE_NAME),
+            jobs_path: path.join(JOBS_FILE_NAME),
             branches_dir: path.join(BRANCHES_DIR_NAME),
         }
     }
@@ -180,6 +186,7 @@ impl Persistence {
         write_json_file(&self.meta_path, &meta)?;
         write_jsonl_file(&self.nodes_path, &[root])?;
         write_json_file(&self.sessions_path, &HashMap::<String, SessionState>::new())?;
+        write_json_file(&self.jobs_path, &HashMap::<String, Job>::new())?;
 
         Ok((self.clone(), store))
     }
@@ -206,7 +213,13 @@ impl Persistence {
                 message: "missing branches directory".to_owned(),
             }
         );
-
+        ensure!(
+            self.jobs_path.is_file(),
+            CorruptedStoreSnafu {
+                path: self.jobs_path.clone(),
+                message: "missing jobs metadata file".to_owned(),
+            }
+        );
         let meta = read_json_file::<Meta>(&self.meta_path)?;
         ensure!(
             meta.version == STORE_FORMAT_VERSION,
@@ -291,12 +304,17 @@ impl Persistence {
         );
         store.sessions = read_json_file::<HashMap<String, SessionState>>(&self.sessions_path)?;
         map_session_validation_error(&self.sessions_path, store.validate_session_records())?;
+        store.jobs = read_json_file::<HashMap<String, Job>>(&self.jobs_path)?;
 
         Ok((self.clone(), store))
     }
 
     pub fn persist_sessions(&self, state: &StoreState) -> Result<()> {
         write_json_file(&self.sessions_path, &state.list_session_states())
+    }
+
+    pub fn persist_jobs(&self, state: &StoreState) -> Result<()> {
+        write_json_file(&self.jobs_path, &state.jobs)
     }
 }
 
@@ -450,6 +468,35 @@ impl Store for FsStore {
         }
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
+    }
+
+    fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let created = temp.submit_job(branch, base)?;
+        self.persistence.persist_jobs(&temp)?;
+        state.jobs = temp.jobs;
+        Ok(created)
+    }
+
+    fn get_job(&self, job_id: &str) -> Result<Job> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_job(job_id)
+    }
+
+    fn list_jobs(&self) -> Result<HashMap<String, Job>> {
+        Ok(self.inner.read().expect("store lock poisoned").list_jobs())
+    }
+
+    fn set_job_status(&self, job_id: &str, expected: JobStatus, next: JobStatus) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.set_job_status(job_id, expected, next)?;
+        self.persistence.persist_jobs(&temp)?;
+        state.jobs = temp.jobs;
+        Ok(updated)
     }
 
     fn runtime_store_path(&self) -> Option<PathBuf> {

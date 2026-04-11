@@ -82,6 +82,28 @@ pub enum SessionState {
     },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Finished,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A persisted execution job bound to a branch.
+pub struct Job {
+    pub job_id: String,
+    pub created_at: Timestamp,
+    pub branch: String,
+    /// The node where this job starts execution.
+    ///
+    /// For prompt-based jobs this is the detached prompt anchor. For resume-style
+    /// jobs this can be any existing node that should continue execution.
+    pub base: String,
+    pub status: JobStatus,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchorPatch {
     pub provider: Option<String>,
@@ -199,6 +221,22 @@ impl SessionAnchor {
                 .additional_params
                 .clone()
                 .unwrap_or_else(|| self.additional_params.clone()),
+        }
+    }
+}
+
+impl Job {
+    pub fn new(
+        job_id: impl Into<String>,
+        branch: impl Into<String>,
+        base: impl Into<String>,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            created_at: Timestamp::now(),
+            branch: branch.into(),
+            base: base.into(),
+            status: JobStatus::Queued,
         }
     }
 }
