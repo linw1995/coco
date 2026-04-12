@@ -174,6 +174,30 @@ pub struct SessionFeedback {
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     pub branch: String,
+    pub origin: CompletionOrigin,
+    pub input: CompletionInput,
+    pub overrides: CompletionOverrides,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CompletionOrigin {
+    #[default]
+    BranchHead,
+    Reference(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CompletionInput {
+    #[default]
+    Continue,
+    Prompt {
+        text: String,
+        merge_parents: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompletionOverrides {
     pub provider: Option<Provider>,
     pub model: Option<String>,
     pub temperature: Option<f64>,
@@ -995,18 +1019,14 @@ where
 
     pub async fn prompt(&self, request: PromptRequest) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
-        self.append_prompt_anchor_to_branch(
-            &request.branch,
-            &request.prompt,
-            &request.merge_parents,
-        )?;
         self.run_locked(CompletionRequest {
             branch: request.branch,
-            provider: None,
-            model: None,
-            temperature: None,
-            max_tokens: None,
-            additional_params: None,
+            origin: CompletionOrigin::BranchHead,
+            input: CompletionInput::Prompt {
+                text: request.prompt,
+                merge_parents: request.merge_parents,
+            },
+            overrides: CompletionOverrides::default(),
         })
         .await
     }
@@ -1018,6 +1038,21 @@ where
         merge_parents: &[String],
     ) -> Result<String> {
         let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let anchor_id =
+            self.append_prompt_anchor_to_parent(&original_head, prompt, merge_parents)?;
+        self.store
+            .set_branch_head(branch, &original_head, &anchor_id)
+            .context(MemorySnafu)?;
+
+        Ok(anchor_id)
+    }
+
+    fn append_prompt_anchor_to_parent(
+        &self,
+        parent_id: &str,
+        prompt: &str,
+        merge_parents: &[String],
+    ) -> Result<String> {
         let merge_parents = merge_parents
             .iter()
             .map(|reference| {
@@ -1033,10 +1068,9 @@ where
                     .context(MemorySnafu)
             })
             .collect::<Result<Vec<_>>>()?;
-        let anchor_id = self
-            .store
+        self.store
             .append(NewNode {
-                parent: original_head.clone(),
+                parent: parent_id.to_owned(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::prompt(
@@ -1046,12 +1080,7 @@ where
                     },
                 )),
             })
-            .context(MemorySnafu)?;
-        self.store
-            .set_branch_head(branch, &original_head, &anchor_id)
-            .context(MemorySnafu)?;
-
-        Ok(anchor_id)
+            .context(MemorySnafu)
     }
 
     pub fn fork(&self, branch: impl Into<String>, from_ref: &str) -> Result<String> {
@@ -1069,12 +1098,23 @@ where
             .store
             .get_branch_head(&request.branch)
             .context(MemorySnafu)?;
-        let session = self.resolve_session(&request.branch)?;
+        let reference_id = match &request.origin {
+            CompletionOrigin::BranchHead => original_head.clone(),
+            CompletionOrigin::Reference(reference) => self.resolve_reference_id(reference)?,
+        };
+        let retry_from_node_id = match &request.input {
+            CompletionInput::Continue => reference_id,
+            CompletionInput::Prompt {
+                text,
+                merge_parents,
+            } => self.append_prompt_anchor_to_parent(&reference_id, text, merge_parents)?,
+        };
+        let session = self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
         let trace_recorder = BackendTraceRecorderHandle::new(
             Arc::new(StoreTraceAppender {
                 store: self.store.clone(),
             }),
-            original_head.clone(),
+            retry_from_node_id.clone(),
         );
         let resolved = self.resolve_request(&session, request.clone(), Some(trace_recorder));
 
@@ -1094,7 +1134,7 @@ where
                     {
                         Some(parent_id) => parent_id,
                         None => self
-                            .append_backend_steps(original_head.clone(), &steps)
+                            .append_backend_steps(retry_from_node_id.clone(), &steps)
                             .context(MemorySnafu)?,
                     };
                     self.store
@@ -1120,7 +1160,7 @@ where
                     {
                         Some(parent_id) => parent_id,
                         None => self
-                            .append_backend_steps(original_head.clone(), &steps)
+                            .append_backend_steps(retry_from_node_id.clone(), &steps)
                             .context(MemorySnafu)?,
                     };
                     let error_node_id = self
@@ -1132,12 +1172,17 @@ where
                             kind: Kind::Failure(message.clone()),
                         })
                         .context(MemorySnafu)?;
+                    if original_head != retry_from_node_id {
+                        self.store
+                            .set_branch_head(&resolved.branch, &original_head, &retry_from_node_id)
+                            .context(MemorySnafu)?;
+                    }
                     Err(BackendSnafu {
                         context: Box::new(BackendFailureContext {
                             branch: resolved.branch,
                             execution_id,
                             error_node_id,
-                            retry_from_node_id: original_head,
+                            retry_from_node_id,
                         }),
                     }
                     .into_error(BackendError::failed(message)))
@@ -1149,7 +1194,7 @@ where
                     .trace_recorder
                     .as_ref()
                     .and_then(BackendTraceRecorderHandle::current_tail_id)
-                    .unwrap_or_else(|| original_head.clone());
+                    .unwrap_or_else(|| retry_from_node_id.clone());
                 let error_node_id = self
                     .store
                     .append(NewNode {
@@ -1159,12 +1204,17 @@ where
                         kind: Kind::Failure(source.to_string()),
                     })
                     .context(MemorySnafu)?;
+                if original_head != retry_from_node_id {
+                    self.store
+                        .set_branch_head(&resolved.branch, &original_head, &retry_from_node_id)
+                        .context(MemorySnafu)?;
+                }
                 Err(BackendSnafu {
                     context: Box::new(BackendFailureContext {
                         branch: resolved.branch,
                         execution_id,
                         error_node_id,
-                        retry_from_node_id: original_head,
+                        retry_from_node_id,
                     }),
                 }
                 .into_error(source))
@@ -1283,8 +1333,17 @@ where
         guards
     }
 
+    #[cfg(test)]
     fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
-        let context = self.resolve_context(branch)?;
+        self.resolve_session_from_reference(branch, branch)
+    }
+
+    fn resolve_session_from_reference(
+        &self,
+        branch: &str,
+        reference: &str,
+    ) -> Result<ResolvedSession> {
+        let context = self.resolve_context(reference)?;
         let mut conversation = Vec::new();
         let mut tracked_entries = Vec::new();
         if !context.session_anchor.prompt.is_empty() {
@@ -1450,13 +1509,18 @@ where
     ) -> ResolvedCompletionRequest {
         ResolvedCompletionRequest {
             branch: request.branch,
-            provider: request.provider.unwrap_or(session.config.provider),
+            provider: request
+                .overrides
+                .provider
+                .unwrap_or(session.config.provider),
             model: request
+                .overrides
                 .model
                 .unwrap_or_else(|| session.config.model.clone()),
-            temperature: request.temperature.or(session.config.temperature),
-            max_tokens: request.max_tokens.or(session.config.max_tokens),
+            temperature: request.overrides.temperature.or(session.config.temperature),
+            max_tokens: request.overrides.max_tokens.or(session.config.max_tokens),
             additional_params: request
+                .overrides
                 .additional_params
                 .or_else(|| session.config.additional_params.clone()),
             trace_recorder,
@@ -2679,11 +2743,9 @@ mod tests {
     fn request(branch: &str) -> CompletionRequest {
         CompletionRequest {
             branch: branch.to_owned(),
-            provider: None,
-            model: None,
-            temperature: None,
-            max_tokens: None,
-            additional_params: None,
+            origin: CompletionOrigin::BranchHead,
+            input: CompletionInput::Continue,
+            overrides: CompletionOverrides::default(),
         }
     }
 
