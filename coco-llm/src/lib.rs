@@ -269,107 +269,76 @@ pub struct ResolvedCompletionRequest {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
-    trace_recorder: Option<BackendTraceRecorderHandle>,
-}
-
-trait TraceAppender: Send + Sync {
-    fn append(&self, node: NewNode) -> std::result::Result<String, StoreError>;
+    trace_node_appender: Option<TraceNodeAppenderHandle>,
 }
 
 #[derive(Debug)]
-struct StoreTraceAppender<S> {
+struct StoreNodeAppender<S> {
     store: S,
-}
-
-impl<S> TraceAppender for StoreTraceAppender<S>
-where
-    S: Store,
-{
-    fn append(&self, node: NewNode) -> std::result::Result<String, StoreError> {
-        self.store.append(node)
-    }
-}
-
-#[derive(Debug)]
-struct BackendTraceRecorderState {
-    current_tail_id: String,
-    persisted_any: bool,
-}
-
-struct BackendTraceRecorderInner {
-    appender: Arc<dyn TraceAppender>,
-    state: StdMutex<BackendTraceRecorderState>,
+    head_id: StdMutex<String>,
 }
 
 #[derive(Clone)]
-struct BackendTraceRecorderHandle {
-    inner: Arc<BackendTraceRecorderInner>,
+struct TraceNodeAppenderHandle {
+    inner: Arc<dyn TraceNodeAppender>,
 }
 
-impl BackendTraceRecorderHandle {
-    fn new(
-        appender: Arc<dyn TraceAppender>,
-        initial_parent_id: String,
-    ) -> BackendTraceRecorderHandle {
-        Self {
-            inner: Arc::new(BackendTraceRecorderInner {
-                appender,
-                state: StdMutex::new(BackendTraceRecorderState {
-                    current_tail_id: initial_parent_id,
-                    persisted_any: false,
-                }),
-            }),
-        }
-    }
-
-    fn append_events(
+trait TraceNodeAppender: Send + Sync {
+    /// Appends a store node to the current trace tail.
+    fn append(
         &self,
-        execution_id: &str,
-        events: &[BackendEvent],
-    ) -> std::result::Result<(), BackendError> {
-        if events.is_empty() {
-            return Ok(());
-        }
+        role: Role,
+        metadata: Option<NodeMetadata>,
+        kind: Kind,
+    ) -> std::result::Result<String, BackendError>;
+}
 
-        let metadata = NodeMetadata::execution(execution_id.to_owned());
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace recorder lock poisoned");
-
-        for event in events {
-            let (role, metadata, kind) =
-                persisted_node_from_backend_event(event.clone(), &metadata);
-            state.current_tail_id = self
-                .inner
-                .appender
-                .append(NewNode {
-                    parent: state.current_tail_id.clone(),
-                    role,
-                    metadata,
-                    kind,
-                })
-                .map_err(|source| BackendError::failed(source.to_string()))?;
-            state.persisted_any = true;
-        }
-
-        Ok(())
+impl TraceNodeAppenderHandle {
+    fn new(inner: Arc<dyn TraceNodeAppender>) -> TraceNodeAppenderHandle {
+        Self { inner }
     }
 
-    fn current_tail_id(&self) -> Option<String> {
-        let state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace recorder lock poisoned");
-        state.persisted_any.then(|| state.current_tail_id.clone())
+    fn append(
+        &self,
+        role: Role,
+        metadata: Option<NodeMetadata>,
+        kind: Kind,
+    ) -> std::result::Result<String, BackendError> {
+        self.inner.append(role, metadata, kind)
     }
 }
 
-impl std::fmt::Debug for BackendTraceRecorderHandle {
+impl std::fmt::Debug for TraceNodeAppenderHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BackendTraceRecorderHandle(..)")
+        formatter.write_str("TraceNodeAppenderHandle(..)")
+    }
+}
+
+impl<S> TraceNodeAppender for StoreNodeAppender<S>
+where
+    S: Store,
+{
+    fn append(
+        &self,
+        role: Role,
+        metadata: Option<NodeMetadata>,
+        kind: Kind,
+    ) -> std::result::Result<String, BackendError> {
+        let mut head_id = self
+            .head_id
+            .lock()
+            .expect("trace node appender lock poisoned");
+        let node_id = self
+            .store
+            .append(NewNode {
+                parent: head_id.clone(),
+                role,
+                metadata,
+                kind,
+            })
+            .map_err(|source| BackendError::failed(source.to_string()))?;
+        *head_id = node_id.clone();
+        Ok(node_id)
     }
 }
 
@@ -548,6 +517,7 @@ pub struct BackendStep {
 pub struct BackendRun {
     pub steps: Vec<BackendStep>,
     pub outcome: BackendOutcome,
+    pub persisted_head_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -570,6 +540,7 @@ impl BackendRun {
         Self {
             steps,
             outcome: BackendOutcome::Succeeded { text: text.into() },
+            persisted_head_id: None,
         }
     }
 
@@ -589,6 +560,7 @@ impl BackendRun {
             outcome: BackendOutcome::Failed {
                 message: message.into(),
             },
+            persisted_head_id: None,
         }
     }
 
@@ -600,6 +572,11 @@ impl BackendRun {
                 events,
             }],
         )
+    }
+
+    pub fn with_persisted_head_id(mut self, persisted_head_id: Option<String>) -> Self {
+        self.persisted_head_id = persisted_head_id;
+        self
     }
 }
 
@@ -1110,105 +1087,118 @@ where
             } => self.append_prompt_anchor_to_parent(&reference_id, text, merge_parents)?,
         };
         let session = self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
-        let trace_recorder = BackendTraceRecorderHandle::new(
-            Arc::new(StoreTraceAppender {
-                store: self.store.clone(),
-            }),
-            retry_from_node_id.clone(),
-        );
-        let resolved = self.resolve_request(&session, request.clone(), Some(trace_recorder));
-
+        let trace_node_appender = TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
+            store: self.store.clone(),
+            head_id: StdMutex::new(retry_from_node_id.clone()),
+        }));
+        let resolved = self.resolve_request(&session, request.clone(), Some(trace_node_appender));
         match self
             .backend
             .complete(session.clone(), resolved.clone())
             .await
         {
-            Ok(run) => match run.outcome {
-                BackendOutcome::Succeeded { text } => {
-                    let (last_execution_id, steps) =
-                        normalize_backend_steps(run.steps, Some(text.clone()));
-                    let parent_id = match resolved
-                        .trace_recorder
-                        .as_ref()
-                        .and_then(BackendTraceRecorderHandle::current_tail_id)
-                    {
-                        Some(parent_id) => parent_id,
-                        None => self
-                            .append_backend_steps(retry_from_node_id.clone(), &steps)
-                            .context(MemorySnafu)?,
-                    };
-                    self.store
-                        .set_branch_head(&resolved.branch, &original_head, &parent_id)
-                        .context(MemorySnafu)?;
-                    self.finalize_branch_handoffs(&resolved.branch)?;
+            Ok(run) => {
+                let BackendRun {
+                    steps,
+                    outcome,
+                    persisted_head_id,
+                } = run;
+                match outcome {
+                    BackendOutcome::Succeeded { text } => {
+                        let (last_execution_id, steps) =
+                            normalize_backend_steps(steps, Some(text.clone()));
+                        let response_node_id = match resolved.trace_node_appender.as_ref() {
+                            Some(trace_node_appender) => persisted_head_id.clone().map_or_else(
+                                || {
+                                    self.persist_backend_steps_with_trace_node_appender(
+                                        &resolved.branch,
+                                        &retry_from_node_id,
+                                        trace_node_appender,
+                                        &steps,
+                                    )
+                                },
+                                Ok,
+                            )?,
+                            None => self
+                                .append_backend_steps(retry_from_node_id.clone(), &steps)
+                                .context(MemorySnafu)?,
+                        };
+                        self.move_branch_head(&resolved.branch, &original_head, &response_node_id)?;
+                        self.finalize_branch_handoffs(&resolved.branch)?;
 
-                    Ok(CompletionResult {
-                        branch: resolved.branch,
-                        anchor_id: session.anchor_id,
-                        execution_id: last_execution_id,
-                        response_node_id: parent_id.clone(),
-                        branch_head: parent_id,
-                        text,
-                    })
-                }
-                BackendOutcome::Failed { message } => {
-                    let (execution_id, steps) = normalize_backend_steps(run.steps, None);
-                    let partial_history_tail = match resolved
-                        .trace_recorder
-                        .as_ref()
-                        .and_then(BackendTraceRecorderHandle::current_tail_id)
-                    {
-                        Some(parent_id) => parent_id,
-                        None => self
-                            .append_backend_steps(retry_from_node_id.clone(), &steps)
-                            .context(MemorySnafu)?,
-                    };
-                    let error_node_id = self
-                        .store
-                        .append(NewNode {
-                            parent: partial_history_tail,
-                            role: Role::System,
-                            metadata: Some(NodeMetadata::execution(execution_id.clone())),
-                            kind: Kind::Failure(message.clone()),
-                        })
-                        .context(MemorySnafu)?;
-                    if original_head != retry_from_node_id {
-                        self.store
-                            .set_branch_head(&resolved.branch, &original_head, &retry_from_node_id)
-                            .context(MemorySnafu)?;
-                    }
-                    Err(BackendSnafu {
-                        context: Box::new(BackendFailureContext {
+                        Ok(CompletionResult {
                             branch: resolved.branch,
-                            execution_id,
-                            error_node_id,
-                            retry_from_node_id,
-                        }),
+                            anchor_id: session.anchor_id,
+                            execution_id: last_execution_id,
+                            response_node_id: response_node_id.clone(),
+                            branch_head: response_node_id,
+                            text,
+                        })
                     }
-                    .into_error(BackendError::failed(message)))
+                    BackendOutcome::Failed { message } => {
+                        let (execution_id, steps) = normalize_backend_steps(steps, None);
+                        let error_node_id = match resolved.trace_node_appender.as_ref() {
+                            Some(trace_node_appender) => {
+                                persisted_head_id.clone().map_or_else(
+                                    || {
+                                        self.persist_backend_steps_with_trace_node_appender(
+                                            &resolved.branch,
+                                            &retry_from_node_id,
+                                            trace_node_appender,
+                                            &steps,
+                                        )
+                                    },
+                                    Ok,
+                                )?;
+                                self.append_failure_with_trace_node_appender(
+                                    &resolved.branch,
+                                    &retry_from_node_id,
+                                    trace_node_appender,
+                                    &execution_id,
+                                    &message,
+                                )?
+                            }
+                            None => self.append_failure_node(
+                                self.append_backend_steps(retry_from_node_id.clone(), &steps)
+                                    .context(MemorySnafu)?,
+                                &execution_id,
+                                &message,
+                            )?,
+                        };
+                        self.move_branch_head(
+                            &resolved.branch,
+                            &original_head,
+                            &retry_from_node_id,
+                        )?;
+                        Err(BackendSnafu {
+                            context: Box::new(BackendFailureContext {
+                                branch: resolved.branch,
+                                execution_id,
+                                error_node_id,
+                                retry_from_node_id,
+                            }),
+                        }
+                        .into_error(BackendError::failed(message)))
+                    }
                 }
-            },
+            }
             Err(source) => {
                 let execution_id = format!("execution-{}", nanoid::nanoid!());
-                let failure_parent = resolved
-                    .trace_recorder
-                    .as_ref()
-                    .and_then(BackendTraceRecorderHandle::current_tail_id)
-                    .unwrap_or_else(|| retry_from_node_id.clone());
-                let error_node_id = self
-                    .store
-                    .append(NewNode {
-                        parent: failure_parent,
-                        role: Role::System,
-                        metadata: Some(NodeMetadata::execution(execution_id.clone())),
-                        kind: Kind::Failure(source.to_string()),
-                    })
-                    .context(MemorySnafu)?;
-                if original_head != retry_from_node_id {
-                    self.store
-                        .set_branch_head(&resolved.branch, &original_head, &retry_from_node_id)
-                        .context(MemorySnafu)?;
-                }
+                let error_node_id = match resolved.trace_node_appender.as_ref() {
+                    Some(trace_node_appender) => self.append_failure_with_trace_node_appender(
+                        &resolved.branch,
+                        &retry_from_node_id,
+                        trace_node_appender,
+                        &execution_id,
+                        &source.to_string(),
+                    )?,
+                    None => self.append_failure_node(
+                        retry_from_node_id.clone(),
+                        &execution_id,
+                        &source.to_string(),
+                    )?,
+                };
+                self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
                 Err(BackendSnafu {
                     context: Box::new(BackendFailureContext {
                         branch: resolved.branch,
@@ -1232,6 +1222,15 @@ where
         };
 
         branch_lock.lock_owned().await
+    }
+
+    fn resolve_session_from_reference(
+        &self,
+        branch: &str,
+        reference: &str,
+    ) -> Result<ResolvedSession> {
+        let context = self.resolve_context(reference)?;
+        self.session_from_context(branch, context)
     }
 
     fn append_backend_events(
@@ -1265,6 +1264,82 @@ where
         }
 
         Ok(parent_id)
+    }
+
+    fn persist_backend_steps_with_trace_node_appender(
+        &self,
+        branch: &str,
+        retry_from_node_id: &str,
+        trace_node_appender: &TraceNodeAppenderHandle,
+        steps: &[BackendStep],
+    ) -> Result<String> {
+        let mut head_id = retry_from_node_id.to_owned();
+        for step in steps {
+            if step.events.is_empty() {
+                continue;
+            }
+            head_id = append_backend_events(trace_node_appender, &step.execution_id, &step.events)
+                .context(BackendSnafu {
+                    context: Box::new(BackendFailureContext {
+                        branch: branch.to_owned(),
+                        execution_id: step.execution_id.clone(),
+                        error_node_id: retry_from_node_id.to_owned(),
+                        retry_from_node_id: retry_from_node_id.to_owned(),
+                    }),
+                })?;
+        }
+
+        Ok(head_id)
+    }
+
+    fn append_failure_with_trace_node_appender(
+        &self,
+        branch: &str,
+        retry_from_node_id: &str,
+        trace_node_appender: &TraceNodeAppenderHandle,
+        execution_id: &str,
+        message: &str,
+    ) -> Result<String> {
+        trace_node_appender
+            .append(
+                Role::System,
+                Some(NodeMetadata::execution(execution_id.to_owned())),
+                Kind::Failure(message.to_owned()),
+            )
+            .context(BackendSnafu {
+                context: Box::new(BackendFailureContext {
+                    branch: branch.to_owned(),
+                    execution_id: execution_id.to_owned(),
+                    error_node_id: retry_from_node_id.to_owned(),
+                    retry_from_node_id: retry_from_node_id.to_owned(),
+                }),
+            })
+    }
+
+    fn append_failure_node(
+        &self,
+        parent_id: String,
+        execution_id: &str,
+        message: &str,
+    ) -> Result<String> {
+        self.store
+            .append(NewNode {
+                parent: parent_id,
+                role: Role::System,
+                metadata: Some(NodeMetadata::execution(execution_id.to_owned())),
+                kind: Kind::Failure(message.to_owned()),
+            })
+            .context(MemorySnafu)
+    }
+
+    fn move_branch_head(&self, branch: &str, current_head: &str, next_head: &str) -> Result<()> {
+        if current_head == next_head {
+            return Ok(());
+        }
+
+        self.store
+            .set_branch_head(branch, current_head, next_head)
+            .context(MemorySnafu)
     }
 
     fn finalize_branch_handoffs(&self, branch: &str) -> Result<()> {
@@ -1335,15 +1410,15 @@ where
 
     #[cfg(test)]
     fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
-        self.resolve_session_from_reference(branch, branch)
+        let context = self.resolve_context(branch)?;
+        self.session_from_context(branch, context)
     }
 
-    fn resolve_session_from_reference(
+    fn session_from_context(
         &self,
         branch: &str,
-        reference: &str,
+        context: ResolvedContext,
     ) -> Result<ResolvedSession> {
-        let context = self.resolve_context(reference)?;
         let mut conversation = Vec::new();
         let mut tracked_entries = Vec::new();
         if !context.session_anchor.prompt.is_empty() {
@@ -1396,104 +1471,7 @@ where
         let mut state: Option<ResolvedContext> = None;
 
         for node in ordered {
-            match &node.kind {
-                Kind::Anchor(anchor) => match &anchor.payload {
-                    AnchorPayload::Session(session_anchor) => {
-                        state = Some(ResolvedContext {
-                            active_anchor_id: node.id.clone(),
-                            session_anchor: session_anchor.clone(),
-                            tail_entries: vec![],
-                        });
-                    }
-                    AnchorPayload::Prompt(prompt_anchor) => {
-                        let Some(context) = state.as_mut() else {
-                            return MissingAnchorSnafu {
-                                branch: reference.to_owned(),
-                            }
-                            .fail();
-                        };
-
-                        if !prompt_anchor.prompt.is_empty() {
-                            context.tail_entries.push(TrackedConversationEntry {
-                                execution_id: None,
-                                entry: ConversationEntry::Message(ConversationMessage {
-                                    role: MessageRole::User,
-                                    text: prompt_anchor.prompt.clone(),
-                                }),
-                            });
-                        }
-                        context.active_anchor_id = node.id.clone();
-                    }
-                    AnchorPayload::SkillResult(skill_result) => {
-                        let Some(context) = state.as_mut() else {
-                            return MissingAnchorSnafu {
-                                branch: reference.to_owned(),
-                            }
-                            .fail();
-                        };
-
-                        context.tail_entries.push(TrackedConversationEntry {
-                            execution_id: node
-                                .metadata
-                                .as_ref()
-                                .and_then(|metadata| metadata.execution_id.clone()),
-                            entry: ConversationEntry::ToolResult(ToolResult {
-                                id: skill_result.tool_id.clone(),
-                                output: skill_result.output.clone(),
-                            }),
-                        });
-                        context.active_anchor_id = node.id.clone();
-                    }
-                },
-                Kind::Text(text) => {
-                    let Some(context) = state.as_mut() else {
-                        continue;
-                    };
-
-                    let role = match node.role {
-                        Role::User => Some(MessageRole::User),
-                        Role::LLM => Some(MessageRole::Assistant),
-                        Role::System => None,
-                    };
-                    if let Some(role) = role {
-                        context.tail_entries.push(TrackedConversationEntry {
-                            execution_id: node
-                                .metadata
-                                .as_ref()
-                                .and_then(|metadata| metadata.execution_id.clone()),
-                            entry: ConversationEntry::Message(ConversationMessage {
-                                role,
-                                text: text.clone(),
-                            }),
-                        });
-                    }
-                }
-                Kind::ToolUse(tool_use) => {
-                    let Some(context) = state.as_mut() else {
-                        continue;
-                    };
-                    context.tail_entries.push(TrackedConversationEntry {
-                        execution_id: node
-                            .metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.execution_id.clone()),
-                        entry: ConversationEntry::ToolUse(tool_use.clone()),
-                    });
-                }
-                Kind::ToolResult(tool_result) => {
-                    let Some(context) = state.as_mut() else {
-                        continue;
-                    };
-                    context.tail_entries.push(TrackedConversationEntry {
-                        execution_id: node
-                            .metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.execution_id.clone()),
-                        entry: ConversationEntry::ToolResult(tool_result.clone()),
-                    });
-                }
-                Kind::Failure(_) => {}
-            }
+            self.apply_node_to_context(reference, &mut state, &node)?;
         }
 
         state.context(MissingAnchorSnafu {
@@ -1501,11 +1479,119 @@ where
         })
     }
 
+    fn apply_node_to_context(
+        &self,
+        reference: &str,
+        state: &mut Option<ResolvedContext>,
+        node: &coco_mem::Node,
+    ) -> Result<()> {
+        match &node.kind {
+            Kind::Anchor(anchor) => match &anchor.payload {
+                AnchorPayload::Session(session_anchor) => {
+                    *state = Some(ResolvedContext {
+                        active_anchor_id: node.id.clone(),
+                        session_anchor: session_anchor.clone(),
+                        tail_entries: vec![],
+                    });
+                }
+                AnchorPayload::Prompt(prompt_anchor) => {
+                    let Some(context) = state.as_mut() else {
+                        return MissingAnchorSnafu {
+                            branch: reference.to_owned(),
+                        }
+                        .fail();
+                    };
+
+                    if !prompt_anchor.prompt.is_empty() {
+                        context.tail_entries.push(TrackedConversationEntry {
+                            execution_id: None,
+                            entry: ConversationEntry::Message(ConversationMessage {
+                                role: MessageRole::User,
+                                text: prompt_anchor.prompt.clone(),
+                            }),
+                        });
+                    }
+                    context.active_anchor_id = node.id.clone();
+                }
+                AnchorPayload::SkillResult(skill_result) => {
+                    let Some(context) = state.as_mut() else {
+                        return MissingAnchorSnafu {
+                            branch: reference.to_owned(),
+                        }
+                        .fail();
+                    };
+
+                    context.tail_entries.push(TrackedConversationEntry {
+                        execution_id: node
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.execution_id.clone()),
+                        entry: ConversationEntry::ToolResult(ToolResult {
+                            id: skill_result.tool_id.clone(),
+                            output: skill_result.output.clone(),
+                        }),
+                    });
+                    context.active_anchor_id = node.id.clone();
+                }
+            },
+            Kind::Text(text) => {
+                let Some(context) = state.as_mut() else {
+                    return Ok(());
+                };
+
+                let role = match node.role {
+                    Role::User => Some(MessageRole::User),
+                    Role::LLM => Some(MessageRole::Assistant),
+                    Role::System => None,
+                };
+                if let Some(role) = role {
+                    context.tail_entries.push(TrackedConversationEntry {
+                        execution_id: node
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.execution_id.clone()),
+                        entry: ConversationEntry::Message(ConversationMessage {
+                            role,
+                            text: text.clone(),
+                        }),
+                    });
+                }
+            }
+            Kind::ToolUse(tool_use) => {
+                let Some(context) = state.as_mut() else {
+                    return Ok(());
+                };
+                context.tail_entries.push(TrackedConversationEntry {
+                    execution_id: node
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.execution_id.clone()),
+                    entry: ConversationEntry::ToolUse(tool_use.clone()),
+                });
+            }
+            Kind::ToolResult(tool_result) => {
+                let Some(context) = state.as_mut() else {
+                    return Ok(());
+                };
+                context.tail_entries.push(TrackedConversationEntry {
+                    execution_id: node
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.execution_id.clone()),
+                    entry: ConversationEntry::ToolResult(tool_result.clone()),
+                });
+            }
+            Kind::Failure(_) => {}
+        }
+
+        Ok(())
+    }
+
     fn resolve_request(
         &self,
         session: &ResolvedSession,
         request: CompletionRequest,
-        trace_recorder: Option<BackendTraceRecorderHandle>,
+        trace_node_appender: Option<TraceNodeAppenderHandle>,
     ) -> ResolvedCompletionRequest {
         ResolvedCompletionRequest {
             branch: request.branch,
@@ -1523,7 +1609,7 @@ where
                 .overrides
                 .additional_params
                 .or_else(|| session.config.additional_params.clone()),
-            trace_recorder,
+            trace_node_appender,
         }
     }
 
@@ -1735,6 +1821,33 @@ fn persisted_node_from_backend_event(
     }
 }
 
+fn append_backend_event(
+    trace_node_appender: &TraceNodeAppenderHandle,
+    execution_id: &str,
+    event: BackendEvent,
+) -> std::result::Result<String, BackendError> {
+    let metadata = NodeMetadata::execution(execution_id.to_owned());
+    let (role, metadata, kind) = persisted_node_from_backend_event(event, &metadata);
+    trace_node_appender.append(role, metadata, kind)
+}
+
+fn append_backend_events(
+    trace_node_appender: &TraceNodeAppenderHandle,
+    execution_id: &str,
+    events: &[BackendEvent],
+) -> std::result::Result<String, BackendError> {
+    let mut events = events.iter();
+    let first = events
+        .next()
+        .expect("append_backend_events requires at least one event");
+    let mut head_id = append_backend_event(trace_node_appender, execution_id, first.clone())?;
+    for event in events {
+        head_id = append_backend_event(trace_node_appender, execution_id, event.clone())?;
+    }
+
+    Ok(head_id)
+}
+
 fn rig_messages_from_tracked_entries(
     entries: &[TrackedConversationEntry],
 ) -> Vec<rig::completion::message::Message> {
@@ -1942,6 +2055,7 @@ struct CompletionRunner {
     history: Vec<CompletionMessage>,
     toolset: rig::tool::ToolSet,
     tool_definitions: Vec<CompletionToolDefinition>,
+    persisted_head_id: Option<String>,
     steps: Vec<BackendStep>,
     pending_step: Option<BackendStep>,
 }
@@ -1978,6 +2092,7 @@ impl CompletionRunner {
             history: history.to_vec(),
             toolset,
             tool_definitions,
+            persisted_head_id: None,
             steps: vec![],
             pending_step: None,
         })
@@ -2020,15 +2135,17 @@ impl CompletionRunner {
     }
 
     fn record_turn_events(
-        &self,
+        &mut self,
         execution_id: &str,
         step_events: &mut Vec<BackendEvent>,
         turn: &BackendTurn,
     ) -> std::result::Result<(), BackendError> {
-        if let Some(trace_recorder) = self.request.trace_recorder.as_ref()
+        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref()
             && !turn.trace_persisted
+            && !turn.events.is_empty()
         {
-            trace_recorder.append_events(execution_id, &turn.events)?;
+            let head_id = append_backend_events(trace_node_appender, execution_id, &turn.events)?;
+            self.persisted_head_id = Some(head_id);
         }
         step_events.extend(turn.events.clone());
         Ok(())
@@ -2040,6 +2157,7 @@ impl CompletionRunner {
             events: state.step_events,
         });
         BackendRun::failed_with_steps(error.to_string(), std::mem::take(&mut self.steps))
+            .with_persisted_head_id(self.persisted_head_id.take())
     }
 
     fn complete_terminal_step(
@@ -2054,14 +2172,14 @@ impl CompletionRunner {
             execution_id: state.execution_id,
             events: state.step_events,
         });
-        Ok(BackendRun::succeeded_with_steps(
-            text,
-            std::mem::take(&mut self.steps),
-        ))
+        Ok(
+            BackendRun::succeeded_with_steps(text, std::mem::take(&mut self.steps))
+                .with_persisted_head_id(self.persisted_head_id.take()),
+        )
     }
 
     async fn execute_tool_call(
-        &self,
+        &mut self,
         next_execution_id: &str,
         tool_call: CompletionToolCall,
     ) -> std::result::Result<(BackendEvent, rig::completion::message::UserContent), BackendError>
@@ -2104,8 +2222,12 @@ impl CompletionRunner {
                 output: output.clone(),
             })
         };
-        if let Some(trace_recorder) = self.request.trace_recorder.as_ref() {
-            trace_recorder.append_events(next_execution_id, std::slice::from_ref(&event))?;
+        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
+            self.persisted_head_id = Some(append_backend_event(
+                trace_node_appender,
+                next_execution_id,
+                event.clone(),
+            )?);
         }
 
         Ok((
@@ -2172,6 +2294,7 @@ impl CompletionRunner {
             format!("MaxTurnError: (reached max turn limit: {DEFAULT_AGENT_MAX_TURNS})"),
             std::mem::take(&mut self.steps),
         )
+        .with_persisted_head_id(self.persisted_head_id.take())
     }
 
     async fn run<B>(mut self, backend: &B) -> std::result::Result<BackendRun, BackendError>
@@ -2486,17 +2609,17 @@ mod tests {
             request: ResolvedCompletionRequest,
         ) -> std::result::Result<BackendRun, BackendError> {
             self.calls.lock().await.push((session, request.clone()));
-            let trace_recorder = request
-                .trace_recorder
+            let trace_node_appender = request
+                .trace_node_appender
                 .clone()
-                .expect("streaming backend requires trace recorder");
+                .expect("streaming backend requires trace node appender");
 
             let step_one_events = vec![BackendEvent::ToolUse(ToolUse {
                 id: "tool-call-1".to_owned(),
                 name: "use_skill".to_owned(),
                 input: serde_json::json!({"name": "find-skills"}),
             })];
-            trace_recorder.append_events("execution-step-1", &step_one_events)?;
+            append_backend_events(&trace_node_appender, "execution-step-1", &step_one_events)?;
 
             tokio::time::sleep(Duration::from_millis(5)).await;
 
@@ -2504,14 +2627,20 @@ mod tests {
                 id: "tool-call-1".to_owned(),
                 output: "delegated output".to_owned(),
             });
-            trace_recorder
-                .append_events("execution-step-2", std::slice::from_ref(&step_two_result))?;
+            append_backend_event(
+                &trace_node_appender,
+                "execution-step-2",
+                step_two_result.clone(),
+            )?;
 
             tokio::time::sleep(Duration::from_millis(5)).await;
 
             let step_two_text = BackendEvent::AssistantText("done".to_owned());
-            trace_recorder
-                .append_events("execution-step-2", std::slice::from_ref(&step_two_text))?;
+            let persisted_head_id = Some(append_backend_event(
+                &trace_node_appender,
+                "execution-step-2",
+                step_two_text.clone(),
+            )?);
 
             Ok(BackendRun::succeeded_with_steps(
                 "done",
@@ -2525,7 +2654,8 @@ mod tests {
                         events: vec![step_two_result, step_two_text],
                     },
                 ],
-            ))
+            )
+            .with_persisted_head_id(persisted_head_id))
         }
     }
 
@@ -2539,17 +2669,17 @@ mod tests {
             _session: ResolvedSession,
             request: ResolvedCompletionRequest,
         ) -> std::result::Result<BackendRun, BackendError> {
-            let trace_recorder = request
-                .trace_recorder
+            let trace_node_appender = request
+                .trace_node_appender
                 .clone()
-                .expect("streaming backend requires trace recorder");
+                .expect("streaming backend requires trace node appender");
 
             let step_one_events = vec![BackendEvent::ToolUse(ToolUse {
                 id: "tool-call-1".to_owned(),
                 name: "bash".to_owned(),
                 input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
             })];
-            trace_recorder.append_events("execution-step-1", &step_one_events)?;
+            append_backend_events(&trace_node_appender, "execution-step-1", &step_one_events)?;
 
             tokio::time::sleep(Duration::from_millis(5)).await;
 
@@ -2560,7 +2690,8 @@ mod tests {
                 }),
                 BackendEvent::AssistantText("trying again".to_owned()),
             ];
-            trace_recorder.append_events("execution-step-2", &step_two_events)?;
+            let persisted_head_id =
+                append_backend_events(&trace_node_appender, "execution-step-2", &step_two_events)?;
 
             Ok(BackendRun::failed_with_steps(
                 "MaxTurnError: (reached max turn limit: 8)",
@@ -2574,7 +2705,8 @@ mod tests {
                         events: step_two_events,
                     },
                 ],
-            ))
+            )
+            .with_persisted_head_id(Some(persisted_head_id)))
         }
     }
 
@@ -3166,6 +3298,80 @@ mod tests {
         assert_eq!(recovered.anchor_id, prompt_anchor_id);
         let recovered_node = store.get_node(&recovered.response_node_id).unwrap();
         assert_eq!(recovered_node.parent, prompt_anchor_id);
+    }
+
+    #[tokio::test]
+    async fn run_can_continue_from_historical_reference() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[("main", &[Ok("first"), Ok("resumed")])]);
+        let service = LlmService::new(store.clone(), backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let first = service.run(request("main")).await.unwrap();
+
+        let resumed = service
+            .run(CompletionRequest {
+                branch: "main".to_owned(),
+                origin: CompletionOrigin::Reference(first.response_node_id.clone()),
+                input: CompletionInput::Continue,
+                overrides: CompletionOverrides::default(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.text, "resumed");
+        assert_eq!(
+            store.get_branch_head("main").unwrap(),
+            resumed.response_node_id
+        );
+
+        let resumed_node = store.get_node(&resumed.response_node_id).unwrap();
+        assert_eq!(resumed_node.parent, first.response_node_id);
+    }
+
+    #[tokio::test]
+    async fn run_can_start_from_historical_reference_with_prompt() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[("main", &[Ok("old head"), Ok("new head")])]);
+        let service = LlmService::new(store.clone(), backend);
+        let session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let old_head = service.run(request("main")).await.unwrap();
+
+        let resumed = service
+            .run(CompletionRequest {
+                branch: "main".to_owned(),
+                origin: CompletionOrigin::Reference(session.anchor_id.clone()),
+                input: CompletionInput::Prompt {
+                    text: "resume from base".to_owned(),
+                    merge_parents: vec![],
+                },
+                overrides: CompletionOverrides::default(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.text, "new head");
+        assert_eq!(
+            store.get_branch_head("main").unwrap(),
+            resumed.response_node_id
+        );
+        assert_ne!(old_head.response_node_id, resumed.response_node_id);
+
+        let prompt_anchor = store.get_node(&resumed.anchor_id).unwrap();
+        assert_eq!(prompt_anchor.parent, session.anchor_id);
+        assert!(matches!(
+            &prompt_anchor.kind,
+            Kind::Anchor(anchor)
+                if matches!(
+                    &anchor.payload,
+                    AnchorPayload::Prompt(prompt_anchor) if prompt_anchor.prompt == "resume from base"
+                )
+        ));
     }
 
     #[tokio::test]
