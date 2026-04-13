@@ -8,8 +8,8 @@ use crate::StoreResult as Result;
 use crate::error::{
     AmbiguousNodePrefixSnafu, BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu,
     DuplicateMergeParentSnafu, InvalidAnchorSnafu, MergeParentMatchesParentSnafu,
-    MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu, PromptJobMovedSnafu,
-    PromptJobNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
+    MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu, PromptJobActiveOnBranchSnafu,
+    PromptJobMovedSnafu, PromptJobNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
 };
 use crate::{
     Anchor, AnchorPayload, Job, JobStatus, Kind, NewNode, Node, PauseReason, Role,
@@ -302,6 +302,17 @@ impl StoreState {
     pub fn submit_job(&mut self, branch: &str, base: &str) -> Result<Job> {
         self.get_branch_head(branch)?;
         self.get_node(base)?;
+        if let Some(active_job) = self
+            .jobs
+            .values()
+            .find(|job| job.branch == branch && !matches!(job.status, JobStatus::Finished))
+        {
+            return PromptJobActiveOnBranchSnafu {
+                branch: branch.to_owned(),
+                job_id: active_job.job_id.clone(),
+            }
+            .fail();
+        }
         let job = Job::new(self.next_job_id(), branch, base);
         self.jobs.insert(job.job_id.clone(), job.clone());
         Ok(job)

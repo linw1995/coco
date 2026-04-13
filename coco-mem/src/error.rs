@@ -56,6 +56,9 @@ pub enum StoreError {
         actual: String,
     },
 
+    #[snafu(display("Branch {branch:?} already has an active prompt job {job_id:?}"))]
+    PromptJobActiveOnBranch { branch: String, job_id: String },
+
     #[snafu(display("Ref {base_ref:?} is not an ancestor of {head_ref:?}"))]
     RefsNotConnected { base_ref: String, head_ref: String },
 

@@ -1257,6 +1257,59 @@ where
     assert_eq!(store.get_job(&job.job_id).unwrap(), finished);
 }
 
+fn assert_submit_job_rejects_second_active_job_on_same_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+
+    let second_parent = store.get_branch_head("main").unwrap();
+    let second_anchor_id = store
+        .append(NewNode {
+            parent: second_parent,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![],
+                PromptAnchor {
+                    prompt: "world".to_owned(),
+                },
+            )),
+        })
+        .unwrap();
+    let err = store.submit_job("main", &second_anchor_id).unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::PromptJobActiveOnBranch { branch, job_id }
+            if branch == "main" && job_id == first.job_id
+    ));
+}
+
+fn assert_submit_job_allows_new_job_after_previous_job_finishes<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_status(&first.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    store
+        .set_job_status(&first.job_id, JobStatus::Running, JobStatus::Finished)
+        .unwrap();
+
+    let second = submit_prompt_job(&store, "main", "world");
+
+    assert_ne!(first.job_id, second.job_id);
+    assert_eq!(second.status, JobStatus::Queued);
+}
+
 macro_rules! define_common_store_tests {
     ($module:ident, $factory:ty) => {
         mod $module {
@@ -1500,6 +1553,16 @@ macro_rules! define_common_store_tests {
             #[test]
             fn finished_job_round_trip() {
                 assert_finished_job_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn submit_job_rejects_second_active_job_on_same_branch() {
+                assert_submit_job_rejects_second_active_job_on_same_branch::<$factory>();
+            }
+
+            #[test]
+            fn submit_job_allows_new_job_after_previous_job_finishes() {
+                assert_submit_job_allows_new_job_after_previous_job_finishes::<$factory>();
             }
 
         }

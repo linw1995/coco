@@ -65,6 +65,8 @@ pub trait Store: Clone + Send + Sync + 'static {
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
 
     /// Creates a new single-task prompt job record.
+    ///
+    /// Rejects the request when the branch already has an unfinished prompt job.
     fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job>;
 
     /// Returns a persisted prompt job.
