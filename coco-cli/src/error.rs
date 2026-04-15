@@ -44,11 +44,20 @@ pub enum Error {
     #[snafu(display("Failed to read stdin: {source}"))]
     ReadStdin { source: io::Error },
 
+    #[snafu(display("Failed to resolve current executable: {source}"))]
+    ResolveCurrentExe { source: io::Error },
+
+    #[snafu(display("Failed to spawn prompt worker: {source}"))]
+    SpawnPromptWorker { source: io::Error },
+
     #[snafu(display("{source}"))]
     Store { source: coco_mem::StoreError },
 
     #[snafu(display("{source}"))]
     Core { source: coco_core::Error },
+
+    #[snafu(display("{source}"))]
+    CoreEngine { source: coco_core::EngineError },
 
     #[snafu(display("{source}"))]
     Llm { source: coco_llm::Error },

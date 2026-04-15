@@ -265,7 +265,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "coco-llm",
+ "futures",
+ "indoc",
+ "jiff",
+ "nanoid",
+ "serde",
+ "serde_json",
  "snafu",
+ "tempfile",
  "tokio",
 ]
 

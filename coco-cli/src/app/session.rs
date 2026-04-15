@@ -595,7 +595,11 @@ fn build_graph_transition(
         }
     }
 
-    let mut insert_at = current_col.min(next.len());
+    let mut insert_at = entry
+        .primary_parent
+        .as_ref()
+        .and_then(|primary_parent| next.iter().position(|node_id| node_id == primary_parent))
+        .map_or_else(|| current_col.min(next.len()), |index| index + 1);
     for merge_parent in &entry.merge_parents {
         if next.iter().any(|node_id| node_id == merge_parent) {
             continue;

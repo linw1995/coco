@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::sync::Arc;
 
+use coco_core::CoreSkillToolExecutor;
 use coco_llm::{
     BashToolCliBridgeHandle, CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge,
     LlmService, RigBackend, SessionConfig,
@@ -27,7 +28,7 @@ where
 {
     let shared_store = open_store(&cli.store_path)?;
     let llm = Arc::new_cyclic(|weak_llm| {
-        let bridge_impl = Arc::new(LlmRuntimeBridge::new(weak_llm.clone(), {
+        let bash_bridge_impl = Arc::new(LlmRuntimeBridge::new(weak_llm.clone(), {
             let shared_store = shared_store.clone();
             move |request, llm| {
                 let shared_store = shared_store.clone();
@@ -44,10 +45,11 @@ where
                 }
             }
         }));
-        let bridge = BashToolCliBridgeHandle::new(bridge_impl.clone());
+        let bash_bridge = BashToolCliBridgeHandle::new(bash_bridge_impl);
+        let skill_bridge = Arc::new(CoreSkillToolExecutor::new(weak_llm.clone()));
         LlmService::builder(shared_store.clone(), backend)
-            .with_bash_tool_cli_bridge(bridge)
-            .with_skill_tool_executor(bridge_impl)
+            .with_bash_tool_cli_bridge(bash_bridge)
+            .with_skill_tool_executor(skill_bridge)
             .build()
     });
 
@@ -61,10 +63,10 @@ pub async fn run_with_services<B, R>(
     llm: &Arc<LlmService<B, FsStore>>,
 ) -> Result<Option<String>>
 where
-    B: CompletionBackend,
+    B: CompletionBackend + 'static,
     R: Read,
 {
-    runtime::run_with_services(cli, reader, shared_store, llm).await
+    runtime::run_with_services(cli, reader, shared_store, llm, false).await
 }
 
 pub async fn run_forwarded_with_services<B>(
@@ -76,7 +78,7 @@ pub async fn run_forwarded_with_services<B>(
     llm: &Arc<LlmService<B, FsStore>>,
 ) -> CocoCliRuntimeResponse
 where
-    B: CompletionBackend,
+    B: CompletionBackend + 'static,
 {
     runtime::run_forwarded_with_services(args, stdin, branch_env, store_path_env, shared_store, llm)
         .await

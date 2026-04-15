@@ -2,9 +2,11 @@ use snafu::prelude::*;
 
 use coco_llm::CompletionBackend;
 use coco_llm::coco_mem::Store;
+use std::collections::HashSet;
 
 use crate::{
-    BranchResolver, ConversationEngine, EngineError, Error, InboundMessage, OutboundMessage,
+    BatchPromptRequest, BatchPromptResult, BranchResolver, ConversationEngine, EngineError, Error,
+    InboundMessage, OutboundMessage,
     error::{BranchResolveFailedSnafu, InvalidInputSnafu},
 };
 
@@ -32,7 +34,7 @@ where
 impl<R, B, S> CoreService<R, B, S>
 where
     R: BranchResolver,
-    B: CompletionBackend,
+    B: CompletionBackend + 'static,
     S: Store,
 {
     pub async fn handle_message(&self, message: InboundMessage) -> Result<OutboundMessage> {
@@ -60,5 +62,44 @@ where
                 Err(Error::ConversationFailed { branch, source })
             }
         }
+    }
+
+    pub async fn handle_batch_prompt(
+        &self,
+        request: BatchPromptRequest,
+    ) -> Result<BatchPromptResult> {
+        ensure!(
+            !request.items.is_empty(),
+            InvalidInputSnafu {
+                message: "batch prompt items are empty".to_owned(),
+            }
+        );
+        ensure!(
+            request.max_concurrency > 0,
+            InvalidInputSnafu {
+                message: "batch prompt max_concurrency must be greater than zero".to_owned(),
+            }
+        );
+
+        let mut seen = HashSet::new();
+        for item in &request.items {
+            ensure!(
+                !item.prompt.trim().is_empty(),
+                InvalidInputSnafu {
+                    message: format!("batch prompt text is empty for branch {:?}", item.branch),
+                }
+            );
+            ensure!(
+                seen.insert(item.branch.as_str()),
+                InvalidInputSnafu {
+                    message: format!("batch prompt branch {:?} is duplicated", item.branch),
+                }
+            );
+        }
+
+        Ok(self
+            .engine
+            .reply_many(request.items, request.max_concurrency)
+            .await)
     }
 }

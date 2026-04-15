@@ -3,12 +3,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
-use snafu::prelude::*;
 
 use crate::{
     BashToolCliBridge, BashToolCliBridgeError, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
-    CompletionBackend, LlmService, SkillToolExecutionResult, SkillToolExecutor,
-    SkillToolExecutorError, SkillToolRequest, Store, WorkflowFailedSnafu,
+    CompletionBackend, LlmService, Store,
 };
 
 type CocoCliForwarder<B, S> = dyn Fn(
@@ -69,25 +67,5 @@ where
             .upgrade()
             .ok_or(BashToolCliBridgeError::Unavailable)?;
         Ok((self.cli_forwarder)(request, llm).await)
-    }
-}
-
-#[async_trait]
-impl<B, S> SkillToolExecutor for LlmRuntimeBridge<B, S>
-where
-    B: CompletionBackend + 'static,
-    S: Store + 'static,
-{
-    async fn execute_skill_tool(
-        &self,
-        request: SkillToolRequest,
-    ) -> std::result::Result<SkillToolExecutionResult, SkillToolExecutorError> {
-        let llm = self
-            .llm
-            .upgrade()
-            .ok_or(SkillToolExecutorError::ExecutorUnavailable)?;
-        llm.use_skill_workflow(request)
-            .await
-            .context(WorkflowFailedSnafu)
     }
 }

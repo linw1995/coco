@@ -2,6 +2,7 @@ use coco_llm::coco_mem::StoreError;
 use snafu::prelude::*;
 
 use crate::ChannelKind;
+use crate::skill::SkillError;
 
 #[derive(Debug, Snafu, Clone, PartialEq, Eq)]
 pub enum BranchResolveError {
@@ -43,6 +44,14 @@ impl From<StoreError> for EngineError {
             other => Self::EngineFailed {
                 message: other.to_string(),
             },
+        }
+    }
+}
+
+impl From<SkillError> for EngineError {
+    fn from(error: SkillError) -> Self {
+        Self::EngineFailed {
+            message: error.to_string(),
         }
     }
 }

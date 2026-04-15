@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::Parser;
 use coco_llm::coco_mem::{
-    Anchor, Kind, NewNode, PromptAnchor, Role, SkillResultAnchor, Store, ToolResult, ToolUse,
+    Anchor, Kind, NewNode, PromptAnchor, Role, SessionAnchor, SkillResultAnchor, Store, ToolResult,
+    ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEvent, BackendTurn, CompletionBackend, CompletionMessage,
@@ -14,22 +15,41 @@ use coco_llm::{
 use coco_mem::SessionState;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::{
     Cli,
     app::{resolve_session_config, run_forwarded_with_services, run_with_backend},
     cli::{
-        Command, PromptCommand, SessionBranchCommand, SessionCloseCommand, SessionCommand,
-        SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand, SessionGraphCommand,
-        SessionMergeCommand, SessionPrCommand, SessionRebaseCommand, SessionShowCommand,
-        SessionSubcommand,
+        Command, PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
+        PromptSubcommand, PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand,
+        SessionCommand, SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand,
+        SessionGraphCommand, SessionMergeCommand, SessionPrCommand, SessionRebaseCommand,
+        SessionShowCommand, SessionSubcommand,
     },
     store::open_store,
 };
 
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
+
+fn submit_prompt_job<S: Store>(store: &S, branch: &str, prompt: &str) -> coco_mem::Job {
+    let parent = store.get_branch_head(branch).unwrap();
+    let prompt_anchor_id = store
+        .append(NewNode {
+            parent,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![],
+                PromptAnchor {
+                    prompt: prompt.to_owned(),
+                },
+            )),
+        })
+        .unwrap();
+    store.submit_job(branch, &prompt_anchor_id).unwrap()
+}
 
 #[derive(Debug, Clone)]
 struct FakeBackend {
@@ -88,6 +108,26 @@ struct UseSkillBackend {
     main_turn: Arc<Mutex<usize>>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct UseSkillFailureBackend {
+    main_turn: Arc<Mutex<usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct BlockingBackend {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl CompletionBackend for BlockingBackend {
+    async fn step(&self, _ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
+        self.started.notify_waiters();
+        self.release.notified().await;
+        Ok(FakeBackend::finished_turn("done"))
+    }
+}
+
 #[async_trait::async_trait]
 impl CompletionBackend for UseSkillBackend {
     async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
@@ -136,12 +176,118 @@ impl CompletionBackend for UseSkillBackend {
     }
 }
 
+#[async_trait::async_trait]
+impl CompletionBackend for UseSkillFailureBackend {
+    async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
+        if ctx.request.branch == "main" {
+            let mut main_turn = self.main_turn.lock().unwrap();
+            let current_turn = *main_turn;
+            *main_turn += 1;
+            return match current_turn {
+                0 => {
+                    let tool_call: CompletionToolCall = serde_json::from_value(json!({
+                        "id": "tool-call-1",
+                        "call_id": null,
+                        "function": {
+                            "name": "use_skill",
+                            "arguments": {
+                                "name": "fast-rust"
+                            }
+                        },
+                        "signature": null,
+                        "additional_params": null
+                    }))
+                    .unwrap();
+                    Ok(BackendTurn {
+                        message: CompletionMessage::assistant("delegating".to_owned()),
+                        events: vec![BackendEvent::ToolUse(ToolUse {
+                            id: tool_call.id.clone(),
+                            name: tool_call.function.name.clone(),
+                            input: tool_call.function.arguments.clone(),
+                        })],
+                        tool_calls: vec![tool_call],
+                        final_text: None,
+                        trace_persisted: false,
+                    })
+                }
+                1 => Ok(FakeBackend::finished_turn("base recovered")),
+                other => panic!("unexpected main turn {other}"),
+            };
+        }
+
+        if ctx.request.branch.starts_with("main/skill/fast-rust-") {
+            return Err(BackendError::Failed {
+                message: "delegated failure".to_owned(),
+            });
+        }
+
+        panic!("unexpected branch {:?}", ctx.request.branch);
+    }
+}
+
 fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str]) -> Cli {
     Cli {
         store_path,
         command: Command::Prompt(PromptCommand {
-            branch: branch.unwrap_or("main").to_owned(),
-            text: text.iter().map(|part| (*part).to_owned()).collect(),
+            command: None,
+            run: PromptRunCommand {
+                branch: branch.unwrap_or("main").to_owned(),
+                asynchronous: false,
+                text: text.iter().map(|part| (*part).to_owned()).collect(),
+            },
+        }),
+    }
+}
+
+fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
+    Cli {
+        store_path,
+        command: Command::Prompt(PromptCommand {
+            command: Some(PromptSubcommand::Worker(PromptWorkerCommand {
+                job: job.to_owned(),
+            })),
+            run: PromptRunCommand {
+                branch: "main".to_owned(),
+                asynchronous: false,
+                text: vec![],
+            },
+        }),
+    }
+}
+
+fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
+    Cli {
+        store_path,
+        command: Command::Prompt(PromptCommand {
+            command: Some(PromptSubcommand::Status(PromptStatusCommand {
+                job: job.to_owned(),
+            })),
+            run: PromptRunCommand {
+                branch: "main".to_owned(),
+                asynchronous: false,
+                text: vec![],
+            },
+        }),
+    }
+}
+
+fn prompt_branch_status_cli(
+    store_path: std::path::PathBuf,
+    job: &str,
+    branch: Option<&str>,
+) -> Cli {
+    Cli {
+        store_path,
+        command: Command::Prompt(PromptCommand {
+            command: Some(PromptSubcommand::BranchStatus(PromptBranchStatusCommand {
+                job: job.to_owned(),
+                branch: branch.map(str::to_owned),
+            })),
+            run: PromptRunCommand {
+                branch: "main".to_owned(),
+                asynchronous: false,
+                text: vec![],
+            },
         }),
     }
 }
@@ -348,6 +494,29 @@ fn append_prompt_anchor(
                 merge_parents.iter().map(|id| (*id).to_owned()).collect(),
                 PromptAnchor {
                     prompt: prompt.to_owned(),
+                },
+            )),
+        })
+        .unwrap()
+}
+
+fn append_session_anchor(store: &impl Store, parent: &str, prompt: &str) -> String {
+    store
+        .append(NewNode {
+            parent: parent.to_owned(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(
+                vec![],
+                SessionAnchor {
+                    provider: "openai".to_owned(),
+                    model: "gpt-4.1-mini".to_owned(),
+                    tools: vec![],
+                    system_prompt: "You are helpful.".to_owned(),
+                    prompt: prompt.to_owned(),
+                    temperature: Some(0.2),
+                    max_tokens: Some(64),
+                    additional_params: None,
                 },
             )),
         })
@@ -570,6 +739,72 @@ description: "Review Rust changes."
     .unwrap();
 
     assert_eq!(output, Some("base done".to_owned()));
+
+    let store = open_store(&store_path).unwrap();
+    let jobs = store.list_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs.values().all(|job| job.branch == "main"));
+
+    let session_states = store.list_session_states().unwrap();
+    assert!(
+        !session_states
+            .keys()
+            .any(|branch| branch.starts_with("main/skill/fast-rust-"))
+    );
+
+    let ancestry = store.ancestry("main").unwrap();
+    let tool_use = ancestry
+        .iter()
+        .find(|node| {
+            matches!(
+                &node.kind,
+                Kind::ToolUse(ToolUse { id, name, .. })
+                    if id == "tool-call-1" && name == "use_skill"
+            )
+        })
+        .expect("expected use_skill tool use on main");
+    let handoff_anchor = ancestry
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor
+                .as_skill_result()
+                .map(|skill_result| (anchor, skill_result)),
+            _ => None,
+        })
+        .expect("expected skill handoff anchor on main");
+    assert_eq!(handoff_anchor.1.skill_name, "fast-rust");
+    assert_eq!(handoff_anchor.1.output, "delegated output");
+
+    let merge_parent = handoff_anchor
+        .0
+        .merge_parents()
+        .first()
+        .expect("skill handoff should keep child merge parent")
+        .clone();
+    let children = store.list_children(&tool_use.id).unwrap();
+    let child_session_anchor = children
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor.as_session().map(|session| (node, session)),
+            _ => None,
+        })
+        .expect("expected child session anchor under use_skill");
+    assert_eq!(child_session_anchor.0.parent, tool_use.id);
+    let child_ancestry = store.ancestry(&merge_parent).unwrap();
+    assert!(
+        child_ancestry
+            .iter()
+            .any(|node| node.id == child_session_anchor.0.id)
+    );
+    let child_prompt = child_ancestry
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor.as_session().map(|session| session.prompt.as_str()),
+            _ => None,
+        })
+        .expect("child skill execution should persist its session prompt");
+    assert!(child_prompt.contains("You are executing the skill `fast-rust`"));
+    assert!(child_prompt.contains("Additional task from caller:\nReview the change"));
 }
 
 #[tokio::test]
@@ -601,6 +836,120 @@ async fn prompt_reads_text_from_stdin() {
 }
 
 #[tokio::test]
+async fn prompt_keeps_failed_use_skill_child_visible_under_tool_use() {
+    let (_tempdir, store_path) = temp_store_path();
+    let skills_root = tempdir().unwrap();
+    std::fs::create_dir_all(skills_root.path().join("fast-rust")).unwrap();
+    std::fs::write(
+        skills_root.path().join("fast-rust").join("SKILL.md"),
+        r#"---
+name: "fast-rust"
+description: "Review Rust changes."
+---
+
+# Fast Rust
+"#,
+    )
+    .unwrap();
+    let skills_env = std::env::join_paths([skills_root.path()]).unwrap();
+
+    with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "openai"),
+            ("COCO_MODEL", "gpt-4.1-mini"),
+            ("COCO_TOOLS", "use_skill"),
+            ("COCO_SKILLS_DIRS", skills_env.to_str().unwrap()),
+        ],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                UseSkillFailureBackend::default(),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let output = with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "openai"),
+            ("COCO_MODEL", "gpt-4.1-mini"),
+            ("COCO_TOOLS", "use_skill"),
+            ("COCO_SKILLS_DIRS", skills_env.to_str().unwrap()),
+        ],
+        || async {
+            run_with_backend(
+                prompt_cli(store_path.clone(), Some("main"), &["delegate"]),
+                &mut Cursor::new(""),
+                UseSkillFailureBackend::default(),
+            )
+            .await
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output, Some("base recovered".to_owned()));
+
+    let store = open_store(&store_path).unwrap();
+    let ancestry = store.ancestry("main").unwrap();
+    let tool_use = ancestry
+        .iter()
+        .find(|node| {
+            matches!(
+                &node.kind,
+                Kind::ToolUse(ToolUse { id, name, .. })
+                    if id == "tool-call-1" && name == "use_skill"
+            )
+        })
+        .expect("expected use_skill tool use on main");
+    let children = store.list_children(&tool_use.id).unwrap();
+    let child_session_anchor = children
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor.as_session().map(|session| (node, session)),
+            _ => None,
+        })
+        .expect("expected child session anchor under tool use");
+    let (handoff_node, handoff_anchor, skill_result) = children
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor
+                .as_skill_result()
+                .map(|skill_result| (node, anchor, skill_result)),
+            _ => None,
+        })
+        .expect("expected skill handoff anchor under tool use");
+
+    assert_eq!(skill_result.skill_name, "fast-rust");
+    assert_eq!(
+        skill_result.output,
+        "Backend call failed: delegated failure"
+    );
+    let merge_parent = handoff_anchor
+        .merge_parents()
+        .first()
+        .expect("expected child failure merge parent")
+        .clone();
+    assert_eq!(handoff_node.parent, tool_use.id);
+    assert_eq!(child_session_anchor.0.parent, tool_use.id);
+    assert!(
+        child_session_anchor
+            .1
+            .prompt
+            .contains("You are executing the skill `fast-rust`")
+    );
+
+    let child_failure = store.get_node(&merge_parent).unwrap();
+    assert!(matches!(
+        &child_failure.kind,
+        Kind::Failure(text) if text == "delegated failure"
+    ));
+}
+
+#[tokio::test]
 async fn prompt_returns_missing_session_when_branch_does_not_exist() {
     let (_tempdir, store_path) = temp_store_path();
 
@@ -615,6 +964,187 @@ async fn prompt_returns_missing_session_when_branch_does_not_exist() {
     assert!(
         matches!(error, crate::Error::Core { source: coco_core::Error::MissingSession { branch } } if branch == "main")
     );
+}
+
+#[tokio::test]
+async fn prompt_persists_single_job_even_without_async() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let output = run_with_backend(
+        prompt_cli(store_path.clone(), Some("main"), &["hello"]),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[("main", &[Ok("done")])]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(output, "done");
+
+    let jobs = open_store(&store_path).unwrap().list_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    let job_id = jobs.keys().next().unwrap().clone();
+    let status_output = run_with_backend(
+        prompt_status_cli(store_path, &job_id),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value: Value = serde_json::from_str(&status_output).unwrap();
+    assert_eq!(value["job"]["status"], "finished");
+    assert!(value["job"]["finished_at"].is_string());
+    assert_eq!(value["base_node"]["kind"], "prompt");
+    assert_eq!(value["base_node"]["prompt"], "hello");
+    assert_eq!(value["base_node"]["merge_parents"], json!([]));
+    assert!(value["base_node"]["node_id"].is_string());
+    assert!(value["job"]["head"].is_string());
+}
+
+#[tokio::test]
+async fn prompt_worker_persists_job_results_and_status_queries() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    run_with_backend(
+        prompt_worker_cli(store_path.clone(), &job.job_id),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[("main", &[Ok("main done")])]),
+    )
+    .await
+    .unwrap();
+
+    let output = run_with_backend(
+        prompt_status_cli(store_path.clone(), &job.job_id),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["job"]["status"], "finished");
+    assert!(value["job"]["finished_at"].is_string());
+    assert_eq!(value["job"]["branch"], "main");
+    assert_eq!(value["base_node"]["kind"], "prompt");
+    assert_eq!(value["base_node"]["prompt"], "hello");
+    assert_eq!(value["base_node"]["merge_parents"], json!([]));
+    assert!(value["base_node"]["node_id"].is_string());
+    assert!(value["job"]["head"].is_string());
+
+    let branch_output = run_with_backend(
+        prompt_branch_status_cli(store_path, &job.job_id, Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let branch_value: Value = serde_json::from_str(&branch_output).unwrap();
+    assert_eq!(branch_value["branch"], "main");
+    assert!(branch_value["head"].is_string());
+}
+
+#[tokio::test]
+async fn prompt_branch_status_reports_running_task_progress() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello progress");
+
+    let backend = BlockingBackend {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    };
+    let started = backend.started.clone();
+    let release = backend.release.clone();
+    let job_id = job.job_id.clone();
+    let worker = tokio::spawn({
+        let store_path = store_path.clone();
+        let backend = backend.clone();
+        let job_id = job_id.clone();
+        async move {
+            run_with_backend(
+                prompt_worker_cli(store_path, &job_id),
+                &mut Cursor::new(""),
+                backend,
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    started.notified().await;
+
+    let output = run_with_backend(
+        prompt_branch_status_cli(store_path.clone(), &job_id, Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["status"], "running");
+    assert!(value["finished_at"].is_null());
+    assert_eq!(value["head"], json!(job.base));
+
+    release.notify_waiters();
+    worker.await.unwrap();
+
+    let status_output = run_with_backend(
+        prompt_status_cli(store_path, &job_id),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value: Value = serde_json::from_str(&status_output).unwrap();
+    assert_eq!(value["job"]["status"], "finished");
+    assert!(value["job"]["finished_at"].is_string());
 }
 
 #[tokio::test]
@@ -1485,6 +2015,63 @@ async fn session_graph_and_show_render_skill_result_anchor() {
     assert!(show_output.contains("tool_id: tool-1"));
     assert!(show_output.contains("skill_name: find-skills"));
     assert!(show_output.contains("Delegated result"));
+}
+
+#[tokio::test]
+async fn session_graph_places_skill_child_branch_on_the_right() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_head = store.get_branch_head("main").unwrap();
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "use_skill");
+    store
+        .set_branch_head("main", &session_head, &tool_use_id)
+        .unwrap();
+    let child_session_id = append_session_anchor(
+        &store,
+        &tool_use_id,
+        "You are executing the skill `fast-rust` on an isolated branch.",
+    );
+    let skill_result_id = append_skill_result_anchor(
+        &store,
+        &tool_use_id,
+        &child_session_id,
+        "tool-1",
+        "fast-rust",
+        "Delegated result",
+    );
+    store
+        .set_branch_head("main", &tool_use_id, &skill_result_id)
+        .unwrap();
+
+    let graph_output = run_with_backend(
+        session_graph_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let short_id = |id: &str| id.chars().take(8).collect::<String>();
+    assert!(graph_output.contains(&format!("* {} skill_result", short_id(&skill_result_id))));
+    assert!(graph_output.contains(&format!("| * {} session", short_id(&child_session_id))));
+    assert!(graph_output.contains(&format!("* {} tool_use", short_id(&tool_use_id))));
+    assert!(graph_output.contains("|\\"));
+    assert!(graph_output.contains("|/"));
 }
 
 #[tokio::test]

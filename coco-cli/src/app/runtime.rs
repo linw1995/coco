@@ -3,16 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use coco_core::{ConversationEngine, CoreService, FixedBranchResolver, InboundMessage};
 use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::FsStore;
-use snafu::prelude::*;
 
-use super::{prompt::resolve_prompt_input, session::run_session_command};
+use super::{prompt::run_prompt_command, session::run_session_command};
 use crate::{
     Cli, Result,
     cli::{Command, SessionSubcommand},
-    error::CoreSnafu,
 };
 
 pub async fn run_with_services<B, R>(
@@ -20,23 +17,15 @@ pub async fn run_with_services<B, R>(
     reader: &mut R,
     shared_store: &FsStore,
     llm: &Arc<LlmService<B, FsStore>>,
+    forwarded_runtime: bool,
 ) -> Result<Option<String>>
 where
-    B: CompletionBackend,
+    B: CompletionBackend + 'static,
     R: Read,
 {
     match cli.command {
         Command::Prompt(command) => {
-            let input = resolve_prompt_input(&command, reader)?;
-            let service = CoreService::new(
-                FixedBranchResolver::new(command.branch),
-                ConversationEngine::new(llm.clone()),
-            );
-            let response = service
-                .handle_message(InboundMessage::cli("cli", "cli", input))
-                .await
-                .context(CoreSnafu)?;
-            Ok(Some(response.text))
+            run_prompt_command(command, reader, shared_store, llm, forwarded_runtime).await
         }
         Command::Session(command) => run_session_command(command, shared_store, llm).await,
     }
@@ -51,7 +40,7 @@ pub async fn run_forwarded_with_services<B>(
     llm: &Arc<LlmService<B, FsStore>>,
 ) -> CocoCliRuntimeResponse
 where
-    B: CompletionBackend,
+    B: CompletionBackend + 'static,
 {
     let argv = std::iter::once("coco-cli".to_owned())
         .chain(args.iter().cloned())
@@ -78,7 +67,15 @@ where
 
     apply_forwarded_defaults(&mut cli, args, branch_env, store_path_env);
 
-    match run_with_services(cli, &mut std::io::Cursor::new(stdin), shared_store, llm).await {
+    match run_with_services(
+        cli,
+        &mut std::io::Cursor::new(stdin),
+        shared_store,
+        llm,
+        true,
+    )
+    .await
+    {
         Ok(Some(output)) => CocoCliRuntimeResponse {
             exit_code: 0,
             stdout: format!("{output}\n"),
@@ -125,7 +122,11 @@ fn apply_forwarded_defaults(
     let branch = branch_env.to_owned();
 
     match &mut cli.command {
-        Command::Prompt(command) => command.branch = branch,
+        Command::Prompt(command) => {
+            if command.command.is_none() {
+                command.run.branch = branch;
+            }
+        }
         Command::Session(command) => match &mut command.command {
             SessionSubcommand::Create(command) => command.branch = branch,
             SessionSubcommand::Fork(_) => {}

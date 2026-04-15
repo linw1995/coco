@@ -26,9 +26,8 @@ use snafu::prelude::*;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use skill::{
-    BranchHandoff, SkillToolExecutionResult, SkillToolExecutor, SkillToolExecutorError,
-    SkillToolHandoff, SkillToolHandoffRecorder, SkillToolRequest, SkillToolRunResult,
-    WorkflowFailedSnafu,
+    BranchHandoff, ExecutorError, SearchSkillToolRequest, SkillToolExecutionResult,
+    SkillToolExecutor, SkillToolHandoff, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
 };
 
 pub use coco_mem;
@@ -258,7 +257,7 @@ pub struct ResolvedSession {
     pub config: SessionModelConfig,
     pub conversation: Vec<ConversationEntry>,
     pub provider_history: Vec<rig::completion::message::Message>,
-    pub bash_tool_context: BashToolContext,
+    pub tool_runtime_env: ToolRuntimeEnv,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +269,61 @@ pub struct ResolvedCompletionRequest {
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
     trace_node_appender: Option<TraceNodeAppenderHandle>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ToolInvocationContext {
+    pub(crate) persisted_tool_use_node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolExecutionOutcome {
+    ToolResult {
+        provider_output: String,
+    },
+    BranchHandoff {
+        provider_output: String,
+        handoff: SkillToolHandoff,
+    },
+}
+
+impl ToolExecutionOutcome {
+    pub fn tool_result(provider_output: impl Into<String>) -> Self {
+        Self::ToolResult {
+            provider_output: provider_output.into(),
+        }
+    }
+
+    pub fn branch_handoff(provider_output: impl Into<String>, handoff: SkillToolHandoff) -> Self {
+        Self::BranchHandoff {
+            provider_output: provider_output.into(),
+            handoff,
+        }
+    }
+
+    pub fn provider_output(&self) -> &str {
+        match self {
+            Self::ToolResult { provider_output }
+            | Self::BranchHandoff {
+                provider_output, ..
+            } => provider_output,
+        }
+    }
+
+    pub fn into_backend_event(self, tool_id: String) -> BackendEvent {
+        match self {
+            Self::ToolResult { provider_output } => BackendEvent::ToolResult(ToolResult {
+                id: tool_id,
+                output: provider_output,
+            }),
+            Self::BranchHandoff { handoff, .. } => BackendEvent::BranchHandoff(BranchHandoff {
+                tool_id,
+                skill_name: handoff.skill_name,
+                merge_parent: handoff.merge_parent,
+                output: handoff.output,
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -435,11 +489,18 @@ struct UnavailableSkillToolExecutor;
 
 #[async_trait]
 impl SkillToolExecutor for UnavailableSkillToolExecutor {
+    async fn search_skill_tool(
+        &self,
+        _request: SearchSkillToolRequest,
+    ) -> std::result::Result<String, ExecutorError> {
+        Err(ExecutorError::Unavailable)
+    }
+
     async fn execute_skill_tool(
         &self,
-        _request: SkillToolRequest,
-    ) -> std::result::Result<SkillToolExecutionResult, SkillToolExecutorError> {
-        Err(SkillToolExecutorError::ExecutorUnavailable)
+        _request: UseSkillToolRequest,
+    ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
+        Err(ExecutorError::Unavailable)
     }
 }
 
@@ -457,10 +518,17 @@ impl SkillToolExecutorHandle {
         Self::new(Arc::new(UnavailableSkillToolExecutor))
     }
 
+    pub async fn search_skill_tool(
+        &self,
+        request: SearchSkillToolRequest,
+    ) -> std::result::Result<String, ExecutorError> {
+        self.inner.search_skill_tool(request).await
+    }
+
     pub async fn execute_skill_tool(
         &self,
-        request: SkillToolRequest,
-    ) -> std::result::Result<SkillToolExecutionResult, SkillToolExecutorError> {
+        request: UseSkillToolRequest,
+    ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
         self.inner.execute_skill_tool(request).await
     }
 }
@@ -478,23 +546,21 @@ impl Default for SkillToolExecutorHandle {
 }
 
 #[derive(Clone)]
-pub struct BashToolContext {
+pub struct ToolRuntimeEnv {
     pub session_branch: String,
     pub store_path: Option<PathBuf>,
     pub cli_bridge: BashToolCliBridgeHandle,
     pub skill_executor: SkillToolExecutorHandle,
-    pub(crate) skill_handoff_recorder: SkillToolHandoffRecorder,
 }
 
-impl std::fmt::Debug for BashToolContext {
+impl std::fmt::Debug for ToolRuntimeEnv {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("BashToolContext")
+            .debug_struct("ToolRuntimeEnv")
             .field("session_branch", &self.session_branch)
             .field("store_path", &self.store_path)
             .field("cli_bridge", &self.cli_bridge)
             .field("skill_executor", &self.skill_executor)
-            .field("skill_handoff_recorder", &"SkillToolHandoffRecorder(..)")
             .finish()
     }
 }
@@ -517,7 +583,7 @@ pub struct BackendStep {
 pub struct BackendRun {
     pub steps: Vec<BackendStep>,
     pub outcome: BackendOutcome,
-    pub persisted_head_id: Option<String>,
+    pub head: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -540,7 +606,7 @@ impl BackendRun {
         Self {
             steps,
             outcome: BackendOutcome::Succeeded { text: text.into() },
-            persisted_head_id: None,
+            head: None,
         }
     }
 
@@ -560,7 +626,7 @@ impl BackendRun {
             outcome: BackendOutcome::Failed {
                 message: message.into(),
             },
-            persisted_head_id: None,
+            head: None,
         }
     }
 
@@ -574,8 +640,8 @@ impl BackendRun {
         )
     }
 
-    pub fn with_persisted_head_id(mut self, persisted_head_id: Option<String>) -> Self {
-        self.persisted_head_id = persisted_head_id;
+    pub fn with_head(mut self, head: Option<String>) -> Self {
+        self.head = head;
         self
     }
 }
@@ -1101,24 +1167,28 @@ where
                 let BackendRun {
                     steps,
                     outcome,
-                    persisted_head_id,
+                    head,
                 } = run;
                 match outcome {
                     BackendOutcome::Succeeded { text } => {
                         let (last_execution_id, steps) =
                             normalize_backend_steps(steps, Some(text.clone()));
                         let response_node_id = match resolved.trace_node_appender.as_ref() {
-                            Some(trace_node_appender) => persisted_head_id.clone().map_or_else(
-                                || {
-                                    self.persist_backend_steps_with_trace_node_appender(
+                            Some(trace_node_appender) => match head.as_deref() {
+                                Some(head_id) => self
+                                    .validate_terminal_text_with_trace_node_appender(
                                         &resolved.branch,
-                                        &retry_from_node_id,
-                                        trace_node_appender,
-                                        &steps,
-                                    )
-                                },
-                                Ok,
-                            )?,
+                                        &last_execution_id,
+                                        head_id,
+                                        &text,
+                                    )?,
+                                None => self.persist_backend_steps_with_trace_node_appender(
+                                    &resolved.branch,
+                                    &retry_from_node_id,
+                                    trace_node_appender,
+                                    &steps,
+                                )?,
+                            },
                             None => self
                                 .append_backend_steps(retry_from_node_id.clone(), &steps)
                                 .context(MemorySnafu)?,
@@ -1139,7 +1209,7 @@ where
                         let (execution_id, steps) = normalize_backend_steps(steps, None);
                         let error_node_id = match resolved.trace_node_appender.as_ref() {
                             Some(trace_node_appender) => {
-                                persisted_head_id.clone().map_or_else(
+                                head.clone().map_or_else(
                                     || {
                                         self.persist_backend_steps_with_trace_node_appender(
                                             &resolved.branch,
@@ -1316,6 +1386,31 @@ where
             })
     }
 
+    fn validate_terminal_text_with_trace_node_appender(
+        &self,
+        branch: &str,
+        execution_id: &str,
+        head: &str,
+        text: &str,
+    ) -> Result<String> {
+        let node = self.store.get_node(head).context(MemorySnafu)?;
+        if matches!(&node.kind, Kind::Text(last_text) if last_text == text) {
+            return Ok(head.to_owned());
+        }
+
+        Err(BackendSnafu {
+            context: Box::new(BackendFailureContext {
+                branch: branch.to_owned(),
+                execution_id: execution_id.to_owned(),
+                error_node_id: head.to_owned(),
+                retry_from_node_id: head.to_owned(),
+            }),
+        }
+        .into_error(BackendError::failed(format!(
+            "backend returned head {head:?} without terminal assistant text {text:?}"
+        ))))
+    }
+
     fn append_failure_node(
         &self,
         parent_id: String,
@@ -1449,12 +1544,11 @@ where
             },
             conversation,
             provider_history: rig_messages_from_tracked_entries(&tracked_entries),
-            bash_tool_context: BashToolContext {
+            tool_runtime_env: ToolRuntimeEnv {
                 session_branch: branch.to_owned(),
                 store_path: self.store.runtime_store_path(),
                 cli_bridge: self.runtime.bash_tool_cli_bridge.clone(),
                 skill_executor: self.runtime.skill_tool_executor.clone(),
-                skill_handoff_recorder: SkillToolHandoffRecorder::default(),
             },
         })
     }
@@ -1689,46 +1783,103 @@ where
 
 const DEFAULT_AGENT_MAX_TURNS: usize = 100;
 
-fn build_runtime_tool_set(
-    session: &ResolvedSession,
-    workspace_root: std::path::PathBuf,
-) -> std::result::Result<rig::tool::ToolSet, BackendError> {
-    let runtime_tools = session
-        .config
-        .tools
-        .iter()
-        .map(|tool| match tool.name.as_str() {
-            "bash" => Ok(bash_tool::runtime_tool(
-                tool.clone(),
-                workspace_root.clone(),
-                session.bash_tool_context.clone(),
-            )),
-            "search_skill" => Ok(skill_tool::search_runtime_tool(
-                tool.clone(),
-                workspace_root.clone(),
-            )),
-            "use_skill" => Ok(skill_tool::run_runtime_tool(
-                tool.clone(),
-                workspace_root.clone(),
-                session.bash_tool_context.clone(),
-            )),
-            other => Err(BackendError::failed(format!(
-                "unsupported tool {other:?}; only \"bash\", \"search_skill\", and \"use_skill\" are implemented"
-            ))),
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    Ok(rig::tool::ToolSet::from_tools_boxed(runtime_tools))
+struct RuntimeToolSet {
+    definitions: Vec<CompletionToolDefinition>,
+    tools: HashMap<String, RuntimeTool>,
 }
 
-fn build_runtime_tool_set_for_session(
+enum RuntimeTool {
+    Bash(bash_tool::BashToolRuntime),
+    SearchSkill(skill_tool::SkillToolRuntime),
+    UseSkill(skill_tool::SkillToolRuntime),
+}
+
+impl RuntimeTool {
+    fn definition(&self) -> CompletionToolDefinition {
+        match self {
+            Self::Bash(tool) => tool.tool_definition(),
+            Self::SearchSkill(tool) | Self::UseSkill(tool) => tool.tool_definition(),
+        }
+    }
+
+    async fn execute(
+        &self,
+        args: String,
+        invocation: ToolInvocationContext,
+    ) -> std::result::Result<ToolExecutionOutcome, rig::tool::ToolError> {
+        match self {
+            Self::Bash(tool) => tool.execute(args, invocation).await,
+            Self::SearchSkill(tool) | Self::UseSkill(tool) => tool.execute(args, invocation).await,
+        }
+    }
+}
+
+impl RuntimeToolSet {
+    fn definition_list(&self) -> Vec<CompletionToolDefinition> {
+        self.definitions.clone()
+    }
+
+    async fn execute(
+        &self,
+        tool_name: &str,
+        args: String,
+        invocation: ToolInvocationContext,
+    ) -> std::result::Result<ToolExecutionOutcome, BackendError> {
+        let tool = self.tools.get(tool_name).ok_or_else(|| {
+            BackendError::failed(format!("unsupported runtime tool {tool_name:?}"))
+        })?;
+        match tool.execute(args, invocation).await {
+            Ok(outcome) => Ok(outcome),
+            Err(source) => Ok(ToolExecutionOutcome::tool_result(source.to_string())),
+        }
+    }
+}
+
+fn build_runtime_tools(
     session: &ResolvedSession,
-) -> std::result::Result<rig::tool::ToolSet, BackendError> {
+    workspace_root: std::path::PathBuf,
+) -> std::result::Result<RuntimeToolSet, BackendError> {
+    let mut definitions = Vec::with_capacity(session.config.tools.len());
+    let mut tools = HashMap::with_capacity(session.config.tools.len());
+
+    for tool in &session.config.tools {
+        let runtime_tool = match tool.name.as_str() {
+            "bash" => RuntimeTool::Bash(bash_tool::runtime(
+                tool.clone(),
+                workspace_root.clone(),
+                session.tool_runtime_env.clone(),
+            )),
+            "search_skill" => RuntimeTool::SearchSkill(skill_tool::search_runtime(
+                tool.clone(),
+                workspace_root.clone(),
+                session.tool_runtime_env.clone(),
+            )),
+            "use_skill" => RuntimeTool::UseSkill(skill_tool::run_runtime(
+                tool.clone(),
+                workspace_root.clone(),
+                session.tool_runtime_env.clone(),
+            )),
+            other => {
+                return Err(BackendError::failed(format!(
+                    "unsupported tool {other:?}; only \"bash\", \"search_skill\", and \"use_skill\" are implemented"
+                )));
+            }
+        };
+        definitions.push(runtime_tool.definition());
+        tools.insert(tool.name.clone(), runtime_tool);
+    }
+
+    Ok(RuntimeToolSet { definitions, tools })
+}
+
+fn build_runtime_tools_for_session(
+    session: &ResolvedSession,
+) -> std::result::Result<RuntimeToolSet, BackendError> {
     let workspace_root =
         bash_tool::resolve_workspace_root().map_err(|source| BackendError::BashTool {
             message: source.to_string(),
         })?;
-    build_runtime_tool_set(session, workspace_root)
+    build_runtime_tools(session, workspace_root)
 }
 
 fn configure_completion_request_builder<M>(
@@ -2053,9 +2204,10 @@ struct CompletionRunner {
     request: ResolvedCompletionRequest,
     prompt: CompletionMessage,
     history: Vec<CompletionMessage>,
-    toolset: rig::tool::ToolSet,
+    runtime_tools: RuntimeToolSet,
     tool_definitions: Vec<CompletionToolDefinition>,
-    persisted_head_id: Option<String>,
+    head: Option<String>,
+    tool_use_node_ids: HashMap<String, String>,
     steps: Vec<BackendStep>,
     pending_step: Option<BackendStep>,
 }
@@ -2079,20 +2231,18 @@ impl CompletionRunner {
         let Some((prompt, history)) = history.split_last() else {
             return Err(BackendError::failed("completion requires history"));
         };
-        let toolset = build_runtime_tool_set_for_session(&session)?;
-        let tool_definitions = toolset
-            .get_tool_definitions()
-            .await
-            .map_err(|source| BackendError::failed(source.to_string()))?;
+        let runtime_tools = build_runtime_tools_for_session(&session)?;
+        let tool_definitions = runtime_tools.definition_list();
 
         Ok(Self {
             session,
             request,
             prompt: prompt.clone(),
             history: history.to_vec(),
-            toolset,
+            runtime_tools,
             tool_definitions,
-            persisted_head_id: None,
+            head: None,
+            tool_use_node_ids: HashMap::new(),
             steps: vec![],
             pending_step: None,
         })
@@ -2144,8 +2294,17 @@ impl CompletionRunner {
             && !turn.trace_persisted
             && !turn.events.is_empty()
         {
-            let head_id = append_backend_events(trace_node_appender, execution_id, &turn.events)?;
-            self.persisted_head_id = Some(head_id);
+            let mut head_id = None;
+            for event in &turn.events {
+                let node_id =
+                    append_backend_event(trace_node_appender, execution_id, event.clone())?;
+                if let BackendEvent::ToolUse(tool_use) = event {
+                    self.tool_use_node_ids
+                        .insert(tool_use.id.clone(), node_id.clone());
+                }
+                head_id = Some(node_id);
+            }
+            self.head = head_id;
         }
         step_events.extend(turn.events.clone());
         Ok(())
@@ -2157,7 +2316,7 @@ impl CompletionRunner {
             events: state.step_events,
         });
         BackendRun::failed_with_steps(error.to_string(), std::mem::take(&mut self.steps))
-            .with_persisted_head_id(self.persisted_head_id.take())
+            .with_head(self.head.take())
     }
 
     fn complete_terminal_step(
@@ -2168,13 +2327,26 @@ impl CompletionRunner {
         let text = turn.final_text.ok_or_else(|| {
             BackendError::failed("completion response did not include assistant text")
         })?;
+        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref()
+            && !turn.trace_persisted
+            && !matches!(
+                turn.events.last(),
+                Some(BackendEvent::AssistantText(last_text)) if last_text == &text
+            )
+        {
+            self.head = Some(append_backend_event(
+                trace_node_appender,
+                &state.execution_id,
+                BackendEvent::AssistantText(text.clone()),
+            )?);
+        }
         self.steps.push(BackendStep {
             execution_id: state.execution_id,
             events: state.step_events,
         });
         Ok(
             BackendRun::succeeded_with_steps(text, std::mem::take(&mut self.steps))
-                .with_persisted_head_id(self.persisted_head_id.take()),
+                .with_head(self.head.take()),
         )
     }
 
@@ -2184,46 +2356,29 @@ impl CompletionRunner {
         tool_call: CompletionToolCall,
     ) -> std::result::Result<(BackendEvent, rig::completion::message::UserContent), BackendError>
     {
+        let tool_use_node_id = self.tool_use_node_ids.remove(&tool_call.id);
+        if tool_call.function.name == "use_skill" && tool_use_node_id.is_none() {
+            return Err(BackendError::failed(format!(
+                "missing persisted tool_use node for {:?}",
+                tool_call.id
+            )));
+        }
         let args = serde_json::to_string(&tool_call.function.arguments)
             .map_err(|source| BackendError::failed(source.to_string()))?;
-        let output = match self.toolset.call(&tool_call.function.name, args).await {
-            Ok(output) => output,
-            Err(source) => source.to_string(),
-        };
-        let handoff = self
-            .session
-            .bash_tool_context
-            .skill_handoff_recorder
-            .take_next();
-        let event = if tool_call.function.name == "use_skill" {
-            handoff.map_or_else(
-                || {
-                    BackendEvent::ToolResult(ToolResult {
-                        id: tool_call.id.clone(),
-                        output: output.clone(),
-                    })
-                },
-                |handoff| {
-                    BackendEvent::BranchHandoff(BranchHandoff {
-                        tool_id: tool_call.id.clone(),
-                        skill_name: handoff.skill_name,
-                        merge_parent: handoff.merge_parent,
-                        output: handoff.output,
-                    })
+        let outcome = self
+            .runtime_tools
+            .execute(
+                &tool_call.function.name,
+                args,
+                ToolInvocationContext {
+                    persisted_tool_use_node_id: tool_use_node_id,
                 },
             )
-        } else {
-            debug_assert!(
-                handoff.is_none(),
-                "only use_skill should record branch handoff metadata"
-            );
-            BackendEvent::ToolResult(ToolResult {
-                id: tool_call.id.clone(),
-                output: output.clone(),
-            })
-        };
+            .await?;
+        let provider_output = outcome.provider_output().to_owned();
+        let event = outcome.into_backend_event(tool_call.id.clone());
         if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
-            self.persisted_head_id = Some(append_backend_event(
+            self.head = Some(append_backend_event(
                 trace_node_appender,
                 next_execution_id,
                 event.clone(),
@@ -2234,7 +2389,9 @@ impl CompletionRunner {
             event,
             rig::completion::message::UserContent::tool_result(
                 tool_call.id,
-                rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(output)),
+                rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
+                    provider_output,
+                )),
             ),
         ))
     }
@@ -2262,6 +2419,9 @@ impl CompletionRunner {
             execution_id: state.execution_id,
             events: state.step_events,
         });
+        // A use_skill handoff persists the child branch result on the parent branch, but it is
+        // still an intermediate tool outcome. The parent run must continue from that handoff
+        // until it produces its own terminal text or failure.
         self.pending_step = Some(BackendStep {
             execution_id: next_execution_id,
             events: next_events,
@@ -2294,7 +2454,7 @@ impl CompletionRunner {
             format!("MaxTurnError: (reached max turn limit: {DEFAULT_AGENT_MAX_TURNS})"),
             std::mem::take(&mut self.steps),
         )
-        .with_persisted_head_id(self.persisted_head_id.take())
+        .with_head(self.head.take())
     }
 
     async fn run<B>(mut self, backend: &B) -> std::result::Result<BackendRun, BackendError>
@@ -2560,35 +2720,6 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct AnyBranchBackend {
-        calls: RecordedCalls,
-        text: String,
-    }
-
-    impl AnyBranchBackend {
-        fn new(text: &str) -> Self {
-            Self {
-                calls: Arc::new(Mutex::new(vec![])),
-                text: text.to_owned(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl CompletionBackend for AnyBranchBackend {
-        async fn step(
-            &self,
-            ctx: StepContext<'_>,
-        ) -> std::result::Result<BackendTurn, BackendError> {
-            self.calls
-                .lock()
-                .await
-                .push((ctx.session.clone(), ctx.request.clone()));
-            Ok(BackendTurn::finished(self.text.clone()))
-        }
-    }
-
-    #[derive(Clone)]
     struct StreamingBackend {
         calls: RecordedCalls,
     }
@@ -2636,7 +2767,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
 
             let step_two_text = BackendEvent::AssistantText("done".to_owned());
-            let persisted_head_id = Some(append_backend_event(
+            let head = Some(append_backend_event(
                 &trace_node_appender,
                 "execution-step-2",
                 step_two_text.clone(),
@@ -2655,7 +2786,7 @@ mod tests {
                     },
                 ],
             )
-            .with_persisted_head_id(persisted_head_id))
+            .with_head(head))
         }
     }
 
@@ -2690,7 +2821,7 @@ mod tests {
                 }),
                 BackendEvent::AssistantText("trying again".to_owned()),
             ];
-            let persisted_head_id =
+            let head =
                 append_backend_events(&trace_node_appender, "execution-step-2", &step_two_events)?;
 
             Ok(BackendRun::failed_with_steps(
@@ -2706,154 +2837,53 @@ mod tests {
                     },
                 ],
             )
-            .with_persisted_head_id(Some(persisted_head_id)))
+            .with_head(Some(head)))
         }
     }
 
     #[derive(Clone)]
-    struct AlwaysFailBackend {
-        calls: RecordedCalls,
-    }
-
-    impl AlwaysFailBackend {
-        fn new() -> Self {
-            Self {
-                calls: Arc::new(Mutex::new(vec![])),
-            }
-        }
-    }
+    struct StreamingInvalidTerminalTextBackend;
 
     #[async_trait]
-    impl CompletionBackend for AlwaysFailBackend {
-        async fn step(
+    impl CompletionBackend for StreamingInvalidTerminalTextBackend {
+        async fn complete(
             &self,
-            ctx: StepContext<'_>,
-        ) -> std::result::Result<BackendTurn, BackendError> {
-            self.calls
-                .lock()
-                .await
-                .push((ctx.session.clone(), ctx.request.clone()));
-            Err(BackendError::failed("backend failed"))
-        }
-    }
+            _session: ResolvedSession,
+            request: ResolvedCompletionRequest,
+        ) -> std::result::Result<BackendRun, BackendError> {
+            let trace_node_appender = request
+                .trace_node_appender
+                .clone()
+                .expect("streaming backend requires trace node appender");
 
-    #[derive(Clone)]
-    struct FailingDeleteStore {
-        inner: MemoryStore,
-    }
+            let step_one_events = vec![BackendEvent::ToolUse(ToolUse {
+                id: "tool-call-1".to_owned(),
+                name: "bash".to_owned(),
+                input: serde_json::json!({"command": "printf done"}),
+            })];
+            append_backend_events(&trace_node_appender, "execution-step-1", &step_one_events)?;
 
-    impl FailingDeleteStore {
-        fn new() -> Self {
-            Self {
-                inner: MemoryStore::new(),
-            }
-        }
-    }
+            let step_two_events = vec![BackendEvent::ToolResult(ToolResult {
+                id: "tool-call-1".to_owned(),
+                output: "stdout: done".to_owned(),
+            })];
+            let head =
+                append_backend_events(&trace_node_appender, "execution-step-2", &step_two_events)?;
 
-    impl Store for FailingDeleteStore {
-        fn root_id(&self) -> String {
-            self.inner.root_id()
-        }
-
-        fn append(&self, node: NewNode) -> coco_mem::StoreResult<String> {
-            self.inner.append(node)
-        }
-
-        fn fork(&self, name: &str, from_ref: &str) -> coco_mem::StoreResult<String> {
-            self.inner.fork(name, from_ref)
-        }
-
-        fn get_branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {
-            self.inner.get_branch_head(name)
-        }
-
-        fn delete_branch(&self, _name: &str) -> coco_mem::StoreResult<()> {
-            Err(coco_mem::StoreError::CorruptedStore {
-                path: std::path::PathBuf::from("/tmp/use-skill-cleanup"),
-                message: "injected delete failure".to_owned(),
-            })
-        }
-
-        fn set_branch_head(
-            &self,
-            name: &str,
-            expected_old_head: &str,
-            new_head: &str,
-        ) -> coco_mem::StoreResult<()> {
-            self.inner
-                .set_branch_head(name, expected_old_head, new_head)
-        }
-
-        fn ancestry(&self, head_ref: &str) -> coco_mem::StoreResult<Vec<coco_mem::Node>> {
-            self.inner.ancestry(head_ref)
-        }
-
-        fn log(
-            &self,
-            base_ref: &str,
-            head_ref: &str,
-        ) -> coco_mem::StoreResult<Vec<coco_mem::Node>> {
-            self.inner.log(base_ref, head_ref)
-        }
-
-        fn get_node(&self, id: &str) -> coco_mem::StoreResult<coco_mem::Node> {
-            self.inner.get_node(id)
-        }
-
-        fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<coco_mem::Node>> {
-            self.inner.list_children(node_id)
-        }
-
-        fn list_session_states(
-            &self,
-        ) -> coco_mem::StoreResult<HashMap<String, coco_mem::SessionState>> {
-            self.inner.list_session_states()
-        }
-
-        fn get_session_state(&self, name: &str) -> coco_mem::StoreResult<coco_mem::SessionState> {
-            self.inner.get_session_state(name)
-        }
-
-        fn set_session_state(
-            &self,
-            name: &str,
-            expected: Option<&coco_mem::SessionState>,
-            next: coco_mem::SessionState,
-        ) -> coco_mem::StoreResult<coco_mem::SessionState> {
-            self.inner.set_session_state(name, expected, next)
-        }
-
-        fn rebase_session(
-            &self,
-            name: &str,
-            patch: &SessionConfigPatch,
-        ) -> coco_mem::StoreResult<String> {
-            self.inner.rebase_session(name, patch)
-        }
-
-        fn submit_job(&self, branch: &str, base: &str) -> coco_mem::StoreResult<coco_mem::Job> {
-            self.inner.submit_job(branch, base)
-        }
-
-        fn get_job(&self, job_id: &str) -> coco_mem::StoreResult<coco_mem::Job> {
-            self.inner.get_job(job_id)
-        }
-
-        fn list_jobs(&self) -> coco_mem::StoreResult<HashMap<String, coco_mem::Job>> {
-            self.inner.list_jobs()
-        }
-
-        fn set_job_status(
-            &self,
-            job_id: &str,
-            expected: coco_mem::JobStatus,
-            next: coco_mem::JobStatus,
-        ) -> coco_mem::StoreResult<coco_mem::Job> {
-            self.inner.set_job_status(job_id, expected, next)
-        }
-
-        fn runtime_store_path(&self) -> Option<std::path::PathBuf> {
-            self.inner.runtime_store_path()
+            Ok(BackendRun::succeeded_with_steps(
+                "done",
+                vec![
+                    BackendStep {
+                        execution_id: "execution-step-1".to_owned(),
+                        events: step_one_events,
+                    },
+                    BackendStep {
+                        execution_id: "execution-step-2".to_owned(),
+                        events: step_two_events,
+                    },
+                ],
+            )
+            .with_head(Some(head)))
         }
     }
 
@@ -3797,6 +3827,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_rejects_streamed_trace_head_without_terminal_text() {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), StreamingInvalidTerminalTextBackend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let original_head = store.get_branch_head("main").unwrap();
+
+        let error = service
+            .prompt(prompt_request("main", "finish the streamed reply"))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without terminal assistant text")
+        );
+        assert_eq!(store.get_branch_head("main").unwrap(), original_head);
+    }
+
+    #[tokio::test]
     async fn streamed_tool_trace_preserves_event_timestamps() {
         let store = MemoryStore::new();
         let service = LlmService::new(store.clone(), StreamingBackend::new());
@@ -3828,154 +3880,6 @@ mod tests {
                 if id == "tool-call-1" && output == "delegated output"
         ));
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
-    }
-
-    #[tokio::test]
-    async fn use_skill_workflow_executes_on_child_branch_and_prepares_handoff() {
-        let store = MemoryStore::new();
-        let backend = AnyBranchBackend::new("child result");
-        let service = LlmService::new(store.clone(), backend.clone());
-        let base_session = service
-            .create_session(session_config("main"))
-            .await
-            .unwrap();
-
-        let result = service
-            .use_skill_workflow(SkillToolRequest {
-                base_branch: "main".to_owned(),
-                skill_name: "find-skills".to_owned(),
-                skill_description: "Find relevant skills.".to_owned(),
-                skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
-                skill_body: "# Find Skills".to_owned(),
-                task: Some("Search the ecosystem".to_owned()),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.result.text, "child result");
-        assert_eq!(result.handoff.skill_name, "find-skills");
-        assert_eq!(result.handoff.output, "child result");
-
-        let calls = backend.calls.lock().await;
-        assert_eq!(calls.len(), 1);
-        let child_branch = calls[0].1.branch.clone();
-        drop(calls);
-
-        assert!(child_branch.starts_with("main/skill/find-skills-"));
-        let err = store.get_branch_head(&child_branch).unwrap_err();
-        assert!(
-            matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == child_branch)
-        );
-        let err = store.get_session_state(&child_branch).unwrap_err();
-        assert!(
-            matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == child_branch)
-        );
-        let ancestry = store.ancestry(&result.handoff.merge_parent).unwrap();
-        assert!(
-            ancestry
-                .iter()
-                .any(|node| node.id == base_session.anchor_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn use_skill_workflow_deletes_temp_branch_when_workflow_fails() {
-        let store = MemoryStore::new();
-        let backend = AlwaysFailBackend::new();
-        let service = LlmService::new(store.clone(), backend.clone());
-        service
-            .create_session(session_config("main"))
-            .await
-            .unwrap();
-
-        let err = service
-            .use_skill_workflow(SkillToolRequest {
-                base_branch: "main".to_owned(),
-                skill_name: "find-skills".to_owned(),
-                skill_description: "Find relevant skills.".to_owned(),
-                skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
-                skill_body: "# Find Skills".to_owned(),
-                task: None,
-            })
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, Error::Backend { .. }));
-        let calls = backend.calls.lock().await;
-        assert_eq!(calls.len(), 1);
-        let child_branch = calls[0].1.branch.clone();
-        drop(calls);
-
-        let err = store.get_branch_head(&child_branch).unwrap_err();
-        assert!(
-            matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == child_branch)
-        );
-    }
-
-    #[tokio::test]
-    async fn use_skill_workflow_returns_cleanup_error_when_branch_deletion_fails() {
-        let store = FailingDeleteStore::new();
-        let service = LlmService::new(store, AnyBranchBackend::new("child result"));
-        service
-            .create_session(session_config("main"))
-            .await
-            .unwrap();
-
-        let err = service
-            .use_skill_workflow(SkillToolRequest {
-                base_branch: "main".to_owned(),
-                skill_name: "find-skills".to_owned(),
-                skill_description: "Find relevant skills.".to_owned(),
-                skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
-                skill_body: "# Find Skills".to_owned(),
-                task: None,
-            })
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            Error::UseSkillCleanup { branch, .. }
-                if branch.starts_with("main/skill/find-skills-")
-        ));
-    }
-
-    #[tokio::test]
-    async fn use_skill_workflow_reports_cleanup_failure_after_workflow_error() {
-        let store = FailingDeleteStore::new();
-        let service = LlmService::new(store, AlwaysFailBackend::new());
-        service
-            .create_session(session_config("main"))
-            .await
-            .unwrap();
-
-        let err = service
-            .use_skill_workflow(SkillToolRequest {
-                base_branch: "main".to_owned(),
-                skill_name: "find-skills".to_owned(),
-                skill_description: "Find relevant skills.".to_owned(),
-                skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
-                skill_body: "# Find Skills".to_owned(),
-                task: None,
-            })
-            .await
-            .unwrap_err();
-
-        match err {
-            Error::UseSkillWorkflowFailedCleanup {
-                branch,
-                workflow,
-                cleanup,
-            } => {
-                assert!(branch.starts_with("main/skill/find-skills-"));
-                assert!(matches!(*workflow, Error::Backend { .. }));
-                assert!(matches!(
-                    cleanup,
-                    coco_mem::StoreError::CorruptedStore { .. }
-                ));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -4477,12 +4381,11 @@ mod tests {
         let runtime = bash_tool::runtime_tool(
             bash_tool(),
             temp_root.path().to_path_buf(),
-            BashToolContext {
+            ToolRuntimeEnv {
                 session_branch: "main".to_owned(),
                 store_path: None,
                 cli_bridge: BashToolCliBridgeHandle::default(),
                 skill_executor: SkillToolExecutorHandle::default(),
-                skill_handoff_recorder: SkillToolHandoffRecorder::default(),
             },
         );
         let output = with_process_env_async(

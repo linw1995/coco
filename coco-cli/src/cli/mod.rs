@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-pub use prompt::PromptCommand;
+pub use prompt::{
+    PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
+    PromptSubcommand, PromptWorkerCommand,
+};
 #[cfg(test)]
 pub use session::{
     SessionBranchCommand, SessionCloseCommand, SessionFeedbackCommand, SessionForkCommand,

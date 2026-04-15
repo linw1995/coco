@@ -14,15 +14,16 @@ use tokio::process::Command;
 use std::os::unix::ffi::OsStrExt;
 
 use crate::{
-    BashToolContext, COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_STORE_PATH_ENV,
-    CocoCliRuntimeRequest, CocoCliRuntimeResponse,
+    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_STORE_PATH_ENV,
+    CocoCliRuntimeRequest, CocoCliRuntimeResponse, ToolExecutionOutcome, ToolInvocationContext,
+    ToolRuntimeEnv,
 };
 
 #[derive(Debug, Clone)]
-pub struct BashToolRuntime {
+pub(crate) struct BashToolRuntime {
     definition: Tool,
     workspace_root: PathBuf,
-    context: BashToolContext,
+    context: ToolRuntimeEnv,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +40,7 @@ struct BashCommandRequest {
     workspace_root: PathBuf,
     sandbox_mode: BashSandboxMode,
     timeout_ms: Option<u64>,
-    context: BashToolContext,
+    context: ToolRuntimeEnv,
 }
 
 #[derive(Debug)]
@@ -166,17 +167,26 @@ pub fn resolve_workspace_root() -> std::result::Result<PathBuf, BashToolError> {
     Ok(path)
 }
 
-pub fn runtime_tool(
+pub(crate) fn runtime(
     definition: Tool,
     workspace_root: PathBuf,
-    context: BashToolContext,
-) -> Box<dyn rig::tool::ToolDyn> {
+    context: ToolRuntimeEnv,
+) -> BashToolRuntime {
     let workspace_root = canonicalize_existing_path(&workspace_root);
-    Box::new(BashToolRuntime {
+    BashToolRuntime {
         definition,
         workspace_root,
         context,
-    })
+    }
+}
+
+#[cfg(test)]
+pub fn runtime_tool(
+    definition: Tool,
+    workspace_root: PathBuf,
+    context: ToolRuntimeEnv,
+) -> Box<dyn rig::tool::ToolDyn> {
+    Box::new(runtime(definition, workspace_root, context))
 }
 
 fn resolve_sandbox_mode() -> std::result::Result<BashSandboxMode, BashToolError> {
@@ -233,7 +243,7 @@ fn resolve_runtime_root(workspace_root: &Path) -> std::result::Result<PathBuf, B
 fn resolve_bash_request(
     args: &Value,
     workspace_root: &Path,
-    context: BashToolContext,
+    context: ToolRuntimeEnv,
 ) -> std::result::Result<BashCommandRequest, BashToolError> {
     let workspace_root = canonicalize_existing_path(workspace_root);
     let object = args.as_object().context(InvalidInputTypeSnafu)?;
@@ -424,7 +434,7 @@ fn encode_runtime_response(response: &CocoCliRuntimeResponse) -> Vec<u8> {
 
 async fn start_coco_cli_runtime_server(
     workspace_root: &Path,
-    context: &BashToolContext,
+    context: &ToolRuntimeEnv,
 ) -> std::result::Result<Option<CocoCliRuntimeServer>, BashToolError> {
     if !context.cli_bridge.is_available() {
         return Ok(None);
@@ -558,6 +568,37 @@ async fn execute_bash_command(
     ))
 }
 
+impl BashToolRuntime {
+    pub fn tool_definition(&self) -> rig::completion::ToolDefinition {
+        rig::completion::ToolDefinition {
+            name: self.definition.name.clone(),
+            description: self.definition.description.clone(),
+            parameters: self.definition.input_schema.clone(),
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        args: String,
+        _invocation: ToolInvocationContext,
+    ) -> std::result::Result<ToolExecutionOutcome, rig::tool::ToolError> {
+        use rig::tool::ToolError;
+
+        let workspace_root = self.workspace_root.clone();
+        let context = self.context.clone();
+        let result = async {
+            let args: Value = serde_json::from_str(&args).context(ParseArgsSnafu)?;
+            let request = resolve_bash_request(&args, &workspace_root, context)?;
+            execute_bash_command(request).await
+        }
+        .await;
+        match result {
+            Ok(output) => Ok(ToolExecutionOutcome::tool_result(output)),
+            Err(source) => Err(ToolError::ToolCallError(Box::new(source))),
+        }
+    }
+}
+
 impl rig::tool::ToolDyn for BashToolRuntime {
     fn name(&self) -> String {
         self.definition.name.clone()
@@ -567,11 +608,7 @@ impl rig::tool::ToolDyn for BashToolRuntime {
         &'a self,
         _prompt: String,
     ) -> rig::wasm_compat::WasmBoxedFuture<'a, rig::completion::ToolDefinition> {
-        let definition = rig::completion::ToolDefinition {
-            name: self.definition.name.clone(),
-            description: self.definition.description.clone(),
-            parameters: self.definition.input_schema.clone(),
-        };
+        let definition = self.tool_definition();
         Box::pin(async move { definition })
     }
 
@@ -580,20 +617,10 @@ impl rig::tool::ToolDyn for BashToolRuntime {
         args: String,
     ) -> rig::wasm_compat::WasmBoxedFuture<'a, std::result::Result<String, rig::tool::ToolError>>
     {
-        use rig::tool::ToolError;
-
-        let workspace_root = self.workspace_root.clone();
-        let context = self.context.clone();
         Box::pin(async move {
-            let result = async {
-                let args: Value = serde_json::from_str(&args).context(ParseArgsSnafu)?;
-                let request = resolve_bash_request(&args, &workspace_root, context)?;
-                execute_bash_command(request).await
-            }
-            .await;
-            match result {
-                Ok(output) => Ok(output),
-                Err(source) => Err(ToolError::ToolCallError(Box::new(source))),
+            match self.execute(args, ToolInvocationContext::default()).await {
+                Ok(outcome) => Ok(outcome.provider_output().to_owned()),
+                Err(source) => Err(source),
             }
         })
     }
@@ -610,13 +637,12 @@ mod tests {
 
     use super::*;
 
-    fn test_context() -> BashToolContext {
-        BashToolContext {
+    fn test_context() -> ToolRuntimeEnv {
+        ToolRuntimeEnv {
             session_branch: "main".to_owned(),
             store_path: None,
             cli_bridge: crate::BashToolCliBridgeHandle::default(),
             skill_executor: crate::SkillToolExecutorHandle::default(),
-            skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
         }
     }
 
@@ -725,7 +751,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(resolved, std::env::temp_dir().join("coco"));
+        assert_eq!(
+            resolved,
+            canonicalize_existing_path(&std::env::temp_dir()).join("coco")
+        );
     }
 
     #[tokio::test]
@@ -991,12 +1020,11 @@ mod tests {
         let runtime = runtime_tool(
             temp_tool(),
             workspace.path().to_path_buf(),
-            BashToolContext {
+            ToolRuntimeEnv {
                 session_branch: "draft".to_owned(),
                 store_path: None,
                 cli_bridge: crate::BashToolCliBridgeHandle::default(),
                 skill_executor: crate::SkillToolExecutorHandle::default(),
-                skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
             },
         );
 
@@ -1034,20 +1062,27 @@ mod tests {
             requests: requests.clone(),
         }));
         let runtime_store = workspace.path().join("runtime-store");
-        let context = BashToolContext {
+        let context = ToolRuntimeEnv {
             session_branch: "draft".to_owned(),
             store_path: Some(runtime_store.clone()),
             cli_bridge: bridge,
             skill_executor: crate::SkillToolExecutorHandle::default(),
-            skill_handoff_recorder: crate::SkillToolHandoffRecorder::default(),
         };
         let server = crate::with_process_env_async(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],
             || async { start_coco_cli_runtime_server(workspace.path(), &context).await },
         )
-        .await
-        .unwrap()
-        .expect("runtime server should be started");
+        .await;
+        let server = match server {
+            Ok(Some(server)) => server,
+            Ok(None) => panic!("runtime server should be started"),
+            Err(BashToolError::BindRuntimeSocket { source })
+                if source.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return;
+            }
+            Err(error) => panic!("runtime server setup failed: {error}"),
+        };
 
         let request = CocoCliRuntimeRequest {
             args: vec!["prompt".to_owned(), "hello".to_owned()],
