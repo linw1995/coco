@@ -69,6 +69,9 @@ pub enum BashToolError {
     #[snafu(display("failed to resolve runtime root: {source}"))]
     ResolveRuntimeRoot { source: io::Error },
 
+    #[snafu(display("failed to resolve current executable for coco command injection: {source}"))]
+    ResolveCurrentExe { source: io::Error },
+
     #[snafu(display(
         "bash tool sandbox mode must be one of \"auto\", \"nono\", or \"off\", got {value:?}"
     ))]
@@ -124,6 +127,12 @@ pub enum BashToolError {
 
     #[snafu(display("bash tool could not bind coco-cli runtime socket: {source}"))]
     BindRuntimeSocket { source: io::Error },
+
+    #[snafu(display("bash tool could not create coco command shim directory: {source}"))]
+    CreateCocoCommandShimDir { source: io::Error },
+
+    #[snafu(display("bash tool could not create coco command shim at {path:?}: {source}"))]
+    CreateCocoCommandShim { path: PathBuf, source: io::Error },
 
     #[snafu(display(
         "bash tool runtime socket path is too long for a Unix socket: {path:?} ({length} bytes, max {max})"
@@ -315,6 +324,19 @@ struct ExecutionSpec {
     args: Vec<OsString>,
 }
 
+#[derive(Debug)]
+struct CocoCommandPathInjection {
+    root_dir: PathBuf,
+    path_env: OsString,
+    extra_allow_paths: Vec<PathBuf>,
+}
+
+impl Drop for CocoCommandPathInjection {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root_dir);
+    }
+}
+
 fn find_program_in_path(name: &str, path_env: Option<&OsStr>) -> Option<PathBuf> {
     let owned_path_env;
     let path_env = match path_env {
@@ -340,10 +362,76 @@ fn bash_execution_spec(command: &str) -> ExecutionSpec {
     }
 }
 
+fn create_command_alias(target: &Path, alias_path: &Path) -> std::result::Result<(), io::Error> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, alias_path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(target, alias_path).map(|_| ())
+    }
+}
+
+fn prepend_path_entry(path_env: Option<OsString>, entry: &Path) -> OsString {
+    let paths = std::iter::once(entry.to_path_buf())
+        .chain(
+            path_env
+                .as_ref()
+                .into_iter()
+                .flat_map(std::env::split_paths),
+        )
+        .collect::<Vec<_>>();
+    std::env::join_paths(paths).unwrap_or_else(|_| {
+        let mut fallback = entry.as_os_str().to_owned();
+        if let Some(path_env) = path_env {
+            #[cfg(unix)]
+            let separator = ":";
+            #[cfg(windows)]
+            let separator = ";";
+            fallback.push(separator);
+            fallback.push(path_env);
+        }
+        fallback
+    })
+}
+
+fn prepare_coco_command_path_injection(
+    workspace_root: &Path,
+) -> std::result::Result<CocoCommandPathInjection, BashToolError> {
+    let runtime_root = resolve_runtime_root(workspace_root)?;
+    std::fs::create_dir_all(&runtime_root).context(CreateCocoCommandShimDirSnafu)?;
+
+    let root_dir = next_runtime_socket_dir(&runtime_root);
+    let bin_dir = root_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).context(CreateCocoCommandShimDirSnafu)?;
+
+    let current_exe = std::env::current_exe().context(ResolveCurrentExeSnafu)?;
+    let current_exe = canonicalize_existing_path(&current_exe);
+    let alias_path = bin_dir.join("coco");
+    create_command_alias(&current_exe, &alias_path).context(CreateCocoCommandShimSnafu {
+        path: alias_path.clone(),
+    })?;
+
+    let mut extra_allow_paths = vec![bin_dir.clone()];
+    if let Some(parent) = current_exe.parent()
+        && !path_is_within_workspace(parent, workspace_root)
+    {
+        extra_allow_paths.push(parent.to_path_buf());
+    }
+
+    Ok(CocoCommandPathInjection {
+        root_dir,
+        path_env: prepend_path_entry(std::env::var_os("PATH"), &bin_dir),
+        extra_allow_paths,
+    })
+}
+
 fn nono_execution_spec(
     nono: PathBuf,
     request: &BashCommandRequest,
-    extra_allow_path: Option<&Path>,
+    extra_allow_paths: &[PathBuf],
 ) -> ExecutionSpec {
     let mut args = vec![
         OsString::from("run"),
@@ -355,7 +443,7 @@ fn nono_execution_spec(
         args.push(OsString::from("--allow-file"));
         args.push(OsString::from(default_allow_file));
     }
-    if let Some(extra_allow_path) = extra_allow_path {
+    for extra_allow_path in extra_allow_paths {
         args.push(OsString::from("--allow"));
         args.push(extra_allow_path.as_os_str().to_owned());
     }
@@ -374,17 +462,17 @@ fn nono_execution_spec(
 fn resolve_execution_spec(
     request: &BashCommandRequest,
     path_env: Option<&OsStr>,
-    extra_allow_path: Option<&Path>,
+    extra_allow_paths: &[PathBuf],
 ) -> std::result::Result<ExecutionSpec, BashToolError> {
     match request.sandbox_mode {
         BashSandboxMode::Off => Ok(bash_execution_spec(&request.command)),
         BashSandboxMode::Auto => match find_program_in_path("nono", path_env) {
-            Some(nono) => Ok(nono_execution_spec(nono, request, extra_allow_path)),
+            Some(nono) => Ok(nono_execution_spec(nono, request, extra_allow_paths)),
             None => Ok(bash_execution_spec(&request.command)),
         },
         BashSandboxMode::Nono => {
             let nono = find_program_in_path("nono", path_env).context(NonoNotFoundSnafu)?;
-            Ok(nono_execution_spec(nono, request, extra_allow_path))
+            Ok(nono_execution_spec(nono, request, extra_allow_paths))
         }
     }
 }
@@ -505,15 +593,14 @@ impl CocoCliRuntimeServer {
 async fn execute_bash_command(
     request: BashCommandRequest,
 ) -> std::result::Result<String, BashToolError> {
+    let coco_command = prepare_coco_command_path_injection(&request.workspace_root)?;
     let runtime_server =
         start_coco_cli_runtime_server(&request.workspace_root, &request.context).await?;
-    let execution = resolve_execution_spec(
-        &request,
-        None,
-        runtime_server
-            .as_ref()
-            .map(|runtime_server| runtime_server.socket_dir.as_path()),
-    )?;
+    let mut extra_allow_paths = coco_command.extra_allow_paths.clone();
+    if let Some(runtime_server) = &runtime_server {
+        extra_allow_paths.push(runtime_server.socket_dir.clone());
+    }
+    let execution = resolve_execution_spec(&request, None, &extra_allow_paths)?;
     let mut command = Command::new(&execution.program);
     command
         .args(&execution.args)
@@ -524,6 +611,7 @@ async fn execute_bash_command(
         .env_remove(COCO_SESSION_BRANCH_ENV)
         .env_remove(COCO_STORE_PATH_ENV)
         .env_remove(COCO_CLI_RUNTIME_SOCKET_ENV)
+        .env("PATH", &coco_command.path_env)
         .env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch);
     if let Some(store_path) = &request.context.store_path {
         command.env(COCO_STORE_PATH_ENV, store_path);
@@ -798,7 +886,7 @@ mod tests {
             context: test_context(),
         };
         let path_env = OsString::from("/tmp/nono-bin:/tmp/bash-bin");
-        let spec = resolve_execution_spec(&request, Some(path_env.as_os_str()), None);
+        let spec = resolve_execution_spec(&request, Some(path_env.as_os_str()), &[]);
         assert!(matches!(spec, Err(BashToolError::NonoNotFound)));
     }
 
@@ -815,7 +903,7 @@ mod tests {
         };
         let nono = PathBuf::from("/bin/nono");
         let runtime_dir = temp_root.path().join(".coco-runtime").join("socket-dir");
-        let spec = nono_execution_spec(nono.clone(), &request, Some(&runtime_dir));
+        let spec = nono_execution_spec(nono.clone(), &request, std::slice::from_ref(&runtime_dir));
 
         assert_eq!(spec.program, nono);
         let mut expected_args = vec![
@@ -852,7 +940,7 @@ mod tests {
             timeout_ms: None,
             context: test_context(),
         };
-        let spec = nono_execution_spec(PathBuf::from("/bin/nono"), &request, None);
+        let spec = nono_execution_spec(PathBuf::from("/bin/nono"), &request, &[]);
 
         assert!(
             spec.args
@@ -931,6 +1019,29 @@ mod tests {
 
         assert!(output.contains("exit_status: 0"));
         assert!(output.contains("stdout:\nfallback"));
+    }
+
+    #[tokio::test]
+    async fn bash_runtime_injects_coco_command_into_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
+
+        let output = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                runtime
+                    .call(format!(
+                        r#"{{"command":"command -v coco","workdir":"{}"}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("exit_status: 0"));
+        assert!(output.contains("/bin/coco"));
     }
 
     #[tokio::test]
