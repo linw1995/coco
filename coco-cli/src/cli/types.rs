@@ -5,6 +5,7 @@ use coco_llm::Provider;
 pub enum CliProvider {
     Openai,
     Anthropic,
+    Chatgpt,
 }
 
 impl CliProvider {
@@ -12,6 +13,7 @@ impl CliProvider {
         match value {
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
+            "chatgpt" => Some(Self::Chatgpt),
             _ => None,
         }
     }
@@ -22,6 +24,7 @@ impl From<CliProvider> for Provider {
         match value {
             CliProvider::Openai => Provider::OpenAi,
             CliProvider::Anthropic => Provider::Anthropic,
+            CliProvider::Chatgpt => Provider::ChatGpt,
         }
     }
 }

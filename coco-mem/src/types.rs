@@ -10,7 +10,7 @@ pub struct Node {
     pub parent: String,
     pub created_at: Timestamp,
     pub role: Role,
-    pub metadata: Option<NodeMetadata>,
+    pub metadata: Option<BackendMetadata>,
     pub kind: Kind,
 }
 
@@ -18,7 +18,7 @@ pub struct Node {
 pub struct NewNode {
     pub parent: String,
     pub role: Role,
-    pub metadata: Option<NodeMetadata>,
+    pub metadata: Option<BackendMetadata>,
     pub kind: Kind,
 }
 
@@ -130,9 +130,28 @@ pub struct SkillResultAnchor {
     pub output: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct NodeMetadata {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionMetadata {
+    pub execution_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderMetadata {
+    pub call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BackendMetadata {
     pub execution_id: Option<String>,
+    // Provider-specific metadata such as rig's optional call_id should stay at
+    // the metadata boundary instead of leaking into domain payload types.
+    pub call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackendMetadataBuilder {
+    execution_id: Option<String>,
+    call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -244,11 +263,68 @@ impl Job {
     }
 }
 
-impl NodeMetadata {
-    pub fn execution(execution_id: String) -> Self {
-        Self {
-            execution_id: Some(execution_id),
+impl ExecutionMetadata {
+    pub fn new(execution_id: String) -> Self {
+        Self { execution_id }
+    }
+}
+
+impl ProviderMetadata {
+    pub fn new(call_id: Option<String>) -> Self {
+        Self { call_id }
+    }
+}
+
+impl BackendMetadata {
+    pub fn builder() -> BackendMetadataBuilder {
+        BackendMetadataBuilder::default()
+    }
+
+    pub fn from_parts(
+        execution: Option<&ExecutionMetadata>,
+        provider: Option<&ProviderMetadata>,
+    ) -> Option<Self> {
+        Self::builder()
+            .maybe_execution(execution)
+            .maybe_provider(provider)
+            .build()
+    }
+}
+
+impl BackendMetadataBuilder {
+    pub fn execution(mut self, metadata: &ExecutionMetadata) -> Self {
+        self.execution_id = Some(metadata.execution_id.clone());
+        self
+    }
+
+    pub fn maybe_execution(self, metadata: Option<&ExecutionMetadata>) -> Self {
+        match metadata {
+            Some(metadata) => self.execution(metadata),
+            None => self,
         }
+    }
+
+    pub fn provider(mut self, metadata: &ProviderMetadata) -> Self {
+        self.call_id = metadata.call_id.clone();
+        self
+    }
+
+    pub fn maybe_provider(self, metadata: Option<&ProviderMetadata>) -> Self {
+        match metadata {
+            Some(metadata) => self.provider(metadata),
+            None => self,
+        }
+    }
+
+    pub fn build(self) -> Option<BackendMetadata> {
+        if self.execution_id.is_none() && self.call_id.is_none() {
+            return None;
+        }
+
+        Some(BackendMetadata {
+            execution_id: self.execution_id,
+            call_id: self.call_id,
+        })
     }
 }
 
@@ -256,7 +332,7 @@ impl Node {
     pub fn new(
         parent: String,
         role: Role,
-        metadata: Option<NodeMetadata>,
+        metadata: Option<BackendMetadata>,
         kind: Kind,
         created_at: Timestamp,
     ) -> Self {
@@ -281,7 +357,7 @@ impl Node {
 struct NodeHashPayload<'a> {
     parent: &'a str,
     role: &'a Role,
-    metadata: Option<&'a NodeMetadata>,
+    metadata: Option<&'a BackendMetadata>,
     kind: &'a Kind,
     created_at: &'a Timestamp,
 }
@@ -289,7 +365,7 @@ struct NodeHashPayload<'a> {
 fn compute_node_id(
     parent: &str,
     role: &Role,
-    metadata: Option<&NodeMetadata>,
+    metadata: Option<&BackendMetadata>,
     kind: &Kind,
     created_at: &Timestamp,
 ) -> String {
@@ -324,18 +400,15 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchor, Kind, NewNode, Node, NodeMetadata, PauseReason, PromptAnchor, Role, SessionAnchor,
-        SessionAnchorPatch, SessionState, SkillResultAnchor, Tool, ToolResult,
+        Anchor, BackendMetadata, ExecutionMetadata, Kind, NewNode, Node, PauseReason, PromptAnchor,
+        ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch, SessionState, SkillResultAnchor,
+        Tool, ToolResult,
     };
     use jiff::Timestamp;
     use serde_json::json;
 
     fn fixed_timestamp() -> Timestamp {
         "2026-03-25T09:10:11Z".parse().unwrap()
-    }
-
-    fn make_metadata() -> NodeMetadata {
-        NodeMetadata::execution("execution-1".to_owned())
     }
 
     fn make_text_node(parent: &str, text: &str, created_at: Timestamp) -> Node {
@@ -540,14 +613,18 @@ mod tests {
         let left = Node::new(
             "parent".to_owned(),
             Role::User,
-            Some(NodeMetadata::execution("execution-1".to_owned())),
+            BackendMetadata::builder()
+                .execution(&ExecutionMetadata::new("execution-1".to_owned()))
+                .build(),
             Kind::Text("hello".to_owned()),
             fixed_timestamp(),
         );
         let right = Node::new(
             "parent".to_owned(),
             Role::User,
-            Some(NodeMetadata::execution("execution-2".to_owned())),
+            BackendMetadata::builder()
+                .execution(&ExecutionMetadata::new("execution-2".to_owned()))
+                .build(),
             Kind::Text("hello".to_owned()),
             fixed_timestamp(),
         );
@@ -577,7 +654,9 @@ mod tests {
         let node = Node::new(
             "parent".to_owned(),
             Role::LLM,
-            None,
+            BackendMetadata::builder()
+                .provider(&ProviderMetadata::new(Some("call-1".to_owned())))
+                .build(),
             Kind::ToolResult(ToolResult {
                 id: "call-1".to_owned(),
                 output: "ok".to_owned(),
@@ -612,7 +691,9 @@ mod tests {
         let node = NewNode {
             parent: "parent".to_owned(),
             role: Role::System,
-            metadata: Some(NodeMetadata::execution("execution-1".to_owned())),
+            metadata: BackendMetadata::builder()
+                .execution(&ExecutionMetadata::new("execution-1".to_owned()))
+                .build(),
             kind: Kind::Anchor(Anchor::prompt(
                 vec!["merge-a".to_owned(), "merge-b".to_owned()],
                 make_prompt_anchor(),
@@ -706,7 +787,10 @@ mod tests {
         let node = Node::new(
             "parent".to_owned(),
             Role::User,
-            Some(make_metadata()),
+            BackendMetadata::builder()
+                .execution(&ExecutionMetadata::new("execution-1".to_owned()))
+                .provider(&ProviderMetadata::new(Some("call-1".to_owned())))
+                .build(),
             Kind::Text("hello".to_owned()),
             fixed_timestamp(),
         );
@@ -716,6 +800,12 @@ mod tests {
         let metadata = decoded.metadata.expect("expected node metadata");
 
         assert_eq!(metadata.execution_id.as_deref(), Some("execution-1"));
+        assert_eq!(metadata.call_id.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn backend_metadata_builder_returns_none_when_empty() {
+        assert_eq!(BackendMetadata::builder().build(), None);
     }
 
     #[test]

@@ -5,12 +5,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
-    Anchor, JobStatus, Kind, MemoryStore, NewNode, NodeMetadata, PromptAnchor, Role, Store,
-    ToolResult, ToolUse,
+    Anchor, BackendMetadata, ExecutionMetadata, JobStatus, Kind, MemoryStore, NewNode,
+    PromptAnchor, ProviderMetadata, Role, Store, ToolResult, ToolUse,
 };
 use coco_llm::{
-    BackendError, BackendEvent, BackendTurn, CompletionBackend, CompletionMessage, LlmService,
-    Provider, SessionConfig, StepContext,
+    BackendError, BackendEventPayload, BackendTurn, CompletionBackend, CompletionMessage,
+    LlmService, Provider, SessionConfig, StepContext,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
@@ -30,7 +30,10 @@ fn append_use_skill_node<S: Store>(store: &S, parent: &str, skill_name: &str) ->
         .append(NewNode {
             parent: parent.to_owned(),
             role: Role::LLM,
-            metadata: Some(NodeMetadata::execution("execution-use-skill".to_owned())),
+            metadata: BackendMetadata::builder()
+                .execution(&ExecutionMetadata::new("execution-use-skill".to_owned()))
+                .provider(&ProviderMetadata::new(Some("tool-call-1".to_owned())))
+                .build(),
             kind: Kind::ToolUse(ToolUse {
                 id: "tool-call-1".to_owned(),
                 name: "use_skill".to_owned(),
@@ -178,7 +181,7 @@ impl CompletionBackend for MissingFinalTextBackend {
         self.calls.lock().await.push(ctx.request.branch.clone());
         Ok(BackendTurn {
             message: CompletionMessage::assistant("thinking"),
-            events: vec![BackendEvent::AssistantText("thinking".to_owned())],
+            events: vec![BackendEventPayload::AssistantText("thinking".to_owned()).into()],
             tool_calls: vec![],
             final_text: None,
             trace_persisted: false,
@@ -653,7 +656,10 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
         .append(NewNode {
             parent: job.base.clone(),
             role: Role::LLM,
-            metadata: Some(NodeMetadata::execution("execution-step-1".to_owned())),
+            metadata: BackendMetadata::builder()
+                .execution(&ExecutionMetadata::new("execution-step-1".to_owned()))
+                .provider(&ProviderMetadata::new(Some("tool-call-1".to_owned())))
+                .build(),
             kind: Kind::ToolUse(ToolUse {
                 id: "tool-call-1".to_owned(),
                 name: "bash".to_owned(),
@@ -668,7 +674,10 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
         .append(NewNode {
             parent: tool_use_id.clone(),
             role: Role::User,
-            metadata: Some(NodeMetadata::execution("execution-step-2".to_owned())),
+            metadata: BackendMetadata::builder()
+                .execution(&ExecutionMetadata::new("execution-step-2".to_owned()))
+                .provider(&ProviderMetadata::new(Some("tool-call-1".to_owned())))
+                .build(),
             kind: Kind::ToolResult(ToolResult {
                 id: "tool-call-1".to_owned(),
                 output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),

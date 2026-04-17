@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, Kind, MemoryStore, NewNode, NodeMetadata, PauseReason, PromptAnchor,
-    Role, SessionAnchor, SessionState, SkillResultAnchor, Store, StoreError, Tool, ToolResult,
-    ToolUse,
+    Anchor, AnchorPayload, BackendMetadata, ExecutionMetadata, Kind, MemoryStore, NewNode,
+    PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionState,
+    SkillResultAnchor, Store, StoreError, Tool, ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -89,6 +89,7 @@ where
 pub enum Provider {
     OpenAi,
     Anthropic,
+    ChatGpt,
 }
 
 impl Provider {
@@ -96,6 +97,7 @@ impl Provider {
         match self {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
+            Self::ChatGpt => "chatgpt",
         }
     }
 
@@ -103,6 +105,7 @@ impl Provider {
         match value {
             "openai" => Ok(Self::OpenAi),
             "anthropic" => Ok(Self::Anthropic),
+            "chatgpt" => Ok(Self::ChatGpt),
             _ => UnknownProviderSnafu {
                 provider: value.to_owned(),
             }
@@ -234,8 +237,8 @@ pub enum ConversationEntry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct TrackedConversationEntry {
-    execution_id: Option<String>,
+struct ConversationTraceEntry {
+    metadata: Option<BackendMetadata>,
     entry: ConversationEntry,
 }
 
@@ -310,19 +313,23 @@ impl ToolExecutionOutcome {
         }
     }
 
-    pub fn into_backend_event(self, tool_id: String) -> BackendEvent {
-        match self {
-            Self::ToolResult { provider_output } => BackendEvent::ToolResult(ToolResult {
+    pub fn into_backend_event(self, tool_id: String, call_id: Option<String>) -> BackendEvent {
+        let event = match self {
+            Self::ToolResult { provider_output } => BackendEventPayload::ToolResult(ToolResult {
                 id: tool_id,
                 output: provider_output,
             }),
-            Self::BranchHandoff { handoff, .. } => BackendEvent::BranchHandoff(BranchHandoff {
-                tool_id,
-                skill_name: handoff.skill_name,
-                merge_parent: handoff.merge_parent,
-                output: handoff.output,
-            }),
-        }
+            Self::BranchHandoff { handoff, .. } => {
+                BackendEventPayload::BranchHandoff(BranchHandoff {
+                    tool_id,
+                    skill_name: handoff.skill_name,
+                    merge_parent: handoff.merge_parent,
+                    output: handoff.output,
+                })
+            }
+        };
+
+        BackendEvent::new(event).with_metadata(Some(ProviderMetadata::new(call_id)))
     }
 }
 
@@ -342,7 +349,7 @@ trait TraceNodeAppender: Send + Sync {
     fn append(
         &self,
         role: Role,
-        metadata: Option<NodeMetadata>,
+        metadata: Option<BackendMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError>;
 }
@@ -355,7 +362,7 @@ impl TraceNodeAppenderHandle {
     fn append(
         &self,
         role: Role,
-        metadata: Option<NodeMetadata>,
+        metadata: Option<BackendMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError> {
         self.inner.append(role, metadata, kind)
@@ -375,7 +382,7 @@ where
     fn append(
         &self,
         role: Role,
-        metadata: Option<NodeMetadata>,
+        metadata: Option<BackendMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError> {
         let mut head_id = self
@@ -566,7 +573,7 @@ impl std::fmt::Debug for ToolRuntimeEnv {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum BackendEvent {
+pub enum BackendEventPayload {
     AssistantText(String),
     ToolUse(ToolUse),
     ToolResult(ToolResult),
@@ -574,8 +581,34 @@ pub enum BackendEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct BackendEvent {
+    pub metadata: Option<ProviderMetadata>,
+    pub event: BackendEventPayload,
+}
+
+impl BackendEvent {
+    pub fn new(event: BackendEventPayload) -> Self {
+        Self {
+            metadata: None,
+            event,
+        }
+    }
+
+    pub fn with_metadata(mut self, metadata: Option<ProviderMetadata>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+impl From<BackendEventPayload> for BackendEvent {
+    fn from(event: BackendEventPayload) -> Self {
+        Self::new(event)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackendStep {
-    pub execution_id: String,
+    pub execution: ExecutionMetadata,
     pub events: Vec<BackendEvent>,
 }
 
@@ -614,7 +647,7 @@ impl BackendRun {
         Self::succeeded_with_steps(
             text,
             vec![BackendStep {
-                execution_id: format!("execution-{}", nanoid::nanoid!()),
+                execution: ExecutionMetadata::new(format!("execution-{}", nanoid::nanoid!())),
                 events,
             }],
         )
@@ -634,7 +667,7 @@ impl BackendRun {
         Self::failed_with_steps(
             message,
             vec![BackendStep {
-                execution_id: format!("execution-{}", nanoid::nanoid!()),
+                execution: ExecutionMetadata::new(format!("execution-{}", nanoid::nanoid!())),
                 events,
             }],
         )
@@ -652,7 +685,7 @@ impl BackendTurn {
         let text = text.into();
         Self {
             message: CompletionMessage::assistant(text.clone()),
-            events: vec![BackendEvent::AssistantText(text.clone())],
+            events: vec![BackendEventPayload::AssistantText(text.clone()).into()],
             tool_calls: vec![],
             final_text: Some(text),
             trace_persisted: false,
@@ -812,7 +845,7 @@ type Result<T> = std::result::Result<T, Error>;
 struct ResolvedContext {
     active_anchor_id: String,
     session_anchor: SessionAnchor,
-    tail_entries: Vec<TrackedConversationEntry>,
+    tail_entries: Vec<ConversationTraceEntry>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1306,12 +1339,13 @@ where
     fn append_backend_events(
         &self,
         parent_id: String,
-        metadata: &NodeMetadata,
+        execution: &ExecutionMetadata,
         events: &[BackendEvent],
     ) -> std::result::Result<String, StoreError> {
         let mut parent_id = parent_id;
         for event in events {
-            let (role, metadata, kind) = persisted_node_from_backend_event(event.clone(), metadata);
+            let (role, metadata, kind) =
+                persisted_node_from_backend_event(event.clone(), execution);
             parent_id = self.store.append(NewNode {
                 parent: parent_id,
                 role,
@@ -1329,8 +1363,7 @@ where
         steps: &[BackendStep],
     ) -> std::result::Result<String, StoreError> {
         for step in steps {
-            let metadata = NodeMetadata::execution(step.execution_id.clone());
-            parent_id = self.append_backend_events(parent_id, &metadata, &step.events)?;
+            parent_id = self.append_backend_events(parent_id, &step.execution, &step.events)?;
         }
 
         Ok(parent_id)
@@ -1348,11 +1381,11 @@ where
             if step.events.is_empty() {
                 continue;
             }
-            head_id = append_backend_events(trace_node_appender, &step.execution_id, &step.events)
+            head_id = append_backend_events(trace_node_appender, &step.execution, &step.events)
                 .context(BackendSnafu {
                     context: Box::new(BackendFailureContext {
                         branch: branch.to_owned(),
-                        execution_id: step.execution_id.clone(),
+                        execution_id: step.execution.execution_id.clone(),
                         error_node_id: retry_from_node_id.to_owned(),
                         retry_from_node_id: retry_from_node_id.to_owned(),
                     }),
@@ -1373,7 +1406,9 @@ where
         trace_node_appender
             .append(
                 Role::System,
-                Some(NodeMetadata::execution(execution_id.to_owned())),
+                BackendMetadata::builder()
+                    .execution(&ExecutionMetadata::new(execution_id.to_owned()))
+                    .build(),
                 Kind::Failure(message.to_owned()),
             )
             .context(BackendSnafu {
@@ -1421,7 +1456,9 @@ where
             .append(NewNode {
                 parent: parent_id,
                 role: Role::System,
-                metadata: Some(NodeMetadata::execution(execution_id.to_owned())),
+                metadata: BackendMetadata::builder()
+                    .execution(&ExecutionMetadata::new(execution_id.to_owned()))
+                    .build(),
                 kind: Kind::Failure(message.to_owned()),
             })
             .context(MemorySnafu)
@@ -1522,8 +1559,8 @@ where
                 text: context.session_anchor.prompt.clone(),
             });
             conversation.push(entry.clone());
-            tracked_entries.push(TrackedConversationEntry {
-                execution_id: None,
+            tracked_entries.push(ConversationTraceEntry {
+                metadata: None,
                 entry,
             });
         }
@@ -1597,8 +1634,8 @@ where
                     };
 
                     if !prompt_anchor.prompt.is_empty() {
-                        context.tail_entries.push(TrackedConversationEntry {
-                            execution_id: None,
+                        context.tail_entries.push(ConversationTraceEntry {
+                            metadata: None,
                             entry: ConversationEntry::Message(ConversationMessage {
                                 role: MessageRole::User,
                                 text: prompt_anchor.prompt.clone(),
@@ -1615,11 +1652,8 @@ where
                         .fail();
                     };
 
-                    context.tail_entries.push(TrackedConversationEntry {
-                        execution_id: node
-                            .metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.execution_id.clone()),
+                    context.tail_entries.push(ConversationTraceEntry {
+                        metadata: node.metadata.clone(),
                         entry: ConversationEntry::ToolResult(ToolResult {
                             id: skill_result.tool_id.clone(),
                             output: skill_result.output.clone(),
@@ -1639,11 +1673,8 @@ where
                     Role::System => None,
                 };
                 if let Some(role) = role {
-                    context.tail_entries.push(TrackedConversationEntry {
-                        execution_id: node
-                            .metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.execution_id.clone()),
+                    context.tail_entries.push(ConversationTraceEntry {
+                        metadata: node.metadata.clone(),
                         entry: ConversationEntry::Message(ConversationMessage {
                             role,
                             text: text.clone(),
@@ -1655,11 +1686,8 @@ where
                 let Some(context) = state.as_mut() else {
                     return Ok(());
                 };
-                context.tail_entries.push(TrackedConversationEntry {
-                    execution_id: node
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.execution_id.clone()),
+                context.tail_entries.push(ConversationTraceEntry {
+                    metadata: node.metadata.clone(),
                     entry: ConversationEntry::ToolUse(tool_use.clone()),
                 });
             }
@@ -1667,11 +1695,8 @@ where
                 let Some(context) = state.as_mut() else {
                     return Ok(());
                 };
-                context.tail_entries.push(TrackedConversationEntry {
-                    execution_id: node
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.execution_id.clone()),
+                context.tail_entries.push(ConversationTraceEntry {
+                    metadata: node.metadata.clone(),
                     entry: ConversationEntry::ToolResult(tool_result.clone()),
                 });
             }
@@ -1943,23 +1968,55 @@ fn tool_result_message(
     }
 }
 
-fn persisted_node_from_backend_event(
-    event: BackendEvent,
-    metadata: &NodeMetadata,
-) -> (Role, Option<NodeMetadata>, Kind) {
-    match event {
-        BackendEvent::AssistantText(text) => (Role::LLM, Some(metadata.clone()), Kind::Text(text)),
-        BackendEvent::ToolUse(tool_use) => {
-            (Role::LLM, Some(metadata.clone()), Kind::ToolUse(tool_use))
+fn rig_tool_call_content(
+    id: impl Into<String>,
+    call_id: Option<String>,
+    name: impl Into<String>,
+    arguments: serde_json::Value,
+) -> rig::message::AssistantContent {
+    match call_id {
+        Some(call_id) => {
+            rig::message::AssistantContent::tool_call_with_call_id(id, call_id, name, arguments)
         }
-        BackendEvent::ToolResult(tool_result) => (
-            Role::User,
-            Some(metadata.clone()),
-            Kind::ToolResult(tool_result),
-        ),
-        BackendEvent::BranchHandoff(handoff) => (
+        None => rig::message::AssistantContent::tool_call(id, name, arguments),
+    }
+}
+
+fn rig_tool_result_content(
+    id: impl Into<String>,
+    call_id: Option<String>,
+    content: rig::OneOrMany<rig::completion::message::ToolResultContent>,
+) -> rig::completion::message::UserContent {
+    match call_id {
+        Some(call_id) => {
+            rig::completion::message::UserContent::tool_result_with_call_id(id, call_id, content)
+        }
+        None => rig::completion::message::UserContent::tool_result(id, content),
+    }
+}
+
+fn provider_metadata(call_id: Option<String>) -> Option<ProviderMetadata> {
+    Some(ProviderMetadata::new(call_id))
+}
+
+fn persisted_node_from_backend_event(
+    envelope: BackendEvent,
+    execution: &ExecutionMetadata,
+) -> (Role, Option<BackendMetadata>, Kind) {
+    let metadata = BackendMetadata::builder()
+        .execution(execution)
+        .maybe_provider(envelope.metadata.as_ref())
+        .build();
+
+    match envelope.event {
+        BackendEventPayload::AssistantText(text) => (Role::LLM, metadata, Kind::Text(text)),
+        BackendEventPayload::ToolUse(tool_use) => (Role::LLM, metadata, Kind::ToolUse(tool_use)),
+        BackendEventPayload::ToolResult(tool_result) => {
+            (Role::User, metadata, Kind::ToolResult(tool_result))
+        }
+        BackendEventPayload::BranchHandoff(handoff) => (
             Role::System,
-            Some(metadata.clone()),
+            metadata,
             Kind::Anchor(Anchor::skill_result(
                 vec![handoff.merge_parent.clone()],
                 SkillResultAnchor {
@@ -1974,33 +2031,32 @@ fn persisted_node_from_backend_event(
 
 fn append_backend_event(
     trace_node_appender: &TraceNodeAppenderHandle,
-    execution_id: &str,
+    execution: &ExecutionMetadata,
     event: BackendEvent,
 ) -> std::result::Result<String, BackendError> {
-    let metadata = NodeMetadata::execution(execution_id.to_owned());
-    let (role, metadata, kind) = persisted_node_from_backend_event(event, &metadata);
+    let (role, metadata, kind) = persisted_node_from_backend_event(event, execution);
     trace_node_appender.append(role, metadata, kind)
 }
 
 fn append_backend_events(
     trace_node_appender: &TraceNodeAppenderHandle,
-    execution_id: &str,
+    execution: &ExecutionMetadata,
     events: &[BackendEvent],
 ) -> std::result::Result<String, BackendError> {
     let mut events = events.iter();
     let first = events
         .next()
         .expect("append_backend_events requires at least one event");
-    let mut head_id = append_backend_event(trace_node_appender, execution_id, first.clone())?;
+    let mut head_id = append_backend_event(trace_node_appender, execution, first.clone())?;
     for event in events {
-        head_id = append_backend_event(trace_node_appender, execution_id, event.clone())?;
+        head_id = append_backend_event(trace_node_appender, execution, event.clone())?;
     }
 
     Ok(head_id)
 }
 
 fn rig_messages_from_tracked_entries(
-    entries: &[TrackedConversationEntry],
+    entries: &[ConversationTraceEntry],
 ) -> Vec<rig::completion::message::Message> {
     fn flush_assistant_contents(
         messages: &mut Vec<rig::completion::message::Message>,
@@ -2040,6 +2096,10 @@ fn rig_messages_from_tracked_entries(
     let mut tool_result_execution_id = None;
 
     for tracked_entry in entries {
+        let execution_id = tracked_entry
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.execution_id.clone());
         match &tracked_entry.entry {
             ConversationEntry::Message(message) => match message.role {
                 MessageRole::User => {
@@ -2063,16 +2123,14 @@ fn rig_messages_from_tracked_entries(
                         &mut tool_results,
                         &mut tool_result_execution_id,
                     );
-                    if !assistant_contents.is_empty()
-                        && assistant_execution_id != tracked_entry.execution_id
-                    {
+                    if !assistant_contents.is_empty() && assistant_execution_id != execution_id {
                         flush_assistant_contents(
                             &mut messages,
                             &mut assistant_contents,
                             &mut assistant_execution_id,
                         );
                     }
-                    assistant_execution_id = tracked_entry.execution_id.clone();
+                    assistant_execution_id = execution_id.clone();
                     assistant_contents
                         .push(rig::message::AssistantContent::text(message.text.clone()));
                 }
@@ -2083,18 +2141,21 @@ fn rig_messages_from_tracked_entries(
                     &mut tool_results,
                     &mut tool_result_execution_id,
                 );
-                if !assistant_contents.is_empty()
-                    && assistant_execution_id != tracked_entry.execution_id
-                {
+                if !assistant_contents.is_empty() && assistant_execution_id != execution_id {
                     flush_assistant_contents(
                         &mut messages,
                         &mut assistant_contents,
                         &mut assistant_execution_id,
                     );
                 }
-                assistant_execution_id = tracked_entry.execution_id.clone();
-                assistant_contents.push(rig::message::AssistantContent::tool_call(
+                assistant_execution_id = execution_id.clone();
+                let call_id = tracked_entry
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.call_id.clone());
+                assistant_contents.push(rig_tool_call_content(
                     tool_use.id.clone(),
+                    call_id,
                     tool_use.name.clone(),
                     tool_use.input.clone(),
                 ));
@@ -2105,21 +2166,25 @@ fn rig_messages_from_tracked_entries(
                     &mut assistant_contents,
                     &mut assistant_execution_id,
                 );
-                if !tool_results.is_empty()
-                    && tool_result_execution_id != tracked_entry.execution_id
-                {
+                if !tool_results.is_empty() && tool_result_execution_id != execution_id {
                     flush_tool_results(
                         &mut messages,
                         &mut tool_results,
                         &mut tool_result_execution_id,
                     );
                 }
-                tool_result_execution_id = tracked_entry.execution_id.clone();
-                tool_results.push(rig::completion::message::UserContent::tool_result(
+                tool_result_execution_id = execution_id;
+                let content = rig::OneOrMany::one(
+                    rig::completion::message::ToolResultContent::text(tool_result.output.clone()),
+                );
+                let call_id = tracked_entry
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.call_id.clone());
+                tool_results.push(rig_tool_result_content(
                     tool_result.id.clone(),
-                    rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
-                        tool_result.output.clone(),
-                    )),
+                    call_id,
+                    content,
                 ));
             }
         }
@@ -2141,7 +2206,9 @@ fn rig_messages_from_tracked_entries(
 
 fn push_assistant_text_event(buffer: &mut Vec<String>, events: &mut Vec<BackendEvent>) {
     if !buffer.is_empty() {
-        events.push(BackendEvent::AssistantText(buffer.join("\n")));
+        events.push(BackendEvent::new(BackendEventPayload::AssistantText(
+            buffer.join("\n"),
+        )));
         buffer.clear();
     }
 }
@@ -2159,11 +2226,14 @@ fn backend_events_from_choice(
             }
             rig::message::AssistantContent::ToolCall(tool_call) => {
                 push_assistant_text_event(&mut text_buffer, &mut events);
-                events.push(BackendEvent::ToolUse(ToolUse {
-                    id: tool_call.id.clone(),
-                    name: tool_call.function.name.clone(),
-                    input: tool_call.function.arguments.clone(),
-                }));
+                events.push(
+                    BackendEvent::new(BackendEventPayload::ToolUse(ToolUse {
+                        id: tool_call.id.clone(),
+                        name: tool_call.function.name.clone(),
+                        input: tool_call.function.arguments.clone(),
+                    }))
+                    .with_metadata(provider_metadata(tool_call.call_id.clone())),
+                );
             }
             rig::message::AssistantContent::Reasoning(_)
             | rig::message::AssistantContent::Image(_) => {}
@@ -2180,7 +2250,7 @@ fn normalize_backend_steps(
 ) -> (String, Vec<BackendStep>) {
     if steps.is_empty() {
         steps.push(BackendStep {
-            execution_id: format!("execution-{}", nanoid::nanoid!()),
+            execution: ExecutionMetadata::new(format!("execution-{}", nanoid::nanoid!())),
             events: vec![],
         });
     }
@@ -2190,13 +2260,16 @@ fn normalize_backend_steps(
     if let Some(text) = final_text
         && !matches!(
             last_step.events.last(),
-            Some(BackendEvent::AssistantText(last_text)) if last_text == &text
+            Some(last_event)
+                if matches!(&last_event.event, BackendEventPayload::AssistantText(last_text) if last_text == &text)
         )
     {
-        last_step.events.push(BackendEvent::AssistantText(text));
+        last_step
+            .events
+            .push(BackendEventPayload::AssistantText(text).into());
     }
 
-    (last_step.execution_id.clone(), steps)
+    (last_step.execution.execution_id.clone(), steps)
 }
 
 struct CompletionRunner {
@@ -2213,7 +2286,7 @@ struct CompletionRunner {
 }
 
 struct StepState {
-    execution_id: String,
+    execution: ExecutionMetadata,
     step_events: Vec<BackendEvent>,
 }
 
@@ -2264,11 +2337,11 @@ impl CompletionRunner {
 
     fn begin_step(&mut self) -> StepState {
         StepState {
-            execution_id: self
+            execution: self
                 .pending_step
                 .as_ref()
-                .map(|step| step.execution_id.clone())
-                .unwrap_or_else(Self::next_execution_id),
+                .map(|step| step.execution.clone())
+                .unwrap_or_else(|| ExecutionMetadata::new(Self::next_execution_id())),
             step_events: self
                 .pending_step
                 .take()
@@ -2286,7 +2359,7 @@ impl CompletionRunner {
 
     fn record_turn_events(
         &mut self,
-        execution_id: &str,
+        execution: &ExecutionMetadata,
         step_events: &mut Vec<BackendEvent>,
         turn: &BackendTurn,
     ) -> std::result::Result<(), BackendError> {
@@ -2296,9 +2369,8 @@ impl CompletionRunner {
         {
             let mut head_id = None;
             for event in &turn.events {
-                let node_id =
-                    append_backend_event(trace_node_appender, execution_id, event.clone())?;
-                if let BackendEvent::ToolUse(tool_use) = event {
+                let node_id = append_backend_event(trace_node_appender, execution, event.clone())?;
+                if let BackendEventPayload::ToolUse(tool_use) = &event.event {
                     self.tool_use_node_ids
                         .insert(tool_use.id.clone(), node_id.clone());
                 }
@@ -2312,7 +2384,7 @@ impl CompletionRunner {
 
     fn fail_current_run(&mut self, state: StepState, error: BackendError) -> BackendRun {
         self.steps.push(BackendStep {
-            execution_id: state.execution_id,
+            execution: state.execution,
             events: state.step_events,
         });
         BackendRun::failed_with_steps(error.to_string(), std::mem::take(&mut self.steps))
@@ -2331,17 +2403,18 @@ impl CompletionRunner {
             && !turn.trace_persisted
             && !matches!(
                 turn.events.last(),
-                Some(BackendEvent::AssistantText(last_text)) if last_text == &text
+                Some(last_event)
+                    if matches!(&last_event.event, BackendEventPayload::AssistantText(last_text) if last_text == &text)
             )
         {
             self.head = Some(append_backend_event(
                 trace_node_appender,
-                &state.execution_id,
-                BackendEvent::AssistantText(text.clone()),
+                &state.execution,
+                BackendEventPayload::AssistantText(text.clone()).into(),
             )?);
         }
         self.steps.push(BackendStep {
-            execution_id: state.execution_id,
+            execution: state.execution,
             events: state.step_events,
         });
         Ok(
@@ -2352,7 +2425,7 @@ impl CompletionRunner {
 
     async fn execute_tool_call(
         &mut self,
-        next_execution_id: &str,
+        next_execution: &ExecutionMetadata,
         tool_call: CompletionToolCall,
     ) -> std::result::Result<(BackendEvent, rig::completion::message::UserContent), BackendError>
     {
@@ -2376,19 +2449,21 @@ impl CompletionRunner {
             )
             .await?;
         let provider_output = outcome.provider_output().to_owned();
-        let event = outcome.into_backend_event(tool_call.id.clone());
+        let call_id = tool_call.call_id.clone();
+        let event = outcome.into_backend_event(tool_call.id.clone(), call_id.clone());
         if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
             self.head = Some(append_backend_event(
                 trace_node_appender,
-                next_execution_id,
+                next_execution,
                 event.clone(),
             )?);
         }
 
         Ok((
             event,
-            rig::completion::message::UserContent::tool_result(
+            rig_tool_result_content(
                 tool_call.id,
+                call_id,
                 rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
                     provider_output,
                 )),
@@ -2404,26 +2479,24 @@ impl CompletionRunner {
         self.history.push(self.prompt.clone());
         self.history.push(turn.message);
 
-        let next_execution_id = Self::next_execution_id();
+        let next_execution = ExecutionMetadata::new(Self::next_execution_id());
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
         for tool_call in turn.tool_calls {
-            let (event, tool_result) = self
-                .execute_tool_call(&next_execution_id, tool_call)
-                .await?;
+            let (event, tool_result) = self.execute_tool_call(&next_execution, tool_call).await?;
             next_events.push(event);
             tool_results.push(tool_result);
         }
 
         self.steps.push(BackendStep {
-            execution_id: state.execution_id,
+            execution: state.execution,
             events: state.step_events,
         });
         // A use_skill handoff persists the child branch result on the parent branch, but it is
         // still an intermediate tool outcome. The parent run must continue from that handoff
         // until it produces its own terminal text or failure.
         self.pending_step = Some(BackendStep {
-            execution_id: next_execution_id,
+            execution: next_execution,
             events: next_events,
         });
         self.prompt = tool_result_message(tool_results);
@@ -2468,7 +2541,7 @@ impl CompletionRunner {
                 Err(source) => return Ok(self.fail_current_run(state, source)),
             };
 
-            self.record_turn_events(&state.execution_id, &mut state.step_events, &turn)?;
+            self.record_turn_events(&state.execution, &mut state.step_events, &turn)?;
 
             match self.finish_step(state, turn).await? {
                 RunControl::Continue => {}
@@ -2506,39 +2579,59 @@ where
     ))
 }
 
+fn resolve_provider_api_key(
+    provider: Provider,
+    provider_env: &'static str,
+) -> std::result::Result<String, BackendError> {
+    let generic = std::env::var("COCO_API_KEY").ok();
+    let provider_specific = std::env::var(provider_env).ok();
+
+    generic.or(provider_specific).ok_or_else(|| {
+        BackendError::failed(format!(
+            "missing API key for provider {}",
+            provider.as_str()
+        ))
+    })
+}
+
+fn resolve_chatgpt_auth() -> std::result::Result<rig::providers::chatgpt::ChatGPTAuth, BackendError>
+{
+    if std::env::var_os("COCO_API_KEY").is_some() {
+        return Err(BackendError::failed(
+            "COCO_API_KEY must not be set when provider is chatgpt",
+        ));
+    }
+
+    match std::env::var("CHATGPT_ACCESS_TOKEN").ok() {
+        Some(access_token) => Ok(rig::providers::chatgpt::ChatGPTAuth::AccessToken {
+            access_token,
+            account_id: std::env::var("CHATGPT_ACCOUNT_ID").ok(),
+        }),
+        None => Ok(rig::providers::chatgpt::ChatGPTAuth::OAuth),
+    }
+}
+
+fn resolve_base_url(provider: Provider) -> Option<String> {
+    std::env::var("COCO_BASE_URL")
+        .ok()
+        .or_else(|| match provider {
+            Provider::OpenAi => std::env::var("OPENAI_BASE_URL").ok(),
+            Provider::Anthropic => None,
+            Provider::ChatGpt => std::env::var("CHATGPT_API_BASE")
+                .ok()
+                .or_else(|| std::env::var("OPENAI_CHATGPT_API_BASE").ok()),
+        })
+}
+
 #[async_trait]
 impl CompletionBackend for RigBackend {
     async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
         use rig::client::CompletionClient;
-        use rig::providers::{anthropic, openai};
-
-        fn resolve_api_key(provider: Provider) -> std::result::Result<String, BackendError> {
-            let generic = std::env::var("COCO_API_KEY").ok();
-            let provider_specific = match provider {
-                Provider::OpenAi => std::env::var("OPENAI_API_KEY").ok(),
-                Provider::Anthropic => std::env::var("ANTHROPIC_API_KEY").ok(),
-            };
-
-            generic.or(provider_specific).ok_or_else(|| {
-                BackendError::failed(format!(
-                    "missing API key for provider {}",
-                    provider.as_str()
-                ))
-            })
-        }
-
-        fn resolve_base_url(provider: Provider) -> Option<String> {
-            std::env::var("COCO_BASE_URL")
-                .ok()
-                .or_else(|| match provider {
-                    Provider::OpenAi => std::env::var("OPENAI_BASE_URL").ok(),
-                    Provider::Anthropic => None,
-                })
-        }
+        use rig::providers::{anthropic, chatgpt, openai};
 
         match ctx.request.provider {
             Provider::OpenAi => {
-                let api_key = resolve_api_key(ctx.request.provider)?;
+                let api_key = resolve_provider_api_key(ctx.request.provider, "OPENAI_API_KEY")?;
                 let mut builder = openai::Client::builder().api_key(&api_key);
                 if let Some(base_url) = resolve_base_url(ctx.request.provider) {
                     builder = builder.base_url(&base_url);
@@ -2549,10 +2642,20 @@ impl CompletionBackend for RigBackend {
                 send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
             }
             Provider::Anthropic => {
-                let api_key = resolve_api_key(ctx.request.provider)?;
+                let api_key = resolve_provider_api_key(ctx.request.provider, "ANTHROPIC_API_KEY")?;
                 let mut builder = anthropic::Client::builder().api_key(api_key);
                 if let Some(base_url) = resolve_base_url(ctx.request.provider) {
                     builder = builder.base_url(&base_url);
+                }
+                let client = builder
+                    .build()
+                    .map_err(|source| BackendError::failed(source.to_string()))?;
+                send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
+            }
+            Provider::ChatGpt => {
+                let mut builder = chatgpt::Client::builder().api_key(resolve_chatgpt_auth()?);
+                if let Some(base_url) = resolve_base_url(ctx.request.provider) {
+                    builder = builder.base_url(base_url);
                 }
                 let client = builder
                     .build()
@@ -2745,31 +2848,44 @@ mod tests {
                 .clone()
                 .expect("streaming backend requires trace node appender");
 
-            let step_one_events = vec![BackendEvent::ToolUse(ToolUse {
-                id: "tool-call-1".to_owned(),
-                name: "use_skill".to_owned(),
-                input: serde_json::json!({"name": "find-skills"}),
-            })];
-            append_backend_events(&trace_node_appender, "execution-step-1", &step_one_events)?;
+            let step_one_events = vec![backend_event(
+                BackendEventPayload::ToolUse(ToolUse {
+                    id: "tool-call-1".to_owned(),
+                    name: "use_skill".to_owned(),
+                    input: serde_json::json!({"name": "find-skills"}),
+                }),
+                Some("execution-step-1"),
+                Some("tool-call-1"),
+            )];
+            append_backend_events(
+                &trace_node_appender,
+                &execution("execution-step-1"),
+                &step_one_events,
+            )?;
 
             tokio::time::sleep(Duration::from_millis(5)).await;
 
-            let step_two_result = BackendEvent::ToolResult(ToolResult {
-                id: "tool-call-1".to_owned(),
-                output: "delegated output".to_owned(),
-            });
+            let step_two_result = backend_event(
+                BackendEventPayload::ToolResult(ToolResult {
+                    id: "tool-call-1".to_owned(),
+                    output: "delegated output".to_owned(),
+                }),
+                Some("execution-step-2"),
+                Some("tool-call-1"),
+            );
             append_backend_event(
                 &trace_node_appender,
-                "execution-step-2",
+                &execution("execution-step-2"),
                 step_two_result.clone(),
             )?;
 
             tokio::time::sleep(Duration::from_millis(5)).await;
 
-            let step_two_text = BackendEvent::AssistantText("done".to_owned());
+            let step_two_text: BackendEvent =
+                BackendEventPayload::AssistantText("done".to_owned()).into();
             let head = Some(append_backend_event(
                 &trace_node_appender,
-                "execution-step-2",
+                &execution("execution-step-2"),
                 step_two_text.clone(),
             )?);
 
@@ -2777,11 +2893,11 @@ mod tests {
                 "done",
                 vec![
                     BackendStep {
-                        execution_id: "execution-step-1".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-1".to_owned()),
                         events: step_one_events,
                     },
                     BackendStep {
-                        execution_id: "execution-step-2".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-2".to_owned()),
                         events: vec![step_two_result, step_two_text],
                     },
                 ],
@@ -2805,34 +2921,49 @@ mod tests {
                 .clone()
                 .expect("streaming backend requires trace node appender");
 
-            let step_one_events = vec![BackendEvent::ToolUse(ToolUse {
-                id: "tool-call-1".to_owned(),
-                name: "bash".to_owned(),
-                input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
-            })];
-            append_backend_events(&trace_node_appender, "execution-step-1", &step_one_events)?;
+            let step_one_events = vec![backend_event(
+                BackendEventPayload::ToolUse(ToolUse {
+                    id: "tool-call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
+                }),
+                Some("execution-step-1"),
+                Some("tool-call-1"),
+            )];
+            append_backend_events(
+                &trace_node_appender,
+                &execution("execution-step-1"),
+                &step_one_events,
+            )?;
 
             tokio::time::sleep(Duration::from_millis(5)).await;
 
             let step_two_events = vec![
-                BackendEvent::ToolResult(ToolResult {
-                    id: "tool-call-1".to_owned(),
-                    output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
-                }),
-                BackendEvent::AssistantText("trying again".to_owned()),
+                backend_event(
+                    BackendEventPayload::ToolResult(ToolResult {
+                        id: "tool-call-1".to_owned(),
+                        output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
+                    }),
+                    Some("execution-step-2"),
+                    Some("tool-call-1"),
+                ),
+                BackendEventPayload::AssistantText("trying again".to_owned()).into(),
             ];
-            let head =
-                append_backend_events(&trace_node_appender, "execution-step-2", &step_two_events)?;
+            let head = append_backend_events(
+                &trace_node_appender,
+                &execution("execution-step-2"),
+                &step_two_events,
+            )?;
 
             Ok(BackendRun::failed_with_steps(
                 "MaxTurnError: (reached max turn limit: 8)",
                 vec![
                     BackendStep {
-                        execution_id: "execution-step-1".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-1".to_owned()),
                         events: step_one_events,
                     },
                     BackendStep {
-                        execution_id: "execution-step-2".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-2".to_owned()),
                         events: step_two_events,
                     },
                 ],
@@ -2856,29 +2987,44 @@ mod tests {
                 .clone()
                 .expect("streaming backend requires trace node appender");
 
-            let step_one_events = vec![BackendEvent::ToolUse(ToolUse {
-                id: "tool-call-1".to_owned(),
-                name: "bash".to_owned(),
-                input: serde_json::json!({"command": "printf done"}),
-            })];
-            append_backend_events(&trace_node_appender, "execution-step-1", &step_one_events)?;
+            let step_one_events = vec![backend_event(
+                BackendEventPayload::ToolUse(ToolUse {
+                    id: "tool-call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    input: serde_json::json!({"command": "printf done"}),
+                }),
+                Some("execution-step-1"),
+                Some("tool-call-1"),
+            )];
+            append_backend_events(
+                &trace_node_appender,
+                &execution("execution-step-1"),
+                &step_one_events,
+            )?;
 
-            let step_two_events = vec![BackendEvent::ToolResult(ToolResult {
-                id: "tool-call-1".to_owned(),
-                output: "stdout: done".to_owned(),
-            })];
-            let head =
-                append_backend_events(&trace_node_appender, "execution-step-2", &step_two_events)?;
+            let step_two_events = vec![backend_event(
+                BackendEventPayload::ToolResult(ToolResult {
+                    id: "tool-call-1".to_owned(),
+                    output: "stdout: done".to_owned(),
+                }),
+                Some("execution-step-2"),
+                Some("tool-call-1"),
+            )];
+            let head = append_backend_events(
+                &trace_node_appender,
+                &execution("execution-step-2"),
+                &step_two_events,
+            )?;
 
             Ok(BackendRun::succeeded_with_steps(
                 "done",
                 vec![
                     BackendStep {
-                        execution_id: "execution-step-1".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-1".to_owned()),
                         events: step_one_events,
                     },
                     BackendStep {
-                        execution_id: "execution-step-2".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-2".to_owned()),
                         events: step_two_events,
                     },
                 ],
@@ -2944,6 +3090,120 @@ mod tests {
                 ConversationEntry::ToolUse(_) | ConversationEntry::ToolResult(_) => None,
             })
             .collect()
+    }
+
+    fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<BackendMetadata> {
+        let execution =
+            execution_id.map(|execution_id| ExecutionMetadata::new(execution_id.to_owned()));
+        let provider = call_id.map(|call_id| ProviderMetadata::new(Some(call_id.to_owned())));
+
+        BackendMetadata::builder()
+            .maybe_execution(execution.as_ref())
+            .maybe_provider(provider.as_ref())
+            .build()
+    }
+
+    fn execution(execution_id: &str) -> ExecutionMetadata {
+        ExecutionMetadata::new(execution_id.to_owned())
+    }
+
+    fn backend_event(
+        event: BackendEventPayload,
+        _execution_id: Option<&str>,
+        call_id: Option<&str>,
+    ) -> BackendEvent {
+        BackendEvent::new(event)
+            .with_metadata(call_id.map(|call_id| ProviderMetadata::new(Some(call_id.to_owned()))))
+    }
+
+    #[test]
+    fn provider_parse_accepts_chatgpt() {
+        assert_eq!(Provider::parse("chatgpt").unwrap(), Provider::ChatGpt);
+        assert_eq!(Provider::ChatGpt.as_str(), "chatgpt");
+    }
+
+    #[tokio::test]
+    async fn resolve_chatgpt_auth_uses_access_token_when_configured() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", None),
+                ("CHATGPT_ACCESS_TOKEN", Some(OsStr::new("chatgpt-token"))),
+                ("CHATGPT_ACCOUNT_ID", Some(OsStr::new("acct-123"))),
+            ],
+            || async {
+                match resolve_chatgpt_auth().unwrap() {
+                    rig::providers::chatgpt::ChatGPTAuth::AccessToken {
+                        access_token,
+                        account_id,
+                    } => {
+                        assert_eq!(access_token, "chatgpt-token");
+                        assert_eq!(account_id.as_deref(), Some("acct-123"));
+                    }
+                    rig::providers::chatgpt::ChatGPTAuth::OAuth => {
+                        panic!("expected access token auth")
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_chatgpt_auth_defaults_to_oauth_without_token() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", None),
+                ("CHATGPT_ACCESS_TOKEN", None),
+                ("CHATGPT_ACCOUNT_ID", None),
+            ],
+            || async {
+                assert!(matches!(
+                    resolve_chatgpt_auth().unwrap(),
+                    rig::providers::chatgpt::ChatGPTAuth::OAuth
+                ));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_chatgpt_auth_rejects_coco_api_key() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", Some(OsStr::new("generic-key"))),
+                ("CHATGPT_ACCESS_TOKEN", None),
+                ("CHATGPT_ACCOUNT_ID", None),
+            ],
+            || async {
+                let error = resolve_chatgpt_auth().unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "COCO_API_KEY must not be set when provider is chatgpt"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_base_url_reads_chatgpt_specific_env() {
+        with_process_env_async(
+            &[
+                ("COCO_BASE_URL", None),
+                (
+                    "CHATGPT_API_BASE",
+                    Some(OsStr::new("https://chatgpt.example.test")),
+                ),
+                ("OPENAI_CHATGPT_API_BASE", None),
+            ],
+            || async {
+                assert_eq!(
+                    resolve_base_url(Provider::ChatGpt).as_deref(),
+                    Some("https://chatgpt.example.test")
+                );
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3281,7 +3541,7 @@ mod tests {
                 Ok(BackendRun::failed("rate limited", vec![])),
                 Ok(BackendRun::succeeded(
                     "recovered",
-                    vec![BackendEvent::AssistantText("recovered".to_owned())],
+                    vec![BackendEventPayload::AssistantText("recovered".to_owned()).into()],
                 )),
             ],
         )]);
@@ -3753,21 +4013,29 @@ mod tests {
                 "done",
                 vec![
                     BackendStep {
-                        execution_id: "execution-step-1".to_owned(),
-                        events: vec![BackendEvent::ToolUse(ToolUse {
-                            id: "tool-call-1".to_owned(),
-                            name: "bash".to_owned(),
-                            input: serde_json::json!({"command": "rg --files"}),
-                        })],
+                        execution: ExecutionMetadata::new("execution-step-1".to_owned()),
+                        events: vec![backend_event(
+                            BackendEventPayload::ToolUse(ToolUse {
+                                id: "tool-call-1".to_owned(),
+                                name: "bash".to_owned(),
+                                input: serde_json::json!({"command": "rg --files"}),
+                            }),
+                            Some("execution-step-1"),
+                            Some("tool-call-1"),
+                        )],
                     },
                     BackendStep {
-                        execution_id: "execution-step-2".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-2".to_owned()),
                         events: vec![
-                            BackendEvent::ToolResult(ToolResult {
-                                id: "tool-call-1".to_owned(),
-                                output: "Cargo.toml".to_owned(),
-                            }),
-                            BackendEvent::AssistantText("done".to_owned()),
+                            backend_event(
+                                BackendEventPayload::ToolResult(ToolResult {
+                                    id: "tool-call-1".to_owned(),
+                                    output: "Cargo.toml".to_owned(),
+                                }),
+                                Some("execution-step-2"),
+                                Some("tool-call-1"),
+                            ),
+                            BackendEventPayload::AssistantText("done".to_owned()).into(),
                         ],
                     },
                 ],
@@ -3799,7 +4067,7 @@ mod tests {
         assert_eq!(tool_result.role, Role::User);
         assert!(matches!(
             &tool_result.kind,
-            Kind::ToolResult(ToolResult { id, output })
+            Kind::ToolResult(ToolResult { id, output, .. })
                 if id == "tool-call-1" && output == "Cargo.toml"
         ));
         assert_eq!(
@@ -3815,7 +4083,7 @@ mod tests {
         assert_eq!(tool_use.role, Role::LLM);
         assert!(matches!(
             &tool_use.kind,
-            Kind::ToolUse(ToolUse { id, name, input })
+            Kind::ToolUse(ToolUse { id, name, input, .. })
                 if id == "tool-call-1"
                     && name == "bash"
                     && input == &serde_json::json!({"command": "rg --files"})
@@ -3876,7 +4144,7 @@ mod tests {
         ));
         assert!(matches!(
             &tool_result.kind,
-            Kind::ToolResult(ToolResult { id, output })
+            Kind::ToolResult(ToolResult { id, output, .. })
                 if id == "tool-call-1" && output == "delegated output"
         ));
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
@@ -3908,15 +4176,19 @@ mod tests {
             &[Ok(BackendRun::succeeded_with_steps(
                 "base done",
                 vec![BackendStep {
-                    execution_id: "execution-step-1".to_owned(),
+                    execution: ExecutionMetadata::new("execution-step-1".to_owned()),
                     events: vec![
-                        BackendEvent::BranchHandoff(BranchHandoff {
-                            tool_id: "tool-call-1".to_owned(),
-                            skill_name: "find-skills".to_owned(),
-                            merge_parent: draft_head.clone(),
-                            output: "Skill handoff".to_owned(),
-                        }),
-                        BackendEvent::AssistantText("base done".to_owned()),
+                        backend_event(
+                            BackendEventPayload::BranchHandoff(BranchHandoff {
+                                tool_id: "tool-call-1".to_owned(),
+                                skill_name: "find-skills".to_owned(),
+                                merge_parent: draft_head.clone(),
+                                output: "Skill handoff".to_owned(),
+                            }),
+                            Some("execution-step-1"),
+                            Some("tool-call-1"),
+                        ),
+                        BackendEventPayload::AssistantText("base done".to_owned()).into(),
                     ],
                 }],
             ))],
@@ -3965,21 +4237,29 @@ mod tests {
                 "done",
                 vec![
                     BackendStep {
-                        execution_id: "execution-step-1".to_owned(),
-                        events: vec![BackendEvent::ToolUse(ToolUse {
-                            id: "tool-call-1".to_owned(),
-                            name: "bash".to_owned(),
-                            input: serde_json::json!({"command": "rg --files"}),
-                        })],
+                        execution: ExecutionMetadata::new("execution-step-1".to_owned()),
+                        events: vec![backend_event(
+                            BackendEventPayload::ToolUse(ToolUse {
+                                id: "tool-call-1".to_owned(),
+                                name: "bash".to_owned(),
+                                input: serde_json::json!({"command": "rg --files"}),
+                            }),
+                            Some("execution-step-1"),
+                            Some("tool-call-1"),
+                        )],
                     },
                     BackendStep {
-                        execution_id: "execution-step-2".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-2".to_owned()),
                         events: vec![
-                            BackendEvent::ToolResult(ToolResult {
-                                id: "tool-call-1".to_owned(),
-                                output: "Cargo.toml".to_owned(),
-                            }),
-                            BackendEvent::AssistantText("done".to_owned()),
+                            backend_event(
+                                BackendEventPayload::ToolResult(ToolResult {
+                                    id: "tool-call-1".to_owned(),
+                                    output: "Cargo.toml".to_owned(),
+                                }),
+                                Some("execution-step-2"),
+                                Some("tool-call-1"),
+                            ),
+                            BackendEventPayload::AssistantText("done".to_owned()).into(),
                         ],
                     },
                 ],
@@ -4044,52 +4324,52 @@ mod tests {
     #[test]
     fn rig_messages_from_entries_groups_tool_calls_and_results_by_turn() {
         let messages = rig_messages_from_tracked_entries(&[
-            TrackedConversationEntry {
-                execution_id: None,
+            ConversationTraceEntry {
+                metadata: None,
                 entry: ConversationEntry::Message(ConversationMessage {
                     role: MessageRole::User,
                     text: "list files".to_owned(),
                 }),
             },
-            TrackedConversationEntry {
-                execution_id: Some("execution-1".to_owned()),
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-1"), None),
                 entry: ConversationEntry::Message(ConversationMessage {
                     role: MessageRole::Assistant,
                     text: "checking".to_owned(),
                 }),
             },
-            TrackedConversationEntry {
-                execution_id: Some("execution-1".to_owned()),
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-1"), Some("call-1")),
                 entry: ConversationEntry::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
                     name: "bash".to_owned(),
                     input: serde_json::json!({"command": "ls"}),
                 }),
             },
-            TrackedConversationEntry {
-                execution_id: Some("execution-1".to_owned()),
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-1"), Some("call-2")),
                 entry: ConversationEntry::ToolUse(ToolUse {
                     id: "tool-call-2".to_owned(),
                     name: "bash".to_owned(),
                     input: serde_json::json!({"command": "pwd"}),
                 }),
             },
-            TrackedConversationEntry {
-                execution_id: Some("execution-1".to_owned()),
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-1"), Some("call-1")),
                 entry: ConversationEntry::ToolResult(ToolResult {
                     id: "tool-call-1".to_owned(),
                     output: "Cargo.toml".to_owned(),
                 }),
             },
-            TrackedConversationEntry {
-                execution_id: Some("execution-1".to_owned()),
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-1"), Some("call-2")),
                 entry: ConversationEntry::ToolResult(ToolResult {
                     id: "tool-call-2".to_owned(),
                     output: "/tmp".to_owned(),
                 }),
             },
-            TrackedConversationEntry {
-                execution_id: Some("execution-2".to_owned()),
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-2"), None),
                 entry: ConversationEntry::Message(ConversationMessage {
                     role: MessageRole::Assistant,
                     text: "done".to_owned(),
@@ -4121,11 +4401,13 @@ mod tests {
                         items[1],
                         rig::completion::message::AssistantContent::ToolCall(tool_call)
                             if tool_call.id == "tool-call-1"
+                                && tool_call.call_id.as_deref() == Some("call-1")
                     )
                     && matches!(
                         items[2],
                         rig::completion::message::AssistantContent::ToolCall(tool_call)
                             if tool_call.id == "tool-call-2"
+                                && tool_call.call_id.as_deref() == Some("call-2")
                     )
                 }
         ));
@@ -4139,11 +4421,13 @@ mod tests {
                         items[0],
                         rig::completion::message::UserContent::ToolResult(tool_result)
                             if tool_result.id == "tool-call-1"
+                                && tool_result.call_id.as_deref() == Some("call-1")
                     )
                     && matches!(
                         items[1],
                         rig::completion::message::UserContent::ToolResult(tool_result)
                             if tool_result.id == "tool-call-2"
+                                && tool_result.call_id.as_deref() == Some("call-2")
                     )
                 }
         ));
@@ -4157,6 +4441,126 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rig_messages_from_entries_preserves_call_id() {
+        let messages = rig_messages_from_tracked_entries(&[
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-1"), Some("call-legacy")),
+                entry: ConversationEntry::ToolUse(ToolUse {
+                    id: "tool-call-legacy".to_owned(),
+                    name: "bash".to_owned(),
+                    input: serde_json::json!({"command": "pwd"}),
+                }),
+            },
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-1"), Some("call-legacy")),
+                entry: ConversationEntry::ToolResult(ToolResult {
+                    id: "tool-call-legacy".to_owned(),
+                    output: "/tmp".to_owned(),
+                }),
+            },
+        ]);
+
+        assert!(matches!(
+            &messages[0],
+            rig::completion::message::Message::Assistant { content, .. }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::AssistantContent::ToolCall(tool_call)
+                        if tool_call.id == "tool-call-legacy"
+                            && tool_call.call_id.as_deref() == Some("call-legacy")
+                )
+        ));
+        assert!(matches!(
+            &messages[1],
+            rig::completion::message::Message::User { content }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::UserContent::ToolResult(tool_result)
+                        if tool_result.id == "tool-call-legacy"
+                            && tool_result.call_id.as_deref() == Some("call-legacy")
+                )
+        ));
+    }
+
+    #[test]
+    fn rig_messages_from_entries_omits_call_id_when_absent() {
+        let messages = rig_messages_from_tracked_entries(&[
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-1"), None),
+                entry: ConversationEntry::ToolUse(ToolUse {
+                    id: "tool-call-legacy".to_owned(),
+                    name: "bash".to_owned(),
+                    input: serde_json::json!({"command": "pwd"}),
+                }),
+            },
+            ConversationTraceEntry {
+                metadata: metadata(Some("execution-1"), None),
+                entry: ConversationEntry::ToolResult(ToolResult {
+                    id: "tool-call-legacy".to_owned(),
+                    output: "/tmp".to_owned(),
+                }),
+            },
+        ]);
+
+        assert!(matches!(
+            &messages[0],
+            rig::completion::message::Message::Assistant { content, .. }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::AssistantContent::ToolCall(tool_call)
+                        if tool_call.id == "tool-call-legacy"
+                            && tool_call.call_id.is_none()
+                )
+        ));
+        assert!(matches!(
+            &messages[1],
+            rig::completion::message::Message::User { content }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::UserContent::ToolResult(tool_result)
+                        if tool_result.id == "tool-call-legacy"
+                            && tool_result.call_id.is_none()
+                )
+        ));
+    }
+
+    #[test]
+    fn backend_events_from_choice_preserves_optional_call_id() {
+        let choice = rig::OneOrMany::many(vec![
+            rig::message::AssistantContent::tool_call(
+                "tool-call-1",
+                "bash",
+                serde_json::json!({"command": "pwd"}),
+            ),
+            rig::message::AssistantContent::tool_call_with_call_id(
+                "tool-call-2",
+                "call-2".to_owned(),
+                "bash",
+                serde_json::json!({"command": "ls"}),
+            ),
+        ])
+        .expect("assistant choice should be non-empty");
+
+        let events = backend_events_from_choice(&choice);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            BackendEvent {
+                metadata: Some(ProviderMetadata { call_id }),
+                event: BackendEventPayload::ToolUse(ToolUse { id, .. }),
+            } if id == "tool-call-1" && call_id.is_none()
+        ));
+        assert!(matches!(
+            &events[1],
+            BackendEvent {
+                metadata: Some(ProviderMetadata { call_id }),
+                event: BackendEventPayload::ToolUse(ToolUse { id, .. }),
+            } if id == "tool-call-2" && call_id.as_deref() == Some("call-2")
+        ));
+    }
+
     #[tokio::test]
     async fn multi_step_completion_uses_distinct_execution_ids_per_completion_call() {
         let store = MemoryStore::new();
@@ -4166,22 +4570,30 @@ mod tests {
                 "done",
                 vec![
                     BackendStep {
-                        execution_id: "execution-step-1".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-1".to_owned()),
                         events: vec![
-                            BackendEvent::ToolUse(ToolUse {
-                                id: "tool-call-1".to_owned(),
-                                name: "bash".to_owned(),
-                                input: serde_json::json!({"command": "ls"}),
-                            }),
-                            BackendEvent::ToolResult(ToolResult {
-                                id: "tool-call-1".to_owned(),
-                                output: "Cargo.toml".to_owned(),
-                            }),
+                            backend_event(
+                                BackendEventPayload::ToolUse(ToolUse {
+                                    id: "tool-call-1".to_owned(),
+                                    name: "bash".to_owned(),
+                                    input: serde_json::json!({"command": "ls"}),
+                                }),
+                                Some("execution-step-1"),
+                                Some("tool-call-1"),
+                            ),
+                            backend_event(
+                                BackendEventPayload::ToolResult(ToolResult {
+                                    id: "tool-call-1".to_owned(),
+                                    output: "Cargo.toml".to_owned(),
+                                }),
+                                Some("execution-step-1"),
+                                Some("tool-call-1"),
+                            ),
                         ],
                     },
                     BackendStep {
-                        execution_id: "execution-step-2".to_owned(),
-                        events: vec![BackendEvent::AssistantText("done".to_owned())],
+                        execution: ExecutionMetadata::new("execution-step-2".to_owned()),
+                        events: vec![BackendEventPayload::AssistantText("done".to_owned()).into()],
                     },
                 ],
             ))],
@@ -4260,21 +4672,29 @@ mod tests {
                 "MaxTurnError: (reached max turn limit: 8)",
                 vec![
                     BackendStep {
-                        execution_id: "execution-step-1".to_owned(),
-                        events: vec![BackendEvent::ToolUse(ToolUse {
-                            id: "tool-call-1".to_owned(),
-                            name: "bash".to_owned(),
-                            input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
-                        })],
+                        execution: ExecutionMetadata::new("execution-step-1".to_owned()),
+                        events: vec![backend_event(
+                            BackendEventPayload::ToolUse(ToolUse {
+                                id: "tool-call-1".to_owned(),
+                                name: "bash".to_owned(),
+                                input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
+                            }),
+                            Some("execution-step-1"),
+                            Some("tool-call-1"),
+                        )],
                     },
                     BackendStep {
-                        execution_id: "execution-step-2".to_owned(),
+                        execution: ExecutionMetadata::new("execution-step-2".to_owned()),
                         events: vec![
-                            BackendEvent::ToolResult(ToolResult {
-                                id: "tool-call-1".to_owned(),
-                                output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
-                            }),
-                            BackendEvent::AssistantText("trying again".to_owned()),
+                            backend_event(
+                                BackendEventPayload::ToolResult(ToolResult {
+                                    id: "tool-call-1".to_owned(),
+                                    output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
+                                }),
+                                Some("execution-step-2"),
+                                Some("tool-call-1"),
+                            ),
+                            BackendEventPayload::AssistantText("trying again".to_owned()).into(),
                         ],
                     },
                 ],

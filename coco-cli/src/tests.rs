@@ -5,12 +5,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::Parser;
 use coco_llm::coco_mem::{
-    Anchor, Kind, NewNode, PromptAnchor, Role, SessionAnchor, SkillResultAnchor, Store, ToolResult,
-    ToolUse,
+    Anchor, BackendMetadata, Kind, NewNode, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
+    SkillResultAnchor, Store, ToolResult, ToolUse,
 };
 use coco_llm::{
-    BackendError, BackendEvent, BackendTurn, CompletionBackend, CompletionMessage,
-    CompletionToolCall, Provider, StepContext,
+    BackendError, BackendEvent, BackendEventPayload, BackendTurn, CompletionBackend,
+    CompletionMessage, CompletionToolCall, Provider, StepContext,
 };
 use coco_mem::SessionState;
 use serde_json::{Value, json};
@@ -139,7 +139,7 @@ impl CompletionBackend for UseSkillBackend {
                 0 => {
                     let tool_call: CompletionToolCall = serde_json::from_value(json!({
                         "id": "tool-call-1",
-                        "call_id": null,
+                        "call_id": "tool-call-1",
                         "function": {
                             "name": "use_skill",
                             "arguments": {
@@ -153,11 +153,14 @@ impl CompletionBackend for UseSkillBackend {
                     .unwrap();
                     Ok(BackendTurn {
                         message: CompletionMessage::assistant("delegating".to_owned()),
-                        events: vec![BackendEvent::ToolUse(ToolUse {
-                            id: tool_call.id.clone(),
-                            name: tool_call.function.name.clone(),
-                            input: tool_call.function.arguments.clone(),
-                        })],
+                        events: vec![
+                            BackendEvent::new(BackendEventPayload::ToolUse(ToolUse {
+                                id: tool_call.id.clone(),
+                                name: tool_call.function.name.clone(),
+                                input: tool_call.function.arguments.clone(),
+                            }))
+                            .with_metadata(Some(ProviderMetadata::new(tool_call.call_id.clone()))),
+                        ],
                         tool_calls: vec![tool_call],
                         final_text: None,
                         trace_persisted: false,
@@ -187,7 +190,7 @@ impl CompletionBackend for UseSkillFailureBackend {
                 0 => {
                     let tool_call: CompletionToolCall = serde_json::from_value(json!({
                         "id": "tool-call-1",
-                        "call_id": null,
+                        "call_id": "tool-call-1",
                         "function": {
                             "name": "use_skill",
                             "arguments": {
@@ -200,11 +203,14 @@ impl CompletionBackend for UseSkillFailureBackend {
                     .unwrap();
                     Ok(BackendTurn {
                         message: CompletionMessage::assistant("delegating".to_owned()),
-                        events: vec![BackendEvent::ToolUse(ToolUse {
-                            id: tool_call.id.clone(),
-                            name: tool_call.function.name.clone(),
-                            input: tool_call.function.arguments.clone(),
-                        })],
+                        events: vec![
+                            BackendEvent::new(BackendEventPayload::ToolUse(ToolUse {
+                                id: tool_call.id.clone(),
+                                name: tool_call.function.name.clone(),
+                                input: tool_call.function.arguments.clone(),
+                            }))
+                            .with_metadata(Some(ProviderMetadata::new(tool_call.call_id.clone()))),
+                        ],
                         tool_calls: vec![tool_call],
                         final_text: None,
                         trace_persisted: false,
@@ -528,7 +534,9 @@ fn append_tool_use_node(store: &impl Store, parent: &str, id: &str, name: &str) 
         .append(NewNode {
             parent: parent.to_owned(),
             role: Role::LLM,
-            metadata: None,
+            metadata: BackendMetadata::builder()
+                .provider(&ProviderMetadata::new(Some(id.to_owned())))
+                .build(),
             kind: Kind::ToolUse(ToolUse {
                 id: id.to_owned(),
                 name: name.to_owned(),
@@ -545,7 +553,9 @@ fn append_tool_result_node(store: &impl Store, parent: &str, id: &str, output: &
         .append(NewNode {
             parent: parent.to_owned(),
             role: Role::System,
-            metadata: None,
+            metadata: BackendMetadata::builder()
+                .provider(&ProviderMetadata::new(Some(id.to_owned())))
+                .build(),
             kind: Kind::ToolResult(ToolResult {
                 id: id.to_owned(),
                 output: output.to_owned(),
@@ -577,7 +587,9 @@ fn append_skill_result_anchor(
         .append(NewNode {
             parent: parent.to_owned(),
             role: Role::System,
-            metadata: None,
+            metadata: BackendMetadata::builder()
+                .provider(&ProviderMetadata::new(Some(tool_id.to_owned())))
+                .build(),
             kind: Kind::Anchor(Anchor::skill_result(
                 vec![merge_parent.to_owned()],
                 SkillResultAnchor {
@@ -2462,6 +2474,35 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
 
     assert_eq!(config.provider, Provider::Anthropic);
     assert_eq!(config.model, "claude-sonnet-4-20250514");
+}
+
+#[test]
+fn resolve_session_config_accepts_chatgpt_provider() {
+    let config = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(with_coco_env_async(
+            &[
+                ("COCO_PROVIDER", "chatgpt"),
+                ("COCO_MODEL", "gpt-5.3-codex"),
+            ],
+            || async {
+                resolve_session_config(SessionCreateCommand {
+                    branch: "main".to_owned(),
+                    system_prompt: "You are helpful.".to_owned(),
+                    prompt: "".to_owned(),
+                    temperature: Some(0.2),
+                    max_tokens: Some(64),
+                    additional_params: None,
+                    tools: vec![],
+                })
+                .unwrap()
+            },
+        ));
+
+    assert_eq!(config.provider, Provider::ChatGpt);
+    assert_eq!(config.model, "gpt-5.3-codex");
 }
 
 #[test]

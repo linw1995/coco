@@ -8,7 +8,9 @@ async-trait.workspace = true
 coco-mem = { path = "../coco-mem" }
 indoc = "2.0.6"
 nanoid = "0.4.0"
-rig = { package = "rig-core", version = "0.32.0", features = ["derive"] }
+rig = { package = "rig-core", git = "https://github.com/0xPlaygrounds/rig", branch = "main", features = [
+  "derive",
+] }
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
