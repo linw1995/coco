@@ -53,6 +53,7 @@ pub enum AnchorPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchor {
+    pub role: SessionRole,
     pub provider: String,
     pub model: String,
     pub tools: Vec<Tool>,
@@ -90,6 +91,13 @@ pub enum JobStatus {
     Finished,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole {
+    Orchestrator,
+    Runner,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 /// A persisted execution job bound to a branch.
 pub struct Job {
@@ -108,6 +116,7 @@ pub struct Job {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchorPatch {
+    pub role: Option<SessionRole>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub tools: Option<Vec<Tool>>,
@@ -225,6 +234,7 @@ impl Anchor {
 impl SessionAnchor {
     pub fn apply_patch(&self, patch: &SessionAnchorPatch) -> Self {
         Self {
+            role: patch.role.unwrap_or(self.role),
             provider: patch
                 .provider
                 .clone()
@@ -242,6 +252,23 @@ impl SessionAnchor {
                 .additional_params
                 .clone()
                 .unwrap_or_else(|| self.additional_params.clone()),
+        }
+    }
+}
+
+impl SessionRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Orchestrator => "orchestrator",
+            Self::Runner => "runner",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "orchestrator" => Some(Self::Orchestrator),
+            "runner" => Some(Self::Runner),
+            _ => None,
         }
     }
 }
@@ -401,8 +428,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         Anchor, BackendMetadata, ExecutionMetadata, Kind, NewNode, Node, PauseReason, PromptAnchor,
-        ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch, SessionState, SkillResultAnchor,
-        Tool, ToolResult,
+        ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
+        SkillResultAnchor, Tool, ToolResult,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -433,6 +460,7 @@ mod tests {
 
     fn make_session_anchor() -> SessionAnchor {
         SessionAnchor {
+            role: SessionRole::Orchestrator,
             provider: "openai".to_owned(),
             model: "gpt-5.4".to_owned(),
             tools: vec![Tool {
@@ -727,6 +755,7 @@ mod tests {
         let session_anchor = anchor.as_session().expect("expected session anchor");
 
         assert_eq!(session_anchor.prompt, "prompt");
+        assert_eq!(session_anchor.role, SessionRole::Orchestrator);
         assert_eq!(anchor.merge_parents(), ["merge-a", "merge-b"]);
     }
 
@@ -811,6 +840,7 @@ mod tests {
     #[test]
     fn session_anchor_patch_updates_selected_fields() {
         let updated = make_session_anchor().apply_patch(&SessionAnchorPatch {
+            role: Some(SessionRole::Runner),
             provider: Some("anthropic".to_owned()),
             model: Some("claude-sonnet-4-20250514".to_owned()),
             tools: Some(vec![]),
@@ -821,6 +851,7 @@ mod tests {
             additional_params: Some(Some(json!({"service_tier": "priority"}))),
         });
 
+        assert_eq!(updated.role, SessionRole::Runner);
         assert_eq!(updated.provider, "anthropic");
         assert_eq!(updated.model, "claude-sonnet-4-20250514");
         assert!(updated.tools.is_empty());
@@ -847,5 +878,15 @@ mod tests {
         let decoded: SessionState = serde_json::from_str(&encoded).unwrap();
 
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn session_role_parse_accepts_known_values() {
+        assert_eq!(
+            SessionRole::parse("orchestrator"),
+            Some(SessionRole::Orchestrator)
+        );
+        assert_eq!(SessionRole::parse("runner"), Some(SessionRole::Runner));
+        assert_eq!(SessionRole::parse("unknown"), None);
     }
 }

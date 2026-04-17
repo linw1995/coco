@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use clap::Parser;
 use coco_llm::coco_mem::{
     Anchor, BackendMetadata, Kind, NewNode, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
-    SkillResultAnchor, Store, ToolResult, ToolUse,
+    SessionRole, SkillResultAnchor, Store, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEvent, BackendEventPayload, BackendTurn, CompletionBackend,
@@ -304,6 +304,7 @@ fn session_create_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Create(SessionCreateCommand {
                 branch: branch.unwrap_or("main").to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
                 system_prompt: "You are helpful.".to_owned(),
                 prompt: "".to_owned(),
                 temperature: Some(0.2),
@@ -385,6 +386,7 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Rebase(SessionRebaseCommand {
                 branch: branch.unwrap_or("main").to_owned(),
+                role: Some(crate::cli::CliSessionRole::Runner),
                 provider: Some(crate::cli::CliProvider::Anthropic),
                 model: Some("claude-sonnet-4-20250514".to_owned()),
                 system_prompt: Some("You are precise.".to_owned()),
@@ -515,6 +517,7 @@ fn append_session_anchor(store: &impl Store, parent: &str, prompt: &str) -> Stri
             kind: Kind::Anchor(Anchor::session(
                 vec![],
                 SessionAnchor {
+                    role: SessionRole::Orchestrator,
                     provider: "openai".to_owned(),
                     model: "gpt-4.1-mini".to_owned(),
                     tools: vec![],
@@ -802,6 +805,7 @@ description: "Review Rust changes."
         })
         .expect("expected child session anchor under use_skill");
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
+    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
     let child_ancestry = store.ancestry(&merge_parent).unwrap();
     assert!(
         child_ancestry
@@ -1226,6 +1230,7 @@ async fn session_fork_creates_active_branch_from_reference() {
         json!({
             "branch": "draft",
             "head_id": source_head_id,
+            "role": "orchestrator",
             "state": "Active",
         })
     );
@@ -1289,6 +1294,7 @@ async fn session_list_returns_sorted_branches_with_states() {
             {
                 "branch": "draft",
                 "head_id": store.get_branch_head("draft").unwrap(),
+                "role": "orchestrator",
                 "state": {
                     "Attached": {
                         "target_branch": "main",
@@ -1299,6 +1305,7 @@ async fn session_list_returns_sorted_branches_with_states() {
             {
                 "branch": "main",
                 "head_id": store.get_branch_head("main").unwrap(),
+                "role": "orchestrator",
                 "state": "Active"
             }
         ])
@@ -1333,7 +1340,9 @@ async fn session_get_returns_state_and_visible_anchor() {
 
     let value: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["branch"], "main");
+    assert_eq!(value["role"], "orchestrator");
     assert_eq!(value["state"], json!("Active"));
+    assert_eq!(value["anchor"]["role"], "orchestrator");
     assert_eq!(value["anchor"]["provider"], "openai");
     assert_eq!(value["anchor"]["model"], "gpt-4.1-mini");
     assert_eq!(value["anchor"]["system_prompt"], "You are helpful.");
@@ -1360,6 +1369,7 @@ async fn session_create_persists_additional_params() {
                 command: Command::Session(SessionCommand {
                     command: SessionSubcommand::Create(SessionCreateCommand {
                         branch: "main".to_owned(),
+                        role: crate::cli::CliSessionRole::Orchestrator,
                         system_prompt: "You are helpful.".to_owned(),
                         prompt: "".to_owned(),
                         temperature: Some(0.2),
@@ -1551,6 +1561,8 @@ async fn session_rebase_updates_visible_session_config() {
     .unwrap();
 
     let value: Value = serde_json::from_str(&get_output).unwrap();
+    assert_eq!(value["role"], "runner");
+    assert_eq!(value["anchor"]["role"], "runner");
     assert_eq!(value["anchor"]["provider"], "anthropic");
     assert_eq!(value["anchor"]["model"], "claude-sonnet-4-20250514");
     assert_eq!(value["anchor"]["system_prompt"], "You are precise.");
@@ -2393,6 +2405,7 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
         &["prompt".to_owned(), "hello".to_owned()],
         &[],
         Some("draft"),
+        Some(SessionRole::Orchestrator),
         None,
         &store,
         &llm,
@@ -2436,6 +2449,7 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
         ],
         &[],
         Some("draft"),
+        Some(SessionRole::Orchestrator),
         None,
         &store,
         &llm,
@@ -2445,6 +2459,184 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
     assert_eq!(response.exit_code, 0);
     assert_eq!(response.stdout, "main-response\n");
     assert!(response.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
+    let (_tempdir, store_path) = temp_store_path();
+    let store = open_store(&store_path).unwrap();
+    let llm = Arc::new(coco_llm::LlmService::new(
+        store.clone(),
+        FakeBackend::with_responses(&[]),
+    ));
+
+    let response = run_forwarded_with_services(
+        &["prompt".to_owned(), "--help".to_owned()],
+        &[],
+        Some("main"),
+        Some(SessionRole::Runner),
+        None,
+        &store,
+        &llm,
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 0);
+    assert!(response.stdout.contains("Usage: coco prompt"));
+    assert!(response.stdout.contains("status"));
+    assert!(response.stdout.contains("branch-status"));
+    assert!(!response.stdout.contains("[TEXT]"));
+    assert!(!response.stdout.contains("--async"));
+    assert!(!response.stdout.contains("--store-path"));
+    assert!(response.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn forwarded_runtime_runner_session_help_hides_write_subcommands() {
+    let (_tempdir, store_path) = temp_store_path();
+    let store = open_store(&store_path).unwrap();
+    let llm = Arc::new(coco_llm::LlmService::new(
+        store.clone(),
+        FakeBackend::with_responses(&[]),
+    ));
+
+    let response = run_forwarded_with_services(
+        &["session".to_owned(), "--help".to_owned()],
+        &[],
+        Some("main"),
+        Some(SessionRole::Runner),
+        None,
+        &store,
+        &llm,
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 0);
+    assert!(response.stdout.contains("Usage: coco session"));
+    assert!(response.stdout.contains("list"));
+    assert!(response.stdout.contains("get"));
+    assert!(response.stdout.contains("graph"));
+    assert!(response.stdout.contains("show"));
+    assert!(!response.stdout.contains("create"));
+    assert!(!response.stdout.contains("merge"));
+    assert!(!response.stdout.contains("--store-path"));
+    assert!(response.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
+    let (_tempdir, store_path) = temp_store_path();
+    let store = open_store(&store_path).unwrap();
+    let llm = Arc::new(coco_llm::LlmService::new(
+        store.clone(),
+        FakeBackend::with_responses(&[]),
+    ));
+
+    let response = run_forwarded_with_services(
+        &["prompt".to_owned(), "--help".to_owned()],
+        &[],
+        Some("main"),
+        Some(SessionRole::Orchestrator),
+        None,
+        &store,
+        &llm,
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 0);
+    assert!(response.stdout.contains("Usage: coco prompt"));
+    assert!(!response.stdout.contains("--store-path"));
+    assert!(response.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
+    let (_tempdir, store_path) = temp_store_path();
+    let store = open_store(&store_path).unwrap();
+    let llm = Arc::new(coco_llm::LlmService::new(
+        store.clone(),
+        FakeBackend::with_responses(&[]),
+    ));
+
+    let prompt_response = run_forwarded_with_services(
+        &["prompt".to_owned(), "hello".to_owned()],
+        &[],
+        Some("main"),
+        Some(SessionRole::Runner),
+        None,
+        &store,
+        &llm,
+    )
+    .await;
+
+    assert_eq!(prompt_response.exit_code, 2);
+    assert!(
+        prompt_response
+            .stderr
+            .contains("unrecognized subcommand 'hello'")
+    );
+    assert!(
+        prompt_response
+            .stderr
+            .contains("Usage: coco prompt <COMMAND>")
+    );
+
+    let session_response = run_forwarded_with_services(
+        &[
+            "session".to_owned(),
+            "create".to_owned(),
+            "--help".to_owned(),
+        ],
+        &[],
+        Some("main"),
+        Some(SessionRole::Runner),
+        None,
+        &store,
+        &llm,
+    )
+    .await;
+
+    assert_eq!(session_response.exit_code, 2);
+    assert!(
+        session_response
+            .stderr
+            .contains("unrecognized subcommand 'create'")
+    );
+    assert!(
+        session_response
+            .stderr
+            .contains("Usage: coco session <COMMAND>")
+    );
+}
+
+#[tokio::test]
+async fn forwarded_runtime_rejects_store_path_override() {
+    let (_tempdir, store_path) = temp_store_path();
+    let store = open_store(&store_path).unwrap();
+    let llm = Arc::new(coco_llm::LlmService::new(
+        store.clone(),
+        FakeBackend::with_responses(&[]),
+    ));
+
+    let response = run_forwarded_with_services(
+        &[
+            "--store-path".to_owned(),
+            "/tmp/override".to_owned(),
+            "session".to_owned(),
+            "list".to_owned(),
+        ],
+        &[],
+        Some("main"),
+        Some(SessionRole::Orchestrator),
+        None,
+        &store,
+        &llm,
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 1);
+    assert!(response.stderr.contains("\"--store-path\""));
+    assert!(!response.stderr.contains("Usage:"));
 }
 
 #[test]
@@ -2461,6 +2653,7 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
             || async {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
+                    role: crate::cli::CliSessionRole::Orchestrator,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
@@ -2474,6 +2667,7 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
 
     assert_eq!(config.provider, Provider::Anthropic);
     assert_eq!(config.model, "claude-sonnet-4-20250514");
+    assert_eq!(config.role, SessionRole::Orchestrator);
 }
 
 #[test]
@@ -2490,6 +2684,7 @@ fn resolve_session_config_accepts_chatgpt_provider() {
             || async {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
+                    role: crate::cli::CliSessionRole::Orchestrator,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
@@ -2520,6 +2715,7 @@ fn resolve_session_config_reads_tools_from_env() {
             || async {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
+                    role: crate::cli::CliSessionRole::Orchestrator,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
@@ -2552,6 +2748,7 @@ fn resolve_session_config_parses_additional_params_json_object() {
             || async {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
+                    role: crate::cli::CliSessionRole::Orchestrator,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
@@ -2585,6 +2782,7 @@ fn resolve_session_config_rejects_non_object_additional_params() {
             || async {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
+                    role: crate::cli::CliSessionRole::Orchestrator,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),

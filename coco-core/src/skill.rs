@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Weak;
 
 use async_trait::async_trait;
-use coco_llm::coco_mem::{Anchor, Kind, NewNode, Role, SessionAnchor, Store, ToolUse};
+use coco_llm::coco_mem::{Anchor, Kind, NewNode, Role, SessionAnchor, SessionRole, Store, ToolUse};
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
     Error as LlmError, ExecutorError, LlmService, SearchSkillToolRequest, SkillToolExecutionResult,
@@ -331,6 +331,7 @@ fn resolve_session_anchor<S: Store>(
 
 fn child_session_anchor(parent: SessionAnchor, prompt: String) -> SessionAnchor {
     SessionAnchor {
+        role: SessionRole::Runner,
         provider: parent.provider,
         model: parent.model,
         tools: parent.tools,

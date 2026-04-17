@@ -14,9 +14,9 @@ use tokio::process::Command;
 use std::os::unix::ffi::OsStrExt;
 
 use crate::{
-    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_STORE_PATH_ENV,
-    CocoCliRuntimeRequest, CocoCliRuntimeResponse, ToolExecutionOutcome, ToolInvocationContext,
-    ToolRuntimeEnv,
+    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV,
+    COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse, ToolExecutionOutcome,
+    ToolInvocationContext, ToolRuntimeEnv,
 };
 
 #[derive(Debug, Clone)]
@@ -609,10 +609,12 @@ async fn execute_bash_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove(COCO_SESSION_BRANCH_ENV)
+        .env_remove(COCO_SESSION_ROLE_ENV)
         .env_remove(COCO_STORE_PATH_ENV)
         .env_remove(COCO_CLI_RUNTIME_SOCKET_ENV)
         .env("PATH", &coco_command.path_env)
         .env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch);
+    command.env(COCO_SESSION_ROLE_ENV, request.context.session_role.as_str());
     if let Some(store_path) = &request.context.store_path {
         command.env(COCO_STORE_PATH_ENV, store_path);
     }
@@ -728,6 +730,7 @@ mod tests {
     fn test_context() -> ToolRuntimeEnv {
         ToolRuntimeEnv {
             session_branch: "main".to_owned(),
+            session_role: coco_mem::SessionRole::Orchestrator,
             store_path: None,
             cli_bridge: crate::BashToolCliBridgeHandle::default(),
             skill_executor: crate::SkillToolExecutorHandle::default(),
@@ -1133,6 +1136,7 @@ mod tests {
             workspace.path().to_path_buf(),
             ToolRuntimeEnv {
                 session_branch: "draft".to_owned(),
+                session_role: coco_mem::SessionRole::Runner,
                 store_path: None,
                 cli_bridge: crate::BashToolCliBridgeHandle::default(),
                 skill_executor: crate::SkillToolExecutorHandle::default(),
@@ -1142,6 +1146,7 @@ mod tests {
         let output = crate::with_process_env_async(
             &[
                 (COCO_SESSION_BRANCH_ENV, Some(OsStr::new("stale-branch"))),
+                (COCO_SESSION_ROLE_ENV, Some(OsStr::new("orchestrator"))),
                 (COCO_STORE_PATH_ENV, Some(OsStr::new("/tmp/stale-store"))),
                 (
                     COCO_CLI_RUNTIME_SOCKET_ENV,
@@ -1152,7 +1157,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"command":"printf '%s|%s|%s' \"$COCO_BRANCH\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\"","workdir":"{}"}}"#,
+                        r#"{{"command":"printf '%s|%s|%s|%s' \"$COCO_BRANCH\" \"$COCO_SESSION_ROLE\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\"","workdir":"{}"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -1161,7 +1166,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(output.contains("stdout:\ndraft||"));
+        assert!(output.contains("stdout:\ndraft|runner||"));
     }
 
     #[tokio::test]
@@ -1175,6 +1180,7 @@ mod tests {
         let runtime_store = workspace.path().join("runtime-store");
         let context = ToolRuntimeEnv {
             session_branch: "draft".to_owned(),
+            session_role: coco_mem::SessionRole::Runner,
             store_path: Some(runtime_store.clone()),
             cli_bridge: bridge,
             skill_executor: crate::SkillToolExecutorHandle::default(),
@@ -1199,6 +1205,7 @@ mod tests {
             args: vec!["prompt".to_owned(), "hello".to_owned()],
             stdin: b"stdin".to_vec(),
             branch_env: Some("draft".to_owned()),
+            session_role: Some(coco_mem::SessionRole::Runner),
             store_path_env: Some(runtime_store.display().to_string()),
         };
         let payload = serde_json::to_vec(&request).unwrap();

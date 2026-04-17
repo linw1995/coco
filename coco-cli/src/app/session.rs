@@ -27,6 +27,7 @@ use crate::{
 struct SessionSummary {
     branch: String,
     head_id: String,
+    role: coco_mem::SessionRole,
     state: SessionState,
 }
 
@@ -35,6 +36,7 @@ struct SessionDetails {
     branch: String,
     head_id: String,
     anchor_id: String,
+    role: coco_mem::SessionRole,
     state: SessionState,
     anchor: SessionAnchor,
 }
@@ -60,6 +62,7 @@ struct SessionRebaseResult {
 struct SessionForkResult {
     branch: String,
     head_id: String,
+    role: coco_mem::SessionRole,
     state: SessionState,
 }
 
@@ -158,8 +161,10 @@ where
             let head_id = llm
                 .fork(branch.clone(), &command.from_ref)
                 .context(LlmSnafu)?;
+            let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
             Ok(Some(render_json(SessionForkResult {
                 state: store.get_session_state(&branch).context(StoreSnafu)?,
+                role: anchor.role,
                 branch,
                 head_id,
             })))
@@ -257,6 +262,7 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
     Ok(SessionConfig {
         branch: command.branch,
         merge_parents: vec![],
+        role: command.role.into(),
         provider: provider.into(),
         model,
         system_prompt: command.system_prompt,
@@ -276,8 +282,10 @@ fn list_sessions(store: &FsStore) -> Result<Vec<SessionSummary>> {
     branches
         .into_iter()
         .map(|(branch, state)| {
+            let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
             Ok(SessionSummary {
                 head_id: store.get_branch_head(&branch).context(StoreSnafu)?,
+                role: anchor.role,
                 branch,
                 state,
             })
@@ -294,6 +302,7 @@ fn read_session_details(store: &FsStore, branch: &str) -> Result<SessionDetails>
         branch: branch.to_owned(),
         head_id,
         anchor_id,
+        role: anchor.role,
         state,
         anchor,
     })
@@ -1016,6 +1025,7 @@ fn resolve_visible_session_anchor(
 
 fn resolve_session_patch(command: SessionRebaseCommand) -> SessionConfigPatch {
     SessionConfigPatch {
+        role: command.role.map(Into::into),
         provider: command
             .provider
             .map(|provider| coco_llm::Provider::from(provider).as_str().to_owned()),

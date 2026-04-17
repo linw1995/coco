@@ -2,9 +2,10 @@ use std::io::Read;
 
 use clap::Parser;
 use coco_llm::{
-    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_STORE_PATH_ENV,
-    CocoCliRuntimeRequest, CocoCliRuntimeResponse,
+    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV,
+    COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
 };
+use coco_mem::SessionRole;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -30,11 +31,8 @@ async fn main() {
 }
 
 fn resolve_runtime_socket(args: &[String]) -> Option<String> {
-    let socket = std::env::var(COCO_CLI_RUNTIME_SOCKET_ENV).ok()?;
-    let explicit_store_path = args
-        .iter()
-        .any(|arg| arg == "--store-path" || arg.starts_with("--store-path="));
-    (!explicit_store_path).then_some(socket)
+    let _ = args;
+    std::env::var(COCO_CLI_RUNTIME_SOCKET_ENV).ok()
 }
 
 async fn forward_to_runtime(socket_path: &str, args: &[String]) -> ! {
@@ -47,6 +45,9 @@ async fn forward_to_runtime(socket_path: &str, args: &[String]) -> ! {
         args: args.to_vec(),
         stdin,
         branch_env: std::env::var(COCO_SESSION_BRANCH_ENV).ok(),
+        session_role: std::env::var(COCO_SESSION_ROLE_ENV)
+            .ok()
+            .and_then(|value| SessionRole::parse(&value)),
         store_path_env: std::env::var(COCO_STORE_PATH_ENV).ok(),
     };
     let payload =

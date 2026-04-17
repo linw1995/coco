@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, ExecutionMetadata, Kind, MemoryStore, NewNode,
-    PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionState,
+    PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionState,
     SkillResultAnchor, Store, StoreError, Tool, ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ pub use runtime_bridge::LlmRuntimeBridge;
 pub use tool_definition::builtin_tool_definition;
 
 pub const COCO_SESSION_BRANCH_ENV: &str = "COCO_BRANCH";
+pub const COCO_SESSION_ROLE_ENV: &str = "COCO_SESSION_ROLE";
 pub const COCO_STORE_PATH_ENV: &str = "COCO_STORE_PATH";
 pub const COCO_CLI_RUNTIME_SOCKET_ENV: &str = "COCO_CLI_RUNTIME_SOCKET";
 
@@ -126,6 +127,7 @@ impl FromStr for Provider {
 pub struct SessionConfig {
     pub branch: String,
     pub merge_parents: Vec<String>,
+    pub role: SessionRole,
     pub provider: Provider,
     pub model: String,
     pub system_prompt: String,
@@ -244,6 +246,7 @@ struct ConversationTraceEntry {
 
 #[derive(Debug, Clone)]
 pub struct SessionModelConfig {
+    pub role: SessionRole,
     pub provider: Provider,
     pub model: String,
     pub system_prompt: String,
@@ -408,6 +411,7 @@ pub struct CocoCliRuntimeRequest {
     pub args: Vec<String>,
     pub stdin: Vec<u8>,
     pub branch_env: Option<String>,
+    pub session_role: Option<SessionRole>,
     pub store_path_env: Option<String>,
 }
 
@@ -555,6 +559,7 @@ impl Default for SkillToolExecutorHandle {
 #[derive(Clone)]
 pub struct ToolRuntimeEnv {
     pub session_branch: String,
+    pub session_role: SessionRole,
     pub store_path: Option<PathBuf>,
     pub cli_bridge: BashToolCliBridgeHandle,
     pub skill_executor: SkillToolExecutorHandle,
@@ -565,6 +570,7 @@ impl std::fmt::Debug for ToolRuntimeEnv {
         formatter
             .debug_struct("ToolRuntimeEnv")
             .field("session_branch", &self.session_branch)
+            .field("session_role", &self.session_role)
             .field("store_path", &self.store_path)
             .field("cli_bridge", &self.cli_bridge)
             .field("skill_executor", &self.skill_executor)
@@ -943,6 +949,7 @@ where
                 kind: Kind::Anchor(Anchor::session(
                     merge_parents,
                     SessionAnchor {
+                        role: config.role,
                         provider: config.provider.as_str().to_owned(),
                         model: config.model,
                         tools: config.tools,
@@ -1571,6 +1578,7 @@ where
             branch: branch.to_owned(),
             anchor_id: context.active_anchor_id,
             config: SessionModelConfig {
+                role: context.session_anchor.role,
                 provider: Provider::parse(&context.session_anchor.provider)?,
                 model: context.session_anchor.model.clone(),
                 system_prompt: context.session_anchor.system_prompt.clone(),
@@ -1583,6 +1591,7 @@ where
             provider_history: rig_messages_from_tracked_entries(&tracked_entries),
             tool_runtime_env: ToolRuntimeEnv {
                 session_branch: branch.to_owned(),
+                session_role: context.session_anchor.role,
                 store_path: self.store.runtime_store_path(),
                 cli_bridge: self.runtime.bash_tool_cli_bridge.clone(),
                 skill_executor: self.runtime.skill_tool_executor.clone(),
@@ -3037,6 +3046,7 @@ mod tests {
         SessionConfig {
             branch: branch.to_owned(),
             merge_parents: vec![],
+            role: SessionRole::Orchestrator,
             provider: Provider::OpenAi,
             model: "gpt-4.1-mini".to_owned(),
             system_prompt: "You are helpful.".to_owned(),
@@ -3067,6 +3077,7 @@ mod tests {
 
     fn session_patch() -> SessionConfigPatch {
         SessionConfigPatch {
+            role: None,
             provider: None,
             model: None,
             system_prompt: None,
@@ -3251,6 +3262,7 @@ mod tests {
             .create_session(SessionConfig {
                 branch: "draft".to_owned(),
                 merge_parents: vec!["main".to_owned()],
+                role: SessionRole::Orchestrator,
                 provider: Provider::OpenAi,
                 model: "gpt-4.1-mini".to_owned(),
                 system_prompt: "You are helpful.".to_owned(),
@@ -4803,6 +4815,7 @@ mod tests {
             temp_root.path().to_path_buf(),
             ToolRuntimeEnv {
                 session_branch: "main".to_owned(),
+                session_role: SessionRole::Orchestrator,
                 store_path: None,
                 cli_bridge: BashToolCliBridgeHandle::default(),
                 skill_executor: SkillToolExecutorHandle::default(),

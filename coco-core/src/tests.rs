@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
     Anchor, BackendMetadata, ExecutionMetadata, JobStatus, Kind, MemoryStore, NewNode,
-    PromptAnchor, ProviderMetadata, Role, Store, ToolResult, ToolUse,
+    PromptAnchor, ProviderMetadata, Role, SessionRole, Store, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEventPayload, BackendTurn, CompletionBackend, CompletionMessage,
@@ -203,6 +203,7 @@ fn session_config(branch: &str) -> SessionConfig {
     SessionConfig {
         branch: branch.to_owned(),
         merge_parents: vec![],
+        role: SessionRole::Orchestrator,
         provider: Provider::OpenAi,
         model: "gpt-4.1-mini".to_owned(),
         system_prompt: "You are helpful.".to_owned(),

@@ -1,5 +1,6 @@
 use clap::ValueEnum;
 use coco_llm::Provider;
+use coco_mem::SessionRole;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliProvider {
@@ -54,6 +55,21 @@ impl CliTool {
             Self::Bash => "bash",
             Self::SearchSkill => "search_skill",
             Self::UseSkill => "use_skill",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum CliSessionRole {
+    Orchestrator,
+    Runner,
+}
+
+impl From<CliSessionRole> for SessionRole {
+    fn from(value: CliSessionRole) -> Self {
+        match value {
+            CliSessionRole::Orchestrator => SessionRole::Orchestrator,
+            CliSessionRole::Runner => SessionRole::Runner,
         }
     }
 }

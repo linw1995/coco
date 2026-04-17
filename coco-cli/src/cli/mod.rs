@@ -6,20 +6,21 @@ pub use prompt::{
     PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
     PromptSubcommand, PromptWorkerCommand,
 };
+pub use session::{SessionBranchCommand, SessionGraphCommand, SessionShowCommand};
 #[cfg(test)]
 pub use session::{
-    SessionBranchCommand, SessionCloseCommand, SessionFeedbackCommand, SessionForkCommand,
-    SessionGraphCommand, SessionMergeCommand, SessionPrCommand, SessionShowCommand,
+    SessionCloseCommand, SessionFeedbackCommand, SessionForkCommand, SessionMergeCommand,
+    SessionPrCommand,
 };
 pub use session::{SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand};
-pub use types::{CliProvider, CliTool};
+pub use types::{CliProvider, CliSessionRole, CliTool};
 
 mod prompt;
 mod session;
 mod types;
 
 #[derive(Debug, Parser)]
-#[command(name = "coco-cli")]
+#[command(name = "coco")]
 pub struct Cli {
     #[arg(
         long,

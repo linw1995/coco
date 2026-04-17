@@ -1,16 +1,114 @@
 use std::io::Read;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::FsStore;
+use coco_mem::{FsStore, SessionRole};
 
 use super::{prompt::run_prompt_command, session::run_session_command};
 use crate::{
     Cli, Result,
-    cli::{Command, SessionSubcommand},
+    cli::{
+        Command, PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
+        PromptSubcommand, SessionBranchCommand, SessionCommand, SessionGraphCommand,
+        SessionShowCommand, SessionSubcommand,
+    },
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardedRuntimeScope {
+    Orchestrator,
+    Runner,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "coco")]
+struct ForwardedCli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "coco")]
+struct RunnerCli {
+    #[command(subcommand)]
+    command: RunnerCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RunnerCommand {
+    Prompt(RunnerPromptCommand),
+    Session(RunnerSessionCommand),
+}
+
+#[derive(Debug, Args)]
+struct RunnerPromptCommand {
+    #[command(subcommand)]
+    command: RunnerPromptSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RunnerPromptSubcommand {
+    Status(PromptStatusCommand),
+    #[command(name = "branch-status")]
+    BranchStatus(PromptBranchStatusCommand),
+}
+
+#[derive(Debug, Args)]
+struct RunnerSessionCommand {
+    #[command(subcommand)]
+    command: RunnerSessionSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RunnerSessionSubcommand {
+    List,
+    Get(SessionBranchCommand),
+    Graph(SessionGraphCommand),
+    Show(SessionShowCommand),
+}
+
+impl RunnerCli {
+    fn into_cli(self) -> Cli {
+        let command = match self.command {
+            RunnerCommand::Prompt(command) => Command::Prompt(PromptCommand {
+                command: Some(match command.command {
+                    RunnerPromptSubcommand::Status(command) => PromptSubcommand::Status(command),
+                    RunnerPromptSubcommand::BranchStatus(command) => {
+                        PromptSubcommand::BranchStatus(command)
+                    }
+                }),
+                run: PromptRunCommand {
+                    branch: "main".to_owned(),
+                    asynchronous: false,
+                    text: vec![],
+                },
+            }),
+            RunnerCommand::Session(command) => Command::Session(SessionCommand {
+                command: match command.command {
+                    RunnerSessionSubcommand::List => SessionSubcommand::List,
+                    RunnerSessionSubcommand::Get(command) => SessionSubcommand::Get(command),
+                    RunnerSessionSubcommand::Graph(command) => SessionSubcommand::Graph(command),
+                    RunnerSessionSubcommand::Show(command) => SessionSubcommand::Show(command),
+                },
+            }),
+        };
+
+        Cli {
+            store_path: default_forwarded_store_path(),
+            command,
+        }
+    }
+}
+
+impl ForwardedCli {
+    fn into_cli(self) -> Cli {
+        Cli {
+            store_path: default_forwarded_store_path(),
+            command: self.command,
+        }
+    }
+}
 
 pub async fn run_with_services<B, R>(
     cli: Cli,
@@ -35,6 +133,7 @@ pub async fn run_forwarded_with_services<B>(
     args: &[String],
     stdin: &[u8],
     branch_env: Option<&str>,
+    session_role: Option<SessionRole>,
     store_path_env: Option<&str>,
     shared_store: &FsStore,
     llm: &Arc<LlmService<B, FsStore>>,
@@ -42,27 +141,17 @@ pub async fn run_forwarded_with_services<B>(
 where
     B: CompletionBackend + 'static,
 {
-    let argv = std::iter::once("coco-cli".to_owned())
+    let scope = forwarded_runtime_scope(session_role);
+    if contains_store_path_flag(args) {
+        return unsupported_store_path_response();
+    }
+
+    let argv = std::iter::once("coco".to_owned())
         .chain(args.iter().cloned())
         .collect::<Vec<_>>();
-    let mut cli = match Cli::try_parse_from(argv) {
+    let mut cli = match parse_forwarded_cli(&argv, scope) {
         Ok(cli) => cli,
-        Err(error) => {
-            let output = error.to_string();
-            return if error.use_stderr() {
-                CocoCliRuntimeResponse {
-                    exit_code: error.exit_code(),
-                    stdout: String::new(),
-                    stderr: output,
-                }
-            } else {
-                CocoCliRuntimeResponse {
-                    exit_code: error.exit_code(),
-                    stdout: output,
-                    stderr: String::new(),
-                }
-            };
-        }
+        Err(response) => return response,
     };
 
     apply_forwarded_defaults(&mut cli, args, branch_env, store_path_env);
@@ -94,6 +183,61 @@ where
     }
 }
 
+fn forwarded_runtime_scope(session_role: Option<SessionRole>) -> ForwardedRuntimeScope {
+    match session_role {
+        Some(SessionRole::Runner) => ForwardedRuntimeScope::Runner,
+        Some(SessionRole::Orchestrator) | None => ForwardedRuntimeScope::Orchestrator,
+    }
+}
+
+fn parse_forwarded_cli(
+    argv: &[String],
+    scope: ForwardedRuntimeScope,
+) -> std::result::Result<Cli, CocoCliRuntimeResponse> {
+    match scope {
+        ForwardedRuntimeScope::Orchestrator => ForwardedCli::try_parse_from(argv.iter().cloned())
+            .map(ForwardedCli::into_cli)
+            .map_err(clap_error_response),
+        ForwardedRuntimeScope::Runner => RunnerCli::try_parse_from(argv.iter().cloned())
+            .map(RunnerCli::into_cli)
+            .map_err(clap_error_response),
+    }
+}
+
+fn default_forwarded_store_path() -> std::path::PathBuf {
+    ".coco-store".into()
+}
+
+fn clap_error_response(error: clap::Error) -> CocoCliRuntimeResponse {
+    let output = error.to_string();
+    if error.use_stderr() {
+        CocoCliRuntimeResponse {
+            exit_code: error.exit_code(),
+            stdout: String::new(),
+            stderr: output,
+        }
+    } else {
+        CocoCliRuntimeResponse {
+            exit_code: error.exit_code(),
+            stdout: output,
+            stderr: String::new(),
+        }
+    }
+}
+
+fn unsupported_store_path_response() -> CocoCliRuntimeResponse {
+    CocoCliRuntimeResponse {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: "coco command \"--store-path\" is not available in bash tool runtime\n".to_owned(),
+    }
+}
+
+fn contains_store_path_flag(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--store-path" || arg.starts_with("--store-path="))
+}
+
 fn has_explicit_flag(args: &[String], name: &str) -> bool {
     let long = format!("--{name}");
     let long_eq = format!("--{name}=");
@@ -107,10 +251,8 @@ fn apply_forwarded_defaults(
     branch_env: Option<&str>,
     store_path_env: Option<&str>,
 ) {
-    if !has_explicit_flag(args, "store-path")
-        && let Some(store_path_env) = store_path_env
-    {
-        cli.store_path = PathBuf::from(store_path_env);
+    if let Some(store_path_env) = store_path_env {
+        cli.store_path = std::path::PathBuf::from(store_path_env);
     }
 
     if has_explicit_flag(args, "branch") {

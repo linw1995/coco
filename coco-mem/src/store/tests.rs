@@ -8,7 +8,7 @@ use super::state::StoreState;
 use crate::Store as StoreTrait;
 use crate::{
     Anchor, JobStatus, Kind, NewNode, Node, PauseReason, PromptAnchor, Role, SessionAnchor,
-    SessionAnchorPatch, SessionState, StoreError as Error,
+    SessionAnchorPatch, SessionRole, SessionState, StoreError as Error,
 };
 use serde_json::json;
 
@@ -29,6 +29,7 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
         kind: Kind::Anchor(Anchor::session(
             vec![],
             SessionAnchor {
+                role: SessionRole::Orchestrator,
                 provider: "openai".to_owned(),
                 model: "gpt-5.4".to_owned(),
                 tools: vec![],
@@ -50,6 +51,7 @@ fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> Ne
         kind: Kind::Anchor(Anchor::session(
             vec![merge_parent.to_owned()],
             SessionAnchor {
+                role: SessionRole::Orchestrator,
                 provider: "openai".to_owned(),
                 model: "gpt-5.4".to_owned(),
                 tools: vec![],

@@ -6,7 +6,7 @@ use coco_llm::{
     BashToolCliBridgeHandle, CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge,
     LlmService, RigBackend, SessionConfig,
 };
-use coco_mem::FsStore;
+use coco_mem::{FsStore, SessionRole};
 
 use crate::{Cli, Result, cli::SessionCreateCommand, store::open_store};
 
@@ -37,6 +37,7 @@ where
                         &request.args,
                         &request.stdin,
                         request.branch_env.as_deref(),
+                        request.session_role,
                         request.store_path_env.as_deref(),
                         &shared_store,
                         &llm,
@@ -73,6 +74,7 @@ pub async fn run_forwarded_with_services<B>(
     args: &[String],
     stdin: &[u8],
     branch_env: Option<&str>,
+    session_role: Option<SessionRole>,
     store_path_env: Option<&str>,
     shared_store: &FsStore,
     llm: &Arc<LlmService<B, FsStore>>,
@@ -80,8 +82,16 @@ pub async fn run_forwarded_with_services<B>(
 where
     B: CompletionBackend + 'static,
 {
-    runtime::run_forwarded_with_services(args, stdin, branch_env, store_path_env, shared_store, llm)
-        .await
+    runtime::run_forwarded_with_services(
+        args,
+        stdin,
+        branch_env,
+        session_role,
+        store_path_env,
+        shared_store,
+        llm,
+    )
+    .await
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

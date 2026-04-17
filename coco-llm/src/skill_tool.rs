@@ -263,6 +263,7 @@ mod tests {
     fn run_context(executor: Arc<dyn crate::SkillToolExecutor>) -> ToolRuntimeEnv {
         ToolRuntimeEnv {
             session_branch: "main".to_owned(),
+            session_role: coco_mem::SessionRole::Orchestrator,
             store_path: None,
             cli_bridge: crate::BashToolCliBridgeHandle::default(),
             skill_executor: crate::SkillToolExecutorHandle::new(executor),
