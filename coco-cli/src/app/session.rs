@@ -271,6 +271,7 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
         temperature: command.temperature,
         max_tokens: command.max_tokens,
         additional_params,
+        enable_coco_shim: false,
     })
 }
 
@@ -1050,6 +1051,7 @@ fn resolve_session_patch(command: SessionRebaseCommand) -> SessionConfigPatch {
             command.max_tokens.map(Some)
         },
         additional_params: None,
+        enable_coco_shim: None,
     }
 }
 

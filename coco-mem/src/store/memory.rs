@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use super::Store;
 use super::state::StoreState;
 use crate::StoreResult as Result;
-use crate::{Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState};
+use crate::{BuiltinSkillGroups, Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState};
 
 #[derive(Clone, Debug)]
 pub struct MemoryStore {
@@ -137,6 +137,22 @@ impl Store for MemoryStore {
         }
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
+    }
+
+    fn builtin_skill_groups(&self) -> Result<BuiltinSkillGroups> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .builtin_skill_groups())
+    }
+
+    fn seed_builtin_skill_groups(&self, groups: &BuiltinSkillGroups) -> Result<BuiltinSkillGroups> {
+        Ok(self
+            .inner
+            .write()
+            .expect("store lock poisoned")
+            .seed_builtin_skill_groups(groups))
     }
 
     fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {

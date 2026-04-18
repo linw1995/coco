@@ -15,8 +15,8 @@ use crate::error::{
     WriteStoreMetaSnafu,
 };
 use crate::{
-    Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState, StoreError,
-    StoreResult as Result,
+    BuiltinSkillGroups, Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState,
+    StoreError, StoreResult as Result,
 };
 
 const STORE_FORMAT_VERSION: u64 = 6;
@@ -24,6 +24,7 @@ const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
+const BUILTIN_SKILLS_FILE_NAME: &str = "builtin_skills.json";
 const BRANCHES_DIR_NAME: &str = "branches";
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,7 @@ pub(crate) struct Persistence {
     nodes_path: PathBuf,
     sessions_path: PathBuf,
     jobs_path: PathBuf,
+    builtin_skills_path: PathBuf,
     branches_dir: PathBuf,
 }
 
@@ -152,6 +154,10 @@ impl Persistence {
         write_jsonl_file(&branch_path, &nodes)
     }
 
+    pub fn persist_builtin_skill_groups(&self, state: &StoreState) -> Result<()> {
+        write_json_file(&self.builtin_skills_path, &state.builtin_skill_groups)
+    }
+
     fn new(path: &Path) -> Self {
         Self {
             dir: path.to_owned(),
@@ -159,6 +165,7 @@ impl Persistence {
             nodes_path: path.join(NODES_FILE_NAME),
             sessions_path: path.join(SESSIONS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
+            builtin_skills_path: path.join(BUILTIN_SKILLS_FILE_NAME),
             branches_dir: path.join(BRANCHES_DIR_NAME),
         }
     }
@@ -187,6 +194,7 @@ impl Persistence {
         write_jsonl_file(&self.nodes_path, &[root])?;
         write_json_file(&self.sessions_path, &HashMap::<String, SessionState>::new())?;
         write_json_file(&self.jobs_path, &HashMap::<String, Job>::new())?;
+        write_json_file(&self.builtin_skills_path, &BuiltinSkillGroups::default())?;
 
         Ok((self.clone(), store))
     }
@@ -305,6 +313,11 @@ impl Persistence {
         store.sessions = read_json_file::<HashMap<String, SessionState>>(&self.sessions_path)?;
         map_session_validation_error(&self.sessions_path, store.validate_session_records())?;
         store.jobs = read_json_file::<HashMap<String, Job>>(&self.jobs_path)?;
+        store.builtin_skill_groups = if self.builtin_skills_path.is_file() {
+            read_json_file::<BuiltinSkillGroups>(&self.builtin_skills_path)?
+        } else {
+            BuiltinSkillGroups::default()
+        };
 
         Ok((self.clone(), store))
     }
@@ -468,6 +481,21 @@ impl Store for FsStore {
         }
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
+    }
+
+    fn builtin_skill_groups(&self) -> Result<BuiltinSkillGroups> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .builtin_skill_groups())
+    }
+
+    fn seed_builtin_skill_groups(&self, groups: &BuiltinSkillGroups) -> Result<BuiltinSkillGroups> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let seeded = state.seed_builtin_skill_groups(groups);
+        self.persistence.persist_builtin_skill_groups(&state)?;
+        Ok(seeded)
     }
 
     fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {

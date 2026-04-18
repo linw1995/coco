@@ -2,8 +2,8 @@ use std::io::Read;
 
 use clap::Parser;
 use coco_llm::{
-    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV,
-    COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
+    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_SESSION_BRANCH_ENV,
+    COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
 };
 use coco_mem::SessionRole;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,6 +14,12 @@ use coco_cli::{Cli, run};
 #[tokio::main]
 async fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if shim_mode_is_disabled() {
+        eprintln!(
+            "coco command is not enabled for this bash session; enable the coco shim to use CoCo CLI commands."
+        );
+        std::process::exit(1);
+    }
     if let Some(socket_path) = resolve_runtime_socket(&args[1..]) {
         forward_to_runtime(&socket_path, &args[1..]).await;
     }
@@ -28,6 +34,13 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn shim_mode_is_disabled() -> bool {
+    matches!(
+        std::env::var(COCO_COMMAND_SHIM_MODE_ENV).ok().as_deref(),
+        Some("disabled")
+    )
 }
 
 fn resolve_runtime_socket(args: &[String]) -> Option<String> {

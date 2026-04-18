@@ -12,8 +12,8 @@ use crate::error::{
     PromptJobMovedSnafu, PromptJobNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
 };
 use crate::{
-    Anchor, AnchorPayload, Job, JobStatus, Kind, NewNode, Node, PauseReason, Role,
-    SessionAnchorPatch, SessionState,
+    Anchor, AnchorPayload, BuiltinSkillGroups, Job, JobStatus, Kind, NewNode, Node, PauseReason,
+    Role, SessionAnchorPatch, SessionState,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +24,7 @@ pub(crate) struct StoreState {
     pub branches: HashMap<String, String>,
     pub sessions: HashMap<String, SessionState>,
     pub jobs: HashMap<String, Job>,
+    pub builtin_skill_groups: BuiltinSkillGroups,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +69,7 @@ impl StoreState {
             branches: HashMap::new(),
             sessions: HashMap::new(),
             jobs: HashMap::new(),
+            builtin_skill_groups: BuiltinSkillGroups::default(),
         }
     }
 
@@ -83,6 +85,7 @@ impl StoreState {
             branches: HashMap::new(),
             sessions: HashMap::new(),
             jobs: HashMap::new(),
+            builtin_skill_groups: BuiltinSkillGroups::default(),
         }
     }
 
@@ -316,6 +319,17 @@ impl StoreState {
         let job = Job::new(self.next_job_id(), branch, base);
         self.jobs.insert(job.job_id.clone(), job.clone());
         Ok(job)
+    }
+
+    pub fn builtin_skill_groups(&self) -> BuiltinSkillGroups {
+        self.builtin_skill_groups.clone()
+    }
+
+    pub fn seed_builtin_skill_groups(&mut self, groups: &BuiltinSkillGroups) -> BuiltinSkillGroups {
+        if self.builtin_skill_groups.is_empty() {
+            self.builtin_skill_groups = groups.clone();
+        }
+        self.builtin_skill_groups.clone()
     }
 
     pub fn get_job(&self, job_id: &str) -> Result<Job> {

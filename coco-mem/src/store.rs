@@ -8,7 +8,10 @@ pub(crate) mod state;
 #[cfg(test)]
 mod tests;
 
-use crate::{Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState, StoreResult};
+use crate::{
+    BuiltinSkillGroups, Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState,
+    StoreResult,
+};
 
 /// Thread-safe node graph storage used by CoCo services.
 pub trait Store: Clone + Send + Sync + 'static {
@@ -63,6 +66,15 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+
+    /// Returns the persisted built-in skill template groups.
+    fn builtin_skill_groups(&self) -> StoreResult<BuiltinSkillGroups>;
+
+    /// Seeds built-in skill templates if the store does not have any yet.
+    fn seed_builtin_skill_groups(
+        &self,
+        groups: &BuiltinSkillGroups,
+    ) -> StoreResult<BuiltinSkillGroups>;
 
     /// Creates a new single-task prompt job record.
     ///

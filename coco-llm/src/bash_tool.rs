@@ -14,9 +14,9 @@ use tokio::process::Command;
 use std::os::unix::ffi::OsStrExt;
 
 use crate::{
-    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV,
-    COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse, ToolExecutionOutcome,
-    ToolInvocationContext, ToolRuntimeEnv,
+    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_SESSION_BRANCH_ENV,
+    COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
+    ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv,
 };
 
 #[derive(Debug, Clone)]
@@ -331,6 +331,12 @@ struct CocoCommandPathInjection {
     extra_allow_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CocoCommandShimMode {
+    Enabled,
+    Disabled,
+}
+
 impl Drop for CocoCommandPathInjection {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root_dir);
@@ -397,8 +403,50 @@ fn prepend_path_entry(path_env: Option<OsString>, entry: &Path) -> OsString {
     })
 }
 
+fn coco_cli_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "coco-cli.exe"
+    }
+
+    #[cfg(not(windows))]
+    {
+        "coco-cli"
+    }
+}
+
+fn resolve_coco_cli_executable() -> std::result::Result<PathBuf, BashToolError> {
+    let current_exe = std::env::current_exe().context(ResolveCurrentExeSnafu)?;
+    let current_exe = canonicalize_existing_path(&current_exe);
+    let binary_name = coco_cli_binary_name();
+
+    if current_exe
+        .file_name()
+        .is_some_and(|name| name == OsStr::new(binary_name))
+    {
+        return Ok(current_exe);
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(parent) = current_exe.parent() {
+        candidates.push(parent.join(binary_name));
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.join(binary_name));
+        }
+    }
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Ok(canonicalize_existing_path(&candidate));
+        }
+    }
+
+    Ok(current_exe)
+}
+
 fn prepare_coco_command_path_injection(
     workspace_root: &Path,
+    mode: CocoCommandShimMode,
 ) -> std::result::Result<CocoCommandPathInjection, BashToolError> {
     let runtime_root = resolve_runtime_root(workspace_root)?;
     std::fs::create_dir_all(&runtime_root).context(CreateCocoCommandShimDirSnafu)?;
@@ -407,15 +455,15 @@ fn prepare_coco_command_path_injection(
     let bin_dir = root_dir.join("bin");
     std::fs::create_dir_all(&bin_dir).context(CreateCocoCommandShimDirSnafu)?;
 
-    let current_exe = std::env::current_exe().context(ResolveCurrentExeSnafu)?;
-    let current_exe = canonicalize_existing_path(&current_exe);
+    let current_exe = resolve_coco_cli_executable()?;
     let alias_path = bin_dir.join("coco");
     create_command_alias(&current_exe, &alias_path).context(CreateCocoCommandShimSnafu {
         path: alias_path.clone(),
     })?;
 
     let mut extra_allow_paths = vec![bin_dir.clone()];
-    if let Some(parent) = current_exe.parent()
+    if matches!(mode, CocoCommandShimMode::Enabled)
+        && let Some(parent) = current_exe.parent()
         && !path_is_within_workspace(parent, workspace_root)
     {
         extra_allow_paths.push(parent.to_path_buf());
@@ -593,14 +641,33 @@ impl CocoCliRuntimeServer {
 async fn execute_bash_command(
     request: BashCommandRequest,
 ) -> std::result::Result<String, BashToolError> {
-    let coco_command = prepare_coco_command_path_injection(&request.workspace_root)?;
-    let runtime_server =
-        start_coco_cli_runtime_server(&request.workspace_root, &request.context).await?;
-    let mut extra_allow_paths = coco_command.extra_allow_paths.clone();
+    let coco_command = Some(prepare_coco_command_path_injection(
+        &request.workspace_root,
+        if request.context.enable_coco_shim {
+            CocoCommandShimMode::Enabled
+        } else {
+            CocoCommandShimMode::Disabled
+        },
+    )?);
+    let runtime_server = if request.context.enable_coco_shim {
+        start_coco_cli_runtime_server(&request.workspace_root, &request.context).await?
+    } else {
+        None
+    };
+    let mut extra_allow_paths = coco_command
+        .as_ref()
+        .map(|command| command.extra_allow_paths.clone())
+        .unwrap_or_default();
     if let Some(runtime_server) = &runtime_server {
         extra_allow_paths.push(runtime_server.socket_dir.clone());
     }
-    let execution = resolve_execution_spec(&request, None, &extra_allow_paths)?;
+    let execution = resolve_execution_spec(
+        &request,
+        coco_command
+            .as_ref()
+            .map(|command| command.path_env.as_os_str()),
+        &extra_allow_paths,
+    )?;
     let mut command = Command::new(&execution.program);
     command
         .args(&execution.args)
@@ -612,14 +679,22 @@ async fn execute_bash_command(
         .env_remove(COCO_SESSION_ROLE_ENV)
         .env_remove(COCO_STORE_PATH_ENV)
         .env_remove(COCO_CLI_RUNTIME_SOCKET_ENV)
-        .env("PATH", &coco_command.path_env)
-        .env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch);
-    command.env(COCO_SESSION_ROLE_ENV, request.context.session_role.as_str());
-    if let Some(store_path) = &request.context.store_path {
-        command.env(COCO_STORE_PATH_ENV, store_path);
-    }
-    if let Some(runtime_server) = &runtime_server {
-        command.env(COCO_CLI_RUNTIME_SOCKET_ENV, &runtime_server.socket_path);
+        .env_remove(COCO_COMMAND_SHIM_MODE_ENV);
+    if let Some(coco_command) = &coco_command {
+        command.env("PATH", &coco_command.path_env);
+        if request.context.enable_coco_shim {
+            command
+                .env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch)
+                .env(COCO_SESSION_ROLE_ENV, request.context.session_role.as_str());
+            if let Some(store_path) = &request.context.store_path {
+                command.env(COCO_STORE_PATH_ENV, store_path);
+            }
+            if let Some(runtime_server) = &runtime_server {
+                command.env(COCO_CLI_RUNTIME_SOCKET_ENV, &runtime_server.socket_path);
+            }
+        } else {
+            command.env(COCO_COMMAND_SHIM_MODE_ENV, "disabled");
+        }
     }
     let mut child = command.spawn().context(SpawnProcessSnafu)?;
 
@@ -728,10 +803,15 @@ mod tests {
     use super::*;
 
     fn test_context() -> ToolRuntimeEnv {
+        test_context_with_shim(false)
+    }
+
+    fn test_context_with_shim(enable_coco_shim: bool) -> ToolRuntimeEnv {
         ToolRuntimeEnv {
             session_branch: "main".to_owned(),
             session_role: coco_mem::SessionRole::Orchestrator,
             store_path: None,
+            enable_coco_shim,
             cli_bridge: crate::BashToolCliBridgeHandle::default(),
             skill_executor: crate::SkillToolExecutorHandle::default(),
         }
@@ -1025,12 +1105,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_runtime_injects_coco_command_into_path() {
+    async fn bash_runtime_masks_host_coco_with_injected_alias_by_default() {
         let workspace = tempfile::tempdir().unwrap();
+        let fake_bin = tempfile::tempdir().unwrap();
+        let bash_path = resolve_bash_path_locked().await;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
         let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
+        let path_env = OsString::from(fake_bin.path().as_os_str());
 
         let output = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[
+                ("COCO_BASH_SANDBOX", Some(OsStr::new("off"))),
+                ("PATH", Some(path_env.as_os_str())),
+            ],
+            || async {
+                runtime
+                    .call(format!(
+                        r#"{{"command":"command -v coco","workdir":"{}"}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("exit_status: 0"));
+        assert!(output.contains("/bin/coco"));
+    }
+
+    #[test]
+    fn disabled_coco_shim_uses_binary_alias_instead_of_script() {
+        let workspace = tempfile::tempdir().unwrap();
+        let injection =
+            prepare_coco_command_path_injection(workspace.path(), CocoCommandShimMode::Disabled)
+                .unwrap();
+        let alias_path = injection.root_dir.join("bin").join("coco");
+        let expected = resolve_coco_cli_executable().unwrap();
+
+        #[cfg(unix)]
+        {
+            assert_eq!(std::fs::read_link(&alias_path).unwrap(), expected);
+        }
+
+        #[cfg(not(unix))]
+        {
+            assert_eq!(
+                std::fs::read(&alias_path).unwrap(),
+                std::fs::read(expected).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_runtime_injects_coco_command_when_enabled() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_bin = tempfile::tempdir().unwrap();
+        let bash_path = resolve_bash_path_locked().await;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
+        let runtime = runtime_tool(
+            temp_tool(),
+            workspace.path().to_path_buf(),
+            test_context_with_shim(true),
+        );
+        let path_env = OsString::from(fake_bin.path().as_os_str());
+
+        let output = crate::with_process_env_async(
+            &[
+                ("COCO_BASH_SANDBOX", Some(OsStr::new("off"))),
+                ("PATH", Some(path_env.as_os_str())),
+            ],
             || async {
                 runtime
                     .call(format!(
@@ -1138,6 +1284,7 @@ mod tests {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Runner,
                 store_path: None,
+                enable_coco_shim: true,
                 cli_bridge: crate::BashToolCliBridgeHandle::default(),
                 skill_executor: crate::SkillToolExecutorHandle::default(),
             },
@@ -1182,6 +1329,7 @@ mod tests {
             session_branch: "draft".to_owned(),
             session_role: coco_mem::SessionRole::Runner,
             store_path: Some(runtime_store.clone()),
+            enable_coco_shim: true,
             cli_bridge: bridge,
             skill_executor: crate::SkillToolExecutorHandle::default(),
         };

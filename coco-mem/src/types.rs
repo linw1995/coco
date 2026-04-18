@@ -62,6 +62,8 @@ pub struct SessionAnchor {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
+    #[serde(default)]
+    pub enable_coco_shim: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +127,30 @@ pub struct SessionAnchorPatch {
     pub temperature: Option<Option<f64>>,
     pub max_tokens: Option<Option<u64>>,
     pub additional_params: Option<Option<Value>>,
+    pub enable_coco_shim: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuiltinSkillTemplate {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    #[serde(default)]
+    pub enable_coco_shim: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuiltinSkillGroups {
+    #[serde(default)]
+    pub orchestrator: Vec<BuiltinSkillTemplate>,
+    #[serde(default)]
+    pub runner: Vec<BuiltinSkillTemplate>,
+}
+
+impl BuiltinSkillGroups {
+    pub fn is_empty(&self) -> bool {
+        self.orchestrator.is_empty() && self.runner.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -252,6 +278,7 @@ impl SessionAnchor {
                 .additional_params
                 .clone()
                 .unwrap_or_else(|| self.additional_params.clone()),
+            enable_coco_shim: patch.enable_coco_shim.unwrap_or(self.enable_coco_shim),
         }
     }
 }
@@ -473,6 +500,7 @@ mod tests {
             temperature: Some(0.1),
             max_tokens: Some(128),
             additional_params: Some(json!({"service_tier": "default"})),
+            enable_coco_shim: false,
         }
     }
 
@@ -849,6 +877,7 @@ mod tests {
             temperature: Some(None),
             max_tokens: Some(Some(256)),
             additional_params: Some(Some(json!({"service_tier": "priority"}))),
+            enable_coco_shim: Some(true),
         });
 
         assert_eq!(updated.role, SessionRole::Runner);
@@ -859,6 +888,7 @@ mod tests {
         assert_eq!(updated.prompt, "new prompt");
         assert_eq!(updated.temperature, None);
         assert_eq!(updated.max_tokens, Some(256));
+        assert!(updated.enable_coco_shim);
         assert_eq!(
             updated.additional_params,
             Some(json!({"service_tier": "priority"}))

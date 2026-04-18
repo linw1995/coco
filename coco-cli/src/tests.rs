@@ -526,6 +526,7 @@ fn append_session_anchor(store: &impl Store, parent: &str, prompt: &str) -> Stri
                     temperature: Some(0.2),
                     max_tokens: Some(64),
                     additional_params: None,
+                    enable_coco_shim: false,
                 },
             )),
         })

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use coco_mem::SessionRole;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
@@ -12,6 +13,8 @@ pub struct SkillToolRequest {
     pub skill_description: String,
     pub skill_path: String,
     pub skill_body: String,
+    pub session_role: SessionRole,
+    pub enable_coco_shim: bool,
     pub task: Option<String>,
 }
 
@@ -36,6 +39,7 @@ pub struct SkillToolExecutionResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchSkillToolRequest {
     pub workspace_root: PathBuf,
+    pub session_role: SessionRole,
     pub query: String,
     pub limit: usize,
 }
@@ -44,6 +48,7 @@ pub struct SearchSkillToolRequest {
 pub struct UseSkillToolRequest {
     pub workspace_root: PathBuf,
     pub session_branch: String,
+    pub session_role: SessionRole,
     pub parent_tool_use_id: String,
     pub skill_name: String,
     pub task: Option<String>,

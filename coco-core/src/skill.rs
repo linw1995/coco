@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Weak;
 
 use async_trait::async_trait;
-use coco_llm::coco_mem::{Anchor, Kind, NewNode, Role, SessionAnchor, SessionRole, Store, ToolUse};
+use coco_llm::coco_mem::{
+    Anchor, BuiltinSkillGroups, Kind, NewNode, Role, SessionAnchor, SessionRole, Store, ToolUse,
+};
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
     Error as LlmError, ExecutorError, LlmService, SearchSkillToolRequest, SkillToolExecutionResult,
@@ -35,6 +37,8 @@ struct SkillEntry {
     description: String,
     path: PathBuf,
     body: String,
+    session_role: SessionRole,
+    enable_coco_shim: bool,
     search_blob: String,
 }
 
@@ -68,6 +72,17 @@ pub(crate) enum SkillError {
     InspectSkillPath {
         path: PathBuf,
         source: std::io::Error,
+    },
+
+    #[snafu(display("invalid session_role {value:?} in skill file {path:?}"))]
+    InvalidSkillSessionRole { path: PathBuf, value: String },
+
+    #[snafu(display("invalid enable_coco_shim value {value:?} in skill file {path:?}"))]
+    InvalidSkillCocoShim { path: PathBuf, value: String },
+
+    #[snafu(display("failed to load built-in skill templates from store: {source}"))]
+    LoadBuiltinSkills {
+        source: coco_llm::coco_mem::StoreError,
     },
 
     #[snafu(display("no installed skill named {name:?}"))]
@@ -142,6 +157,7 @@ where
     ) -> std::result::Result<String, ExecutorError> {
         let result = self.upgrade_engine()?.search_skills(
             &request.workspace_root,
+            request.session_role,
             &request.query,
             request.limit,
         )?;
@@ -155,7 +171,12 @@ where
         request: UseSkillToolRequest,
     ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
         let engine = self.upgrade_engine()?;
-        let skill = resolve_skill(&request.workspace_root, &request.skill_name)?;
+        let skill = resolve_skill(
+            &request.workspace_root,
+            engine.service().store(),
+            request.session_role,
+            &request.skill_name,
+        )?;
         let skill_request = SkillToolRequest {
             base_branch: request.session_branch,
             parent_tool_use_id: request.parent_tool_use_id,
@@ -163,6 +184,8 @@ where
             skill_description: skill.description,
             skill_path: skill.path.display().to_string(),
             skill_body: skill.body,
+            session_role: skill.session_role,
+            enable_coco_shim: skill.enable_coco_shim,
             task: request.task,
         };
 
@@ -208,10 +231,17 @@ where
     pub fn search_skills(
         &self,
         workspace_root: &Path,
+        session_role: SessionRole,
         query: &str,
         limit: usize,
     ) -> std::result::Result<SkillSearchResult, EngineError> {
-        let result = search_skills(workspace_root, query, limit)?;
+        let result = search_skills(
+            workspace_root,
+            self.service().store(),
+            session_role,
+            query,
+            limit,
+        )?;
         Ok(result)
     }
 
@@ -219,11 +249,17 @@ where
         &self,
         workspace_root: &Path,
         base_branch: &str,
+        session_role: SessionRole,
         parent_tool_use_id: &str,
         skill_name: &str,
         task: Option<&str>,
     ) -> std::result::Result<SkillToolExecutionResult, EngineError> {
-        let skill = resolve_skill(workspace_root, skill_name)?;
+        let skill = resolve_skill(
+            workspace_root,
+            self.service().store(),
+            session_role,
+            skill_name,
+        )?;
         let request = SkillToolRequest {
             base_branch: base_branch.to_owned(),
             parent_tool_use_id: parent_tool_use_id.to_owned(),
@@ -231,6 +267,8 @@ where
             skill_description: skill.description.clone(),
             skill_path: skill.path.display().to_string(),
             skill_body: skill.body,
+            session_role: skill.session_role,
+            enable_coco_shim: skill.enable_coco_shim,
             task: task.map(str::to_owned),
         };
         self.execute_resolved_skill(request)
@@ -255,6 +293,8 @@ where
                     child_session_anchor(
                         resolve_session_anchor(store, &request.parent_tool_use_id)?,
                         skill_execution_prompt(&request),
+                        request.session_role,
+                        request.enable_coco_shim,
                     ),
                 )),
             })
@@ -329,9 +369,14 @@ fn resolve_session_anchor<S: Store>(
         })
 }
 
-fn child_session_anchor(parent: SessionAnchor, prompt: String) -> SessionAnchor {
+fn child_session_anchor(
+    parent: SessionAnchor,
+    prompt: String,
+    session_role: SessionRole,
+    enable_coco_shim: bool,
+) -> SessionAnchor {
     SessionAnchor {
-        role: SessionRole::Runner,
+        role: session_role,
         provider: parent.provider,
         model: parent.model,
         tools: parent.tools,
@@ -340,6 +385,7 @@ fn child_session_anchor(parent: SessionAnchor, prompt: String) -> SessionAnchor 
         temperature: parent.temperature,
         max_tokens: parent.max_tokens,
         additional_params: parent.additional_params,
+        enable_coco_shim,
     }
 }
 
@@ -378,6 +424,9 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         Skill source:
         {}
 
+        Skill session role:
+        {}
+
         Skill instructions:
         {}
         ",
@@ -385,6 +434,7 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         request.base_branch,
         request.skill_description,
         request.skill_path,
+        request.session_role.as_str(),
         request.skill_body,
     );
     if let Some(task) = &request.task
@@ -451,6 +501,14 @@ fn parse_frontmatter_value(value: &str) -> String {
     value.to_owned()
 }
 
+fn parse_frontmatter_bool(value: &str) -> Option<bool> {
+    match parse_frontmatter_value(value).to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn split_frontmatter(contents: &str) -> (Option<&str>, &str) {
     let mut lines = contents.lines();
     if lines.next() != Some("---") {
@@ -478,6 +536,8 @@ fn load_skill(path: &Path) -> std::result::Result<SkillEntry, SkillError> {
 
     let mut name = None;
     let mut description = None;
+    let mut session_role = SessionRole::Runner;
+    let mut enable_coco_shim = false;
     if let Some(frontmatter) = frontmatter {
         for line in frontmatter.lines() {
             let Some((key, value)) = line.split_once(':') else {
@@ -486,6 +546,22 @@ fn load_skill(path: &Path) -> std::result::Result<SkillEntry, SkillError> {
             match key.trim() {
                 "name" => name = Some(parse_frontmatter_value(value)),
                 "description" => description = Some(parse_frontmatter_value(value)),
+                "session_role" => {
+                    let value = parse_frontmatter_value(value);
+                    session_role =
+                        SessionRole::parse(&value).context(InvalidSkillSessionRoleSnafu {
+                            path: path.to_path_buf(),
+                            value,
+                        })?;
+                }
+                "enable_coco_shim" => {
+                    let raw = parse_frontmatter_value(value);
+                    enable_coco_shim =
+                        parse_frontmatter_bool(value).context(InvalidSkillCocoShimSnafu {
+                            path: path.to_path_buf(),
+                            value: raw,
+                        })?;
+                }
                 _ => {}
             }
         }
@@ -507,8 +583,57 @@ fn load_skill(path: &Path) -> std::result::Result<SkillEntry, SkillError> {
         description,
         path: path.to_path_buf(),
         body: normalized_body,
+        session_role,
+        enable_coco_shim,
         search_blob,
     })
+}
+
+fn synthetic_builtin_skill_path(role: SessionRole, name: &str) -> PathBuf {
+    PathBuf::from(format!("store://builtin-skills/{}/{}", role.as_str(), name))
+}
+
+fn collect_builtin_skills<S: Store>(
+    store: &S,
+    session_role: SessionRole,
+) -> std::result::Result<Vec<SkillEntry>, SkillError> {
+    let groups = store
+        .builtin_skill_groups()
+        .context(LoadBuiltinSkillsSnafu)?;
+    Ok(match session_role {
+        SessionRole::Orchestrator => {
+            skill_entries_from_builtin_group(&groups, session_role, &groups.orchestrator)
+        }
+        SessionRole::Runner => {
+            skill_entries_from_builtin_group(&groups, session_role, &groups.runner)
+        }
+    })
+}
+
+fn skill_entries_from_builtin_group(
+    _groups: &BuiltinSkillGroups,
+    role: SessionRole,
+    templates: &[coco_llm::coco_mem::BuiltinSkillTemplate],
+) -> Vec<SkillEntry> {
+    templates
+        .iter()
+        .map(|template| {
+            let search_blob = format!(
+                "{}\n{}\n{}",
+                template.name, template.description, template.body
+            )
+            .to_ascii_lowercase();
+            SkillEntry {
+                name: template.name.clone(),
+                description: template.description.clone(),
+                path: synthetic_builtin_skill_path(role, &template.name),
+                body: template.body.clone(),
+                session_role: role,
+                enable_coco_shim: template.enable_coco_shim,
+                search_blob,
+            }
+        })
+        .collect()
 }
 
 fn collect_skills_from_dir(
@@ -546,12 +671,17 @@ fn collect_skills_from_dir(
     Ok(())
 }
 
-fn collect_skills(workspace_root: &Path) -> std::result::Result<Vec<SkillEntry>, SkillError> {
+fn collect_skills<S: Store>(
+    workspace_root: &Path,
+    store: &S,
+    session_role: SessionRole,
+) -> std::result::Result<Vec<SkillEntry>, SkillError> {
     let roots = configured_skill_roots(workspace_root)?;
     let mut skills = Vec::new();
     for root in roots {
         collect_skills_from_dir(&root, &mut skills)?;
     }
+    skills.extend(collect_builtin_skills(store, session_role)?);
     skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
     Ok(skills)
 }
@@ -590,10 +720,12 @@ fn score_skill(skill: &SkillEntry, query: &str) -> usize {
 
 fn search_skills(
     workspace_root: &Path,
+    store: &impl Store,
+    session_role: SessionRole,
     query: &str,
     limit: usize,
 ) -> std::result::Result<SkillSearchResult, SkillError> {
-    let mut matches = collect_skills(workspace_root)?
+    let mut matches = collect_skills(workspace_root, store, session_role)?
         .into_iter()
         .filter_map(|skill| {
             let score = score_skill(&skill, query);
@@ -621,8 +753,13 @@ fn search_skills(
     })
 }
 
-fn resolve_skill(workspace_root: &Path, name: &str) -> std::result::Result<SkillEntry, SkillError> {
-    let matches = collect_skills(workspace_root)?
+fn resolve_skill(
+    workspace_root: &Path,
+    store: &impl Store,
+    session_role: SessionRole,
+    name: &str,
+) -> std::result::Result<SkillEntry, SkillError> {
+    let matches = collect_skills(workspace_root, store, session_role)?
         .into_iter()
         .filter(|skill| skill.name == name)
         .collect::<Vec<_>>();
@@ -701,6 +838,8 @@ mod tests {
             skill_description: "Find relevant skills.".to_owned(),
             skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
             skill_body: "# Find Skills".to_owned(),
+            session_role: SessionRole::Runner,
+            enable_coco_shim: true,
             task: Some("Search the ecosystem".to_owned()),
         });
 
@@ -708,6 +847,7 @@ mod tests {
         assert!(prompt.contains("forked from `main`"));
         assert!(prompt.contains("Skill description:\nFind relevant skills."));
         assert!(prompt.contains("Skill source:\n/tmp/find-skills/SKILL.md"));
+        assert!(prompt.contains("Skill session role:\nrunner"));
         assert!(prompt.contains("Skill instructions:\n# Find Skills"));
         assert!(prompt.contains("Additional task from caller:\nSearch the ecosystem"));
     }
@@ -721,6 +861,8 @@ mod tests {
             skill_description: "Find relevant skills.".to_owned(),
             skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
             skill_body: "# Find Skills".to_owned(),
+            session_role: SessionRole::Runner,
+            enable_coco_shim: false,
             task: Some("   ".to_owned()),
         });
 
@@ -753,10 +895,19 @@ description: "Review Rust changes."
 "#,
         );
         let path_env = std::env::join_paths([root.path()]).unwrap();
+        let store = coco_llm::coco_mem::MemoryStore::new();
 
         let result = with_env_async(
             &[("COCO_SKILLS_DIRS", Some(path_env.as_os_str()))],
-            || async { search_skills(root.path(), "openai docs", 1) },
+            || async {
+                search_skills(
+                    root.path(),
+                    &store,
+                    SessionRole::Orchestrator,
+                    "openai docs",
+                    1,
+                )
+            },
         )
         .await
         .unwrap();
@@ -792,10 +943,18 @@ description: "Second copy."
 "#,
         );
         let path_env = std::env::join_paths([first_root.path(), second_root.path()]).unwrap();
+        let store = coco_llm::coco_mem::MemoryStore::new();
 
         let error = with_env_async(
             &[("COCO_SKILLS_DIRS", Some(path_env.as_os_str()))],
-            || async { resolve_skill(first_root.path(), "shared-skill") },
+            || async {
+                resolve_skill(
+                    first_root.path(),
+                    &store,
+                    SessionRole::Orchestrator,
+                    "shared-skill",
+                )
+            },
         )
         .await
         .unwrap_err();
@@ -815,5 +974,44 @@ description: "Second copy."
         .unwrap_err();
 
         assert!(matches!(error, SkillError::ResolveConfiguredRoot { .. }));
+    }
+
+    #[test]
+    fn collect_builtin_skills_only_returns_templates_for_current_session_role() {
+        let store = coco_llm::coco_mem::MemoryStore::new();
+        store
+            .seed_builtin_skill_groups(&BuiltinSkillGroups {
+                orchestrator: vec![coco_llm::coco_mem::BuiltinSkillTemplate {
+                    name: "coco-orchestrator".to_owned(),
+                    description: "orchestrator".to_owned(),
+                    body: "body".to_owned(),
+                    enable_coco_shim: true,
+                }],
+                runner: vec![coco_llm::coco_mem::BuiltinSkillTemplate {
+                    name: "coco-runner".to_owned(),
+                    description: "runner".to_owned(),
+                    body: "body".to_owned(),
+                    enable_coco_shim: true,
+                }],
+            })
+            .unwrap();
+
+        let runner = collect_builtin_skills(&store, SessionRole::Runner).unwrap();
+        let orchestrator = collect_builtin_skills(&store, SessionRole::Orchestrator).unwrap();
+
+        assert_eq!(
+            runner
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["coco-runner"]
+        );
+        assert_eq!(
+            orchestrator
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["coco-orchestrator"]
+        );
     }
 }

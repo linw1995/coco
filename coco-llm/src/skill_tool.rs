@@ -102,6 +102,7 @@ pub fn run_runtime_tool(
 
 fn parse_search_request(
     workspace_root: PathBuf,
+    session_role: coco_mem::SessionRole,
     args: Value,
 ) -> std::result::Result<SearchSkillToolRequest, SkillToolError> {
     let object = args.as_object().context(InvalidInputTypeSnafu)?;
@@ -119,6 +120,7 @@ fn parse_search_request(
 
     Ok(SearchSkillToolRequest {
         workspace_root,
+        session_role,
         query,
         limit,
     })
@@ -127,6 +129,7 @@ fn parse_search_request(
 fn parse_use_request(
     workspace_root: PathBuf,
     session_branch: String,
+    session_role: coco_mem::SessionRole,
     parent_tool_use_id: String,
     args: Value,
 ) -> std::result::Result<UseSkillToolRequest, SkillToolError> {
@@ -148,6 +151,7 @@ fn parse_use_request(
     Ok(UseSkillToolRequest {
         workspace_root,
         session_branch,
+        session_role,
         parent_tool_use_id,
         skill_name,
         task,
@@ -176,7 +180,7 @@ impl SkillToolRuntime {
 
         match kind {
             SkillToolKind::Search => {
-                let request = parse_search_request(workspace_root, args)?;
+                let request = parse_search_request(workspace_root, context.session_role, args)?;
                 let output = context.skill_executor.search_skill_tool(request).await?;
                 Ok(ToolExecutionOutcome::tool_result(output))
             }
@@ -187,6 +191,7 @@ impl SkillToolRuntime {
                 let request = parse_use_request(
                     workspace_root,
                     context.session_branch.clone(),
+                    context.session_role,
                     parent_tool_use_id,
                     args,
                 )?;
@@ -265,6 +270,7 @@ mod tests {
             session_branch: "main".to_owned(),
             session_role: coco_mem::SessionRole::Orchestrator,
             store_path: None,
+            enable_coco_shim: false,
             cli_bridge: crate::BashToolCliBridgeHandle::default(),
             skill_executor: crate::SkillToolExecutorHandle::new(executor),
         }
@@ -338,6 +344,10 @@ mod tests {
         assert_eq!(value["skills"][0]["name"], "openai-docs");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].workspace_root, workspace_root);
+        assert_eq!(
+            requests[0].session_role,
+            coco_mem::SessionRole::Orchestrator
+        );
         assert_eq!(requests[0].query, "openai docs");
         assert_eq!(requests[0].limit, 1);
     }
@@ -385,6 +395,10 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].workspace_root, workspace_root);
         assert_eq!(requests[0].session_branch, "main");
+        assert_eq!(
+            requests[0].session_role,
+            coco_mem::SessionRole::Orchestrator
+        );
         assert_eq!(requests[0].parent_tool_use_id, "tool-use-node");
         assert_eq!(requests[0].skill_name, "find-skills");
         assert_eq!(requests[0].task.as_deref(), Some("Search the ecosystem"));

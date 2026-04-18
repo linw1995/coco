@@ -212,6 +212,7 @@ fn session_config(branch: &str) -> SessionConfig {
         temperature: None,
         max_tokens: None,
         additional_params: None,
+        enable_coco_shim: false,
     }
 }
 
@@ -730,6 +731,7 @@ description: "Review Rust changes."
                 .execute_skill(
                     root.path(),
                     "main",
+                    SessionRole::Orchestrator,
                     &tool_use_id,
                     "fast-rust",
                     Some("Review the change"),
@@ -816,7 +818,14 @@ description: "Review Rust changes."
         &[("COCO_SKILLS_DIRS", Some(path_env.as_os_str()))],
         || async {
             engine
-                .execute_skill(root.path(), "main", &tool_use_id, "fast-rust", None)
+                .execute_skill(
+                    root.path(),
+                    "main",
+                    SessionRole::Orchestrator,
+                    &tool_use_id,
+                    "fast-rust",
+                    None,
+                )
                 .await
         },
     )

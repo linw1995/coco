@@ -15,9 +15,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, BackendMetadata, ExecutionMetadata, Kind, MemoryStore, NewNode,
-    PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionState,
-    SkillResultAnchor, Store, StoreError, Tool, ToolResult, ToolUse,
+    Anchor, AnchorPayload, BackendMetadata, BuiltinSkillGroups, BuiltinSkillTemplate,
+    ExecutionMetadata, Kind, MemoryStore, NewNode, PauseReason, PromptAnchor, ProviderMetadata,
+    Role, SessionAnchor, SessionRole, SessionState, SkillResultAnchor, Store, StoreError, Tool,
+    ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,10 +36,72 @@ pub use coco_mem::SessionAnchorPatch as SessionConfigPatch;
 pub use runtime_bridge::LlmRuntimeBridge;
 pub use tool_definition::builtin_tool_definition;
 
+fn default_builtin_skill_groups() -> BuiltinSkillGroups {
+    BuiltinSkillGroups {
+        orchestrator: vec![BuiltinSkillTemplate {
+            name: "coco-orchestrator".to_owned(),
+            description: "Guide an orchestrator session through CoCo branch and prompt workflows."
+                .to_owned(),
+            body: indoc::indoc! {r#"
+# CoCo Orchestrator Workflow
+
+Use the injected `coco` command through `bash` whenever you need branch-aware session workflow control.
+
+Useful commands:
+- `coco session list`
+- `coco session get --branch <branch>`
+- `coco session show <ref>`
+- `coco session fork --branch <branch> --from-ref <ref>`
+- `coco session pr --branch <branch> --target-branch <branch>`
+- `coco session feedback --branch <branch> --prompt "<text>"`
+- `coco session merge --branch <branch> --target-branch <branch> --prompt "<text>"`
+- `coco prompt --branch <branch> "<text>"`
+- `coco prompt status --job <job>`
+- `coco prompt branch-status --job <job> --branch <branch>`
+
+Guidelines:
+- Prefer `coco` over editing store files directly.
+- Use orchestrator sessions for coordination, branching, and merge decisions.
+- Hand off bounded implementation work to runner sessions when orchestration is no longer needed.
+"#}
+            .trim()
+            .to_owned(),
+            enable_coco_shim: true,
+        }],
+        runner: vec![BuiltinSkillTemplate {
+            name: "coco-runner".to_owned(),
+            description: "Guide a runner session through the CoCo commands available in runner scope."
+                .to_owned(),
+            body: indoc::indoc! {r#"
+# CoCo Runner Workflow
+
+Use the injected `coco` command through `bash` for runner-safe visibility and status inspection.
+
+Useful commands:
+- `coco session list`
+- `coco session get --branch <branch>`
+- `coco session graph`
+- `coco session show <ref>`
+- `coco prompt status --job <job>`
+- `coco prompt branch-status --job <job> --branch <branch>`
+
+Guidelines:
+- Runner-scoped `coco` is read-oriented and intentionally hides write entrypoints.
+- Use runner sessions for isolated execution, inspection, and handoff preparation.
+- If you need workflow mutations such as create, merge, feedback, or prompt submission, hand back to an orchestrator session.
+"#}
+            .trim()
+            .to_owned(),
+            enable_coco_shim: true,
+        }],
+    }
+}
+
 pub const COCO_SESSION_BRANCH_ENV: &str = "COCO_BRANCH";
 pub const COCO_SESSION_ROLE_ENV: &str = "COCO_SESSION_ROLE";
 pub const COCO_STORE_PATH_ENV: &str = "COCO_STORE_PATH";
 pub const COCO_CLI_RUNTIME_SOCKET_ENV: &str = "COCO_CLI_RUNTIME_SOCKET";
+pub const COCO_COMMAND_SHIM_MODE_ENV: &str = "COCO_COMMAND_SHIM_MODE";
 
 pub type CompletionMessage = rig::completion::message::Message;
 pub type CompletionToolCall = rig::completion::message::ToolCall;
@@ -136,6 +199,7 @@ pub struct SessionConfig {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
+    pub enable_coco_shim: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +318,7 @@ pub struct SessionModelConfig {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
+    pub enable_coco_shim: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -561,6 +626,7 @@ pub struct ToolRuntimeEnv {
     pub session_branch: String,
     pub session_role: SessionRole,
     pub store_path: Option<PathBuf>,
+    pub enable_coco_shim: bool,
     pub cli_bridge: BashToolCliBridgeHandle,
     pub skill_executor: SkillToolExecutorHandle,
 }
@@ -572,6 +638,7 @@ impl std::fmt::Debug for ToolRuntimeEnv {
             .field("session_branch", &self.session_branch)
             .field("session_role", &self.session_role)
             .field("store_path", &self.store_path)
+            .field("enable_coco_shim", &self.enable_coco_shim)
             .field("cli_bridge", &self.cli_bridge)
             .field("skill_executor", &self.skill_executor)
             .finish()
@@ -923,6 +990,13 @@ where
 
     pub async fn create_session(&self, config: SessionConfig) -> Result<BranchSession> {
         let _guard = self.lock_branch(&config.branch).await;
+        // TODO: Seed built-in skills during store open or via store metadata versioning.
+        // Existing stores upgraded in place currently learn about these templates only after
+        // create_session runs. We should add an explicit upgrade prompt or versioned migration
+        // path so resumed sessions can discover built-ins immediately.
+        self.store
+            .seed_builtin_skill_groups(&default_builtin_skill_groups())
+            .context(MemorySnafu)?;
         let root_id = self.store.root_id();
         let merge_parents = config
             .merge_parents
@@ -958,6 +1032,7 @@ where
                         temperature: config.temperature,
                         max_tokens: config.max_tokens,
                         additional_params: config.additional_params,
+                        enable_coco_shim: config.enable_coco_shim,
                     },
                 )),
             })
@@ -1586,6 +1661,7 @@ where
                 temperature: context.session_anchor.temperature,
                 max_tokens: context.session_anchor.max_tokens,
                 additional_params: context.session_anchor.additional_params.clone(),
+                enable_coco_shim: context.session_anchor.enable_coco_shim,
             },
             conversation,
             provider_history: rig_messages_from_tracked_entries(&tracked_entries),
@@ -1593,6 +1669,7 @@ where
                 session_branch: branch.to_owned(),
                 session_role: context.session_anchor.role,
                 store_path: self.store.runtime_store_path(),
+                enable_coco_shim: context.session_anchor.enable_coco_shim,
                 cli_bridge: self.runtime.bash_tool_cli_bridge.clone(),
                 skill_executor: self.runtime.skill_tool_executor.clone(),
             },
@@ -3055,6 +3132,7 @@ mod tests {
             temperature: Some(0.2),
             max_tokens: Some(64),
             additional_params: None,
+            enable_coco_shim: false,
         }
     }
 
@@ -3086,6 +3164,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             additional_params: None,
+            enable_coco_shim: None,
         }
     }
 
@@ -3271,6 +3350,7 @@ mod tests {
                 temperature: Some(0.2),
                 max_tokens: Some(64),
                 additional_params: None,
+                enable_coco_shim: false,
             })
             .await
             .unwrap();
@@ -4817,6 +4897,7 @@ mod tests {
                 session_branch: "main".to_owned(),
                 session_role: SessionRole::Orchestrator,
                 store_path: None,
+                enable_coco_shim: false,
                 cli_bridge: BashToolCliBridgeHandle::default(),
                 skill_executor: SkillToolExecutorHandle::default(),
             },
