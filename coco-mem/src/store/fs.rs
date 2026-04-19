@@ -4,6 +4,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+#[cfg(test)]
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
@@ -48,6 +51,8 @@ pub(crate) struct Persistence {
     skills_path: PathBuf,
     skill_history_dir: PathBuf,
     branches_dir: PathBuf,
+    #[cfg(test)]
+    failpoints: Arc<Mutex<SkillPersistenceFailpoints>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +96,19 @@ struct SkillHistoryEntry {
 enum SkillHistoryScope {
     Shared,
     Role(SessionRole),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillPersistenceFailpoint {
+    NextHistoryAppend,
+    NextSnapshotWrite,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SkillPersistenceFailpoints {
+    next: Option<SkillPersistenceFailpoint>,
 }
 
 impl PersistedSkillRecord {
@@ -165,6 +183,50 @@ impl SkillHistoryScope {
 }
 
 impl Persistence {
+    #[cfg(test)]
+    fn arm_failpoint(&self, failpoint: SkillPersistenceFailpoint) {
+        self.failpoints
+            .lock()
+            .expect("failpoint lock poisoned")
+            .next = Some(failpoint);
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_skill_history_append(&self, path: &Path) -> Result<()> {
+        let mut failpoints = self.failpoints.lock().expect("failpoint lock poisoned");
+        if failpoints.next == Some(SkillPersistenceFailpoint::NextHistoryAppend) {
+            failpoints.next = None;
+            return Err(StoreError::WriteStoreLog {
+                path: path.to_owned(),
+                source: std::io::Error::other("injected skill history append failure"),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_skill_snapshot_write(&self) -> Result<()> {
+        let mut failpoints = self.failpoints.lock().expect("failpoint lock poisoned");
+        if failpoints.next == Some(SkillPersistenceFailpoint::NextSnapshotWrite) {
+            failpoints.next = None;
+            return Err(StoreError::WriteStoreMeta {
+                path: self.skills_path.clone(),
+                source: std::io::Error::other("injected skill snapshot write failure"),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn maybe_fail_skill_history_append(&self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn maybe_fail_skill_snapshot_write(&self) -> Result<()> {
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, StoreState)> {
         let persistence = Self::new(path.as_ref());
         if !persistence.dir.exists() {
@@ -269,52 +331,27 @@ impl Persistence {
     }
 
     pub fn persist_skill_groups(&self, state: &StoreState) -> Result<()> {
+        self.maybe_fail_skill_snapshot_write()?;
         write_json_file(
             &self.skills_path,
             &PersistedSkillGroups::from_groups(&state.skill_groups),
         )
     }
 
-    pub fn persist_skill_history_for_name(&self, groups: &SkillGroups, name: &str) -> Result<()> {
+    pub fn append_skill_history_entry(
+        &self,
+        groups: &SkillGroups,
+        role: SessionRole,
+        name: &str,
+        version: &SkillVersion,
+    ) -> Result<()> {
         self.create_skill_history_directories()?;
-
-        let shared = skill_name_is_shared(groups, name);
-        let target_path = self.skill_history_path(
-            name,
-            if shared {
-                None
-            } else {
-                find_skill_role(groups, name)
-            },
-        );
-        let mut entries = Vec::new();
-        for (role, records) in [
-            (SessionRole::Orchestrator, &groups.orchestrator),
-            (SessionRole::Runner, &groups.runner),
-        ] {
-            if let Some(record) = records.get(name) {
-                entries.extend(
-                    record
-                        .versions
-                        .values()
-                        .map(|version| SkillHistoryEntry::from_version(role, name, version)),
-                );
-            }
-        }
-        entries.sort_by(|left, right| {
-            left.version
-                .cmp(&right.version)
-                .then_with(|| left.role.as_str().cmp(right.role.as_str()))
-                .then_with(|| left.created_at.cmp(&right.created_at))
-        });
-
-        for path in self.skill_history_candidate_paths(name) {
-            if path != target_path && path.exists() {
-                fs::remove_file(&path).context(WriteStoreDirectorySnafu { path })?;
-            }
-        }
-
-        write_jsonl_file(&target_path, &entries)
+        let target_path = self.consolidate_skill_history_paths(groups, name)?;
+        self.maybe_fail_skill_history_append(&target_path)?;
+        append_jsonl_record_create(
+            &target_path,
+            &SkillHistoryEntry::from_version(role, name, version),
+        )
     }
 
     pub fn rewrite_skill_history(&self, groups: &SkillGroups) -> Result<()> {
@@ -366,6 +403,8 @@ impl Persistence {
             skills_path: path.join(SKILLS_FILE_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
             branches_dir: path.join(BRANCHES_DIR_NAME),
+            #[cfg(test)]
+            failpoints: Arc::new(Mutex::new(SkillPersistenceFailpoints::default())),
         }
     }
 
@@ -408,6 +447,64 @@ impl Persistence {
             self.skill_history_path(skill_name, Some(SessionRole::Orchestrator)),
             self.skill_history_path(skill_name, Some(SessionRole::Runner)),
         ]
+    }
+
+    fn list_skill_history_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        for scope in [
+            SkillHistoryScope::Shared,
+            SkillHistoryScope::Role(SessionRole::Orchestrator),
+            SkillHistoryScope::Role(SessionRole::Runner),
+        ] {
+            let dir = self.skill_history_scope_dir(scope);
+            let entries =
+                fs::read_dir(&dir).context(WriteStoreDirectorySnafu { path: dir.clone() })?;
+            for entry in entries {
+                let entry = entry.context(WriteStoreDirectorySnafu { path: dir.clone() })?;
+                let path = entry.path();
+                ensure!(
+                    path.is_file(),
+                    CorruptedStoreSnafu {
+                        path: path.clone(),
+                        message: "skill history entry must be a file".to_owned(),
+                    }
+                );
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn consolidate_skill_history_paths(&self, groups: &SkillGroups, name: &str) -> Result<PathBuf> {
+        let target_path = self.skill_history_path(
+            name,
+            if skill_name_is_shared(groups, name) {
+                None
+            } else {
+                find_skill_role(groups, name)
+            },
+        );
+        let existing_paths = self
+            .skill_history_candidate_paths(name)
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        let requires_consolidation = existing_paths.iter().any(|path| *path != target_path);
+        if !requires_consolidation {
+            return Ok(target_path);
+        }
+
+        let entries = read_skill_history_entries(&existing_paths)?;
+        write_jsonl_file(&target_path, &entries)?;
+
+        for path in existing_paths {
+            if path != target_path {
+                fs::remove_file(&path).context(WriteStoreDirectorySnafu { path })?;
+            }
+        }
+
+        Ok(target_path)
     }
 
     fn initialize(&self) -> Result<(Self, StoreState)> {
@@ -579,6 +676,10 @@ impl Persistence {
             self.rewrite_skill_history(&store.skill_groups)?;
         } else {
             store.skill_groups = load_skill_groups_from_history(self, &skill_groups)?;
+            let recovered = PersistedSkillGroups::from_groups(&store.skill_groups);
+            if recovered != skill_groups {
+                let _ = write_json_file(&self.skills_path, &recovered);
+            }
         }
 
         Ok((self.clone(), store))
@@ -597,100 +698,176 @@ fn load_skill_groups_from_history(
     persistence: &Persistence,
     current: &PersistedSkillGroups,
 ) -> Result<SkillGroups> {
+    let history = load_skill_history_records(persistence)?;
+    validate_skill_snapshots(current, &history)?;
+    Ok(history)
+}
+
+fn load_skill_history_records(persistence: &Persistence) -> Result<SkillGroups> {
+    let mut orchestrator = BTreeMap::<String, Vec<(PathBuf, SkillHistoryEntry)>>::new();
+    let mut runner = BTreeMap::<String, Vec<(PathBuf, SkillHistoryEntry)>>::new();
+    for path in persistence.list_skill_history_paths()? {
+        let entries = read_jsonl_file::<SkillHistoryEntry>(&path)?;
+        for entry in entries {
+            let records = match entry.role {
+                SessionRole::Orchestrator => &mut orchestrator,
+                SessionRole::Runner => &mut runner,
+            };
+            records
+                .entry(entry.name.clone())
+                .or_default()
+                .push((path.clone(), entry));
+        }
+    }
+
     Ok(SkillGroups {
-        orchestrator: load_role_skill_records(persistence, SessionRole::Orchestrator, current)?,
-        runner: load_role_skill_records(persistence, SessionRole::Runner, current)?,
+        orchestrator: build_skill_records_for_role(SessionRole::Orchestrator, orchestrator)?,
+        runner: build_skill_records_for_role(SessionRole::Runner, runner)?,
     })
 }
 
-fn load_role_skill_records(
-    persistence: &Persistence,
-    role: SessionRole,
-    current: &PersistedSkillGroups,
-) -> Result<BTreeMap<String, SkillRecord>> {
-    let records = match role {
-        SessionRole::Orchestrator => &current.orchestrator,
-        SessionRole::Runner => &current.runner,
-    };
-    records
-        .iter()
-        .map(|(name, current_record)| {
-            let path = persistence.skill_history_path(
-                name,
-                if skill_name_is_shared_in_current(current, name) {
-                    None
-                } else {
-                    Some(role)
-                },
+fn validate_skill_snapshots(current: &PersistedSkillGroups, history: &SkillGroups) -> Result<()> {
+    for (role, records) in [
+        (SessionRole::Orchestrator, &current.orchestrator),
+        (SessionRole::Runner, &current.runner),
+    ] {
+        for (name, snapshot) in records {
+            let record = history
+                .for_role(role)
+                .get(name)
+                .context(CorruptedStoreSnafu {
+                    path: PathBuf::from(SKILL_HISTORY_DIR_NAME),
+                    message: format!("missing skill history for {:?} role {:?}", name, role),
+                })?;
+            let persisted_current =
+                record
+                    .versions
+                    .get(&snapshot.current_version)
+                    .context(CorruptedStoreSnafu {
+                        path: PathBuf::from(SKILL_HISTORY_DIR_NAME),
+                        message: format!(
+                            "missing current skill version {} for {:?} role {:?}",
+                            snapshot.current_version, snapshot.name, role
+                        ),
+                    })?;
+            ensure!(
+                persisted_current.created_at == snapshot.created_at
+                    && persisted_current.description == snapshot.description
+                    && persisted_current.body == snapshot.body
+                    && persisted_current.enable_coco_shim == snapshot.enable_coco_shim,
+                CorruptedStoreSnafu {
+                    path: PathBuf::from(SKILL_HISTORY_DIR_NAME),
+                    message: format!(
+                        "current skill snapshot mismatch for {:?} role {:?}",
+                        snapshot.name, role
+                    ),
+                }
             );
-            let entries = read_jsonl_file::<SkillHistoryEntry>(&path)?;
-            let record = skill_record_from_history(&path, role, current_record, &entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn build_skill_records_for_role(
+    role: SessionRole,
+    grouped: BTreeMap<String, Vec<(PathBuf, SkillHistoryEntry)>>,
+) -> Result<BTreeMap<String, SkillRecord>> {
+    grouped
+        .iter()
+        .map(|(name, entries)| {
+            let record = skill_record_from_history(role, name, entries)?;
             Ok((name.clone(), record))
         })
         .collect()
 }
 
 fn skill_record_from_history(
-    path: &Path,
     role: SessionRole,
-    current: &PersistedSkillRecord,
-    entries: &[SkillHistoryEntry],
+    name: &str,
+    entries: &[(PathBuf, SkillHistoryEntry)],
 ) -> Result<SkillRecord> {
     let mut versions = BTreeMap::new();
-    for entry in entries
-        .iter()
-        .filter(|entry| entry.role == role && entry.name == current.name)
-    {
+    let mut source_path = None;
+    for (path, entry) in entries {
+        source_path.get_or_insert_with(|| path.clone());
         ensure!(
             versions
                 .insert(entry.version, entry.clone().into_version())
                 .is_none(),
             CorruptedStoreSnafu {
-                path: path.to_owned(),
+                path: path.clone(),
                 message: format!(
                     "duplicate history version {} for skill {:?} role {:?}",
-                    entry.version, current.name, role
+                    entry.version, name, role
                 ),
             }
         );
     }
-
-    let persisted_current =
-        versions
-            .get(&current.current_version)
-            .context(CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!(
-                    "missing current skill version {} for {:?} role {:?}",
-                    current.current_version, current.name, role
-                ),
-            })?;
+    let path = source_path.unwrap_or_else(|| PathBuf::from(SKILL_HISTORY_DIR_NAME));
     ensure!(
-        persisted_current.created_at == current.created_at
-            && persisted_current.description == current.description
-            && persisted_current.body == current.body
-            && persisted_current.enable_coco_shim == current.enable_coco_shim,
+        !versions.is_empty(),
         CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!(
-                "current skill snapshot mismatch for {:?} role {:?}",
-                current.name, role
-            ),
+            path: path.clone(),
+            message: format!("empty skill history for {:?} role {:?}", name, role),
         }
     );
+    let mut expected_version = 1;
+    for version in versions.keys().copied() {
+        ensure!(
+            version == expected_version,
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "non-contiguous history version {} for skill {:?} role {:?}, expected {}",
+                    version, name, role, expected_version
+                ),
+            }
+        );
+        expected_version += 1;
+    }
+    let current_version = versions
+        .keys()
+        .next_back()
+        .copied()
+        .expect("versions checked non-empty");
 
     Ok(SkillRecord {
-        name: current.name.clone(),
-        current_version: current.current_version,
+        name: name.to_owned(),
+        current_version,
         versions,
     })
 }
 
-fn skill_name_is_shared(groups: &SkillGroups, name: &str) -> bool {
-    groups.orchestrator.contains_key(name) && groups.runner.contains_key(name)
+fn read_skill_history_entries(paths: &[PathBuf]) -> Result<Vec<SkillHistoryEntry>> {
+    let mut entries = Vec::new();
+    let mut seen = BTreeMap::<String, PathBuf>::new();
+    for path in paths {
+        for entry in read_jsonl_file::<SkillHistoryEntry>(path)? {
+            let key = format!("{}:{}:{}", entry.role.as_str(), entry.name, entry.version);
+            if let Some(previous_path) = seen.insert(key.clone(), path.clone()) {
+                return CorruptedStoreSnafu {
+                    path: path.clone(),
+                    message: format!(
+                        "duplicate history entry {key:?} across {:?} and {:?}",
+                        previous_path, path
+                    ),
+                }
+                .fail();
+            }
+            entries.push(entry);
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.role.as_str().cmp(right.role.as_str()))
+            .then_with(|| left.version.cmp(&right.version))
+            .then_with(|| left.created_at.cmp(&right.created_at))
+    });
+    Ok(entries)
 }
 
-fn skill_name_is_shared_in_current(groups: &PersistedSkillGroups, name: &str) -> bool {
+fn skill_name_is_shared(groups: &SkillGroups, name: &str) -> bool {
     groups.orchestrator.contains_key(name) && groups.runner.contains_key(name)
 }
 
@@ -720,6 +897,18 @@ impl FsStore {
     #[cfg(test)]
     pub(crate) fn snapshot_state(&self) -> StoreState {
         self.inner.read().expect("store lock poisoned").clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_skill_history_append(&self) {
+        self.persistence
+            .arm_failpoint(SkillPersistenceFailpoint::NextHistoryAppend);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_skill_snapshot_write(&self) {
+        self.persistence
+            .arm_failpoint(SkillPersistenceFailpoint::NextSnapshotWrite);
     }
 }
 
@@ -886,10 +1075,20 @@ impl Store for FsStore {
         spec: SkillVersionSpec,
     ) -> Result<SkillRecord> {
         let mut state = self.inner.write().expect("store lock poisoned");
-        let created = state.add_skill(role, name, spec)?;
-        self.persistence.persist_skill_groups(&state)?;
-        self.persistence
-            .persist_skill_history_for_name(&state.skill_groups, &created.name)?;
+        let mut temp = state.clone();
+        let created = temp.add_skill(role, name, spec)?;
+        let version = created
+            .current()
+            .expect("created skill should have a current version")
+            .clone();
+        self.persistence.append_skill_history_entry(
+            &temp.skill_groups,
+            role,
+            &created.name,
+            &version,
+        )?;
+        let _ = self.persistence.persist_skill_groups(&temp);
+        state.skill_groups = temp.skill_groups;
         Ok(created)
     }
 
@@ -900,10 +1099,20 @@ impl Store for FsStore {
         patch: &SkillUpdatePatch,
     ) -> Result<SkillRecord> {
         let mut state = self.inner.write().expect("store lock poisoned");
-        let updated = state.update_skill(role, name, patch)?;
-        self.persistence.persist_skill_groups(&state)?;
-        self.persistence
-            .persist_skill_history_for_name(&state.skill_groups, &updated.name)?;
+        let mut temp = state.clone();
+        let updated = temp.update_skill(role, name, patch)?;
+        let version = updated
+            .current()
+            .expect("updated skill should have a current version")
+            .clone();
+        self.persistence.append_skill_history_entry(
+            &temp.skill_groups,
+            role,
+            &updated.name,
+            &version,
+        )?;
+        let _ = self.persistence.persist_skill_groups(&temp);
+        state.skill_groups = temp.skill_groups;
         Ok(updated)
     }
 
@@ -914,10 +1123,20 @@ impl Store for FsStore {
         target_version: u64,
     ) -> Result<SkillRecord> {
         let mut state = self.inner.write().expect("store lock poisoned");
-        let updated = state.rollback_skill(role, name, target_version)?;
-        self.persistence.persist_skill_groups(&state)?;
-        self.persistence
-            .persist_skill_history_for_name(&state.skill_groups, &updated.name)?;
+        let mut temp = state.clone();
+        let updated = temp.rollback_skill(role, name, target_version)?;
+        let version = updated
+            .current()
+            .expect("rolled back skill should have a current version")
+            .clone();
+        self.persistence.append_skill_history_entry(
+            &temp.skill_groups,
+            role,
+            &updated.name,
+            &version,
+        )?;
+        let _ = self.persistence.persist_skill_groups(&temp);
+        state.skill_groups = temp.skill_groups;
         Ok(updated)
     }
 
@@ -1112,6 +1331,29 @@ where
     T: Serialize,
 {
     let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .context(WriteStoreLogSnafu {
+            path: path.to_owned(),
+        })?;
+    serde_json::to_writer(&mut file, value).context(SerializeStoreRecordSnafu {
+        path: path.to_owned(),
+    })?;
+    file.write_all(b"\n").context(WriteStoreLogSnafu {
+        path: path.to_owned(),
+    })?;
+    file.flush().context(WriteStoreLogSnafu {
+        path: path.to_owned(),
+    })?;
+    Ok(())
+}
+
+fn append_jsonl_record_create<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let mut file = OpenOptions::new()
+        .create(true)
         .append(true)
         .open(path)
         .context(WriteStoreLogSnafu {

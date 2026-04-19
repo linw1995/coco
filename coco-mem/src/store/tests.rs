@@ -2204,6 +2204,93 @@ fn skill_history_paths_do_not_collide_for_role_suffixed_names() {
 }
 
 #[test]
+fn skill_update_does_not_advance_when_history_append_fails() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store.fail_next_skill_history_append();
+
+    let err = store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "coco-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("should-not-persist".to_owned()),
+                body: None,
+                enable_coco_shim: None,
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, Error::WriteStoreLog { .. }));
+    assert_eq!(
+        store
+            .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+            .unwrap()
+            .current_version,
+        1
+    );
+
+    let skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    assert_eq!(
+        skills["orchestrator"]["coco-orchestrator"]["current_version"],
+        1
+    );
+
+    let reopened = FsStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+            .unwrap()
+            .current_version,
+        1
+    );
+}
+
+#[test]
+fn skill_add_recovers_from_history_when_snapshot_write_fails() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store.fail_next_skill_snapshot_write();
+
+    let created = store
+        .add_skill(
+            SessionRole::Runner,
+            "wal-only",
+            SkillVersionSpec {
+                description: "checkpoint can lag".to_owned(),
+                body: "history is authoritative".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(created.current_version, 1);
+    assert!(store.get_skill(SessionRole::Runner, "wal-only").is_ok());
+
+    let skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    assert!(skills["runner"].get("wal-only").is_none());
+
+    let history = read_jsonl_values(&path.join("skill-history/runner/wal-only.jsonl"));
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["name"], "wal-only");
+    assert_eq!(history[0]["role"], "runner");
+
+    let reopened = FsStore::open(&path).unwrap();
+    let reopened_skill = reopened.get_skill(SessionRole::Runner, "wal-only").unwrap();
+    assert_eq!(reopened_skill.current_version, 1);
+    assert_eq!(
+        reopened_skill.current().unwrap().description,
+        "checkpoint can lag"
+    );
+
+    let repaired_skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    assert_eq!(repaired_skills["runner"]["wal-only"]["current_version"], 1);
+}
+
+#[test]
 fn open_rejects_paused_merged_state_with_anchor_outside_target_branch() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
