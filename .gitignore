@@ -1,2 +1,11 @@
 # Rust artifacts
 target
+
+# Ignore scripts by default
+*.sh
+
+# Agent artifacts
+.agents/
+.coco-store/
+.codex
+skills-lock.json
