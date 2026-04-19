@@ -13,6 +13,7 @@ use crate::{Cli, Result, cli::SessionCreateCommand, store::open_store};
 mod prompt;
 mod runtime;
 mod session;
+mod skill;
 
 pub async fn run<R>(cli: Cli, reader: &mut R) -> Result<Option<String>>
 where

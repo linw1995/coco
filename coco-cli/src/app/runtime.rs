@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{FsStore, SessionRole};
 
-use super::{prompt::run_prompt_command, session::run_session_command};
+use super::{prompt::run_prompt_command, session::run_session_command, skill::run_skill_command};
 use crate::{
     Cli, Result,
     cli::{
@@ -126,6 +126,7 @@ where
             run_prompt_command(command, reader, shared_store, llm, forwarded_runtime).await
         }
         Command::Session(command) => run_session_command(command, shared_store, llm).await,
+        Command::Skill(command) => run_skill_command(command, shared_store).await,
     }
 }
 
@@ -284,5 +285,6 @@ fn apply_forwarded_defaults(
             SessionSubcommand::Merge(command) => command.branch = branch,
             SessionSubcommand::Feedback(command) => command.branch = branch,
         },
+        Command::Skill(_) => {}
     }
 }

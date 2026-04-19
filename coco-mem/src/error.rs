@@ -59,6 +59,25 @@ pub enum StoreError {
     #[snafu(display("Branch {branch:?} already has an active prompt job {job_id:?}"))]
     PromptJobActiveOnBranch { branch: String, job_id: String },
 
+    #[snafu(display("Skill {name:?} already exists for role {role:?}"))]
+    SkillAlreadyExists { role: String, name: String },
+
+    #[snafu(display("Skill {name:?} not found for role {role:?}"))]
+    SkillNotFound { role: String, name: String },
+
+    #[snafu(display("Skill {name:?} version {version} not found for role {role:?}"))]
+    SkillVersionNotFound {
+        role: String,
+        name: String,
+        version: u64,
+    },
+
+    #[snafu(display("Skill {name:?} update is empty for role {role:?}"))]
+    SkillUpdateEmpty { role: String, name: String },
+
+    #[snafu(display("Invalid skill name {name:?}: {message}"))]
+    InvalidSkillName { name: String, message: String },
+
     #[snafu(display("Ref {base_ref:?} is not an ancestor of {head_ref:?}"))]
     RefsNotConnected { base_ref: String, head_ref: String },
 

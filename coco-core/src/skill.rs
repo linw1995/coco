@@ -6,7 +6,7 @@ use std::sync::Weak;
 
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
-    Anchor, BuiltinSkillGroups, Kind, NewNode, Role, SessionAnchor, SessionRole, Store, ToolUse,
+    Anchor, Kind, NewNode, Role, SessionAnchor, SessionRole, SkillRecord, Store, ToolUse,
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
@@ -80,8 +80,8 @@ pub(crate) enum SkillError {
     #[snafu(display("invalid enable_coco_shim value {value:?} in skill file {path:?}"))]
     InvalidSkillCocoShim { path: PathBuf, value: String },
 
-    #[snafu(display("failed to load built-in skill templates from store: {source}"))]
-    LoadBuiltinSkills {
+    #[snafu(display("failed to load skills from store: {source}"))]
+    LoadSkills {
         source: coco_llm::coco_mem::StoreError,
     },
 
@@ -589,49 +589,39 @@ fn load_skill(path: &Path) -> std::result::Result<SkillEntry, SkillError> {
     })
 }
 
-fn synthetic_builtin_skill_path(role: SessionRole, name: &str) -> PathBuf {
-    PathBuf::from(format!("store://builtin-skills/{}/{}", role.as_str(), name))
+fn synthetic_skill_path(role: SessionRole, name: &str, version: u64) -> PathBuf {
+    PathBuf::from(format!(
+        "store://skills/{}/{}@{}",
+        role.as_str(),
+        name,
+        version
+    ))
 }
 
-fn collect_builtin_skills<S: Store>(
+fn collect_store_skills<S: Store>(
     store: &S,
     session_role: SessionRole,
 ) -> std::result::Result<Vec<SkillEntry>, SkillError> {
-    let groups = store
-        .builtin_skill_groups()
-        .context(LoadBuiltinSkillsSnafu)?;
-    Ok(match session_role {
-        SessionRole::Orchestrator => {
-            skill_entries_from_builtin_group(&groups, session_role, &groups.orchestrator)
-        }
-        SessionRole::Runner => {
-            skill_entries_from_builtin_group(&groups, session_role, &groups.runner)
-        }
-    })
+    let records = store.list_skills(session_role).context(LoadSkillsSnafu)?;
+    Ok(skill_entries_from_store_records(session_role, &records))
 }
 
-fn skill_entries_from_builtin_group(
-    _groups: &BuiltinSkillGroups,
-    role: SessionRole,
-    templates: &[coco_llm::coco_mem::BuiltinSkillTemplate],
-) -> Vec<SkillEntry> {
-    templates
+fn skill_entries_from_store_records(role: SessionRole, records: &[SkillRecord]) -> Vec<SkillEntry> {
+    records
         .iter()
-        .map(|template| {
-            let search_blob = format!(
-                "{}\n{}\n{}",
-                template.name, template.description, template.body
-            )
-            .to_ascii_lowercase();
-            SkillEntry {
-                name: template.name.clone(),
-                description: template.description.clone(),
-                path: synthetic_builtin_skill_path(role, &template.name),
-                body: template.body.clone(),
+        .filter_map(|record| {
+            let current = record.current()?;
+            let search_blob = format!("{}\n{}\n{}", record.name, current.description, current.body)
+                .to_ascii_lowercase();
+            Some(SkillEntry {
+                name: record.name.clone(),
+                description: current.description.clone(),
+                path: synthetic_skill_path(role, &record.name, current.version),
+                body: current.body.clone(),
                 session_role: role,
-                enable_coco_shim: template.enable_coco_shim,
+                enable_coco_shim: current.enable_coco_shim,
                 search_blob,
-            }
+            })
         })
         .collect()
 }
@@ -681,7 +671,7 @@ fn collect_skills<S: Store>(
     for root in roots {
         collect_skills_from_dir(&root, &mut skills)?;
     }
-    skills.extend(collect_builtin_skills(store, session_role)?);
+    skills.extend(collect_store_skills(store, session_role)?);
     skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
     Ok(skills)
 }
@@ -977,27 +967,11 @@ description: "Second copy."
     }
 
     #[test]
-    fn collect_builtin_skills_only_returns_templates_for_current_session_role() {
+    fn collect_store_skills_only_returns_templates_for_current_session_role() {
         let store = coco_llm::coco_mem::MemoryStore::new();
-        store
-            .seed_builtin_skill_groups(&BuiltinSkillGroups {
-                orchestrator: vec![coco_llm::coco_mem::BuiltinSkillTemplate {
-                    name: "coco-orchestrator".to_owned(),
-                    description: "orchestrator".to_owned(),
-                    body: "body".to_owned(),
-                    enable_coco_shim: true,
-                }],
-                runner: vec![coco_llm::coco_mem::BuiltinSkillTemplate {
-                    name: "coco-runner".to_owned(),
-                    description: "runner".to_owned(),
-                    body: "body".to_owned(),
-                    enable_coco_shim: true,
-                }],
-            })
-            .unwrap();
 
-        let runner = collect_builtin_skills(&store, SessionRole::Runner).unwrap();
-        let orchestrator = collect_builtin_skills(&store, SessionRole::Orchestrator).unwrap();
+        let runner = collect_store_skills(&store, SessionRole::Runner).unwrap();
+        let orchestrator = collect_store_skills(&store, SessionRole::Orchestrator).unwrap();
 
         assert_eq!(
             runner

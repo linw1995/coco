@@ -13,10 +13,15 @@ pub use session::{
     SessionPrCommand,
 };
 pub use session::{SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand};
+pub use skill::{
+    SkillAddCommand, SkillCommand, SkillListCommand, SkillRollbackCommand, SkillShowCommand,
+    SkillSubcommand, SkillUpdateCommand,
+};
 pub use types::{CliProvider, CliSessionRole, CliTool};
 
 mod prompt;
 mod session;
+mod skill;
 mod types;
 
 #[derive(Debug, Parser)]
@@ -38,4 +43,5 @@ pub struct Cli {
 pub enum Command {
     Prompt(PromptCommand),
     Session(SessionCommand),
+    Skill(SkillCommand),
 }

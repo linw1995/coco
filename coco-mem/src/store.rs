@@ -9,8 +9,8 @@ pub(crate) mod state;
 mod tests;
 
 use crate::{
-    BuiltinSkillGroups, Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState,
-    StoreResult,
+    Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
+    SkillRecord, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 /// Thread-safe node graph storage used by CoCo services.
@@ -67,14 +67,38 @@ pub trait Store: Clone + Send + Sync + 'static {
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
 
-    /// Returns the persisted built-in skill template groups.
-    fn builtin_skill_groups(&self) -> StoreResult<BuiltinSkillGroups>;
+    /// Returns the persisted skill groups.
+    fn skill_groups(&self) -> StoreResult<SkillGroups>;
 
-    /// Seeds built-in skill templates if the store does not have any yet.
-    fn seed_builtin_skill_groups(
+    /// Returns all persisted skills for the given role.
+    fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>>;
+
+    /// Returns one persisted skill for the given role and name.
+    fn get_skill(&self, role: SessionRole, name: &str) -> StoreResult<SkillRecord>;
+
+    /// Creates a new persisted skill for the given role.
+    fn add_skill(
         &self,
-        groups: &BuiltinSkillGroups,
-    ) -> StoreResult<BuiltinSkillGroups>;
+        role: SessionRole,
+        name: &str,
+        spec: SkillVersionSpec,
+    ) -> StoreResult<SkillRecord>;
+
+    /// Creates a new version for an existing skill by patching the current version.
+    fn update_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        patch: &SkillUpdatePatch,
+    ) -> StoreResult<SkillRecord>;
+
+    /// Creates a new version cloned from a previous version and makes it current.
+    fn rollback_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        target_version: u64,
+    ) -> StoreResult<SkillRecord>;
 
     /// Creates a new single-task prompt job record.
     ///

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -131,8 +133,7 @@ pub struct SessionAnchorPatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BuiltinSkillTemplate {
-    pub name: String,
+pub struct SkillVersionSpec {
     pub description: String,
     pub body: String,
     #[serde(default)]
@@ -140,17 +141,196 @@ pub struct BuiltinSkillTemplate {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BuiltinSkillGroups {
-    #[serde(default)]
-    pub orchestrator: Vec<BuiltinSkillTemplate>,
-    #[serde(default)]
-    pub runner: Vec<BuiltinSkillTemplate>,
+pub struct SkillUpdatePatch {
+    pub description: Option<String>,
+    pub body: Option<String>,
+    pub enable_coco_shim: Option<bool>,
 }
 
-impl BuiltinSkillGroups {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillVersion {
+    pub version: u64,
+    pub created_at: Timestamp,
+    pub description: String,
+    pub body: String,
+    #[serde(default)]
+    pub enable_coco_shim: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillRecord {
+    pub name: String,
+    pub current_version: u64,
+    #[serde(default)]
+    pub versions: BTreeMap<u64, SkillVersion>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillGroups {
+    #[serde(default)]
+    pub orchestrator: BTreeMap<String, SkillRecord>,
+    #[serde(default)]
+    pub runner: BTreeMap<String, SkillRecord>,
+}
+
+impl SkillUpdatePatch {
+    pub fn is_empty(&self) -> bool {
+        self.description.is_none() && self.body.is_none() && self.enable_coco_shim.is_none()
+    }
+}
+
+impl SkillVersion {
+    pub fn new(version: u64, spec: SkillVersionSpec) -> Self {
+        Self {
+            version,
+            created_at: Timestamp::now(),
+            description: spec.description,
+            body: spec.body,
+            enable_coco_shim: spec.enable_coco_shim,
+        }
+    }
+}
+
+impl SkillRecord {
+    pub fn new(name: impl Into<String>, spec: SkillVersionSpec) -> Self {
+        let version = SkillVersion::new(1, spec);
+        let current_version = version.version;
+        let mut versions = BTreeMap::new();
+        versions.insert(current_version, version);
+
+        Self {
+            name: name.into(),
+            current_version,
+            versions,
+        }
+    }
+
+    pub fn current(&self) -> Option<&SkillVersion> {
+        self.versions.get(&self.current_version)
+    }
+
+    pub fn update(&mut self, patch: &SkillUpdatePatch) -> Option<&SkillVersion> {
+        let current = self.current()?.clone();
+        let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
+        let next = SkillVersion {
+            version: next_version,
+            created_at: Timestamp::now(),
+            description: patch.description.clone().unwrap_or(current.description),
+            body: patch.body.clone().unwrap_or(current.body),
+            enable_coco_shim: patch.enable_coco_shim.unwrap_or(current.enable_coco_shim),
+        };
+
+        self.current_version = next_version;
+        self.versions.insert(next_version, next);
+        self.current()
+    }
+
+    pub fn rollback(&mut self, target_version: u64) -> Option<&SkillVersion> {
+        let target = self.versions.get(&target_version)?.clone();
+        let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
+        let next = SkillVersion {
+            version: next_version,
+            created_at: Timestamp::now(),
+            description: target.description,
+            body: target.body,
+            enable_coco_shim: target.enable_coco_shim,
+        };
+
+        self.current_version = next_version;
+        self.versions.insert(next_version, next);
+        self.current()
+    }
+}
+
+impl SkillGroups {
     pub fn is_empty(&self) -> bool {
         self.orchestrator.is_empty() && self.runner.is_empty()
     }
+
+    pub fn for_role(&self, role: SessionRole) -> &BTreeMap<String, SkillRecord> {
+        match role {
+            SessionRole::Orchestrator => &self.orchestrator,
+            SessionRole::Runner => &self.runner,
+        }
+    }
+
+    pub fn for_role_mut(&mut self, role: SessionRole) -> &mut BTreeMap<String, SkillRecord> {
+        match role {
+            SessionRole::Orchestrator => &mut self.orchestrator,
+            SessionRole::Runner => &mut self.runner,
+        }
+    }
+}
+
+pub fn default_skill_groups() -> SkillGroups {
+    let mut groups = SkillGroups::default();
+    groups.orchestrator.insert(
+        "coco-orchestrator".to_owned(),
+        SkillRecord::new(
+            "coco-orchestrator",
+            SkillVersionSpec {
+                description: "Guide an orchestrator session through CoCo branch and prompt workflows."
+                    .to_owned(),
+                body: r#"
+# CoCo Orchestrator Workflow
+
+Use the injected `coco` command through `bash` whenever you need branch-aware session workflow control.
+
+Useful commands:
+- `coco session list`
+- `coco session get --branch <branch>`
+- `coco session show <ref>`
+- `coco session fork --branch <branch> --from-ref <ref>`
+- `coco session pr --branch <branch> --target-branch <branch>`
+- `coco session feedback --branch <branch> --prompt "<text>"`
+- `coco session merge --branch <branch> --target-branch <branch> --prompt "<text>"`
+- `coco prompt --branch <branch> "<text>"`
+- `coco prompt status --job <job>`
+- `coco prompt branch-status --job <job> --branch <branch>`
+
+Guidelines:
+- Prefer `coco` over editing store files directly.
+- Use orchestrator sessions for coordination, branching, and merge decisions.
+- Hand off bounded implementation work to runner sessions when orchestration is no longer needed.
+"#
+                .trim()
+                .to_owned(),
+                enable_coco_shim: true,
+            },
+        ),
+    );
+    groups.runner.insert(
+        "coco-runner".to_owned(),
+        SkillRecord::new(
+            "coco-runner",
+            SkillVersionSpec {
+                description: "Guide a runner session through the CoCo commands available in runner scope."
+                    .to_owned(),
+                body: r#"
+# CoCo Runner Workflow
+
+Use the injected `coco` command through `bash` for runner-safe visibility and status inspection.
+
+Useful commands:
+- `coco session list`
+- `coco session get --branch <branch>`
+- `coco session graph`
+- `coco session show <ref>`
+- `coco prompt status --job <job>`
+- `coco prompt branch-status --job <job> --branch <branch>`
+
+Guidelines:
+- Runner-scoped `coco` is read-oriented and intentionally hides write entrypoints.
+- Use runner sessions for isolated execution, inspection, and handoff preparation.
+- If you need workflow mutations such as create, merge, feedback, or prompt submission, hand back to an orchestrator session.
+"#
+                .trim()
+                .to_owned(),
+                enable_coco_shim: true,
+            },
+        ),
+    );
+    groups
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

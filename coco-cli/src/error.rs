@@ -1,6 +1,7 @@
 use snafu::prelude::*;
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -43,6 +44,9 @@ pub enum Error {
 
     #[snafu(display("Failed to read stdin: {source}"))]
     ReadStdin { source: io::Error },
+
+    #[snafu(display("Failed to read skill file {path:?}: {source}"))]
+    ReadSkillFile { path: PathBuf, source: io::Error },
 
     #[snafu(display("Failed to resolve current executable: {source}"))]
     ResolveCurrentExe { source: io::Error },

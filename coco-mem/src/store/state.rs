@@ -7,13 +7,16 @@ use snafu::prelude::*;
 use crate::StoreResult as Result;
 use crate::error::{
     AmbiguousNodePrefixSnafu, BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu,
-    DuplicateMergeParentSnafu, InvalidAnchorSnafu, MergeParentMatchesParentSnafu,
-    MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu, PromptJobActiveOnBranchSnafu,
-    PromptJobMovedSnafu, PromptJobNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
+    DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSkillNameSnafu,
+    MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu,
+    PromptJobActiveOnBranchSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
+    RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu,
+    SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
-    Anchor, AnchorPayload, BuiltinSkillGroups, Job, JobStatus, Kind, NewNode, Node, PauseReason,
-    Role, SessionAnchorPatch, SessionState,
+    Anchor, AnchorPayload, Job, JobStatus, Kind, NewNode, Node, PauseReason, Role,
+    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
+    SkillVersionSpec, default_skill_groups,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,7 +27,7 @@ pub(crate) struct StoreState {
     pub branches: HashMap<String, String>,
     pub sessions: HashMap<String, SessionState>,
     pub jobs: HashMap<String, Job>,
-    pub builtin_skill_groups: BuiltinSkillGroups,
+    pub skill_groups: SkillGroups,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +72,7 @@ impl StoreState {
             branches: HashMap::new(),
             sessions: HashMap::new(),
             jobs: HashMap::new(),
-            builtin_skill_groups: BuiltinSkillGroups::default(),
+            skill_groups: default_skill_groups(),
         }
     }
 
@@ -85,7 +88,7 @@ impl StoreState {
             branches: HashMap::new(),
             sessions: HashMap::new(),
             jobs: HashMap::new(),
-            builtin_skill_groups: BuiltinSkillGroups::default(),
+            skill_groups: default_skill_groups(),
         }
     }
 
@@ -321,15 +324,99 @@ impl StoreState {
         Ok(job)
     }
 
-    pub fn builtin_skill_groups(&self) -> BuiltinSkillGroups {
-        self.builtin_skill_groups.clone()
+    pub fn skill_groups(&self) -> SkillGroups {
+        self.skill_groups.clone()
     }
 
-    pub fn seed_builtin_skill_groups(&mut self, groups: &BuiltinSkillGroups) -> BuiltinSkillGroups {
-        if self.builtin_skill_groups.is_empty() {
-            self.builtin_skill_groups = groups.clone();
-        }
-        self.builtin_skill_groups.clone()
+    pub fn list_skills(&self, role: SessionRole) -> Vec<SkillRecord> {
+        self.skill_groups.for_role(role).values().cloned().collect()
+    }
+
+    pub fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
+        self.skill_groups
+            .for_role(role)
+            .get(name)
+            .cloned()
+            .context(SkillNotFoundSnafu {
+                role: role.as_str().to_owned(),
+                name: name.to_owned(),
+            })
+    }
+
+    pub fn add_skill(
+        &mut self,
+        role: SessionRole,
+        name: &str,
+        spec: SkillVersionSpec,
+    ) -> Result<SkillRecord> {
+        validate_skill_name(name)?;
+        let skills = self.skill_groups.for_role_mut(role);
+        ensure!(
+            !skills.contains_key(name),
+            SkillAlreadyExistsSnafu {
+                role: role.as_str().to_owned(),
+                name: name.to_owned(),
+            }
+        );
+
+        let record = SkillRecord::new(name.to_owned(), spec);
+        skills.insert(name.to_owned(), record.clone());
+        Ok(record)
+    }
+
+    pub fn update_skill(
+        &mut self,
+        role: SessionRole,
+        name: &str,
+        patch: &SkillUpdatePatch,
+    ) -> Result<SkillRecord> {
+        ensure!(
+            !patch.is_empty(),
+            SkillUpdateEmptySnafu {
+                role: role.as_str().to_owned(),
+                name: name.to_owned(),
+            }
+        );
+
+        let record =
+            self.skill_groups
+                .for_role_mut(role)
+                .get_mut(name)
+                .context(SkillNotFoundSnafu {
+                    role: role.as_str().to_owned(),
+                    name: name.to_owned(),
+                })?;
+        let current_version = record.current_version;
+        record.update(patch).context(SkillVersionNotFoundSnafu {
+            role: role.as_str().to_owned(),
+            name: name.to_owned(),
+            version: current_version,
+        })?;
+        Ok(record.clone())
+    }
+
+    pub fn rollback_skill(
+        &mut self,
+        role: SessionRole,
+        name: &str,
+        target_version: u64,
+    ) -> Result<SkillRecord> {
+        let record =
+            self.skill_groups
+                .for_role_mut(role)
+                .get_mut(name)
+                .context(SkillNotFoundSnafu {
+                    role: role.as_str().to_owned(),
+                    name: name.to_owned(),
+                })?;
+        record
+            .rollback(target_version)
+            .context(SkillVersionNotFoundSnafu {
+                role: role.as_str().to_owned(),
+                name: name.to_owned(),
+                version: target_version,
+            })?;
+        Ok(record.clone())
     }
 
     pub fn get_job(&self, job_id: &str) -> Result<Job> {
@@ -674,6 +761,25 @@ impl StoreState {
 
 fn is_node_id(reference: &str) -> bool {
     reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_skill_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    ensure!(
+        !trimmed.is_empty(),
+        InvalidSkillNameSnafu {
+            name: name.to_owned(),
+            message: "name must not be empty".to_owned(),
+        }
+    );
+    ensure!(
+        trimmed == name,
+        InvalidSkillNameSnafu {
+            name: name.to_owned(),
+            message: "name must not have leading or trailing whitespace".to_owned(),
+        }
+    );
+    Ok(())
 }
 
 fn parent_ids(node: &Node) -> Vec<&str> {

@@ -8,7 +8,8 @@ use super::state::StoreState;
 use crate::Store as StoreTrait;
 use crate::{
     Anchor, JobStatus, Kind, NewNode, Node, PauseReason, PromptAnchor, Role, SessionAnchor,
-    SessionAnchorPatch, SessionRole, SessionState, StoreError as Error,
+    SessionAnchorPatch, SessionRole, SessionState, SkillUpdatePatch, SkillVersionSpec,
+    StoreError as Error,
 };
 use serde_json::json;
 
@@ -100,6 +101,14 @@ fn submit_prompt_job<S: StoreTrait>(store: &S, branch: &str, prompt: &str) -> cr
 }
 
 fn read_jsonl_nodes(path: &Path) -> Vec<Node> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn read_jsonl_values(path: &Path) -> Vec<serde_json::Value> {
     fs::read_to_string(path)
         .unwrap()
         .lines()
@@ -1314,6 +1323,129 @@ where
     assert_eq!(second.status, JobStatus::Queued);
 }
 
+fn assert_add_skill_starts_at_version_one<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let record = store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "custom-orchestrator",
+            SkillVersionSpec {
+                description: "first".to_owned(),
+                body: "body".to_owned(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(record.current_version, 1);
+    assert_eq!(record.versions.keys().copied().collect::<Vec<_>>(), vec![1]);
+    assert_eq!(record.current().unwrap().description, "first");
+}
+
+fn assert_update_skill_creates_new_version<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "custom-runner",
+            SkillVersionSpec {
+                description: "v1".to_owned(),
+                body: "body-v1".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+
+    let updated = store
+        .update_skill(
+            SessionRole::Runner,
+            "custom-runner",
+            &SkillUpdatePatch {
+                description: Some("v2".to_owned()),
+                body: None,
+                enable_coco_shim: Some(true),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(updated.current_version, 2);
+    assert_eq!(
+        updated.versions.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(updated.versions.get(&1).unwrap().description, "v1");
+    let current = updated.current().unwrap();
+    assert_eq!(current.description, "v2");
+    assert_eq!(current.body, "body-v1");
+    assert!(current.enable_coco_shim);
+}
+
+fn assert_rollback_skill_creates_new_current_version<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "custom-orchestrator",
+            SkillVersionSpec {
+                description: "v1".to_owned(),
+                body: "body-v1".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+    store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "custom-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("v2".to_owned()),
+                body: Some("body-v2".to_owned()),
+                enable_coco_shim: Some(true),
+            },
+        )
+        .unwrap();
+
+    let rolled_back = store
+        .rollback_skill(SessionRole::Orchestrator, "custom-orchestrator", 1)
+        .unwrap();
+
+    assert_eq!(rolled_back.current_version, 3);
+    assert_eq!(
+        rolled_back.versions.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    let current = rolled_back.current().unwrap();
+    assert_eq!(current.description, "v1");
+    assert_eq!(current.body, "body-v1");
+    assert!(!current.enable_coco_shim);
+}
+
+fn assert_new_store_seeds_default_skills<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+
+    let orchestrator = store
+        .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+        .unwrap();
+    let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
+
+    assert_eq!(orchestrator.current_version, 1);
+    assert_eq!(runner.current_version, 1);
+    assert!(orchestrator.current().unwrap().enable_coco_shim);
+    assert!(runner.current().unwrap().enable_coco_shim);
+}
+
 macro_rules! define_common_store_tests {
     ($module:ident, $factory:ty) => {
         mod $module {
@@ -1555,6 +1687,26 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
+            fn add_skill_starts_at_version_one() {
+                assert_add_skill_starts_at_version_one::<$factory>();
+            }
+
+            #[test]
+            fn new_store_seeds_default_skills() {
+                assert_new_store_seeds_default_skills::<$factory>();
+            }
+
+            #[test]
+            fn update_skill_creates_new_version() {
+                assert_update_skill_creates_new_version::<$factory>();
+            }
+
+            #[test]
+            fn rollback_skill_creates_new_current_version() {
+                assert_rollback_skill_creates_new_current_version::<$factory>();
+            }
+
+            #[test]
             fn finished_job_round_trip() {
                 assert_finished_job_round_trip::<$factory>();
             }
@@ -1624,7 +1776,17 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     assert!(path.join("meta.json").is_file());
     assert!(path.join("nodes.jsonl").is_file());
     assert!(path.join("sessions.json").is_file());
+    assert!(path.join("skills.json").is_file());
     assert!(path.join("branches").is_dir());
+    assert!(path.join("skill-history").is_dir());
+    assert!(
+        path.join("skill-history/coco-orchestrator.orchestrator.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/coco-runner.runner.jsonl")
+            .is_file()
+    );
 
     let nodes = fs::read_to_string(path.join("nodes.jsonl")).unwrap();
     assert!(nodes.lines().count() >= 1);
@@ -1835,6 +1997,129 @@ fn open_rejects_corrupted_jsonl_logs() {
     let err = FsStore::open(&path).unwrap_err();
 
     assert!(matches!(err, Error::ParseStoreLog { line: 1, .. }));
+}
+
+#[test]
+fn open_seeds_default_skills_when_skills_file_is_empty() {
+    let (_tempdir, path) = temp_store_path();
+    let _store = FsStore::open(&path).unwrap();
+    fs::write(
+        path.join("skills.json"),
+        "{\n  \"orchestrator\": {},\n  \"runner\": {}\n}\n",
+    )
+    .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert!(
+        reopened
+            .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+            .is_ok()
+    );
+    assert!(
+        reopened
+            .get_skill(SessionRole::Runner, "coco-runner")
+            .is_ok()
+    );
+    assert!(
+        path.join("skill-history/coco-orchestrator.orchestrator.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/coco-runner.runner.jsonl")
+            .is_file()
+    );
+}
+
+#[test]
+fn skills_json_only_stores_current_snapshots() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "coco-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("updated".to_owned()),
+                body: None,
+                enable_coco_shim: None,
+            },
+        )
+        .unwrap();
+
+    let skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    let orchestrator = &skills["orchestrator"]["coco-orchestrator"];
+
+    assert_eq!(orchestrator["current_version"], 2);
+    assert!(orchestrator.get("versions").is_none());
+    assert_eq!(orchestrator["description"], "updated");
+}
+
+#[test]
+fn skill_history_is_appended_in_central_directory() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+
+    store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "coco-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("updated".to_owned()),
+                body: Some("body-v2".to_owned()),
+                enable_coco_shim: Some(false),
+            },
+        )
+        .unwrap();
+    store
+        .rollback_skill(SessionRole::Orchestrator, "coco-orchestrator", 1)
+        .unwrap();
+
+    let history =
+        read_jsonl_values(&path.join("skill-history/coco-orchestrator.orchestrator.jsonl"));
+
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0]["role"], "orchestrator");
+    assert_eq!(history[0]["version"], 1);
+    assert_eq!(history[1]["version"], 2);
+    assert_eq!(history[2]["version"], 3);
+    assert_eq!(history[2]["description"], history[0]["description"]);
+    assert_eq!(history[2]["body"], history[0]["body"]);
+}
+
+#[test]
+fn shared_skill_history_uses_unsuffixed_file_name() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "coco-orchestrator",
+            SkillVersionSpec {
+                description: "shared".to_owned(),
+                body: "runner-shared".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+
+    assert!(path.join("skill-history/coco-orchestrator.jsonl").is_file());
+    assert!(
+        !path
+            .join("skill-history/coco-orchestrator.orchestrator.jsonl")
+            .exists()
+    );
+    assert!(
+        !path
+            .join("skill-history/coco-orchestrator.runner.jsonl")
+            .exists()
+    );
+
+    let history = read_jsonl_values(&path.join("skill-history/coco-orchestrator.jsonl"));
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["role"], "orchestrator");
+    assert_eq!(history[1]["role"], "runner");
 }
 
 #[test]

@@ -4,7 +4,10 @@ use std::sync::{Arc, RwLock};
 use super::Store;
 use super::state::StoreState;
 use crate::StoreResult as Result;
-use crate::{BuiltinSkillGroups, Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionState};
+use crate::{
+    Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
+    SkillRecord, SkillUpdatePatch, SkillVersionSpec,
+};
 
 #[derive(Clone, Debug)]
 pub struct MemoryStore {
@@ -139,20 +142,63 @@ impl Store for MemoryStore {
         Ok(plan.new_head)
     }
 
-    fn builtin_skill_groups(&self) -> Result<BuiltinSkillGroups> {
+    fn skill_groups(&self) -> Result<SkillGroups> {
         Ok(self
             .inner
             .read()
             .expect("store lock poisoned")
-            .builtin_skill_groups())
+            .skill_groups())
     }
 
-    fn seed_builtin_skill_groups(&self, groups: &BuiltinSkillGroups) -> Result<BuiltinSkillGroups> {
+    fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
         Ok(self
             .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_skills(role))
+    }
+
+    fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_skill(role, name)
+    }
+
+    fn add_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        spec: SkillVersionSpec,
+    ) -> Result<SkillRecord> {
+        self.inner
             .write()
             .expect("store lock poisoned")
-            .seed_builtin_skill_groups(groups))
+            .add_skill(role, name, spec)
+    }
+
+    fn update_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        patch: &SkillUpdatePatch,
+    ) -> Result<SkillRecord> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .update_skill(role, name, patch)
+    }
+
+    fn rollback_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        target_version: u64,
+    ) -> Result<SkillRecord> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .rollback_skill(role, name, target_version)
     }
 
     fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {

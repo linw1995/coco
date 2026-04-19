@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::future::Future;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -2379,6 +2380,167 @@ fn session_show_parses_reference_as_positional_argument() {
     assert!(command.json);
 }
 
+#[test]
+fn skill_show_parses_name_and_role_flags() {
+    let cli = Cli::try_parse_from([
+        "coco-cli",
+        "skill",
+        "show",
+        "--role",
+        "runner",
+        "--name",
+        "coco-runner",
+    ])
+    .unwrap();
+
+    let Command::Skill(command) = cli.command else {
+        panic!("expected skill command");
+    };
+    let crate::cli::SkillSubcommand::Show(command) = command.command else {
+        panic!("expected skill show command");
+    };
+
+    assert_eq!(command.role, crate::cli::CliSessionRole::Runner);
+    assert_eq!(command.name, "coco-runner");
+}
+
+#[tokio::test]
+async fn skill_commands_manage_versions_in_store() {
+    let (_tempdir, store_path) = temp_store_path();
+    let skill_file = store_path.with_file_name("skill.md");
+    let skill_name = "custom-orchestrator";
+    fs::write(&skill_file, "# v1\n").unwrap();
+
+    run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "add",
+            "--role",
+            "orchestrator",
+            "--name",
+            skill_name,
+            "--description",
+            "first",
+            "--file",
+            skill_file.to_str().unwrap(),
+            "--enable-coco-shim",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    fs::write(&skill_file, "# v2\n").unwrap();
+    let update_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "update",
+            "--role",
+            "orchestrator",
+            "--name",
+            skill_name,
+            "--description",
+            "second",
+            "--file",
+            skill_file.to_str().unwrap(),
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let update_json: serde_json::Value = serde_json::from_str(&update_output).unwrap();
+    assert_eq!(update_json["current_version"], 2);
+    assert_eq!(update_json["available_versions"], json!([1, 2]));
+
+    let rollback_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "rollback",
+            "--role",
+            "orchestrator",
+            "--name",
+            skill_name,
+            "--to-version",
+            "1",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let rollback_json: serde_json::Value = serde_json::from_str(&rollback_output).unwrap();
+    assert_eq!(rollback_json["current_version"], 3);
+    assert_eq!(rollback_json["available_versions"], json!([1, 2, 3]));
+
+    let show_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "show",
+            "--role",
+            "orchestrator",
+            "--name",
+            skill_name,
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let show_json: serde_json::Value = serde_json::from_str(&show_output).unwrap();
+    assert_eq!(show_json["current_version"], 3);
+    assert_eq!(show_json["versions"][2]["body"], "# v1");
+}
+
+#[tokio::test]
+async fn skill_show_reads_default_initialized_skill() {
+    let (_tempdir, store_path) = temp_store_path();
+
+    let output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "show",
+            "--role",
+            "runner",
+            "--name",
+            "coco-runner",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let show_json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(show_json["name"], "coco-runner");
+    assert_eq!(show_json["current_version"], 1);
+}
+
 #[tokio::test]
 async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
     let (_tempdir, store_path) = temp_store_path();
@@ -2607,6 +2769,24 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
         session_response
             .stderr
             .contains("Usage: coco session <COMMAND>")
+    );
+
+    let skill_response = run_forwarded_with_services(
+        &["skill".to_owned(), "add".to_owned(), "--help".to_owned()],
+        &[],
+        Some("main"),
+        Some(SessionRole::Runner),
+        None,
+        &store,
+        &llm,
+    )
+    .await;
+
+    assert_eq!(skill_response.exit_code, 2);
+    assert!(
+        skill_response
+            .stderr
+            .contains("unrecognized subcommand 'skill'")
     );
 }
 

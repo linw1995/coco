@@ -15,10 +15,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, BackendMetadata, BuiltinSkillGroups, BuiltinSkillTemplate,
-    ExecutionMetadata, Kind, MemoryStore, NewNode, PauseReason, PromptAnchor, ProviderMetadata,
-    Role, SessionAnchor, SessionRole, SessionState, SkillResultAnchor, Store, StoreError, Tool,
-    ToolResult, ToolUse,
+    Anchor, AnchorPayload, BackendMetadata, ExecutionMetadata, Kind, MemoryStore, NewNode,
+    PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionState,
+    SkillResultAnchor, Store, StoreError, Tool, ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,67 +34,6 @@ pub use coco_mem;
 pub use coco_mem::SessionAnchorPatch as SessionConfigPatch;
 pub use runtime_bridge::LlmRuntimeBridge;
 pub use tool_definition::builtin_tool_definition;
-
-fn default_builtin_skill_groups() -> BuiltinSkillGroups {
-    BuiltinSkillGroups {
-        orchestrator: vec![BuiltinSkillTemplate {
-            name: "coco-orchestrator".to_owned(),
-            description: "Guide an orchestrator session through CoCo branch and prompt workflows."
-                .to_owned(),
-            body: indoc::indoc! {r#"
-# CoCo Orchestrator Workflow
-
-Use the injected `coco` command through `bash` whenever you need branch-aware session workflow control.
-
-Useful commands:
-- `coco session list`
-- `coco session get --branch <branch>`
-- `coco session show <ref>`
-- `coco session fork --branch <branch> --from-ref <ref>`
-- `coco session pr --branch <branch> --target-branch <branch>`
-- `coco session feedback --branch <branch> --prompt "<text>"`
-- `coco session merge --branch <branch> --target-branch <branch> --prompt "<text>"`
-- `coco prompt --branch <branch> "<text>"`
-- `coco prompt status --job <job>`
-- `coco prompt branch-status --job <job> --branch <branch>`
-
-Guidelines:
-- Prefer `coco` over editing store files directly.
-- Use orchestrator sessions for coordination, branching, and merge decisions.
-- Hand off bounded implementation work to runner sessions when orchestration is no longer needed.
-"#}
-            .trim()
-            .to_owned(),
-            enable_coco_shim: true,
-        }],
-        runner: vec![BuiltinSkillTemplate {
-            name: "coco-runner".to_owned(),
-            description: "Guide a runner session through the CoCo commands available in runner scope."
-                .to_owned(),
-            body: indoc::indoc! {r#"
-# CoCo Runner Workflow
-
-Use the injected `coco` command through `bash` for runner-safe visibility and status inspection.
-
-Useful commands:
-- `coco session list`
-- `coco session get --branch <branch>`
-- `coco session graph`
-- `coco session show <ref>`
-- `coco prompt status --job <job>`
-- `coco prompt branch-status --job <job> --branch <branch>`
-
-Guidelines:
-- Runner-scoped `coco` is read-oriented and intentionally hides write entrypoints.
-- Use runner sessions for isolated execution, inspection, and handoff preparation.
-- If you need workflow mutations such as create, merge, feedback, or prompt submission, hand back to an orchestrator session.
-"#}
-            .trim()
-            .to_owned(),
-            enable_coco_shim: true,
-        }],
-    }
-}
 
 pub const COCO_SESSION_BRANCH_ENV: &str = "COCO_BRANCH";
 pub const COCO_SESSION_ROLE_ENV: &str = "COCO_SESSION_ROLE";
@@ -990,13 +928,6 @@ where
 
     pub async fn create_session(&self, config: SessionConfig) -> Result<BranchSession> {
         let _guard = self.lock_branch(&config.branch).await;
-        // TODO: Seed built-in skills during store open or via store metadata versioning.
-        // Existing stores upgraded in place currently learn about these templates only after
-        // create_session runs. We should add an explicit upgrade prompt or versioned migration
-        // path so resumed sessions can discover built-ins immediately.
-        self.store
-            .seed_builtin_skill_groups(&default_builtin_skill_groups())
-            .context(MemorySnafu)?;
         let root_id = self.store.root_id();
         let merge_parents = config
             .merge_parents
