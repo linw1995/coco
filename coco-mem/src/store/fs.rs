@@ -27,6 +27,9 @@ const SESSIONS_FILE_NAME: &str = "sessions.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
 const SKILLS_FILE_NAME: &str = "skills.json";
 const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
+const SHARED_SKILL_HISTORY_DIR_NAME: &str = "shared";
+const ORCHESTRATOR_SKILL_HISTORY_DIR_NAME: &str = "orchestrator";
+const RUNNER_SKILL_HISTORY_DIR_NAME: &str = "runner";
 const BRANCHES_DIR_NAME: &str = "branches";
 
 #[derive(Clone, Debug)]
@@ -82,6 +85,12 @@ struct SkillHistoryEntry {
     body: String,
     #[serde(default)]
     enable_coco_shim: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillHistoryScope {
+    Shared,
+    Role(SessionRole),
 }
 
 impl PersistedSkillRecord {
@@ -141,6 +150,16 @@ impl SkillHistoryEntry {
             description: self.description,
             body: self.body,
             enable_coco_shim: self.enable_coco_shim,
+        }
+    }
+}
+
+impl SkillHistoryScope {
+    fn dir_name(self) -> &'static str {
+        match self {
+            Self::Shared => SHARED_SKILL_HISTORY_DIR_NAME,
+            Self::Role(SessionRole::Orchestrator) => ORCHESTRATOR_SKILL_HISTORY_DIR_NAME,
+            Self::Role(SessionRole::Runner) => RUNNER_SKILL_HISTORY_DIR_NAME,
         }
     }
 }
@@ -257,9 +276,7 @@ impl Persistence {
     }
 
     pub fn persist_skill_history_for_name(&self, groups: &SkillGroups, name: &str) -> Result<()> {
-        fs::create_dir_all(&self.skill_history_dir).context(WriteStoreDirectorySnafu {
-            path: self.skill_history_dir.clone(),
-        })?;
+        self.create_skill_history_directories()?;
 
         let shared = skill_name_is_shared(groups, name);
         let target_path = self.skill_history_path(
@@ -301,9 +318,7 @@ impl Persistence {
     }
 
     pub fn rewrite_skill_history(&self, groups: &SkillGroups) -> Result<()> {
-        fs::create_dir_all(&self.skill_history_dir).context(WriteStoreDirectorySnafu {
-            path: self.skill_history_dir.clone(),
-        })?;
+        self.create_skill_history_directories()?;
 
         let mut history_by_name = BTreeMap::<String, Vec<SkillHistoryEntry>>::new();
         for (role, records) in [
@@ -359,13 +374,32 @@ impl Persistence {
             .join(format!("{}.jsonl", encode_branch_name(branch)))
     }
 
+    fn create_skill_history_directories(&self) -> Result<()> {
+        fs::create_dir_all(&self.skill_history_dir).context(WriteStoreDirectorySnafu {
+            path: self.skill_history_dir.clone(),
+        })?;
+        for scope in [
+            SkillHistoryScope::Shared,
+            SkillHistoryScope::Role(SessionRole::Orchestrator),
+            SkillHistoryScope::Role(SessionRole::Runner),
+        ] {
+            let path = self.skill_history_scope_dir(scope);
+            fs::create_dir_all(&path).context(WriteStoreDirectorySnafu { path })?;
+        }
+        Ok(())
+    }
+
+    fn skill_history_scope_dir(&self, scope: SkillHistoryScope) -> PathBuf {
+        self.skill_history_dir.join(scope.dir_name())
+    }
+
     fn skill_history_path(&self, skill_name: &str, role: Option<SessionRole>) -> PathBuf {
-        let stem = match role {
-            Some(role) => format!("{skill_name}.{}", role.as_str()),
-            None => skill_name.to_owned(),
+        let scope = match role {
+            Some(role) => SkillHistoryScope::Role(role),
+            None => SkillHistoryScope::Shared,
         };
-        self.skill_history_dir
-            .join(format!("{}.jsonl", encode_branch_name(&stem)))
+        self.skill_history_scope_dir(scope)
+            .join(format!("{}.jsonl", encode_branch_name(skill_name)))
     }
 
     fn skill_history_candidate_paths(&self, skill_name: &str) -> Vec<PathBuf> {
@@ -383,9 +417,7 @@ impl Persistence {
         fs::create_dir_all(&self.branches_dir).context(WriteStoreDirectorySnafu {
             path: self.branches_dir.clone(),
         })?;
-        fs::create_dir_all(&self.skill_history_dir).context(WriteStoreDirectorySnafu {
-            path: self.skill_history_dir.clone(),
-        })?;
+        self.create_skill_history_directories()?;
 
         let store = StoreState::new();
         let root = store.root_node().clone();
@@ -451,6 +483,7 @@ impl Persistence {
                 message: "missing skill history directory".to_owned(),
             }
         );
+        self.create_skill_history_directories()?;
         let meta = read_json_file::<Meta>(&self.meta_path)?;
         ensure!(
             meta.version == STORE_FORMAT_VERSION,

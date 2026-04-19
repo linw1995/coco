@@ -1779,12 +1779,15 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     assert!(path.join("skills.json").is_file());
     assert!(path.join("branches").is_dir());
     assert!(path.join("skill-history").is_dir());
+    assert!(path.join("skill-history/shared").is_dir());
+    assert!(path.join("skill-history/orchestrator").is_dir());
+    assert!(path.join("skill-history/runner").is_dir());
     assert!(
-        path.join("skill-history/coco-orchestrator.orchestrator.jsonl")
+        path.join("skill-history/orchestrator/coco-orchestrator.jsonl")
             .is_file()
     );
     assert!(
-        path.join("skill-history/coco-runner.runner.jsonl")
+        path.join("skill-history/runner/coco-runner.jsonl")
             .is_file()
     );
 
@@ -2022,11 +2025,11 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
             .is_ok()
     );
     assert!(
-        path.join("skill-history/coco-orchestrator.orchestrator.jsonl")
+        path.join("skill-history/orchestrator/coco-orchestrator.jsonl")
             .is_file()
     );
     assert!(
-        path.join("skill-history/coco-runner.runner.jsonl")
+        path.join("skill-history/runner/coco-runner.jsonl")
             .is_file()
     );
 }
@@ -2077,7 +2080,7 @@ fn skill_history_is_appended_in_central_directory() {
         .unwrap();
 
     let history =
-        read_jsonl_values(&path.join("skill-history/coco-orchestrator.orchestrator.jsonl"));
+        read_jsonl_values(&path.join("skill-history/orchestrator/coco-orchestrator.jsonl"));
 
     assert_eq!(history.len(), 3);
     assert_eq!(history[0]["role"], "orchestrator");
@@ -2089,7 +2092,7 @@ fn skill_history_is_appended_in_central_directory() {
 }
 
 #[test]
-fn shared_skill_history_uses_unsuffixed_file_name() {
+fn shared_skill_history_uses_shared_scope_directory() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     store
@@ -2104,22 +2107,100 @@ fn shared_skill_history_uses_unsuffixed_file_name() {
         )
         .unwrap();
 
-    assert!(path.join("skill-history/coco-orchestrator.jsonl").is_file());
+    assert!(
+        path.join("skill-history/shared/coco-orchestrator.jsonl")
+            .is_file()
+    );
     assert!(
         !path
-            .join("skill-history/coco-orchestrator.orchestrator.jsonl")
+            .join("skill-history/orchestrator/coco-orchestrator.jsonl")
             .exists()
     );
     assert!(
         !path
-            .join("skill-history/coco-orchestrator.runner.jsonl")
+            .join("skill-history/runner/coco-orchestrator.jsonl")
             .exists()
     );
 
-    let history = read_jsonl_values(&path.join("skill-history/coco-orchestrator.jsonl"));
+    let history = read_jsonl_values(&path.join("skill-history/shared/coco-orchestrator.jsonl"));
     assert_eq!(history.len(), 2);
     assert_eq!(history[0]["role"], "orchestrator");
     assert_eq!(history[1]["role"], "runner");
+}
+
+#[test]
+fn skill_history_paths_do_not_collide_for_role_suffixed_names() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "foo",
+            SkillVersionSpec {
+                description: "runner only".to_owned(),
+                body: "runner-only".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+    store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "foo.runner",
+            SkillVersionSpec {
+                description: "shared orchestrator".to_owned(),
+                body: "orchestrator".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "foo.runner",
+            SkillVersionSpec {
+                description: "shared runner".to_owned(),
+                body: "runner".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+
+    assert!(path.join("skill-history/runner/foo.jsonl").is_file());
+    assert!(path.join("skill-history/shared/foo.runner.jsonl").is_file());
+
+    let runner_only = read_jsonl_values(&path.join("skill-history/runner/foo.jsonl"));
+    let shared = read_jsonl_values(&path.join("skill-history/shared/foo.runner.jsonl"));
+
+    assert_eq!(runner_only.len(), 1);
+    assert_eq!(runner_only[0]["name"], "foo");
+    assert_eq!(runner_only[0]["role"], "runner");
+    assert_eq!(shared.len(), 2);
+    assert_eq!(shared[0]["name"], "foo.runner");
+    assert_eq!(shared[1]["name"], "foo.runner");
+
+    let reopened = FsStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Runner, "foo")
+            .unwrap()
+            .current_version,
+        1
+    );
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Orchestrator, "foo.runner")
+            .unwrap()
+            .current_version,
+        1
+    );
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Runner, "foo.runner")
+            .unwrap()
+            .current_version,
+        1
+    );
 }
 
 #[test]
