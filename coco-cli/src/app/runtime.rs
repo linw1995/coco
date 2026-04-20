@@ -2,6 +2,7 @@ use std::io::Read;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
+use coco_core::ConversationEngine;
 use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{FsStore, SessionRole};
 
@@ -22,6 +23,23 @@ use crate::{
 enum ForwardedRuntimeScope {
     Orchestrator,
     Runner,
+}
+
+pub(crate) struct RuntimeServices<'a, B>
+where
+    B: CompletionBackend + 'static,
+{
+    pub shared_store: &'a FsStore,
+    pub llm: &'a Arc<LlmService<B, FsStore>>,
+    pub shared_engine: Option<&'a Arc<ConversationEngine<B, FsStore>>>,
+}
+
+pub(crate) struct ForwardedRuntimeInputs<'a> {
+    pub args: &'a [String],
+    pub stdin: &'a [u8],
+    pub branch_env: Option<&'a str>,
+    pub session_role: Option<SessionRole>,
+    pub store_path_env: Option<&'a str>,
 }
 
 #[derive(Debug, Parser)]
@@ -129,8 +147,7 @@ impl ForwardedCli {
 pub async fn run_with_services<B, R>(
     cli: Cli,
     reader: &mut R,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
+    services: RuntimeServices<'_, B>,
     forwarded_runtime: bool,
 ) -> Result<Option<String>>
 where
@@ -139,50 +156,54 @@ where
 {
     match cli.command {
         Command::Prompt(command) => {
-            run_prompt_command(command, reader, shared_store, llm, forwarded_runtime).await
+            run_prompt_command(
+                command,
+                reader,
+                services.shared_store,
+                services.llm,
+                services.shared_engine.map(AsRef::as_ref),
+                forwarded_runtime,
+            )
+            .await
         }
-        Command::Session(command) => run_session_command(command, shared_store, llm).await,
-        Command::Skill(command) => run_skill_command(command, shared_store).await,
-        Command::Daemon(command) => run_daemon_command(command, shared_store, llm).await,
+        Command::Session(command) => {
+            run_session_command(command, services.shared_store, services.llm).await
+        }
+        Command::Skill(command) => run_skill_command(command, services.shared_store).await,
+        Command::Daemon(command) => {
+            run_daemon_command(command, services.shared_store, services.llm).await
+        }
     }
 }
 
 pub async fn run_forwarded_with_services<B>(
-    args: &[String],
-    stdin: &[u8],
-    branch_env: Option<&str>,
-    session_role: Option<SessionRole>,
-    store_path_env: Option<&str>,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
+    inputs: ForwardedRuntimeInputs<'_>,
+    services: RuntimeServices<'_, B>,
 ) -> CocoCliRuntimeResponse
 where
     B: CompletionBackend + 'static,
 {
-    let scope = forwarded_runtime_scope(session_role);
-    if contains_store_path_flag(args) {
+    let scope = forwarded_runtime_scope(inputs.session_role);
+    if contains_store_path_flag(inputs.args) {
         return unsupported_store_path_response();
     }
 
     let argv = std::iter::once("coco".to_owned())
-        .chain(args.iter().cloned())
+        .chain(inputs.args.iter().cloned())
         .collect::<Vec<_>>();
     let mut cli = match parse_forwarded_cli(&argv, scope) {
         Ok(cli) => cli,
         Err(response) => return response,
     };
 
-    apply_forwarded_defaults(&mut cli, args, branch_env, store_path_env);
+    apply_forwarded_defaults(
+        &mut cli,
+        inputs.args,
+        inputs.branch_env,
+        inputs.store_path_env,
+    );
 
-    match run_with_services(
-        cli,
-        &mut std::io::Cursor::new(stdin),
-        shared_store,
-        llm,
-        true,
-    )
-    .await
-    {
+    match run_with_services(cli, &mut std::io::Cursor::new(inputs.stdin), services, true).await {
         Ok(Some(output)) => CocoCliRuntimeResponse {
             exit_code: 0,
             stdout: format!("{output}\n"),

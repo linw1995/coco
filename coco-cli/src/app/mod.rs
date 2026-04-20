@@ -1,18 +1,19 @@
 use std::io::Read;
 use std::sync::Arc;
 
+use coco_core::ConversationEngine;
 use coco_core::CoreSkillToolExecutor;
 use coco_llm::{
     BashToolCliBridgeHandle, CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge,
     LlmService, RigBackend, SessionConfig,
 };
-use coco_mem::{FsStore, SessionRole};
+use coco_mem::FsStore;
 
 use crate::{Cli, Result, cli::SessionCreateCommand, store::open_store};
 
 pub(crate) mod daemon;
 mod prompt;
-mod runtime;
+pub(crate) mod runtime;
 mod session;
 mod skill;
 
@@ -44,7 +45,17 @@ where
     B: CompletionBackend + 'static,
     R: Read,
 {
-    runtime::run_with_services(cli, reader, shared_store, llm, false).await
+    runtime::run_with_services(
+        cli,
+        reader,
+        runtime::RuntimeServices {
+            shared_store,
+            llm,
+            shared_engine: None,
+        },
+        false,
+    )
+    .await
 }
 
 fn build_llm_service<B>(shared_store: FsStore, backend: B) -> Arc<LlmService<B, FsStore>>
@@ -58,13 +69,18 @@ where
                 let shared_store = shared_store.clone();
                 async move {
                     run_forwarded_with_services(
-                        &request.args,
-                        &request.stdin,
-                        request.branch_env.as_deref(),
-                        request.session_role,
-                        request.store_path_env.as_deref(),
-                        &shared_store,
-                        &llm,
+                        runtime::ForwardedRuntimeInputs {
+                            args: &request.args,
+                            stdin: &request.stdin,
+                            branch_env: request.branch_env.as_deref(),
+                            session_role: request.session_role,
+                            store_path_env: request.store_path_env.as_deref(),
+                        },
+                        runtime::RuntimeServices {
+                            shared_store: &shared_store,
+                            llm: &llm,
+                            shared_engine: None::<&Arc<ConversationEngine<B, FsStore>>>,
+                        },
                     )
                     .await
                 }
@@ -80,27 +96,13 @@ where
 }
 
 pub async fn run_forwarded_with_services<B>(
-    args: &[String],
-    stdin: &[u8],
-    branch_env: Option<&str>,
-    session_role: Option<SessionRole>,
-    store_path_env: Option<&str>,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
+    inputs: runtime::ForwardedRuntimeInputs<'_>,
+    services: runtime::RuntimeServices<'_, B>,
 ) -> CocoCliRuntimeResponse
 where
     B: CompletionBackend + 'static,
 {
-    runtime::run_forwarded_with_services(
-        args,
-        stdin,
-        branch_env,
-        session_role,
-        store_path_env,
-        shared_store,
-        llm,
-    )
-    .await
+    runtime::run_forwarded_with_services(inputs, services).await
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

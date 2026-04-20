@@ -23,8 +23,9 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::{
     Cli,
     app::{
-        daemon::start_daemon_server, resolve_session_config, run_forwarded_with_services,
-        run_with_backend,
+        daemon::{resume_incomplete_jobs, start_daemon_server},
+        resolve_session_config, run_forwarded_with_services, run_with_backend,
+        runtime::{ForwardedRuntimeInputs, RuntimeServices},
     },
     cli::{
         Command, PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
@@ -2588,13 +2589,18 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
     ));
 
     let response = run_forwarded_with_services(
-        &["prompt".to_owned(), "hello".to_owned()],
-        &[],
-        Some("draft"),
-        Some(SessionRole::Orchestrator),
-        None,
-        &store,
-        &llm,
+        ForwardedRuntimeInputs {
+            args: &["prompt".to_owned(), "hello".to_owned()],
+            stdin: &[],
+            branch_env: Some("draft"),
+            session_role: Some(SessionRole::Orchestrator),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
     )
     .await;
 
@@ -2627,18 +2633,23 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
     ));
 
     let response = run_forwarded_with_services(
-        &[
-            "prompt".to_owned(),
-            "--branch".to_owned(),
-            "main".to_owned(),
-            "hello".to_owned(),
-        ],
-        &[],
-        Some("draft"),
-        Some(SessionRole::Orchestrator),
-        None,
-        &store,
-        &llm,
+        ForwardedRuntimeInputs {
+            args: &[
+                "prompt".to_owned(),
+                "--branch".to_owned(),
+                "main".to_owned(),
+                "hello".to_owned(),
+            ],
+            stdin: &[],
+            branch_env: Some("draft"),
+            session_role: Some(SessionRole::Orchestrator),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
     )
     .await;
 
@@ -2657,13 +2668,18 @@ async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
     ));
 
     let response = run_forwarded_with_services(
-        &["prompt".to_owned(), "--help".to_owned()],
-        &[],
-        Some("main"),
-        Some(SessionRole::Runner),
-        None,
-        &store,
-        &llm,
+        ForwardedRuntimeInputs {
+            args: &["prompt".to_owned(), "--help".to_owned()],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Runner),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
     )
     .await;
 
@@ -2687,13 +2703,18 @@ async fn forwarded_runtime_runner_session_help_hides_write_subcommands() {
     ));
 
     let response = run_forwarded_with_services(
-        &["session".to_owned(), "--help".to_owned()],
-        &[],
-        Some("main"),
-        Some(SessionRole::Runner),
-        None,
-        &store,
-        &llm,
+        ForwardedRuntimeInputs {
+            args: &["session".to_owned(), "--help".to_owned()],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Runner),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
     )
     .await;
 
@@ -2719,13 +2740,18 @@ async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
     ));
 
     let response = run_forwarded_with_services(
-        &["prompt".to_owned(), "--help".to_owned()],
-        &[],
-        Some("main"),
-        Some(SessionRole::Orchestrator),
-        None,
-        &store,
-        &llm,
+        ForwardedRuntimeInputs {
+            args: &["prompt".to_owned(), "--help".to_owned()],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Orchestrator),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
     )
     .await;
 
@@ -2745,13 +2771,18 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
     ));
 
     let prompt_response = run_forwarded_with_services(
-        &["prompt".to_owned(), "hello".to_owned()],
-        &[],
-        Some("main"),
-        Some(SessionRole::Runner),
-        None,
-        &store,
-        &llm,
+        ForwardedRuntimeInputs {
+            args: &["prompt".to_owned(), "hello".to_owned()],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Runner),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
     )
     .await;
 
@@ -2768,17 +2799,22 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
     );
 
     let session_response = run_forwarded_with_services(
-        &[
-            "session".to_owned(),
-            "create".to_owned(),
-            "--help".to_owned(),
-        ],
-        &[],
-        Some("main"),
-        Some(SessionRole::Runner),
-        None,
-        &store,
-        &llm,
+        ForwardedRuntimeInputs {
+            args: &[
+                "session".to_owned(),
+                "create".to_owned(),
+                "--help".to_owned(),
+            ],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Runner),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
     )
     .await;
 
@@ -2795,13 +2831,18 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
     );
 
     let skill_response = run_forwarded_with_services(
-        &["skill".to_owned(), "add".to_owned(), "--help".to_owned()],
-        &[],
-        Some("main"),
-        Some(SessionRole::Runner),
-        None,
-        &store,
-        &llm,
+        ForwardedRuntimeInputs {
+            args: &["skill".to_owned(), "add".to_owned(), "--help".to_owned()],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Runner),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
     )
     .await;
 
@@ -2823,18 +2864,23 @@ async fn forwarded_runtime_rejects_store_path_override() {
     ));
 
     let response = run_forwarded_with_services(
-        &[
-            "--store-path".to_owned(),
-            "/tmp/override".to_owned(),
-            "session".to_owned(),
-            "list".to_owned(),
-        ],
-        &[],
-        Some("main"),
-        Some(SessionRole::Orchestrator),
-        None,
-        &store,
-        &llm,
+        ForwardedRuntimeInputs {
+            args: &[
+                "--store-path".to_owned(),
+                "/tmp/override".to_owned(),
+                "session".to_owned(),
+                "list".to_owned(),
+            ],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Orchestrator),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
     )
     .await;
 
@@ -2870,7 +2916,8 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("daemon-response")])]),
     ));
-    let server = match start_daemon_server(&socket_path, &store, &llm) {
+    let engine = Arc::new(coco_core::ConversationEngine::new(llm.clone()));
+    let server = match start_daemon_server(&socket_path, &store, &llm, &engine) {
         Ok(server) => server,
         Err(crate::Error::BindDaemonSocket { source, .. })
             if source.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -2902,6 +2949,51 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
     assert!(response.stderr.is_empty());
 
     server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_startup_resumes_incomplete_jobs() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let job = submit_prompt_job(&store, "main", "resume me");
+    store
+        .set_job_status(
+            &job.job_id,
+            coco_mem::JobStatus::Queued,
+            coco_mem::JobStatus::Running,
+        )
+        .unwrap();
+
+    let llm = Arc::new(coco_llm::LlmService::new(
+        store.clone(),
+        FakeBackend::with_responses(&[("main", &[Ok("recovered after daemon start")])]),
+    ));
+    let engine = coco_core::ConversationEngine::new(llm);
+
+    resume_incomplete_jobs(&engine).await.unwrap();
+
+    let resumed_job = store.get_job(&job.job_id).unwrap();
+    assert_eq!(resumed_job.status, coco_mem::JobStatus::Finished);
+    let head = store.get_branch_head("main").unwrap();
+    let node = store.get_node(&head).unwrap();
+    match node.kind {
+        Kind::Text(text) => assert_eq!(text, "recovered after daemon start"),
+        other => panic!("expected text node at branch head, got {other:?}"),
+    }
 }
 
 #[test]

@@ -1,13 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use coco_core::ConversationEngine;
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{FsStore, SessionRole};
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 
-use super::run_forwarded_with_services;
+use super::{
+    run_forwarded_with_services,
+    runtime::{ForwardedRuntimeInputs, RuntimeServices},
+};
 use crate::{
     Result,
     cli::{DaemonCommand, DaemonSubcommand},
@@ -31,11 +35,36 @@ where
     let socket_path = resolve_daemon_socket_path(match &command.command {
         DaemonSubcommand::Serve(command) => command.socket.as_deref(),
     })?;
+    let shared_engine = Arc::new(ConversationEngine::new(llm.clone()));
     let server = match command.command {
-        DaemonSubcommand::Serve(_) => start_daemon_server(&socket_path, shared_store, llm)?,
+        DaemonSubcommand::Serve(_) => {
+            start_daemon_server(&socket_path, shared_store, llm, &shared_engine)?
+        }
     };
+    spawn_resume_incomplete_jobs(shared_engine);
     server.wait().await?;
     Ok(None)
+}
+
+pub(crate) async fn resume_incomplete_jobs<B>(engine: &ConversationEngine<B, FsStore>) -> Result<()>
+where
+    B: CompletionBackend + 'static,
+{
+    engine
+        .resume_incomplete_jobs()
+        .await
+        .context(crate::error::CoreEngineSnafu)
+}
+
+fn spawn_resume_incomplete_jobs<B>(engine: Arc<ConversationEngine<B, FsStore>>)
+where
+    B: CompletionBackend + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(error) = resume_incomplete_jobs(engine.as_ref()).await {
+            eprintln!("failed to resume incomplete prompt jobs on daemon startup: {error}");
+        }
+    });
 }
 
 pub fn resolve_default_daemon_socket_path() -> Result<PathBuf> {
@@ -71,6 +100,7 @@ pub(crate) fn start_daemon_server<B>(
     socket_path: &Path,
     shared_store: &FsStore,
     llm: &Arc<LlmService<B, FsStore>>,
+    shared_engine: &Arc<ConversationEngine<B, FsStore>>,
 ) -> Result<CocoCliDaemonServerHandle>
 where
     B: CompletionBackend + 'static,
@@ -92,6 +122,7 @@ where
     let socket_path = socket_path.to_path_buf();
     let shared_store = shared_store.clone();
     let llm = llm.clone();
+    let shared_engine = shared_engine.clone();
     let task = tokio::spawn(async move {
         loop {
             let accepted = listener.accept().await;
@@ -100,8 +131,10 @@ where
             };
             let shared_store = shared_store.clone();
             let llm = llm.clone();
+            let shared_engine = shared_engine.clone();
             tokio::spawn(async move {
-                let response = handle_client(&mut stream, &shared_store, &llm).await;
+                let response =
+                    handle_client(&mut stream, &shared_store, &llm, &shared_engine).await;
                 let payload = encode_runtime_response(&response);
                 let _ = stream.write_all(&payload).await;
             });
@@ -135,6 +168,7 @@ async fn handle_client<B>(
     stream: &mut tokio::net::UnixStream,
     shared_store: &FsStore,
     llm: &Arc<LlmService<B, FsStore>>,
+    shared_engine: &Arc<ConversationEngine<B, FsStore>>,
 ) -> CocoCliRuntimeResponse
 where
     B: CompletionBackend + 'static,
@@ -144,13 +178,18 @@ where
         Ok(_) => match serde_json::from_slice::<CocoCliRuntimeRequest>(&input) {
             Ok(request) => {
                 run_forwarded_with_services(
-                    &request.args,
-                    &request.stdin,
-                    request.branch_env.as_deref(),
-                    request.session_role.or(Some(SessionRole::Orchestrator)),
-                    request.store_path_env.as_deref(),
-                    shared_store,
-                    llm,
+                    ForwardedRuntimeInputs {
+                        args: &request.args,
+                        stdin: &request.stdin,
+                        branch_env: request.branch_env.as_deref(),
+                        session_role: request.session_role.or(Some(SessionRole::Orchestrator)),
+                        store_path_env: request.store_path_env.as_deref(),
+                    },
+                    RuntimeServices {
+                        shared_store,
+                        llm,
+                        shared_engine: Some(shared_engine),
+                    },
                 )
                 .await
             }

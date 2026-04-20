@@ -61,31 +61,48 @@ pub(super) async fn run_prompt_command<B, R>(
     reader: &mut R,
     shared_store: &FsStore,
     llm: &Arc<LlmService<B, FsStore>>,
+    shared_engine: Option<&ConversationEngine<B, FsStore>>,
     forwarded_runtime: bool,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
     R: Read,
 {
+    if let Some(engine) = shared_engine {
+        return run_prompt_command_with_engine(
+            command,
+            reader,
+            shared_store,
+            engine,
+            forwarded_runtime,
+        )
+        .await;
+    }
+
     let engine = ConversationEngine::new(llm.clone());
+    run_prompt_command_with_engine(command, reader, shared_store, &engine, forwarded_runtime).await
+}
+
+async fn run_prompt_command_with_engine<B, R>(
+    command: PromptCommand,
+    reader: &mut R,
+    shared_store: &FsStore,
+    engine: &ConversationEngine<B, FsStore>,
+    forwarded_runtime: bool,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    R: Read,
+{
     match command.command {
-        None => {
-            run_prompt_run(
-                command.run,
-                reader,
-                shared_store,
-                &engine,
-                forwarded_runtime,
-            )
-            .await
-        }
+        None => run_prompt_run(command.run, reader, shared_store, engine, forwarded_runtime).await,
         Some(PromptSubcommand::Status(command)) => {
-            run_prompt_status(command, shared_store, &engine).await
+            run_prompt_status(command, shared_store, engine).await
         }
         Some(PromptSubcommand::BranchStatus(command)) => {
-            run_prompt_branch_status(command, &engine).await
+            run_prompt_branch_status(command, engine).await
         }
-        Some(PromptSubcommand::Worker(command)) => run_prompt_worker(command, &engine).await,
+        Some(PromptSubcommand::Worker(command)) => run_prompt_worker(command, engine).await,
     }
 }
 
