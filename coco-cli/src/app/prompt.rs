@@ -16,7 +16,7 @@ use snafu::prelude::*;
 use tokio::process::Command;
 
 use crate::{
-    Result,
+    COCO_DAEMON_SOCKET_ENV, Result,
     cli::{
         PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
         PromptSubcommand, PromptWorkerCommand,
@@ -223,6 +223,7 @@ async fn spawn_prompt_worker(store_path: &Path, job_id: &str) -> Result<()> {
         .arg("worker")
         .arg("--job")
         .arg(job_id)
+        .env_remove(COCO_DAEMON_SOCKET_ENV)
         .env_remove(COCO_CLI_RUNTIME_SOCKET_ENV)
         .env_remove(COCO_SESSION_BRANCH_ENV)
         .stdin(Stdio::null())

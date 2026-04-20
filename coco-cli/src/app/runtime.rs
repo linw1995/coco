@@ -5,13 +5,16 @@ use clap::{Args, Parser, Subcommand};
 use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{FsStore, SessionRole};
 
-use super::{prompt::run_prompt_command, session::run_session_command, skill::run_skill_command};
+use super::{
+    daemon::run_daemon_command, prompt::run_prompt_command, session::run_session_command,
+    skill::run_skill_command,
+};
 use crate::{
     Cli, Result,
     cli::{
         Command, PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
         PromptSubcommand, SessionBranchCommand, SessionCommand, SessionGraphCommand,
-        SessionShowCommand, SessionSubcommand,
+        SessionShowCommand, SessionSubcommand, SkillCommand,
     },
 };
 
@@ -25,7 +28,14 @@ enum ForwardedRuntimeScope {
 #[command(name = "coco")]
 struct ForwardedCli {
     #[command(subcommand)]
-    command: Command,
+    command: ForwardedCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ForwardedCommand {
+    Prompt(PromptCommand),
+    Session(SessionCommand),
+    Skill(SkillCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -95,6 +105,7 @@ impl RunnerCli {
         };
 
         Cli {
+            daemon_socket: None,
             store_path: default_forwarded_store_path(),
             command,
         }
@@ -104,8 +115,13 @@ impl RunnerCli {
 impl ForwardedCli {
     fn into_cli(self) -> Cli {
         Cli {
+            daemon_socket: None,
             store_path: default_forwarded_store_path(),
-            command: self.command,
+            command: match self.command {
+                ForwardedCommand::Prompt(command) => Command::Prompt(command),
+                ForwardedCommand::Session(command) => Command::Session(command),
+                ForwardedCommand::Skill(command) => Command::Skill(command),
+            },
         }
     }
 }
@@ -127,6 +143,7 @@ where
         }
         Command::Session(command) => run_session_command(command, shared_store, llm).await,
         Command::Skill(command) => run_skill_command(command, shared_store).await,
+        Command::Daemon(command) => run_daemon_command(command, shared_store, llm).await,
     }
 }
 
@@ -286,5 +303,6 @@ fn apply_forwarded_defaults(
             SessionSubcommand::Feedback(command) => command.branch = branch,
         },
         Command::Skill(_) => {}
+        Command::Daemon(_) => {}
     }
 }

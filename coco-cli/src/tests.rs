@@ -16,11 +16,16 @@ use coco_llm::{
 use coco_mem::SessionState;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::{
     Cli,
-    app::{resolve_session_config, run_forwarded_with_services, run_with_backend},
+    app::{
+        daemon::start_daemon_server, resolve_session_config, run_forwarded_with_services,
+        run_with_backend,
+    },
     cli::{
         Command, PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
         PromptSubcommand, PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand,
@@ -234,6 +239,7 @@ impl CompletionBackend for UseSkillFailureBackend {
 
 fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str]) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Prompt(PromptCommand {
             command: None,
@@ -248,6 +254,7 @@ fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str
 
 fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Prompt(PromptCommand {
             command: Some(PromptSubcommand::Worker(PromptWorkerCommand {
@@ -264,6 +271,7 @@ fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
 
 fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Prompt(PromptCommand {
             command: Some(PromptSubcommand::Status(PromptStatusCommand {
@@ -284,6 +292,7 @@ fn prompt_branch_status_cli(
     branch: Option<&str>,
 ) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Prompt(PromptCommand {
             command: Some(PromptSubcommand::BranchStatus(PromptBranchStatusCommand {
@@ -301,6 +310,7 @@ fn prompt_branch_status_cli(
 
 fn session_create_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Create(SessionCreateCommand {
@@ -319,6 +329,7 @@ fn session_create_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
 
 fn session_list_cli(store_path: std::path::PathBuf) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::List,
@@ -328,6 +339,7 @@ fn session_list_cli(store_path: std::path::PathBuf) -> Cli {
 
 fn session_fork_cli(store_path: std::path::PathBuf, branch: &str, from_ref: Option<&str>) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Fork(SessionForkCommand {
@@ -340,6 +352,7 @@ fn session_fork_cli(store_path: std::path::PathBuf, branch: &str, from_ref: Opti
 
 fn session_get_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Get(SessionBranchCommand {
@@ -351,6 +364,7 @@ fn session_get_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli 
 
 fn session_graph_cli(store_path: std::path::PathBuf) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Graph(SessionGraphCommand {}),
@@ -360,6 +374,7 @@ fn session_graph_cli(store_path: std::path::PathBuf) -> Cli {
 
 fn session_show_cli(store_path: std::path::PathBuf, reference: &str, json: bool) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Show(SessionShowCommand {
@@ -372,6 +387,7 @@ fn session_show_cli(store_path: std::path::PathBuf, reference: &str, json: bool)
 
 fn session_delete_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Delete(SessionBranchCommand {
@@ -383,6 +399,7 @@ fn session_delete_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
 
 fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Rebase(SessionRebaseCommand {
@@ -405,6 +422,7 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
 
 fn session_reopen_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Reopen(SessionBranchCommand {
@@ -420,6 +438,7 @@ fn session_pr_cli(
     target_branch: &str,
 ) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Pr(SessionPrCommand {
@@ -436,6 +455,7 @@ fn session_close_cli(
     target_branch: &str,
 ) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Close(SessionCloseCommand {
@@ -453,6 +473,7 @@ fn session_merge_cli(
     prompt: &str,
 ) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Merge(SessionMergeCommand {
@@ -471,6 +492,7 @@ fn session_feedback_cli(
     from_ref: Option<&str>,
 ) -> Cli {
     Cli {
+        daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Feedback(SessionFeedbackCommand {
@@ -1367,6 +1389,7 @@ async fn session_create_persists_additional_params() {
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
             let cli = Cli {
+                daemon_socket: None,
                 store_path: store_path.clone(),
                 command: Command::Session(SessionCommand {
                     command: SessionSubcommand::Create(SessionCreateCommand {
@@ -2818,6 +2841,67 @@ async fn forwarded_runtime_rejects_store_path_override() {
     assert_eq!(response.exit_code, 1);
     assert!(response.stderr.contains("\"--store-path\""));
     assert!(!response.stderr.contains("Usage:"));
+}
+
+#[tokio::test]
+async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let socket_dir = tempfile::Builder::new()
+        .prefix("coco-daemon-test-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket_path = socket_dir.path().join("coco.sock");
+    let store = open_store(&store_path).unwrap();
+    let llm = Arc::new(coco_llm::LlmService::new(
+        store.clone(),
+        FakeBackend::with_responses(&[("main", &[Ok("daemon-response")])]),
+    ));
+    let server = match start_daemon_server(&socket_path, &store, &llm) {
+        Ok(server) => server,
+        Err(crate::Error::BindDaemonSocket { source, .. })
+            if source.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            return;
+        }
+        Err(error) => panic!("failed to start daemon server: {error}"),
+    };
+
+    let request = coco_llm::CocoCliRuntimeRequest {
+        args: vec!["prompt".to_owned(), "hello".to_owned()],
+        stdin: Vec::new(),
+        branch_env: Some("main".to_owned()),
+        session_role: Some(SessionRole::Orchestrator),
+        store_path_env: None,
+    };
+
+    let payload = serde_json::to_vec(&request).unwrap();
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    stream.write_all(&payload).await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response: coco_llm::CocoCliRuntimeResponse = serde_json::from_slice(&response).unwrap();
+
+    assert_eq!(response.exit_code, 0);
+    assert_eq!(response.stdout, "daemon-response\n");
+    assert!(response.stderr.is_empty());
+
+    server.shutdown().await.unwrap();
 }
 
 #[test]

@@ -54,6 +54,15 @@ pub enum Error {
     #[snafu(display("Failed to spawn prompt worker: {source}"))]
     SpawnPromptWorker { source: io::Error },
 
+    #[snafu(display("Failed to resolve daemon socket root: {source}"))]
+    ResolveDaemonSocketRoot { source: io::Error },
+
+    #[snafu(display("Failed to bind daemon socket {path:?}: {source}"))]
+    BindDaemonSocket { path: PathBuf, source: io::Error },
+
+    #[snafu(display("Daemon server task failed: {source}"))]
+    JoinDaemonServer { source: tokio::task::JoinError },
+
     #[snafu(display("{source}"))]
     Store { source: coco_mem::StoreError },
 

@@ -10,6 +10,7 @@ use coco_mem::{FsStore, SessionRole};
 
 use crate::{Cli, Result, cli::SessionCreateCommand, store::open_store};
 
+pub(crate) mod daemon;
 mod prompt;
 mod runtime;
 mod session;
@@ -28,7 +29,29 @@ where
     R: Read,
 {
     let shared_store = open_store(&cli.store_path)?;
-    let llm = Arc::new_cyclic(|weak_llm| {
+    let llm = build_llm_service(shared_store.clone(), backend);
+
+    run_with_services(cli, reader, &shared_store, &llm).await
+}
+
+pub async fn run_with_services<B, R>(
+    cli: Cli,
+    reader: &mut R,
+    shared_store: &FsStore,
+    llm: &Arc<LlmService<B, FsStore>>,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    R: Read,
+{
+    runtime::run_with_services(cli, reader, shared_store, llm, false).await
+}
+
+fn build_llm_service<B>(shared_store: FsStore, backend: B) -> Arc<LlmService<B, FsStore>>
+where
+    B: CompletionBackend + 'static,
+{
+    Arc::new_cyclic(|weak_llm| {
         let bash_bridge_impl = Arc::new(LlmRuntimeBridge::new(weak_llm.clone(), {
             let shared_store = shared_store.clone();
             move |request, llm| {
@@ -53,22 +76,7 @@ where
             .with_bash_tool_cli_bridge(bash_bridge)
             .with_skill_tool_executor(skill_bridge)
             .build()
-    });
-
-    run_with_services(cli, reader, &shared_store, &llm).await
-}
-
-pub async fn run_with_services<B, R>(
-    cli: Cli,
-    reader: &mut R,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
-) -> Result<Option<String>>
-where
-    B: CompletionBackend + 'static,
-    R: Read,
-{
-    runtime::run_with_services(cli, reader, shared_store, llm, false).await
+    })
 }
 
 pub async fn run_forwarded_with_services<B>(

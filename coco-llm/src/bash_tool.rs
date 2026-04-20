@@ -51,6 +51,7 @@ struct CocoCliRuntimeServer {
 }
 
 const MAX_RUNTIME_SOCKET_PATH_LEN: usize = 107;
+const COCO_DAEMON_SOCKET_ENV: &str = "COCO_DAEMON_SOCKET";
 
 #[cfg(unix)]
 const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
@@ -675,6 +676,7 @@ async fn execute_bash_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env_remove(COCO_DAEMON_SOCKET_ENV)
         .env_remove(COCO_SESSION_BRANCH_ENV)
         .env_remove(COCO_SESSION_ROLE_ENV)
         .env_remove(COCO_STORE_PATH_ENV)
