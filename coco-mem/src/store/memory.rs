@@ -5,8 +5,8 @@ use super::Store;
 use super::state::StoreState;
 use crate::StoreResult as Result;
 use crate::{
-    BranchConfig, Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionRole, SessionState,
-    SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
+    BranchConfig, BranchConfigRecord, Job, JobStatus, NewNode, Node, SessionAnchorPatch,
+    SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
 };
 
 #[derive(Clone, Debug)]
@@ -143,11 +143,18 @@ impl Store for MemoryStore {
     }
 
     fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .list_branch_configs()
+    }
+
+    fn list_branch_config_records(&self) -> Result<HashMap<String, BranchConfigRecord>> {
         Ok(self
             .inner
             .read()
             .expect("store lock poisoned")
-            .list_branch_configs())
+            .list_branch_config_records())
     }
 
     fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
@@ -157,12 +164,29 @@ impl Store for MemoryStore {
             .get_branch_config(name)
     }
 
-    fn set_branch_config(&self, name: &str, config: BranchConfig) -> Result<BranchConfig> {
-        Ok(self
-            .inner
+    fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_branch_config_record(name)
+    }
+
+    fn set_branch_config(&self, name: &str, config: BranchConfig) -> Result<BranchConfigRecord> {
+        self.inner
             .write()
             .expect("store lock poisoned")
-            .set_branch_config(name, config))
+            .set_branch_config(name, config)
+    }
+
+    fn rollback_branch_config(
+        &self,
+        name: &str,
+        target_version: u64,
+    ) -> Result<BranchConfigRecord> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .rollback_branch_config(name, target_version)
     }
 
     fn delete_branch_config(&self, name: &str) -> Result<()> {

@@ -141,6 +141,24 @@ pub struct BranchConfig {
     pub role: Option<SessionRole>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BranchConfigVersion {
+    pub version: u64,
+    pub created_at: Timestamp,
+    #[serde(default)]
+    pub session: SessionAnchorPatch,
+    #[serde(default)]
+    pub role: Option<SessionRole>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BranchConfigRecord {
+    pub name: String,
+    pub current_version: u64,
+    #[serde(default)]
+    pub versions: BTreeMap<u64, BranchConfigVersion>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillVersionSpec {
     pub description: String,
@@ -582,6 +600,67 @@ impl BackendMetadataBuilder {
             execution_id: self.execution_id,
             call_id: self.call_id,
         })
+    }
+}
+
+impl BranchConfigVersion {
+    pub fn new(version: u64, config: BranchConfig) -> Self {
+        Self {
+            version,
+            created_at: Timestamp::now(),
+            session: config.session,
+            role: config.role,
+        }
+    }
+
+    pub fn to_config(&self) -> BranchConfig {
+        BranchConfig {
+            session: self.session.clone(),
+            role: self.role,
+        }
+    }
+}
+
+impl BranchConfigRecord {
+    pub fn new(name: impl Into<String>, config: BranchConfig) -> Self {
+        let version = BranchConfigVersion::new(1, config);
+        let current_version = version.version;
+        let mut versions = BTreeMap::new();
+        versions.insert(current_version, version);
+
+        Self {
+            name: name.into(),
+            current_version,
+            versions,
+        }
+    }
+
+    pub fn current(&self) -> Option<&BranchConfigVersion> {
+        self.versions.get(&self.current_version)
+    }
+
+    pub fn current_config(&self) -> Option<BranchConfig> {
+        self.current().map(BranchConfigVersion::to_config)
+    }
+
+    pub fn update(&mut self, config: BranchConfig) -> Option<&BranchConfigVersion> {
+        self.current()?;
+        let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
+        let next = BranchConfigVersion::new(next_version, config);
+
+        self.current_version = next_version;
+        self.versions.insert(next_version, next);
+        self.current()
+    }
+
+    pub fn rollback(&mut self, target_version: u64) -> Option<&BranchConfigVersion> {
+        let target = self.versions.get(&target_version)?.to_config();
+        let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
+        let next = BranchConfigVersion::new(next_version, target);
+
+        self.current_version = next_version;
+        self.versions.insert(next_version, next);
+        self.current()
     }
 }
 
