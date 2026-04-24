@@ -9,8 +9,8 @@ pub(crate) mod state;
 mod tests;
 
 use crate::{
-    Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
-    SkillRecord, SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    BranchConfig, Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionRole, SessionState,
+    SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 /// Thread-safe node graph storage used by CoCo services.
@@ -66,6 +66,18 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+
+    /// Returns all persisted branch preset configs keyed by preset name.
+    fn list_branch_configs(&self) -> StoreResult<HashMap<String, BranchConfig>>;
+
+    /// Returns one branch preset config by preset name.
+    fn get_branch_config(&self, name: &str) -> StoreResult<BranchConfig>;
+
+    /// Creates or replaces a branch preset config under a preset name.
+    fn set_branch_config(&self, name: &str, config: BranchConfig) -> StoreResult<BranchConfig>;
+
+    /// Deletes one branch preset config by preset name.
+    fn delete_branch_config(&self, name: &str) -> StoreResult<()>;
 
     /// Returns the persisted skill groups.
     fn skill_groups(&self) -> StoreResult<SkillGroups>;

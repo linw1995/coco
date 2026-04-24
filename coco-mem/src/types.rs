@@ -132,6 +132,15 @@ pub struct SessionAnchorPatch {
     pub enable_coco_shim: Option<bool>,
 }
 
+/// Preset configuration for creating or rebasing branch sessions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BranchConfig {
+    #[serde(default)]
+    pub session: SessionAnchorPatch,
+    #[serde(default)]
+    pub role: Option<SessionRole>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillVersionSpec {
     pub description: String,
@@ -463,6 +472,20 @@ impl SessionAnchor {
     }
 }
 
+impl BranchConfig {
+    pub fn to_session_anchor_patch(&self) -> SessionAnchorPatch {
+        let mut patch = self.session.clone();
+        if self.role.is_some() {
+            patch.role = self.role;
+        }
+        patch
+    }
+
+    pub fn apply_to_session_anchor(&self, anchor: &SessionAnchor) -> SessionAnchor {
+        anchor.apply_patch(&self.to_session_anchor_patch())
+    }
+}
+
 impl SessionRole {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -634,9 +657,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchor, BackendMetadata, ExecutionMetadata, Kind, NewNode, Node, PauseReason, PromptAnchor,
-        ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
-        SkillResultAnchor, Tool, ToolResult,
+        Anchor, BackendMetadata, BranchConfig, ExecutionMetadata, Kind, NewNode, Node, PauseReason,
+        PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
+        SessionState, SkillResultAnchor, Tool, ToolResult,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -1073,6 +1096,40 @@ mod tests {
             updated.additional_params,
             Some(json!({"service_tier": "priority"}))
         );
+    }
+
+    #[test]
+    fn branch_config_applies_session_and_role_settings() {
+        let updated = BranchConfig {
+            session: SessionAnchorPatch {
+                role: None,
+                provider: Some("anthropic".to_owned()),
+                model: Some("claude-sonnet-4-20250514".to_owned()),
+                tools: Some(vec![]),
+                system_prompt: Some("new system".to_owned()),
+                prompt: Some("new prompt".to_owned()),
+                temperature: Some(Some(0.2)),
+                max_tokens: Some(Some(256)),
+                additional_params: Some(Some(json!({"service_tier": "priority"}))),
+                enable_coco_shim: Some(true),
+            },
+            role: Some(SessionRole::Runner),
+        }
+        .apply_to_session_anchor(&make_session_anchor());
+
+        assert_eq!(updated.role, SessionRole::Runner);
+        assert_eq!(updated.provider, "anthropic");
+        assert_eq!(updated.model, "claude-sonnet-4-20250514");
+        assert!(updated.tools.is_empty());
+        assert_eq!(updated.system_prompt, "new system");
+        assert_eq!(updated.prompt, "new prompt");
+        assert_eq!(updated.temperature, Some(0.2));
+        assert_eq!(updated.max_tokens, Some(256));
+        assert_eq!(
+            updated.additional_params,
+            Some(json!({"service_tier": "priority"}))
+        );
+        assert!(updated.enable_coco_shim);
     }
 
     #[test]

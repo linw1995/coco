@@ -18,8 +18,8 @@ use crate::error::{
     WriteStoreMetaSnafu,
 };
 use crate::{
-    Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
-    SkillRecord, SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError,
+    BranchConfig, Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionRole, SessionState,
+    SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError,
     StoreResult as Result, default_skill_groups,
 };
 
@@ -27,6 +27,7 @@ const STORE_FORMAT_VERSION: u64 = 6;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
+const BRANCH_CONFIGS_FILE_NAME: &str = "branch-configs.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
 const SKILLS_FILE_NAME: &str = "skills.json";
 const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
@@ -47,6 +48,7 @@ pub(crate) struct Persistence {
     meta_path: PathBuf,
     nodes_path: PathBuf,
     sessions_path: PathBuf,
+    branch_configs_path: PathBuf,
     jobs_path: PathBuf,
     skills_path: PathBuf,
     skill_history_dir: PathBuf,
@@ -399,6 +401,7 @@ impl Persistence {
             meta_path: path.join(META_FILE_NAME),
             nodes_path: path.join(NODES_FILE_NAME),
             sessions_path: path.join(SESSIONS_FILE_NAME),
+            branch_configs_path: path.join(BRANCH_CONFIGS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
@@ -527,6 +530,10 @@ impl Persistence {
         write_json_file(&self.meta_path, &meta)?;
         write_jsonl_file(&self.nodes_path, &[root])?;
         write_json_file(&self.sessions_path, &HashMap::<String, SessionState>::new())?;
+        write_json_file(
+            &self.branch_configs_path,
+            &HashMap::<String, BranchConfig>::new(),
+        )?;
         write_json_file(&self.jobs_path, &HashMap::<String, Job>::new())?;
         write_json_file(
             &self.skills_path,
@@ -665,6 +672,20 @@ impl Persistence {
         );
         store.sessions = read_json_file::<HashMap<String, SessionState>>(&self.sessions_path)?;
         map_session_validation_error(&self.sessions_path, store.validate_session_records())?;
+        store.branch_configs = if self.branch_configs_path.exists() {
+            ensure!(
+                self.branch_configs_path.is_file(),
+                CorruptedStoreSnafu {
+                    path: self.branch_configs_path.clone(),
+                    message: "branch preset config metadata entry must be a file".to_owned(),
+                }
+            );
+            read_json_file::<HashMap<String, BranchConfig>>(&self.branch_configs_path)?
+        } else {
+            let configs = HashMap::<String, BranchConfig>::new();
+            write_json_file(&self.branch_configs_path, &configs)?;
+            configs
+        };
         store.jobs = read_json_file::<HashMap<String, Job>>(&self.jobs_path)?;
         let skill_groups = read_json_file::<PersistedSkillGroups>(&self.skills_path)?;
         if skill_groups.is_empty() {
@@ -687,6 +708,10 @@ impl Persistence {
 
     pub fn persist_sessions(&self, state: &StoreState) -> Result<()> {
         write_json_file(&self.sessions_path, &state.list_session_states())
+    }
+
+    pub fn persist_branch_configs(&self, state: &StoreState) -> Result<()> {
+        write_json_file(&self.branch_configs_path, &state.list_branch_configs())
     }
 
     pub fn persist_jobs(&self, state: &StoreState) -> Result<()> {
@@ -1043,6 +1068,39 @@ impl Store for FsStore {
         }
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
+    }
+
+    fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_branch_configs())
+    }
+
+    fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_branch_config(name)
+    }
+
+    fn set_branch_config(&self, name: &str, config: BranchConfig) -> Result<BranchConfig> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.set_branch_config(name, config);
+        self.persistence.persist_branch_configs(&temp)?;
+        state.branch_configs = temp.branch_configs;
+        Ok(updated)
+    }
+
+    fn delete_branch_config(&self, name: &str) -> Result<()> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        temp.delete_branch_config(name)?;
+        self.persistence.persist_branch_configs(&temp)?;
+        state.branch_configs = temp.branch_configs;
+        Ok(())
     }
 
     fn skill_groups(&self) -> Result<SkillGroups> {

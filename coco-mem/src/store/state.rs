@@ -6,15 +6,15 @@ use snafu::prelude::*;
 
 use crate::StoreResult as Result;
 use crate::error::{
-    AmbiguousNodePrefixSnafu, BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu,
-    DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSkillNameSnafu,
+    AmbiguousNodePrefixSnafu, BranchConfigNotFoundSnafu, BranchExistsSnafu, BranchHeadMovedSnafu,
+    BranchNotFoundSnafu, DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSkillNameSnafu,
     MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu,
     PromptJobActiveOnBranchSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
     RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu,
     SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
-    Anchor, AnchorPayload, Job, JobStatus, Kind, NewNode, Node, PauseReason, Role,
+    Anchor, AnchorPayload, BranchConfig, Job, JobStatus, Kind, NewNode, Node, PauseReason, Role,
     SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
     SkillVersionSpec, default_skill_groups,
 };
@@ -26,6 +26,7 @@ pub(crate) struct StoreState {
     pub root: String,
     pub branches: HashMap<String, String>,
     pub sessions: HashMap<String, SessionState>,
+    pub branch_configs: HashMap<String, BranchConfig>,
     pub jobs: HashMap<String, Job>,
     pub skill_groups: SkillGroups,
 }
@@ -71,6 +72,7 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
+            branch_configs: HashMap::new(),
             jobs: HashMap::new(),
             skill_groups: default_skill_groups(),
         }
@@ -87,6 +89,7 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
+            branch_configs: HashMap::new(),
             jobs: HashMap::new(),
             skill_groups: default_skill_groups(),
         }
@@ -303,6 +306,33 @@ impl StoreState {
         })?;
         *state = next;
         Ok(state.clone())
+    }
+
+    pub fn list_branch_configs(&self) -> HashMap<String, BranchConfig> {
+        self.branch_configs.clone()
+    }
+
+    pub fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
+        self.branch_configs
+            .get(name)
+            .cloned()
+            .context(BranchConfigNotFoundSnafu {
+                name: name.to_owned(),
+            })
+    }
+
+    pub fn set_branch_config(&mut self, name: &str, config: BranchConfig) -> BranchConfig {
+        self.branch_configs.insert(name.to_owned(), config.clone());
+        config
+    }
+
+    pub fn delete_branch_config(&mut self, name: &str) -> Result<()> {
+        self.branch_configs
+            .remove(name)
+            .map(|_| ())
+            .context(BranchConfigNotFoundSnafu {
+                name: name.to_owned(),
+            })
     }
 
     pub fn submit_job(&mut self, branch: &str, base: &str) -> Result<Job> {

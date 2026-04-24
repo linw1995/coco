@@ -5,8 +5,8 @@ use super::Store;
 use super::state::StoreState;
 use crate::StoreResult as Result;
 use crate::{
-    Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
-    SkillRecord, SkillUpdatePatch, SkillVersionSpec,
+    BranchConfig, Job, JobStatus, NewNode, Node, SessionAnchorPatch, SessionRole, SessionState,
+    SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
 };
 
 #[derive(Clone, Debug)]
@@ -140,6 +140,36 @@ impl Store for MemoryStore {
         }
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
+    }
+
+    fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_branch_configs())
+    }
+
+    fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_branch_config(name)
+    }
+
+    fn set_branch_config(&self, name: &str, config: BranchConfig) -> Result<BranchConfig> {
+        Ok(self
+            .inner
+            .write()
+            .expect("store lock poisoned")
+            .set_branch_config(name, config))
+    }
+
+    fn delete_branch_config(&self, name: &str) -> Result<()> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .delete_branch_config(name)
     }
 
     fn skill_groups(&self) -> Result<SkillGroups> {

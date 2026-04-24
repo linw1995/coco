@@ -7,9 +7,9 @@ use super::memory::MemoryStore;
 use super::state::StoreState;
 use crate::Store as StoreTrait;
 use crate::{
-    Anchor, JobStatus, Kind, NewNode, Node, PauseReason, PromptAnchor, Role, SessionAnchor,
-    SessionAnchorPatch, SessionRole, SessionState, SkillUpdatePatch, SkillVersionSpec,
-    StoreError as Error,
+    Anchor, BranchConfig, JobStatus, Kind, NewNode, Node, PauseReason, PromptAnchor, Role,
+    SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillUpdatePatch,
+    SkillVersionSpec, StoreError as Error,
 };
 use serde_json::json;
 
@@ -42,6 +42,24 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
                 enable_coco_shim: false,
             },
         )),
+    }
+}
+
+fn make_branch_config(model: &str, role: SessionRole) -> BranchConfig {
+    BranchConfig {
+        session: SessionAnchorPatch {
+            role: None,
+            provider: Some("openai".to_owned()),
+            model: Some(model.to_owned()),
+            tools: Some(vec![]),
+            system_prompt: Some("preset system".to_owned()),
+            prompt: Some("preset prompt".to_owned()),
+            temperature: Some(Some(0.2)),
+            max_tokens: Some(Some(256)),
+            additional_params: Some(Some(json!({"reasoning_effort": "medium"}))),
+            enable_coco_shim: Some(true),
+        },
+        role: Some(role),
     }
 }
 
@@ -899,6 +917,123 @@ where
     );
 }
 
+fn assert_branch_config_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let preset_name = "coding";
+    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+
+    let stored = store
+        .set_branch_config(preset_name, config.clone())
+        .unwrap();
+
+    assert_eq!(stored, config);
+    assert_eq!(store.get_branch_config(preset_name).unwrap(), config);
+    assert_eq!(
+        store.list_branch_configs().unwrap().get(preset_name),
+        Some(&config)
+    );
+}
+
+fn assert_branch_config_replaces_existing_value<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let preset_name = "coding";
+    store
+        .set_branch_config(
+            preset_name,
+            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+        )
+        .unwrap();
+    let updated = make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner);
+
+    let stored = store
+        .set_branch_config(preset_name, updated.clone())
+        .unwrap();
+
+    assert_eq!(stored, updated);
+    assert_eq!(store.get_branch_config(preset_name).unwrap(), updated);
+}
+
+fn assert_delete_branch_config_removes_only_config<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let preset_name = "coding";
+    store.fork("main", &root_id).unwrap();
+    store
+        .set_branch_config(
+            preset_name,
+            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+        )
+        .unwrap();
+
+    store.delete_branch_config(preset_name).unwrap();
+
+    assert!(store.list_branch_configs().unwrap().is_empty());
+    assert!(matches!(
+        store.get_branch_config(preset_name),
+        Err(Error::BranchConfigNotFound { name }) if name == preset_name
+    ));
+    assert_eq!(store.get_branch_head("main").unwrap(), root_id);
+}
+
+fn assert_delete_branch_preserves_branch_config_preset<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let preset_name = "coding";
+    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+    store.fork("main", &root_id).unwrap();
+    store
+        .set_branch_config(preset_name, config.clone())
+        .unwrap();
+
+    store.delete_branch("main").unwrap();
+
+    assert!(matches!(
+        store.get_branch_head("main"),
+        Err(Error::BranchNotFound { name }) if name == "main"
+    ));
+    assert_eq!(store.get_branch_config(preset_name).unwrap(), config);
+}
+
+fn assert_get_branch_config_rejects_missing_config<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+
+    let err = store.get_branch_config("missing-preset").unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::BranchConfigNotFound { name } if name == "missing-preset"
+    ));
+}
+
+fn assert_delete_branch_config_rejects_missing_config<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+
+    let err = store.delete_branch_config("missing-preset").unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::BranchConfigNotFound { name } if name == "missing-preset"
+    ));
+}
+
 fn assert_get_node_supports_branch_name<F>()
 where
     F: TestStoreFactory,
@@ -1617,6 +1752,36 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
+            fn branch_config_round_trip() {
+                assert_branch_config_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn branch_config_replaces_existing_value() {
+                assert_branch_config_replaces_existing_value::<$factory>();
+            }
+
+            #[test]
+            fn delete_branch_config_removes_only_config() {
+                assert_delete_branch_config_removes_only_config::<$factory>();
+            }
+
+            #[test]
+            fn delete_branch_preserves_branch_config_preset() {
+                assert_delete_branch_preserves_branch_config_preset::<$factory>();
+            }
+
+            #[test]
+            fn get_branch_config_rejects_missing_config() {
+                assert_get_branch_config_rejects_missing_config::<$factory>();
+            }
+
+            #[test]
+            fn delete_branch_config_rejects_missing_config() {
+                assert_delete_branch_config_rejects_missing_config::<$factory>();
+            }
+
+            #[test]
             fn get_node_supports_branch_name() {
                 assert_get_node_supports_branch_name::<$factory>();
             }
@@ -1776,6 +1941,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     assert!(path.join("meta.json").is_file());
     assert!(path.join("nodes.jsonl").is_file());
     assert!(path.join("sessions.json").is_file());
+    assert!(path.join("branch-configs.json").is_file());
     assert!(path.join("skills.json").is_file());
     assert!(path.join("branches").is_dir());
     assert!(path.join("skill-history").is_dir());
@@ -1794,6 +1960,33 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     let nodes = fs::read_to_string(path.join("nodes.jsonl")).unwrap();
     assert!(nodes.lines().count() >= 1);
     assert_eq!(store.ancestry(&store.root_id()).unwrap().len(), 1);
+}
+
+#[test]
+fn open_replays_branch_configs() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let preset_name = "coding";
+    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+    store
+        .set_branch_config(preset_name, config.clone())
+        .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.get_branch_config(preset_name).unwrap(), config);
+}
+
+#[test]
+fn open_creates_missing_branch_config_metadata_for_legacy_store() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    fs::remove_file(path.join("branch-configs.json")).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert!(reopened.list_branch_configs().unwrap().is_empty());
+    assert!(path.join("branch-configs.json").is_file());
 }
 
 #[test]

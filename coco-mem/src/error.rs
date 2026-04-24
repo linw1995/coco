@@ -32,6 +32,9 @@ pub enum StoreError {
     #[snafu(display("Branch {name:?} already exists"))]
     BranchExists { name: String },
 
+    #[snafu(display("Branch preset config {name:?} not found"))]
+    BranchConfigNotFound { name: String },
+
     #[snafu(display("Branch {name:?} moved from {expected:?} to {actual:?}"))]
     BranchHeadMoved {
         name: String,
