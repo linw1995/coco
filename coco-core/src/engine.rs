@@ -75,7 +75,15 @@ impl<B, S> ConversationEngine<B, S> {
 impl<B, S> ConversationEngine<B, S>
 where
     B: CompletionBackend + 'static,
-    S: NodeStore + BranchStore + SessionStore + JobStore + RuntimeStore,
+    S: NodeStore
+        + BranchStore
+        + SessionStore
+        + JobStore
+        + RuntimeStore
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     pub async fn reply(
         &self,

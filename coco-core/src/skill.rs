@@ -148,7 +148,15 @@ where
 impl<B, S> SkillToolExecutor for CoreSkillToolExecutor<B, S>
 where
     B: CompletionBackend + 'static,
-    S: NodeStore + BranchStore + SessionStore + SkillStore + RuntimeStore + 'static,
+    S: NodeStore
+        + BranchStore
+        + SessionStore
+        + SkillStore
+        + RuntimeStore
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     async fn search_skill_tool(
         &self,
@@ -225,7 +233,15 @@ fn executor_error_from_llm_error(skill_name: &str, error: LlmError) -> ExecutorE
 impl<B, S> ConversationEngine<B, S>
 where
     B: CompletionBackend + 'static,
-    S: NodeStore + BranchStore + SessionStore + SkillStore + RuntimeStore,
+    S: NodeStore
+        + BranchStore
+        + SessionStore
+        + SkillStore
+        + RuntimeStore
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     pub fn search_skills(
         &self,

@@ -19,8 +19,8 @@ use crate::{
     StoreResult,
 };
 
-/// Thread-safe node graph storage used by CoCo services.
-pub trait NodeStore: Clone + Send + Sync + 'static {
+/// Node graph storage API used by CoCo services.
+pub trait NodeStore {
     /// Returns the global root node identifier.
     fn root_id(&self) -> String;
 
@@ -40,8 +40,8 @@ pub trait NodeStore: Clone + Send + Sync + 'static {
     fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>>;
 }
 
-/// Thread-safe branch reference storage.
-pub trait BranchStore: Clone + Send + Sync + 'static {
+/// Branch reference storage API.
+pub trait BranchStore {
     /// Creates a branch from a node id or branch reference and returns its head id.
     fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String>;
 
@@ -60,8 +60,8 @@ pub trait BranchStore: Clone + Send + Sync + 'static {
     ) -> StoreResult<()>;
 }
 
-/// Thread-safe branch workflow session state storage.
-pub trait SessionStore: Clone + Send + Sync + 'static {
+/// Branch workflow session state storage API.
+pub trait SessionStore {
     /// Returns all persisted branch workflow states keyed by branch.
     fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>>;
 
@@ -80,8 +80,8 @@ pub trait SessionStore: Clone + Send + Sync + 'static {
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
 }
 
-/// Thread-safe branch preset config storage.
-pub trait BranchConfigStore: Clone + Send + Sync + 'static {
+/// Branch preset config storage API.
+pub trait BranchConfigStore {
     /// Returns all persisted branch preset configs keyed by preset name.
     fn list_branch_configs(&self) -> StoreResult<HashMap<String, BranchConfig>>;
 
@@ -112,8 +112,8 @@ pub trait BranchConfigStore: Clone + Send + Sync + 'static {
     fn delete_branch_config(&self, name: &str) -> StoreResult<()>;
 }
 
-/// Thread-safe persisted skill storage.
-pub trait SkillStore: Clone + Send + Sync + 'static {
+/// Persisted skill storage API.
+pub trait SkillStore {
     /// Returns the persisted skill groups.
     fn skill_groups(&self) -> StoreResult<SkillGroups>;
 
@@ -148,8 +148,8 @@ pub trait SkillStore: Clone + Send + Sync + 'static {
     ) -> StoreResult<SkillRecord>;
 }
 
-/// Thread-safe prompt job storage.
-pub trait JobStore: Clone + Send + Sync + 'static {
+/// Prompt job storage API.
+pub trait JobStore {
     /// Creates a new single-task prompt job record.
     ///
     /// Rejects the request when the branch already has an unfinished prompt job.
@@ -171,7 +171,7 @@ pub trait JobStore: Clone + Send + Sync + 'static {
 }
 
 /// Optional runtime metadata for stores with a process-shareable backing path.
-pub trait RuntimeStore: Clone + Send + Sync + 'static {
+pub trait RuntimeStore {
     /// Returns the backing store directory when the store is process-shareable.
     fn runtime_store_path(&self) -> Option<PathBuf> {
         None

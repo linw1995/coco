@@ -148,7 +148,7 @@ trait InspectableStore {
 }
 
 trait TestStoreFactory {
-    type Store: BranchConfigStore
+    type Backend: BranchConfigStore
         + BranchStore
         + InspectableStore
         + JobStore
@@ -156,7 +156,7 @@ trait TestStoreFactory {
         + SessionStore
         + SkillStore;
 
-    fn create() -> Self::Store;
+    fn create() -> Self::Backend;
 }
 
 impl InspectableStore for MemoryStore {
@@ -174,9 +174,9 @@ impl InspectableStore for FsStore {
 struct MemoryFactory;
 
 impl TestStoreFactory for MemoryFactory {
-    type Store = MemoryStore;
+    type Backend = MemoryStore;
 
-    fn create() -> Self::Store {
+    fn create() -> Self::Backend {
         MemoryStore::new()
     }
 }
@@ -184,9 +184,9 @@ impl TestStoreFactory for MemoryFactory {
 struct FsFactory;
 
 impl TestStoreFactory for FsFactory {
-    type Store = FsStore;
+    type Backend = FsStore;
 
-    fn create() -> Self::Store {
+    fn create() -> Self::Backend {
         let tempdir = tempfile::tempdir().expect("temporary directory should be created");
         let path = tempdir.path().join("store");
         let store = FsStore::open(&path).expect("file system store should open");

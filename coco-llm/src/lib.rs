@@ -384,7 +384,7 @@ impl std::fmt::Debug for TraceNodeAppenderHandle {
 
 impl<S> TraceNodeAppender for StoreNodeAppender<S>
 where
-    S: NodeStore,
+    S: NodeStore + Send + Sync,
 {
     fn append(
         &self,
@@ -910,7 +910,7 @@ impl<B, S> LlmService<B, S> {
 impl<B, S> LlmService<B, S>
 where
     B: CompletionBackend,
-    S: NodeStore + BranchStore + SessionStore + RuntimeStore,
+    S: NodeStore + BranchStore + SessionStore + RuntimeStore + Clone + Send + Sync + 'static,
 {
     pub async fn rebase_session(&self, branch: &str, patch: SessionConfigPatch) -> Result<String> {
         let _guard = self.lock_branch(branch).await;

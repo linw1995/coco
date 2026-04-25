@@ -33,7 +33,15 @@ impl<R, B, S> CoreService<R, B, S>
 where
     R: BranchResolver,
     B: CompletionBackend + 'static,
-    S: NodeStore + BranchStore + SessionStore + JobStore + RuntimeStore,
+    S: NodeStore
+        + BranchStore
+        + SessionStore
+        + JobStore
+        + RuntimeStore
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     pub async fn handle_message(&self, message: InboundMessage) -> Result<OutboundMessage> {
         let text = message.text.trim();
