@@ -2603,10 +2603,10 @@ fn preset_set_parses_name_and_patch_flags() {
     };
 
     assert_eq!(command.name, "coding");
-    assert_eq!(command.role, Some(crate::cli::CliSessionRole::Runner));
-    assert_eq!(command.provider, Some(crate::cli::CliProvider::Anthropic));
-    assert_eq!(command.model.as_deref(), Some("claude-sonnet-4-20250514"));
-    assert_eq!(command.system_prompt.as_deref(), Some("You are precise."));
+    assert_eq!(command.role, crate::cli::CliSessionRole::Runner);
+    assert_eq!(command.provider, crate::cli::CliProvider::Anthropic);
+    assert_eq!(command.model, "claude-sonnet-4-20250514");
+    assert_eq!(command.system_prompt, "You are precise.");
     assert_eq!(command.tools, vec![crate::cli::CliTool::Bash]);
     assert!(command.enable_coco_shim);
 }
@@ -2653,13 +2653,13 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(first_json["name"], preset_name);
     assert_eq!(first_json["current_version"], 1);
     assert_eq!(first_json["config"]["role"], "orchestrator");
-    assert_eq!(first_json["config"]["session"]["provider"], "openai");
-    assert_eq!(first_json["config"]["session"]["model"], "gpt-4.1-mini");
+    assert_eq!(first_json["config"]["provider"], "openai");
+    assert_eq!(first_json["config"]["model"], "gpt-4.1-mini");
     assert_eq!(
-        first_json["config"]["session"]["additional_params"],
+        first_json["config"]["additional_params"],
         json!({"reasoning_effort": "low"})
     );
-    assert_eq!(first_json["config"]["session"]["tools"][0]["name"], "bash");
+    assert_eq!(first_json["config"]["tools"][0]["name"], "bash");
 
     let second_output = run_with_backend(
         Cli::try_parse_from([
@@ -2672,12 +2672,12 @@ async fn preset_commands_manage_versions_in_store() {
             preset_name,
             "--role",
             "runner",
+            "--provider",
+            "anthropic",
             "--model",
             "claude-sonnet-4-20250514",
-            "--clear-temperature",
-            "--clear-max-tokens",
-            "--clear-tools",
-            "--clear-additional-params",
+            "--system-prompt",
+            "You are strict.",
             "--disable-coco-shim",
         ])
         .unwrap(),
@@ -2691,31 +2691,20 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(second_json["current_version"], 2);
     assert_eq!(second_json["available_versions"], json!([1, 2]));
     assert_eq!(second_json["config"]["role"], "runner");
-    assert_eq!(
-        second_json["config"]["session"]["model"],
-        "claude-sonnet-4-20250514"
-    );
-    assert_eq!(
-        second_json["config"]["session"]["temperature"],
-        json!({"__coco_patch": "clear"})
-    );
-    assert_eq!(
-        second_json["config"]["session"]["max_tokens"],
-        json!({"__coco_patch": "clear"})
-    );
-    assert_eq!(second_json["config"]["session"]["tools"], json!([]));
-    assert_eq!(
-        second_json["config"]["session"]["additional_params"],
-        json!({"__coco_patch": "clear"})
-    );
-    assert_eq!(second_json["config"]["session"]["enable_coco_shim"], false);
+    assert_eq!(second_json["config"]["provider"], "anthropic");
+    assert_eq!(second_json["config"]["model"], "claude-sonnet-4-20250514");
+    assert_eq!(second_json["config"]["temperature"], json!(null));
+    assert_eq!(second_json["config"]["max_tokens"], json!(null));
+    assert_eq!(second_json["config"]["tools"], json!([]));
+    assert_eq!(second_json["config"]["additional_params"], json!(null));
+    assert_eq!(second_json["config"]["enable_coco_shim"], false);
     let persisted = open_store(&store_path)
         .unwrap()
         .get_branch_config(preset_name)
         .unwrap();
-    assert_eq!(persisted.session.temperature, Some(None));
-    assert_eq!(persisted.session.max_tokens, Some(None));
-    assert_eq!(persisted.session.additional_params, Some(None));
+    assert_eq!(persisted.temperature, None);
+    assert_eq!(persisted.max_tokens, None);
+    assert_eq!(persisted.additional_params, None);
 
     let list_output = run_with_backend(
         Cli::try_parse_from([
@@ -2754,12 +2743,9 @@ async fn preset_commands_manage_versions_in_store() {
     .unwrap()
     .unwrap();
     let show_json: serde_json::Value = serde_json::from_str(&show_output).unwrap();
+    assert_eq!(show_json["versions"][0]["config"]["model"], "gpt-4.1-mini");
     assert_eq!(
-        show_json["versions"][0]["config"]["session"]["model"],
-        "gpt-4.1-mini"
-    );
-    assert_eq!(
-        show_json["versions"][1]["config"]["session"]["model"],
+        show_json["versions"][1]["config"]["model"],
         "claude-sonnet-4-20250514"
     );
 
@@ -2784,7 +2770,7 @@ async fn preset_commands_manage_versions_in_store() {
     .unwrap();
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback_output).unwrap();
     assert_eq!(rollback_json["current_version"], 3);
-    assert_eq!(rollback_json["config"]["session"]["model"], "gpt-4.1-mini");
+    assert_eq!(rollback_json["config"]["model"], "gpt-4.1-mini");
 
     let delete_output = run_with_backend(
         Cli::try_parse_from([
@@ -2840,19 +2826,15 @@ async fn session_rebase_applies_preset_patch() {
             command: Command::Preset(PresetCommand {
                 command: PresetSubcommand::Set(PresetSetCommand {
                     name: "runner-defaults".to_owned(),
-                    role: Some(crate::cli::CliSessionRole::Runner),
-                    provider: Some(crate::cli::CliProvider::Anthropic),
-                    model: Some("claude-sonnet-4-20250514".to_owned()),
-                    system_prompt: Some("You are precise.".to_owned()),
-                    prompt: Some("Start with a plan.".to_owned()),
+                    role: crate::cli::CliSessionRole::Runner,
+                    provider: crate::cli::CliProvider::Anthropic,
+                    model: "claude-sonnet-4-20250514".to_owned(),
+                    system_prompt: "You are precise.".to_owned(),
+                    prompt: "Start with a plan.".to_owned(),
                     temperature: None,
-                    clear_temperature: true,
                     max_tokens: Some(256),
-                    clear_max_tokens: false,
                     tools: vec![],
-                    clear_tools: true,
                     additional_params: Some("{\"reasoning_effort\":\"medium\"}".to_owned()),
-                    clear_additional_params: false,
                     enable_coco_shim: true,
                     disable_coco_shim: false,
                 }),

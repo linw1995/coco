@@ -1,4 +1,3 @@
-use coco_llm::SessionConfigPatch;
 use coco_mem::{BranchConfig, BranchConfigRecord, BranchConfigStore, BranchConfigVersion, FsStore};
 use serde::Serialize;
 use serde_json::Value;
@@ -104,45 +103,18 @@ fn run_preset_delete(command: PresetNameCommand, store: &FsStore) -> Result<Pres
 
 fn resolve_branch_config(command: PresetSetCommand) -> Result<BranchConfig> {
     Ok(BranchConfig {
-        role: command.role.map(Into::into),
-        session: SessionConfigPatch {
-            role: None,
-            provider: command
-                .provider
-                .map(|provider| coco_llm::Provider::from(provider).as_str().to_owned()),
-            model: command.model,
-            tools: if command.clear_tools {
-                Some(vec![])
-            } else if command.tools.is_empty() {
-                None
-            } else {
-                Some(resolve_cli_tools(&command.tools))
-            },
-            system_prompt: command.system_prompt,
-            prompt: command.prompt,
-            temperature: if command.clear_temperature {
-                Some(None)
-            } else {
-                command.temperature.map(Some)
-            },
-            max_tokens: if command.clear_max_tokens {
-                Some(None)
-            } else {
-                command.max_tokens.map(Some)
-            },
-            additional_params: if command.clear_additional_params {
-                Some(None)
-            } else {
-                parse_preset_additional_params(command.additional_params)?.map(Some)
-            },
-            enable_coco_shim: if command.enable_coco_shim {
-                Some(true)
-            } else if command.disable_coco_shim {
-                Some(false)
-            } else {
-                None
-            },
-        },
+        role: command.role.into(),
+        provider: coco_llm::Provider::from(command.provider)
+            .as_str()
+            .to_owned(),
+        model: command.model,
+        tools: resolve_cli_tools(&command.tools),
+        system_prompt: command.system_prompt,
+        prompt: command.prompt,
+        temperature: command.temperature,
+        max_tokens: command.max_tokens,
+        additional_params: parse_preset_additional_params(command.additional_params)?,
+        enable_coco_shim: command.enable_coco_shim && !command.disable_coco_shim,
     })
 }
 

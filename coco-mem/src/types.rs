@@ -1,59 +1,10 @@
 use std::collections::BTreeMap;
 
 use jiff::Timestamp;
+use serde::de::{Deserializer, Error as DeError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-
-mod serde_double_option {
-    use serde::de::{DeserializeOwned, Deserializer, Error};
-    use serde::ser::{SerializeMap, Serializer};
-    use serde::{Deserialize, Serialize};
-    use serde_json::Value;
-
-    const PATCH_KEY: &str = "__coco_patch";
-    const CLEAR_VALUE: &str = "clear";
-
-    pub fn serialize<S, T>(value: &Option<Option<T>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: Serialize,
-    {
-        match value {
-            None => serializer.serialize_none(),
-            Some(None) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry(PATCH_KEY, CLEAR_VALUE)?;
-                map.end()
-            }
-            Some(Some(value)) => value.serialize(serializer),
-        }
-    }
-
-    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: DeserializeOwned,
-    {
-        let Some(value) = Option::<Value>::deserialize(deserializer)? else {
-            return Ok(None);
-        };
-        if is_clear_sentinel(&value) {
-            return Ok(Some(None));
-        }
-
-        serde_json::from_value(value)
-            .map(|value| Some(Some(value)))
-            .map_err(D::Error::custom)
-    }
-
-    fn is_clear_sentinel(value: &Value) -> bool {
-        let Value::Object(map) = value else {
-            return false;
-        };
-        map.len() == 1 && map.get(PATCH_KEY).and_then(Value::as_str) == Some(CLEAR_VALUE)
-    }
-}
 
 /// Represents a node in the memory graph, similar to a git commit
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -170,60 +121,112 @@ pub struct Job {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchorPatch {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<SessionRole>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serde_double_option::serialize",
-        deserialize_with = "serde_double_option::deserialize"
-    )]
     pub temperature: Option<Option<f64>>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serde_double_option::serialize",
-        deserialize_with = "serde_double_option::deserialize"
-    )]
     pub max_tokens: Option<Option<u64>>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serde_double_option::serialize",
-        deserialize_with = "serde_double_option::deserialize"
-    )]
     pub additional_params: Option<Option<Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_coco_shim: Option<bool>,
 }
 
 /// Preset configuration for creating or rebasing branch sessions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct BranchConfig {
+    pub role: SessionRole,
+    pub provider: String,
+    pub model: String,
     #[serde(default)]
-    pub session: SessionAnchorPatch,
+    pub tools: Vec<Tool>,
+    pub system_prompt: String,
     #[serde(default)]
-    pub role: Option<SessionRole>,
+    pub prompt: String,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub additional_params: Option<Value>,
+    #[serde(default)]
+    pub enable_coco_shim: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BranchConfigDeserialize {
+    Full(BranchConfigFields),
+    Legacy(LegacyBranchConfig),
+}
+
+#[derive(Deserialize)]
+struct BranchConfigFields {
+    role: SessionRole,
+    provider: String,
+    model: String,
+    #[serde(default)]
+    tools: Vec<Tool>,
+    system_prompt: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    additional_params: Option<Value>,
+    #[serde(default)]
+    enable_coco_shim: bool,
+}
+
+#[derive(Deserialize)]
+struct LegacyBranchConfig {
+    #[serde(default)]
+    session: SessionAnchorPatch,
+    #[serde(default)]
+    role: Option<SessionRole>,
+}
+
+impl<'de> Deserialize<'de> for BranchConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match BranchConfigDeserialize::deserialize(deserializer)? {
+            BranchConfigDeserialize::Full(fields) => Ok(fields.into()),
+            BranchConfigDeserialize::Legacy(legacy) => {
+                BranchConfig::from_legacy_patch(legacy.session, legacy.role)
+                    .map_err(D::Error::custom)
+            }
+        }
+    }
+}
+
+impl From<BranchConfigFields> for BranchConfig {
+    fn from(fields: BranchConfigFields) -> Self {
+        Self {
+            role: fields.role,
+            provider: fields.provider,
+            model: fields.model,
+            tools: fields.tools,
+            system_prompt: fields.system_prompt,
+            prompt: fields.prompt,
+            temperature: fields.temperature,
+            max_tokens: fields.max_tokens,
+            additional_params: fields.additional_params,
+            enable_coco_shim: fields.enable_coco_shim,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BranchConfigVersion {
     pub version: u64,
     pub created_at: Timestamp,
-    #[serde(default)]
-    pub session: SessionAnchorPatch,
-    #[serde(default)]
-    pub role: Option<SessionRole>,
+    #[serde(flatten)]
+    pub config: BranchConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -570,12 +573,45 @@ impl SessionAnchor {
 }
 
 impl BranchConfig {
+    fn from_legacy_patch(
+        session: SessionAnchorPatch,
+        role: Option<SessionRole>,
+    ) -> std::result::Result<Self, &'static str> {
+        Ok(Self {
+            role: role
+                .or(session.role)
+                .ok_or("legacy branch config is missing role")?,
+            provider: session
+                .provider
+                .ok_or("legacy branch config is missing provider")?,
+            model: session
+                .model
+                .ok_or("legacy branch config is missing model")?,
+            tools: session.tools.unwrap_or_default(),
+            system_prompt: session
+                .system_prompt
+                .ok_or("legacy branch config is missing system_prompt")?,
+            prompt: session.prompt.unwrap_or_default(),
+            temperature: session.temperature.flatten(),
+            max_tokens: session.max_tokens.flatten(),
+            additional_params: session.additional_params.flatten(),
+            enable_coco_shim: session.enable_coco_shim.unwrap_or_default(),
+        })
+    }
+
     pub fn to_session_anchor_patch(&self) -> SessionAnchorPatch {
-        let mut patch = self.session.clone();
-        if self.role.is_some() {
-            patch.role = self.role;
+        SessionAnchorPatch {
+            role: Some(self.role),
+            provider: Some(self.provider.clone()),
+            model: Some(self.model.clone()),
+            tools: Some(self.tools.clone()),
+            system_prompt: Some(self.system_prompt.clone()),
+            prompt: Some(self.prompt.clone()),
+            temperature: Some(self.temperature),
+            max_tokens: Some(self.max_tokens),
+            additional_params: Some(self.additional_params.clone()),
+            enable_coco_shim: Some(self.enable_coco_shim),
         }
-        patch
     }
 
     pub fn apply_to_session_anchor(&self, anchor: &SessionAnchor) -> SessionAnchor {
@@ -687,16 +723,12 @@ impl BranchConfigVersion {
         Self {
             version,
             created_at: Timestamp::now(),
-            session: config.session,
-            role: config.role,
+            config,
         }
     }
 
     pub fn to_config(&self) -> BranchConfig {
-        BranchConfig {
-            session: self.session.clone(),
-            role: self.role,
-        }
+        self.config.clone()
     }
 }
 
@@ -1257,60 +1289,18 @@ mod tests {
     }
 
     #[test]
-    fn session_anchor_patch_round_trip_preserves_clear_fields() {
-        let patch = SessionAnchorPatch {
-            temperature: Some(None),
-            max_tokens: Some(None),
-            additional_params: Some(None),
-            ..SessionAnchorPatch::default()
-        };
-
-        let encoded = serde_json::to_value(&patch).unwrap();
-        assert_eq!(
-            encoded,
-            json!({
-                "temperature": {"__coco_patch": "clear"},
-                "max_tokens": {"__coco_patch": "clear"},
-                "additional_params": {"__coco_patch": "clear"}
-            })
-        );
-
-        let decoded: SessionAnchorPatch = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded.temperature, Some(None));
-        assert_eq!(decoded.max_tokens, Some(None));
-        assert_eq!(decoded.additional_params, Some(None));
-    }
-
-    #[test]
-    fn session_anchor_patch_reads_legacy_null_fields_as_absent() {
-        let decoded: SessionAnchorPatch = serde_json::from_value(json!({
-            "temperature": null,
-            "max_tokens": null,
-            "additional_params": null
-        }))
-        .unwrap();
-
-        assert_eq!(decoded.temperature, None);
-        assert_eq!(decoded.max_tokens, None);
-        assert_eq!(decoded.additional_params, None);
-    }
-
-    #[test]
     fn branch_config_applies_session_and_role_settings() {
         let updated = BranchConfig {
-            session: SessionAnchorPatch {
-                role: None,
-                provider: Some("anthropic".to_owned()),
-                model: Some("claude-sonnet-4-20250514".to_owned()),
-                tools: Some(vec![]),
-                system_prompt: Some("new system".to_owned()),
-                prompt: Some("new prompt".to_owned()),
-                temperature: Some(Some(0.2)),
-                max_tokens: Some(Some(256)),
-                additional_params: Some(Some(json!({"service_tier": "priority"}))),
-                enable_coco_shim: Some(true),
-            },
-            role: Some(SessionRole::Runner),
+            role: SessionRole::Runner,
+            provider: "anthropic".to_owned(),
+            model: "claude-sonnet-4-20250514".to_owned(),
+            tools: vec![],
+            system_prompt: "new system".to_owned(),
+            prompt: "new prompt".to_owned(),
+            temperature: Some(0.2),
+            max_tokens: Some(256),
+            additional_params: Some(json!({"service_tier": "priority"})),
+            enable_coco_shim: true,
         }
         .apply_to_session_anchor(&make_session_anchor());
 

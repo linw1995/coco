@@ -23,47 +23,31 @@ pub struct PresetSetCommand {
     pub name: String,
 
     #[arg(long, value_enum)]
-    pub role: Option<CliSessionRole>,
+    pub role: CliSessionRole,
 
     #[arg(long)]
-    pub provider: Option<CliProvider>,
+    pub provider: CliProvider,
 
     #[arg(long)]
-    pub model: Option<String>,
+    pub model: String,
 
     #[arg(long)]
-    pub system_prompt: Option<String>,
+    pub system_prompt: String,
+
+    #[arg(long, default_value = "")]
+    pub prompt: String,
 
     #[arg(long)]
-    pub prompt: Option<String>,
-
-    #[arg(long, conflicts_with = "clear_temperature")]
     pub temperature: Option<f64>,
 
     #[arg(long)]
-    pub clear_temperature: bool,
-
-    #[arg(long, conflicts_with = "clear_max_tokens")]
     pub max_tokens: Option<u64>,
 
-    #[arg(long)]
-    pub clear_max_tokens: bool,
-
-    #[arg(long = "tool", value_enum, conflicts_with = "clear_tools")]
+    #[arg(long = "tool", value_enum)]
     pub tools: Vec<CliTool>,
 
-    #[arg(long)]
-    pub clear_tools: bool,
-
-    #[arg(
-        long = "additional-params",
-        value_name = "JSON",
-        conflicts_with = "clear_additional_params"
-    )]
+    #[arg(long = "additional-params", value_name = "JSON")]
     pub additional_params: Option<String>,
-
-    #[arg(long)]
-    pub clear_additional_params: bool,
 
     #[arg(long, conflicts_with = "disable_coco_shim")]
     pub enable_coco_shim: bool,

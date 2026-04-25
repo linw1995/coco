@@ -81,10 +81,8 @@ struct PersistedBranchConfigRecord {
     name: String,
     current_version: u64,
     created_at: jiff::Timestamp,
-    #[serde(default)]
-    session: SessionAnchorPatch,
-    #[serde(default)]
-    role: Option<SessionRole>,
+    #[serde(flatten)]
+    config: BranchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -92,10 +90,8 @@ struct BranchConfigHistoryEntry {
     name: String,
     version: u64,
     created_at: jiff::Timestamp,
-    #[serde(default)]
-    session: SessionAnchorPatch,
-    #[serde(default)]
-    role: Option<SessionRole>,
+    #[serde(flatten)]
+    config: BranchConfig,
 }
 
 #[derive(Debug, Default)]
@@ -168,8 +164,7 @@ impl PersistedBranchConfigRecord {
             name: name.to_owned(),
             current_version,
             created_at: version.created_at,
-            session: version.session.clone(),
-            role: version.role,
+            config: version.to_config(),
         }
     }
 }
@@ -180,8 +175,7 @@ impl BranchConfigHistoryEntry {
             name: name.to_owned(),
             version: version.version,
             created_at: version.created_at,
-            session: version.session.clone(),
-            role: version.role,
+            config: version.to_config(),
         }
     }
 
@@ -189,8 +183,7 @@ impl BranchConfigHistoryEntry {
         BranchConfigVersion {
             version: self.version,
             created_at: self.created_at,
-            session: self.session,
-            role: self.role,
+            config: self.config,
         }
     }
 }
@@ -221,9 +214,7 @@ impl VersionedSnapshot for PersistedBranchConfigRecord {
     }
 
     fn matches_version(&self, version: &Self::Version) -> bool {
-        version.created_at == self.created_at
-            && version.session == self.session
-            && version.role == self.role
+        version.created_at == self.created_at && version.config == self.config
     }
 }
 
@@ -1074,9 +1065,22 @@ fn is_branch_config_snapshot_value(value: &Value) -> bool {
 
 fn is_legacy_branch_config_value(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
-        object
-            .keys()
-            .all(|key| matches!(key.as_str(), "session" | "role"))
+        object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "session"
+                    | "role"
+                    | "provider"
+                    | "model"
+                    | "tools"
+                    | "system_prompt"
+                    | "prompt"
+                    | "temperature"
+                    | "max_tokens"
+                    | "additional_params"
+                    | "enable_coco_shim"
+            )
+        })
     })
 }
 

@@ -47,19 +47,16 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
 
 fn make_branch_config(model: &str, role: SessionRole) -> BranchConfig {
     BranchConfig {
-        session: SessionAnchorPatch {
-            role: None,
-            provider: Some("openai".to_owned()),
-            model: Some(model.to_owned()),
-            tools: Some(vec![]),
-            system_prompt: Some("preset system".to_owned()),
-            prompt: Some("preset prompt".to_owned()),
-            temperature: Some(Some(0.2)),
-            max_tokens: Some(Some(256)),
-            additional_params: Some(Some(json!({"reasoning_effort": "medium"}))),
-            enable_coco_shim: Some(true),
-        },
-        role: Some(role),
+        role,
+        provider: "openai".to_owned(),
+        model: model.to_owned(),
+        tools: vec![],
+        system_prompt: "preset system".to_owned(),
+        prompt: "preset prompt".to_owned(),
+        temperature: Some(0.2),
+        max_tokens: Some(256),
+        additional_params: Some(json!({"reasoning_effort": "medium"})),
+        enable_coco_shim: true,
     }
 }
 
@@ -2080,7 +2077,7 @@ fn branch_configs_json_only_stores_current_snapshots() {
 
     assert_eq!(coding["current_version"], 2);
     assert!(coding.get("versions").is_none());
-    assert_eq!(coding["session"]["model"], "claude-sonnet-4-20250514");
+    assert_eq!(coding["model"], "claude-sonnet-4-20250514");
     assert_eq!(coding["role"], "runner");
 }
 
@@ -2110,7 +2107,7 @@ fn branch_config_history_is_appended_in_history_directory() {
     assert_eq!(history[0]["version"], 1);
     assert_eq!(history[1]["version"], 2);
     assert_eq!(history[2]["version"], 3);
-    assert_eq!(history[2]["session"], history[0]["session"]);
+    assert_eq!(history[2]["model"], history[0]["model"]);
     assert_eq!(history[2]["role"], history[0]["role"]);
 }
 

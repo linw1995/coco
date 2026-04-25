@@ -1024,7 +1024,7 @@ fn resolve_visible_session_anchor(
 
 fn resolve_session_patch(
     command: SessionRebaseCommand,
-    store: &FsStore,
+    store: &impl BranchConfigStore,
 ) -> Result<SessionConfigPatch> {
     let mut patch = command
         .preset
