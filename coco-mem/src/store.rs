@@ -1,9 +1,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+pub(crate) mod collection;
 pub(crate) mod fs;
+pub(crate) mod log;
 pub mod memory;
+pub(crate) mod projection;
+pub(crate) mod snapshot;
 pub(crate) mod state;
+pub(crate) mod versioned;
 
 #[cfg(test)]
 mod tests;

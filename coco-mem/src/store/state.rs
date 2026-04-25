@@ -20,7 +20,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct StoreState {
+pub struct StoreState {
     pub nodes: HashMap<String, Node>,
     pub children: HashMap<String, HashSet<String>>,
     pub root: String,
@@ -32,7 +32,7 @@ pub(crate) struct StoreState {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RebasePlan {
+pub struct RebasePlan {
     pub branch: String,
     pub expected_old_head: String,
     pub new_head: String,
@@ -40,7 +40,7 @@ pub(crate) struct RebasePlan {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ForkPlan {
+pub struct ForkPlan {
     pub head_id: String,
 }
 

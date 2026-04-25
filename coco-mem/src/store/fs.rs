@@ -12,7 +12,14 @@ use serde_json::Value;
 use snafu::prelude::*;
 
 use super::Store;
+use super::log::LogEntry;
+use super::projection::ProjectionContext;
+use super::snapshot::Snapshot;
 use super::state::StoreState;
+use super::versioned::{
+    VersionedLogEntry, VersionedSnapshot, VersionedValue, validate_record,
+    validate_snapshot_in_collection, versions_from_history,
+};
 use crate::error::{
     CorruptedStoreSnafu, ParseStoreLogSnafu, ParseStoreMetaSnafu, SerializeStoreRecordSnafu,
     StorePathIsNotDirectorySnafu, WriteStoreDirectorySnafu, WriteStoreLogSnafu,
@@ -46,7 +53,7 @@ pub struct FsStore {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Persistence {
+pub struct Persistence {
     dir: PathBuf,
     meta_path: PathBuf,
     nodes_path: PathBuf,
@@ -62,7 +69,7 @@ pub(crate) struct Persistence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Meta {
+pub struct Meta {
     pub version: u64,
     pub root_id: String,
 }
@@ -183,6 +190,83 @@ impl BranchConfigHistoryEntry {
             session: self.session,
             role: self.role,
         }
+    }
+}
+
+impl LogEntry for BranchConfigHistoryEntry {
+    fn log_key(&self) -> &str {
+        &self.name
+    }
+}
+
+impl LogEntry for SkillHistoryEntry {
+    fn log_key(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Snapshot for PersistedBranchConfigRecord {
+    fn snapshot_key(&self) -> &str {
+        &self.name
+    }
+}
+
+impl VersionedSnapshot for PersistedBranchConfigRecord {
+    type Version = BranchConfigVersion;
+
+    fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
+        self.current_version
+    }
+
+    fn matches_version(&self, version: &Self::Version) -> bool {
+        version.created_at == self.created_at
+            && version.session == self.session
+            && version.role == self.role
+    }
+}
+
+impl Snapshot for PersistedSkillRecord {
+    fn snapshot_key(&self) -> &str {
+        &self.name
+    }
+}
+
+impl VersionedSnapshot for PersistedSkillRecord {
+    type Version = SkillVersion;
+
+    fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
+        self.current_version
+    }
+
+    fn matches_version(&self, version: &Self::Version) -> bool {
+        version.created_at == self.created_at
+            && version.description == self.description
+            && version.body == self.body
+            && version.enable_coco_shim == self.enable_coco_shim
+    }
+}
+
+impl VersionedLogEntry for BranchConfigHistoryEntry {
+    type Version = BranchConfigVersion;
+
+    fn version(&self) -> <Self::Version as VersionedValue>::Id {
+        self.version
+    }
+
+    fn into_version(self) -> Self::Version {
+        BranchConfigHistoryEntry::into_version(self)
+    }
+}
+
+impl VersionedLogEntry for SkillHistoryEntry {
+    type Version = SkillVersion;
+
+    fn version(&self) -> <Self::Version as VersionedValue>::Id {
+        self.version
+    }
+
+    fn into_version(self) -> Self::Version {
+        SkillHistoryEntry::into_version(self)
     }
 }
 
@@ -1009,50 +1093,11 @@ fn validate_branch_config_record(
             ),
         }
     );
-    ensure!(
-        !record.versions.is_empty(),
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!("branch preset config record {:?} has no versions", name),
-        }
-    );
-    ensure!(
-        record.versions.contains_key(&record.current_version),
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!(
-                "branch preset config record {:?} missing current version {}",
-                name, record.current_version
-            ),
-        }
-    );
-
-    let mut expected_version = 1;
-    for (version, entry) in &record.versions {
-        ensure!(
-            *version == expected_version,
-            CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!(
-                    "non-contiguous branch preset config version {} for {:?}, expected {}",
-                    version, name, expected_version
-                ),
-            }
-        );
-        ensure!(
-            entry.version == *version,
-            CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!(
-                    "branch preset config record {:?} stores version {} under key {}",
-                    name, entry.version, version
-                ),
-            }
-        );
-        expected_version += 1;
-    }
-
-    Ok(())
+    validate_record(
+        &ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME),
+        path,
+        record,
+    )
 }
 
 fn validate_branch_config_snapshot(
@@ -1110,34 +1155,9 @@ fn validate_branch_config_snapshots(
     current: &HashMap<String, PersistedBranchConfigRecord>,
     history: &HashMap<String, BranchConfigRecord>,
 ) -> Result<()> {
-    for (name, snapshot) in current {
-        let record = history.get(name).context(CorruptedStoreSnafu {
-            path: PathBuf::from(BRANCH_CONFIG_HISTORY_DIR_NAME),
-            message: format!("missing branch preset config history for {:?}", name),
-        })?;
-        let persisted_current =
-            record
-                .versions
-                .get(&snapshot.current_version)
-                .context(CorruptedStoreSnafu {
-                    path: PathBuf::from(BRANCH_CONFIG_HISTORY_DIR_NAME),
-                    message: format!(
-                        "missing current branch preset config version {} for {:?}",
-                        snapshot.current_version, snapshot.name
-                    ),
-                })?;
-        ensure!(
-            persisted_current.created_at == snapshot.created_at
-                && persisted_current.session == snapshot.session
-                && persisted_current.role == snapshot.role,
-            CorruptedStoreSnafu {
-                path: PathBuf::from(BRANCH_CONFIG_HISTORY_DIR_NAME),
-                message: format!(
-                    "current branch preset config snapshot mismatch for {:?}",
-                    snapshot.name
-                ),
-            }
-        );
+    let context = ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME);
+    for snapshot in current.values() {
+        validate_snapshot_in_collection(&context, snapshot, history)?;
     }
     Ok(())
 }
@@ -1146,50 +1166,11 @@ fn branch_config_record_from_history(
     name: &str,
     entries: &[(PathBuf, BranchConfigHistoryEntry)],
 ) -> Result<BranchConfigRecord> {
-    let mut versions = BTreeMap::new();
-    let mut source_path = None;
-    for (path, entry) in entries {
-        source_path.get_or_insert_with(|| path.clone());
-        ensure!(
-            versions
-                .insert(entry.version, entry.clone().into_version())
-                .is_none(),
-            CorruptedStoreSnafu {
-                path: path.clone(),
-                message: format!(
-                    "duplicate history version {} for branch preset config {:?}",
-                    entry.version, name
-                ),
-            }
-        );
-    }
-    let path = source_path.unwrap_or_else(|| PathBuf::from(BRANCH_CONFIG_HISTORY_DIR_NAME));
-    ensure!(
-        !versions.is_empty(),
-        CorruptedStoreSnafu {
-            path: path.clone(),
-            message: format!("empty branch preset config history for {:?}", name),
-        }
-    );
-    let mut expected_version = 1;
-    for version in versions.keys().copied() {
-        ensure!(
-            version == expected_version,
-            CorruptedStoreSnafu {
-                path: path.clone(),
-                message: format!(
-                    "non-contiguous history version {} for branch preset config {:?}, expected {}",
-                    version, name, expected_version
-                ),
-            }
-        );
-        expected_version += 1;
-    }
-    let current_version = versions
-        .keys()
-        .next_back()
-        .copied()
-        .expect("versions checked non-empty");
+    let (current_version, versions) = versions_from_history(
+        &ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME),
+        Path::new(BRANCH_CONFIG_HISTORY_DIR_NAME),
+        entries,
+    )?;
 
     Ok(BranchConfigRecord {
         name: name.to_owned(),
@@ -1226,38 +1207,11 @@ fn validate_skill_snapshots(current: &PersistedSkillGroups, history: &SkillGroup
         (SessionRole::Orchestrator, &current.orchestrator),
         (SessionRole::Runner, &current.runner),
     ] {
-        for (name, snapshot) in records {
-            let record = history
-                .for_role(role)
-                .get(name)
-                .context(CorruptedStoreSnafu {
-                    path: PathBuf::from(SKILL_HISTORY_DIR_NAME),
-                    message: format!("missing skill history for {:?} role {:?}", name, role),
-                })?;
-            let persisted_current =
-                record
-                    .versions
-                    .get(&snapshot.current_version)
-                    .context(CorruptedStoreSnafu {
-                        path: PathBuf::from(SKILL_HISTORY_DIR_NAME),
-                        message: format!(
-                            "missing current skill version {} for {:?} role {:?}",
-                            snapshot.current_version, snapshot.name, role
-                        ),
-                    })?;
-            ensure!(
-                persisted_current.created_at == snapshot.created_at
-                    && persisted_current.description == snapshot.description
-                    && persisted_current.body == snapshot.body
-                    && persisted_current.enable_coco_shim == snapshot.enable_coco_shim,
-                CorruptedStoreSnafu {
-                    path: PathBuf::from(SKILL_HISTORY_DIR_NAME),
-                    message: format!(
-                        "current skill snapshot mismatch for {:?} role {:?}",
-                        snapshot.name, role
-                    ),
-                }
-            );
+        let context =
+            ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME);
+        let history = history.for_role(role);
+        for snapshot in records.values() {
+            validate_snapshot_in_collection(&context, snapshot, history)?;
         }
     }
     Ok(())
@@ -1281,50 +1235,11 @@ fn skill_record_from_history(
     name: &str,
     entries: &[(PathBuf, SkillHistoryEntry)],
 ) -> Result<SkillRecord> {
-    let mut versions = BTreeMap::new();
-    let mut source_path = None;
-    for (path, entry) in entries {
-        source_path.get_or_insert_with(|| path.clone());
-        ensure!(
-            versions
-                .insert(entry.version, entry.clone().into_version())
-                .is_none(),
-            CorruptedStoreSnafu {
-                path: path.clone(),
-                message: format!(
-                    "duplicate history version {} for skill {:?} role {:?}",
-                    entry.version, name, role
-                ),
-            }
-        );
-    }
-    let path = source_path.unwrap_or_else(|| PathBuf::from(SKILL_HISTORY_DIR_NAME));
-    ensure!(
-        !versions.is_empty(),
-        CorruptedStoreSnafu {
-            path: path.clone(),
-            message: format!("empty skill history for {:?} role {:?}", name, role),
-        }
-    );
-    let mut expected_version = 1;
-    for version in versions.keys().copied() {
-        ensure!(
-            version == expected_version,
-            CorruptedStoreSnafu {
-                path: path.clone(),
-                message: format!(
-                    "non-contiguous history version {} for skill {:?} role {:?}, expected {}",
-                    version, name, role, expected_version
-                ),
-            }
-        );
-        expected_version += 1;
-    }
-    let current_version = versions
-        .keys()
-        .next_back()
-        .copied()
-        .expect("versions checked non-empty");
+    let (current_version, versions) = versions_from_history(
+        &ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME),
+        Path::new(SKILL_HISTORY_DIR_NAME),
+        entries,
+    )?;
 
     Ok(SkillRecord {
         name: name.to_owned(),
