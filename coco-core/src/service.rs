@@ -12,18 +12,12 @@ use crate::{
 
 type Result<T> = std::result::Result<T, Error>;
 
-pub struct CoreService<R, B, S>
-where
-    B: CompletionBackend,
-{
+pub struct CoreService<R, B, S> {
     resolver: R,
     engine: ConversationEngine<B, S>,
 }
 
-impl<R, B, S> CoreService<R, B, S>
-where
-    B: CompletionBackend,
-{
+impl<R, B, S> CoreService<R, B, S> {
     pub fn new(resolver: R, engine: ConversationEngine<B, S>) -> Self {
         Self { resolver, engine }
     }

@@ -113,19 +113,19 @@ impl From<EngineError> for ExecutorError {
     }
 }
 
-pub struct CoreSkillToolExecutor<B, S>
-where
-    B: CompletionBackend,
-{
+pub struct CoreSkillToolExecutor<B, S> {
     llm: Weak<LlmService<B, S>>,
 }
 
-impl<B, S> fmt::Debug for CoreSkillToolExecutor<B, S>
-where
-    B: CompletionBackend,
-{
+impl<B, S> fmt::Debug for CoreSkillToolExecutor<B, S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CoreSkillToolExecutor(..)")
+    }
+}
+
+impl<B, S> CoreSkillToolExecutor<B, S> {
+    pub fn new(llm: Weak<LlmService<B, S>>) -> Self {
+        Self { llm }
     }
 }
 
@@ -134,10 +134,6 @@ where
     B: CompletionBackend + 'static,
     S: 'static,
 {
-    pub fn new(llm: Weak<LlmService<B, S>>) -> Self {
-        Self { llm }
-    }
-
     fn upgrade_engine(&self) -> std::result::Result<ConversationEngine<B, S>, ExecutorError> {
         let llm = self.llm.upgrade().ok_or(ExecutorError::Unavailable)?;
         Ok(ConversationEngine::new(llm))

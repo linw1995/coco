@@ -16,18 +16,12 @@ type CocoCliForwarder<B, S> = dyn Fn(
     + Send
     + Sync;
 
-pub struct LlmRuntimeBridge<B, S>
-where
-    B: CompletionBackend,
-{
+pub struct LlmRuntimeBridge<B, S> {
     llm: Weak<LlmService<B, S>>,
     cli_forwarder: Arc<CocoCliForwarder<B, S>>,
 }
 
-impl<B, S> std::fmt::Debug for LlmRuntimeBridge<B, S>
-where
-    B: CompletionBackend,
-{
+impl<B, S> std::fmt::Debug for LlmRuntimeBridge<B, S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("LlmRuntimeBridge(..)")
     }
@@ -35,7 +29,6 @@ where
 
 impl<B, S> LlmRuntimeBridge<B, S>
 where
-    B: CompletionBackend + 'static,
     S: Send + Sync + 'static,
 {
     pub fn new<F, Fut>(llm: Weak<LlmService<B, S>>, cli_forwarder: F) -> Self
