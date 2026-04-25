@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use super::Store;
 use super::state::StoreState;
+use super::{
+    BranchConfigStore, BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore, SkillStore,
+};
 use crate::StoreResult as Result;
 use crate::{
     BranchConfig, BranchConfigRecord, Job, JobStatus, NewNode, Node, SessionAnchorPatch,
@@ -33,7 +35,7 @@ impl MemoryStore {
     }
 }
 
-impl Store for MemoryStore {
+impl NodeStore for MemoryStore {
     fn root_id(&self) -> String {
         self.inner
             .read()
@@ -46,35 +48,6 @@ impl Store for MemoryStore {
         let mut state = self.inner.write().expect("store lock poisoned");
         let node = state.plan_append_node(node)?;
         state.insert_existing_node(node)
-    }
-
-    fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let plan = state.plan_fork(name, from_ref)?;
-        state.apply_fork(name.to_owned(), plan.head_id.clone())?;
-        Ok(plan.head_id)
-    }
-
-    fn get_branch_head(&self, name: &str) -> Result<String> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_branch_head(name)
-            .map(str::to_owned)
-    }
-
-    fn delete_branch(&self, name: &str) -> Result<()> {
-        self.inner
-            .write()
-            .expect("store lock poisoned")
-            .delete_branch(name)
-    }
-
-    fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {
-        self.inner
-            .write()
-            .expect("store lock poisoned")
-            .apply_set_branch_head(name.to_owned(), expected_old_head, new_head.to_owned())
     }
 
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
@@ -103,7 +76,40 @@ impl Store for MemoryStore {
             .expect("store lock poisoned")
             .list_children(node_id)
     }
+}
 
+impl BranchStore for MemoryStore {
+    fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let plan = state.plan_fork(name, from_ref)?;
+        state.apply_fork(name.to_owned(), plan.head_id.clone())?;
+        Ok(plan.head_id)
+    }
+
+    fn get_branch_head(&self, name: &str) -> Result<String> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_branch_head(name)
+            .map(str::to_owned)
+    }
+
+    fn delete_branch(&self, name: &str) -> Result<()> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .delete_branch(name)
+    }
+
+    fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .apply_set_branch_head(name.to_owned(), expected_old_head, new_head.to_owned())
+    }
+}
+
+impl SessionStore for MemoryStore {
     fn list_session_states(&self) -> Result<HashMap<String, SessionState>> {
         Ok(self
             .inner
@@ -141,7 +147,9 @@ impl Store for MemoryStore {
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
     }
+}
 
+impl BranchConfigStore for MemoryStore {
     fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
         self.inner
             .read()
@@ -195,7 +203,9 @@ impl Store for MemoryStore {
             .expect("store lock poisoned")
             .delete_branch_config(name)
     }
+}
 
+impl SkillStore for MemoryStore {
     fn skill_groups(&self) -> Result<SkillGroups> {
         Ok(self
             .inner
@@ -254,7 +264,9 @@ impl Store for MemoryStore {
             .expect("store lock poisoned")
             .rollback_skill(role, name, target_version)
     }
+}
 
+impl JobStore for MemoryStore {
     fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
         self.inner
             .write()
@@ -280,3 +292,5 @@ impl Store for MemoryStore {
             .set_job_status(job_id, expected, next)
     }
 }
+
+impl RuntimeStore for MemoryStore {}

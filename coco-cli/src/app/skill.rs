@@ -1,7 +1,7 @@
 use std::fs;
 
 use coco_mem::{
-    FsStore, SessionRole, SkillRecord, SkillUpdatePatch, SkillVersion, SkillVersionSpec, Store,
+    FsStore, SessionRole, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersion, SkillVersionSpec,
 };
 use serde::Serialize;
 use snafu::prelude::*;

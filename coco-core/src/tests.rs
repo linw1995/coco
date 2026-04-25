@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
-    Anchor, BackendMetadata, ExecutionMetadata, JobStatus, Kind, MemoryStore, NewNode,
-    PromptAnchor, ProviderMetadata, Role, SessionRole, Store, ToolResult, ToolUse,
+    Anchor, BackendMetadata, BranchStore, ExecutionMetadata, JobStatus, JobStore, Kind,
+    MemoryStore, NewNode, NodeStore, PromptAnchor, ProviderMetadata, Role, SessionRole,
+    SessionStore, Store, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEventPayload, BackendTurn, CompletionBackend, CompletionMessage,

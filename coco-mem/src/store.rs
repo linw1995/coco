@@ -20,13 +20,28 @@ use crate::{
 };
 
 /// Thread-safe node graph storage used by CoCo services.
-pub trait Store: Clone + Send + Sync + 'static {
+pub trait NodeStore: Clone + Send + Sync + 'static {
     /// Returns the global root node identifier.
     fn root_id(&self) -> String;
 
     /// Appends a new node and returns the persisted node identifier.
     fn append(&self, node: NewNode) -> StoreResult<String>;
 
+    /// Returns the chain from a node id or branch reference back to the root.
+    fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>>;
+
+    /// Returns the main-parent chain from `head_ref` back to `base_ref`, inclusive.
+    fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>>;
+
+    /// Returns a single node by branch name, full node ID, or node ID prefix.
+    fn get_node(&self, id: &str) -> StoreResult<Node>;
+
+    /// Returns all direct children for a node, including merge-parent edges.
+    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>>;
+}
+
+/// Thread-safe branch reference storage.
+pub trait BranchStore: Clone + Send + Sync + 'static {
     /// Creates a branch from a node id or branch reference and returns its head id.
     fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String>;
 
@@ -43,19 +58,10 @@ pub trait Store: Clone + Send + Sync + 'static {
         expected_old_head: &str,
         new_head: &str,
     ) -> StoreResult<()>;
+}
 
-    /// Returns the chain from a node id or branch reference back to the root.
-    fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>>;
-
-    /// Returns the main-parent chain from `head_ref` back to `base_ref`, inclusive.
-    fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>>;
-
-    /// Returns a single node by branch name, full node ID, or node ID prefix.
-    fn get_node(&self, id: &str) -> StoreResult<Node>;
-
-    /// Returns all direct children for a node, including merge-parent edges.
-    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>>;
-
+/// Thread-safe branch workflow session state storage.
+pub trait SessionStore: Clone + Send + Sync + 'static {
     /// Returns all persisted branch workflow states keyed by branch.
     fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>>;
 
@@ -72,7 +78,10 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+}
 
+/// Thread-safe branch preset config storage.
+pub trait BranchConfigStore: Clone + Send + Sync + 'static {
     /// Returns all persisted branch preset configs keyed by preset name.
     fn list_branch_configs(&self) -> StoreResult<HashMap<String, BranchConfig>>;
 
@@ -101,7 +110,10 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Deletes one branch preset config by preset name.
     fn delete_branch_config(&self, name: &str) -> StoreResult<()>;
+}
 
+/// Thread-safe persisted skill storage.
+pub trait SkillStore: Clone + Send + Sync + 'static {
     /// Returns the persisted skill groups.
     fn skill_groups(&self) -> StoreResult<SkillGroups>;
 
@@ -134,7 +146,10 @@ pub trait Store: Clone + Send + Sync + 'static {
         name: &str,
         target_version: u64,
     ) -> StoreResult<SkillRecord>;
+}
 
+/// Thread-safe prompt job storage.
+pub trait JobStore: Clone + Send + Sync + 'static {
     /// Creates a new single-task prompt job record.
     ///
     /// Rejects the request when the branch already has an unfinished prompt job.
@@ -153,9 +168,29 @@ pub trait Store: Clone + Send + Sync + 'static {
         expected: JobStatus,
         next: JobStatus,
     ) -> StoreResult<Job>;
+}
 
+/// Optional runtime metadata for stores with a process-shareable backing path.
+pub trait RuntimeStore: Clone + Send + Sync + 'static {
     /// Returns the backing store directory when the store is process-shareable.
     fn runtime_store_path(&self) -> Option<PathBuf> {
         None
     }
+}
+
+/// Full CoCo store facade.
+pub trait Store:
+    NodeStore + BranchStore + SessionStore + BranchConfigStore + SkillStore + JobStore + RuntimeStore
+{
+}
+
+impl<T> Store for T where
+    T: NodeStore
+        + BranchStore
+        + SessionStore
+        + BranchConfigStore
+        + SkillStore
+        + JobStore
+        + RuntimeStore
+{
 }

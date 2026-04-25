@@ -10,7 +10,7 @@ use coco_core::{
 use coco_llm::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, CompletionBackend, LlmService,
 };
-use coco_mem::{AnchorPayload, FsStore, Kind, Store};
+use coco_mem::{AnchorPayload, FsStore, JobStore, Kind, NodeStore};
 use serde::Serialize;
 use snafu::prelude::*;
 use tokio::process::Command;

@@ -6,8 +6,8 @@ use coco_llm::{
     CompletionBackend, LlmService, SessionConfig, SessionConfigPatch, SessionFeedback, SessionMerge,
 };
 use coco_mem::{
-    AnchorPayload, FsStore, Kind, Node, PauseReason, SessionAnchor, SessionState, Store,
-    StoreError, Tool,
+    AnchorPayload, BranchStore, FsStore, Kind, Node, NodeStore, PauseReason, SessionAnchor,
+    SessionState, SessionStore, StoreError, Tool,
 };
 use serde::Serialize;
 use serde_json::Value;

@@ -2691,7 +2691,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::time::Duration;
 
-    use coco_mem::MemoryStore;
+    use coco_mem::{BranchStore, MemoryStore, NodeStore, SessionStore};
     use tokio::sync::Barrier;
 
     type RecordedCalls = Arc<Mutex<Vec<(ResolvedSession, ResolvedCompletionRequest)>>>;

@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::prelude::*;
 
-use super::Store;
 use super::log::LogEntry;
 use super::projection::ProjectionContext;
 use super::snapshot::Snapshot;
@@ -19,6 +18,9 @@ use super::state::StoreState;
 use super::versioned::{
     VersionedLogEntry, VersionedSnapshot, VersionedValue, validate_record,
     validate_snapshot_in_collection, versions_from_history,
+};
+use super::{
+    BranchConfigStore, BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore, SkillStore,
 };
 use crate::error::{
     CorruptedStoreSnafu, ParseStoreLogSnafu, ParseStoreMetaSnafu, SerializeStoreRecordSnafu,
@@ -1322,7 +1324,7 @@ impl FsStore {
     }
 }
 
-impl Store for FsStore {
+impl NodeStore for FsStore {
     fn root_id(&self) -> String {
         self.inner
             .read()
@@ -1338,6 +1340,35 @@ impl Store for FsStore {
         state.insert_existing_node(node)
     }
 
+    fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .ancestry(head_ref)
+            .map(|nodes| nodes.into_iter().cloned().collect())
+    }
+
+    fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .log(base_ref, head_ref)
+            .map(|nodes| nodes.into_iter().cloned().collect())
+    }
+
+    fn get_node(&self, id: &str) -> Result<Node> {
+        self.inner.read().expect("store lock poisoned").get_node(id)
+    }
+
+    fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .list_children(node_id)
+    }
+}
+
+impl BranchStore for FsStore {
     fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
         let mut state = self.inner.write().expect("store lock poisoned");
         let plan = state.plan_fork(name, from_ref)?;
@@ -1372,34 +1403,9 @@ impl Store for FsStore {
             .persist_branch_head_update(name, expected_old_head, new_head, &temp)?;
         state.apply_set_branch_head(name.to_owned(), expected_old_head, new_head.to_owned())
     }
+}
 
-    fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .ancestry(head_ref)
-            .map(|nodes| nodes.into_iter().cloned().collect())
-    }
-
-    fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .log(base_ref, head_ref)
-            .map(|nodes| nodes.into_iter().cloned().collect())
-    }
-
-    fn get_node(&self, id: &str) -> Result<Node> {
-        self.inner.read().expect("store lock poisoned").get_node(id)
-    }
-
-    fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .list_children(node_id)
-    }
-
+impl SessionStore for FsStore {
     fn list_session_states(&self) -> Result<HashMap<String, SessionState>> {
         Ok(self
             .inner
@@ -1454,7 +1460,9 @@ impl Store for FsStore {
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
     }
+}
 
+impl BranchConfigStore for FsStore {
     fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
         self.inner
             .read()
@@ -1527,7 +1535,9 @@ impl Store for FsStore {
         state.branch_configs = temp.branch_configs;
         Ok(())
     }
+}
 
+impl SkillStore for FsStore {
     fn skill_groups(&self) -> Result<SkillGroups> {
         Ok(self
             .inner
@@ -1622,7 +1632,9 @@ impl Store for FsStore {
         state.skill_groups = temp.skill_groups;
         Ok(updated)
     }
+}
 
+impl JobStore for FsStore {
     fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
@@ -1651,7 +1663,9 @@ impl Store for FsStore {
         state.jobs = temp.jobs;
         Ok(updated)
     }
+}
 
+impl RuntimeStore for FsStore {
     fn runtime_store_path(&self) -> Option<PathBuf> {
         Some(self.path().to_path_buf())
     }
