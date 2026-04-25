@@ -1,7 +1,7 @@
 use snafu::prelude::*;
 
 use coco_llm::CompletionBackend;
-use coco_llm::coco_mem::Store;
+use coco_llm::coco_mem::{BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore};
 use std::collections::HashSet;
 
 use crate::{
@@ -15,7 +15,6 @@ type Result<T> = std::result::Result<T, Error>;
 pub struct CoreService<R, B, S>
 where
     B: CompletionBackend,
-    S: Store,
 {
     resolver: R,
     engine: ConversationEngine<B, S>,
@@ -24,7 +23,6 @@ where
 impl<R, B, S> CoreService<R, B, S>
 where
     B: CompletionBackend,
-    S: Store,
 {
     pub fn new(resolver: R, engine: ConversationEngine<B, S>) -> Self {
         Self { resolver, engine }
@@ -35,7 +33,7 @@ impl<R, B, S> CoreService<R, B, S>
 where
     R: BranchResolver,
     B: CompletionBackend + 'static,
-    S: Store,
+    S: NodeStore + BranchStore + SessionStore + JobStore + RuntimeStore,
 {
     pub async fn handle_message(&self, message: InboundMessage) -> Result<OutboundMessage> {
         let text = message.text.trim();

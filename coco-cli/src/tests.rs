@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use clap::Parser;
 use coco_llm::coco_mem::{
     Anchor, BackendMetadata, BranchStore, JobStore, Kind, NewNode, NodeStore, PromptAnchor,
-    ProviderMetadata, Role, SessionAnchor, SessionRole, SessionStore, SkillResultAnchor, Store,
+    ProviderMetadata, Role, SessionAnchor, SessionRole, SessionStore, SkillResultAnchor,
     ToolResult, ToolUse,
 };
 use coco_llm::{
@@ -41,7 +41,10 @@ use crate::{
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
-fn submit_prompt_job<S: Store>(store: &S, branch: &str, prompt: &str) -> coco_mem::Job {
+fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> coco_mem::Job
+where
+    S: BranchStore + JobStore + NodeStore,
+{
     let parent = store.get_branch_head(branch).unwrap();
     let prompt_anchor_id = store
         .append(NewNode {
@@ -513,7 +516,7 @@ fn temp_store_path() -> (TempDir, std::path::PathBuf) {
 }
 
 fn append_prompt_anchor(
-    store: &impl Store,
+    store: &impl NodeStore,
     parent: &str,
     prompt: &str,
     merge_parents: &[&str],
@@ -533,7 +536,7 @@ fn append_prompt_anchor(
         .unwrap()
 }
 
-fn append_session_anchor(store: &impl Store, parent: &str, prompt: &str) -> String {
+fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -558,7 +561,7 @@ fn append_session_anchor(store: &impl Store, parent: &str, prompt: &str) -> Stri
         .unwrap()
 }
 
-fn append_tool_use_node(store: &impl Store, parent: &str, id: &str, name: &str) -> String {
+fn append_tool_use_node(store: &impl NodeStore, parent: &str, id: &str, name: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -577,7 +580,7 @@ fn append_tool_use_node(store: &impl Store, parent: &str, id: &str, name: &str) 
         .unwrap()
 }
 
-fn append_tool_result_node(store: &impl Store, parent: &str, id: &str, output: &str) -> String {
+fn append_tool_result_node(store: &impl NodeStore, parent: &str, id: &str, output: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -593,7 +596,7 @@ fn append_tool_result_node(store: &impl Store, parent: &str, id: &str, output: &
         .unwrap()
 }
 
-fn append_failure_node(store: &impl Store, parent: &str, message: &str) -> String {
+fn append_failure_node(store: &impl NodeStore, parent: &str, message: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -605,7 +608,7 @@ fn append_failure_node(store: &impl Store, parent: &str, message: &str) -> Strin
 }
 
 fn append_skill_result_anchor(
-    store: &impl Store,
+    store: &impl NodeStore,
     parent: &str,
     merge_parent: &str,
     tool_id: &str,

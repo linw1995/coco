@@ -9,7 +9,7 @@ use crate::{
     Anchor, BranchConfig, BranchConfigStore, BranchStore, JobStatus, JobStore, Kind, NewNode, Node,
     NodeStore, PauseReason, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
     SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
-    Store as StoreTrait, StoreError as Error,
+    StoreError as Error,
 };
 use serde_json::json;
 
@@ -100,7 +100,10 @@ fn make_prompt_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
     }
 }
 
-fn submit_prompt_job<S: StoreTrait>(store: &S, branch: &str, prompt: &str) -> crate::Job {
+fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> crate::Job
+where
+    S: BranchStore + JobStore + NodeStore,
+{
     let parent = store.get_branch_head(branch).unwrap();
     let prompt_anchor_id = store
         .append(NewNode {
@@ -145,7 +148,13 @@ trait InspectableStore {
 }
 
 trait TestStoreFactory {
-    type Store: StoreTrait + InspectableStore;
+    type Store: BranchConfigStore
+        + BranchStore
+        + InspectableStore
+        + JobStore
+        + NodeStore
+        + SessionStore
+        + SkillStore;
 
     fn create() -> Self::Store;
 }

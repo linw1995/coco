@@ -177,20 +177,3 @@ pub trait RuntimeStore: Clone + Send + Sync + 'static {
         None
     }
 }
-
-/// Full CoCo store facade.
-pub trait Store:
-    NodeStore + BranchStore + SessionStore + BranchConfigStore + SkillStore + JobStore + RuntimeStore
-{
-}
-
-impl<T> Store for T where
-    T: NodeStore
-        + BranchStore
-        + SessionStore
-        + BranchConfigStore
-        + SkillStore
-        + JobStore
-        + RuntimeStore
-{
-}

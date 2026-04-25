@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::{
     BashToolCliBridge, BashToolCliBridgeError, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
-    CompletionBackend, LlmService, Store,
+    CompletionBackend, LlmService,
 };
 
 type CocoCliForwarder<B, S> = dyn Fn(
@@ -19,7 +19,6 @@ type CocoCliForwarder<B, S> = dyn Fn(
 pub struct LlmRuntimeBridge<B, S>
 where
     B: CompletionBackend,
-    S: Store,
 {
     llm: Weak<LlmService<B, S>>,
     cli_forwarder: Arc<CocoCliForwarder<B, S>>,
@@ -28,7 +27,6 @@ where
 impl<B, S> std::fmt::Debug for LlmRuntimeBridge<B, S>
 where
     B: CompletionBackend,
-    S: Store,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("LlmRuntimeBridge(..)")
@@ -38,7 +36,7 @@ where
 impl<B, S> LlmRuntimeBridge<B, S>
 where
     B: CompletionBackend + 'static,
-    S: Store + 'static,
+    S: Send + Sync + 'static,
 {
     pub fn new<F, Fut>(llm: Weak<LlmService<B, S>>, cli_forwarder: F) -> Self
     where
@@ -56,7 +54,7 @@ where
 impl<B, S> BashToolCliBridge for LlmRuntimeBridge<B, S>
 where
     B: CompletionBackend + 'static,
-    S: Store + 'static,
+    S: Send + Sync + 'static,
 {
     async fn execute_coco_cli(
         &self,

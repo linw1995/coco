@@ -1,7 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use coco_llm::coco_mem::{
-    Anchor, Job, JobStatus, Kind, MemoryStore, NewNode, Node, PromptAnchor, Role, Store,
+    Anchor, BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, NewNode, Node, NodeStore,
+    PromptAnchor, Role, RuntimeStore, SessionStore,
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
@@ -38,18 +39,12 @@ struct PromptReply {
     text: String,
 }
 
-pub struct ConversationEngine<B = RigBackend, S = MemoryStore>
-where
-    S: Store,
-{
+pub struct ConversationEngine<B = RigBackend, S = MemoryStore> {
     service: Arc<LlmService<B, S>>,
     inflight_jobs: InflightJobTable,
 }
 
-impl<B, S> Clone for ConversationEngine<B, S>
-where
-    S: Store,
-{
+impl<B, S> Clone for ConversationEngine<B, S> {
     fn clone(&self) -> Self {
         Self {
             service: self.service.clone(),
@@ -64,11 +59,7 @@ impl ConversationEngine<RigBackend, MemoryStore> {
     }
 }
 
-impl<B, S> ConversationEngine<B, S>
-where
-    B: CompletionBackend + 'static,
-    S: Store,
-{
+impl<B, S> ConversationEngine<B, S> {
     pub fn new(service: Arc<LlmService<B, S>>) -> Self {
         Self {
             service,
@@ -79,7 +70,13 @@ where
     pub(crate) fn service(&self) -> &Arc<LlmService<B, S>> {
         &self.service
     }
+}
 
+impl<B, S> ConversationEngine<B, S>
+where
+    B: CompletionBackend + 'static,
+    S: NodeStore + BranchStore + SessionStore + JobStore + RuntimeStore,
+{
     pub async fn reply(
         &self,
         branch: &str,
@@ -347,10 +344,10 @@ where
     }
 }
 
-fn find_job_last_node<S: Store>(
-    store: &S,
-    job: &Job,
-) -> std::result::Result<Option<Node>, EngineError> {
+fn find_job_last_node<S>(store: &S, job: &Job) -> std::result::Result<Option<Node>, EngineError>
+where
+    S: NodeStore,
+{
     let path = match store.log(&job.base, &job.branch) {
         Ok(path) => path,
         Err(coco_llm::coco_mem::StoreError::RefsNotConnected { .. }) => return Ok(None),
@@ -372,11 +369,14 @@ fn is_terminal_job_last_node(node: &Node) -> bool {
     matches!(&node.kind, Kind::Text(_) | Kind::Failure(_))
 }
 
-fn build_prompt_reply<S: Store>(
+fn build_prompt_reply<S>(
     store: &S,
     job: &Job,
     snapshot: &JobStatusSnapshot,
-) -> std::result::Result<PromptReply, EngineError> {
+) -> std::result::Result<PromptReply, EngineError>
+where
+    S: NodeStore,
+{
     let response_node = store.get_node(&snapshot.head)?;
     let execution_id = response_node
         .metadata
@@ -400,10 +400,13 @@ fn build_prompt_reply<S: Store>(
     }
 }
 
-fn resolve_reference_ids<S: Store>(
+fn resolve_reference_ids<S>(
     store: &S,
     references: &[String],
-) -> std::result::Result<Vec<String>, EngineError> {
+) -> std::result::Result<Vec<String>, EngineError>
+where
+    S: NodeStore,
+{
     references
         .iter()
         .map(|reference| {

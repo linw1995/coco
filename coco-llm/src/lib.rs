@@ -15,9 +15,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, BackendMetadata, ExecutionMetadata, Kind, MemoryStore, NewNode,
-    PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionState,
-    SkillResultAnchor, Store, StoreError, Tool, ToolResult, ToolUse,
+    Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
+    NewNode, NodeStore, PauseReason, PromptAnchor, ProviderMetadata, Role, RuntimeStore,
+    SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor, StoreError, Tool,
+    ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -383,7 +384,7 @@ impl std::fmt::Debug for TraceNodeAppenderHandle {
 
 impl<S> TraceNodeAppender for StoreNodeAppender<S>
 where
-    S: Store,
+    S: NodeStore,
 {
     fn append(
         &self,
@@ -772,10 +773,7 @@ pub struct RuntimeCapabilities {
     pub skill_tool_executor: SkillToolExecutorHandle,
 }
 
-pub struct LlmService<B = RigBackend, S = MemoryStore>
-where
-    S: Store,
-{
+pub struct LlmService<B = RigBackend, S = MemoryStore> {
     store: S,
     backend: B,
     runtime: RuntimeCapabilities,
@@ -783,10 +781,7 @@ where
     workflow_lock: WorkflowLock,
 }
 
-pub struct LlmServiceBuilder<B, S>
-where
-    S: Store,
-{
+pub struct LlmServiceBuilder<B, S> {
     store: S,
     backend: B,
     bash_tool_cli_bridge: Option<BashToolCliBridgeHandle>,
@@ -868,11 +863,7 @@ impl LlmService<RigBackend, MemoryStore> {
     }
 }
 
-impl<B, S> LlmServiceBuilder<B, S>
-where
-    B: CompletionBackend,
-    S: Store,
-{
+impl<B, S> LlmServiceBuilder<B, S> {
     pub fn with_bash_tool_cli_bridge(mut self, bridge: BashToolCliBridgeHandle) -> Self {
         self.bash_tool_cli_bridge = Some(bridge);
         self
@@ -897,11 +888,7 @@ where
     }
 }
 
-impl<B, S> LlmService<B, S>
-where
-    B: CompletionBackend,
-    S: Store,
-{
+impl<B, S> LlmService<B, S> {
     pub fn builder(store: S, backend: B) -> LlmServiceBuilder<B, S> {
         LlmServiceBuilder {
             store,
@@ -918,7 +905,13 @@ where
     pub fn store(&self) -> &S {
         &self.store
     }
+}
 
+impl<B, S> LlmService<B, S>
+where
+    B: CompletionBackend,
+    S: NodeStore + BranchStore + SessionStore + RuntimeStore,
+{
     pub async fn rebase_session(&self, branch: &str, patch: SessionConfigPatch) -> Result<String> {
         let _guard = self.lock_branch(branch).await;
         self.store

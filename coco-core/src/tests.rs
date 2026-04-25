@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use coco_llm::coco_mem::{
     Anchor, BackendMetadata, BranchStore, ExecutionMetadata, JobStatus, JobStore, Kind,
     MemoryStore, NewNode, NodeStore, PromptAnchor, ProviderMetadata, Role, SessionRole,
-    SessionStore, Store, ToolResult, ToolUse,
+    SessionStore, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEventPayload, BackendTurn, CompletionBackend, CompletionMessage,
@@ -26,7 +26,10 @@ use crate::{
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
-fn append_use_skill_node<S: Store>(store: &S, parent: &str, skill_name: &str) -> String {
+fn append_use_skill_node<S>(store: &S, parent: &str, skill_name: &str) -> String
+where
+    S: NodeStore,
+{
     store
         .append(NewNode {
             parent: parent.to_owned(),

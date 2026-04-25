@@ -6,7 +6,8 @@ use std::sync::Weak;
 
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
-    Anchor, Kind, NewNode, Role, SessionAnchor, SessionRole, SkillRecord, Store, ToolUse,
+    Anchor, BranchStore, Kind, NewNode, NodeStore, Role, RuntimeStore, SessionAnchor, SessionRole,
+    SessionStore, SkillRecord, SkillStore, ToolUse,
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
@@ -115,7 +116,6 @@ impl From<EngineError> for ExecutorError {
 pub struct CoreSkillToolExecutor<B, S>
 where
     B: CompletionBackend,
-    S: Store,
 {
     llm: Weak<LlmService<B, S>>,
 }
@@ -123,7 +123,6 @@ where
 impl<B, S> fmt::Debug for CoreSkillToolExecutor<B, S>
 where
     B: CompletionBackend,
-    S: Store,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CoreSkillToolExecutor(..)")
@@ -133,7 +132,7 @@ where
 impl<B, S> CoreSkillToolExecutor<B, S>
 where
     B: CompletionBackend + 'static,
-    S: Store + 'static,
+    S: 'static,
 {
     pub fn new(llm: Weak<LlmService<B, S>>) -> Self {
         Self { llm }
@@ -149,7 +148,7 @@ where
 impl<B, S> SkillToolExecutor for CoreSkillToolExecutor<B, S>
 where
     B: CompletionBackend + 'static,
-    S: Store + 'static,
+    S: NodeStore + BranchStore + SessionStore + SkillStore + RuntimeStore + 'static,
 {
     async fn search_skill_tool(
         &self,
@@ -226,7 +225,7 @@ fn executor_error_from_llm_error(skill_name: &str, error: LlmError) -> ExecutorE
 impl<B, S> ConversationEngine<B, S>
 where
     B: CompletionBackend + 'static,
-    S: Store,
+    S: NodeStore + BranchStore + SessionStore + SkillStore + RuntimeStore,
 {
     pub fn search_skills(
         &self,
@@ -338,10 +337,13 @@ where
     }
 }
 
-fn resolve_session_anchor<S: Store>(
+fn resolve_session_anchor<S>(
     store: &S,
     reference: &str,
-) -> std::result::Result<SessionAnchor, LlmError> {
+) -> std::result::Result<SessionAnchor, LlmError>
+where
+    S: NodeStore,
+{
     let ancestry = store
         .ancestry(reference)
         .map_err(|source| LlmError::Memory { source })?;
@@ -598,10 +600,13 @@ fn synthetic_skill_path(role: SessionRole, name: &str, version: u64) -> PathBuf 
     ))
 }
 
-fn collect_store_skills<S: Store>(
+fn collect_store_skills<S>(
     store: &S,
     session_role: SessionRole,
-) -> std::result::Result<Vec<SkillEntry>, SkillError> {
+) -> std::result::Result<Vec<SkillEntry>, SkillError>
+where
+    S: SkillStore,
+{
     let records = store.list_skills(session_role).context(LoadSkillsSnafu)?;
     Ok(skill_entries_from_store_records(session_role, &records))
 }
@@ -661,11 +666,14 @@ fn collect_skills_from_dir(
     Ok(())
 }
 
-fn collect_skills<S: Store>(
+fn collect_skills<S>(
     workspace_root: &Path,
     store: &S,
     session_role: SessionRole,
-) -> std::result::Result<Vec<SkillEntry>, SkillError> {
+) -> std::result::Result<Vec<SkillEntry>, SkillError>
+where
+    S: SkillStore,
+{
     let roots = configured_skill_roots(workspace_root)?;
     let mut skills = Vec::new();
     for root in roots {
@@ -710,7 +718,7 @@ fn score_skill(skill: &SkillEntry, query: &str) -> usize {
 
 fn search_skills(
     workspace_root: &Path,
-    store: &impl Store,
+    store: &impl SkillStore,
     session_role: SessionRole,
     query: &str,
     limit: usize,
@@ -745,7 +753,7 @@ fn search_skills(
 
 fn resolve_skill(
     workspace_root: &Path,
-    store: &impl Store,
+    store: &impl SkillStore,
     session_role: SessionRole,
     name: &str,
 ) -> std::result::Result<SkillEntry, SkillError> {
