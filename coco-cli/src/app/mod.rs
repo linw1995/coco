@@ -12,6 +12,7 @@ use coco_mem::FsStore;
 use crate::{Cli, Result, cli::SessionCreateCommand, store::open_store};
 
 pub(crate) mod daemon;
+mod preset;
 mod prompt;
 pub(crate) mod runtime;
 mod session;

@@ -88,6 +88,9 @@ pub struct SessionRebaseCommand {
     #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
 
+    #[arg(long)]
+    pub preset: Option<String>,
+
     #[arg(long, value_enum)]
     pub role: Option<CliSessionRole>,
 

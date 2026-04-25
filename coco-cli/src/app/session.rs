@@ -6,8 +6,8 @@ use coco_llm::{
     CompletionBackend, LlmService, SessionConfig, SessionConfigPatch, SessionFeedback, SessionMerge,
 };
 use coco_mem::{
-    AnchorPayload, BranchStore, FsStore, Kind, Node, NodeStore, PauseReason, SessionAnchor,
-    SessionState, SessionStore, StoreError, Tool,
+    AnchorPayload, BranchConfigStore, BranchStore, FsStore, Kind, Node, NodeStore, PauseReason,
+    SessionAnchor, SessionState, SessionStore, StoreError, Tool,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -188,10 +188,8 @@ where
         }
         SessionSubcommand::Rebase(command) => {
             let branch = command.branch.clone();
-            let head_id = llm
-                .rebase_session(&branch, resolve_session_patch(command))
-                .await
-                .context(LlmSnafu)?;
+            let patch = resolve_session_patch(command, store)?;
+            let head_id = llm.rebase_session(&branch, patch).await.context(LlmSnafu)?;
             Ok(Some(render_json(SessionRebaseResult { branch, head_id })))
         }
         SessionSubcommand::Reopen(command) => Ok(Some(render_json(SessionMutationResult {
@@ -1024,35 +1022,54 @@ fn resolve_visible_session_anchor(
     })
 }
 
-fn resolve_session_patch(command: SessionRebaseCommand) -> SessionConfigPatch {
-    SessionConfigPatch {
-        role: command.role.map(Into::into),
-        provider: command
-            .provider
-            .map(|provider| coco_llm::Provider::from(provider).as_str().to_owned()),
-        model: command.model,
-        tools: if command.clear_tools {
-            Some(vec![])
-        } else if command.tools.is_empty() {
-            None
-        } else {
-            Some(resolve_cli_tools(&command.tools))
-        },
-        system_prompt: command.system_prompt,
-        prompt: command.prompt,
-        temperature: if command.clear_temperature {
-            Some(None)
-        } else {
-            command.temperature.map(Some)
-        },
-        max_tokens: if command.clear_max_tokens {
-            Some(None)
-        } else {
-            command.max_tokens.map(Some)
-        },
-        additional_params: None,
-        enable_coco_shim: None,
+fn resolve_session_patch(
+    command: SessionRebaseCommand,
+    store: &FsStore,
+) -> Result<SessionConfigPatch> {
+    let mut patch = command
+        .preset
+        .as_deref()
+        .map(|name| {
+            store
+                .get_branch_config(name)
+                .map(|config| config.to_session_anchor_patch())
+                .context(StoreSnafu)
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    if let Some(role) = command.role {
+        patch.role = Some(role.into());
     }
+    if let Some(provider) = command.provider {
+        patch.provider = Some(coco_llm::Provider::from(provider).as_str().to_owned());
+    }
+    if command.model.is_some() {
+        patch.model = command.model;
+    }
+    if command.clear_tools {
+        patch.tools = Some(vec![]);
+    } else if !command.tools.is_empty() {
+        patch.tools = Some(resolve_cli_tools(&command.tools));
+    }
+    if command.system_prompt.is_some() {
+        patch.system_prompt = command.system_prompt;
+    }
+    if command.prompt.is_some() {
+        patch.prompt = command.prompt;
+    }
+    if command.clear_temperature {
+        patch.temperature = Some(None);
+    } else if let Some(temperature) = command.temperature {
+        patch.temperature = Some(Some(temperature));
+    }
+    if command.clear_max_tokens {
+        patch.max_tokens = Some(None);
+    } else if let Some(max_tokens) = command.max_tokens {
+        patch.max_tokens = Some(Some(max_tokens));
+    }
+
+    Ok(patch)
 }
 
 fn resolve_cli_tools(tools: &[CliTool]) -> Vec<Tool> {

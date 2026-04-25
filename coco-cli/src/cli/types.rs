@@ -2,7 +2,7 @@ use clap::ValueEnum;
 use coco_llm::Provider;
 use coco_mem::SessionRole;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum CliProvider {
     Openai,
     Anthropic,

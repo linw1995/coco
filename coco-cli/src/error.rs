@@ -27,11 +27,20 @@ pub enum Error {
     #[snafu(display("Failed to parse session additional params JSON: {source}"))]
     ParseSessionAdditionalParams { source: serde_json::Error },
 
+    #[snafu(display("Failed to parse preset additional params JSON: {source}"))]
+    ParsePresetAdditionalParams { source: serde_json::Error },
+
     #[snafu(display(
         "Session additional params must be a JSON object, got {kind}",
         kind = JsonValueKind(value)
     ))]
     InvalidSessionAdditionalParamsType { value: serde_json::Value },
+
+    #[snafu(display(
+        "Preset additional params must be a JSON object, got {kind}",
+        kind = JsonValueKind(value)
+    ))]
+    InvalidPresetAdditionalParamsType { value: serde_json::Value },
 
     #[snafu(display("Reference {reference:?} did not match any branch or node ID"))]
     UnknownShowReference { reference: String },

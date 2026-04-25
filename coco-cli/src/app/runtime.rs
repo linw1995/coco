@@ -7,15 +7,15 @@ use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{FsStore, SessionRole};
 
 use super::{
-    daemon::run_daemon_command, prompt::run_prompt_command, session::run_session_command,
-    skill::run_skill_command,
+    daemon::run_daemon_command, preset::run_preset_command, prompt::run_prompt_command,
+    session::run_session_command, skill::run_skill_command,
 };
 use crate::{
     Cli, Result,
     cli::{
-        Command, PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
-        PromptSubcommand, SessionBranchCommand, SessionCommand, SessionGraphCommand,
-        SessionShowCommand, SessionSubcommand, SkillCommand,
+        Command, PresetCommand, PromptBranchStatusCommand, PromptCommand, PromptRunCommand,
+        PromptStatusCommand, PromptSubcommand, SessionBranchCommand, SessionCommand,
+        SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand,
     },
 };
 
@@ -51,6 +51,7 @@ struct ForwardedCli {
 
 #[derive(Debug, Subcommand)]
 enum ForwardedCommand {
+    Preset(PresetCommand),
     Prompt(PromptCommand),
     Session(SessionCommand),
     Skill(SkillCommand),
@@ -136,6 +137,7 @@ impl ForwardedCli {
             daemon_socket: None,
             store_path: default_forwarded_store_path(),
             command: match self.command {
+                ForwardedCommand::Preset(command) => Command::Preset(command),
                 ForwardedCommand::Prompt(command) => Command::Prompt(command),
                 ForwardedCommand::Session(command) => Command::Session(command),
                 ForwardedCommand::Skill(command) => Command::Skill(command),
@@ -155,6 +157,7 @@ where
     R: Read,
 {
     match cli.command {
+        Command::Preset(command) => run_preset_command(command, services.shared_store).await,
         Command::Prompt(command) => {
             run_prompt_command(
                 command,
@@ -303,6 +306,7 @@ fn apply_forwarded_defaults(
     let branch = branch_env.to_owned();
 
     match &mut cli.command {
+        Command::Preset(_) => {}
         Command::Prompt(command) => {
             if command.command.is_none() {
                 command.run.branch = branch;

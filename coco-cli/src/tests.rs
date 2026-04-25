@@ -14,7 +14,7 @@ use coco_llm::{
     BackendError, BackendEvent, BackendEventPayload, BackendTurn, CompletionBackend,
     CompletionMessage, CompletionToolCall, Provider, StepContext,
 };
-use coco_mem::SessionState;
+use coco_mem::{BranchConfigStore, SessionState};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,11 +29,12 @@ use crate::{
         runtime::{ForwardedRuntimeInputs, RuntimeServices},
     },
     cli::{
-        Command, PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
-        PromptSubcommand, PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand,
-        SessionCommand, SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand,
-        SessionGraphCommand, SessionMergeCommand, SessionPrCommand, SessionRebaseCommand,
-        SessionShowCommand, SessionSubcommand,
+        Command, PresetCommand, PresetSetCommand, PresetSubcommand, PromptBranchStatusCommand,
+        PromptCommand, PromptRunCommand, PromptStatusCommand, PromptSubcommand,
+        PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand, SessionCommand,
+        SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand, SessionGraphCommand,
+        SessionMergeCommand, SessionPrCommand, SessionRebaseCommand, SessionShowCommand,
+        SessionSubcommand,
     },
     store::open_store,
 };
@@ -409,6 +410,7 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Rebase(SessionRebaseCommand {
                 branch: branch.unwrap_or("main").to_owned(),
+                preset: None,
                 role: Some(crate::cli::CliSessionRole::Runner),
                 provider: Some(crate::cli::CliProvider::Anthropic),
                 model: Some("claude-sonnet-4-20250514".to_owned()),
@@ -2569,6 +2571,346 @@ async fn skill_show_reads_default_initialized_skill() {
     assert_eq!(show_json["current_version"], 1);
 }
 
+#[test]
+fn preset_set_parses_name_and_patch_flags() {
+    let cli = Cli::try_parse_from([
+        "coco-cli",
+        "preset",
+        "set",
+        "--name",
+        "coding",
+        "--role",
+        "runner",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-20250514",
+        "--system-prompt",
+        "You are precise.",
+        "--tool",
+        "bash",
+        "--additional-params",
+        "{\"reasoning_effort\":\"medium\"}",
+        "--enable-coco-shim",
+    ])
+    .unwrap();
+
+    let Command::Preset(command) = cli.command else {
+        panic!("expected preset command");
+    };
+    let PresetSubcommand::Set(command) = command.command else {
+        panic!("expected preset set command");
+    };
+
+    assert_eq!(command.name, "coding");
+    assert_eq!(command.role, Some(crate::cli::CliSessionRole::Runner));
+    assert_eq!(command.provider, Some(crate::cli::CliProvider::Anthropic));
+    assert_eq!(command.model.as_deref(), Some("claude-sonnet-4-20250514"));
+    assert_eq!(command.system_prompt.as_deref(), Some("You are precise."));
+    assert_eq!(command.tools, vec![crate::cli::CliTool::Bash]);
+    assert!(command.enable_coco_shim);
+}
+
+#[tokio::test]
+async fn preset_commands_manage_versions_in_store() {
+    let (_tempdir, store_path) = temp_store_path();
+    let preset_name = "coding";
+
+    let first_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "set",
+            "--name",
+            preset_name,
+            "--role",
+            "orchestrator",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4.1-mini",
+            "--system-prompt",
+            "You are helpful.",
+            "--temperature",
+            "0.2",
+            "--max-tokens",
+            "64",
+            "--additional-params",
+            "{\"reasoning_effort\":\"low\"}",
+            "--tool",
+            "bash",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let first_json: serde_json::Value = serde_json::from_str(&first_output).unwrap();
+    assert_eq!(first_json["name"], preset_name);
+    assert_eq!(first_json["current_version"], 1);
+    assert_eq!(first_json["config"]["role"], "orchestrator");
+    assert_eq!(first_json["config"]["session"]["provider"], "openai");
+    assert_eq!(first_json["config"]["session"]["model"], "gpt-4.1-mini");
+    assert_eq!(
+        first_json["config"]["session"]["additional_params"],
+        json!({"reasoning_effort": "low"})
+    );
+    assert_eq!(first_json["config"]["session"]["tools"][0]["name"], "bash");
+
+    let second_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "set",
+            "--name",
+            preset_name,
+            "--role",
+            "runner",
+            "--model",
+            "claude-sonnet-4-20250514",
+            "--clear-temperature",
+            "--clear-max-tokens",
+            "--clear-tools",
+            "--clear-additional-params",
+            "--disable-coco-shim",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let second_json: serde_json::Value = serde_json::from_str(&second_output).unwrap();
+    assert_eq!(second_json["current_version"], 2);
+    assert_eq!(second_json["available_versions"], json!([1, 2]));
+    assert_eq!(second_json["config"]["role"], "runner");
+    assert_eq!(
+        second_json["config"]["session"]["model"],
+        "claude-sonnet-4-20250514"
+    );
+    assert_eq!(
+        second_json["config"]["session"]["temperature"],
+        json!({"__coco_patch": "clear"})
+    );
+    assert_eq!(
+        second_json["config"]["session"]["max_tokens"],
+        json!({"__coco_patch": "clear"})
+    );
+    assert_eq!(second_json["config"]["session"]["tools"], json!([]));
+    assert_eq!(
+        second_json["config"]["session"]["additional_params"],
+        json!({"__coco_patch": "clear"})
+    );
+    assert_eq!(second_json["config"]["session"]["enable_coco_shim"], false);
+    let persisted = open_store(&store_path)
+        .unwrap()
+        .get_branch_config(preset_name)
+        .unwrap();
+    assert_eq!(persisted.session.temperature, Some(None));
+    assert_eq!(persisted.session.max_tokens, Some(None));
+    assert_eq!(persisted.session.additional_params, Some(None));
+
+    let list_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "list",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let list_json: serde_json::Value = serde_json::from_str(&list_output).unwrap();
+    assert_eq!(list_json.as_array().unwrap().len(), 1);
+    assert_eq!(list_json[0]["name"], preset_name);
+
+    let show_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "show",
+            "--name",
+            preset_name,
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let show_json: serde_json::Value = serde_json::from_str(&show_output).unwrap();
+    assert_eq!(
+        show_json["versions"][0]["config"]["session"]["model"],
+        "gpt-4.1-mini"
+    );
+    assert_eq!(
+        show_json["versions"][1]["config"]["session"]["model"],
+        "claude-sonnet-4-20250514"
+    );
+
+    let rollback_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "rollback",
+            "--name",
+            preset_name,
+            "--to-version",
+            "1",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let rollback_json: serde_json::Value = serde_json::from_str(&rollback_output).unwrap();
+    assert_eq!(rollback_json["current_version"], 3);
+    assert_eq!(rollback_json["config"]["session"]["model"], "gpt-4.1-mini");
+
+    let delete_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "delete",
+            "--name",
+            preset_name,
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&delete_output).unwrap(),
+        json!({ "name": preset_name })
+    );
+    assert!(
+        open_store(&store_path)
+            .unwrap()
+            .list_branch_config_records()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn session_rebase_applies_preset_patch() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    run_with_backend(
+        Cli {
+            daemon_socket: None,
+            store_path: store_path.clone(),
+            command: Command::Preset(PresetCommand {
+                command: PresetSubcommand::Set(PresetSetCommand {
+                    name: "runner-defaults".to_owned(),
+                    role: Some(crate::cli::CliSessionRole::Runner),
+                    provider: Some(crate::cli::CliProvider::Anthropic),
+                    model: Some("claude-sonnet-4-20250514".to_owned()),
+                    system_prompt: Some("You are precise.".to_owned()),
+                    prompt: Some("Start with a plan.".to_owned()),
+                    temperature: None,
+                    clear_temperature: true,
+                    max_tokens: Some(256),
+                    clear_max_tokens: false,
+                    tools: vec![],
+                    clear_tools: true,
+                    additional_params: Some("{\"reasoning_effort\":\"medium\"}".to_owned()),
+                    clear_additional_params: false,
+                    enable_coco_shim: true,
+                    disable_coco_shim: false,
+                }),
+            }),
+        },
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "rebase",
+            "--preset",
+            "runner-defaults",
+            "--branch",
+            "main",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["branch"], "main");
+    assert!(value["head_id"].as_str().is_some());
+
+    let session_output = run_with_backend(
+        session_get_cli(store_path, Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let session_json: serde_json::Value = serde_json::from_str(&session_output).unwrap();
+    assert_eq!(session_json["role"], "runner");
+    assert_eq!(session_json["anchor"]["provider"], "anthropic");
+    assert_eq!(session_json["anchor"]["model"], "claude-sonnet-4-20250514");
+    assert_eq!(session_json["anchor"]["system_prompt"], "You are precise.");
+    assert_eq!(session_json["anchor"]["prompt"], "Start with a plan.");
+    assert_eq!(session_json["anchor"]["temperature"], json!(null));
+    assert_eq!(session_json["anchor"]["max_tokens"], 256);
+    assert_eq!(
+        session_json["anchor"]["additional_params"],
+        json!({"reasoning_effort": "medium"})
+    );
+    assert_eq!(session_json["anchor"]["tools"], json!([]));
+    assert_eq!(session_json["anchor"]["enable_coco_shim"], true);
+}
+
 #[tokio::test]
 async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
     let (_tempdir, store_path) = temp_store_path();
@@ -2855,6 +3197,29 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
         skill_response
             .stderr
             .contains("unrecognized subcommand 'skill'")
+    );
+
+    let preset_response = run_forwarded_with_services(
+        ForwardedRuntimeInputs {
+            args: &["preset".to_owned(), "list".to_owned()],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Runner),
+            store_path_env: None,
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            shared_engine: None,
+        },
+    )
+    .await;
+
+    assert_eq!(preset_response.exit_code, 2);
+    assert!(
+        preset_response
+            .stderr
+            .contains("unrecognized subcommand 'preset'")
     );
 }
 

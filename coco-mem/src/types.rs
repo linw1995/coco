@@ -5,6 +5,56 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod serde_double_option {
+    use serde::de::{DeserializeOwned, Deserializer, Error};
+    use serde::ser::{SerializeMap, Serializer};
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+
+    const PATCH_KEY: &str = "__coco_patch";
+    const CLEAR_VALUE: &str = "clear";
+
+    pub fn serialize<S, T>(value: &Option<Option<T>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Serialize,
+    {
+        match value {
+            None => serializer.serialize_none(),
+            Some(None) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(PATCH_KEY, CLEAR_VALUE)?;
+                map.end()
+            }
+            Some(Some(value)) => value.serialize(serializer),
+        }
+    }
+
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: DeserializeOwned,
+    {
+        let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        if is_clear_sentinel(&value) {
+            return Ok(Some(None));
+        }
+
+        serde_json::from_value(value)
+            .map(|value| Some(Some(value)))
+            .map_err(D::Error::custom)
+    }
+
+    fn is_clear_sentinel(value: &Value) -> bool {
+        let Value::Object(map) = value else {
+            return false;
+        };
+        map.len() == 1 && map.get(PATCH_KEY).and_then(Value::as_str) == Some(CLEAR_VALUE)
+    }
+}
+
 /// Represents a node in the memory graph, similar to a git commit
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Node {
@@ -120,15 +170,40 @@ pub struct Job {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchorPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<SessionRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serde_double_option::serialize",
+        deserialize_with = "serde_double_option::deserialize"
+    )]
     pub temperature: Option<Option<f64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serde_double_option::serialize",
+        deserialize_with = "serde_double_option::deserialize"
+    )]
     pub max_tokens: Option<Option<u64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serde_double_option::serialize",
+        deserialize_with = "serde_double_option::deserialize"
+    )]
     pub additional_params: Option<Option<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_coco_shim: Option<bool>,
 }
 
@@ -311,6 +386,10 @@ Useful commands:
 - `coco session pr --branch <branch> --target-branch <branch>`
 - `coco session feedback --branch <branch> --prompt "<text>"`
 - `coco session merge --branch <branch> --target-branch <branch> --prompt "<text>"`
+- `coco preset list`
+- `coco preset show --name <preset>`
+- `coco preset set --name <preset> [session options]`
+- `coco session rebase --preset <preset> --branch <branch>`
 - `coco prompt --branch <branch> "<text>"`
 - `coco prompt status --job <job>`
 - `coco prompt branch-status --job <job> --branch <branch>`
@@ -1175,6 +1254,45 @@ mod tests {
             updated.additional_params,
             Some(json!({"service_tier": "priority"}))
         );
+    }
+
+    #[test]
+    fn session_anchor_patch_round_trip_preserves_clear_fields() {
+        let patch = SessionAnchorPatch {
+            temperature: Some(None),
+            max_tokens: Some(None),
+            additional_params: Some(None),
+            ..SessionAnchorPatch::default()
+        };
+
+        let encoded = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "temperature": {"__coco_patch": "clear"},
+                "max_tokens": {"__coco_patch": "clear"},
+                "additional_params": {"__coco_patch": "clear"}
+            })
+        );
+
+        let decoded: SessionAnchorPatch = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.temperature, Some(None));
+        assert_eq!(decoded.max_tokens, Some(None));
+        assert_eq!(decoded.additional_params, Some(None));
+    }
+
+    #[test]
+    fn session_anchor_patch_reads_legacy_null_fields_as_absent() {
+        let decoded: SessionAnchorPatch = serde_json::from_value(json!({
+            "temperature": null,
+            "max_tokens": null,
+            "additional_params": null
+        }))
+        .unwrap();
+
+        assert_eq!(decoded.temperature, None);
+        assert_eq!(decoded.max_tokens, None);
+        assert_eq!(decoded.additional_params, None);
     }
 
     #[test]
