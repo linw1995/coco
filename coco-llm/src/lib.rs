@@ -905,12 +905,41 @@ impl<B, S> LlmService<B, S> {
     pub fn store(&self) -> &S {
         &self.store
     }
+
+    async fn lock_branch(&self, branch: &str) -> OwnedMutexGuard<()> {
+        let branch_lock = {
+            let mut locks = self.branch_locks.lock().await;
+            locks
+                .entry(branch.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        branch_lock.lock_owned().await
+    }
+
+    async fn lock_workflow(&self) -> OwnedMutexGuard<()> {
+        self.workflow_lock.clone().lock_owned().await
+    }
+
+    async fn lock_branch_pair(&self, left: &str, right: &str) -> Vec<OwnedMutexGuard<()>> {
+        let mut branches = vec![left.to_owned()];
+        if left != right {
+            branches.push(right.to_owned());
+            branches.sort();
+        }
+
+        let mut guards = Vec::with_capacity(branches.len());
+        for branch in branches {
+            guards.push(self.lock_branch(&branch).await);
+        }
+        guards
+    }
 }
 
 impl<B, S> LlmService<B, S>
 where
-    B: CompletionBackend,
-    S: NodeStore + BranchStore + SessionStore + RuntimeStore + Clone + Send + Sync + 'static,
+    S: SessionStore,
 {
     pub async fn rebase_session(&self, branch: &str, patch: SessionConfigPatch) -> Result<String> {
         let _guard = self.lock_branch(branch).await;
@@ -918,7 +947,12 @@ where
             .rebase_session(branch, &patch)
             .context(MemorySnafu)
     }
+}
 
+impl<B, S> LlmService<B, S>
+where
+    S: NodeStore + BranchStore,
+{
     pub async fn create_session(&self, config: SessionConfig) -> Result<BranchSession> {
         let _guard = self.lock_branch(&config.branch).await;
         let root_id = self.store.root_id();
@@ -971,6 +1005,32 @@ where
         })
     }
 
+    pub fn fork(&self, branch: impl Into<String>, from_ref: &str) -> Result<String> {
+        let branch = branch.into();
+        self.store.fork(&branch, from_ref).context(MemorySnafu)
+    }
+
+    fn append_prompt_anchor_to_branch(
+        &self,
+        branch: &str,
+        prompt: &str,
+        merge_parents: &[String],
+    ) -> Result<String> {
+        let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let anchor_id =
+            self.append_prompt_anchor_to_parent(&original_head, prompt, merge_parents)?;
+        self.store
+            .set_branch_head(branch, &original_head, &anchor_id)
+            .context(MemorySnafu)?;
+
+        Ok(anchor_id)
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
+    S: BranchStore + SessionStore,
+{
     pub async fn open_pull_request(
         &self,
         branch: &str,
@@ -999,106 +1059,13 @@ where
             base_head_id,
         })
     }
+}
 
-    pub async fn merge_session(
-        &self,
-        branch: &str,
-        target_branch: Option<&str>,
-        prompt: &str,
-    ) -> Result<SessionMerge> {
-        let _workflow = self.lock_workflow().await;
-        let _branch_guard = self.lock_branch(branch).await;
-        let resolved_target_branch = self.resolve_target_branch(branch, target_branch)?;
-        let _target_guard = if resolved_target_branch == branch {
-            None
-        } else {
-            Some(self.lock_branch(&resolved_target_branch).await)
-        };
-
-        let source_head_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
-        let merged_anchor_id = self.append_prompt_anchor_to_branch(
-            &resolved_target_branch,
-            prompt,
-            std::slice::from_ref(&source_head_id),
-        )?;
-        self.store
-            .set_session_state(
-                branch,
-                None,
-                SessionState::Paused {
-                    target_branch: resolved_target_branch.clone(),
-                    reason: PauseReason::Merged {
-                        merged_anchor_id: merged_anchor_id.clone(),
-                    },
-                },
-            )
-            .context(MemorySnafu)?;
-
-        Ok(SessionMerge {
-            branch: branch.to_owned(),
-            target_branch: resolved_target_branch,
-            source_head_id,
-            merged_anchor_id,
-        })
-    }
-
-    pub async fn apply_feedback(
-        &self,
-        branch: &str,
-        prompt: &str,
-        from_ref: Option<&str>,
-    ) -> Result<SessionFeedback> {
-        let _workflow = self.lock_workflow().await;
-        let _branch_guard = self.lock_branch(branch).await;
-        let (target_branch, base_head_id) = self.attached_state(branch)?;
-        let _target_guard = if target_branch == branch {
-            None
-        } else {
-            Some(self.lock_branch(&target_branch).await)
-        };
-
-        let source_anchor_id = self.resolve_reference_id(from_ref.unwrap_or(&target_branch))?;
-        self.ensure_ref_visible_on_branch(&target_branch, &source_anchor_id)?;
-        if source_anchor_id != base_head_id {
-            match self.store.log(&base_head_id, &source_anchor_id) {
-                Ok(_) => {}
-                Err(StoreError::RefsNotConnected { .. }) => {
-                    return FeedbackSourceNotAheadSnafu {
-                        target_branch,
-                        base_head_id,
-                        source_anchor_id,
-                    }
-                    .fail();
-                }
-                Err(source) => return Err(Error::Memory { source }),
-            }
-        }
-
-        let feedback_anchor_id = self.append_prompt_anchor_to_branch(
-            branch,
-            prompt,
-            std::slice::from_ref(&source_anchor_id),
-        )?;
-        self.store
-            .set_session_state(
-                branch,
-                None,
-                SessionState::Attached {
-                    target_branch: target_branch.clone(),
-                    base_head_id: source_anchor_id.clone(),
-                },
-            )
-            .context(MemorySnafu)?;
-
-        Ok(SessionFeedback {
-            branch: branch.to_owned(),
-            target_branch,
-            base_head_id: source_anchor_id.clone(),
-            source_anchor_id,
-            feedback_anchor_id,
-        })
-    }
-
+impl<B, S> LlmService<B, S>
+where
+    B: CompletionBackend,
+    S: NodeStore + BranchStore + SessionStore + RuntimeStore + Clone + Send + Sync + 'static,
+{
     pub async fn prompt(&self, request: PromptRequest) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
         self.run_locked(CompletionRequest {
@@ -1111,63 +1078,6 @@ where
             overrides: CompletionOverrides::default(),
         })
         .await
-    }
-
-    fn append_prompt_anchor_to_branch(
-        &self,
-        branch: &str,
-        prompt: &str,
-        merge_parents: &[String],
-    ) -> Result<String> {
-        let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
-        let anchor_id =
-            self.append_prompt_anchor_to_parent(&original_head, prompt, merge_parents)?;
-        self.store
-            .set_branch_head(branch, &original_head, &anchor_id)
-            .context(MemorySnafu)?;
-
-        Ok(anchor_id)
-    }
-
-    fn append_prompt_anchor_to_parent(
-        &self,
-        parent_id: &str,
-        prompt: &str,
-        merge_parents: &[String],
-    ) -> Result<String> {
-        let merge_parents = merge_parents
-            .iter()
-            .map(|reference| {
-                self.store
-                    .ancestry(reference)
-                    .map(|nodes| {
-                        nodes
-                            .into_iter()
-                            .next()
-                            .expect("ancestry should always include the head node")
-                            .id
-                    })
-                    .context(MemorySnafu)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.store
-            .append(NewNode {
-                parent: parent_id.to_owned(),
-                role: Role::System,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::prompt(
-                    merge_parents,
-                    PromptAnchor {
-                        prompt: prompt.to_owned(),
-                    },
-                )),
-            })
-            .context(MemorySnafu)
-    }
-
-    pub fn fork(&self, branch: impl Into<String>, from_ref: &str) -> Result<String> {
-        let branch = branch.into();
-        self.store.fork(&branch, from_ref).context(MemorySnafu)
     }
 
     pub async fn run(&self, request: CompletionRequest) -> Result<CompletionResult> {
@@ -1320,19 +1230,12 @@ where
             }
         }
     }
+}
 
-    async fn lock_branch(&self, branch: &str) -> OwnedMutexGuard<()> {
-        let branch_lock = {
-            let mut locks = self.branch_locks.lock().await;
-            locks
-                .entry(branch.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-
-        branch_lock.lock_owned().await
-    }
-
+impl<B, S> LlmService<B, S>
+where
+    S: NodeStore + RuntimeStore,
+{
     fn resolve_session_from_reference(
         &self,
         branch: &str,
@@ -1340,6 +1243,47 @@ where
     ) -> Result<ResolvedSession> {
         let context = self.resolve_context(reference)?;
         self.session_from_context(branch, context)
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
+    S: NodeStore,
+{
+    fn append_prompt_anchor_to_parent(
+        &self,
+        parent_id: &str,
+        prompt: &str,
+        merge_parents: &[String],
+    ) -> Result<String> {
+        let merge_parents = merge_parents
+            .iter()
+            .map(|reference| {
+                self.store
+                    .ancestry(reference)
+                    .map(|nodes| {
+                        nodes
+                            .into_iter()
+                            .next()
+                            .expect("ancestry should always include the head node")
+                            .id
+                    })
+                    .context(MemorySnafu)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.store
+            .append(NewNode {
+                parent: parent_id.to_owned(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    merge_parents,
+                    PromptAnchor {
+                        prompt: prompt.to_owned(),
+                    },
+                )),
+            })
+            .context(MemorySnafu)
     }
 
     fn append_backend_events(
@@ -1469,7 +1413,12 @@ where
             })
             .context(MemorySnafu)
     }
+}
 
+impl<B, S> LlmService<B, S>
+where
+    S: BranchStore,
+{
     fn move_branch_head(&self, branch: &str, current_head: &str, next_head: &str) -> Result<()> {
         if current_head == next_head {
             return Ok(());
@@ -1478,6 +1427,110 @@ where
         self.store
             .set_branch_head(branch, current_head, next_head)
             .context(MemorySnafu)
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
+    S: NodeStore + BranchStore + SessionStore,
+{
+    pub async fn merge_session(
+        &self,
+        branch: &str,
+        target_branch: Option<&str>,
+        prompt: &str,
+    ) -> Result<SessionMerge> {
+        let _workflow = self.lock_workflow().await;
+        let _branch_guard = self.lock_branch(branch).await;
+        let resolved_target_branch = self.resolve_target_branch(branch, target_branch)?;
+        let _target_guard = if resolved_target_branch == branch {
+            None
+        } else {
+            Some(self.lock_branch(&resolved_target_branch).await)
+        };
+
+        let source_head_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let merged_anchor_id = self.append_prompt_anchor_to_branch(
+            &resolved_target_branch,
+            prompt,
+            std::slice::from_ref(&source_head_id),
+        )?;
+        self.store
+            .set_session_state(
+                branch,
+                None,
+                SessionState::Paused {
+                    target_branch: resolved_target_branch.clone(),
+                    reason: PauseReason::Merged {
+                        merged_anchor_id: merged_anchor_id.clone(),
+                    },
+                },
+            )
+            .context(MemorySnafu)?;
+
+        Ok(SessionMerge {
+            branch: branch.to_owned(),
+            target_branch: resolved_target_branch,
+            source_head_id,
+            merged_anchor_id,
+        })
+    }
+
+    pub async fn apply_feedback(
+        &self,
+        branch: &str,
+        prompt: &str,
+        from_ref: Option<&str>,
+    ) -> Result<SessionFeedback> {
+        let _workflow = self.lock_workflow().await;
+        let _branch_guard = self.lock_branch(branch).await;
+        let (target_branch, base_head_id) = self.attached_state(branch)?;
+        let _target_guard = if target_branch == branch {
+            None
+        } else {
+            Some(self.lock_branch(&target_branch).await)
+        };
+
+        let source_anchor_id = self.resolve_reference_id(from_ref.unwrap_or(&target_branch))?;
+        self.ensure_ref_visible_on_branch(&target_branch, &source_anchor_id)?;
+        if source_anchor_id != base_head_id {
+            match self.store.log(&base_head_id, &source_anchor_id) {
+                Ok(_) => {}
+                Err(StoreError::RefsNotConnected { .. }) => {
+                    return FeedbackSourceNotAheadSnafu {
+                        target_branch,
+                        base_head_id,
+                        source_anchor_id,
+                    }
+                    .fail();
+                }
+                Err(source) => return Err(Error::Memory { source }),
+            }
+        }
+
+        let feedback_anchor_id = self.append_prompt_anchor_to_branch(
+            branch,
+            prompt,
+            std::slice::from_ref(&source_anchor_id),
+        )?;
+        self.store
+            .set_session_state(
+                branch,
+                None,
+                SessionState::Attached {
+                    target_branch: target_branch.clone(),
+                    base_head_id: source_anchor_id.clone(),
+                },
+            )
+            .context(MemorySnafu)?;
+
+        Ok(SessionFeedback {
+            branch: branch.to_owned(),
+            target_branch,
+            base_head_id: source_anchor_id.clone(),
+            source_anchor_id,
+            feedback_anchor_id,
+        })
     }
 
     fn finalize_branch_handoffs(&self, branch: &str) -> Result<()> {
@@ -1527,31 +1580,23 @@ where
 
         Ok(())
     }
+}
 
-    async fn lock_workflow(&self) -> OwnedMutexGuard<()> {
-        self.workflow_lock.clone().lock_owned().await
-    }
-
-    async fn lock_branch_pair(&self, left: &str, right: &str) -> Vec<OwnedMutexGuard<()>> {
-        let mut branches = vec![left.to_owned()];
-        if left != right {
-            branches.push(right.to_owned());
-            branches.sort();
-        }
-
-        let mut guards = Vec::with_capacity(branches.len());
-        for branch in branches {
-            guards.push(self.lock_branch(&branch).await);
-        }
-        guards
-    }
-
+impl<B, S> LlmService<B, S>
+where
+    S: NodeStore + RuntimeStore,
+{
     #[cfg(test)]
     fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
         let context = self.resolve_context(branch)?;
         self.session_from_context(branch, context)
     }
+}
 
+impl<B, S> LlmService<B, S>
+where
+    S: RuntimeStore,
+{
     fn session_from_context(
         &self,
         branch: &str,
@@ -1599,7 +1644,12 @@ where
             },
         })
     }
+}
 
+impl<B, S> LlmService<B, S>
+where
+    S: NodeStore,
+{
     fn resolve_context(&self, reference: &str) -> Result<ResolvedContext> {
         let ordered: Vec<_> = self
             .store
@@ -1715,7 +1765,9 @@ where
 
         Ok(())
     }
+}
 
+impl<B, S> LlmService<B, S> {
     fn resolve_request(
         &self,
         session: &ResolvedSession,
@@ -1741,7 +1793,12 @@ where
             trace_node_appender,
         }
     }
+}
 
+impl<B, S> LlmService<B, S>
+where
+    S: SessionStore,
+{
     fn resolve_target_branch(&self, branch: &str, explicit_target: Option<&str>) -> Result<String> {
         let state = self.store.get_session_state(branch).context(MemorySnafu)?;
 
@@ -1794,7 +1851,12 @@ where
             .fail(),
         }
     }
+}
 
+impl<B, S> LlmService<B, S>
+where
+    S: NodeStore,
+{
     fn resolve_reference_id(&self, reference: &str) -> Result<String> {
         self.store
             .ancestry(reference)
