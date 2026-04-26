@@ -207,6 +207,7 @@ fn session_config(branch: &str) -> SessionConfig {
     SessionConfig {
         branch: branch.to_owned(),
         merge_parents: vec![],
+        provider_profile: None,
         role: SessionRole::Orchestrator,
         provider: Provider::OpenAi,
         model: "gpt-4.1-mini".to_owned(),

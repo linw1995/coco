@@ -38,6 +38,9 @@ pub enum StoreError {
     #[snafu(display("Branch preset config {name:?} version {version} not found"))]
     BranchConfigVersionNotFound { name: String, version: u64 },
 
+    #[snafu(display("Provider profile {name:?} not found"))]
+    ProviderProfileNotFound { name: String },
+
     #[snafu(display("Branch {name:?} moved from {expected:?} to {actual:?}"))]
     BranchHeadMoved {
         name: String,

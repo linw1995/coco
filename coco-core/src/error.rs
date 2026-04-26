@@ -23,12 +23,13 @@ impl From<coco_llm::Error> for EngineError {
     fn from(error: coco_llm::Error) -> Self {
         match error {
             coco_llm::Error::MissingAnchor { branch } => Self::SessionMissing { branch },
-            coco_llm::Error::Memory {
-                source: StoreError::BranchNotFound { name },
-            } => Self::SessionMissing { branch: name },
-            coco_llm::Error::Memory {
-                source: StoreError::MissingSessionAnchor { branch },
-            } => Self::SessionMissing { branch },
+            coco_llm::Error::Memory { source } => match *source {
+                StoreError::BranchNotFound { name } => Self::SessionMissing { branch: name },
+                StoreError::MissingSessionAnchor { branch } => Self::SessionMissing { branch },
+                other => Self::EngineFailed {
+                    message: other.to_string(),
+                },
+            },
             other => Self::EngineFailed {
                 message: other.to_string(),
             },

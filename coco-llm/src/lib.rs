@@ -4,7 +4,7 @@ mod skill;
 mod skill_tool;
 mod tool_definition;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -129,6 +129,7 @@ impl FromStr for Provider {
 pub struct SessionConfig {
     pub branch: String,
     pub merge_parents: Vec<String>,
+    pub provider_profile: Option<String>,
     pub role: SessionRole,
     pub provider: Provider,
     pub model: String,
@@ -250,8 +251,11 @@ struct ConversationTraceEntry {
 #[derive(Debug, Clone)]
 pub struct SessionModelConfig {
     pub role: SessionRole,
+    pub provider_profile: Option<String>,
     pub provider: Provider,
     pub model: String,
+    pub secrets: BTreeMap<String, String>,
+    pub base_url: Option<String>,
     pub system_prompt: String,
     pub tools: Vec<Tool>,
     pub temperature: Option<f64>,
@@ -275,10 +279,20 @@ pub struct ResolvedCompletionRequest {
     pub branch: String,
     pub provider: Provider,
     pub model: String,
+    pub secrets: BTreeMap<String, String>,
+    pub base_url: Option<String>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
     trace_node_appender: Option<TraceNodeAppenderHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderRuntimeConfig {
+    pub provider: Provider,
+    pub secrets: BTreeMap<String, String>,
+    pub base_url: Option<String>,
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -776,6 +790,7 @@ pub struct RuntimeCapabilities {
 pub struct LlmService<B = RigBackend, S = MemoryStore> {
     store: S,
     backend: B,
+    provider_configs: HashMap<String, ProviderRuntimeConfig>,
     runtime: RuntimeCapabilities,
     branch_locks: BranchLockTable,
     workflow_lock: WorkflowLock,
@@ -784,6 +799,7 @@ pub struct LlmService<B = RigBackend, S = MemoryStore> {
 pub struct LlmServiceBuilder<B, S> {
     store: S,
     backend: B,
+    provider_configs: HashMap<String, ProviderRuntimeConfig>,
     bash_tool_cli_bridge: Option<BashToolCliBridgeHandle>,
     skill_tool_executor: Option<SkillToolExecutorHandle>,
 }
@@ -791,7 +807,10 @@ pub struct LlmServiceBuilder<B, S> {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Memory operation failed: {source}"))]
-    Memory { source: coco_mem::StoreError },
+    Memory {
+        #[snafu(source(from(coco_mem::StoreError, Box::new)))]
+        source: Box<coco_mem::StoreError>,
+    },
 
     #[snafu(display("Branch {branch:?} has no session anchor"))]
     MissingAnchor { branch: String },
@@ -801,6 +820,9 @@ pub enum Error {
 
     #[snafu(display("Unknown provider {provider:?}"))]
     UnknownProvider { provider: String },
+
+    #[snafu(display("Provider profile {profile:?} is not configured"))]
+    ProviderProfileNotConfigured { profile: String },
 
     #[snafu(display("Session {branch:?} is not attached to a target branch"))]
     SessionNotAttached { branch: String },
@@ -832,7 +854,8 @@ pub enum Error {
     #[snafu(display("Failed to clean up temporary use_skill branch {branch:?}: {source}"))]
     UseSkillCleanup {
         branch: String,
-        source: coco_mem::StoreError,
+        #[snafu(source(from(coco_mem::StoreError, Box::new)))]
+        source: Box<coco_mem::StoreError>,
     },
 
     #[snafu(display(
@@ -841,7 +864,8 @@ pub enum Error {
     UseSkillWorkflowFailedCleanup {
         branch: String,
         workflow: Box<Error>,
-        cleanup: coco_mem::StoreError,
+        #[snafu(source(from(coco_mem::StoreError, Box::new)))]
+        cleanup: Box<coco_mem::StoreError>,
     },
 }
 
@@ -864,6 +888,14 @@ impl LlmService<RigBackend, MemoryStore> {
 }
 
 impl<B, S> LlmServiceBuilder<B, S> {
+    pub fn with_provider_configs(
+        mut self,
+        provider_configs: HashMap<String, ProviderRuntimeConfig>,
+    ) -> Self {
+        self.provider_configs = provider_configs;
+        self
+    }
+
     pub fn with_bash_tool_cli_bridge(mut self, bridge: BashToolCliBridgeHandle) -> Self {
         self.bash_tool_cli_bridge = Some(bridge);
         self
@@ -878,6 +910,7 @@ impl<B, S> LlmServiceBuilder<B, S> {
         LlmService {
             store: self.store,
             backend: self.backend,
+            provider_configs: self.provider_configs,
             runtime: RuntimeCapabilities {
                 bash_tool_cli_bridge: self.bash_tool_cli_bridge.unwrap_or_default(),
                 skill_tool_executor: self.skill_tool_executor.unwrap_or_default(),
@@ -893,6 +926,7 @@ impl<B, S> LlmService<B, S> {
         LlmServiceBuilder {
             store,
             backend,
+            provider_configs: HashMap::new(),
             bash_tool_cli_bridge: None,
             skill_tool_executor: None,
         }
@@ -956,6 +990,10 @@ where
     pub async fn create_session(&self, config: SessionConfig) -> Result<BranchSession> {
         let _guard = self.lock_branch(&config.branch).await;
         let root_id = self.store.root_id();
+        let provider_profile = config.provider_profile;
+        let provider = provider_profile
+            .is_none()
+            .then(|| config.provider.as_str().to_owned());
         let merge_parents = config
             .merge_parents
             .iter()
@@ -982,7 +1020,8 @@ where
                     merge_parents,
                     SessionAnchor {
                         role: config.role,
-                        provider: config.provider.as_str().to_owned(),
+                        provider_profile,
+                        provider,
                         model: config.model,
                         tools: config.tools,
                         system_prompt: config.system_prompt,
@@ -1246,6 +1285,33 @@ where
     }
 }
 
+fn resolve_session_provider(
+    anchor: &SessionAnchor,
+    config: Option<&ProviderRuntimeConfig>,
+) -> Result<Provider> {
+    if let Some(config) = config {
+        return Ok(config.provider);
+    }
+
+    let Some(provider) = anchor.provider.as_deref() else {
+        return UnknownProviderSnafu {
+            provider: "<missing>".to_owned(),
+        }
+        .fail();
+    };
+    Provider::parse(provider)
+}
+
+fn resolve_session_model(anchor: &SessionAnchor, config: Option<&ProviderRuntimeConfig>) -> String {
+    if !anchor.model.is_empty() {
+        return anchor.model.clone();
+    }
+
+    config
+        .and_then(|config| config.default_model.clone())
+        .unwrap_or_default()
+}
+
 impl<B, S> LlmService<B, S>
 where
     S: NodeStore,
@@ -1504,7 +1570,11 @@ where
                     }
                     .fail();
                 }
-                Err(source) => return Err(Error::Memory { source }),
+                Err(source) => {
+                    return Err(Error::Memory {
+                        source: Box::new(source),
+                    });
+                }
             }
         }
 
@@ -1618,13 +1688,35 @@ where
         conversation.extend(context.tail_entries.iter().map(|entry| entry.entry.clone()));
         tracked_entries.extend(context.tail_entries);
 
+        let provider_config = context
+            .session_anchor
+            .provider_profile
+            .as_deref()
+            .map(|name| {
+                self.provider_configs
+                    .get(name)
+                    .ok_or_else(|| Error::ProviderProfileNotConfigured {
+                        profile: name.to_owned(),
+                    })
+            })
+            .transpose()?;
+        let provider = resolve_session_provider(&context.session_anchor, provider_config)?;
+        let model = resolve_session_model(&context.session_anchor, provider_config);
+        let secrets = provider_config
+            .map(|config| config.secrets.clone())
+            .unwrap_or_default();
+        let base_url = provider_config.and_then(|config| config.base_url.clone());
+
         Ok(ResolvedSession {
             branch: branch.to_owned(),
             anchor_id: context.active_anchor_id,
             config: SessionModelConfig {
                 role: context.session_anchor.role,
-                provider: Provider::parse(&context.session_anchor.provider)?,
-                model: context.session_anchor.model.clone(),
+                provider_profile: context.session_anchor.provider_profile.clone(),
+                provider,
+                model,
+                secrets,
+                base_url,
                 system_prompt: context.session_anchor.system_prompt.clone(),
                 tools: context.session_anchor.tools.clone(),
                 temperature: context.session_anchor.temperature,
@@ -1681,7 +1773,7 @@ where
                 AnchorPayload::Session(session_anchor) => {
                     *state = Some(ResolvedContext {
                         active_anchor_id: node.id.clone(),
-                        session_anchor: session_anchor.clone(),
+                        session_anchor: session_anchor.as_ref().clone(),
                         tail_entries: vec![],
                     });
                 }
@@ -1774,16 +1866,26 @@ impl<B, S> LlmService<B, S> {
         request: CompletionRequest,
         trace_node_appender: Option<TraceNodeAppenderHandle>,
     ) -> ResolvedCompletionRequest {
+        let provider = request
+            .overrides
+            .provider
+            .unwrap_or(session.config.provider);
+        let uses_session_provider = provider == session.config.provider;
         ResolvedCompletionRequest {
             branch: request.branch,
-            provider: request
-                .overrides
-                .provider
-                .unwrap_or(session.config.provider),
+            provider,
             model: request
                 .overrides
                 .model
                 .unwrap_or_else(|| session.config.model.clone()),
+            secrets: if uses_session_provider {
+                session.config.secrets.clone()
+            } else {
+                BTreeMap::new()
+            },
+            base_url: uses_session_provider
+                .then(|| session.config.base_url.clone())
+                .flatten(),
             temperature: request.overrides.temperature.or(session.config.temperature),
             max_tokens: request.overrides.max_tokens.or(session.config.max_tokens),
             additional_params: request
@@ -2654,7 +2756,18 @@ where
 fn resolve_provider_api_key(
     provider: Provider,
     provider_env: &'static str,
+    secrets: &BTreeMap<String, String>,
 ) -> std::result::Result<String, BackendError> {
+    if let Some(env) = secrets.get("api_key") {
+        return std::env::var(env).map_err(|_| {
+            BackendError::failed(format!(
+                "missing API key for provider {} in environment variable {}",
+                provider.as_str(),
+                env
+            ))
+        });
+    }
+
     let generic = std::env::var("COCO_API_KEY").ok();
     let provider_specific = std::env::var(provider_env).ok();
 
@@ -2666,8 +2779,22 @@ fn resolve_provider_api_key(
     })
 }
 
-fn resolve_chatgpt_auth() -> std::result::Result<rig::providers::chatgpt::ChatGPTAuth, BackendError>
-{
+fn resolve_chatgpt_auth(
+    secrets: &BTreeMap<String, String>,
+) -> std::result::Result<rig::providers::chatgpt::ChatGPTAuth, BackendError> {
+    if let Some(env) = secrets.get("access_token") {
+        let access_token = std::env::var(env).map_err(|_| {
+            BackendError::failed(format!(
+                "missing access token for provider chatgpt in environment variable {env}"
+            ))
+        })?;
+        return Ok(rig::providers::chatgpt::ChatGPTAuth::AccessToken {
+            access_token,
+            account_id: resolve_optional_secret(secrets, "account_id")?
+                .or_else(|| std::env::var("CHATGPT_ACCOUNT_ID").ok()),
+        });
+    }
+
     if std::env::var_os("COCO_API_KEY").is_some() {
         return Err(BackendError::failed(
             "COCO_API_KEY must not be set when provider is chatgpt",
@@ -2677,22 +2804,42 @@ fn resolve_chatgpt_auth() -> std::result::Result<rig::providers::chatgpt::ChatGP
     match std::env::var("CHATGPT_ACCESS_TOKEN").ok() {
         Some(access_token) => Ok(rig::providers::chatgpt::ChatGPTAuth::AccessToken {
             access_token,
-            account_id: std::env::var("CHATGPT_ACCOUNT_ID").ok(),
+            account_id: resolve_optional_secret(secrets, "account_id")?
+                .or_else(|| std::env::var("CHATGPT_ACCOUNT_ID").ok()),
         }),
         None => Ok(rig::providers::chatgpt::ChatGPTAuth::OAuth),
     }
 }
 
-fn resolve_base_url(provider: Provider) -> Option<String> {
-    std::env::var("COCO_BASE_URL")
-        .ok()
-        .or_else(|| match provider {
-            Provider::OpenAi => std::env::var("OPENAI_BASE_URL").ok(),
-            Provider::Anthropic => None,
-            Provider::ChatGpt => std::env::var("CHATGPT_API_BASE")
-                .ok()
-                .or_else(|| std::env::var("OPENAI_CHATGPT_API_BASE").ok()),
+fn resolve_optional_secret(
+    secrets: &BTreeMap<String, String>,
+    key: &str,
+) -> std::result::Result<Option<String>, BackendError> {
+    secrets
+        .get(key)
+        .map(|env| {
+            std::env::var(env).map(Some).map_err(|_| {
+                BackendError::failed(format!(
+                    "missing secret {key} in environment variable {env}"
+                ))
+            })
         })
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn resolve_base_url(provider: Provider, custom_base_url: Option<&str>) -> Option<String> {
+    custom_base_url.map(str::to_owned).or_else(|| {
+        std::env::var("COCO_BASE_URL")
+            .ok()
+            .or_else(|| match provider {
+                Provider::OpenAi => std::env::var("OPENAI_BASE_URL").ok(),
+                Provider::Anthropic => None,
+                Provider::ChatGpt => std::env::var("CHATGPT_API_BASE")
+                    .ok()
+                    .or_else(|| std::env::var("OPENAI_CHATGPT_API_BASE").ok()),
+            })
+    })
 }
 
 #[async_trait]
@@ -2703,9 +2850,15 @@ impl CompletionBackend for RigBackend {
 
         match ctx.request.provider {
             Provider::OpenAi => {
-                let api_key = resolve_provider_api_key(ctx.request.provider, "OPENAI_API_KEY")?;
+                let api_key = resolve_provider_api_key(
+                    ctx.request.provider,
+                    "OPENAI_API_KEY",
+                    &ctx.request.secrets,
+                )?;
                 let mut builder = openai::Client::builder().api_key(&api_key);
-                if let Some(base_url) = resolve_base_url(ctx.request.provider) {
+                if let Some(base_url) =
+                    resolve_base_url(ctx.request.provider, ctx.request.base_url.as_deref())
+                {
                     builder = builder.base_url(&base_url);
                 }
                 let client = builder
@@ -2714,9 +2867,15 @@ impl CompletionBackend for RigBackend {
                 send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
             }
             Provider::Anthropic => {
-                let api_key = resolve_provider_api_key(ctx.request.provider, "ANTHROPIC_API_KEY")?;
+                let api_key = resolve_provider_api_key(
+                    ctx.request.provider,
+                    "ANTHROPIC_API_KEY",
+                    &ctx.request.secrets,
+                )?;
                 let mut builder = anthropic::Client::builder().api_key(api_key);
-                if let Some(base_url) = resolve_base_url(ctx.request.provider) {
+                if let Some(base_url) =
+                    resolve_base_url(ctx.request.provider, ctx.request.base_url.as_deref())
+                {
                     builder = builder.base_url(&base_url);
                 }
                 let client = builder
@@ -2725,8 +2884,11 @@ impl CompletionBackend for RigBackend {
                 send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
             }
             Provider::ChatGpt => {
-                let mut builder = chatgpt::Client::builder().api_key(resolve_chatgpt_auth()?);
-                if let Some(base_url) = resolve_base_url(ctx.request.provider) {
+                let mut builder =
+                    chatgpt::Client::builder().api_key(resolve_chatgpt_auth(&ctx.request.secrets)?);
+                if let Some(base_url) =
+                    resolve_base_url(ctx.request.provider, ctx.request.base_url.as_deref())
+                {
                     builder = builder.base_url(base_url);
                 }
                 let client = builder
@@ -3109,6 +3271,7 @@ mod tests {
         SessionConfig {
             branch: branch.to_owned(),
             merge_parents: vec![],
+            provider_profile: None,
             role: SessionRole::Orchestrator,
             provider: Provider::OpenAi,
             model: "gpt-4.1-mini".to_owned(),
@@ -3142,6 +3305,7 @@ mod tests {
     fn session_patch() -> SessionConfigPatch {
         SessionConfigPatch {
             role: None,
+            provider_profile: None,
             provider: None,
             model: None,
             system_prompt: None,
@@ -3198,6 +3362,13 @@ mod tests {
         assert_eq!(Provider::ChatGpt.as_str(), "chatgpt");
     }
 
+    fn secrets(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
     #[tokio::test]
     async fn resolve_chatgpt_auth_uses_access_token_when_configured() {
         with_process_env_async(
@@ -3207,7 +3378,7 @@ mod tests {
                 ("CHATGPT_ACCOUNT_ID", Some(OsStr::new("acct-123"))),
             ],
             || async {
-                match resolve_chatgpt_auth().unwrap() {
+                match resolve_chatgpt_auth(&BTreeMap::new()).unwrap() {
                     rig::providers::chatgpt::ChatGPTAuth::AccessToken {
                         access_token,
                         account_id,
@@ -3234,7 +3405,7 @@ mod tests {
             ],
             || async {
                 assert!(matches!(
-                    resolve_chatgpt_auth().unwrap(),
+                    resolve_chatgpt_auth(&BTreeMap::new()).unwrap(),
                     rig::providers::chatgpt::ChatGPTAuth::OAuth
                 ));
             },
@@ -3251,10 +3422,91 @@ mod tests {
                 ("CHATGPT_ACCOUNT_ID", None),
             ],
             || async {
-                let error = resolve_chatgpt_auth().unwrap_err();
+                let error = resolve_chatgpt_auth(&BTreeMap::new()).unwrap_err();
                 assert_eq!(
                     error.to_string(),
                     "COCO_API_KEY must not be set when provider is chatgpt"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_chatgpt_auth_uses_custom_env_access_token() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", Some(OsStr::new("generic-key"))),
+                (
+                    "COCO_CHATGPT_ACCESS_TOKEN",
+                    Some(OsStr::new("profile-token")),
+                ),
+                ("COCO_CHATGPT_ACCOUNT_ID", Some(OsStr::new("profile-acct"))),
+                ("CHATGPT_ACCOUNT_ID", Some(OsStr::new("default-acct"))),
+            ],
+            || async {
+                match resolve_chatgpt_auth(&secrets(&[
+                    ("access_token", "COCO_CHATGPT_ACCESS_TOKEN"),
+                    ("account_id", "COCO_CHATGPT_ACCOUNT_ID"),
+                ]))
+                .unwrap()
+                {
+                    rig::providers::chatgpt::ChatGPTAuth::AccessToken {
+                        access_token,
+                        account_id,
+                    } => {
+                        assert_eq!(access_token, "profile-token");
+                        assert_eq!(account_id.as_deref(), Some("profile-acct"));
+                    }
+                    rig::providers::chatgpt::ChatGPTAuth::OAuth => {
+                        panic!("expected access token auth")
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_api_key_prefers_custom_env() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", Some(OsStr::new("generic-key"))),
+                ("OPENAI_API_KEY", Some(OsStr::new("openai-key"))),
+                ("COCO_WORK_OPENAI_API_KEY", Some(OsStr::new("work-key"))),
+            ],
+            || async {
+                assert_eq!(
+                    resolve_provider_api_key(
+                        Provider::OpenAi,
+                        "OPENAI_API_KEY",
+                        &secrets(&[("api_key", "COCO_WORK_OPENAI_API_KEY")])
+                    )
+                    .unwrap(),
+                    "work-key"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_api_key_reports_missing_custom_env() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", Some(OsStr::new("generic-key"))),
+                ("COCO_WORK_OPENAI_API_KEY", None),
+            ],
+            || async {
+                let error = resolve_provider_api_key(
+                    Provider::OpenAi,
+                    "OPENAI_API_KEY",
+                    &secrets(&[("api_key", "COCO_WORK_OPENAI_API_KEY")]),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "missing API key for provider openai in environment variable COCO_WORK_OPENAI_API_KEY"
                 );
             },
         )
@@ -3274,12 +3526,20 @@ mod tests {
             ],
             || async {
                 assert_eq!(
-                    resolve_base_url(Provider::ChatGpt).as_deref(),
+                    resolve_base_url(Provider::ChatGpt, None).as_deref(),
                     Some("https://chatgpt.example.test")
                 );
             },
         )
         .await;
+    }
+
+    #[test]
+    fn resolve_base_url_prefers_profile_base_url() {
+        assert_eq!(
+            resolve_base_url(Provider::OpenAi, Some("https://profile.example.test")).as_deref(),
+            Some("https://profile.example.test")
+        );
     }
 
     #[tokio::test]
@@ -3327,6 +3587,7 @@ mod tests {
             .create_session(SessionConfig {
                 branch: "draft".to_owned(),
                 merge_parents: vec!["main".to_owned()],
+                provider_profile: None,
                 role: SessionRole::Orchestrator,
                 provider: Provider::OpenAi,
                 model: "gpt-4.1-mini".to_owned(),
@@ -3347,6 +3608,28 @@ mod tests {
         };
         assert!(anchor.as_session().is_some());
         assert_eq!(anchor.merge_parents, vec![main_session.anchor_id]);
+    }
+
+    #[tokio::test]
+    async fn create_session_with_provider_profile_persists_only_profile_name() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[]);
+        let service = LlmService::new(store.clone(), backend);
+        let mut config = session_config("main");
+        config.provider_profile = Some("work-openai".to_owned());
+
+        let session = service.create_session(config).await.unwrap();
+
+        let anchor = store.get_node(&session.anchor_id).unwrap();
+        let Kind::Anchor(anchor) = anchor.kind else {
+            panic!("expected anchor node");
+        };
+        let session_anchor = anchor.as_session().expect("expected session anchor");
+        assert_eq!(
+            session_anchor.provider_profile.as_deref(),
+            Some("work-openai")
+        );
+        assert_eq!(session_anchor.provider, None);
     }
 
     #[tokio::test]
@@ -3992,7 +4275,7 @@ mod tests {
             .rebase_session(
                 "main",
                 SessionConfigPatch {
-                    provider: Some("anthropic".to_owned()),
+                    provider: Some(Some("anthropic".to_owned())),
                     model: Some("claude-sonnet-4-20250514".to_owned()),
                     system_prompt: Some("You are strict.".to_owned()),
                     temperature: Some(None),

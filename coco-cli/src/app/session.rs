@@ -7,7 +7,7 @@ use coco_llm::{
 };
 use coco_mem::{
     AnchorPayload, BranchConfigStore, BranchStore, Kind, Node, NodeStore, PauseReason,
-    SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
+    ProviderProfileStore, SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -15,10 +15,11 @@ use snafu::prelude::*;
 
 use crate::{
     Result,
+    app::config::ProviderProfiles,
     cli::{CliTool, SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand},
-    env::{read_env, resolve_env_provider, resolve_env_tools},
+    env::resolve_env_tools,
     error::{
-        AmbiguousNodePrefixSnafu, LlmSnafu, MissingConfigurationSnafu,
+        AmbiguousNodePrefixSnafu, LlmSnafu, MissingProviderProfileModelSnafu,
         ParseSessionAdditionalParamsSnafu, StoreSnafu, UnknownShowReferenceSnafu,
     },
 };
@@ -146,6 +147,7 @@ pub(super) async fn run_session_command<B, S>(
     command: SessionCommand,
     store: &S,
     llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -153,7 +155,7 @@ where
 {
     match command.command {
         SessionSubcommand::Create(command) => {
-            let config = resolve_session_config(command)?;
+            let config = resolve_session_config(command, provider_profiles)?;
             llm.create_session(config).await.context(LlmSnafu)?;
             Ok(None)
         }
@@ -189,7 +191,7 @@ where
         }
         SessionSubcommand::Rebase(command) => {
             let branch = command.branch.clone();
-            let patch = resolve_session_patch(command, store)?;
+            let patch = resolve_session_patch(command, store, provider_profiles)?;
             let head_id = llm.rebase_session(&branch, patch).await.context(LlmSnafu)?;
             Ok(Some(render_json(SessionRebaseResult { branch, head_id })))
         }
@@ -248,9 +250,20 @@ where
     }
 }
 
-pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionConfig> {
-    let provider = resolve_env_provider()?;
-    let model = read_env("COCO_MODEL").context(MissingConfigurationSnafu { name: "COCO_MODEL" })?;
+pub fn resolve_session_config(
+    command: SessionCreateCommand,
+    store: &impl ProviderProfileStore,
+) -> Result<SessionConfig> {
+    let provider_profile = resolve_create_provider_profile(command.provider_profile, store)?;
+    let profile = store
+        .get_provider_profile(&provider_profile)
+        .context(StoreSnafu)?;
+    let provider = coco_llm::Provider::parse(&profile.provider).context(LlmSnafu)?;
+    let model = profile
+        .default_model
+        .context(MissingProviderProfileModelSnafu {
+            profile: provider_profile.clone(),
+        })?;
     let tools = if command.tools.is_empty() {
         resolve_cli_tools(&resolve_env_tools()?)
     } else {
@@ -261,8 +274,9 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
     Ok(SessionConfig {
         branch: command.branch,
         merge_parents: vec![],
+        provider_profile: Some(provider_profile),
         role: command.role.into(),
-        provider: provider.into(),
+        provider,
         model,
         system_prompt: command.system_prompt,
         prompt: command.prompt,
@@ -272,6 +286,26 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
         additional_params,
         enable_coco_shim: false,
     })
+}
+
+fn resolve_create_provider_profile(
+    explicit: Option<String>,
+    store: &impl ProviderProfileStore,
+) -> Result<String> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit);
+    }
+
+    let profiles = store.list_provider_profiles().context(StoreSnafu)?;
+    if profiles.len() == 1 {
+        return Ok(profiles
+            .into_keys()
+            .next()
+            .expect("single provider profile should exist"));
+    }
+    let mut available = profiles.into_keys().collect::<Vec<_>>();
+    available.sort();
+    Err(crate::Error::MissingProviderProfileSelection { available })
 }
 
 fn list_sessions(
@@ -867,7 +901,10 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
             match &anchor.payload {
                 AnchorPayload::Session(session) => {
                     lines.extend([
-                        format!("provider: {}", session.provider),
+                        format!(
+                            "provider: {}",
+                            session.provider.as_deref().unwrap_or("<profile>")
+                        ),
                         format!("model: {}", session.model),
                         format!(
                             "temperature: {}",
@@ -1025,7 +1062,7 @@ fn resolve_visible_session_anchor(
             continue;
         };
 
-        return Ok((node.id, session_anchor));
+        return Ok((node.id, *session_anchor));
     }
 
     Err(crate::Error::Llm {
@@ -1038,15 +1075,14 @@ fn resolve_visible_session_anchor(
 fn resolve_session_patch(
     command: SessionRebaseCommand,
     store: &impl BranchConfigStore,
+    provider_profiles: &impl ProviderProfileStore,
 ) -> Result<SessionConfigPatch> {
     let mut patch = command
         .preset
         .as_deref()
         .map(|name| {
-            store
-                .get_branch_config(name)
-                .map(|config| config.to_session_anchor_patch())
-                .context(StoreSnafu)
+            let config = store.get_branch_config(name).context(StoreSnafu)?;
+            branch_config_to_session_anchor_patch(&config, provider_profiles)
         })
         .transpose()?
         .unwrap_or_default();
@@ -1055,7 +1091,19 @@ fn resolve_session_patch(
         patch.role = Some(role.into());
     }
     if let Some(provider) = command.provider {
-        patch.provider = Some(coco_llm::Provider::from(provider).as_str().to_owned());
+        patch.provider_profile = Some(None);
+        patch.provider = Some(Some(coco_llm::Provider::from(provider).as_str().to_owned()));
+    }
+    if let Some(provider_profile) = command.provider_profile {
+        let profile = provider_profiles
+            .get_provider_profile(&provider_profile)
+            .context(StoreSnafu)?;
+        patch.provider_profile = Some(Some(provider_profile));
+        let default_model = profile.default_model.clone();
+        patch.provider = Some(None);
+        if command.model.is_none() {
+            patch.model = default_model;
+        }
     }
     if command.model.is_some() {
         patch.model = command.model;
@@ -1082,6 +1130,18 @@ fn resolve_session_patch(
         patch.max_tokens = Some(Some(max_tokens));
     }
 
+    Ok(patch)
+}
+
+fn branch_config_to_session_anchor_patch(
+    config: &coco_mem::BranchConfig,
+    store: &impl ProviderProfileStore,
+) -> Result<SessionConfigPatch> {
+    store
+        .get_provider_profile(&config.provider_profile)
+        .context(StoreSnafu)?;
+    let mut patch = config.to_session_anchor_patch();
+    patch.provider = Some(None);
     Ok(patch)
 }
 

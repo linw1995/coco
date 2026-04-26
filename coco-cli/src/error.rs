@@ -9,12 +9,35 @@ pub enum Error {
     #[snafu(display("Prompt text is empty"))]
     EmptyPrompt,
 
-    #[snafu(display("Missing configuration value {name:?}"))]
-    MissingConfiguration { name: &'static str },
+    #[snafu(display("Failed to resolve current directory: {source}"))]
+    ResolveCurrentDir { source: io::Error },
 
-    #[snafu(display("Invalid provider value {value:?} from {source_name:?}"))]
-    InvalidProviderConfiguration {
-        source_name: &'static str,
+    #[snafu(display("Failed to read config file {path:?}: {source}"))]
+    ReadConfigFile { path: PathBuf, source: io::Error },
+
+    #[snafu(display("Failed to parse config file {path:?}: {source}"))]
+    ParseConfigFile {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+
+    #[snafu(display("Preset requires --model or a provider profile default model"))]
+    MissingPresetModel,
+
+    #[snafu(display(
+        "No provider profile selected; pass --provider-profile. Available profiles: {available:?}"
+    ))]
+    MissingProviderProfileSelection { available: Vec<String> },
+
+    #[snafu(display("Provider profile {profile:?} requires default_model for session create"))]
+    MissingProviderProfileModel { profile: String },
+
+    #[snafu(display(
+        "Invalid provider secret reference {value:?} for profile {profile:?} key {key:?}"
+    ))]
+    InvalidProviderSecretReference {
+        profile: String,
+        key: String,
         value: String,
     },
 

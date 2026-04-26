@@ -1029,13 +1029,6 @@ fn read_branch_config_snapshots(path: &Path) -> Result<BranchConfigSnapshotRead>
             validate_branch_config_snapshot(path, &name, &snapshot)?;
             read.current.insert(name, snapshot);
         } else {
-            ensure!(
-                is_legacy_branch_config_value(&value),
-                CorruptedStoreSnafu {
-                    path: path.to_owned(),
-                    message: format!("branch preset config record {:?} has unknown shape", name),
-                }
-            );
             let config =
                 serde_json::from_value::<BranchConfig>(value).context(ParseStoreMetaSnafu {
                     path: path.to_owned(),
@@ -1061,27 +1054,6 @@ fn is_branch_config_snapshot_value(value: &Value) -> bool {
     value.get("name").is_some()
         || value.get("current_version").is_some()
         || value.get("created_at").is_some()
-}
-
-fn is_legacy_branch_config_value(value: &Value) -> bool {
-    value.as_object().is_some_and(|object| {
-        object.keys().all(|key| {
-            matches!(
-                key.as_str(),
-                "session"
-                    | "role"
-                    | "provider"
-                    | "model"
-                    | "tools"
-                    | "system_prompt"
-                    | "prompt"
-                    | "temperature"
-                    | "max_tokens"
-                    | "additional_params"
-                    | "enable_coco_shim"
-            )
-        })
-    })
 }
 
 fn validate_branch_config_record(

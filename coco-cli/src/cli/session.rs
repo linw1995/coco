@@ -38,6 +38,9 @@ pub struct SessionCreateCommand {
     pub role: CliSessionRole,
 
     #[arg(long)]
+    pub provider_profile: Option<String>,
+
+    #[arg(long)]
     pub system_prompt: String,
 
     #[arg(long, default_value = "")]
@@ -90,6 +93,9 @@ pub struct SessionRebaseCommand {
 
     #[arg(long)]
     pub preset: Option<String>,
+
+    #[arg(long)]
+    pub provider_profile: Option<String>,
 
     #[arg(long, value_enum)]
     pub role: Option<CliSessionRole>,

@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 
 use super::{
+    config::ProviderProfiles,
     run_forwarded_with_services,
     runtime::{ForwardedRuntimeInputs, RuntimeServices},
 };
@@ -28,6 +29,7 @@ pub(super) async fn run_daemon_command<B, S>(
     command: DaemonCommand,
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -38,9 +40,13 @@ where
     })?;
     let shared_engine = Arc::new(ConversationEngine::new(llm.clone()));
     let server = match command.command {
-        DaemonSubcommand::Serve(_) => {
-            start_daemon_server(&socket_path, shared_store, llm, &shared_engine)?
-        }
+        DaemonSubcommand::Serve(_) => start_daemon_server(
+            &socket_path,
+            shared_store,
+            llm,
+            provider_profiles,
+            &shared_engine,
+        )?,
     };
     spawn_resume_incomplete_jobs(shared_engine);
     server.wait().await?;
@@ -103,6 +109,7 @@ pub(crate) fn start_daemon_server<B, S>(
     socket_path: &Path,
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
     shared_engine: &Arc<ConversationEngine<B, S>>,
 ) -> Result<CocoCliDaemonServerHandle>
 where
@@ -126,6 +133,7 @@ where
     let socket_path = socket_path.to_path_buf();
     let shared_store = shared_store.clone();
     let llm = llm.clone();
+    let provider_profiles = provider_profiles.clone();
     let shared_engine = shared_engine.clone();
     let task = tokio::spawn(async move {
         loop {
@@ -135,10 +143,17 @@ where
             };
             let shared_store = shared_store.clone();
             let llm = llm.clone();
+            let provider_profiles = provider_profiles.clone();
             let shared_engine = shared_engine.clone();
             tokio::spawn(async move {
-                let response =
-                    handle_client(&mut stream, &shared_store, &llm, &shared_engine).await;
+                let response = handle_client(
+                    &mut stream,
+                    &shared_store,
+                    &llm,
+                    &provider_profiles,
+                    &shared_engine,
+                )
+                .await;
                 let payload = encode_runtime_response(&response);
                 let _ = stream.write_all(&payload).await;
             });
@@ -172,6 +187,7 @@ async fn handle_client<B, S>(
     stream: &mut tokio::net::UnixStream,
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
     shared_engine: &Arc<ConversationEngine<B, S>>,
 ) -> CocoCliRuntimeResponse
 where
@@ -193,6 +209,7 @@ where
                     RuntimeServices {
                         shared_store,
                         llm,
+                        provider_profiles,
                         shared_engine: Some(shared_engine),
                     },
                 )

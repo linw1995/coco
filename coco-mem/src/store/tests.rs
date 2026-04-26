@@ -31,7 +31,8 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
             vec![],
             SessionAnchor {
                 role: SessionRole::Orchestrator,
-                provider: "openai".to_owned(),
+                provider_profile: None,
+                provider: Some("openai".to_owned()),
                 model: "gpt-5.4".to_owned(),
                 tools: vec![],
                 system_prompt: "system".to_owned(),
@@ -48,7 +49,7 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
 fn make_branch_config(model: &str, role: SessionRole) -> BranchConfig {
     BranchConfig {
         role,
-        provider: "openai".to_owned(),
+        provider_profile: "openai".to_owned(),
         model: model.to_owned(),
         tools: vec![],
         system_prompt: "preset system".to_owned(),
@@ -69,7 +70,8 @@ fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> Ne
             vec![merge_parent.to_owned()],
             SessionAnchor {
                 role: SessionRole::Orchestrator,
-                provider: "openai".to_owned(),
+                provider_profile: None,
+                provider: Some("openai".to_owned()),
                 model: "gpt-5.4".to_owned(),
                 tools: vec![],
                 system_prompt: "system".to_owned(),
@@ -1262,7 +1264,7 @@ where
         .rebase_session(
             "main",
             &SessionAnchorPatch {
-                provider: Some("anthropic".to_owned()),
+                provider: Some(Some("anthropic".to_owned())),
                 model: Some("claude-sonnet-4-20250514".to_owned()),
                 temperature: Some(None),
                 ..SessionAnchorPatch::default()
@@ -1281,7 +1283,7 @@ where
         panic!("expected session anchor");
     };
     let session = anchor.as_session().expect("expected session anchor");
-    assert_eq!(session.provider, "anthropic");
+    assert_eq!(session.provider.as_deref(), Some("anthropic"));
     assert_eq!(session.model, "claude-sonnet-4-20250514");
     assert_eq!(session.temperature, None);
     assert_eq!(
@@ -1300,7 +1302,10 @@ where
     let Kind::Anchor(old_anchor) = &old_session.kind else {
         panic!("expected original session anchor");
     };
-    assert_eq!(old_anchor.as_session().unwrap().provider, "openai");
+    assert_eq!(
+        old_anchor.as_session().unwrap().provider.as_deref(),
+        Some("openai")
+    );
 }
 
 fn assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes<F>()
@@ -1355,7 +1360,7 @@ where
         .rebase_session(
             "main",
             &SessionAnchorPatch {
-                provider: Some("anthropic".to_owned()),
+                provider: Some(Some("anthropic".to_owned())),
                 ..SessionAnchorPatch::default()
             },
         )
@@ -1367,7 +1372,10 @@ where
     let Kind::Anchor(anchor) = &draft_ancestry[1].kind else {
         panic!("expected session anchor");
     };
-    assert_eq!(anchor.as_session().unwrap().provider, "openai");
+    assert_eq!(
+        anchor.as_session().unwrap().provider.as_deref(),
+        Some("openai")
+    );
     assert_eq!(draft_ancestry[1].id, session_id);
 }
 
@@ -1406,7 +1414,7 @@ where
         .rebase_session(
             "main",
             &SessionAnchorPatch {
-                provider: Some("anthropic".to_owned()),
+                provider: Some(Some("anthropic".to_owned())),
                 ..SessionAnchorPatch::default()
             },
         )
@@ -2747,7 +2755,7 @@ fn rebase_rewrites_branch_view_but_preserves_dangling_nodes() {
         .rebase_session(
             "main",
             &SessionAnchorPatch {
-                provider: Some("anthropic".to_owned()),
+                provider: Some(Some("anthropic".to_owned())),
                 ..SessionAnchorPatch::default()
             },
         )

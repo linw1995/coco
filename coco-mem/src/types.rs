@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use jiff::Timestamp;
-use serde::de::{Deserializer, Error as DeError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -49,7 +48,7 @@ pub struct Anchor {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AnchorPayload {
-    Session(SessionAnchor),
+    Session(Box<SessionAnchor>),
     Prompt(PromptAnchor),
     SkillResult(SkillResultAnchor),
 }
@@ -57,7 +56,10 @@ pub enum AnchorPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchor {
     pub role: SessionRole,
-    pub provider: String,
+    #[serde(default)]
+    pub provider_profile: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
     pub model: String,
     pub tools: Vec<Tool>,
     pub system_prompt: String,
@@ -122,7 +124,8 @@ pub struct Job {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchorPatch {
     pub role: Option<SessionRole>,
-    pub provider: Option<String>,
+    pub provider_profile: Option<Option<String>>,
+    pub provider: Option<Option<String>>,
     pub model: Option<String>,
     pub tools: Option<Vec<Tool>>,
     pub system_prompt: Option<String>,
@@ -134,10 +137,10 @@ pub struct SessionAnchorPatch {
 }
 
 /// Preset configuration for creating or rebasing branch sessions.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BranchConfig {
     pub role: SessionRole,
-    pub provider: String,
+    pub provider_profile: String,
     pub model: String,
     #[serde(default)]
     pub tools: Vec<Tool>,
@@ -154,71 +157,15 @@ pub struct BranchConfig {
     pub enable_coco_shim: bool,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum BranchConfigDeserialize {
-    Full(BranchConfigFields),
-    Legacy(LegacyBranchConfig),
-}
-
-#[derive(Deserialize)]
-struct BranchConfigFields {
-    role: SessionRole,
-    provider: String,
-    model: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderProfile {
+    pub provider: String,
     #[serde(default)]
-    tools: Vec<Tool>,
-    system_prompt: String,
+    pub secrets: BTreeMap<String, String>,
     #[serde(default)]
-    prompt: String,
+    pub base_url: Option<String>,
     #[serde(default)]
-    temperature: Option<f64>,
-    #[serde(default)]
-    max_tokens: Option<u64>,
-    #[serde(default)]
-    additional_params: Option<Value>,
-    #[serde(default)]
-    enable_coco_shim: bool,
-}
-
-#[derive(Deserialize)]
-struct LegacyBranchConfig {
-    #[serde(default)]
-    session: SessionAnchorPatch,
-    #[serde(default)]
-    role: Option<SessionRole>,
-}
-
-impl<'de> Deserialize<'de> for BranchConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match BranchConfigDeserialize::deserialize(deserializer)? {
-            BranchConfigDeserialize::Full(fields) => Ok(fields.into()),
-            BranchConfigDeserialize::Legacy(legacy) => {
-                BranchConfig::from_legacy_patch(legacy.session, legacy.role)
-                    .map_err(D::Error::custom)
-            }
-        }
-    }
-}
-
-impl From<BranchConfigFields> for BranchConfig {
-    fn from(fields: BranchConfigFields) -> Self {
-        Self {
-            role: fields.role,
-            provider: fields.provider,
-            model: fields.model,
-            tools: fields.tools,
-            system_prompt: fields.system_prompt,
-            prompt: fields.prompt,
-            temperature: fields.temperature,
-            max_tokens: fields.max_tokens,
-            additional_params: fields.additional_params,
-            enable_coco_shim: fields.enable_coco_shim,
-        }
-    }
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -502,7 +449,7 @@ impl Anchor {
     pub fn session(merge_parents: Vec<String>, anchor: SessionAnchor) -> Self {
         Self {
             merge_parents,
-            payload: AnchorPayload::Session(anchor),
+            payload: AnchorPayload::Session(Box::new(anchor)),
         }
     }
 
@@ -526,7 +473,7 @@ impl Anchor {
 
     pub fn as_session(&self) -> Option<&SessionAnchor> {
         match &self.payload {
-            AnchorPayload::Session(anchor) => Some(anchor),
+            AnchorPayload::Session(anchor) => Some(anchor.as_ref()),
             AnchorPayload::Prompt(_) | AnchorPayload::SkillResult(_) => None,
         }
     }
@@ -550,6 +497,10 @@ impl SessionAnchor {
     pub fn apply_patch(&self, patch: &SessionAnchorPatch) -> Self {
         Self {
             role: patch.role.unwrap_or(self.role),
+            provider_profile: patch
+                .provider_profile
+                .clone()
+                .unwrap_or_else(|| self.provider_profile.clone()),
             provider: patch
                 .provider
                 .clone()
@@ -573,36 +524,11 @@ impl SessionAnchor {
 }
 
 impl BranchConfig {
-    fn from_legacy_patch(
-        session: SessionAnchorPatch,
-        role: Option<SessionRole>,
-    ) -> std::result::Result<Self, &'static str> {
-        Ok(Self {
-            role: role
-                .or(session.role)
-                .ok_or("legacy branch config is missing role")?,
-            provider: session
-                .provider
-                .ok_or("legacy branch config is missing provider")?,
-            model: session
-                .model
-                .ok_or("legacy branch config is missing model")?,
-            tools: session.tools.unwrap_or_default(),
-            system_prompt: session
-                .system_prompt
-                .ok_or("legacy branch config is missing system_prompt")?,
-            prompt: session.prompt.unwrap_or_default(),
-            temperature: session.temperature.flatten(),
-            max_tokens: session.max_tokens.flatten(),
-            additional_params: session.additional_params.flatten(),
-            enable_coco_shim: session.enable_coco_shim.unwrap_or_default(),
-        })
-    }
-
     pub fn to_session_anchor_patch(&self) -> SessionAnchorPatch {
         SessionAnchorPatch {
             role: Some(self.role),
-            provider: Some(self.provider.clone()),
+            provider_profile: Some(Some(self.provider_profile.clone())),
+            provider: Some(None),
             model: Some(self.model.clone()),
             tools: Some(self.tools.clone()),
             system_prompt: Some(self.system_prompt.clone()),
@@ -881,7 +807,8 @@ mod tests {
     fn make_session_anchor() -> SessionAnchor {
         SessionAnchor {
             role: SessionRole::Orchestrator,
-            provider: "openai".to_owned(),
+            provider_profile: None,
+            provider: Some("openai".to_owned()),
             model: "gpt-5.4".to_owned(),
             tools: vec![Tool {
                 name: "search".to_owned(),
@@ -1262,7 +1189,8 @@ mod tests {
     fn session_anchor_patch_updates_selected_fields() {
         let updated = make_session_anchor().apply_patch(&SessionAnchorPatch {
             role: Some(SessionRole::Runner),
-            provider: Some("anthropic".to_owned()),
+            provider_profile: Some(Some("anthropic-main".to_owned())),
+            provider: Some(Some("anthropic".to_owned())),
             model: Some("claude-sonnet-4-20250514".to_owned()),
             tools: Some(vec![]),
             system_prompt: Some("new system".to_owned()),
@@ -1274,7 +1202,8 @@ mod tests {
         });
 
         assert_eq!(updated.role, SessionRole::Runner);
-        assert_eq!(updated.provider, "anthropic");
+        assert_eq!(updated.provider_profile.as_deref(), Some("anthropic-main"));
+        assert_eq!(updated.provider.as_deref(), Some("anthropic"));
         assert_eq!(updated.model, "claude-sonnet-4-20250514");
         assert!(updated.tools.is_empty());
         assert_eq!(updated.system_prompt, "new system");
@@ -1292,7 +1221,7 @@ mod tests {
     fn branch_config_applies_session_and_role_settings() {
         let updated = BranchConfig {
             role: SessionRole::Runner,
-            provider: "anthropic".to_owned(),
+            provider_profile: "anthropic-main".to_owned(),
             model: "claude-sonnet-4-20250514".to_owned(),
             tools: vec![],
             system_prompt: "new system".to_owned(),
@@ -1305,7 +1234,8 @@ mod tests {
         .apply_to_session_anchor(&make_session_anchor());
 
         assert_eq!(updated.role, SessionRole::Runner);
-        assert_eq!(updated.provider, "anthropic");
+        assert_eq!(updated.provider_profile.as_deref(), Some("anthropic-main"));
+        assert_eq!(updated.provider, None);
         assert_eq!(updated.model, "claude-sonnet-4-20250514");
         assert!(updated.tools.is_empty());
         assert_eq!(updated.system_prompt, "new system");

@@ -9,3 +9,4 @@ target
 .coco-store/
 .codex
 skills-lock.json
+config.toml

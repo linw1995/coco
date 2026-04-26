@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand};
 
-use super::{CliProvider, CliSessionRole, CliTool};
+use super::{CliSessionRole, CliTool};
 
 #[derive(Debug, Args)]
 pub struct PresetCommand {
@@ -26,10 +26,10 @@ pub struct PresetSetCommand {
     pub role: CliSessionRole,
 
     #[arg(long)]
-    pub provider: CliProvider,
+    pub provider_profile: String,
 
     #[arg(long)]
-    pub model: String,
+    pub model: Option<String>,
 
     #[arg(long)]
     pub system_prompt: String,

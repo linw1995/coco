@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::io::Cursor;
@@ -12,9 +12,9 @@ use coco_llm::coco_mem::{
 };
 use coco_llm::{
     BackendError, BackendEvent, BackendEventPayload, BackendTurn, CompletionBackend,
-    CompletionMessage, CompletionToolCall, Provider, StepContext,
+    CompletionMessage, CompletionToolCall, Provider, ProviderRuntimeConfig, StepContext,
 };
-use coco_mem::{BranchConfigStore, SessionState};
+use coco_mem::{BranchConfigStore, ProviderProfile, ProviderProfileStore, SessionState};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,6 +24,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::{
     Cli,
     app::{
+        config::ProviderProfiles,
         daemon::{resume_incomplete_jobs, start_daemon_server},
         resolve_session_config, run_forwarded_with_services, run_with_backend,
         runtime::{ForwardedRuntimeInputs, RuntimeServices},
@@ -322,6 +323,7 @@ fn session_create_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
             command: SessionSubcommand::Create(SessionCreateCommand {
                 branch: branch.unwrap_or("main").to_owned(),
                 role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
                 system_prompt: "You are helpful.".to_owned(),
                 prompt: "".to_owned(),
                 temperature: Some(0.2),
@@ -411,6 +413,7 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
             command: SessionSubcommand::Rebase(SessionRebaseCommand {
                 branch: branch.unwrap_or("main").to_owned(),
                 preset: None,
+                provider_profile: None,
                 role: Some(crate::cli::CliSessionRole::Runner),
                 provider: Some(crate::cli::CliProvider::Anthropic),
                 model: Some("claude-sonnet-4-20250514".to_owned()),
@@ -517,6 +520,107 @@ fn temp_store_path() -> (TempDir, std::path::PathBuf) {
     (tempdir, store_path)
 }
 
+fn provider_profile(
+    name: &str,
+    provider: &str,
+    api_key_secret: &str,
+    base_url: Option<&str>,
+    default_model: Option<&str>,
+) -> (String, ProviderProfile) {
+    let mut secrets = BTreeMap::new();
+    secrets.insert("api_key".to_owned(), api_key_secret.to_owned());
+    (
+        name.to_owned(),
+        ProviderProfile {
+            provider: provider.to_owned(),
+            secrets,
+            base_url: base_url.map(str::to_owned),
+            default_model: default_model.map(str::to_owned),
+        },
+    )
+}
+
+fn test_provider_profiles() -> ProviderProfiles {
+    ProviderProfiles::from_profiles(HashMap::from([provider_profile(
+        "openai-codex",
+        "chatgpt",
+        "${CHATGPT_ACCESS_TOKEN}",
+        None,
+        Some("gpt-5.4"),
+    )]))
+}
+
+fn shared_test_provider_profiles() -> &'static ProviderProfiles {
+    static PROVIDER_PROFILES: OnceLock<ProviderProfiles> = OnceLock::new();
+    PROVIDER_PROFILES.get_or_init(test_provider_profiles)
+}
+
+fn llm_with_test_provider_config<B, S>(store: S, backend: B) -> Arc<coco_llm::LlmService<B, S>> {
+    let mut provider_configs = HashMap::new();
+    provider_configs.insert(
+        "openai-codex".to_owned(),
+        ProviderRuntimeConfig {
+            provider: Provider::ChatGpt,
+            secrets: BTreeMap::new(),
+            base_url: None,
+            default_model: Some("gpt-5.4".to_owned()),
+        },
+    );
+    Arc::new(
+        coco_llm::LlmService::builder(store, backend)
+            .with_provider_configs(provider_configs)
+            .build(),
+    )
+}
+
+async fn run_with_backend_and_provider_profiles<B, R>(
+    cli: Cli,
+    reader: &mut R,
+    backend: B,
+    provider_profiles: ProviderProfiles,
+) -> crate::Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    R: std::io::Read,
+{
+    let store = open_store(&cli.store_path)?;
+    let provider_configs = HashMap::from_iter(
+        provider_profiles
+            .list_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .map(|(name, profile)| {
+                (
+                    name,
+                    ProviderRuntimeConfig {
+                        provider: Provider::parse(&profile.provider).unwrap(),
+                        secrets: BTreeMap::new(),
+                        base_url: profile.base_url,
+                        default_model: profile.default_model,
+                    },
+                )
+            }),
+    );
+    let llm = Arc::new(
+        coco_llm::LlmService::builder(store.clone(), backend)
+            .with_provider_configs(provider_configs)
+            .build(),
+    );
+
+    crate::app::runtime::run_with_services(
+        cli,
+        reader,
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: &provider_profiles,
+            shared_engine: None,
+        },
+        false,
+    )
+    .await
+}
+
 fn append_prompt_anchor(
     store: &impl NodeStore,
     parent: &str,
@@ -548,7 +652,8 @@ fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> 
                 vec![],
                 SessionAnchor {
                     role: SessionRole::Orchestrator,
-                    provider: "openai".to_owned(),
+                    provider_profile: None,
+                    provider: Some("openai".to_owned()),
                     model: "gpt-4.1-mini".to_owned(),
                     tools: vec![],
                     system_prompt: "You are helpful.".to_owned(),
@@ -641,6 +746,27 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
 {
+    let entries = entries
+        .iter()
+        .map(|(name, value)| (*name, Some(*value)))
+        .collect::<Vec<_>>();
+    with_coco_env_state_async(&entries, run).await
+}
+
+async fn without_coco_env_async<T, F, Fut>(names: &[&str], run: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let entries = names.iter().map(|name| (*name, None)).collect::<Vec<_>>();
+    with_coco_env_state_async(&entries, run).await
+}
+
+async fn with_coco_env_state_async<T, F, Fut>(entries: &[(&str, Option<&str>)], run: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
     static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
     let _guard = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
@@ -650,8 +776,13 @@ where
         .collect();
 
     for (name, value) in entries {
-        unsafe {
-            std::env::set_var(name, value);
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var(name, value);
+            },
+            None => unsafe {
+                std::env::remove_var(name);
+            },
         }
     }
 
@@ -1374,8 +1505,9 @@ async fn session_get_returns_state_and_visible_anchor() {
     assert_eq!(value["role"], "orchestrator");
     assert_eq!(value["state"], json!("Active"));
     assert_eq!(value["anchor"]["role"], "orchestrator");
-    assert_eq!(value["anchor"]["provider"], "openai");
-    assert_eq!(value["anchor"]["model"], "gpt-4.1-mini");
+    assert_eq!(value["anchor"]["provider_profile"], "openai-codex");
+    assert_eq!(value["anchor"]["provider"], Value::Null);
+    assert_eq!(value["anchor"]["model"], "gpt-5.4");
     assert_eq!(value["anchor"]["system_prompt"], "You are helpful.");
     assert_eq!(value["anchor"]["prompt"], "");
     assert_eq!(value["anchor"]["temperature"], json!(0.2));
@@ -1402,6 +1534,7 @@ async fn session_create_persists_additional_params() {
                     command: SessionSubcommand::Create(SessionCreateCommand {
                         branch: "main".to_owned(),
                         role: crate::cli::CliSessionRole::Orchestrator,
+                        provider_profile: None,
                         system_prompt: "You are helpful.".to_owned(),
                         prompt: "".to_owned(),
                         temperature: Some(0.2),
@@ -1439,6 +1572,35 @@ async fn session_create_persists_additional_params() {
             "reasoning_effort": "medium",
         })
     );
+}
+
+#[tokio::test]
+async fn session_create_uses_single_provider_profile_when_env_is_absent() {
+    let (_tempdir, store_path) = temp_store_path();
+
+    without_coco_env_async(&["COCO_PROVIDER", "COCO_MODEL"], || async {
+        run_with_backend(
+            session_create_cli(store_path.clone(), Some("main")),
+            &mut Cursor::new(""),
+            FakeBackend::with_responses(&[]),
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+
+    let output = run_with_backend(
+        session_get_cli(store_path, Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["anchor"]["provider_profile"], "openai-codex");
+    assert_eq!(value["anchor"]["provider"], Value::Null);
+    assert_eq!(value["anchor"]["model"], "gpt-5.4");
 }
 
 #[tokio::test]
@@ -2581,8 +2743,8 @@ fn preset_set_parses_name_and_patch_flags() {
         "coding",
         "--role",
         "runner",
-        "--provider",
-        "anthropic",
+        "--provider-profile",
+        "anthropic-main",
         "--model",
         "claude-sonnet-4-20250514",
         "--system-prompt",
@@ -2604,11 +2766,79 @@ fn preset_set_parses_name_and_patch_flags() {
 
     assert_eq!(command.name, "coding");
     assert_eq!(command.role, crate::cli::CliSessionRole::Runner);
-    assert_eq!(command.provider, crate::cli::CliProvider::Anthropic);
-    assert_eq!(command.model, "claude-sonnet-4-20250514");
+    assert_eq!(command.provider_profile, "anthropic-main");
+    assert_eq!(command.model.as_deref(), Some("claude-sonnet-4-20250514"));
     assert_eq!(command.system_prompt, "You are precise.");
     assert_eq!(command.tools, vec![crate::cli::CliTool::Bash]);
     assert!(command.enable_coco_shim);
+}
+
+#[test]
+fn provider_profiles_load_from_cwd_config_toml() {
+    let tempdir = tempdir().unwrap();
+    let config_path = tempdir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"[providers.work-openai]
+provider = "openai"
+base_url = "https://openai.example.test/v1"
+default_model = "gpt-4.1-mini"
+
+[providers.work-openai.secrets]
+api_key = "${COCO_WORK_OPENAI_API_KEY}"
+"#,
+    )
+    .unwrap();
+
+    let profiles = crate::app::config::load_provider_profiles_from(&config_path).unwrap();
+    let profile = profiles.get_provider_profile("work-openai").unwrap();
+    assert_eq!(profile.provider, "openai");
+    assert_eq!(
+        profile.secrets.get("api_key").map(String::as_str),
+        Some("${COCO_WORK_OPENAI_API_KEY}")
+    );
+    assert_eq!(profile.default_model.as_deref(), Some("gpt-4.1-mini"));
+}
+
+#[tokio::test]
+async fn preset_can_reference_provider_profile_id() {
+    let (_tempdir, store_path) = temp_store_path();
+    let provider_profiles = ProviderProfiles::from_profiles(HashMap::from([provider_profile(
+        "work-openai",
+        "openai",
+        "${COCO_WORK_OPENAI_API_KEY}",
+        None,
+        Some("gpt-4.1-mini"),
+    )]));
+
+    let output = run_with_backend_and_provider_profiles(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "set",
+            "--name",
+            "coding",
+            "--role",
+            "orchestrator",
+            "--provider-profile",
+            "work-openai",
+            "--system-prompt",
+            "You are helpful.",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+        provider_profiles,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["config"]["provider_profile"], "work-openai");
+    assert_eq!(value["config"]["model"], "gpt-4.1-mini");
 }
 
 #[tokio::test]
@@ -2616,7 +2846,12 @@ async fn preset_commands_manage_versions_in_store() {
     let (_tempdir, store_path) = temp_store_path();
     let preset_name = "coding";
 
-    let first_output = run_with_backend(
+    let provider_profiles = ProviderProfiles::from_profiles(HashMap::from([
+        provider_profile("openai", "openai", "${OPENAI_API_KEY}", None, None),
+        provider_profile("anthropic", "anthropic", "${ANTHROPIC_API_KEY}", None, None),
+    ]));
+
+    let first_output = run_with_backend_and_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2627,7 +2862,7 @@ async fn preset_commands_manage_versions_in_store() {
             preset_name,
             "--role",
             "orchestrator",
-            "--provider",
+            "--provider-profile",
             "openai",
             "--model",
             "gpt-4.1-mini",
@@ -2645,6 +2880,7 @@ async fn preset_commands_manage_versions_in_store() {
         .unwrap(),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
+        provider_profiles.clone(),
     )
     .await
     .unwrap()
@@ -2653,7 +2889,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(first_json["name"], preset_name);
     assert_eq!(first_json["current_version"], 1);
     assert_eq!(first_json["config"]["role"], "orchestrator");
-    assert_eq!(first_json["config"]["provider"], "openai");
+    assert_eq!(first_json["config"]["provider_profile"], "openai");
     assert_eq!(first_json["config"]["model"], "gpt-4.1-mini");
     assert_eq!(
         first_json["config"]["additional_params"],
@@ -2661,7 +2897,7 @@ async fn preset_commands_manage_versions_in_store() {
     );
     assert_eq!(first_json["config"]["tools"][0]["name"], "bash");
 
-    let second_output = run_with_backend(
+    let second_output = run_with_backend_and_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2672,7 +2908,7 @@ async fn preset_commands_manage_versions_in_store() {
             preset_name,
             "--role",
             "runner",
-            "--provider",
+            "--provider-profile",
             "anthropic",
             "--model",
             "claude-sonnet-4-20250514",
@@ -2683,6 +2919,7 @@ async fn preset_commands_manage_versions_in_store() {
         .unwrap(),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
+        provider_profiles,
     )
     .await
     .unwrap()
@@ -2691,7 +2928,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(second_json["current_version"], 2);
     assert_eq!(second_json["available_versions"], json!([1, 2]));
     assert_eq!(second_json["config"]["role"], "runner");
-    assert_eq!(second_json["config"]["provider"], "anthropic");
+    assert_eq!(second_json["config"]["provider_profile"], "anthropic");
     assert_eq!(second_json["config"]["model"], "claude-sonnet-4-20250514");
     assert_eq!(second_json["config"]["temperature"], json!(null));
     assert_eq!(second_json["config"]["max_tokens"], json!(null));
@@ -2819,7 +3056,15 @@ async fn session_rebase_applies_preset_patch() {
     )
     .await;
 
-    run_with_backend(
+    let provider_profiles = ProviderProfiles::from_profiles(HashMap::from([provider_profile(
+        "anthropic-main",
+        "anthropic",
+        "${ANTHROPIC_API_KEY}",
+        None,
+        None,
+    )]));
+
+    run_with_backend_and_provider_profiles(
         Cli {
             daemon_socket: None,
             store_path: store_path.clone(),
@@ -2827,8 +3072,8 @@ async fn session_rebase_applies_preset_patch() {
                 command: PresetSubcommand::Set(PresetSetCommand {
                     name: "runner-defaults".to_owned(),
                     role: crate::cli::CliSessionRole::Runner,
-                    provider: crate::cli::CliProvider::Anthropic,
-                    model: "claude-sonnet-4-20250514".to_owned(),
+                    provider_profile: "anthropic-main".to_owned(),
+                    model: Some("claude-sonnet-4-20250514".to_owned()),
                     system_prompt: "You are precise.".to_owned(),
                     prompt: "Start with a plan.".to_owned(),
                     temperature: None,
@@ -2842,11 +3087,12 @@ async fn session_rebase_applies_preset_patch() {
         },
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
+        provider_profiles.clone(),
     )
     .await
     .unwrap();
 
-    let output = run_with_backend(
+    let output = run_with_backend_and_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2861,6 +3107,7 @@ async fn session_rebase_applies_preset_patch() {
         .unwrap(),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
+        provider_profiles,
     )
     .await
     .unwrap()
@@ -2879,7 +3126,8 @@ async fn session_rebase_applies_preset_patch() {
     .unwrap();
     let session_json: serde_json::Value = serde_json::from_str(&session_output).unwrap();
     assert_eq!(session_json["role"], "runner");
-    assert_eq!(session_json["anchor"]["provider"], "anthropic");
+    assert_eq!(session_json["anchor"]["provider_profile"], "anthropic-main");
+    assert_eq!(session_json["anchor"]["provider"], json!(null));
     assert_eq!(session_json["anchor"]["model"], "claude-sonnet-4-20250514");
     assert_eq!(session_json["anchor"]["system_prompt"], "You are precise.");
     assert_eq!(session_json["anchor"]["prompt"], "Start with a plan.");
@@ -2911,10 +3159,10 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
     .await;
 
     let store = open_store(&store_path).unwrap();
-    let llm = Arc::new(coco_llm::LlmService::new(
+    let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("draft", &[Ok("world")])]),
-    ));
+    );
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
@@ -2927,6 +3175,7 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -2955,10 +3204,10 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
     .await;
 
     let store = open_store(&store_path).unwrap();
-    let llm = Arc::new(coco_llm::LlmService::new(
+    let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("main-response")])]),
-    ));
+    );
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
@@ -2976,6 +3225,7 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -2990,10 +3240,7 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
 async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
     let (_tempdir, store_path) = temp_store_path();
     let store = open_store(&store_path).unwrap();
-    let llm = Arc::new(coco_llm::LlmService::new(
-        store.clone(),
-        FakeBackend::with_responses(&[]),
-    ));
+    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
@@ -3006,6 +3253,7 @@ async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -3025,10 +3273,7 @@ async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
 async fn forwarded_runtime_runner_session_help_hides_write_subcommands() {
     let (_tempdir, store_path) = temp_store_path();
     let store = open_store(&store_path).unwrap();
-    let llm = Arc::new(coco_llm::LlmService::new(
-        store.clone(),
-        FakeBackend::with_responses(&[]),
-    ));
+    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
@@ -3041,6 +3286,7 @@ async fn forwarded_runtime_runner_session_help_hides_write_subcommands() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -3062,10 +3308,7 @@ async fn forwarded_runtime_runner_session_help_hides_write_subcommands() {
 async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
     let (_tempdir, store_path) = temp_store_path();
     let store = open_store(&store_path).unwrap();
-    let llm = Arc::new(coco_llm::LlmService::new(
-        store.clone(),
-        FakeBackend::with_responses(&[]),
-    ));
+    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
@@ -3078,6 +3321,7 @@ async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -3093,10 +3337,7 @@ async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
 async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
     let (_tempdir, store_path) = temp_store_path();
     let store = open_store(&store_path).unwrap();
-    let llm = Arc::new(coco_llm::LlmService::new(
-        store.clone(),
-        FakeBackend::with_responses(&[]),
-    ));
+    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let prompt_response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
@@ -3109,6 +3350,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -3141,6 +3383,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -3169,6 +3412,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -3192,6 +3436,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -3209,10 +3454,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
 async fn forwarded_runtime_rejects_store_path_override() {
     let (_tempdir, store_path) = temp_store_path();
     let store = open_store(&store_path).unwrap();
-    let llm = Arc::new(coco_llm::LlmService::new(
-        store.clone(),
-        FakeBackend::with_responses(&[]),
-    ));
+    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
@@ -3230,6 +3472,7 @@ async fn forwarded_runtime_rejects_store_path_override() {
         RuntimeServices {
             shared_store: &store,
             llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
             shared_engine: None,
         },
     )
@@ -3263,12 +3506,18 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
         .unwrap();
     let socket_path = socket_dir.path().join("coco.sock");
     let store = open_store(&store_path).unwrap();
-    let llm = Arc::new(coco_llm::LlmService::new(
+    let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("daemon-response")])]),
-    ));
+    );
     let engine = Arc::new(coco_core::ConversationEngine::new(llm.clone()));
-    let server = match start_daemon_server(&socket_path, &store, &llm, &engine) {
+    let server = match start_daemon_server(
+        &socket_path,
+        &store,
+        &llm,
+        shared_test_provider_profiles(),
+        &engine,
+    ) {
         Ok(server) => server,
         Err(crate::Error::BindDaemonSocket { source, .. })
             if source.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -3329,10 +3578,10 @@ async fn daemon_startup_resumes_incomplete_jobs() {
         )
         .unwrap();
 
-    let llm = Arc::new(coco_llm::LlmService::new(
+    let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("recovered after daemon start")])]),
-    ));
+    );
     let engine = coco_core::ConversationEngine::new(llm);
 
     resume_incomplete_jobs(&engine).await.unwrap();
@@ -3362,6 +3611,7 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
                     role: crate::cli::CliSessionRole::Orchestrator,
+                    provider_profile: None,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
@@ -3373,8 +3623,8 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
             },
         ));
 
-    assert_eq!(config.provider, Provider::Anthropic);
-    assert_eq!(config.model, "claude-sonnet-4-20250514");
+    assert_eq!(config.provider, Provider::ChatGpt);
+    assert_eq!(config.model, "gpt-5.4");
     assert_eq!(config.role, SessionRole::Orchestrator);
 }
 
@@ -3393,6 +3643,7 @@ fn resolve_session_config_accepts_chatgpt_provider() {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
                     role: crate::cli::CliSessionRole::Orchestrator,
+                    provider_profile: None,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
@@ -3405,7 +3656,7 @@ fn resolve_session_config_accepts_chatgpt_provider() {
         ));
 
     assert_eq!(config.provider, Provider::ChatGpt);
-    assert_eq!(config.model, "gpt-5.3-codex");
+    assert_eq!(config.model, "gpt-5.4");
 }
 
 #[test]
@@ -3424,6 +3675,7 @@ fn resolve_session_config_reads_tools_from_env() {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
                     role: crate::cli::CliSessionRole::Orchestrator,
+                    provider_profile: None,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
@@ -3457,6 +3709,7 @@ fn resolve_session_config_parses_additional_params_json_object() {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
                     role: crate::cli::CliSessionRole::Orchestrator,
+                    provider_profile: None,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),
@@ -3491,6 +3744,7 @@ fn resolve_session_config_rejects_non_object_additional_params() {
                 resolve_session_config(SessionCreateCommand {
                     branch: "main".to_owned(),
                     role: crate::cli::CliSessionRole::Orchestrator,
+                    provider_profile: None,
                     system_prompt: "You are helpful.".to_owned(),
                     prompt: "".to_owned(),
                     temperature: Some(0.2),

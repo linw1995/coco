@@ -1,10 +1,13 @@
-use coco_mem::{BranchConfig, BranchConfigRecord, BranchConfigStore, BranchConfigVersion};
+use coco_mem::{
+    BranchConfig, BranchConfigRecord, BranchConfigStore, BranchConfigVersion, ProviderProfileStore,
+};
 use serde::Serialize;
 use serde_json::Value;
 use snafu::prelude::*;
 
 use crate::{
     Result,
+    app::config::ProviderProfiles,
     cli::{
         CliTool, PresetCommand, PresetNameCommand, PresetRollbackCommand, PresetSetCommand,
         PresetSubcommand,
@@ -39,12 +42,20 @@ struct PresetDeleteResult {
     name: String,
 }
 
-pub(super) async fn run_preset_command(
+pub(super) async fn run_preset_command<S>(
     command: PresetCommand,
-    store: &impl BranchConfigStore,
-) -> Result<Option<String>> {
+    store: &S,
+    provider_profiles: &ProviderProfiles,
+) -> Result<Option<String>>
+where
+    S: BranchConfigStore,
+{
     match command.command {
-        PresetSubcommand::Set(command) => Ok(Some(render_json(run_preset_set(command, store)?))),
+        PresetSubcommand::Set(command) => Ok(Some(render_json(run_preset_set(
+            command,
+            store,
+            provider_profiles,
+        )?))),
         PresetSubcommand::List => Ok(Some(render_json(run_preset_list(store)?))),
         PresetSubcommand::Show(command) => Ok(Some(render_json(run_preset_show(command, store)?))),
         PresetSubcommand::Rollback(command) => {
@@ -56,12 +67,16 @@ pub(super) async fn run_preset_command(
     }
 }
 
-fn run_preset_set(
+fn run_preset_set<S>(
     command: PresetSetCommand,
-    store: &impl BranchConfigStore,
-) -> Result<PresetSummaryView> {
+    store: &S,
+    provider_profiles: &ProviderProfiles,
+) -> Result<PresetSummaryView>
+where
+    S: BranchConfigStore,
+{
     let name = command.name.clone();
-    let config = resolve_branch_config(command)?;
+    let config = resolve_branch_config(command, provider_profiles)?;
     let record = store.set_branch_config(&name, config).context(StoreSnafu)?;
     Ok(preset_summary_view(&record))
 }
@@ -110,13 +125,22 @@ fn run_preset_delete(
     Ok(PresetDeleteResult { name: command.name })
 }
 
-fn resolve_branch_config(command: PresetSetCommand) -> Result<BranchConfig> {
+fn resolve_branch_config(
+    command: PresetSetCommand,
+    store: &impl ProviderProfileStore,
+) -> Result<BranchConfig> {
+    let provider_profile = command.provider_profile;
+    let profile = store
+        .get_provider_profile(&provider_profile)
+        .context(StoreSnafu)?;
+
     Ok(BranchConfig {
         role: command.role.into(),
-        provider: coco_llm::Provider::from(command.provider)
-            .as_str()
-            .to_owned(),
-        model: command.model,
+        provider_profile,
+        model: command
+            .model
+            .or(profile.default_model)
+            .context(crate::error::MissingPresetModelSnafu)?,
         tools: resolve_cli_tools(&command.tools),
         system_prompt: command.system_prompt,
         prompt: command.prompt,

@@ -309,11 +309,15 @@ where
                     ),
                 )),
             })
-            .map_err(|source| LlmError::Memory { source })?;
+            .map_err(|source| LlmError::Memory {
+                source: Box::new(source),
+            })?;
 
         store
             .fork(&child_branch, &child_session_anchor_id)
-            .map_err(|source| LlmError::Memory { source })?;
+            .map_err(|source| LlmError::Memory {
+                source: Box::new(source),
+            })?;
         let prompt_result = service
             .run(CompletionRequest {
                 branch: child_branch.clone(),
@@ -338,12 +342,12 @@ where
             (Err(workflow), Ok(())) => Err(workflow),
             (Ok(_), Err(cleanup)) => Err(LlmError::UseSkillCleanup {
                 branch: child_branch,
-                source: cleanup,
+                source: Box::new(cleanup),
             }),
             (Err(workflow), Err(cleanup)) => Err(LlmError::UseSkillWorkflowFailedCleanup {
                 branch: child_branch,
                 workflow: Box::new(workflow),
-                cleanup,
+                cleanup: Box::new(cleanup),
             }),
         }
     }
@@ -358,7 +362,9 @@ where
 {
     let ancestry = store
         .ancestry(reference)
-        .map_err(|source| LlmError::Memory { source })?;
+        .map_err(|source| LlmError::Memory {
+            source: Box::new(source),
+        })?;
     let head = ancestry.first().ok_or_else(|| LlmError::InvalidAnchor {
         anchor_id: reference.to_owned(),
     })?;
@@ -391,6 +397,7 @@ fn child_session_anchor(
 ) -> SessionAnchor {
     SessionAnchor {
         role: session_role,
+        provider_profile: parent.provider_profile,
         provider: parent.provider,
         model: parent.model,
         tools: parent.tools,

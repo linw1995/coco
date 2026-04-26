@@ -7,8 +7,8 @@ use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{SessionRole, Store};
 
 use super::{
-    daemon::run_daemon_command, preset::run_preset_command, prompt::run_prompt_command,
-    session::run_session_command, skill::run_skill_command,
+    config::ProviderProfiles, daemon::run_daemon_command, preset::run_preset_command,
+    prompt::run_prompt_command, session::run_session_command, skill::run_skill_command,
 };
 use crate::{
     Cli, Result,
@@ -32,6 +32,7 @@ where
 {
     pub shared_store: &'a S,
     pub llm: &'a Arc<LlmService<B, S>>,
+    pub provider_profiles: &'a ProviderProfiles,
     pub shared_engine: Option<&'a Arc<ConversationEngine<B, S>>>,
 }
 
@@ -159,7 +160,9 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     match cli.command {
-        Command::Preset(command) => run_preset_command(command, services.shared_store).await,
+        Command::Preset(command) => {
+            run_preset_command(command, services.shared_store, services.provider_profiles).await
+        }
         Command::Prompt(command) => {
             run_prompt_command(
                 command,
@@ -172,11 +175,23 @@ where
             .await
         }
         Command::Session(command) => {
-            run_session_command(command, services.shared_store, services.llm).await
+            run_session_command(
+                command,
+                services.shared_store,
+                services.llm,
+                services.provider_profiles,
+            )
+            .await
         }
         Command::Skill(command) => run_skill_command(command, services.shared_store).await,
         Command::Daemon(command) => {
-            run_daemon_command(command, services.shared_store, services.llm).await
+            run_daemon_command(
+                command,
+                services.shared_store,
+                services.llm,
+                services.provider_profiles,
+            )
+            .await
         }
     }
 }

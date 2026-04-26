@@ -10,13 +10,14 @@ use crate::error::{
     BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu, DuplicateMergeParentSnafu,
     InvalidAnchorSnafu, InvalidSkillNameSnafu, MergeParentMatchesParentSnafu,
     MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu, PromptJobActiveOnBranchSnafu,
-    PromptJobMovedSnafu, PromptJobNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
-    SkillAlreadyExistsSnafu, SkillNotFoundSnafu, SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
+    PromptJobMovedSnafu, PromptJobNotFoundSnafu, ProviderProfileNotFoundSnafu,
+    RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu,
+    SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
     Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind, NewNode, Node,
-    PauseReason, Role, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
-    SkillUpdatePatch, SkillVersionSpec, default_skill_groups,
+    PauseReason, ProviderProfile, Role, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
+    SkillRecord, SkillUpdatePatch, SkillVersionSpec, default_skill_groups,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub struct StoreState {
     pub branches: HashMap<String, String>,
     pub sessions: HashMap<String, SessionState>,
     pub branch_configs: HashMap<String, BranchConfigRecord>,
+    pub provider_profiles: HashMap<String, ProviderProfile>,
     pub jobs: HashMap<String, Job>,
     pub skill_groups: SkillGroups,
 }
@@ -73,6 +75,7 @@ impl StoreState {
             branches: HashMap::new(),
             sessions: HashMap::new(),
             branch_configs: HashMap::new(),
+            provider_profiles: HashMap::new(),
             jobs: HashMap::new(),
             skill_groups: default_skill_groups(),
         }
@@ -90,6 +93,7 @@ impl StoreState {
             branches: HashMap::new(),
             sessions: HashMap::new(),
             branch_configs: HashMap::new(),
+            provider_profiles: HashMap::new(),
             jobs: HashMap::new(),
             skill_groups: default_skill_groups(),
         }
@@ -393,6 +397,19 @@ impl StoreState {
             .remove(name)
             .map(|_| ())
             .context(BranchConfigNotFoundSnafu {
+                name: name.to_owned(),
+            })
+    }
+
+    pub fn list_provider_profiles(&self) -> HashMap<String, ProviderProfile> {
+        self.provider_profiles.clone()
+    }
+
+    pub fn get_provider_profile(&self, name: &str) -> Result<ProviderProfile> {
+        self.provider_profiles
+            .get(name)
+            .cloned()
+            .context(ProviderProfileNotFoundSnafu {
                 name: name.to_owned(),
             })
     }
