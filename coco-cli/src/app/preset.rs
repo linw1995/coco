@@ -1,4 +1,4 @@
-use coco_mem::{BranchConfig, BranchConfigRecord, BranchConfigStore, BranchConfigVersion, FsStore};
+use coco_mem::{BranchConfig, BranchConfigRecord, BranchConfigStore, BranchConfigVersion};
 use serde::Serialize;
 use serde_json::Value;
 use snafu::prelude::*;
@@ -41,7 +41,7 @@ struct PresetDeleteResult {
 
 pub(super) async fn run_preset_command(
     command: PresetCommand,
-    store: &FsStore,
+    store: &impl BranchConfigStore,
 ) -> Result<Option<String>> {
     match command.command {
         PresetSubcommand::Set(command) => Ok(Some(render_json(run_preset_set(command, store)?))),
@@ -56,14 +56,17 @@ pub(super) async fn run_preset_command(
     }
 }
 
-fn run_preset_set(command: PresetSetCommand, store: &FsStore) -> Result<PresetSummaryView> {
+fn run_preset_set(
+    command: PresetSetCommand,
+    store: &impl BranchConfigStore,
+) -> Result<PresetSummaryView> {
     let name = command.name.clone();
     let config = resolve_branch_config(command)?;
     let record = store.set_branch_config(&name, config).context(StoreSnafu)?;
     Ok(preset_summary_view(&record))
 }
 
-fn run_preset_list(store: &FsStore) -> Result<Vec<PresetSummaryView>> {
+fn run_preset_list(store: &impl BranchConfigStore) -> Result<Vec<PresetSummaryView>> {
     let mut records = store
         .list_branch_config_records()
         .context(StoreSnafu)?
@@ -73,7 +76,10 @@ fn run_preset_list(store: &FsStore) -> Result<Vec<PresetSummaryView>> {
     Ok(records.iter().map(preset_summary_view).collect())
 }
 
-fn run_preset_show(command: PresetNameCommand, store: &FsStore) -> Result<PresetShowView> {
+fn run_preset_show(
+    command: PresetNameCommand,
+    store: &impl BranchConfigStore,
+) -> Result<PresetShowView> {
     let record = store
         .get_branch_config_record(&command.name)
         .context(StoreSnafu)?;
@@ -86,7 +92,7 @@ fn run_preset_show(command: PresetNameCommand, store: &FsStore) -> Result<Preset
 
 fn run_preset_rollback(
     command: PresetRollbackCommand,
-    store: &FsStore,
+    store: &impl BranchConfigStore,
 ) -> Result<PresetSummaryView> {
     let record = store
         .rollback_branch_config(&command.name, command.to_version)
@@ -94,7 +100,10 @@ fn run_preset_rollback(
     Ok(preset_summary_view(&record))
 }
 
-fn run_preset_delete(command: PresetNameCommand, store: &FsStore) -> Result<PresetDeleteResult> {
+fn run_preset_delete(
+    command: PresetNameCommand,
+    store: &impl BranchConfigStore,
+) -> Result<PresetDeleteResult> {
     store
         .delete_branch_config(&command.name)
         .context(StoreSnafu)?;

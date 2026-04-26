@@ -4,7 +4,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use coco_core::ConversationEngine;
 use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::{FsStore, SessionRole};
+use coco_mem::{SessionRole, Store};
 
 use super::{
     daemon::run_daemon_command, preset::run_preset_command, prompt::run_prompt_command,
@@ -25,13 +25,14 @@ enum ForwardedRuntimeScope {
     Runner,
 }
 
-pub(crate) struct RuntimeServices<'a, B>
+pub(crate) struct RuntimeServices<'a, B, S>
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
-    pub shared_store: &'a FsStore,
-    pub llm: &'a Arc<LlmService<B, FsStore>>,
-    pub shared_engine: Option<&'a Arc<ConversationEngine<B, FsStore>>>,
+    pub shared_store: &'a S,
+    pub llm: &'a Arc<LlmService<B, S>>,
+    pub shared_engine: Option<&'a Arc<ConversationEngine<B, S>>>,
 }
 
 pub(crate) struct ForwardedRuntimeInputs<'a> {
@@ -146,15 +147,16 @@ impl ForwardedCli {
     }
 }
 
-pub async fn run_with_services<B, R>(
+pub async fn run_with_services<B, R, S>(
     cli: Cli,
     reader: &mut R,
-    services: RuntimeServices<'_, B>,
+    services: RuntimeServices<'_, B, S>,
     forwarded_runtime: bool,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
     R: Read,
+    S: Store + Clone + Send + Sync + 'static,
 {
     match cli.command {
         Command::Preset(command) => run_preset_command(command, services.shared_store).await,
@@ -179,12 +181,13 @@ where
     }
 }
 
-pub async fn run_forwarded_with_services<B>(
+pub async fn run_forwarded_with_services<B, S>(
     inputs: ForwardedRuntimeInputs<'_>,
-    services: RuntimeServices<'_, B>,
+    services: RuntimeServices<'_, B, S>,
 ) -> CocoCliRuntimeResponse
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     let scope = forwarded_runtime_scope(inputs.session_role);
     if contains_store_path_flag(inputs.args) {

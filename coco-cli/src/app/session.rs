@@ -6,8 +6,8 @@ use coco_llm::{
     CompletionBackend, LlmService, SessionConfig, SessionConfigPatch, SessionFeedback, SessionMerge,
 };
 use coco_mem::{
-    AnchorPayload, BranchConfigStore, BranchStore, FsStore, Kind, Node, NodeStore, PauseReason,
-    SessionAnchor, SessionState, SessionStore, StoreError, Tool,
+    AnchorPayload, BranchConfigStore, BranchStore, Kind, Node, NodeStore, PauseReason,
+    SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -142,13 +142,14 @@ struct NodeShowResult {
     node: Node,
 }
 
-pub(super) async fn run_session_command<B>(
+pub(super) async fn run_session_command<B, S>(
     command: SessionCommand,
-    store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
+    store: &S,
+    llm: &Arc<LlmService<B, S>>,
 ) -> Result<Option<String>>
 where
-    B: CompletionBackend,
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     match command.command {
         SessionSubcommand::Create(command) => {
@@ -273,7 +274,9 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
     })
 }
 
-fn list_sessions(store: &FsStore) -> Result<Vec<SessionSummary>> {
+fn list_sessions(
+    store: &(impl BranchStore + NodeStore + SessionStore),
+) -> Result<Vec<SessionSummary>> {
     let states = store.list_session_states().context(StoreSnafu)?;
     let mut branches = states.into_iter().collect::<Vec<_>>();
     branches.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -292,7 +295,10 @@ fn list_sessions(store: &FsStore) -> Result<Vec<SessionSummary>> {
         .collect()
 }
 
-fn read_session_details(store: &FsStore, branch: &str) -> Result<SessionDetails> {
+fn read_session_details(
+    store: &(impl BranchStore + NodeStore + SessionStore),
+    branch: &str,
+) -> Result<SessionDetails> {
     let head_id = store.get_branch_head(branch).context(StoreSnafu)?;
     let state = store.get_session_state(branch).context(StoreSnafu)?;
     let (anchor_id, anchor) = resolve_visible_session_anchor(store, branch)?;
@@ -307,7 +313,7 @@ fn read_session_details(store: &FsStore, branch: &str) -> Result<SessionDetails>
     })
 }
 
-fn render_session_graph(store: &FsStore) -> Result<String> {
+fn render_session_graph(store: &(impl BranchStore + NodeStore + SessionStore)) -> Result<String> {
     let states = store.list_session_states().context(StoreSnafu)?;
     if states.is_empty() {
         return Ok("No sessions found.".to_owned());
@@ -458,7 +464,7 @@ fn compare_graph_entries_desc(left: &GraphNodeEntry, right: &GraphNodeEntry) -> 
 }
 
 fn collect_visible_graph_nodes(
-    store: &FsStore,
+    store: &impl NodeStore,
     head_id: &str,
     visible_node_ids: &mut BTreeSet<String>,
     visible_nodes: &mut HashMap<String, Node>,
@@ -488,7 +494,11 @@ fn collect_visible_graph_nodes(
     Ok(())
 }
 
-fn render_session_show(store: &FsStore, reference: &str, json_output: bool) -> Result<String> {
+fn render_session_show(
+    store: &impl NodeStore,
+    reference: &str,
+    json_output: bool,
+) -> Result<String> {
     let node = resolve_show_reference(store, reference)?;
     let children = store
         .list_children(&node.id)
@@ -510,7 +520,7 @@ fn render_session_show(store: &FsStore, reference: &str, json_output: bool) -> R
     }
 }
 
-fn resolve_show_reference(store: &FsStore, reference: &str) -> Result<Node> {
+fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Node> {
     match store.get_node(reference) {
         Ok(node) => Ok(node),
         Err(StoreError::NotFound { .. }) => UnknownShowReferenceSnafu {
@@ -959,7 +969,7 @@ fn shorten_id(node_id: &str) -> &str {
 }
 
 fn build_pull_request_result(
-    store: &FsStore,
+    store: &impl SessionStore,
     pr: coco_llm::PullRequest,
 ) -> Result<PullRequestResult> {
     Ok(PullRequestResult {
@@ -970,7 +980,10 @@ fn build_pull_request_result(
     })
 }
 
-fn build_session_merge_result(store: &FsStore, merged: SessionMerge) -> Result<SessionMergeResult> {
+fn build_session_merge_result(
+    store: &impl SessionStore,
+    merged: SessionMerge,
+) -> Result<SessionMergeResult> {
     Ok(SessionMergeResult {
         branch: merged.branch.clone(),
         target_branch: merged.target_branch,
@@ -983,7 +996,7 @@ fn build_session_merge_result(store: &FsStore, merged: SessionMerge) -> Result<S
 }
 
 fn build_session_feedback_result(
-    store: &FsStore,
+    store: &impl SessionStore,
     feedback: SessionFeedback,
 ) -> Result<SessionFeedbackResult> {
     Ok(SessionFeedbackResult {
@@ -999,7 +1012,7 @@ fn build_session_feedback_result(
 }
 
 fn resolve_visible_session_anchor(
-    store: &FsStore,
+    store: &impl NodeStore,
     branch: &str,
 ) -> Result<(String, SessionAnchor)> {
     let ancestry = store.ancestry(branch).context(StoreSnafu)?;

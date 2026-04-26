@@ -63,6 +63,9 @@ pub enum Error {
     #[snafu(display("Failed to spawn prompt worker: {source}"))]
     SpawnPromptWorker { source: io::Error },
 
+    #[snafu(display("Current store cannot be shared with a prompt worker process"))]
+    StoreRuntimePathUnavailable,
+
     #[snafu(display("Failed to resolve daemon socket root: {source}"))]
     ResolveDaemonSocketRoot { source: io::Error },
 

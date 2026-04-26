@@ -10,7 +10,7 @@ use coco_core::{
 use coco_llm::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, CompletionBackend, LlmService,
 };
-use coco_mem::{AnchorPayload, FsStore, JobStore, Kind, NodeStore};
+use coco_mem::{AnchorPayload, JobStore, Kind, NodeStore, Store};
 use serde::Serialize;
 use snafu::prelude::*;
 use tokio::process::Command;
@@ -56,17 +56,18 @@ struct PromptAnchorDetails {
     merge_parents: Vec<String>,
 }
 
-pub(super) async fn run_prompt_command<B, R>(
+pub(super) async fn run_prompt_command<B, R, S>(
     command: PromptCommand,
     reader: &mut R,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
-    shared_engine: Option<&ConversationEngine<B, FsStore>>,
+    shared_store: &S,
+    llm: &Arc<LlmService<B, S>>,
+    shared_engine: Option<&ConversationEngine<B, S>>,
     forwarded_runtime: bool,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
     R: Read,
+    S: Store + Clone + Send + Sync + 'static,
 {
     if let Some(engine) = shared_engine {
         return run_prompt_command_with_engine(
@@ -83,16 +84,17 @@ where
     run_prompt_command_with_engine(command, reader, shared_store, &engine, forwarded_runtime).await
 }
 
-async fn run_prompt_command_with_engine<B, R>(
+async fn run_prompt_command_with_engine<B, R, S>(
     command: PromptCommand,
     reader: &mut R,
-    shared_store: &FsStore,
-    engine: &ConversationEngine<B, FsStore>,
+    shared_store: &S,
+    engine: &ConversationEngine<B, S>,
     forwarded_runtime: bool,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
     R: Read,
+    S: Store + Clone + Send + Sync + 'static,
 {
     match command.command {
         None => run_prompt_run(command.run, reader, shared_store, engine, forwarded_runtime).await,
@@ -122,16 +124,17 @@ where
     Ok(text)
 }
 
-async fn run_prompt_run<B, R>(
+async fn run_prompt_run<B, R, S>(
     command: PromptRunCommand,
     reader: &mut R,
-    shared_store: &FsStore,
-    engine: &ConversationEngine<B, FsStore>,
+    shared_store: &S,
+    engine: &ConversationEngine<B, S>,
     forwarded_runtime: bool,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
     R: Read,
+    S: Store + Clone + Send + Sync + 'static,
 {
     let input = resolve_prompt_input(&command, reader)?;
     if command.asynchronous {
@@ -139,8 +142,17 @@ where
             .submit_job(&command.branch, &input, vec![])
             .await
             .context(CoreEngineSnafu)?;
+        let store_path = if forwarded_runtime {
+            None
+        } else {
+            Some(
+                shared_store
+                    .runtime_store_path()
+                    .context(crate::error::StoreRuntimePathUnavailableSnafu)?,
+            )
+        };
         ensure_job_driver(
-            shared_store.path(),
+            store_path.as_deref(),
             &job.job_id,
             (*engine).clone(),
             forwarded_runtime,
@@ -162,13 +174,14 @@ where
     Ok(Some(response.text))
 }
 
-async fn run_prompt_status<B>(
+async fn run_prompt_status<B, S>(
     command: PromptStatusCommand,
-    shared_store: &FsStore,
-    engine: &ConversationEngine<B, FsStore>,
+    shared_store: &S,
+    engine: &ConversationEngine<B, S>,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     let snapshot = engine.get_job(&command.job).context(CoreEngineSnafu)?;
     let prompt_details =
@@ -179,12 +192,13 @@ where
     ))))
 }
 
-async fn run_prompt_branch_status<B>(
+async fn run_prompt_branch_status<B, S>(
     command: PromptBranchStatusCommand,
-    engine: &ConversationEngine<B, FsStore>,
+    engine: &ConversationEngine<B, S>,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     let snapshot = engine.get_job(&command.job).context(CoreEngineSnafu)?;
     if command
@@ -197,12 +211,13 @@ where
     Ok(Some(render_json(Vec::<JobStatusSnapshot>::new())))
 }
 
-async fn run_prompt_worker<B>(
+async fn run_prompt_worker<B, S>(
     command: PromptWorkerCommand,
-    engine: &ConversationEngine<B, FsStore>,
+    engine: &ConversationEngine<B, S>,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     engine
         .drive_job(&command.job)
@@ -211,14 +226,15 @@ where
     Ok(None)
 }
 
-async fn ensure_job_driver<B>(
-    store_path: &Path,
+async fn ensure_job_driver<B, S>(
+    store_path: Option<&Path>,
     job_id: &str,
-    engine: ConversationEngine<B, FsStore>,
+    engine: ConversationEngine<B, S>,
     forwarded_runtime: bool,
 ) -> Result<()>
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     if forwarded_runtime {
         let job_id = job_id.to_owned();
@@ -228,6 +244,7 @@ where
         return Ok(());
     }
 
+    let store_path = store_path.context(crate::error::StoreRuntimePathUnavailableSnafu)?;
     spawn_prompt_worker(store_path, job_id).await
 }
 
@@ -267,7 +284,7 @@ fn build_job_status_view(
 }
 
 fn load_prompt_anchor_details(
-    store: &FsStore,
+    store: &(impl JobStore + NodeStore),
     job_id: &str,
 ) -> std::result::Result<PromptAnchorDetails, EngineError> {
     let job = store.get_job(job_id)?;

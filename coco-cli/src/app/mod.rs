@@ -7,7 +7,7 @@ use coco_llm::{
     BashToolCliBridgeHandle, CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge,
     LlmService, RigBackend, SessionConfig,
 };
-use coco_mem::FsStore;
+use coco_mem::Store;
 
 use crate::{Cli, Result, cli::SessionCreateCommand, store::open_store};
 
@@ -36,15 +36,16 @@ where
     run_with_services(cli, reader, &shared_store, &llm).await
 }
 
-pub async fn run_with_services<B, R>(
+pub async fn run_with_services<B, R, S>(
     cli: Cli,
     reader: &mut R,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
+    shared_store: &S,
+    llm: &Arc<LlmService<B, S>>,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
     R: Read,
+    S: Store + Clone + Send + Sync + 'static,
 {
     runtime::run_with_services(
         cli,
@@ -59,9 +60,10 @@ where
     .await
 }
 
-fn build_llm_service<B>(shared_store: FsStore, backend: B) -> Arc<LlmService<B, FsStore>>
+fn build_llm_service<B, S>(shared_store: S, backend: B) -> Arc<LlmService<B, S>>
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     Arc::new_cyclic(|weak_llm| {
         let bash_bridge_impl = Arc::new(LlmRuntimeBridge::new(weak_llm.clone(), {
@@ -80,7 +82,7 @@ where
                         runtime::RuntimeServices {
                             shared_store: &shared_store,
                             llm: &llm,
-                            shared_engine: None::<&Arc<ConversationEngine<B, FsStore>>>,
+                            shared_engine: None::<&Arc<ConversationEngine<B, S>>>,
                         },
                     )
                     .await
@@ -96,12 +98,13 @@ where
     })
 }
 
-pub async fn run_forwarded_with_services<B>(
+pub async fn run_forwarded_with_services<B, S>(
     inputs: runtime::ForwardedRuntimeInputs<'_>,
-    services: runtime::RuntimeServices<'_, B>,
+    services: runtime::RuntimeServices<'_, B, S>,
 ) -> CocoCliRuntimeResponse
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     runtime::run_forwarded_with_services(inputs, services).await
 }

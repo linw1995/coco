@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use coco_core::ConversationEngine;
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::{FsStore, SessionRole};
+use coco_mem::{SessionRole, Store};
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -24,13 +24,14 @@ pub(crate) struct CocoCliDaemonServerHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
-pub(super) async fn run_daemon_command<B>(
+pub(super) async fn run_daemon_command<B, S>(
     command: DaemonCommand,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
+    shared_store: &S,
+    llm: &Arc<LlmService<B, S>>,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     let socket_path = resolve_daemon_socket_path(match &command.command {
         DaemonSubcommand::Serve(command) => command.socket.as_deref(),
@@ -46,9 +47,10 @@ where
     Ok(None)
 }
 
-pub(crate) async fn resume_incomplete_jobs<B>(engine: &ConversationEngine<B, FsStore>) -> Result<()>
+pub(crate) async fn resume_incomplete_jobs<B, S>(engine: &ConversationEngine<B, S>) -> Result<()>
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     engine
         .resume_incomplete_jobs()
@@ -56,9 +58,10 @@ where
         .context(crate::error::CoreEngineSnafu)
 }
 
-fn spawn_resume_incomplete_jobs<B>(engine: Arc<ConversationEngine<B, FsStore>>)
+fn spawn_resume_incomplete_jobs<B, S>(engine: Arc<ConversationEngine<B, S>>)
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     tokio::spawn(async move {
         if let Err(error) = resume_incomplete_jobs(engine.as_ref()).await {
@@ -96,14 +99,15 @@ pub(crate) fn resolve_daemon_socket_path(socket_path: Option<&Path>) -> Result<P
     }
 }
 
-pub(crate) fn start_daemon_server<B>(
+pub(crate) fn start_daemon_server<B, S>(
     socket_path: &Path,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
-    shared_engine: &Arc<ConversationEngine<B, FsStore>>,
+    shared_store: &S,
+    llm: &Arc<LlmService<B, S>>,
+    shared_engine: &Arc<ConversationEngine<B, S>>,
 ) -> Result<CocoCliDaemonServerHandle>
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).context(BindDaemonSocketSnafu {
@@ -164,14 +168,15 @@ impl CocoCliDaemonServerHandle {
     }
 }
 
-async fn handle_client<B>(
+async fn handle_client<B, S>(
     stream: &mut tokio::net::UnixStream,
-    shared_store: &FsStore,
-    llm: &Arc<LlmService<B, FsStore>>,
-    shared_engine: &Arc<ConversationEngine<B, FsStore>>,
+    shared_store: &S,
+    llm: &Arc<LlmService<B, S>>,
+    shared_engine: &Arc<ConversationEngine<B, S>>,
 ) -> CocoCliRuntimeResponse
 where
     B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
 {
     let mut input = Vec::new();
     match stream.read_to_end(&mut input).await {

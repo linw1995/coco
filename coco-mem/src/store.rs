@@ -177,3 +177,20 @@ pub trait RuntimeStore {
         None
     }
 }
+
+/// Complete storage API used by CoCo application services.
+pub trait Store:
+    NodeStore + BranchStore + SessionStore + BranchConfigStore + SkillStore + JobStore + RuntimeStore
+{
+}
+
+impl<T> Store for T where
+    T: NodeStore
+        + BranchStore
+        + SessionStore
+        + BranchConfigStore
+        + SkillStore
+        + JobStore
+        + RuntimeStore
+{
+}

@@ -1,7 +1,7 @@
 use std::fs;
 
 use coco_mem::{
-    FsStore, SessionRole, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersion, SkillVersionSpec,
+    SessionRole, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersion, SkillVersionSpec,
 };
 use serde::Serialize;
 use snafu::prelude::*;
@@ -44,7 +44,7 @@ struct SkillVersionView {
 
 pub(super) async fn run_skill_command(
     command: SkillCommand,
-    store: &FsStore,
+    store: &impl SkillStore,
 ) -> Result<Option<String>> {
     match command.command {
         SkillSubcommand::Add(command) => Ok(Some(render_json(run_skill_add(command, store)?))),
@@ -59,7 +59,7 @@ pub(super) async fn run_skill_command(
     }
 }
 
-fn run_skill_add(command: SkillAddCommand, store: &FsStore) -> Result<SkillSummaryView> {
+fn run_skill_add(command: SkillAddCommand, store: &impl SkillStore) -> Result<SkillSummaryView> {
     let body = read_skill_body(&command.file)?;
     let record = store
         .add_skill(
@@ -75,7 +75,10 @@ fn run_skill_add(command: SkillAddCommand, store: &FsStore) -> Result<SkillSumma
     Ok(skill_summary_view(command.role.into(), &record))
 }
 
-fn run_skill_update(command: SkillUpdateCommand, store: &FsStore) -> Result<SkillSummaryView> {
+fn run_skill_update(
+    command: SkillUpdateCommand,
+    store: &impl SkillStore,
+) -> Result<SkillSummaryView> {
     let patch = SkillUpdatePatch {
         description: command.description,
         body: command
@@ -97,14 +100,20 @@ fn run_skill_update(command: SkillUpdateCommand, store: &FsStore) -> Result<Skil
     Ok(skill_summary_view(command.role.into(), &record))
 }
 
-fn run_skill_rollback(command: SkillRollbackCommand, store: &FsStore) -> Result<SkillSummaryView> {
+fn run_skill_rollback(
+    command: SkillRollbackCommand,
+    store: &impl SkillStore,
+) -> Result<SkillSummaryView> {
     let record = store
         .rollback_skill(command.role.into(), &command.name, command.to_version)
         .context(StoreSnafu)?;
     Ok(skill_summary_view(command.role.into(), &record))
 }
 
-fn run_skill_list(command: SkillListCommand, store: &FsStore) -> Result<Vec<SkillSummaryView>> {
+fn run_skill_list(
+    command: SkillListCommand,
+    store: &impl SkillStore,
+) -> Result<Vec<SkillSummaryView>> {
     let roles = command
         .role
         .map(Into::into)
@@ -123,7 +132,7 @@ fn run_skill_list(command: SkillListCommand, store: &FsStore) -> Result<Vec<Skil
     Ok(skills)
 }
 
-fn run_skill_show(command: SkillShowCommand, store: &FsStore) -> Result<SkillShowView> {
+fn run_skill_show(command: SkillShowCommand, store: &impl SkillStore) -> Result<SkillShowView> {
     let role: SessionRole = command.role.into();
     let record = store.get_skill(role, &command.name).context(StoreSnafu)?;
     let versions = record
