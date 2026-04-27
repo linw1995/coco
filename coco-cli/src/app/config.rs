@@ -32,6 +32,7 @@ impl ProviderProfiles {
         Self { profiles }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_profiles(profiles: HashMap<String, ProviderProfile>) -> Self {
         Self::new(profiles)
     }

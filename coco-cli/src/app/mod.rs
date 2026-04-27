@@ -6,17 +6,20 @@ use coco_core::ConversationEngine;
 use coco_core::CoreSkillToolExecutor;
 use coco_llm::{
     BashToolCliBridgeHandle, CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge,
-    LlmService, ProviderRuntimeConfig, RigBackend, SessionConfig,
+    LlmService, ProviderRuntimeConfig, RigBackend,
 };
 use coco_mem::{ProviderProfileStore, Store};
 use snafu::prelude::*;
 
+#[cfg(test)]
+use crate::cli::SessionCreateCommand;
 use crate::{
     Cli, Result,
-    cli::SessionCreateCommand,
     error::{LlmSnafu, StoreSnafu},
-    store::open_store,
+    store::open_store_for_command,
 };
+#[cfg(test)]
+use coco_llm::SessionConfig;
 
 pub(crate) mod config;
 pub(crate) mod daemon;
@@ -38,7 +41,7 @@ where
     B: CompletionBackend + 'static,
     R: Read,
 {
-    let shared_store = open_store(&cli.store_path)?;
+    let shared_store = open_store_for_command(&cli.store_path, &cli.command)?;
     let provider_profiles = config::load_cwd_provider_profiles()?;
     let provider_configs = resolve_provider_runtime_configs(&provider_profiles)?;
     let llm = build_llm_service(
@@ -202,7 +205,7 @@ where
     runtime::run_forwarded_with_services(inputs, services).await
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionConfig> {
     let mut profiles = HashMap::new();
     profiles.insert(

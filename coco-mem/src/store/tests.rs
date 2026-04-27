@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use super::fs::FsStore;
@@ -2013,6 +2014,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     let store = FsStore::open(&path).unwrap();
 
     assert!(path.join("meta.json").is_file());
+    assert!(path.join("store.lock").is_file());
     assert!(path.join("nodes.jsonl").is_file());
     assert!(path.join("sessions.json").is_file());
     assert!(path.join("branch-configs.json").is_file());
@@ -2035,6 +2037,84 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     let nodes = fs::read_to_string(path.join("nodes.jsonl")).unwrap();
     assert!(nodes.lines().count() >= 1);
     assert_eq!(store.ancestry(&store.root_id()).unwrap().len(), 1);
+}
+
+#[test]
+fn open_rejects_store_locked_by_another_owner() {
+    let (_tempdir, path) = temp_store_path();
+    fs::create_dir_all(&path).unwrap();
+    let lock_path = path.join("store.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(result, 0);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::StoreLocked { path: locked } if locked == path));
+}
+
+#[test]
+fn open_read_only_allows_store_locked_by_another_owner() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    drop(store);
+
+    let lock_path = path.join("store.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(result, 0);
+
+    let read_only = FsStore::open_read_only(&path).unwrap();
+
+    assert_eq!(read_only.get_branch_head("main").unwrap(), root_id);
+    let err = read_only
+        .append(make_text_node(&root_id, "read-only write"))
+        .unwrap_err();
+    assert!(matches!(err, Error::StoreReadOnly { path: locked } if locked == path));
+}
+
+#[test]
+fn open_read_only_does_not_create_missing_history_directories() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    drop(store);
+
+    fs::write(
+        path.join("skills.json"),
+        r#"{"orchestrator":{},"runner":{}}"#,
+    )
+    .unwrap();
+    fs::remove_dir_all(path.join("branch-config-history")).unwrap();
+    fs::remove_dir_all(path.join("skill-history")).unwrap();
+
+    let lock_path = path.join("store.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(result, 0);
+
+    let read_only = FsStore::open_read_only(&path).unwrap();
+
+    assert_eq!(read_only.root_id(), root_id);
+    assert!(!path.join("branch-config-history").exists());
+    assert!(!path.join("skill-history").exists());
 }
 
 #[test]

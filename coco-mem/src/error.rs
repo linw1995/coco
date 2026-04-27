@@ -96,6 +96,12 @@ pub enum StoreError {
     #[snafu(display("Store path {path:?} is not a directory"))]
     StorePathIsNotDirectory { path: PathBuf },
 
+    #[snafu(display("Store at {path:?} is locked by another process"))]
+    StoreLocked { path: PathBuf },
+
+    #[snafu(display("Store at {path:?} was opened read-only"))]
+    StoreReadOnly { path: PathBuf },
+
     #[snafu(display("Failed to create or access store directory {path:?}: {source}"))]
     WriteStoreDirectory {
         path: PathBuf,

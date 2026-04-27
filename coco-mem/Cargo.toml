@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 jiff = { version = "0.2.23", features = ["serde"] }
+libc = "0.2.178"
 nanoid.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -304,6 +304,7 @@ name = "coco-mem"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "libc",
  "nanoid",
  "serde",
  "serde_json",
