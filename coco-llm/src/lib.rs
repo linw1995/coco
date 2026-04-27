@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use skill::{
     BranchHandoff, ExecutorError, SearchSkillToolRequest, SkillToolExecutionResult,
-    SkillToolExecutor, SkillToolHandoff, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
+    SkillToolExecutor, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
 };
 
 pub use coco_mem;
@@ -302,13 +302,7 @@ pub(crate) struct ToolInvocationContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolExecutionOutcome {
-    ToolResult {
-        provider_output: String,
-    },
-    BranchHandoff {
-        provider_output: String,
-        handoff: SkillToolHandoff,
-    },
+    ToolResult { provider_output: String },
 }
 
 impl ToolExecutionOutcome {
@@ -318,17 +312,9 @@ impl ToolExecutionOutcome {
         }
     }
 
-    pub fn branch_handoff(provider_output: impl Into<String>, handoff: SkillToolHandoff) -> Self {
-        Self::BranchHandoff {
-            provider_output: provider_output.into(),
-            handoff,
-        }
-    }
-
     pub fn provider_output(&self) -> &str {
         match self {
-            Self::ToolResult { provider_output }
-            | Self::BranchHandoff {
+            Self::ToolResult {
                 provider_output, ..
             } => provider_output,
         }
@@ -340,14 +326,6 @@ impl ToolExecutionOutcome {
                 id: tool_id,
                 output: provider_output,
             }),
-            Self::BranchHandoff { handoff, .. } => {
-                BackendEventPayload::BranchHandoff(BranchHandoff {
-                    tool_id,
-                    skill_name: handoff.skill_name,
-                    merge_parent: handoff.merge_parent,
-                    output: handoff.output,
-                })
-            }
         };
 
         BackendEvent::new(event).with_metadata(Some(ProviderMetadata::new(call_id)))

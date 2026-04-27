@@ -739,7 +739,6 @@ description: "Review Rust changes."
                     SessionRole::Orchestrator,
                     &tool_use_id,
                     "fast-rust",
-                    Some("Review the change"),
                 )
                 .await
         },
@@ -748,8 +747,6 @@ description: "Review Rust changes."
     .unwrap();
 
     assert_eq!(result.result.text, "child result");
-    assert_eq!(result.handoff.skill_name, "fast-rust");
-    assert_eq!(result.handoff.output, "child result");
 
     let calls = calls.lock().await;
     assert_eq!(calls.len(), 1);
@@ -768,8 +765,8 @@ description: "Review Rust changes."
     ));
     assert!(store.list_jobs().unwrap().is_empty());
 
-    let ancestry = store.ancestry(&result.handoff.merge_parent).unwrap();
-    let child_session_anchor = ancestry
+    let children = store.list_children(&tool_use_id).unwrap();
+    let child_session_anchor = children
         .iter()
         .find_map(|node| match &node.kind {
             Kind::Anchor(anchor) => anchor.as_session().map(|session| (node, session)),
@@ -784,16 +781,11 @@ description: "Review Rust changes."
             .contains("You are executing the skill `fast-rust`")
     );
     assert!(
-        child_session_anchor
+        !child_session_anchor
             .1
             .prompt
-            .contains("Additional task from caller:\nReview the change")
+            .contains("Additional task from caller:")
     );
-    let parent_tool_use = ancestry
-        .iter()
-        .find(|node| node.id == tool_use_id)
-        .expect("child ancestry should keep the originating tool_use node");
-    assert_eq!(parent_tool_use.parent, base_session.anchor_id);
 }
 
 #[tokio::test]
@@ -829,7 +821,6 @@ description: "Review Rust changes."
                     SessionRole::Orchestrator,
                     &tool_use_id,
                     "fast-rust",
-                    None,
                 )
                 .await
         },

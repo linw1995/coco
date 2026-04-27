@@ -141,20 +141,12 @@ fn parse_use_request(
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .context(MissingSkillNameSnafu)?;
-    let task = object
-        .get("task")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|task| !task.is_empty())
-        .map(str::to_owned);
-
     Ok(UseSkillToolRequest {
         workspace_root,
         session_branch,
         session_role,
         parent_tool_use_id,
         skill_name,
-        task,
     })
 }
 
@@ -199,18 +191,9 @@ impl SkillToolRuntime {
                     Ok(result) => {
                         let output = serde_json::to_string_pretty(&result.result)
                             .context(SerializeOutputSnafu)?;
-                        Ok(ToolExecutionOutcome::branch_handoff(output, result.handoff))
+                        Ok(ToolExecutionOutcome::tool_result(output))
                     }
-                    Err(error) => {
-                        if let Some(handoff) = error.skill_handoff().cloned() {
-                            Ok(ToolExecutionOutcome::branch_handoff(
-                                error.to_string(),
-                                handoff,
-                            ))
-                        } else {
-                            Err(error.into())
-                        }
-                    }
+                    Err(error) => Ok(ToolExecutionOutcome::tool_result(error.to_string())),
                 }
             }
         }
@@ -253,9 +236,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::{
-        SkillToolExecutionResult, SkillToolExecutor, SkillToolHandoff, SkillToolRunResult,
-    };
+    use crate::{SkillToolExecutionResult, SkillToolExecutor, SkillToolRunResult};
 
     fn search_tool_definition() -> Tool {
         crate::builtin_tool_definition("search_skill").expect("builtin tool should exist")
@@ -310,11 +291,6 @@ mod tests {
                 result: SkillToolRunResult {
                     text: "Executed skill result".to_owned(),
                 },
-                handoff: SkillToolHandoff {
-                    skill_name: "find-skills".to_owned(),
-                    merge_parent: "node-1".to_owned(),
-                    output: "Executed skill result".to_owned(),
-                },
             })
         }
     }
@@ -368,7 +344,7 @@ mod tests {
 
         let outcome = runtime
             .execute(
-                r#"{"name":"find-skills","task":"Search the ecosystem"}"#.to_owned(),
+                r#"{"name":"find-skills"}"#.to_owned(),
                 ToolInvocationContext {
                     persisted_tool_use_node_id: Some("tool-use-node".to_owned()),
                 },
@@ -376,22 +352,11 @@ mod tests {
             .await
             .unwrap();
         let requests = use_requests.lock().await;
-        let (provider_output, handoff) = match outcome {
-            ToolExecutionOutcome::BranchHandoff {
-                provider_output,
-                handoff,
-            } => (provider_output, handoff),
-            ToolExecutionOutcome::ToolResult { .. } => {
-                panic!("expected branch handoff outcome")
-            }
-        };
+        let ToolExecutionOutcome::ToolResult { provider_output } = outcome;
         let value: Value = serde_json::from_str(&provider_output).unwrap();
 
         assert_eq!(value.as_object().expect("expected JSON object").len(), 1);
         assert_eq!(value["text"], "Executed skill result");
-        assert_eq!(handoff.skill_name, "find-skills");
-        assert_eq!(handoff.merge_parent, "node-1");
-        assert_eq!(handoff.output, "Executed skill result");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].workspace_root, workspace_root);
         assert_eq!(requests[0].session_branch, "main");
@@ -401,7 +366,6 @@ mod tests {
         );
         assert_eq!(requests[0].parent_tool_use_id, "tool-use-node");
         assert_eq!(requests[0].skill_name, "find-skills");
-        assert_eq!(requests[0].task.as_deref(), Some("Search the ecosystem"));
     }
 
     #[tokio::test]
@@ -443,18 +407,13 @@ mod tests {
         ) -> std::result::Result<SkillToolExecutionResult, crate::ExecutorError> {
             Err(crate::ExecutorError::OperationFailed {
                 message: "delegated failure".to_owned(),
-                handoff: Some(SkillToolHandoff {
-                    skill_name: "find-skills".to_owned(),
-                    merge_parent: "node-failure".to_owned(),
-                    output: "delegated failure".to_owned(),
-                }),
                 source: None,
             })
         }
     }
 
     #[tokio::test]
-    async fn use_skill_runtime_records_handoff_even_when_executor_fails() {
+    async fn use_skill_runtime_returns_executor_errors_as_tool_results() {
         let workspace_root = std::env::temp_dir().join("skill-tool-use-failure");
         let runtime = run_runtime(
             run_tool_definition(),
@@ -471,19 +430,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let (provider_output, handoff) = match outcome {
-            ToolExecutionOutcome::BranchHandoff {
-                provider_output,
-                handoff,
-            } => (provider_output, handoff),
-            ToolExecutionOutcome::ToolResult { .. } => {
-                panic!("expected branch handoff outcome")
-            }
-        };
+        let ToolExecutionOutcome::ToolResult { provider_output } = outcome;
 
         assert_eq!(provider_output, "delegated failure");
-        assert_eq!(handoff.skill_name, "find-skills");
-        assert_eq!(handoff.merge_parent, "node-failure");
-        assert_eq!(handoff.output, "delegated failure");
     }
 }

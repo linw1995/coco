@@ -52,10 +52,6 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                     "name": {
                         "type": "string",
                         "description": "The exact skill name returned by search_skill."
-                    },
-                    "task": {
-                        "type": "string",
-                        "description": "Optional task specialization for the skill run."
                     }
                 },
                 "required": ["name"],

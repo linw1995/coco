@@ -156,8 +156,7 @@ impl CompletionBackend for UseSkillBackend {
                         "function": {
                             "name": "use_skill",
                             "arguments": {
-                                "name": "fast-rust",
-                                "task": "Review the change"
+                                "name": "fast-rust"
                             }
                         },
                         "signature": null,
@@ -940,24 +939,20 @@ description: "Review Rust changes."
             )
         })
         .expect("expected use_skill tool use on main");
-    let handoff_anchor = ancestry
+    let tool_result = ancestry
         .iter()
         .find_map(|node| match &node.kind {
-            Kind::Anchor(anchor) => anchor
-                .as_skill_result()
-                .map(|skill_result| (anchor, skill_result)),
+            Kind::ToolResult(result) if result.id == "tool-call-1" => Some(result),
             _ => None,
         })
-        .expect("expected skill handoff anchor on main");
-    assert_eq!(handoff_anchor.1.skill_name, "fast-rust");
-    assert_eq!(handoff_anchor.1.output, "delegated output");
+        .expect("expected use_skill tool result on main");
+    let value: serde_json::Value = serde_json::from_str(&tool_result.output).unwrap();
+    assert_eq!(value["text"], "delegated output");
+    assert!(!ancestry.iter().any(|node| matches!(
+        &node.kind,
+        Kind::Anchor(anchor) if anchor.as_skill_result().is_some()
+    )));
 
-    let merge_parent = handoff_anchor
-        .0
-        .merge_parents()
-        .first()
-        .expect("skill handoff should keep child merge parent")
-        .clone();
     let children = store.list_children(&tool_use.id).unwrap();
     let child_session_anchor = children
         .iter()
@@ -968,21 +963,18 @@ description: "Review Rust changes."
         .expect("expected child session anchor under use_skill");
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
     assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
-    let child_ancestry = store.ancestry(&merge_parent).unwrap();
     assert!(
-        child_ancestry
-            .iter()
-            .any(|node| node.id == child_session_anchor.0.id)
+        child_session_anchor
+            .1
+            .prompt
+            .contains("You are executing the skill `fast-rust`")
     );
-    let child_prompt = child_ancestry
-        .iter()
-        .find_map(|node| match &node.kind {
-            Kind::Anchor(anchor) => anchor.as_session().map(|session| session.prompt.as_str()),
-            _ => None,
-        })
-        .expect("child skill execution should persist its session prompt");
-    assert!(child_prompt.contains("You are executing the skill `fast-rust`"));
-    assert!(child_prompt.contains("Additional task from caller:\nReview the change"));
+    assert!(
+        !child_session_anchor
+            .1
+            .prompt
+            .contains("Additional task from caller:")
+    );
 }
 
 #[tokio::test]
@@ -1091,27 +1083,19 @@ description: "Review Rust changes."
             _ => None,
         })
         .expect("expected child session anchor under tool use");
-    let (handoff_node, handoff_anchor, skill_result) = children
+    let tool_result = children
         .iter()
         .find_map(|node| match &node.kind {
-            Kind::Anchor(anchor) => anchor
-                .as_skill_result()
-                .map(|skill_result| (node, anchor, skill_result)),
+            Kind::ToolResult(result) if result.id == "tool-call-1" => Some(result),
             _ => None,
         })
-        .expect("expected skill handoff anchor under tool use");
+        .expect("expected use_skill failure as parent tool result");
 
-    assert_eq!(skill_result.skill_name, "fast-rust");
-    assert_eq!(
-        skill_result.output,
-        "Backend call failed: delegated failure"
-    );
-    let merge_parent = handoff_anchor
-        .merge_parents()
-        .first()
-        .expect("expected child failure merge parent")
-        .clone();
-    assert_eq!(handoff_node.parent, tool_use.id);
+    assert_eq!(tool_result.output, "Backend call failed: delegated failure");
+    assert!(!children.iter().any(|node| matches!(
+        &node.kind,
+        Kind::Anchor(anchor) if anchor.as_skill_result().is_some()
+    )));
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
     assert!(
         child_session_anchor
@@ -1120,11 +1104,11 @@ description: "Review Rust changes."
             .contains("You are executing the skill `fast-rust`")
     );
 
-    let child_failure = store.get_node(&merge_parent).unwrap();
-    assert!(matches!(
-        &child_failure.kind,
+    let child_session_children = store.list_children(&child_session_anchor.0.id).unwrap();
+    assert!(child_session_children.iter().any(|node| matches!(
+        &node.kind,
         Kind::Failure(text) if text == "delegated failure"
-    ));
+    )));
 }
 
 #[tokio::test]

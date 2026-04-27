@@ -15,7 +15,6 @@ pub struct SkillToolRequest {
     pub skill_body: String,
     pub session_role: SessionRole,
     pub enable_coco_shim: bool,
-    pub task: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,16 +23,8 @@ pub struct SkillToolRunResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillToolHandoff {
-    pub skill_name: String,
-    pub merge_parent: String,
-    pub output: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillToolExecutionResult {
     pub result: SkillToolRunResult,
-    pub handoff: SkillToolHandoff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +42,6 @@ pub struct UseSkillToolRequest {
     pub session_role: SessionRole,
     pub parent_tool_use_id: String,
     pub skill_name: String,
-    pub task: Option<String>,
 }
 
 #[derive(Debug, Snafu)]
@@ -63,19 +53,9 @@ pub enum ExecutorError {
     #[snafu(display("{message}"))]
     OperationFailed {
         message: String,
-        handoff: Option<SkillToolHandoff>,
         #[snafu(source(false))]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
-}
-
-impl ExecutorError {
-    pub fn skill_handoff(&self) -> Option<&SkillToolHandoff> {
-        match self {
-            Self::OperationFailed { handoff, .. } => handoff.as_ref(),
-            Self::Unavailable => None,
-        }
-    }
 }
 
 #[async_trait]

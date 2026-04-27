@@ -12,7 +12,7 @@ use coco_llm::coco_mem::{
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
     Error as LlmError, ExecutorError, LlmService, SearchSkillToolRequest, SkillToolExecutionResult,
-    SkillToolExecutor, SkillToolHandoff, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
+    SkillToolExecutor, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
 };
 use indoc::formatdoc;
 use serde::Serialize;
@@ -97,7 +97,6 @@ impl From<SkillError> for ExecutorError {
     fn from(error: SkillError) -> Self {
         Self::OperationFailed {
             message: error.to_string(),
-            handoff: None,
             source: Some(Box::new(error)),
         }
     }
@@ -107,7 +106,6 @@ impl From<EngineError> for ExecutorError {
     fn from(error: EngineError) -> Self {
         Self::OperationFailed {
             message: error.to_string(),
-            handoff: None,
             source: Some(Box::new(error)),
         }
     }
@@ -189,38 +187,18 @@ where
             skill_body: skill.body,
             session_role: skill.session_role,
             enable_coco_shim: skill.enable_coco_shim,
-            task: request.task,
         };
 
         engine
             .execute_resolved_skill(skill_request)
             .await
-            .map_err(|error| executor_error_from_llm_error(&skill.name, error))
+            .map_err(executor_error_from_llm_error)
     }
 }
 
-fn handoff_from_llm_error(
-    skill_name: &str,
-    output: &str,
-    error: &LlmError,
-) -> Option<SkillToolHandoff> {
-    match error {
-        LlmError::Backend { context, .. } => Some(SkillToolHandoff {
-            skill_name: skill_name.to_owned(),
-            merge_parent: context.error_node_id.clone(),
-            output: output.to_owned(),
-        }),
-        LlmError::UseSkillWorkflowFailedCleanup { workflow, .. } => {
-            handoff_from_llm_error(skill_name, output, workflow)
-        }
-        _ => None,
-    }
-}
-
-fn executor_error_from_llm_error(skill_name: &str, error: LlmError) -> ExecutorError {
+fn executor_error_from_llm_error(error: LlmError) -> ExecutorError {
     let message = error.to_string();
     ExecutorError::OperationFailed {
-        handoff: handoff_from_llm_error(skill_name, &message, &error),
         message,
         source: Some(Box::new(error)),
     }
@@ -263,7 +241,6 @@ where
         session_role: SessionRole,
         parent_tool_use_id: &str,
         skill_name: &str,
-        task: Option<&str>,
     ) -> std::result::Result<SkillToolExecutionResult, EngineError> {
         let skill = resolve_skill(
             workspace_root,
@@ -280,7 +257,6 @@ where
             skill_body: skill.body,
             session_role: skill.session_role,
             enable_coco_shim: skill.enable_coco_shim,
-            task: task.map(str::to_owned),
         };
         self.execute_resolved_skill(request)
             .await
@@ -332,11 +308,6 @@ where
             (Ok(result), Ok(())) => Ok(SkillToolExecutionResult {
                 result: SkillToolRunResult {
                     text: result.text.clone(),
-                },
-                handoff: SkillToolHandoff {
-                    skill_name: request.skill_name,
-                    merge_parent: result.branch_head,
-                    output: result.text,
                 },
             }),
             (Err(workflow), Ok(())) => Err(workflow),
@@ -433,11 +404,11 @@ fn temporary_skill_branch_name(base_branch: &str, skill_name: &str) -> String {
 }
 
 fn skill_execution_prompt(request: &SkillToolRequest) -> String {
-    let mut prompt = formatdoc!(
+    formatdoc!(
         "
         You are executing the skill `{}` on an isolated child branch forked from `{}`.
         Follow the skill instructions below and do all exploration on this child branch only.
-        When finished, return only the final handoff content that should be carried back to the base branch.
+        When finished, return only the final result that should be sent back to the caller.
 
         Skill description:
         {}
@@ -457,20 +428,7 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         request.skill_path,
         request.session_role.as_str(),
         request.skill_body,
-    );
-    if let Some(task) = &request.task
-        && !task.trim().is_empty()
-    {
-        prompt.push_str(&formatdoc!(
-            "
-
-            Additional task from caller:
-            {}
-            ",
-            task.trim(),
-        ));
-    }
-    prompt
+    )
 }
 
 fn configured_skill_roots(workspace_root: &Path) -> std::result::Result<Vec<PathBuf>, SkillError> {
@@ -847,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_execution_prompt_includes_skill_context_and_optional_task() {
+    fn skill_execution_prompt_includes_skill_context() {
         let prompt = skill_execution_prompt(&SkillToolRequest {
             base_branch: "main".to_owned(),
             parent_tool_use_id: "tool-use-node".to_owned(),
@@ -857,7 +815,6 @@ mod tests {
             skill_body: "# Find Skills".to_owned(),
             session_role: SessionRole::Runner,
             enable_coco_shim: true,
-            task: Some("Search the ecosystem".to_owned()),
         });
 
         assert!(prompt.contains("skill `find-skills`"));
@@ -866,23 +823,6 @@ mod tests {
         assert!(prompt.contains("Skill source:\n/tmp/find-skills/SKILL.md"));
         assert!(prompt.contains("Skill session role:\nrunner"));
         assert!(prompt.contains("Skill instructions:\n# Find Skills"));
-        assert!(prompt.contains("Additional task from caller:\nSearch the ecosystem"));
-    }
-
-    #[test]
-    fn skill_execution_prompt_skips_blank_optional_task() {
-        let prompt = skill_execution_prompt(&SkillToolRequest {
-            base_branch: "main".to_owned(),
-            parent_tool_use_id: "tool-use-node".to_owned(),
-            skill_name: "find-skills".to_owned(),
-            skill_description: "Find relevant skills.".to_owned(),
-            skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
-            skill_body: "# Find Skills".to_owned(),
-            session_role: SessionRole::Runner,
-            enable_coco_shim: false,
-            task: Some("   ".to_owned()),
-        });
-
         assert!(!prompt.contains("Additional task from caller:"));
     }
 
