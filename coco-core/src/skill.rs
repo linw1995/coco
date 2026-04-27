@@ -270,24 +270,8 @@ where
         let service = self.service();
         let store = service.store();
         let child_branch = temporary_skill_branch_name(&request.base_branch, &request.skill_name);
-        let child_session_anchor_id = store
-            .append(NewNode {
-                parent: request.parent_tool_use_id.clone(),
-                role: Role::System,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::session(
-                    vec![],
-                    child_session_anchor(
-                        resolve_session_anchor(store, &request.parent_tool_use_id)?,
-                        skill_execution_prompt(&request),
-                        request.session_role,
-                        request.enable_coco_shim,
-                    ),
-                )),
-            })
-            .map_err(|source| LlmError::Memory {
-                source: Box::new(source),
-            })?;
+        ensure_use_skill_node(store, &request.parent_tool_use_id)?;
+        let child_session_anchor_id = append_skill_session_anchor(store, &request)?;
 
         store
             .fork(&child_branch, &child_session_anchor_id)
@@ -324,60 +308,91 @@ where
     }
 }
 
-fn resolve_session_anchor<S>(
+fn ensure_use_skill_node<S>(store: &S, reference: &str) -> std::result::Result<(), LlmError>
+where
+    S: NodeStore,
+{
+    let node = store
+        .get_node(reference)
+        .map_err(|source| LlmError::Memory {
+            source: Box::new(source),
+        })?;
+
+    if matches!(&node.kind, Kind::ToolUse(ToolUse { name, .. }) if name == "use_skill") {
+        return Ok(());
+    }
+
+    Err(LlmError::InvalidAnchor {
+        anchor_id: reference.to_owned(),
+    })
+}
+
+fn append_skill_session_anchor<S>(
     store: &S,
-    reference: &str,
+    request: &SkillToolRequest,
+) -> std::result::Result<String, LlmError>
+where
+    S: NodeStore,
+{
+    let inherited = resolve_parent_session_anchor(store, &request.parent_tool_use_id)?;
+    store
+        .append(NewNode {
+            parent: request.parent_tool_use_id.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(
+                vec![],
+                SessionAnchor {
+                    role: request.session_role,
+                    provider_profile: inherited.provider_profile,
+                    provider: inherited.provider,
+                    model: inherited.model,
+                    tools: inherited.tools,
+                    system_prompt: inherited.system_prompt,
+                    prompt: skill_execution_prompt(request),
+                    temperature: inherited.temperature,
+                    max_tokens: inherited.max_tokens,
+                    additional_params: inherited.additional_params,
+                    enable_coco_shim: request.enable_coco_shim,
+                },
+            )),
+        })
+        .map_err(|source| LlmError::Memory {
+            source: Box::new(source),
+        })
+}
+
+fn resolve_parent_session_anchor<S>(
+    store: &S,
+    start_id: &str,
 ) -> std::result::Result<SessionAnchor, LlmError>
 where
     S: NodeStore,
 {
-    let ancestry = store
-        .ancestry(reference)
+    let mut node = store
+        .get_node(start_id)
         .map_err(|source| LlmError::Memory {
             source: Box::new(source),
         })?;
-    let head = ancestry.first().ok_or_else(|| LlmError::InvalidAnchor {
-        anchor_id: reference.to_owned(),
-    })?;
 
-    match &head.kind {
-        Kind::ToolUse(ToolUse { name, .. }) if name == "use_skill" => {}
-        _ => {
+    loop {
+        if let Kind::Anchor(anchor) = &node.kind
+            && let Some(session) = anchor.as_session()
+        {
+            return Ok(session.clone());
+        }
+
+        if node.is_root() {
             return Err(LlmError::InvalidAnchor {
-                anchor_id: reference.to_owned(),
+                anchor_id: start_id.to_owned(),
             });
         }
-    }
 
-    ancestry
-        .into_iter()
-        .find_map(|node| match &node.kind {
-            Kind::Anchor(anchor) => anchor.as_session().cloned(),
-            _ => None,
-        })
-        .ok_or_else(|| LlmError::InvalidAnchor {
-            anchor_id: reference.to_owned(),
-        })
-}
-
-fn child_session_anchor(
-    parent: SessionAnchor,
-    prompt: String,
-    session_role: SessionRole,
-    enable_coco_shim: bool,
-) -> SessionAnchor {
-    SessionAnchor {
-        role: session_role,
-        provider_profile: parent.provider_profile,
-        provider: parent.provider,
-        model: parent.model,
-        tools: parent.tools,
-        system_prompt: parent.system_prompt,
-        prompt,
-        temperature: parent.temperature,
-        max_tokens: parent.max_tokens,
-        additional_params: parent.additional_params,
-        enable_coco_shim,
+        node = store
+            .get_node(&node.parent)
+            .map_err(|source| LlmError::Memory {
+                source: Box::new(source),
+            })?;
     }
 }
 

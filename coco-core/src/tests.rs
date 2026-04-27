@@ -721,6 +721,8 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
         r#"---
 name: "fast-rust"
 description: "Review Rust changes."
+session_role: "runner"
+enable_coco_shim: true
 ---
 
 # Fast Rust
@@ -774,6 +776,8 @@ description: "Review Rust changes."
         })
         .expect("child execution should persist a child session anchor");
     assert_eq!(child_session_anchor.0.parent, tool_use_id);
+    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
+    assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
         child_session_anchor
             .1
@@ -786,6 +790,11 @@ description: "Review Rust changes."
             .prompt
             .contains("Additional task from caller:")
     );
+    let child_session_children = store.list_children(&child_session_anchor.0.id).unwrap();
+    assert!(!child_session_children.iter().any(|node| matches!(
+        &node.kind,
+        Kind::Anchor(anchor) if anchor.as_prompt().is_some()
+    )));
 }
 
 #[tokio::test]

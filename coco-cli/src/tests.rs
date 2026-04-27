@@ -868,6 +868,8 @@ async fn prompt_wires_skill_executor_for_use_skill() {
         r#"---
 name: "fast-rust"
 description: "Review Rust changes."
+session_role: "runner"
+enable_coco_shim: true
 ---
 
 # Fast Rust
@@ -963,6 +965,7 @@ description: "Review Rust changes."
         .expect("expected child session anchor under use_skill");
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
     assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
+    assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
         child_session_anchor
             .1
@@ -1015,6 +1018,8 @@ async fn prompt_keeps_failed_use_skill_child_visible_under_tool_use() {
         r#"---
 name: "fast-rust"
 description: "Review Rust changes."
+session_role: "runner"
+enable_coco_shim: true
 ---
 
 # Fast Rust
@@ -1097,6 +1102,8 @@ description: "Review Rust changes."
         Kind::Anchor(anchor) if anchor.as_skill_result().is_some()
     )));
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
+    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
+    assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
         child_session_anchor
             .1
