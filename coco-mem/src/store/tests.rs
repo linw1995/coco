@@ -1649,6 +1649,20 @@ where
     assert_eq!(runner.current_version, 1);
     assert!(orchestrator.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
+    assert!(
+        orchestrator
+            .current()
+            .unwrap()
+            .body
+            .contains("fork from the node before the `use_skill` ToolUse")
+    );
+    assert!(
+        orchestrator
+            .current()
+            .unwrap()
+            .body
+            .contains("coco session rebase --branch \"$RUNNER_BRANCH\" --role runner --tool bash --tool search_skill")
+    );
 }
 
 macro_rules! define_common_store_tests {

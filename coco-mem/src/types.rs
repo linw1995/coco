@@ -321,36 +321,12 @@ pub fn default_skill_groups() -> SkillGroups {
         SkillRecord::new(
             "coco-orchestrator",
             SkillVersionSpec {
-                description: "Guide an orchestrator session through CoCo branch and prompt workflows."
+                description:
+                    "Guide an orchestrator session through CoCo branch and prompt workflows."
+                        .to_owned(),
+                body: include_str!("default_skills/coco-orchestrator.md")
+                    .trim()
                     .to_owned(),
-                body: r#"
-# CoCo Orchestrator Workflow
-
-Use the injected `coco` command through `bash` whenever you need branch-aware session workflow control.
-
-Useful commands:
-- `coco session list`
-- `coco session get --branch <branch>`
-- `coco session show <ref>`
-- `coco session fork --branch <branch> --from-ref <ref>`
-- `coco session pr --branch <branch> --target-branch <branch>`
-- `coco session feedback --branch <branch> --prompt "<text>"`
-- `coco session merge --branch <branch> --target-branch <branch> --prompt "<text>"`
-- `coco preset list`
-- `coco preset show --name <preset>`
-- `coco preset set --name <preset> [session options]`
-- `coco session rebase --preset <preset> --branch <branch>`
-- `coco prompt --branch <branch> "<text>"`
-- `coco prompt status --job <job>`
-- `coco prompt branch-status --job <job> --branch <branch>`
-
-Guidelines:
-- Prefer `coco` over editing store files directly.
-- Use orchestrator sessions for coordination, branching, and merge decisions.
-- Hand off bounded implementation work to runner sessions when orchestration is no longer needed.
-"#
-                .trim()
-                .to_owned(),
                 enable_coco_shim: true,
             },
         ),
@@ -360,28 +336,12 @@ Guidelines:
         SkillRecord::new(
             "coco-runner",
             SkillVersionSpec {
-                description: "Guide a runner session through the CoCo commands available in runner scope."
+                description:
+                    "Guide a runner session through the CoCo commands available in runner scope."
+                        .to_owned(),
+                body: include_str!("default_skills/coco-runner.md")
+                    .trim()
                     .to_owned(),
-                body: r#"
-# CoCo Runner Workflow
-
-Use the injected `coco` command through `bash` for runner-safe visibility and status inspection.
-
-Useful commands:
-- `coco session list`
-- `coco session get --branch <branch>`
-- `coco session graph`
-- `coco session show <ref>`
-- `coco prompt status --job <job>`
-- `coco prompt branch-status --job <job> --branch <branch>`
-
-Guidelines:
-- Runner-scoped `coco` is read-oriented and intentionally hides write entrypoints.
-- Use runner sessions for isolated execution, inspection, and handoff preparation.
-- If you need workflow mutations such as create, merge, feedback, or prompt submission, hand back to an orchestrator session.
-"#
-                .trim()
-                .to_owned(),
                 enable_coco_shim: true,
             },
         ),
