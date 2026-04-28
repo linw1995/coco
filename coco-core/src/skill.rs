@@ -293,6 +293,7 @@ where
                 result: SkillToolRunResult {
                     text: result.text.clone(),
                 },
+                response_node_id: result.response_node_id,
             }),
             (Err(workflow), Ok(())) => Err(workflow),
             (Ok(_), Err(cleanup)) => Err(LlmError::UseSkillCleanup {

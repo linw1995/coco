@@ -25,6 +25,7 @@ pub struct SkillToolRunResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillToolExecutionResult {
     pub result: SkillToolRunResult,
+    pub response_node_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +73,7 @@ pub trait SkillToolExecutor: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchHandoff {
+pub struct SkillResultEvent {
     pub tool_id: String,
     pub skill_name: String,
     pub merge_parent: String,

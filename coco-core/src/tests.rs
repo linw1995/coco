@@ -770,6 +770,11 @@ enable_coco_shim: true
     .unwrap();
 
     assert_eq!(result.result.text, "child result");
+    let response_node = store.get_node(&result.response_node_id).unwrap();
+    assert!(matches!(
+        response_node.kind,
+        Kind::Text(ref text) if text == "child result"
+    ));
 
     let calls = calls.lock().await;
     assert_eq!(calls.len(), 1);

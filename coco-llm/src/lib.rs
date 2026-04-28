@@ -27,7 +27,7 @@ use snafu::prelude::*;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use skill::{
-    BranchHandoff, ExecutorError, SearchSkillToolRequest, SkillToolExecutionResult,
+    ExecutorError, SearchSkillToolRequest, SkillResultEvent, SkillToolExecutionResult,
     SkillToolExecutor, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
 };
 
@@ -302,7 +302,14 @@ pub(crate) struct ToolInvocationContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolExecutionOutcome {
-    ToolResult { provider_output: String },
+    ToolResult {
+        provider_output: String,
+    },
+    SkillResult {
+        skill_name: String,
+        provider_output: String,
+        merge_parent: String,
+    },
 }
 
 impl ToolExecutionOutcome {
@@ -312,9 +319,24 @@ impl ToolExecutionOutcome {
         }
     }
 
+    pub fn skill_result(
+        skill_name: impl Into<String>,
+        provider_output: impl Into<String>,
+        merge_parent: impl Into<String>,
+    ) -> Self {
+        Self::SkillResult {
+            skill_name: skill_name.into(),
+            provider_output: provider_output.into(),
+            merge_parent: merge_parent.into(),
+        }
+    }
+
     pub fn provider_output(&self) -> &str {
         match self {
             Self::ToolResult {
+                provider_output, ..
+            }
+            | Self::SkillResult {
                 provider_output, ..
             } => provider_output,
         }
@@ -324,6 +346,16 @@ impl ToolExecutionOutcome {
         let event = match self {
             Self::ToolResult { provider_output } => BackendEventPayload::ToolResult(ToolResult {
                 id: tool_id,
+                output: provider_output,
+            }),
+            Self::SkillResult {
+                skill_name,
+                provider_output,
+                merge_parent,
+            } => BackendEventPayload::SkillResult(SkillResultEvent {
+                tool_id,
+                skill_name,
+                merge_parent,
                 output: provider_output,
             }),
         };
@@ -581,7 +613,7 @@ pub enum BackendEventPayload {
     AssistantText(String),
     ToolUse(ToolUse),
     ToolResult(ToolResult),
-    BranchHandoff(BranchHandoff),
+    SkillResult(SkillResultEvent),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1160,7 +1192,6 @@ where
                                 .context(MemorySnafu)?,
                         };
                         self.move_branch_head(&resolved.branch, &original_head, &response_node_id)?;
-                        self.finalize_branch_handoffs(&resolved.branch)?;
 
                         Ok(CompletionResult {
                             branch: resolved.branch,
@@ -1579,54 +1610,6 @@ where
             source_anchor_id,
             feedback_anchor_id,
         })
-    }
-
-    fn finalize_branch_handoffs(&self, branch: &str) -> Result<()> {
-        let ancestry = self.store.ancestry(branch).context(MemorySnafu)?;
-        for node in ancestry {
-            let Kind::Anchor(anchor) = &node.kind else {
-                continue;
-            };
-            let Some(merge_parent) = anchor.merge_parents().first() else {
-                continue;
-            };
-
-            let branches = self.store.list_session_states().context(MemorySnafu)?;
-            for (source_branch, state) in branches {
-                let SessionState::Attached {
-                    target_branch,
-                    base_head_id: _,
-                } = state
-                else {
-                    continue;
-                };
-                if target_branch != branch {
-                    continue;
-                }
-                if self
-                    .store
-                    .get_branch_head(&source_branch)
-                    .context(MemorySnafu)?
-                    != *merge_parent
-                {
-                    continue;
-                }
-                self.store
-                    .set_session_state(
-                        &source_branch,
-                        None,
-                        SessionState::Paused {
-                            target_branch: branch.to_owned(),
-                            reason: PauseReason::Merged {
-                                merged_anchor_id: node.id.clone(),
-                            },
-                        },
-                    )
-                    .context(MemorySnafu)?;
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -2208,15 +2191,15 @@ fn persisted_node_from_backend_event(
         BackendEventPayload::ToolResult(tool_result) => {
             (Role::User, metadata, Kind::ToolResult(tool_result))
         }
-        BackendEventPayload::BranchHandoff(handoff) => (
+        BackendEventPayload::SkillResult(skill_result) => (
             Role::System,
             metadata,
             Kind::Anchor(Anchor::skill_result(
-                vec![handoff.merge_parent.clone()],
+                vec![skill_result.merge_parent.clone()],
                 SkillResultAnchor {
-                    tool_id: handoff.tool_id,
-                    skill_name: handoff.skill_name,
-                    output: handoff.output,
+                    tool_id: skill_result.tool_id,
+                    skill_name: skill_result.skill_name,
+                    output: skill_result.output,
                 },
             )),
         ),
@@ -3095,6 +3078,7 @@ mod tests {
             session: ResolvedSession,
             request: ResolvedCompletionRequest,
         ) -> std::result::Result<BackendRun, BackendError> {
+            let skill_merge_parent = session.anchor_id.clone();
             self.calls.lock().await.push((session, request.clone()));
             let trace_node_appender = request
                 .trace_node_appender
@@ -3119,8 +3103,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
 
             let step_two_result = backend_event(
-                BackendEventPayload::ToolResult(ToolResult {
-                    id: "tool-call-1".to_owned(),
+                BackendEventPayload::SkillResult(SkillResultEvent {
+                    tool_id: "tool-call-1".to_owned(),
+                    skill_name: "find-skills".to_owned(),
+                    merge_parent: skill_merge_parent,
                     output: "delegated output".to_owned(),
                 }),
                 Some("execution-step-2"),
@@ -4512,26 +4498,31 @@ mod tests {
 
         let ancestry = store.ancestry("main").unwrap();
         let assistant = &ancestry[0];
-        let tool_result = &ancestry[1];
+        let skill_result = &ancestry[1];
         let tool_use = &ancestry[2];
 
         assert_eq!(assistant.id, result.response_node_id);
-        assert!(tool_use.created_at < tool_result.created_at);
-        assert!(tool_result.created_at < assistant.created_at);
+        assert!(tool_use.created_at < skill_result.created_at);
+        assert!(skill_result.created_at < assistant.created_at);
         assert!(matches!(
             &tool_use.kind,
             Kind::ToolUse(ToolUse { id, name, .. }) if id == "tool-call-1" && name == "use_skill"
         ));
-        assert!(matches!(
-            &tool_result.kind,
-            Kind::ToolResult(ToolResult { id, output, .. })
-                if id == "tool-call-1" && output == "delegated output"
-        ));
+        let Kind::Anchor(anchor) = &skill_result.kind else {
+            panic!("expected skill result anchor");
+        };
+        let persisted = anchor
+            .as_skill_result()
+            .expect("expected skill result payload");
+        assert_eq!(persisted.tool_id, "tool-call-1");
+        assert_eq!(persisted.skill_name, "find-skills");
+        assert_eq!(persisted.output, "delegated output");
+        assert_eq!(anchor.merge_parents(), [tool_use.parent.as_str()]);
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
     }
 
     #[tokio::test]
-    async fn branch_handoff_event_persists_prompt_anchor_and_pauses_child_branch() {
+    async fn skill_result_event_persists_anchor_without_handoff_state_transition() {
         let store = MemoryStore::new();
         let service = LlmService::new(store.clone(), FakeBackend::with_completions(&[]));
         let base_session = service
@@ -4559,7 +4550,7 @@ mod tests {
                     execution: ExecutionMetadata::new("execution-step-1".to_owned()),
                     events: vec![
                         backend_event(
-                            BackendEventPayload::BranchHandoff(BranchHandoff {
+                            BackendEventPayload::SkillResult(SkillResultEvent {
                                 tool_id: "tool-call-1".to_owned(),
                                 skill_name: "find-skills".to_owned(),
                                 merge_parent: draft_head.clone(),
@@ -4597,11 +4588,9 @@ mod tests {
         assert_eq!(anchor.merge_parents(), [draft_head.as_str()]);
         assert_eq!(
             store.get_session_state("draft").unwrap(),
-            SessionState::Paused {
+            SessionState::Attached {
                 target_branch: "main".to_owned(),
-                reason: PauseReason::Merged {
-                    merged_anchor_id: handoff_anchor.id.clone(),
-                },
+                base_head_id: base_session.anchor_id.clone(),
             }
         );
         assert_eq!(assistant.parent, handoff_anchor.id);

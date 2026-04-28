@@ -187,11 +187,16 @@ impl SkillToolRuntime {
                     parent_tool_use_id,
                     args,
                 )?;
+                let skill_name = request.skill_name.clone();
                 match context.skill_executor.execute_skill_tool(request).await {
                     Ok(result) => {
                         let output = serde_json::to_string_pretty(&result.result)
                             .context(SerializeOutputSnafu)?;
-                        Ok(ToolExecutionOutcome::tool_result(output))
+                        Ok(ToolExecutionOutcome::skill_result(
+                            skill_name,
+                            output,
+                            result.response_node_id,
+                        ))
                     }
                     Err(error) => Ok(ToolExecutionOutcome::tool_result(error.to_string())),
                 }
@@ -291,6 +296,7 @@ mod tests {
                 result: SkillToolRunResult {
                     text: "Executed skill result".to_owned(),
                 },
+                response_node_id: "child-response-node".to_owned(),
             })
         }
     }
@@ -352,11 +358,20 @@ mod tests {
             .await
             .unwrap();
         let requests = use_requests.lock().await;
-        let ToolExecutionOutcome::ToolResult { provider_output } = outcome;
+        let ToolExecutionOutcome::SkillResult {
+            skill_name,
+            provider_output,
+            merge_parent,
+        } = outcome
+        else {
+            panic!("expected skill result outcome");
+        };
         let value: Value = serde_json::from_str(&provider_output).unwrap();
 
         assert_eq!(value.as_object().expect("expected JSON object").len(), 1);
         assert_eq!(value["text"], "Executed skill result");
+        assert_eq!(skill_name, "find-skills");
+        assert_eq!(merge_parent, "child-response-node");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].workspace_root, workspace_root);
         assert_eq!(requests[0].session_branch, "main");
@@ -430,7 +445,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let ToolExecutionOutcome::ToolResult { provider_output } = outcome;
+        let ToolExecutionOutcome::ToolResult { provider_output } = outcome else {
+            panic!("expected tool result outcome");
+        };
 
         assert_eq!(provider_output, "delegated failure");
     }

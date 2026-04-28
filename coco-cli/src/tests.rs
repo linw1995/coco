@@ -952,19 +952,28 @@ enable_coco_shim: true
             )
         })
         .expect("expected use_skill tool use on main");
-    let tool_result = ancestry
+    let skill_result = ancestry
         .iter()
         .find_map(|node| match &node.kind {
-            Kind::ToolResult(result) if result.id == "tool-call-1" => Some(result),
+            Kind::Anchor(anchor) => anchor
+                .as_skill_result()
+                .map(|result| (node, anchor, result)),
             _ => None,
         })
-        .expect("expected use_skill tool result on main");
-    let value: serde_json::Value = serde_json::from_str(&tool_result.output).unwrap();
+        .expect("expected use_skill skill result on main");
+    assert_eq!(skill_result.2.tool_id, "tool-call-1");
+    assert_eq!(skill_result.2.skill_name, "fast-rust");
+    let value: serde_json::Value = serde_json::from_str(&skill_result.2.output).unwrap();
     assert_eq!(value["text"], "delegated output");
-    assert!(!ancestry.iter().any(|node| matches!(
-        &node.kind,
-        Kind::Anchor(anchor) if anchor.as_skill_result().is_some()
-    )));
+    assert_eq!(skill_result.0.parent, tool_use.id);
+    assert_eq!(skill_result.1.merge_parents().len(), 1);
+    let child_response = store
+        .get_node(&skill_result.1.merge_parents()[0])
+        .expect("skill result merge parent should exist");
+    assert!(matches!(
+        &child_response.kind,
+        Kind::Text(text) if text == "delegated output"
+    ));
 
     let children = store.list_children(&tool_use.id).unwrap();
     let child_session_anchor = children
