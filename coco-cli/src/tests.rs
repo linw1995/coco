@@ -650,7 +650,7 @@ fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> 
             kind: Kind::Anchor(Anchor::session(
                 vec![],
                 SessionAnchor {
-                    role: SessionRole::Orchestrator,
+                    role: SessionRole::Runner,
                     provider_profile: None,
                     provider: Some("openai".to_owned()),
                     model: "gpt-4.1-mini".to_owned(),
@@ -660,7 +660,7 @@ fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> 
                     temperature: Some(0.2),
                     max_tokens: Some(64),
                     additional_params: None,
-                    enable_coco_shim: false,
+                    enable_coco_shim: true,
                 },
             )),
         })
@@ -698,6 +698,17 @@ fn append_tool_result_node(store: &impl NodeStore, parent: &str, id: &str, outpu
                 id: id.to_owned(),
                 output: output.to_owned(),
             }),
+        })
+        .unwrap()
+}
+
+fn append_text_node(store: &impl NodeStore, parent: &str, text: &str) -> String {
+    store
+        .append(NewNode {
+            parent: parent.to_owned(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::Text(text.to_owned()),
         })
         .unwrap()
 }
@@ -978,6 +989,11 @@ enable_coco_shim: true
             .prompt
             .contains("Additional task from caller:")
     );
+    let child_session_children = store.list_children(&child_session_anchor.0.id).unwrap();
+    assert!(!child_session_children.iter().any(|node| matches!(
+        &node.kind,
+        Kind::Anchor(anchor) if anchor.as_prompt().is_some()
+    )));
 }
 
 #[tokio::test]
@@ -2254,20 +2270,15 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
         &tool_use_id,
         "You are executing the skill `fast-rust` on an isolated branch.",
     );
-    let skill_result_id = append_skill_result_anchor(
-        &store,
-        &tool_use_id,
-        &child_session_id,
-        "tool-1",
-        "fast-rust",
-        "Delegated result",
-    );
+    let child_output_id = append_text_node(&store, &child_session_id, "Delegated result");
+    let tool_result_id =
+        append_tool_result_node(&store, &tool_use_id, "tool-1", "Delegated result");
     store
-        .set_branch_head("main", &tool_use_id, &skill_result_id)
+        .set_branch_head("main", &tool_use_id, &tool_result_id)
         .unwrap();
 
     let graph_output = run_with_backend(
-        session_graph_cli(store_path),
+        session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -2276,11 +2287,10 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
     .unwrap();
 
     let short_id = |id: &str| id.chars().take(8).collect::<String>();
-    assert!(graph_output.contains(&format!("* {} skill_result", short_id(&skill_result_id))));
+    assert!(graph_output.contains(&format!("* {} tool_result", short_id(&tool_result_id))));
+    assert!(graph_output.contains(&format!("| * {} text", short_id(&child_output_id))));
     assert!(graph_output.contains(&format!("| * {} session", short_id(&child_session_id))));
     assert!(graph_output.contains(&format!("* {} tool_use", short_id(&tool_use_id))));
-    assert!(graph_output.contains("|\\"));
-    assert!(graph_output.contains("|/"));
 }
 
 #[tokio::test]

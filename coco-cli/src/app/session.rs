@@ -520,12 +520,46 @@ fn collect_visible_graph_nodes(
         if let Kind::Anchor(anchor) = &node.kind {
             pending.extend(anchor.merge_parents().iter().cloned());
         }
+        if is_use_skill_tool_use(&node) {
+            collect_visible_anchor_child_subtrees(store, &node.id, &mut pending)?;
+        }
 
         visible_node_ids.insert(node.id.clone());
         visible_nodes.insert(node.id.clone(), node);
     }
 
     Ok(())
+}
+
+fn collect_visible_anchor_child_subtrees(
+    store: &impl NodeStore,
+    parent_id: &str,
+    pending: &mut Vec<String>,
+) -> Result<()> {
+    let mut descendants = store
+        .list_children(parent_id)
+        .context(StoreSnafu)?
+        .into_iter()
+        .filter_map(|child| matches!(child.kind, Kind::Anchor(_)).then_some(child.id))
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+
+    while let Some(node_id) = descendants.pop() {
+        if node_id.is_empty() || !visited.insert(node_id.clone()) {
+            continue;
+        }
+
+        pending.push(node_id.clone());
+        for child in store.list_children(&node_id).context(StoreSnafu)? {
+            descendants.push(child.id);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_use_skill_tool_use(node: &Node) -> bool {
+    matches!(&node.kind, Kind::ToolUse(tool_use) if tool_use.name == "use_skill")
 }
 
 fn render_session_show(

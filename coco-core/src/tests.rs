@@ -123,6 +123,7 @@ struct BlockingBackend {
 #[derive(Debug, Clone)]
 struct AnyBranchBackend {
     calls: Arc<AsyncMutex<Vec<String>>>,
+    provider_contexts: Arc<AsyncMutex<Vec<String>>>,
     text: String,
 }
 
@@ -130,6 +131,7 @@ impl AnyBranchBackend {
     fn new(text: &str) -> Self {
         Self {
             calls: Arc::new(AsyncMutex::new(Vec::new())),
+            provider_contexts: Arc::new(AsyncMutex::new(Vec::new())),
             text: text.to_owned(),
         }
     }
@@ -139,6 +141,10 @@ impl AnyBranchBackend {
 impl CompletionBackend for AnyBranchBackend {
     async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
         self.calls.lock().await.push(ctx.request.branch.clone());
+        self.provider_contexts
+            .lock()
+            .await
+            .push(format!("{:?}\n{:?}", ctx.history, ctx.prompt));
         Ok(FakeBackend::finished_turn(&self.text))
     }
 }
@@ -711,6 +717,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
     let store = MemoryStore::new();
     let backend = AnyBranchBackend::new("child result");
     let calls = backend.calls.clone();
+    let provider_contexts = backend.provider_contexts.clone();
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
@@ -729,7 +736,21 @@ enable_coco_shim: true
 "#,
     );
     let path_env = std::env::join_paths([root.path()]).unwrap();
-    let tool_use_id = append_use_skill_node(&store, &base_session.anchor_id, "fast-rust");
+    let caller_task = "Review the inherited task from the parent prompt.";
+    let caller_prompt_id = store
+        .append(NewNode {
+            parent: base_session.anchor_id.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![],
+                PromptAnchor {
+                    prompt: caller_task.to_owned(),
+                },
+            )),
+        })
+        .unwrap();
+    let tool_use_id = append_use_skill_node(&store, &caller_prompt_id, "fast-rust");
 
     let result = with_env_async(
         &[("COCO_SKILLS_DIRS", Some(path_env.as_os_str()))],
@@ -795,6 +816,11 @@ enable_coco_shim: true
         &node.kind,
         Kind::Anchor(anchor) if anchor.as_prompt().is_some()
     )));
+
+    let provider_contexts = provider_contexts.lock().await;
+    assert_eq!(provider_contexts.len(), 1);
+    assert!(provider_contexts[0].contains(caller_task));
+    assert!(!provider_contexts[0].contains("use_skill"));
 }
 
 #[tokio::test]

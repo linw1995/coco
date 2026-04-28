@@ -1731,8 +1731,13 @@ where
 
         let mut state: Option<ResolvedContext> = None;
 
-        for node in ordered {
-            self.apply_node_to_context(reference, &mut state, &node)?;
+        for index in 0..ordered.len() {
+            let node = &ordered[index];
+            let next = ordered.get(index + 1);
+            if should_skip_inherited_use_skill_tool_use(node, next) {
+                continue;
+            }
+            self.apply_node_to_context(reference, &mut state, node)?;
         }
 
         state.context(MissingAnchorSnafu {
@@ -1749,10 +1754,18 @@ where
         match &node.kind {
             Kind::Anchor(anchor) => match &anchor.payload {
                 AnchorPayload::Session(session_anchor) => {
+                    let tail_entries = if is_skill_execution_prompt(&session_anchor.prompt) {
+                        state
+                            .as_ref()
+                            .map(|context| context.tail_entries.clone())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     *state = Some(ResolvedContext {
                         active_anchor_id: node.id.clone(),
                         session_anchor: session_anchor.as_ref().clone(),
-                        tail_entries: vec![],
+                        tail_entries,
                     });
                 }
                 AnchorPayload::Prompt(prompt_anchor) => {
@@ -1835,6 +1848,35 @@ where
 
         Ok(())
     }
+}
+
+fn should_skip_inherited_use_skill_tool_use(
+    node: &coco_mem::Node,
+    next: Option<&coco_mem::Node>,
+) -> bool {
+    is_use_skill_tool_use(node) && next.is_some_and(is_skill_execution_anchor)
+}
+
+fn is_use_skill_tool_use(node: &coco_mem::Node) -> bool {
+    matches!(&node.kind, Kind::ToolUse(ToolUse { name, .. }) if name == "use_skill")
+}
+
+fn is_skill_execution_anchor(node: &coco_mem::Node) -> bool {
+    match &node.kind {
+        Kind::Anchor(anchor) => {
+            anchor
+                .as_prompt()
+                .is_some_and(|prompt| is_skill_execution_prompt(&prompt.prompt))
+                || anchor
+                    .as_session()
+                    .is_some_and(|session| is_skill_execution_prompt(&session.prompt))
+        }
+        _ => false,
+    }
+}
+
+fn is_skill_execution_prompt(prompt: &str) -> bool {
+    prompt.starts_with("You are executing the skill `")
 }
 
 impl<B, S> LlmService<B, S> {
@@ -2644,8 +2686,7 @@ impl CompletionRunner {
             execution: state.execution,
             events: state.step_events,
         });
-        // A use_skill handoff persists the child branch result on the parent branch, but it is
-        // still an intermediate tool outcome. The parent run must continue from that handoff
+        // Tool calls are intermediate outcomes. The parent run must continue from the tool result
         // until it produces its own terminal text or failure.
         self.pending_step = Some(BackendStep {
             execution: next_execution,
