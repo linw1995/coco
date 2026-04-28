@@ -190,6 +190,7 @@ where
                 services.shared_store,
                 services.llm,
                 services.provider_profiles,
+                None,
             )
             .await
         }

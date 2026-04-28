@@ -30,12 +30,12 @@ use crate::{
         runtime::{ForwardedRuntimeInputs, RuntimeServices},
     },
     cli::{
-        Command, PresetCommand, PresetSetCommand, PresetSubcommand, PromptBranchStatusCommand,
-        PromptCommand, PromptRunCommand, PromptStatusCommand, PromptSubcommand,
-        PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand, SessionCommand,
-        SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand, SessionGraphCommand,
-        SessionMergeCommand, SessionPrCommand, SessionRebaseCommand, SessionShowCommand,
-        SessionSubcommand,
+        Command, DaemonSubcommand, PresetCommand, PresetSetCommand, PresetSubcommand,
+        PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
+        PromptSubcommand, PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand,
+        SessionCommand, SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand,
+        SessionGraphCommand, SessionMergeCommand, SessionPrCommand, SessionRebaseCommand,
+        SessionShowCommand, SessionSubcommand,
     },
     store::open_store,
 };
@@ -3527,6 +3527,8 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
         &llm,
         shared_test_provider_profiles(),
         &engine,
+        None,
+        None,
     ) {
         Ok(server) => server,
         Err(crate::Error::BindDaemonSocket { source, .. })
@@ -3559,6 +3561,43 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
     assert!(response.stderr.is_empty());
 
     server.shutdown().await.unwrap();
+}
+
+#[test]
+fn daemon_serve_enables_console_by_default() {
+    let cli = Cli::parse_from(["coco", "daemon", "serve"]);
+    let Command::Daemon(command) = cli.command else {
+        panic!("expected daemon command");
+    };
+    let DaemonSubcommand::Serve(command) = command.command;
+
+    assert!(!command.no_console);
+    assert_eq!(
+        command.console_addr,
+        std::net::SocketAddr::from(([127, 0, 0, 1], 17667))
+    );
+}
+
+#[test]
+fn daemon_serve_allows_disabling_console_and_overriding_addr() {
+    let cli = Cli::parse_from([
+        "coco",
+        "daemon",
+        "serve",
+        "--no-console",
+        "--console-addr",
+        "127.0.0.1:0",
+    ]);
+    let Command::Daemon(command) = cli.command else {
+        panic!("expected daemon command");
+    };
+    let DaemonSubcommand::Serve(command) = command.command;
+
+    assert!(command.no_console);
+    assert_eq!(
+        command.console_addr,
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0))
+    );
 }
 
 #[tokio::test]

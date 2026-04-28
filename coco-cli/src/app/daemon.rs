@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
 use coco_core::ConversationEngine;
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{SessionRole, Store};
@@ -16,13 +17,16 @@ use super::{
 use crate::{
     Result,
     cli::{DaemonCommand, DaemonSubcommand},
-    error::{BindDaemonSocketSnafu, JoinDaemonServerSnafu, ResolveDaemonSocketRootSnafu},
+    error::{
+        BindDaemonSocketSnafu, ConsoleSnafu, JoinDaemonServerSnafu, ResolveDaemonSocketRootSnafu,
+    },
 };
 
 #[derive(Debug)]
 pub(crate) struct CocoCliDaemonServerHandle {
     socket_path: PathBuf,
-    task: tokio::task::JoinHandle<()>,
+    socket_task: tokio::task::JoinHandle<()>,
+    console: Option<ConsoleServerHandle>,
 }
 
 pub(super) async fn run_daemon_command<B, S>(
@@ -30,6 +34,7 @@ pub(super) async fn run_daemon_command<B, S>(
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
     provider_profiles: &ProviderProfiles,
+    console_publisher: Option<ConsolePublisher>,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -39,6 +44,12 @@ where
         DaemonSubcommand::Serve(command) => command.socket.as_deref(),
     })?;
     let shared_engine = Arc::new(ConversationEngine::new(llm.clone()));
+    let console_config = match (&command.command, console_publisher.as_ref()) {
+        (DaemonSubcommand::Serve(command), Some(_)) if !command.no_console => Some(ConsoleConfig {
+            addr: command.console_addr,
+        }),
+        _ => None,
+    };
     let server = match command.command {
         DaemonSubcommand::Serve(_) => start_daemon_server(
             &socket_path,
@@ -46,6 +57,8 @@ where
             llm,
             provider_profiles,
             &shared_engine,
+            console_config,
+            console_publisher,
         )?,
     };
     spawn_resume_incomplete_jobs(shared_engine);
@@ -111,6 +124,8 @@ pub(crate) fn start_daemon_server<B, S>(
     llm: &Arc<LlmService<B, S>>,
     provider_profiles: &ProviderProfiles,
     shared_engine: &Arc<ConversationEngine<B, S>>,
+    console_config: Option<ConsoleConfig>,
+    console_publisher: Option<ConsolePublisher>,
 ) -> Result<CocoCliDaemonServerHandle>
 where
     B: CompletionBackend + 'static,
@@ -135,7 +150,22 @@ where
     let llm = llm.clone();
     let provider_profiles = provider_profiles.clone();
     let shared_engine = shared_engine.clone();
-    let task = tokio::spawn(async move {
+    let console = match console_config {
+        Some(config) => Some(
+            start_console_server(
+                config,
+                shared_store.clone(),
+                console_publisher.expect("console publisher should exist when console is enabled"),
+            )
+            .context(ConsoleSnafu)?,
+        ),
+        None => None,
+    };
+    if let Some(console) = &console {
+        eprintln!("coco console listening on http://{}", console.addr());
+    }
+
+    let socket_task = tokio::spawn(async move {
         loop {
             let accepted = listener.accept().await;
             let Ok((mut stream, _)) = accepted else {
@@ -160,20 +190,50 @@ where
         }
     });
 
-    Ok(CocoCliDaemonServerHandle { socket_path, task })
+    Ok(CocoCliDaemonServerHandle {
+        socket_path,
+        socket_task,
+        console,
+    })
 }
 
 impl CocoCliDaemonServerHandle {
     pub(crate) async fn wait(self) -> Result<()> {
-        let result = self.task.await.context(JoinDaemonServerSnafu);
-        cleanup_socket(&self.socket_path);
-        result.map(|_| ())
+        let Self {
+            socket_path,
+            socket_task,
+            console,
+        } = self;
+
+        match console {
+            Some(mut console) => {
+                tokio::select! {
+                    socket_result = socket_task => {
+                        cleanup_socket(&socket_path);
+                        console.shutdown().await.context(ConsoleSnafu)?;
+                        socket_result.context(JoinDaemonServerSnafu).map(|_| ())
+                    }
+                    console_result = console.wait_mut() => {
+                        cleanup_socket(&socket_path);
+                        console_result.context(ConsoleSnafu)
+                    }
+                }
+            }
+            None => {
+                let result = socket_task.await.context(JoinDaemonServerSnafu);
+                cleanup_socket(&socket_path);
+                result.map(|_| ())
+            }
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn shutdown(self) -> Result<()> {
-        self.task.abort();
-        let result = self.task.await;
+        self.socket_task.abort();
+        let result = self.socket_task.await;
+        if let Some(console) = self.console {
+            console.shutdown().await.context(ConsoleSnafu)?;
+        }
         cleanup_socket(&self.socket_path);
         match result {
             Ok(()) => Ok(()),

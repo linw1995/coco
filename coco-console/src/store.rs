@@ -1,0 +1,255 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use coco_mem::{
+    BranchConfig, BranchConfigRecord, BranchConfigStore, BranchStore, Job, JobStatus, JobStore,
+    NewNode, Node, NodeStore, ProviderProfile, ProviderProfileStore, RuntimeStore,
+    SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillGroups, SkillRecord,
+    SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
+};
+
+use crate::ConsolePublisher;
+
+#[derive(Clone)]
+pub struct ConsoleStore<S> {
+    inner: S,
+    publisher: ConsolePublisher,
+}
+
+impl<S> ConsoleStore<S> {
+    pub fn new(inner: S, publisher: ConsolePublisher) -> Self {
+        Self { inner, publisher }
+    }
+
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn publisher(&self) -> &ConsolePublisher {
+        &self.publisher
+    }
+
+    fn notify_if_ok<T>(&self, result: StoreResult<T>) -> StoreResult<T> {
+        if result.is_ok() {
+            self.publisher.mark_changed();
+        }
+        result
+    }
+}
+
+impl<S> NodeStore for ConsoleStore<S>
+where
+    S: NodeStore,
+{
+    fn root_id(&self) -> String {
+        self.inner.root_id()
+    }
+
+    fn append(&self, node: NewNode) -> StoreResult<String> {
+        self.notify_if_ok(self.inner.append(node))
+    }
+
+    fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {
+        self.inner.ancestry(head_ref)
+    }
+
+    fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>> {
+        self.inner.log(base_ref, head_ref)
+    }
+
+    fn get_node(&self, id: &str) -> StoreResult<Node> {
+        self.inner.get_node(id)
+    }
+
+    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>> {
+        self.inner.list_children(node_id)
+    }
+}
+
+impl<S> BranchStore for ConsoleStore<S>
+where
+    S: BranchStore,
+{
+    fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
+        self.notify_if_ok(self.inner.fork(name, from_ref))
+    }
+
+    fn get_branch_head(&self, name: &str) -> StoreResult<String> {
+        self.inner.get_branch_head(name)
+    }
+
+    fn delete_branch(&self, name: &str) -> StoreResult<()> {
+        self.notify_if_ok(self.inner.delete_branch(name))
+    }
+
+    fn set_branch_head(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        new_head: &str,
+    ) -> StoreResult<()> {
+        self.notify_if_ok(
+            self.inner
+                .set_branch_head(name, expected_old_head, new_head),
+        )
+    }
+}
+
+impl<S> SessionStore for ConsoleStore<S>
+where
+    S: SessionStore,
+{
+    fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>> {
+        self.inner.list_session_states()
+    }
+
+    fn get_session_state(&self, name: &str) -> StoreResult<SessionState> {
+        self.inner.get_session_state(name)
+    }
+
+    fn set_session_state(
+        &self,
+        name: &str,
+        expected: Option<&SessionState>,
+        next: SessionState,
+    ) -> StoreResult<SessionState> {
+        self.notify_if_ok(self.inner.set_session_state(name, expected, next))
+    }
+
+    fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
+        self.notify_if_ok(self.inner.rebase_session(name, patch))
+    }
+}
+
+impl<S> BranchConfigStore for ConsoleStore<S>
+where
+    S: BranchConfigStore,
+{
+    fn list_branch_configs(&self) -> StoreResult<HashMap<String, BranchConfig>> {
+        self.inner.list_branch_configs()
+    }
+
+    fn list_branch_config_records(&self) -> StoreResult<HashMap<String, BranchConfigRecord>> {
+        self.inner.list_branch_config_records()
+    }
+
+    fn get_branch_config(&self, name: &str) -> StoreResult<BranchConfig> {
+        self.inner.get_branch_config(name)
+    }
+
+    fn get_branch_config_record(&self, name: &str) -> StoreResult<BranchConfigRecord> {
+        self.inner.get_branch_config_record(name)
+    }
+
+    fn set_branch_config(
+        &self,
+        name: &str,
+        config: BranchConfig,
+    ) -> StoreResult<BranchConfigRecord> {
+        self.notify_if_ok(self.inner.set_branch_config(name, config))
+    }
+
+    fn rollback_branch_config(
+        &self,
+        name: &str,
+        target_version: u64,
+    ) -> StoreResult<BranchConfigRecord> {
+        self.notify_if_ok(self.inner.rollback_branch_config(name, target_version))
+    }
+
+    fn delete_branch_config(&self, name: &str) -> StoreResult<()> {
+        self.notify_if_ok(self.inner.delete_branch_config(name))
+    }
+}
+
+impl<S> ProviderProfileStore for ConsoleStore<S>
+where
+    S: ProviderProfileStore,
+{
+    fn list_provider_profiles(&self) -> StoreResult<HashMap<String, ProviderProfile>> {
+        self.inner.list_provider_profiles()
+    }
+
+    fn get_provider_profile(&self, name: &str) -> StoreResult<ProviderProfile> {
+        self.inner.get_provider_profile(name)
+    }
+}
+
+impl<S> SkillStore for ConsoleStore<S>
+where
+    S: SkillStore,
+{
+    fn skill_groups(&self) -> StoreResult<SkillGroups> {
+        self.inner.skill_groups()
+    }
+
+    fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>> {
+        self.inner.list_skills(role)
+    }
+
+    fn get_skill(&self, role: SessionRole, name: &str) -> StoreResult<SkillRecord> {
+        self.inner.get_skill(role, name)
+    }
+
+    fn add_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        spec: SkillVersionSpec,
+    ) -> StoreResult<SkillRecord> {
+        self.notify_if_ok(self.inner.add_skill(role, name, spec))
+    }
+
+    fn update_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        patch: &SkillUpdatePatch,
+    ) -> StoreResult<SkillRecord> {
+        self.notify_if_ok(self.inner.update_skill(role, name, patch))
+    }
+
+    fn rollback_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        target_version: u64,
+    ) -> StoreResult<SkillRecord> {
+        self.notify_if_ok(self.inner.rollback_skill(role, name, target_version))
+    }
+}
+
+impl<S> JobStore for ConsoleStore<S>
+where
+    S: JobStore,
+{
+    fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job> {
+        self.notify_if_ok(self.inner.submit_job(branch, base))
+    }
+
+    fn get_job(&self, job_id: &str) -> StoreResult<Job> {
+        self.inner.get_job(job_id)
+    }
+
+    fn list_jobs(&self) -> StoreResult<HashMap<String, Job>> {
+        self.inner.list_jobs()
+    }
+
+    fn set_job_status(
+        &self,
+        job_id: &str,
+        expected: JobStatus,
+        next: JobStatus,
+    ) -> StoreResult<Job> {
+        self.notify_if_ok(self.inner.set_job_status(job_id, expected, next))
+    }
+}
+
+impl<S> RuntimeStore for ConsoleStore<S>
+where
+    S: RuntimeStore,
+{
+    fn runtime_store_path(&self) -> Option<PathBuf> {
+        self.inner.runtime_store_path()
+    }
+}

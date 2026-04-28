@@ -1,0 +1,12 @@
+[package]
+name = "coco-console"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+coco-mem = { path = "../coco-mem" }
+leptos.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+tokio.workspace = true

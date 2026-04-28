@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -19,4 +20,10 @@ pub enum DaemonSubcommand {
 pub struct DaemonServeCommand {
     #[arg(long, env = COCO_DAEMON_SOCKET_ENV)]
     pub socket: Option<PathBuf>,
+
+    #[arg(long, default_value = "127.0.0.1:17667")]
+    pub console_addr: SocketAddr,
+
+    #[arg(long)]
+    pub no_console: bool,
 }

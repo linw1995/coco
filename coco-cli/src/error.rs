@@ -99,6 +99,9 @@ pub enum Error {
     JoinDaemonServer { source: tokio::task::JoinError },
 
     #[snafu(display("{source}"))]
+    Console { source: coco_console::Error },
+
+    #[snafu(display("{source}"))]
     Store { source: coco_mem::StoreError },
 
     #[snafu(display("{source}"))]

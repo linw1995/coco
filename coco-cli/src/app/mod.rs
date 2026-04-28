@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
 
+use coco_console::{ConsolePublisher, ConsoleStore};
 use coco_core::ConversationEngine;
 use coco_core::CoreSkillToolExecutor;
 use coco_llm::{
@@ -15,6 +16,7 @@ use snafu::prelude::*;
 use crate::cli::SessionCreateCommand;
 use crate::{
     Cli, Result,
+    cli::Command,
     error::{LlmSnafu, StoreSnafu},
     store::open_store_for_command,
 };
@@ -41,18 +43,56 @@ where
     B: CompletionBackend + 'static,
     R: Read,
 {
-    let shared_store = open_store_for_command(&cli.store_path, &cli.command)?;
+    let Cli {
+        daemon_socket,
+        store_path,
+        command,
+    } = cli;
+    let shared_store = open_store_for_command(&store_path, &command)?;
     let provider_profiles = config::load_cwd_provider_profiles()?;
     let provider_configs = resolve_provider_runtime_configs(&provider_profiles)?;
-    let llm = build_llm_service(
-        shared_store.clone(),
-        backend,
-        provider_profiles.clone(),
-        provider_configs,
-    );
+    match command {
+        Command::Daemon(command) => {
+            let console_publisher = ConsolePublisher::new();
+            let shared_store = ConsoleStore::new(shared_store, console_publisher.clone());
+            let llm = build_llm_service(
+                shared_store.clone(),
+                backend,
+                provider_profiles.clone(),
+                provider_configs,
+            );
+            daemon::run_daemon_command(
+                command,
+                &shared_store,
+                &llm,
+                &provider_profiles,
+                Some(console_publisher),
+            )
+            .await
+        }
+        command => {
+            let cli = Cli {
+                daemon_socket,
+                store_path,
+                command,
+            };
+            let llm = build_llm_service(
+                shared_store.clone(),
+                backend,
+                provider_profiles.clone(),
+                provider_configs,
+            );
 
-    run_with_services_with_provider_profiles(cli, reader, &shared_store, &llm, &provider_profiles)
-        .await
+            run_with_services_with_provider_profiles(
+                cli,
+                reader,
+                &shared_store,
+                &llm,
+                &provider_profiles,
+            )
+            .await
+        }
+    }
 }
 
 #[allow(dead_code)]

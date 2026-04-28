@@ -7,6 +7,7 @@ version.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 coco-core = { path = "../coco-core" }
+coco-console = { path = "../coco-console" }
 coco-llm = { path = "../coco-llm" }
 coco-mem = { path = "../coco-mem" }
 serde.workspace = true
