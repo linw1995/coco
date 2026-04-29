@@ -2743,6 +2743,7 @@ async fn skill_commands_manage_versions_in_store() {
             skill_name,
             "--to-version",
             "1",
+            "--json",
         ])
         .unwrap(),
         &mut Cursor::new(""),
@@ -2864,6 +2865,113 @@ async fn skill_update_defaults_to_text_and_supports_json() {
     let skill: serde_json::Value = serde_json::from_str(&json_output).unwrap();
     assert_eq!(skill["name"], "update-skill");
     assert_eq!(skill["current_version"], 3);
+}
+
+#[tokio::test]
+async fn skill_rollback_defaults_to_text_and_supports_json() {
+    let (_tempdir, store_path) = temp_store_path();
+    let skill_file = store_path.with_file_name("skill-rollback.md");
+    fs::write(&skill_file, "# v1\n").unwrap();
+
+    run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "add",
+            "--role",
+            "orchestrator",
+            "--name",
+            "rollback-skill",
+            "--description",
+            "first",
+            "--file",
+            skill_file.to_str().unwrap(),
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    fs::write(&skill_file, "# v2\n").unwrap();
+    run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "update",
+            "--role",
+            "orchestrator",
+            "--name",
+            "rollback-skill",
+            "--description",
+            "second",
+            "--file",
+            skill_file.to_str().unwrap(),
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "rollback",
+            "--role",
+            "orchestrator",
+            "--name",
+            "rollback-skill",
+            "--to-version",
+            "1",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.contains("name: rollback-skill"));
+    assert!(text_output.contains("current_version: 3"));
+
+    let json_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "rollback",
+            "--role",
+            "orchestrator",
+            "--name",
+            "rollback-skill",
+            "--to-version",
+            "2",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let skill: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+    assert_eq!(skill["name"], "rollback-skill");
+    assert_eq!(skill["current_version"], 4);
 }
 
 #[tokio::test]

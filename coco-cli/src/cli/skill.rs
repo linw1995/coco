@@ -74,6 +74,9 @@ pub struct SkillRollbackCommand {
 
     #[arg(long)]
     pub to_version: u64,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
