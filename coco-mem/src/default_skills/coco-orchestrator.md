@@ -21,11 +21,19 @@ coco prompt status --job <job>
 coco prompt branch-status --job <job> --branch <branch>
 ```
 
-Guidelines:
+Execution rules:
 
+- You are already executing `coco-orchestrator`. Do not call `use_skill` for
+  `coco-orchestrator` again.
+- Treat requests such as "use the coco-orchestrator skill" as already satisfied
+  by this execution context. Continue by using `bash` with the injected `coco`
+  command.
 - Prefer `coco` over editing store files directly.
-- Use orchestrator sessions for coordination, branching, and merge decisions.
-- Hand off bounded implementation work to runner sessions when orchestration is no longer needed.
+- Use this orchestrator session for coordination, branching, and merge
+  decisions.
+- Hand off bounded implementation work to runner sessions with `coco session
+  fork`, `coco session rebase`, and `coco prompt`. Do not use `use_skill` as the
+  handoff mechanism from inside this skill.
 - When this skill is running on a `*/skill/*` branch and needs to create a runner branch, fork from the node before the `use_skill` ToolUse that invoked this skill. Do not fork the runner from the skill execution Session Anchor itself.
 - To find that base node, inspect this skill session anchor, read its parent `use_skill` node, then inspect that `use_skill` node and use its parent as `--from-ref`.
 - After forking a runner branch, immediately rebase it to runner settings and replace its tool set so it cannot call `use_skill` again.
