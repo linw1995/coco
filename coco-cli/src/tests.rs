@@ -4144,6 +4144,7 @@ async fn session_rebase_applies_preset_patch() {
             "runner-defaults",
             "--branch",
             "main",
+            "--json",
         ])
         .unwrap(),
         &mut Cursor::new(""),
