@@ -38,6 +38,9 @@ pub enum PromptSubcommand {
 pub struct PromptStatusCommand {
     #[arg(long)]
     pub job: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

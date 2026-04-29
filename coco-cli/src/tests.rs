@@ -284,6 +284,7 @@ fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
         command: Command::Prompt(PromptCommand {
             command: Some(PromptSubcommand::Status(PromptStatusCommand {
                 job: job.to_owned(),
+                json: true,
             })),
             run: PromptRunCommand {
                 branch: "main".to_owned(),
@@ -1195,6 +1196,28 @@ async fn prompt_persists_single_job_even_without_async() {
     let jobs = open_store(&store_path).unwrap().list_jobs().unwrap();
     assert_eq!(jobs.len(), 1);
     let job_id = jobs.keys().next().unwrap().clone();
+    let status_text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "prompt",
+            "status",
+            "--job",
+            &job_id,
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&status_text_output).is_err());
+    assert!(status_text_output.contains("status: Finished"));
+    assert!(status_text_output.contains("prompt: hello"));
+
     let status_output = run_with_backend(
         prompt_status_cli(store_path, &job_id),
         &mut Cursor::new(""),

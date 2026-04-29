@@ -191,10 +191,12 @@ where
     let snapshot = engine.get_job(&command.job).context(CoreEngineSnafu)?;
     let prompt_details =
         load_prompt_anchor_details(shared_store, &command.job).context(CoreEngineSnafu)?;
-    Ok(Some(render_json(build_job_status_view(
-        snapshot,
-        prompt_details,
-    ))))
+    let view = build_job_status_view(snapshot, prompt_details);
+    Ok(Some(if command.json {
+        render_json(view)
+    } else {
+        render_prompt_status_text(&view)
+    }))
 }
 
 async fn run_prompt_branch_status<B, S>(
@@ -328,5 +330,31 @@ fn render_job_queued_text(view: &JobQueuedView) -> String {
     format!(
         "job_id: {}\nstatus: {:?}\ncreated_at: {}\nbranch: {}",
         view.job_id, view.status, view.created_at, view.branch
+    )
+}
+
+fn render_prompt_status_text(view: &PromptJobStatusView) -> String {
+    format!(
+        "{}\nbase_node: {}\nbase_kind: {}\nprompt: {}",
+        render_job_status_snapshot_text(&view.job),
+        view.base_node.node_id,
+        view.base_node.kind,
+        view.base_node.prompt
+    )
+}
+
+fn render_job_status_snapshot_text(snapshot: &JobStatusSnapshot) -> String {
+    format!(
+        "job_id: {}\nstatus: {:?}\nbranch: {}\nbase: {}\nhead: {}\ncreated_at: {}\nfinished_at: {}",
+        snapshot.job_id,
+        snapshot.status,
+        snapshot.branch,
+        snapshot.base,
+        snapshot.head,
+        snapshot.created_at,
+        snapshot
+            .finished_at
+            .map(|finished_at| finished_at.to_string())
+            .unwrap_or_else(|| "null".to_owned())
     )
 }
