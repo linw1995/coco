@@ -522,6 +522,7 @@ fn session_feedback_cli(
                 branch: branch.unwrap_or("main").to_owned(),
                 prompt: prompt.to_owned(),
                 from_ref: from_ref.map(str::to_owned),
+                json: true,
             }),
         }),
     }
@@ -2441,6 +2442,53 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         anchor.as_prompt().expect("expected prompt anchor").prompt,
         "address review note"
     );
+
+    let second_feedback_source_id =
+        append_prompt_anchor(&store, &merged_feedback_source_id, "second review", &[]);
+    store
+        .set_branch_head(
+            "base",
+            &merged_feedback_source_id,
+            &second_feedback_source_id,
+        )
+        .unwrap();
+    store
+        .set_session_state(
+            "main",
+            None,
+            SessionState::Attached {
+                target_branch: "base".to_owned(),
+                base_head_id: merged_feedback_source_id.clone(),
+            },
+        )
+        .unwrap();
+
+    let feedback_text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "feedback",
+            "--branch",
+            "main",
+            "--prompt",
+            "address second review",
+            "--from-ref",
+            "base",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<Value>(&feedback_text_output).is_err());
+    assert!(feedback_text_output.contains("branch: main"));
+    assert!(feedback_text_output.contains("target_branch: base"));
+    assert!(feedback_text_output.contains("state: attached target=base"));
 }
 
 #[tokio::test]

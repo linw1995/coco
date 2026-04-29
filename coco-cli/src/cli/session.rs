@@ -198,4 +198,7 @@ pub struct SessionFeedbackCommand {
 
     #[arg(long)]
     pub from_ref: Option<String>,
+
+    #[arg(long)]
+    pub json: bool,
 }

@@ -293,6 +293,7 @@ where
             }))
         }
         SessionSubcommand::Feedback(command) => {
+            let json = command.json;
             let feedback = llm
                 .apply_feedback(
                     &command.branch,
@@ -301,9 +302,12 @@ where
                 )
                 .await
                 .context(LlmSnafu)?;
-            Ok(Some(render_json(build_session_feedback_result(
-                store, feedback,
-            )?)))
+            let result = build_session_feedback_result(store, feedback)?;
+            Ok(Some(if json {
+                render_json(result)
+            } else {
+                render_session_feedback_text(&result)
+            }))
         }
     }
 }
@@ -482,6 +486,18 @@ fn render_session_merge_text(result: &SessionMergeResult) -> String {
         result.target_branch,
         result.source_head_id,
         result.merged_anchor_id,
+        render_session_state_text(&result.state)
+    )
+}
+
+fn render_session_feedback_text(result: &SessionFeedbackResult) -> String {
+    format!(
+        "branch: {}\ntarget_branch: {}\nbase_head_id: {}\nsource_anchor_id: {}\nfeedback_anchor_id: {}\nstate: {}",
+        result.branch,
+        result.target_branch,
+        result.base_head_id,
+        result.source_anchor_id,
+        result.feedback_anchor_id,
         render_session_state_text(&result.state)
     )
 }
