@@ -1,12 +1,14 @@
 # CoCo Orchestrator Workflow
 
-Use the injected `coco` command through `bash` whenever you need branch-aware session workflow control.
+Use the injected `coco` command through `bash` for branch-aware workflow control.
+Default output is human-readable; use `--json` whenever piping to `jq` or scripts.
 
 Useful commands:
 
 ```bash
 coco session list
 coco session get --branch <branch>
+coco session get --json --branch <branch>
 coco session show <ref>
 coco session fork --branch <branch> --from-ref <ref>
 coco session pr --branch <branch> --target-branch <branch>
@@ -21,26 +23,20 @@ coco prompt status --job <job>
 coco prompt branch-status --job <job> --branch <branch>
 ```
 
-Execution rules:
+Rules:
 
-- You are already executing `coco-orchestrator`. Do not call `use_skill` for
-  `coco-orchestrator` again.
-- Treat requests such as "use the coco-orchestrator skill" as already satisfied
-  by this execution context. Continue by using `bash` with the injected `coco`
-  command.
-- Prefer `coco` over editing store files directly.
-- Use this orchestrator session for coordination, branching, and merge
-  decisions.
-- Hand off bounded implementation work to runner sessions with `coco session
-  fork`, `coco session rebase`, and `coco prompt`. Do not use `use_skill` as the
-  handoff mechanism from inside this skill.
-- When this skill is running on a `*/skill/*` branch and needs to create a runner branch, fork from the node before the `use_skill` ToolUse that invoked this skill. Do not fork the runner from the skill execution Session Anchor itself.
-- To find that base node, inspect this skill session anchor, read its parent `use_skill` node, then inspect that `use_skill` node and use its parent as `--from-ref`.
-- After forking a runner branch, immediately rebase it to runner settings and replace its tool set so it cannot call `use_skill` again.
-- Example:
+- You are already in `coco-orchestrator`; do not call `use_skill` for it again.
+- Prefer `coco` commands over direct store edits.
+- Hand off bounded work with `coco session fork`, `coco session rebase`, and
+  `coco prompt`; do not use `use_skill` as the handoff mechanism here.
+- On a `*/skill/*` branch, fork from the node before the `use_skill` ToolUse
+  that invoked this skill, not from the skill session anchor.
+- After forking, rebase the runner and restrict its tools.
+
+Example:
 
 ```bash
-ANCHOR=$(coco session get --branch "$COCO_BRANCH" | jq -r '.anchor_id')
+ANCHOR=$(coco session get --json --branch "$COCO_BRANCH" | jq -r '.anchor_id')
 USE_SKILL=$(coco session show --json "$ANCHOR" | jq -r '.node.parent')
 BASE=$(coco session show --json "$USE_SKILL" | jq -r '.node.parent')
 coco session fork --branch "$RUNNER_BRANCH" --from-ref "$BASE"
