@@ -308,6 +308,7 @@ fn prompt_branch_status_cli(
             command: Some(PromptSubcommand::BranchStatus(PromptBranchStatusCommand {
                 job: job.to_owned(),
                 branch: branch.map(str::to_owned),
+                json: true,
             })),
             run: PromptRunCommand {
                 branch: "main".to_owned(),
@@ -1374,7 +1375,7 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
     assert!(value["job"]["head"].is_string());
 
     let branch_output = run_with_backend(
-        prompt_branch_status_cli(store_path, &job.job_id, Some("main")),
+        prompt_branch_status_cli(store_path.clone(), &job.job_id, Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -1384,6 +1385,30 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
     let branch_value: Value = serde_json::from_str(&branch_output).unwrap();
     assert_eq!(branch_value["branch"], "main");
     assert!(branch_value["head"].is_string());
+
+    let branch_text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "prompt",
+            "branch-status",
+            "--job",
+            &job.job_id,
+            "--branch",
+            "main",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&branch_text_output).is_err());
+    assert!(branch_text_output.contains("status: Finished"));
+    assert!(branch_text_output.contains("branch: main"));
 }
 
 #[tokio::test]

@@ -213,9 +213,17 @@ where
         .as_ref()
         .is_none_or(|branch| branch == &snapshot.branch)
     {
-        return Ok(Some(render_json(snapshot)));
+        return Ok(Some(if command.json {
+            render_json(snapshot)
+        } else {
+            render_job_status_snapshot_text(&snapshot)
+        }));
     }
-    Ok(Some(render_json(Vec::<JobStatusSnapshot>::new())))
+    Ok(Some(if command.json {
+        render_json(Vec::<JobStatusSnapshot>::new())
+    } else {
+        "No matching prompt job.".to_owned()
+    }))
 }
 
 async fn run_prompt_worker<B, S>(

@@ -50,6 +50,9 @@ pub struct PromptBranchStatusCommand {
 
     #[arg(long)]
     pub branch: Option<String>,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
