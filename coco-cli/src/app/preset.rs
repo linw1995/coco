@@ -78,7 +78,13 @@ where
             }))
         }
         PresetSubcommand::Rollback(command) => {
-            Ok(Some(render_json(run_preset_rollback(command, store)?)))
+            let json = command.json;
+            let preset = run_preset_rollback(command, store)?;
+            Ok(Some(if json {
+                render_json(preset)
+            } else {
+                render_preset_summary_text(&preset)
+            }))
         }
         PresetSubcommand::Delete(command) => {
             Ok(Some(render_json(run_preset_delete(command, store)?)))

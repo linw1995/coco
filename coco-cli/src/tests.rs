@@ -3409,7 +3409,7 @@ async fn preset_commands_manage_versions_in_store() {
         "claude-sonnet-4-20250514"
     );
 
-    let rollback_output = run_with_backend(
+    let rollback_text_output = run_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -3428,9 +3428,34 @@ async fn preset_commands_manage_versions_in_store() {
     .await
     .unwrap()
     .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&rollback_text_output).is_err());
+    assert!(rollback_text_output.contains("name: coding"));
+    assert!(rollback_text_output.contains("current_version: 3"));
+
+    let rollback_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "rollback",
+            "--name",
+            preset_name,
+            "--to-version",
+            "2",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback_output).unwrap();
-    assert_eq!(rollback_json["current_version"], 3);
-    assert_eq!(rollback_json["config"]["model"], "gpt-4.1-mini");
+    assert_eq!(rollback_json["current_version"], 4);
+    assert_eq!(rollback_json["config"]["model"], "claude-sonnet-4-20250514");
 
     let delete_output = run_with_backend(
         Cli::try_parse_from([

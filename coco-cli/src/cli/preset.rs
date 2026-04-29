@@ -81,4 +81,7 @@ pub struct PresetRollbackCommand {
 
     #[arg(long)]
     pub to_version: u64,
+
+    #[arg(long)]
+    pub json: bool,
 }
