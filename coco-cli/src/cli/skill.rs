@@ -74,6 +74,9 @@ pub struct SkillRollbackCommand {
 pub struct SkillListCommand {
     #[arg(long, value_enum)]
     pub role: Option<CliSessionRole>,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

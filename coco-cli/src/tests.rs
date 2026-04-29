@@ -2743,6 +2743,57 @@ async fn skill_show_reads_default_initialized_skill() {
     assert_eq!(show_json["current_version"], 1);
 }
 
+#[tokio::test]
+async fn skill_list_defaults_to_text_and_supports_json() {
+    let (_tempdir, store_path) = temp_store_path();
+
+    let text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "list",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.contains("coco-orchestrator"));
+    assert!(text_output.contains("coco-runner"));
+
+    let json_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "list",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let skills: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+    assert!(
+        skills
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill| { skill["role"] == "runner" && skill["name"] == "coco-runner" })
+    );
+}
+
 #[test]
 fn preset_set_parses_name_and_patch_flags() {
     let cli = Cli::try_parse_from([

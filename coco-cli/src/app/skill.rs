@@ -54,7 +54,15 @@ pub(super) async fn run_skill_command(
         SkillSubcommand::Rollback(command) => {
             Ok(Some(render_json(run_skill_rollback(command, store)?)))
         }
-        SkillSubcommand::List(command) => Ok(Some(render_json(run_skill_list(command, store)?))),
+        SkillSubcommand::List(command) => {
+            let json = command.json;
+            let skills = run_skill_list(command, store)?;
+            Ok(Some(if json {
+                render_json(skills)
+            } else {
+                render_skill_list_text(&skills)
+            }))
+        }
         SkillSubcommand::Show(command) => Ok(Some(render_json(run_skill_show(command, store)?))),
     }
 }
@@ -180,6 +188,33 @@ fn skill_version_view(version: &SkillVersion) -> SkillVersionView {
         enable_coco_shim: version.enable_coco_shim,
         body: version.body.clone(),
     }
+}
+
+fn render_skill_list_text(skills: &[SkillSummaryView]) -> String {
+    if skills.is_empty() {
+        return "No skills found.".to_owned();
+    }
+
+    skills
+        .iter()
+        .map(|skill| {
+            format!(
+                "{} {} current={} available=[{}] shim={} - {}",
+                skill.role,
+                skill.name,
+                skill.current_version,
+                skill
+                    .available_versions
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                skill.enable_coco_shim,
+                skill.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_json<T>(value: T) -> String
