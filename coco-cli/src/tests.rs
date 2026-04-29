@@ -370,6 +370,7 @@ fn session_get_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli 
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Get(SessionBranchCommand {
                 branch: branch.unwrap_or("main").to_owned(),
+                json: true,
             }),
         }),
     }
@@ -405,6 +406,7 @@ fn session_delete_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Delete(SessionBranchCommand {
                 branch: branch.unwrap_or("main").to_owned(),
+                json: false,
             }),
         }),
     }
@@ -442,6 +444,7 @@ fn session_reopen_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
         command: Command::Session(SessionCommand {
             command: SessionSubcommand::Reopen(SessionBranchCommand {
                 branch: branch.unwrap_or("main").to_owned(),
+                json: false,
             }),
         }),
     }
@@ -1669,6 +1672,28 @@ async fn session_get_returns_state_and_visible_anchor() {
         },
     )
     .await;
+
+    let text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "get",
+            "--branch",
+            "main",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.contains("branch: main"));
+    assert!(text_output.contains("role: orchestrator"));
 
     let output = run_with_backend(
         session_get_cli(store_path.clone(), Some("main")),

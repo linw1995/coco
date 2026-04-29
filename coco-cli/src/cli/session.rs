@@ -78,6 +78,9 @@ pub struct SessionForkCommand {
 pub struct SessionBranchCommand {
     #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

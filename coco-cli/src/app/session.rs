@@ -180,10 +180,14 @@ where
                 render_session_list_text(&sessions)
             }))
         }
-        SessionSubcommand::Get(command) => Ok(Some(render_json(read_session_details(
-            store,
-            &command.branch,
-        )?))),
+        SessionSubcommand::Get(command) => {
+            let details = read_session_details(store, &command.branch)?;
+            Ok(Some(if command.json {
+                render_json(details)
+            } else {
+                render_session_details_text(&details)
+            }))
+        }
         SessionSubcommand::Graph(_) => Ok(Some(render_session_graph(store)?)),
         SessionSubcommand::Show(command) => Ok(Some(render_session_show(
             store,
@@ -372,6 +376,20 @@ fn render_session_list_text(sessions: &[SessionSummary]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_session_details_text(details: &SessionDetails) -> String {
+    format!(
+        "branch: {}\nrole: {}\nstate: {}\nhead_id: {}\nanchor_id: {}\nmodel: {}\nsystem_prompt: {}\nprompt: {}",
+        details.branch,
+        details.role.as_str(),
+        render_session_state_text(&details.state),
+        details.head_id,
+        details.anchor_id,
+        details.anchor.model,
+        details.anchor.system_prompt,
+        details.anchor.prompt
+    )
 }
 
 fn render_session_state_text(state: &SessionState) -> String {
