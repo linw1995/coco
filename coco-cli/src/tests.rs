@@ -3328,6 +3328,28 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(list_json.as_array().unwrap().len(), 1);
     assert_eq!(list_json[0]["name"], preset_name);
 
+    let show_text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "show",
+            "--name",
+            preset_name,
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&show_text_output).is_err());
+    assert!(show_text_output.contains("name: coding"));
+    assert!(show_text_output.contains("current_version: 2"));
+
     let show_output = run_with_backend(
         Cli::try_parse_from([
             "coco-cli",
@@ -3337,6 +3359,7 @@ async fn preset_commands_manage_versions_in_store() {
             "show",
             "--name",
             preset_name,
+            "--json",
         ])
         .unwrap(),
         &mut Cursor::new(""),

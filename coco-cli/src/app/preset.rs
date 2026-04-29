@@ -64,7 +64,15 @@ where
                 render_preset_list_text(&presets)
             }))
         }
-        PresetSubcommand::Show(command) => Ok(Some(render_json(run_preset_show(command, store)?))),
+        PresetSubcommand::Show(command) => {
+            let json = command.json;
+            let preset = run_preset_show(command, store)?;
+            Ok(Some(if json {
+                render_json(preset)
+            } else {
+                render_preset_show_text(&preset)
+            }))
+        }
         PresetSubcommand::Rollback(command) => {
             Ok(Some(render_json(run_preset_rollback(command, store)?)))
         }
@@ -229,6 +237,35 @@ fn render_preset_list_text(presets: &[PresetSummaryView]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_preset_show_text(preset: &PresetShowView) -> String {
+    let mut lines = vec![
+        format!("name: {}", preset.name),
+        format!("current_version: {}", preset.current_version),
+        "versions:".to_owned(),
+    ];
+
+    for version in &preset.versions {
+        lines.push(format!(
+            "- version={} created_at={} {}",
+            version.version,
+            version.created_at,
+            render_preset_config_summary(&version.config)
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn render_preset_config_summary(config: &BranchConfig) -> String {
+    format!(
+        "role={} profile={} model={} shim={}",
+        config.role.as_str(),
+        config.provider_profile,
+        config.model,
+        config.enable_coco_shim
+    )
 }
 
 fn render_json<T>(value: T) -> String

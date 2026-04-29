@@ -60,6 +60,9 @@ pub struct PresetSetCommand {
 pub struct PresetNameCommand {
     #[arg(long)]
     pub name: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
