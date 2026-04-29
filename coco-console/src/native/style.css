@@ -62,8 +62,14 @@ body {
   overflow: hidden;
 }
 
-.graph-wrap {
+.graph-shell {
   height: calc(100vh - 4.45rem);
+  min-width: 0;
+  position: relative;
+}
+
+.graph-wrap {
+  height: 100%;
   min-width: 0;
   overflow: auto;
 }
@@ -76,6 +82,59 @@ body {
 
 .graph-bg {
   fill: transparent;
+}
+
+.minimap {
+  background: rgba(8, 11, 18, 0.82);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  bottom: 1rem;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.36);
+  cursor: crosshair;
+  height: 7.875rem;
+  left: 1rem;
+  overflow: hidden;
+  position: absolute;
+  user-select: none;
+  -webkit-user-select: none;
+  width: 14rem;
+  z-index: 4;
+}
+
+.minimap-bg {
+  fill: rgba(15, 23, 42, 0.50);
+}
+
+.minimap-edge {
+  fill: none;
+  stroke: rgba(148, 163, 184, 0.36);
+  stroke-linecap: round;
+  stroke-width: 1.45;
+}
+
+.minimap-edge.fork {
+  stroke: rgba(250, 204, 21, 0.72);
+  stroke-width: 2.3;
+}
+
+.minimap-edge.merge-parent {
+  stroke: rgba(45, 212, 191, 0.78);
+  stroke-dasharray: 8 8;
+  stroke-width: 2.8;
+}
+
+.minimap-node {
+  fill: #dbeafe;
+  opacity: 0.82;
+  stroke: rgba(8, 11, 18, 0.84);
+  stroke-width: 1.5;
+}
+
+.minimap-viewport {
+  fill: rgba(96, 165, 250, 0.08);
+  stroke: #60a5fa;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
 }
 
 .edge {

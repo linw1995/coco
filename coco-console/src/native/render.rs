@@ -4,7 +4,9 @@ use coco_mem::{PauseReason, SessionState};
 use leptos::{html::HtmlElement, prelude::*};
 
 use crate::graph::{GraphNode, GraphSnapshot, css_token, node_target_id, shorten_id};
-use crate::layout::{GraphLayoutEdgeKind, layout_graph, line_points, routed_elbow_points};
+use crate::layout::{
+    GraphLayout, GraphLayoutEdgeKind, layout_graph, line_points, routed_elbow_points,
+};
 
 pub fn render_index_page(snapshot: &GraphSnapshot) -> String {
     render_snapshot_document(snapshot, true)
@@ -71,24 +73,38 @@ fn render_root(snapshot: &GraphSnapshot) -> AnyView {
 }
 
 fn render_content(snapshot: &GraphSnapshot) -> AnyView {
-    let graph = render_graph(snapshot);
+    if snapshot.nodes.is_empty() {
+        return view! {
+            <section class="content">
+                <div class="graph-shell">
+                    <div class="graph-wrap">
+                        <div class="empty">"No sessions found."</div>
+                    </div>
+                </div>
+                {render_side(snapshot)}
+            </section>
+        }
+        .into_any();
+    }
+
+    let layout = layout_graph(snapshot);
+    let graph = render_graph(snapshot, &layout);
+    let minimap = render_minimap(&layout);
     let side = render_side(snapshot);
 
     view! {
         <section class="content">
-            <div class="graph-wrap">{graph}</div>
+            <div class="graph-shell">
+                <div class="graph-wrap">{graph}</div>
+                {minimap}
+            </div>
             {side}
         </section>
     }
     .into_any()
 }
 
-fn render_graph(snapshot: &GraphSnapshot) -> AnyView {
-    if snapshot.nodes.is_empty() {
-        return view! { <div class="empty">"No sessions found."</div> }.into_any();
-    }
-
-    let layout = layout_graph(snapshot);
+fn render_graph(snapshot: &GraphSnapshot, layout: &GraphLayout) -> AnyView {
     let edge_views = layout
         .primary_edges
         .iter()
@@ -203,6 +219,72 @@ fn render_graph(snapshot: &GraphSnapshot) -> AnyView {
     }
     .into_any()
 }
+
+fn render_minimap(layout: &GraphLayout) -> AnyView {
+    let edge_views = layout
+        .primary_edges
+        .iter()
+        .chain(layout.fork_edges.iter())
+        .chain(layout.merge_edges.iter())
+        .map(|edge| match edge.kind {
+            GraphLayoutEdgeKind::PrimaryParent => {
+                let (x1, y1, x2, y2) =
+                    line_points(edge.source, edge.target, edge.target_port_offset);
+                view! { <line class="minimap-edge primary-parent" x1=x1 y1=y1 x2=x2 y2=y2 /> }
+                    .into_any()
+            }
+            GraphLayoutEdgeKind::Fork => {
+                let points = routed_elbow_points(
+                    edge.source,
+                    edge.target,
+                    edge.route_slot,
+                    edge.target_port_offset,
+                );
+                view! { <polyline class="minimap-edge fork" points=points /> }.into_any()
+            }
+            GraphLayoutEdgeKind::MergeParent => {
+                let points = routed_elbow_points(
+                    edge.source,
+                    edge.target,
+                    edge.route_slot,
+                    edge.target_port_offset,
+                );
+                view! { <polyline class="minimap-edge merge-parent" points=points /> }.into_any()
+            }
+        })
+        .collect::<Vec<_>>();
+    let node_views = layout
+        .occurrences
+        .iter()
+        .map(|occurrence| {
+            let x = occurrence.point.x.to_string();
+            let y = occurrence.point.y.to_string();
+            view! { <circle class="minimap-node" cx=x cy=y r="26" /> }
+        })
+        .collect::<Vec<_>>();
+    let view_box = format!("0 0 {} {}", layout.width, layout.height);
+    let graph_width = layout.width.to_string();
+    let graph_height = layout.height.to_string();
+
+    view! {
+        <svg
+            class="minimap"
+            role="img"
+            aria-label="Graph minimap"
+            viewBox=view_box
+            preserveAspectRatio="xMidYMid meet"
+            data-graph-width=graph_width
+            data-graph-height=graph_height
+        >
+            <rect class="minimap-bg" x="0" y="0" width=layout.width.to_string() height=layout.height.to_string() />
+            {edge_views}
+            {node_views}
+            <rect class="minimap-viewport" x="0" y="0" width="0" height="0" rx="18" />
+        </svg>
+    }
+    .into_any()
+}
+
 fn render_selection_style(snapshot: &GraphSnapshot) -> String {
     snapshot
         .nodes

@@ -22,10 +22,12 @@ wasm-bindgen-futures = "0.4.64"
 web-sys = { version = "0.3.91", features = [
   "console",
   "Document",
+  "DomRect",
   "DomTokenList",
   "Element",
   "EventTarget",
   "HtmlElement",
+  "MouseEvent",
   "NodeList",
   "Response",
   "Storage",
