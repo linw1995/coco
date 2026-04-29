@@ -57,7 +57,13 @@ pub(super) async fn run_skill_command(
             }))
         }
         SkillSubcommand::Update(command) => {
-            Ok(Some(render_json(run_skill_update(command, store)?)))
+            let json = command.json;
+            let skill = run_skill_update(command, store)?;
+            Ok(Some(if json {
+                render_json(skill)
+            } else {
+                render_skill_summary_text(&skill)
+            }))
         }
         SkillSubcommand::Rollback(command) => {
             Ok(Some(render_json(run_skill_rollback(command, store)?)))
