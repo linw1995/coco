@@ -47,7 +47,15 @@ pub(super) async fn run_skill_command(
     store: &impl SkillStore,
 ) -> Result<Option<String>> {
     match command.command {
-        SkillSubcommand::Add(command) => Ok(Some(render_json(run_skill_add(command, store)?))),
+        SkillSubcommand::Add(command) => {
+            let json = command.json;
+            let skill = run_skill_add(command, store)?;
+            Ok(Some(if json {
+                render_json(skill)
+            } else {
+                render_skill_summary_text(&skill)
+            }))
+        }
         SkillSubcommand::Update(command) => {
             Ok(Some(render_json(run_skill_update(command, store)?)))
         }
@@ -223,6 +231,23 @@ fn render_skill_list_text(skills: &[SkillSummaryView]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_skill_summary_text(skill: &SkillSummaryView) -> String {
+    format!(
+        "role: {}\nname: {}\ncurrent_version: {}\navailable_versions: [{}]\nshim: {}\ndescription: {}",
+        skill.role,
+        skill.name,
+        skill.current_version,
+        skill
+            .available_versions
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        skill.enable_coco_shim,
+        skill.description
+    )
 }
 
 fn render_skill_show_text(skill: &SkillShowView) -> String {

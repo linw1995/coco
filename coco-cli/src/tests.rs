@@ -2607,6 +2607,70 @@ fn skill_show_parses_name_and_role_flags() {
 }
 
 #[tokio::test]
+async fn skill_add_defaults_to_text_and_supports_json() {
+    let (_tempdir, store_path) = temp_store_path();
+    let skill_file = store_path.with_file_name("skill-add.md");
+    fs::write(&skill_file, "# skill\n").unwrap();
+
+    let text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "add",
+            "--role",
+            "orchestrator",
+            "--name",
+            "text-skill",
+            "--description",
+            "text output",
+            "--file",
+            skill_file.to_str().unwrap(),
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.contains("name: text-skill"));
+    assert!(text_output.contains("current_version: 1"));
+
+    let json_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "add",
+            "--role",
+            "orchestrator",
+            "--name",
+            "json-skill",
+            "--description",
+            "json output",
+            "--file",
+            skill_file.to_str().unwrap(),
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let skill: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+    assert_eq!(skill["name"], "json-skill");
+    assert_eq!(skill["current_version"], 1);
+}
+
+#[tokio::test]
 async fn skill_commands_manage_versions_in_store() {
     let (_tempdir, store_path) = temp_store_path();
     let skill_file = store_path.with_file_name("skill.md");

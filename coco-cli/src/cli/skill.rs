@@ -35,6 +35,9 @@ pub struct SkillAddCommand {
 
     #[arg(long)]
     pub enable_coco_shim: bool,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
