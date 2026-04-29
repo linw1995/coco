@@ -168,6 +168,9 @@ pub struct SessionCloseCommand {
 
     #[arg(long, default_value = "")]
     pub target_branch: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

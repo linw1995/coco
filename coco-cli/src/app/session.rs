@@ -255,19 +255,26 @@ where
                 render_pull_request_text(&result)
             }))
         }
-        SessionSubcommand::Close(command) => Ok(Some(render_json(SessionMutationResult {
-            branch: command.branch.clone(),
-            state: store
-                .set_session_state(
-                    &command.branch,
-                    None,
-                    SessionState::Paused {
-                        target_branch: command.target_branch,
-                        reason: PauseReason::Closed,
-                    },
-                )
-                .context(StoreSnafu)?,
-        }))),
+        SessionSubcommand::Close(command) => {
+            let result = SessionMutationResult {
+                branch: command.branch.clone(),
+                state: store
+                    .set_session_state(
+                        &command.branch,
+                        None,
+                        SessionState::Paused {
+                            target_branch: command.target_branch,
+                            reason: PauseReason::Closed,
+                        },
+                    )
+                    .context(StoreSnafu)?,
+            };
+            Ok(Some(if command.json {
+                render_json(result)
+            } else {
+                render_session_mutation_text(&result)
+            }))
+        }
         SessionSubcommand::Merge(command) => {
             let merged = llm
                 .merge_session(

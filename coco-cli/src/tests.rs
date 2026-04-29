@@ -482,6 +482,7 @@ fn session_close_cli(
             command: SessionSubcommand::Close(SessionCloseCommand {
                 branch: branch.unwrap_or("main").to_owned(),
                 target_branch: target_branch.to_owned(),
+                json: false,
             }),
         }),
     }
@@ -2168,17 +2169,11 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
     .await
     .unwrap()
     .unwrap();
+
+    assert!(serde_json::from_str::<Value>(&close_output).is_err());
     assert_eq!(
-        serde_json::from_str::<Value>(&close_output).unwrap(),
-        json!({
-            "branch": "main",
-            "state": {
-                "Paused": {
-                    "target_branch": "main",
-                    "reason": "Closed",
-                }
-            }
-        })
+        close_output,
+        "branch: main\nstate: paused target=main reason=closed"
     );
 
     let reopen_output = run_with_backend(
@@ -2201,13 +2196,39 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
         SessionState::Active
     );
 
-    run_with_backend(
-        session_close_cli(store_path.clone(), Some("main"), "main"),
+    let close_json_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "close",
+            "--branch",
+            "main",
+            "--target-branch",
+            "main",
+            "--json",
+        ])
+        .unwrap(),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
     .await
+    .unwrap()
     .unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&close_json_output).unwrap(),
+        json!({
+            "branch": "main",
+            "state": {
+                "Paused": {
+                    "target_branch": "main",
+                    "reason": "Closed",
+                }
+            }
+        })
+    );
 
     let reopen_json_output = run_with_backend(
         Cli::try_parse_from([
