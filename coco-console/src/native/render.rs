@@ -1,32 +1,30 @@
 use std::collections::HashMap;
 
-use coco_mem::{BranchStore, NodeStore, PauseReason, SessionState, SessionStore};
+use coco_mem::{PauseReason, SessionState};
 use leptos::{html::HtmlElement, prelude::*};
 
-use crate::Result;
-use crate::graph::{
-    GraphNode, GraphSnapshot, build_graph_snapshot, css_token, node_target_id, shorten_id,
-};
+use crate::graph::{GraphNode, GraphSnapshot, css_token, node_target_id, shorten_id};
 use crate::layout::{GraphLayoutEdgeKind, layout_graph, line_points, routed_elbow_points};
 
-pub fn render_index<S>(store: &S, version: u64) -> Result<String>
-where
-    S: BranchStore + NodeStore + SessionStore,
-{
-    let snapshot = build_graph_snapshot(store, version)?;
-    Ok(render_snapshot_page(&snapshot))
+pub fn render_index_page(snapshot: &GraphSnapshot) -> String {
+    render_snapshot_document(snapshot, true)
 }
 
+#[cfg(test)]
 pub fn render_snapshot_page(snapshot: &GraphSnapshot) -> String {
-    let stats = format!(
-        "{} nodes / {} edges / version {}",
-        snapshot.nodes.len(),
-        snapshot.edges.len(),
-        snapshot.version
-    );
-    let selection_style = render_selection_style(snapshot);
-    let graph = render_graph(snapshot);
-    let side = render_side(snapshot);
+    render_snapshot_document(snapshot, false)
+}
+
+pub fn render_fragment(snapshot: &GraphSnapshot) -> String {
+    render_root(snapshot).to_html()
+}
+
+fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> String {
+    let root = render_root(snapshot);
+    let client_script = include_client
+        .then(|| view! { <script type="module" src="/pkg/coco_console.js"></script> }.into_any())
+        .into_iter()
+        .collect::<Vec<_>>();
     let rendered: View<HtmlElement<_, _, _>> = view! {
         <html lang="en">
             <head>
@@ -34,27 +32,55 @@ pub fn render_snapshot_page(snapshot: &GraphSnapshot) -> String {
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
                 <title>"CoCo Console"</title>
                 <link rel="stylesheet" href="/style.css" />
-                <style>{selection_style}</style>
+                {client_script}
             </head>
             <body>
-                <main class="shell">
-                    <header class="topbar">
-                        <section class="brand">
-                            <h1>"CoCo Console"</h1>
-                            <p>"Live node relationship graph from the daemon store."</p>
-                        </section>
-                        <p class="stats">{stats}</p>
-                    </header>
-                    <section class="content">
-                        <div class="graph-wrap">{graph}</div>
-                        {side}
-                    </section>
-                </main>
+                {root}
             </body>
         </html>
     };
 
     format!("<!doctype html>{}", rendered.to_html())
+}
+
+fn render_root(snapshot: &GraphSnapshot) -> AnyView {
+    let stats = format!(
+        "{} nodes / {} edges / version {}",
+        snapshot.nodes.len(),
+        snapshot.edges.len(),
+        snapshot.version
+    );
+    let selection_style = render_selection_style(snapshot);
+    let content = render_content(snapshot);
+    let version = snapshot.version.to_string();
+
+    view! {
+        <main id="console-root" class="shell" data-version=version>
+            <style id="selection-style">{selection_style}</style>
+            <header class="topbar">
+                <section class="brand">
+                    <h1>"CoCo Console"</h1>
+                    <p>"Live node relationship graph from the daemon store."</p>
+                </section>
+                <p class="stats">{stats}</p>
+            </header>
+            {content}
+        </main>
+    }
+    .into_any()
+}
+
+fn render_content(snapshot: &GraphSnapshot) -> AnyView {
+    let graph = render_graph(snapshot);
+    let side = render_side(snapshot);
+
+    view! {
+        <section class="content">
+            <div class="graph-wrap">{graph}</div>
+            {side}
+        </section>
+    }
+    .into_any()
 }
 
 fn render_graph(snapshot: &GraphSnapshot) -> AnyView {
@@ -139,8 +165,9 @@ fn render_graph(snapshot: &GraphSnapshot) -> AnyView {
             let kind = node.kind.clone();
             let node_target = occurrence.node_target.clone();
             let href = format!("#{node_target}");
+            let node_id = node.id.clone();
             Some(view! {
-                <a class="node-link" href=href data-node-target=node_target>
+                <a class="node-link" href=href data-node-target=node_target data-node-id=node_id>
                     <g class=class transform=transform>
                         <title>{title}</title>
                         <circle class="core" r="26" />

@@ -31,21 +31,23 @@ rec {
         devShells = {
           default = pkgs.mkShell {
             nativeBuildInputs = with pkgs.fenix; [
-              (combine (with stable;[
-                cargo
-                clippy
-                rust-src
-                rustc
-                rustfmt
-                rust-analyzer
-                llvm-tools
-              ]))
+              (combine [
+                stable.cargo
+                stable.clippy
+                stable.rust-src
+                stable.rustc
+                stable.rustfmt
+                stable.rust-analyzer
+                stable.llvm-tools
+                targets.wasm32-unknown-unknown.stable.rust-std
+              ])
             ];
             packages = with pkgs; [
               prek
               grcov
 
               cargo-nextest
+              wasm-bindgen-cli
 
               nono
             ];

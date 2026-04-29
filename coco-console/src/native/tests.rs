@@ -9,7 +9,7 @@ use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LANE_HEIGHT, GRAPH_LEFT_X, GRAPH_TOP_Y,
     GraphLayoutEdgeKind, Point, layout_graph, routed_elbow_points,
 };
-use crate::render::render_snapshot_page;
+use crate::render::{render_fragment, render_index_page, render_snapshot_page};
 use crate::{ConsolePublisher, ConsoleStore, GraphSnapshot, build_graph_snapshot};
 
 fn session_anchor() -> SessionAnchor {
@@ -232,6 +232,44 @@ fn rendered_page_does_not_embed_javascript() {
     let html = render_snapshot_page(&snapshot);
 
     assert!(!html.contains("<script"));
+    assert!(!html.contains("javascript"));
+    assert!(!html.contains("http-equiv=\"refresh\""));
+}
+
+#[test]
+fn fragment_renders_refresh_free_console_root() {
+    let snapshot = GraphSnapshot {
+        version: 0,
+        root_id: "root".to_owned(),
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        branches: Vec::new(),
+    };
+    let html = render_fragment(&snapshot);
+
+    assert!(html.contains("id=\"console-root\""));
+    assert!(html.contains("data-version=\"0\""));
+    assert!(!html.contains("<!doctype"));
+    assert!(!html.contains("<script"));
+    assert!(!html.contains("javascript"));
+    assert!(!html.contains("http-equiv=\"refresh\""));
+}
+
+#[test]
+fn index_page_loads_wasm_client_without_document_refresh() {
+    let snapshot = GraphSnapshot {
+        version: 0,
+        root_id: "root".to_owned(),
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        branches: Vec::new(),
+    };
+    let html = render_index_page(&snapshot);
+
+    assert!(html.contains("src=\"/pkg/coco_console.js\""));
+    assert!(html.contains("id=\"console-root\""));
+    assert!(!html.contains("<iframe"));
+    assert!(!html.contains("/live"));
     assert!(!html.contains("javascript"));
     assert!(!html.contains("http-equiv=\"refresh\""));
 }

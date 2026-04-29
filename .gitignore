@@ -1,5 +1,6 @@
 # Rust artifacts
 target
+coco-console/pkg
 
 # Ignore scripts by default
 *.sh

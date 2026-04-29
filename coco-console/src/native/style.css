@@ -129,6 +129,27 @@ body {
 .node.failure .core { fill: #b91c1c; stroke: #fecaca; }
 .node.active .core { stroke: #7dd3fc; stroke-width: 2.4; }
 
+.node-link.node-new .core {
+  animation: node-grow 680ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes node-grow {
+  0% {
+    opacity: 0;
+    r: 6;
+    stroke-width: 5;
+  }
+
+  58% {
+    opacity: 1;
+    r: 31;
+  }
+
+  100% {
+    r: 26;
+  }
+}
+
 .node-label {
   fill: #f8fafc;
   font-size: 11px;
