@@ -381,7 +381,7 @@ fn session_graph_cli(store_path: std::path::PathBuf) -> Cli {
         daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
-            command: SessionSubcommand::Graph(SessionGraphCommand {}),
+            command: SessionSubcommand::Graph(SessionGraphCommand { json: false }),
         }),
     }
 }
@@ -1812,7 +1812,7 @@ async fn session_graph_reports_empty_store() {
     let (_tempdir, store_path) = temp_store_path();
 
     let output = run_with_backend(
-        session_graph_cli(store_path),
+        session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -1821,6 +1821,28 @@ async fn session_graph_reports_empty_store() {
     .unwrap();
 
     assert_eq!(output, "No sessions found.");
+
+    let json_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "graph",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json_output).unwrap(),
+        json!([])
+    );
 }
 
 #[tokio::test]

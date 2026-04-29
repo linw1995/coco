@@ -94,13 +94,13 @@ struct SessionFeedbackResult {
     state: SessionState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct GraphBranchLabel {
     branch: String,
     state: SessionState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct GraphNodeEntry {
     node: Node,
     primary_parent: Option<String>,
@@ -188,7 +188,14 @@ where
                 render_session_details_text(&details)
             }))
         }
-        SessionSubcommand::Graph(_) => Ok(Some(render_session_graph(store)?)),
+        SessionSubcommand::Graph(command) => {
+            let entries = build_session_graph_entries(store)?;
+            Ok(Some(if command.json {
+                render_json(entries)
+            } else {
+                render_session_graph_text(&entries)
+            }))
+        }
         SessionSubcommand::Show(command) => Ok(Some(render_session_show(
             store,
             &command.reference,
@@ -411,10 +418,12 @@ fn render_session_state_text(state: &SessionState) -> String {
     }
 }
 
-fn render_session_graph(store: &(impl BranchStore + NodeStore + SessionStore)) -> Result<String> {
+fn build_session_graph_entries(
+    store: &(impl BranchStore + NodeStore + SessionStore),
+) -> Result<Vec<GraphNodeEntry>> {
     let states = store.list_session_states().context(StoreSnafu)?;
     if states.is_empty() {
-        return Ok("No sessions found.".to_owned());
+        return Ok(vec![]);
     }
 
     let mut branches = states.into_iter().collect::<Vec<_>>();
@@ -470,7 +479,15 @@ fn render_session_graph(store: &(impl BranchStore + NodeStore + SessionStore)) -
 
     entries = topologically_sort_graph_entries(entries);
 
-    Ok(render_graph_entries(&entries))
+    Ok(entries)
+}
+
+fn render_session_graph_text(entries: &[GraphNodeEntry]) -> String {
+    if entries.is_empty() {
+        return "No sessions found.".to_owned();
+    }
+
+    render_graph_entries(entries)
 }
 
 fn topologically_sort_graph_entries(entries: Vec<GraphNodeEntry>) -> Vec<GraphNodeEntry> {
