@@ -172,7 +172,14 @@ where
                 head_id,
             })))
         }
-        SessionSubcommand::List => Ok(Some(render_json(list_sessions(store)?))),
+        SessionSubcommand::List(command) => {
+            let sessions = list_sessions(store)?;
+            Ok(Some(if command.json {
+                render_json(sessions)
+            } else {
+                render_session_list_text(&sessions)
+            }))
+        }
         SessionSubcommand::Get(command) => Ok(Some(render_json(read_session_details(
             store,
             &command.branch,
@@ -345,6 +352,45 @@ fn read_session_details(
         state,
         anchor,
     })
+}
+
+fn render_session_list_text(sessions: &[SessionSummary]) -> String {
+    if sessions.is_empty() {
+        return "No sessions found.".to_owned();
+    }
+
+    sessions
+        .iter()
+        .map(|session| {
+            format!(
+                "{} role={} head={} state={}",
+                session.branch,
+                session.role.as_str(),
+                session.head_id,
+                render_session_state_text(&session.state)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_session_state_text(state: &SessionState) -> String {
+    match state {
+        SessionState::Active => "active".to_owned(),
+        SessionState::Attached {
+            target_branch,
+            base_head_id,
+        } => format!("attached target={target_branch} base={base_head_id}"),
+        SessionState::Paused {
+            target_branch,
+            reason,
+        } => match reason {
+            PauseReason::Merged { merged_anchor_id } => {
+                format!("paused target={target_branch} reason=merged anchor={merged_anchor_id}")
+            }
+            PauseReason::Closed => format!("paused target={target_branch} reason=closed"),
+        },
+    }
 }
 
 fn render_session_graph(store: &(impl BranchStore + NodeStore + SessionStore)) -> Result<String> {

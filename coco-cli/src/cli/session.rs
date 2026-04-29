@@ -12,7 +12,7 @@ pub struct SessionCommand {
 pub enum SessionSubcommand {
     Create(SessionCreateCommand),
     Fork(SessionForkCommand),
-    List,
+    List(SessionListCommand),
     Get(SessionBranchCommand),
     Graph(SessionGraphCommand),
     Show(SessionShowCommand),
@@ -27,6 +27,12 @@ pub enum SessionSubcommand {
     #[command(name = "merge")]
     Merge(SessionMergeCommand),
     Feedback(SessionFeedbackCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionListCommand {
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

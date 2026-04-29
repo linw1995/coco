@@ -345,7 +345,7 @@ fn session_list_cli(store_path: std::path::PathBuf) -> Cli {
         daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
-            command: SessionSubcommand::List,
+            command: SessionSubcommand::List(crate::cli::SessionListCommand { json: true }),
         }),
     }
 }
@@ -1598,6 +1598,26 @@ async fn session_list_returns_sorted_branches_with_states() {
     )
     .await
     .unwrap();
+
+    let text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "list",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.contains("draft role=orchestrator"));
+    assert!(text_output.contains("state=attached target=main"));
 
     let output = run_with_backend(
         session_list_cli(store_path),

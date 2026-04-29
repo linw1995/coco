@@ -18,7 +18,10 @@ pub use session::{
     SessionCloseCommand, SessionFeedbackCommand, SessionForkCommand, SessionMergeCommand,
     SessionPrCommand,
 };
-pub use session::{SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand};
+pub use session::{
+    SessionCommand, SessionCreateCommand, SessionListCommand, SessionRebaseCommand,
+    SessionSubcommand,
+};
 pub use skill::{
     SkillAddCommand, SkillCommand, SkillListCommand, SkillRollbackCommand, SkillShowCommand,
     SkillSubcommand, SkillUpdateCommand,

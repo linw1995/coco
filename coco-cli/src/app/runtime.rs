@@ -118,7 +118,9 @@ impl RunnerCli {
             }),
             RunnerCommand::Session(command) => Command::Session(SessionCommand {
                 command: match command.command {
-                    RunnerSessionSubcommand::List => SessionSubcommand::List,
+                    RunnerSessionSubcommand::List => {
+                        SessionSubcommand::List(crate::cli::SessionListCommand { json: false })
+                    }
                     RunnerSessionSubcommand::Get(command) => SessionSubcommand::Get(command),
                     RunnerSessionSubcommand::Graph(command) => SessionSubcommand::Graph(command),
                     RunnerSessionSubcommand::Show(command) => SessionSubcommand::Show(command),
@@ -335,7 +337,7 @@ fn apply_forwarded_defaults(
         Command::Session(command) => match &mut command.command {
             SessionSubcommand::Create(command) => command.branch = branch,
             SessionSubcommand::Fork(_) => {}
-            SessionSubcommand::List => {}
+            SessionSubcommand::List(_) => {}
             SessionSubcommand::Get(command) => command.branch = branch,
             SessionSubcommand::Graph(_) => {}
             SessionSubcommand::Show(_) => {}

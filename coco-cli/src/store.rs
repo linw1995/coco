@@ -34,7 +34,7 @@ fn command_is_read_only(command: &Command) -> bool {
         ),
         Command::Session(command) => matches!(
             &command.command,
-            SessionSubcommand::List
+            SessionSubcommand::List(_)
                 | SessionSubcommand::Get(_)
                 | SessionSubcommand::Graph(_)
                 | SessionSubcommand::Show(_)
