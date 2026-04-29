@@ -165,12 +165,17 @@ where
                 .fork(branch.clone(), &command.from_ref)
                 .context(LlmSnafu)?;
             let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
-            Ok(Some(render_json(SessionForkResult {
+            let result = SessionForkResult {
                 state: store.get_session_state(&branch).context(StoreSnafu)?,
                 role: anchor.role,
                 branch,
                 head_id,
-            })))
+            };
+            Ok(Some(if command.json {
+                render_json(result)
+            } else {
+                render_session_fork_text(&result)
+            }))
         }
         SessionSubcommand::List(command) => {
             let sessions = list_sessions(store)?;
@@ -396,6 +401,16 @@ fn render_session_details_text(details: &SessionDetails) -> String {
         details.anchor.model,
         details.anchor.system_prompt,
         details.anchor.prompt
+    )
+}
+
+fn render_session_fork_text(result: &SessionForkResult) -> String {
+    format!(
+        "branch: {}\nrole: {}\nstate: {}\nhead_id: {}",
+        result.branch,
+        result.role.as_str(),
+        render_session_state_text(&result.state),
+        result.head_id
     )
 }
 

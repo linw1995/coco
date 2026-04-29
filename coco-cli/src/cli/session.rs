@@ -72,6 +72,9 @@ pub struct SessionForkCommand {
 
     #[arg(long, default_value = "main")]
     pub from_ref: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

@@ -358,6 +358,7 @@ fn session_fork_cli(store_path: std::path::PathBuf, branch: &str, from_ref: Opti
             command: SessionSubcommand::Fork(SessionForkCommand {
                 branch: branch.to_owned(),
                 from_ref: from_ref.unwrap_or("main").to_owned(),
+                json: true,
             }),
         }),
     }
@@ -1540,8 +1541,32 @@ async fn session_fork_creates_active_branch_from_reference() {
         .get_branch_head("main")
         .unwrap();
 
+    let text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "fork",
+            "--branch",
+            "draft",
+            "--from-ref",
+            "main",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.contains("branch: draft"));
+    assert!(text_output.contains("state: active"));
+
     let output = run_with_backend(
-        session_fork_cli(store_path.clone(), "draft", Some("main")),
+        session_fork_cli(store_path.clone(), "json-draft", Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -1552,7 +1577,7 @@ async fn session_fork_creates_active_branch_from_reference() {
     assert_eq!(
         serde_json::from_str::<Value>(&output).unwrap(),
         json!({
-            "branch": "draft",
+            "branch": "json-draft",
             "head_id": source_head_id,
             "role": "orchestrator",
             "state": "Active",
@@ -1561,6 +1586,7 @@ async fn session_fork_creates_active_branch_from_reference() {
 
     let store = open_store(&store_path).unwrap();
     assert_eq!(store.get_branch_head("draft").unwrap(), source_head_id);
+    assert_eq!(store.get_branch_head("json-draft").unwrap(), source_head_id);
     assert_eq!(
         store.get_session_state("draft").unwrap(),
         SessionState::Active
