@@ -3117,6 +3117,7 @@ fn preset_set_parses_name_and_patch_flags() {
     assert_eq!(command.system_prompt, "You are precise.");
     assert_eq!(command.tools, vec![crate::cli::CliTool::Bash]);
     assert!(command.enable_coco_shim);
+    assert!(!command.json);
 }
 
 #[test]
@@ -3157,7 +3158,7 @@ async fn preset_can_reference_provider_profile_id() {
         Some("gpt-4.1-mini"),
     )]));
 
-    let output = run_with_backend_and_provider_profiles(
+    let text_output = run_with_backend_and_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -3176,13 +3177,44 @@ async fn preset_can_reference_provider_profile_id() {
         .unwrap(),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
+        provider_profiles.clone(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.contains("name: coding"));
+    assert!(text_output.contains("profile=work-openai"));
+    assert!(text_output.contains("model=gpt-4.1-mini"));
+
+    let json_output = run_with_backend_and_provider_profiles(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "set",
+            "--name",
+            "json-coding",
+            "--role",
+            "orchestrator",
+            "--provider-profile",
+            "work-openai",
+            "--system-prompt",
+            "You are helpful.",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
         provider_profiles,
     )
     .await
     .unwrap()
     .unwrap();
 
-    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json_output).unwrap();
     assert_eq!(value["config"]["provider_profile"], "work-openai");
     assert_eq!(value["config"]["model"], "gpt-4.1-mini");
 }
@@ -3222,6 +3254,7 @@ async fn preset_commands_manage_versions_in_store() {
             "{\"reasoning_effort\":\"low\"}",
             "--tool",
             "bash",
+            "--json",
         ])
         .unwrap(),
         &mut Cursor::new(""),
@@ -3261,6 +3294,7 @@ async fn preset_commands_manage_versions_in_store() {
             "--system-prompt",
             "You are strict.",
             "--disable-coco-shim",
+            "--json",
         ])
         .unwrap(),
         &mut Cursor::new(""),
@@ -3471,6 +3505,7 @@ async fn session_rebase_applies_preset_patch() {
                     additional_params: Some("{\"reasoning_effort\":\"medium\"}".to_owned()),
                     enable_coco_shim: true,
                     disable_coco_shim: false,
+                    json: false,
                 }),
             }),
         },

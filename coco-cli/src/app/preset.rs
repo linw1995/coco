@@ -51,11 +51,15 @@ where
     S: BranchConfigStore,
 {
     match command.command {
-        PresetSubcommand::Set(command) => Ok(Some(render_json(run_preset_set(
-            command,
-            store,
-            provider_profiles,
-        )?))),
+        PresetSubcommand::Set(command) => {
+            let json = command.json;
+            let preset = run_preset_set(command, store, provider_profiles)?;
+            Ok(Some(if json {
+                render_json(preset)
+            } else {
+                render_preset_summary_text(&preset)
+            }))
+        }
         PresetSubcommand::List(command) => {
             let presets = run_preset_list(store)?;
             Ok(Some(if command.json {
@@ -237,6 +241,21 @@ fn render_preset_list_text(presets: &[PresetSummaryView]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_preset_summary_text(preset: &PresetSummaryView) -> String {
+    format!(
+        "name: {}\ncurrent_version: {}\navailable_versions: [{}]\n{}",
+        preset.name,
+        preset.current_version,
+        preset
+            .available_versions
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        render_preset_config_summary(&preset.config)
+    )
 }
 
 fn render_preset_show_text(preset: &PresetShowView) -> String {

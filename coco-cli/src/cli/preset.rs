@@ -54,6 +54,9 @@ pub struct PresetSetCommand {
 
     #[arg(long, conflicts_with = "enable_coco_shim")]
     pub disable_coco_shim: bool,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
