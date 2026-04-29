@@ -243,11 +243,17 @@ where
             }))
         }
         SessionSubcommand::Pr(command) => {
+            let json = command.json;
             let pr = llm
                 .open_pull_request(&command.branch, &command.target_branch)
                 .await
                 .context(LlmSnafu)?;
-            Ok(Some(render_json(build_pull_request_result(store, pr)?)))
+            let result = build_pull_request_result(store, pr)?;
+            Ok(Some(if json {
+                render_json(result)
+            } else {
+                render_pull_request_text(&result)
+            }))
         }
         SessionSubcommand::Close(command) => Ok(Some(render_json(SessionMutationResult {
             branch: command.branch.clone(),
@@ -444,6 +450,16 @@ fn render_session_mutation_text(result: &SessionMutationResult) -> String {
     format!(
         "branch: {}\nstate: {}",
         result.branch,
+        render_session_state_text(&result.state)
+    )
+}
+
+fn render_pull_request_text(result: &PullRequestResult) -> String {
+    format!(
+        "branch: {}\ntarget_branch: {}\nbase_head_id: {}\nstate: {}",
+        result.branch,
+        result.target_branch,
+        result.base_head_id,
         render_session_state_text(&result.state)
     )
 }

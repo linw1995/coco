@@ -156,6 +156,9 @@ pub struct SessionPrCommand {
 
     #[arg(long)]
     pub target_branch: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

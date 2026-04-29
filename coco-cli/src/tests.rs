@@ -464,6 +464,7 @@ fn session_pr_cli(
             command: SessionSubcommand::Pr(SessionPrCommand {
                 branch: branch.unwrap_or("main").to_owned(),
                 target_branch: target_branch.to_owned(),
+                json: true,
             }),
         }),
     }
@@ -2098,15 +2099,46 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
             )
             .await
             .unwrap();
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("json")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
         },
     )
     .await;
 
     let store = open_store(&store_path).unwrap();
-    let base_head_id = store.get_branch_head("main").unwrap();
 
+    let pr_text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "pr",
+            "--branch",
+            "main",
+            "--target-branch",
+            "main",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<Value>(&pr_text_output).is_err());
+    assert!(pr_text_output.contains("branch: main"));
+    assert!(pr_text_output.contains("state: attached target=main"));
+
+    let json_base_head_id = store.get_branch_head("main").unwrap();
     let pr_output = run_with_backend(
-        session_pr_cli(store_path.clone(), Some("main"), "main"),
+        session_pr_cli(store_path.clone(), Some("json"), "main"),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -2116,13 +2148,13 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
     assert_eq!(
         serde_json::from_str::<Value>(&pr_output).unwrap(),
         json!({
-            "branch": "main",
+            "branch": "json",
             "target_branch": "main",
-            "base_head_id": base_head_id,
+            "base_head_id": json_base_head_id,
             "state": {
                 "Attached": {
                     "target_branch": "main",
-                    "base_head_id": store.get_branch_head("main").unwrap(),
+                    "base_head_id": json_base_head_id,
                 }
             }
         })
