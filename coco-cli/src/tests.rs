@@ -1937,6 +1937,13 @@ async fn session_delete_removes_branch_and_session_state() {
             )
             .await
             .unwrap();
+            run_with_backend(
+                session_fork_cli(store_path.clone(), "json-draft", Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
         },
     )
     .await;
@@ -1950,9 +1957,31 @@ async fn session_delete_removes_branch_and_session_state() {
     .unwrap()
     .unwrap();
 
+    assert!(serde_json::from_str::<Value>(&output).is_err());
+    assert_eq!(output, "deleted branch: draft");
+
+    let json_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "delete",
+            "--branch",
+            "json-draft",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
     assert_eq!(
-        serde_json::from_str::<Value>(&output).unwrap(),
-        json!({"branch": "draft"})
+        serde_json::from_str::<Value>(&json_output).unwrap(),
+        json!({"branch": "json-draft"})
     );
 
     let store = open_store(&store_path).unwrap();
@@ -1960,6 +1989,8 @@ async fn session_delete_removes_branch_and_session_state() {
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
     let err = store.get_session_state("draft").unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
+    let err = store.get_branch_head("json-draft").unwrap_err();
+    assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "json-draft"));
 }
 
 #[tokio::test]

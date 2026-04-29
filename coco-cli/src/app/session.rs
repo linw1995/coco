@@ -208,9 +208,14 @@ where
         )?)),
         SessionSubcommand::Delete(command) => {
             store.delete_branch(&command.branch).context(StoreSnafu)?;
-            Ok(Some(render_json(SessionDeleteResult {
+            let result = SessionDeleteResult {
                 branch: command.branch,
-            })))
+            };
+            Ok(Some(if command.json {
+                render_json(result)
+            } else {
+                render_session_delete_text(&result)
+            }))
         }
         SessionSubcommand::Rebase(command) => {
             let branch = command.branch.clone();
@@ -412,6 +417,10 @@ fn render_session_fork_text(result: &SessionForkResult) -> String {
         render_session_state_text(&result.state),
         result.head_id
     )
+}
+
+fn render_session_delete_text(result: &SessionDeleteResult) -> String {
+    format!("deleted branch: {}", result.branch)
 }
 
 fn render_session_state_text(state: &SessionState) -> String {
