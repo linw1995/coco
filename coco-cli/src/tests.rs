@@ -252,6 +252,7 @@ fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str
             run: PromptRunCommand {
                 branch: branch.unwrap_or("main").to_owned(),
                 asynchronous: false,
+                json: false,
                 text: text.iter().map(|part| (*part).to_owned()).collect(),
             },
         }),
@@ -269,6 +270,7 @@ fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
             run: PromptRunCommand {
                 branch: "main".to_owned(),
                 asynchronous: false,
+                json: false,
                 text: vec![],
             },
         }),
@@ -286,6 +288,7 @@ fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
             run: PromptRunCommand {
                 branch: "main".to_owned(),
                 asynchronous: false,
+                json: false,
                 text: vec![],
             },
         }),
@@ -308,6 +311,7 @@ fn prompt_branch_status_cli(
             run: PromptRunCommand {
                 branch: "main".to_owned(),
                 asynchronous: false,
+                json: false,
                 text: vec![],
             },
         }),
@@ -1207,6 +1211,97 @@ async fn prompt_persists_single_job_even_without_async() {
     assert_eq!(value["base_node"]["merge_parents"], json!([]));
     assert!(value["base_node"]["node_id"].is_string());
     assert!(value["job"]["head"].is_string());
+}
+
+#[tokio::test]
+async fn prompt_async_defaults_to_text_and_supports_json() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("json")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let llm = llm_with_test_provider_config(
+        store.clone(),
+        FakeBackend::with_responses(&[("main", &[Ok("async done")]), ("json", &[Ok("json done")])]),
+    );
+
+    let text_output = crate::app::runtime::run_with_services(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "prompt",
+            "--branch",
+            "main",
+            "--async",
+            "hello",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
+            shared_engine: None,
+        },
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.contains("status: Queued"));
+    assert!(text_output.contains("branch: main"));
+
+    let json_output = crate::app::runtime::run_with_services(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "prompt",
+            "--branch",
+            "json",
+            "--async",
+            "--json",
+            "hello json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
+            shared_engine: None,
+        },
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let value: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+    assert_eq!(value["status"], "queued");
+    assert_eq!(value["branch"], "json");
+    assert!(value["job_id"].is_string());
 }
 
 #[tokio::test]

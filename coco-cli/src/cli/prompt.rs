@@ -18,6 +18,9 @@ pub struct PromptRunCommand {
     #[arg(long = "async")]
     pub asynchronous: bool,
 
+    #[arg(long)]
+    pub json: bool,
+
     #[arg(value_name = "TEXT")]
     pub text: Vec<String>,
 }

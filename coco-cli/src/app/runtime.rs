@@ -112,6 +112,7 @@ impl RunnerCli {
                 run: PromptRunCommand {
                     branch: "main".to_owned(),
                     asynchronous: false,
+                    json: false,
                     text: vec![],
                 },
             }),

@@ -158,12 +158,17 @@ where
             forwarded_runtime,
         )
         .await?;
-        return Ok(Some(render_json(JobQueuedView {
+        let view = JobQueuedView {
             job_id: job.job_id.clone(),
             status: JobStatus::Queued,
             created_at: job.created_at.to_string(),
             branch: job.branch.clone(),
-        })));
+        };
+        return Ok(Some(if command.json {
+            render_json(view)
+        } else {
+            render_job_queued_text(&view)
+        }));
     }
 
     let service = CoreService::new(FixedBranchResolver::new(command.branch), (*engine).clone());
@@ -317,4 +322,11 @@ where
     T: Serialize,
 {
     serde_json::to_string_pretty(&value).expect("prompt output should serialize")
+}
+
+fn render_job_queued_text(view: &JobQueuedView) -> String {
+    format!(
+        "job_id: {}\nstatus: {:?}\ncreated_at: {}\nbranch: {}",
+        view.job_id, view.status, view.created_at, view.branch
+    )
 }
