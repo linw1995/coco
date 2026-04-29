@@ -502,6 +502,7 @@ fn session_merge_cli(
                 branch: branch.unwrap_or("main").to_owned(),
                 target_branch: target_branch.map(str::to_owned),
                 prompt: prompt.to_owned(),
+                json: true,
             }),
         }),
     }
@@ -2278,6 +2279,13 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
             )
             .await
             .unwrap();
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("text")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
         },
     )
     .await;
@@ -2289,10 +2297,45 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     )
     .await
     .unwrap();
+    run_with_backend(
+        session_pr_cli(store_path.clone(), Some("text"), "base"),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
 
     let store = open_store(&store_path).unwrap();
     let source_head_id = store.get_branch_head("main").unwrap();
-    let base_head_id = store.get_branch_head("base").unwrap();
+
+    let merge_text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "merge",
+            "--branch",
+            "text",
+            "--prompt",
+            "handoff text to base",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<Value>(&merge_text_output).is_err());
+    assert!(merge_text_output.contains("branch: text"));
+    assert!(merge_text_output.contains("state: paused target=base reason=merged"));
+
+    let base_head_id = open_store(&store_path)
+        .unwrap()
+        .get_branch_head("base")
+        .unwrap();
 
     let merge_output = run_with_backend(
         session_merge_cli(store_path.clone(), Some("main"), None, "handoff to base"),

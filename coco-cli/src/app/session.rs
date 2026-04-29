@@ -276,6 +276,7 @@ where
             }))
         }
         SessionSubcommand::Merge(command) => {
+            let json = command.json;
             let merged = llm
                 .merge_session(
                     &command.branch,
@@ -284,9 +285,12 @@ where
                 )
                 .await
                 .context(LlmSnafu)?;
-            Ok(Some(render_json(build_session_merge_result(
-                store, merged,
-            )?)))
+            let result = build_session_merge_result(store, merged)?;
+            Ok(Some(if json {
+                render_json(result)
+            } else {
+                render_session_merge_text(&result)
+            }))
         }
         SessionSubcommand::Feedback(command) => {
             let feedback = llm
@@ -467,6 +471,17 @@ fn render_pull_request_text(result: &PullRequestResult) -> String {
         result.branch,
         result.target_branch,
         result.base_head_id,
+        render_session_state_text(&result.state)
+    )
+}
+
+fn render_session_merge_text(result: &SessionMergeResult) -> String {
+    format!(
+        "branch: {}\ntarget_branch: {}\nsource_head_id: {}\nmerged_anchor_id: {}\nstate: {}",
+        result.branch,
+        result.target_branch,
+        result.source_head_id,
+        result.merged_anchor_id,
         render_session_state_text(&result.state)
     )
 }

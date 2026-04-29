@@ -183,6 +183,9 @@ pub struct SessionMergeCommand {
 
     #[arg(long)]
     pub prompt: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
