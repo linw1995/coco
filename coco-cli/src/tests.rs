@@ -433,6 +433,7 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
                 clear_max_tokens: false,
                 tools: vec![],
                 clear_tools: false,
+                json: true,
             }),
         }),
     }
@@ -2014,6 +2015,41 @@ async fn session_rebase_updates_visible_session_config() {
         .unwrap()
         .get_branch_head("main")
         .unwrap();
+
+    let rebase_text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "rebase",
+            "--branch",
+            "main",
+            "--role",
+            "runner",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-4-20250514",
+            "--system-prompt",
+            "You are precise.",
+            "--prompt",
+            "Start with a plan.",
+            "--clear-temperature",
+            "--max-tokens",
+            "256",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&rebase_text_output).is_err());
+    assert!(rebase_text_output.contains("branch: main"));
+    assert!(rebase_text_output.contains("head_id: "));
 
     let rebase_output = run_with_backend(
         session_rebase_cli(store_path.clone(), Some("main")),

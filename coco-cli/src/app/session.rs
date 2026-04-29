@@ -219,9 +219,15 @@ where
         }
         SessionSubcommand::Rebase(command) => {
             let branch = command.branch.clone();
+            let json = command.json;
             let patch = resolve_session_patch(command, store, provider_profiles)?;
             let head_id = llm.rebase_session(&branch, patch).await.context(LlmSnafu)?;
-            Ok(Some(render_json(SessionRebaseResult { branch, head_id })))
+            let result = SessionRebaseResult { branch, head_id };
+            Ok(Some(if json {
+                render_json(result)
+            } else {
+                render_session_rebase_text(&result)
+            }))
         }
         SessionSubcommand::Reopen(command) => Ok(Some(render_json(SessionMutationResult {
             branch: command.branch.clone(),
@@ -421,6 +427,10 @@ fn render_session_fork_text(result: &SessionForkResult) -> String {
 
 fn render_session_delete_text(result: &SessionDeleteResult) -> String {
     format!("deleted branch: {}", result.branch)
+}
+
+fn render_session_rebase_text(result: &SessionRebaseResult) -> String {
+    format!("branch: {}\nhead_id: {}", result.branch, result.head_id)
 }
 
 fn render_session_state_text(state: &SessionState) -> String {

@@ -144,6 +144,9 @@ pub struct SessionRebaseCommand {
 
     #[arg(long)]
     pub clear_tools: bool,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
