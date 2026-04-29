@@ -229,12 +229,19 @@ where
                 render_session_rebase_text(&result)
             }))
         }
-        SessionSubcommand::Reopen(command) => Ok(Some(render_json(SessionMutationResult {
-            branch: command.branch.clone(),
-            state: store
-                .set_session_state(&command.branch, None, SessionState::Active)
-                .context(StoreSnafu)?,
-        }))),
+        SessionSubcommand::Reopen(command) => {
+            let result = SessionMutationResult {
+                branch: command.branch.clone(),
+                state: store
+                    .set_session_state(&command.branch, None, SessionState::Active)
+                    .context(StoreSnafu)?,
+            };
+            Ok(Some(if command.json {
+                render_json(result)
+            } else {
+                render_session_mutation_text(&result)
+            }))
+        }
         SessionSubcommand::Pr(command) => {
             let pr = llm
                 .open_pull_request(&command.branch, &command.target_branch)
@@ -431,6 +438,14 @@ fn render_session_delete_text(result: &SessionDeleteResult) -> String {
 
 fn render_session_rebase_text(result: &SessionRebaseResult) -> String {
     format!("branch: {}\nhead_id: {}", result.branch, result.head_id)
+}
+
+fn render_session_mutation_text(result: &SessionMutationResult) -> String {
+    format!(
+        "branch: {}\nstate: {}",
+        result.branch,
+        render_session_state_text(&result.state)
+    )
 }
 
 fn render_session_state_text(state: &SessionState) -> String {

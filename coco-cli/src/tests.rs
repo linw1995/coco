@@ -2149,13 +2149,17 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
         })
     );
 
-    run_with_backend(
+    let reopen_output = run_with_backend(
         session_reopen_cli(store_path.clone(), Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
     .await
+    .unwrap()
     .unwrap();
+
+    assert!(serde_json::from_str::<Value>(&reopen_output).is_err());
+    assert_eq!(reopen_output, "branch: main\nstate: active");
 
     assert_eq!(
         open_store(&store_path)
@@ -2163,6 +2167,41 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
             .get_session_state("main")
             .unwrap(),
         SessionState::Active
+    );
+
+    run_with_backend(
+        session_close_cli(store_path.clone(), Some("main"), "main"),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let reopen_json_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "reopen",
+            "--branch",
+            "main",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&reopen_json_output).unwrap(),
+        json!({
+            "branch": "main",
+            "state": "Active"
+        })
     );
 }
 
