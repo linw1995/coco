@@ -26,7 +26,7 @@ fn command_is_read_only(command: &Command) -> bool {
     match command {
         Command::Preset(command) => matches!(
             &command.command,
-            PresetSubcommand::List | PresetSubcommand::Show(_)
+            PresetSubcommand::List(_) | PresetSubcommand::Show(_)
         ),
         Command::Prompt(command) => matches!(
             &command.command,

@@ -56,7 +56,14 @@ where
             store,
             provider_profiles,
         )?))),
-        PresetSubcommand::List => Ok(Some(render_json(run_preset_list(store)?))),
+        PresetSubcommand::List(command) => {
+            let presets = run_preset_list(store)?;
+            Ok(Some(if command.json {
+                render_json(presets)
+            } else {
+                render_preset_list_text(&presets)
+            }))
+        }
         PresetSubcommand::Show(command) => Ok(Some(render_json(run_preset_show(command, store)?))),
         PresetSubcommand::Rollback(command) => {
             Ok(Some(render_json(run_preset_rollback(command, store)?)))
@@ -194,6 +201,34 @@ fn preset_version_view(version: &BranchConfigVersion) -> PresetVersionView {
         created_at: version.created_at.to_string(),
         config: version.to_config(),
     }
+}
+
+fn render_preset_list_text(presets: &[PresetSummaryView]) -> String {
+    if presets.is_empty() {
+        return "No presets found.".to_owned();
+    }
+
+    presets
+        .iter()
+        .map(|preset| {
+            format!(
+                "{} current={} available=[{}] role={} profile={} model={} shim={}",
+                preset.name,
+                preset.current_version,
+                preset
+                    .available_versions
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                preset.config.role.as_str(),
+                preset.config.provider_profile,
+                preset.config.model,
+                preset.config.enable_coco_shim
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_json<T>(value: T) -> String

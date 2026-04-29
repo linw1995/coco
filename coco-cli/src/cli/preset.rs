@@ -11,7 +11,7 @@ pub struct PresetCommand {
 #[derive(Debug, Subcommand)]
 pub enum PresetSubcommand {
     Set(PresetSetCommand),
-    List,
+    List(PresetListCommand),
     Show(PresetNameCommand),
     Rollback(PresetRollbackCommand),
     Delete(PresetNameCommand),
@@ -60,6 +60,12 @@ pub struct PresetSetCommand {
 pub struct PresetNameCommand {
     #[arg(long)]
     pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PresetListCommand {
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

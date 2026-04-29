@@ -3289,6 +3289,25 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(persisted.max_tokens, None);
     assert_eq!(persisted.additional_params, None);
 
+    let list_text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "list",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&list_text_output).is_err());
+    assert!(list_text_output.contains("coding current=2"));
+
     let list_output = run_with_backend(
         Cli::try_parse_from([
             "coco-cli",
@@ -3296,6 +3315,7 @@ async fn preset_commands_manage_versions_in_store() {
             store_path.to_str().unwrap(),
             "preset",
             "list",
+            "--json",
         ])
         .unwrap(),
         &mut Cursor::new(""),
