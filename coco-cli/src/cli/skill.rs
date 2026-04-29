@@ -86,4 +86,7 @@ pub struct SkillShowCommand {
 
     #[arg(long)]
     pub name: String,
+
+    #[arg(long)]
+    pub json: bool,
 }

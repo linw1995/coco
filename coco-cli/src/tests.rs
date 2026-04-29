@@ -2701,6 +2701,7 @@ async fn skill_commands_manage_versions_in_store() {
             "orchestrator",
             "--name",
             skill_name,
+            "--json",
         ])
         .unwrap(),
         &mut Cursor::new(""),
@@ -2718,7 +2719,7 @@ async fn skill_commands_manage_versions_in_store() {
 async fn skill_show_reads_default_initialized_skill() {
     let (_tempdir, store_path) = temp_store_path();
 
-    let output = run_with_backend(
+    let text_output = run_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2738,7 +2739,32 @@ async fn skill_show_reads_default_initialized_skill() {
     .unwrap()
     .unwrap();
 
-    let show_json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.contains("name: coco-runner"));
+    assert!(text_output.contains("current_version: 1"));
+
+    let json_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "show",
+            "--role",
+            "runner",
+            "--name",
+            "coco-runner",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let show_json: serde_json::Value = serde_json::from_str(&json_output).unwrap();
     assert_eq!(show_json["name"], "coco-runner");
     assert_eq!(show_json["current_version"], 1);
 }

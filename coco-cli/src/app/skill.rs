@@ -63,7 +63,15 @@ pub(super) async fn run_skill_command(
                 render_skill_list_text(&skills)
             }))
         }
-        SkillSubcommand::Show(command) => Ok(Some(render_json(run_skill_show(command, store)?))),
+        SkillSubcommand::Show(command) => {
+            let json = command.json;
+            let skill = run_skill_show(command, store)?;
+            Ok(Some(if json {
+                render_json(skill)
+            } else {
+                render_skill_show_text(&skill)
+            }))
+        }
     }
 }
 
@@ -215,6 +223,28 @@ fn render_skill_list_text(skills: &[SkillSummaryView]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_skill_show_text(skill: &SkillShowView) -> String {
+    let mut lines = vec![
+        format!("role: {}", skill.role),
+        format!("name: {}", skill.name),
+        format!("current_version: {}", skill.current_version),
+        "versions:".to_owned(),
+    ];
+
+    for version in &skill.versions {
+        lines.extend([
+            format!(
+                "- version={} created_at={} shim={} description={}",
+                version.version, version.created_at, version.enable_coco_shim, version.description
+            ),
+            "  body:".to_owned(),
+        ]);
+        lines.extend(version.body.lines().map(|line| format!("  {line}")));
+    }
+
+    lines.join("\n")
 }
 
 fn render_json<T>(value: T) -> String
