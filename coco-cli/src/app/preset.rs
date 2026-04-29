@@ -87,7 +87,13 @@ where
             }))
         }
         PresetSubcommand::Delete(command) => {
-            Ok(Some(render_json(run_preset_delete(command, store)?)))
+            let json = command.json;
+            let result = run_preset_delete(command, store)?;
+            Ok(Some(if json {
+                render_json(result)
+            } else {
+                render_preset_delete_text(&result)
+            }))
         }
     }
 }
@@ -291,6 +297,10 @@ fn render_preset_config_summary(config: &BranchConfig) -> String {
         config.model,
         config.enable_coco_shim
     )
+}
+
+fn render_preset_delete_text(result: &PresetDeleteResult) -> String {
+    format!("deleted preset: {}", result.name)
 }
 
 fn render_json<T>(value: T) -> String

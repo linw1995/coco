@@ -3466,6 +3466,7 @@ async fn preset_commands_manage_versions_in_store() {
             "delete",
             "--name",
             preset_name,
+            "--json",
         ])
         .unwrap(),
         &mut Cursor::new(""),
@@ -3484,6 +3485,111 @@ async fn preset_commands_manage_versions_in_store() {
             .list_branch_config_records()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn preset_delete_defaults_to_text_and_supports_json() {
+    let (_tempdir, store_path) = temp_store_path();
+    let provider_profiles = ProviderProfiles::from_profiles(HashMap::from([provider_profile(
+        "work-openai",
+        "openai",
+        "${COCO_WORK_OPENAI_API_KEY}",
+        None,
+        Some("gpt-4.1-mini"),
+    )]));
+
+    run_with_backend_and_provider_profiles(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "set",
+            "--name",
+            "delete-text",
+            "--role",
+            "orchestrator",
+            "--provider-profile",
+            "work-openai",
+            "--system-prompt",
+            "You are helpful.",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+        provider_profiles.clone(),
+    )
+    .await
+    .unwrap();
+
+    let text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "delete",
+            "--name",
+            "delete-text",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert_eq!(text_output, "deleted preset: delete-text");
+
+    run_with_backend_and_provider_profiles(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "set",
+            "--name",
+            "delete-json",
+            "--role",
+            "orchestrator",
+            "--provider-profile",
+            "work-openai",
+            "--system-prompt",
+            "You are helpful.",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+        provider_profiles,
+    )
+    .await
+    .unwrap();
+
+    let json_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "preset",
+            "delete",
+            "--name",
+            "delete-json",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json_output).unwrap(),
+        json!({ "name": "delete-json" })
     );
 }
 
