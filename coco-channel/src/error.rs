@@ -11,6 +11,12 @@ pub enum Error {
     #[snafu(display("Channel transport failed: {source}"))]
     Transport { source: BoxError },
 
+    #[cfg(feature = "telegram")]
+    #[snafu(display("Telegram channel transport failed: {source}"))]
+    TelegramTransport {
+        source: crate::telegram::TelegramError,
+    },
+
     #[snafu(display("Invalid channel input: {message}"))]
     InvalidInput { message: String },
 }

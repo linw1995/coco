@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
+use crate::error::TelegramTransportSnafu;
 use crate::{ChannelRuntime, Error, InboundMessage, MessageHandler, Result};
 
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 30;
@@ -208,21 +209,21 @@ impl ReqwestTelegramTransport {
             .send()
             .await
             .context(RequestSnafu)
-            .map_err(Error::transport)?
+            .context(TelegramTransportSnafu)?
             .error_for_status()
             .context(RequestSnafu)
-            .map_err(Error::transport)?
+            .context(TelegramTransportSnafu)?
             .json::<TelegramApiResponse<Response>>()
             .await
             .context(RequestSnafu)
-            .map_err(Error::transport)?;
+            .context(TelegramTransportSnafu)?;
 
-        response.into_result().map_err(Error::transport)
+        response.into_result().context(TelegramTransportSnafu)
     }
 }
 
 #[derive(Debug, Snafu)]
-enum TelegramError {
+pub enum TelegramError {
     #[snafu(display("Telegram API request failed: {source}"))]
     Request { source: reqwest::Error },
 
