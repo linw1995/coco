@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::Parser;
 use coco_llm::coco_mem::{
-    Anchor, BackendMetadata, BranchStore, JobStore, Kind, NewNode, NodeStore, PromptAnchor,
-    ProviderMetadata, Role, SessionAnchor, SessionRole, SessionStore, SkillResultAnchor,
-    ToolResult, ToolUse,
+    Anchor, BackendMetadata, BranchStore, JobStore, Kind, MergeParent, NewNode, NodeStore,
+    PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionStore,
+    SkillResultAnchor, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEvent, BackendEventPayload, BackendTurn, CompletionBackend,
@@ -647,7 +647,10 @@ fn append_prompt_anchor(
             role: Role::System,
             metadata: None,
             kind: Kind::Anchor(Anchor::prompt(
-                merge_parents.iter().map(|id| (*id).to_owned()).collect(),
+                merge_parents
+                    .iter()
+                    .map(|id| MergeParent::merge(*id))
+                    .collect(),
                 PromptAnchor {
                     prompt: prompt.to_owned(),
                 },
@@ -755,7 +758,7 @@ fn append_skill_result_anchor(
                 .provider(&ProviderMetadata::new(Some(tool_id.to_owned())))
                 .build(),
             kind: Kind::Anchor(Anchor::skill_result(
-                vec![merge_parent.to_owned()],
+                vec![MergeParent::merge(merge_parent)],
                 SkillResultAnchor {
                     tool_id: tool_id.to_owned(),
                     skill_name: skill_name.to_owned(),
@@ -983,7 +986,7 @@ enable_coco_shim: true
     assert_eq!(skill_result.0.parent, tool_use.id);
     assert_eq!(skill_result.1.merge_parents().len(), 1);
     let child_response = store
-        .get_node(&skill_result.1.merge_parents()[0])
+        .get_node(skill_result.1.merge_parents()[0].node_id())
         .expect("skill result merge parent should exist");
     assert!(matches!(
         &child_response.kind,
@@ -2371,7 +2374,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         panic!("expected merged prompt anchor");
     };
     assert_eq!(merged_anchor.parent, base_head_id);
-    assert_eq!(anchor.merge_parents(), [source_head_id.as_str()]);
+    assert_eq!(anchor.merge_parent_node_ids(), [source_head_id.as_str()]);
     assert_eq!(
         anchor.as_prompt().expect("expected prompt anchor").prompt,
         "handoff to base"
@@ -2437,7 +2440,10 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         panic!("expected feedback prompt anchor");
     };
     assert_eq!(feedback_anchor.parent, main_head_before_feedback);
-    assert_eq!(anchor.merge_parents(), [merged_feedback_source_id.as_str()]);
+    assert_eq!(
+        anchor.merge_parent_node_ids(),
+        [merged_feedback_source_id.as_str()]
+    );
     assert_eq!(
         anchor.as_prompt().expect("expected prompt anchor").prompt,
         "address review note"

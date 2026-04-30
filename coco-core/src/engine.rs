@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use coco_llm::coco_mem::{
-    Anchor, BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, NewNode, Node, NodeStore,
-    PromptAnchor, Role, RuntimeStore, SessionStore,
+    Anchor, BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, NewNode, Node,
+    NodeStore, PromptAnchor, Role, RuntimeStore, SessionStore,
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
@@ -163,7 +163,10 @@ where
         prompt: &str,
         merge_parents: Vec<String>,
     ) -> std::result::Result<Job, EngineError> {
-        let merge_parent_ids = resolve_reference_ids(self.service.store(), &merge_parents)?;
+        let merge_parent_ids = resolve_reference_ids(self.service.store(), &merge_parents)?
+            .into_iter()
+            .map(MergeParent::merge)
+            .collect();
         let base = self.service.store().get_branch_head(branch)?;
         let base = self.service.store().append(NewNode {
             parent: base,

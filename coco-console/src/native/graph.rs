@@ -106,7 +106,7 @@ pub fn build_graph_snapshot(
                     .merge_parents()
                     .iter()
                     .filter_map(|merge_parent| {
-                        resolve_visible_parent(&visible_node_ids, merge_parent)
+                        resolve_visible_parent(&visible_node_ids, merge_parent.node_id())
                     })
                     .filter(|parent_id| primary_parent.as_ref() != Some(parent_id))
                     .fold(Vec::<String>::new(), |mut parents, parent_id| {
@@ -194,7 +194,12 @@ fn collect_visible_graph_nodes(
 
         pending.push(node.parent.clone());
         if let Kind::Anchor(anchor) = &node.kind {
-            pending.extend(anchor.merge_parents().iter().cloned());
+            pending.extend(
+                anchor
+                    .merge_parents()
+                    .iter()
+                    .map(|parent| parent.node_id().to_owned()),
+            );
         }
         if is_use_skill_tool_use(&node) {
             collect_visible_anchor_child_subtrees(store, &node.id, &mut pending)?;

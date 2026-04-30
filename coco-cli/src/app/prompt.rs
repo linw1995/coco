@@ -305,11 +305,15 @@ fn load_prompt_anchor_details(
     let job = store.get_job(job_id)?;
     let node = store.get_node(&job.base)?;
     match node.kind {
-        Kind::Anchor(anchor) => match anchor.payload {
+        Kind::Anchor(anchor) => match &anchor.payload {
             AnchorPayload::Prompt(prompt_anchor) => Ok(PromptAnchorDetails {
                 node_id: node.id,
-                prompt: prompt_anchor.prompt,
-                merge_parents: anchor.merge_parents,
+                prompt: prompt_anchor.prompt.clone(),
+                merge_parents: anchor
+                    .merge_parent_node_ids()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
             }),
             _ => Err(EngineError::EngineFailed {
                 message: format!(

@@ -42,8 +42,15 @@ pub enum Kind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Anchor {
-    pub merge_parents: Vec<String>,
+    pub merge_parents: Vec<MergeParent>,
     pub payload: AnchorPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MergeParent {
+    Merge { node_id: String },
+    Shadow { node_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -405,30 +412,61 @@ pub struct Tool {
     pub input_schema: Value,
 }
 
+impl MergeParent {
+    pub fn merge(node_id: impl Into<String>) -> Self {
+        Self::Merge {
+            node_id: node_id.into(),
+        }
+    }
+
+    pub fn shadow(node_id: impl Into<String>) -> Self {
+        Self::Shadow {
+            node_id: node_id.into(),
+        }
+    }
+
+    pub fn node_id(&self) -> &str {
+        match self {
+            Self::Merge { node_id } | Self::Shadow { node_id } => node_id,
+        }
+    }
+
+    pub fn is_shadow(&self) -> bool {
+        matches!(self, Self::Shadow { .. })
+    }
+}
+
 impl Anchor {
-    pub fn session(merge_parents: Vec<String>, anchor: SessionAnchor) -> Self {
+    pub fn session(merge_parents: Vec<MergeParent>, anchor: SessionAnchor) -> Self {
         Self {
             merge_parents,
             payload: AnchorPayload::Session(Box::new(anchor)),
         }
     }
 
-    pub fn prompt(merge_parents: Vec<String>, anchor: PromptAnchor) -> Self {
+    pub fn prompt(merge_parents: Vec<MergeParent>, anchor: PromptAnchor) -> Self {
         Self {
             merge_parents,
             payload: AnchorPayload::Prompt(anchor),
         }
     }
 
-    pub fn skill_result(merge_parents: Vec<String>, anchor: SkillResultAnchor) -> Self {
+    pub fn skill_result(merge_parents: Vec<MergeParent>, anchor: SkillResultAnchor) -> Self {
         Self {
             merge_parents,
             payload: AnchorPayload::SkillResult(anchor),
         }
     }
 
-    pub fn merge_parents(&self) -> &[String] {
+    pub fn merge_parents(&self) -> &[MergeParent] {
         &self.merge_parents
+    }
+
+    pub fn merge_parent_node_ids(&self) -> Vec<&str> {
+        self.merge_parents
+            .iter()
+            .map(MergeParent::node_id)
+            .collect()
     }
 
     pub fn as_session(&self) -> Option<&SessionAnchor> {
@@ -733,9 +771,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchor, BackendMetadata, BranchConfig, ExecutionMetadata, Kind, NewNode, Node, PauseReason,
-        PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
-        SessionState, SkillResultAnchor, Tool, ToolResult,
+        Anchor, BackendMetadata, BranchConfig, ExecutionMetadata, Kind, MergeParent, NewNode, Node,
+        PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch,
+        SessionRole, SessionState, SkillResultAnchor, Tool, ToolResult,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -828,7 +866,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::prompt(
-                vec!["merge-a".to_owned()],
+                vec![MergeParent::merge("merge-a")],
                 make_prompt_anchor(),
             )),
             fixed_timestamp(),
@@ -844,7 +882,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::prompt(
-                vec!["merge-a".to_owned()],
+                vec![MergeParent::merge("merge-a")],
                 make_prompt_anchor(),
             )),
             fixed_timestamp(),
@@ -854,7 +892,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::prompt(
-                vec!["merge-b".to_owned()],
+                vec![MergeParent::merge("merge-b")],
                 make_prompt_anchor(),
             )),
             fixed_timestamp(),
@@ -870,7 +908,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::session(
-                vec!["merge-a".to_owned()],
+                vec![MergeParent::merge("merge-a")],
                 make_session_anchor(),
             )),
             fixed_timestamp(),
@@ -880,7 +918,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::session(
-                vec!["merge-b".to_owned()],
+                vec![MergeParent::merge("merge-b")],
                 make_session_anchor(),
             )),
             fixed_timestamp(),
@@ -896,7 +934,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::skill_result(
-                vec!["merge-a".to_owned()],
+                vec![MergeParent::merge("merge-a")],
                 make_skill_result_anchor(),
             )),
             fixed_timestamp(),
@@ -906,7 +944,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::skill_result(
-                vec!["merge-a".to_owned()],
+                vec![MergeParent::merge("merge-a")],
                 SkillResultAnchor {
                     output: "different result".to_owned(),
                     ..make_skill_result_anchor()
@@ -925,7 +963,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::skill_result(
-                vec!["merge-a".to_owned()],
+                vec![MergeParent::merge("merge-a")],
                 make_skill_result_anchor(),
             )),
             fixed_timestamp(),
@@ -935,7 +973,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::skill_result(
-                vec!["merge-b".to_owned()],
+                vec![MergeParent::merge("merge-b")],
                 make_skill_result_anchor(),
             )),
             fixed_timestamp(),
@@ -1031,7 +1069,7 @@ mod tests {
                 .execution(&ExecutionMetadata::new("execution-1".to_owned()))
                 .build(),
             kind: Kind::Anchor(Anchor::prompt(
-                vec!["merge-a".to_owned(), "merge-b".to_owned()],
+                vec![MergeParent::merge("merge-a"), MergeParent::merge("merge-b")],
                 make_prompt_anchor(),
             )),
         };
@@ -1049,7 +1087,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::session(
-                vec!["merge-a".to_owned(), "merge-b".to_owned()],
+                vec![MergeParent::merge("merge-a"), MergeParent::merge("merge-b")],
                 make_session_anchor(),
             )),
             fixed_timestamp(),
@@ -1064,7 +1102,7 @@ mod tests {
 
         assert_eq!(session_anchor.prompt, "prompt");
         assert_eq!(session_anchor.role, SessionRole::Orchestrator);
-        assert_eq!(anchor.merge_parents(), ["merge-a", "merge-b"]);
+        assert_eq!(anchor.merge_parent_node_ids(), ["merge-a", "merge-b"]);
     }
 
     #[test]
@@ -1074,7 +1112,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::prompt(
-                vec!["merge-a".to_owned(), "merge-b".to_owned()],
+                vec![MergeParent::merge("merge-a"), MergeParent::merge("merge-b")],
                 make_prompt_anchor(),
             )),
             fixed_timestamp(),
@@ -1087,8 +1125,33 @@ mod tests {
         };
         let prompt_anchor = anchor.as_prompt().expect("expected prompt anchor");
 
-        assert_eq!(anchor.merge_parents, vec!["merge-a", "merge-b"]);
+        assert_eq!(anchor.merge_parent_node_ids(), ["merge-a", "merge-b"]);
         assert_eq!(prompt_anchor.prompt, "merge prompt");
+    }
+
+    #[test]
+    fn prompt_anchor_round_trip_preserves_shadow_merge_parent_kind() {
+        let node = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::prompt(
+                vec![MergeParent::shadow("shadow-a")],
+                make_prompt_anchor(),
+            )),
+            fixed_timestamp(),
+        );
+
+        let encoded = serde_json::to_string(&node).unwrap();
+        let decoded: Node = serde_json::from_str(&encoded).unwrap();
+        let Kind::Anchor(anchor) = decoded.kind else {
+            panic!("expected anchor node");
+        };
+
+        assert_eq!(
+            anchor.merge_parents(),
+            [MergeParent::shadow("shadow-a")].as_slice()
+        );
     }
 
     #[test]
@@ -1098,7 +1161,7 @@ mod tests {
             Role::System,
             None,
             Kind::Anchor(Anchor::skill_result(
-                vec!["merge-a".to_owned()],
+                vec![MergeParent::merge("merge-a")],
                 make_skill_result_anchor(),
             )),
             fixed_timestamp(),
@@ -1113,7 +1176,7 @@ mod tests {
             .as_skill_result()
             .expect("expected skill result anchor");
 
-        assert_eq!(anchor.merge_parents, vec!["merge-a"]);
+        assert_eq!(anchor.merge_parent_node_ids(), ["merge-a"]);
         assert_eq!(skill_result.tool_id, "tool-call-1");
         assert_eq!(skill_result.skill_name, "find-skills");
         assert_eq!(skill_result.output, "child result");

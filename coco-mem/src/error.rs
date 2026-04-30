@@ -14,6 +14,9 @@ pub enum StoreError {
     #[snafu(display("Merge parent ID {id:?} matches the primary parent"))]
     MergeParentMatchesParent { id: String },
 
+    #[snafu(display("Anchor has multiple shadow parents: {ids:?}"))]
+    MultipleShadowParents { ids: Vec<String> },
+
     #[snafu(display("ID {id:?} not found"))]
     NotFound { id: String },
 

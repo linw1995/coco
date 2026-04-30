@@ -9,10 +9,10 @@ use crate::error::{
     AmbiguousNodePrefixSnafu, BranchConfigNotFoundSnafu, BranchConfigVersionNotFoundSnafu,
     BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu, DuplicateMergeParentSnafu,
     InvalidAnchorSnafu, InvalidSkillNameSnafu, MergeParentMatchesParentSnafu,
-    MissingSessionAnchorSnafu, NotFoundSnafu, ParentNotFoundSnafu, PromptJobActiveOnBranchSnafu,
-    PromptJobMovedSnafu, PromptJobNotFoundSnafu, ProviderProfileNotFoundSnafu,
-    RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu,
-    SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
+    MissingSessionAnchorSnafu, MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu,
+    PromptJobActiveOnBranchSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
+    ProviderProfileNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
+    SkillAlreadyExistsSnafu, SkillNotFoundSnafu, SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
     Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind, NewNode, Node,
@@ -787,26 +787,37 @@ impl StoreState {
         };
 
         let mut seen = HashSet::new();
+        let mut shadow_parents = Vec::new();
         for merge_parent in anchor.merge_parents() {
+            let node_id = merge_parent.node_id();
             ensure!(
-                merge_parent != parent,
+                node_id != parent,
                 MergeParentMatchesParentSnafu {
-                    id: merge_parent.clone(),
+                    id: node_id.to_owned(),
                 }
             );
             ensure!(
-                seen.insert(merge_parent.as_str()),
+                seen.insert(node_id),
                 DuplicateMergeParentSnafu {
-                    id: merge_parent.clone(),
+                    id: node_id.to_owned(),
                 }
             );
             ensure!(
-                self.nodes.contains_key(merge_parent),
+                self.nodes.contains_key(node_id),
                 ParentNotFoundSnafu {
-                    id: merge_parent.clone(),
+                    id: node_id.to_owned(),
                 }
             );
+            if merge_parent.is_shadow() {
+                shadow_parents.push(node_id.to_owned());
+            }
         }
+        ensure!(
+            shadow_parents.len() <= 1,
+            MultipleShadowParentsSnafu {
+                ids: shadow_parents,
+            }
+        );
 
         Ok(())
     }
@@ -894,7 +905,7 @@ fn validate_skill_name(name: &str) -> Result<()> {
 fn parent_ids(node: &Node) -> Vec<&str> {
     let mut parents = vec![node.parent.as_str()];
     if let Kind::Anchor(anchor) = &node.kind {
-        parents.extend(anchor.merge_parents().iter().map(String::as_str));
+        parents.extend(anchor.merge_parents().iter().map(|parent| parent.node_id()));
     }
     parents
 }

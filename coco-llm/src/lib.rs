@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
-    NewNode, NodeStore, PauseReason, PromptAnchor, ProviderMetadata, Role, RuntimeStore,
-    SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor, StoreError, Tool,
-    ToolResult, ToolUse,
+    MergeParent, NewNode, NodeStore, PauseReason, PromptAnchor, ProviderMetadata, Role,
+    RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
+    StoreError, Tool, ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1020,6 +1020,7 @@ where
                     .context(MemorySnafu)
             })
             .collect::<Result<Vec<_>>>()?;
+        let merge_parents = merge_parents.into_iter().map(MergeParent::merge).collect();
         let anchor_id = self
             .store
             .append(NewNode {
@@ -1346,6 +1347,7 @@ where
                     .context(MemorySnafu)
             })
             .collect::<Result<Vec<_>>>()?;
+        let merge_parents = merge_parents.into_iter().map(MergeParent::merge).collect();
         self.store
             .append(NewNode {
                 parent: parent_id.to_owned(),
@@ -2195,7 +2197,7 @@ fn persisted_node_from_backend_event(
             Role::System,
             metadata,
             Kind::Anchor(Anchor::skill_result(
-                vec![skill_result.merge_parent.clone()],
+                vec![MergeParent::merge(skill_result.merge_parent)],
                 SkillResultAnchor {
                     tool_id: skill_result.tool_id,
                     skill_name: skill_result.skill_name,
@@ -3612,7 +3614,10 @@ mod tests {
             panic!("expected anchor node");
         };
         assert!(anchor.as_session().is_some());
-        assert_eq!(anchor.merge_parents, vec![main_session.anchor_id]);
+        assert_eq!(
+            anchor.merge_parent_node_ids(),
+            [main_session.anchor_id.as_str()]
+        );
     }
 
     #[tokio::test]
@@ -4136,7 +4141,7 @@ mod tests {
         let prompt_anchor = anchor.as_prompt().expect("expected prompt anchor");
         assert_eq!(merged_anchor.parent, pr.base_head_id);
         assert_eq!(prompt_anchor.prompt, "handoff to base");
-        assert_eq!(anchor.merge_parents(), [source_head_id.as_str()]);
+        assert_eq!(anchor.merge_parent_node_ids(), [source_head_id.as_str()]);
         assert_eq!(
             store.get_branch_head("base").unwrap(),
             merged.merged_anchor_id
@@ -4199,7 +4204,7 @@ mod tests {
         let prompt_anchor = anchor.as_prompt().expect("expected prompt anchor");
         assert_eq!(feedback_anchor.parent, main_session.anchor_id);
         assert_eq!(prompt_anchor.prompt, "address review comments");
-        assert_eq!(anchor.merge_parents(), [base_feedback_id.as_str()]);
+        assert_eq!(anchor.merge_parent_node_ids(), [base_feedback_id.as_str()]);
         assert_eq!(
             store.get_branch_head("main").unwrap(),
             feedback.feedback_anchor_id
@@ -4517,7 +4522,7 @@ mod tests {
         assert_eq!(persisted.tool_id, "tool-call-1");
         assert_eq!(persisted.skill_name, "find-skills");
         assert_eq!(persisted.output, "delegated output");
-        assert_eq!(anchor.merge_parents(), [tool_use.parent.as_str()]);
+        assert_eq!(anchor.merge_parent_node_ids(), [tool_use.parent.as_str()]);
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
     }
 
@@ -4585,7 +4590,7 @@ mod tests {
         assert_eq!(skill_result.tool_id, "tool-call-1");
         assert_eq!(skill_result.skill_name, "find-skills");
         assert_eq!(skill_result.output, "Skill handoff");
-        assert_eq!(anchor.merge_parents(), [draft_head.as_str()]);
+        assert_eq!(anchor.merge_parent_node_ids(), [draft_head.as_str()]);
         assert_eq!(
             store.get_session_state("draft").unwrap(),
             SessionState::Attached {

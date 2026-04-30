@@ -7,9 +7,9 @@ use super::fs::FsStore;
 use super::memory::MemoryStore;
 use super::state::StoreState;
 use crate::{
-    Anchor, BranchConfig, BranchConfigStore, BranchStore, JobStatus, JobStore, Kind, NewNode, Node,
-    NodeStore, PauseReason, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
-    SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
+    Anchor, BranchConfig, BranchConfigStore, BranchStore, JobStatus, JobStore, Kind, MergeParent,
+    NewNode, Node, NodeStore, PauseReason, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch,
+    SessionRole, SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
     StoreError as Error,
 };
 use serde_json::json;
@@ -68,7 +68,7 @@ fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> Ne
         role: Role::System,
         metadata: None,
         kind: Kind::Anchor(Anchor::session(
-            vec![merge_parent.to_owned()],
+            vec![MergeParent::merge(merge_parent)],
             SessionAnchor {
                 role: SessionRole::Orchestrator,
                 provider_profile: None,
@@ -92,7 +92,10 @@ fn make_prompt_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
         role: Role::System,
         metadata: None,
         kind: Kind::Anchor(Anchor::prompt(
-            merge_parents.iter().map(|id| (*id).to_owned()).collect(),
+            merge_parents
+                .iter()
+                .map(|id| MergeParent::merge(*id))
+                .collect(),
             PromptAnchor {
                 prompt: "merge prompt".to_owned(),
             },
@@ -337,6 +340,43 @@ where
     assert!(matches!(
         err,
         Error::DuplicateMergeParent { id } if id == merge_parent_id
+    ));
+}
+
+fn assert_append_prompt_anchor_rejects_multiple_shadow_parents<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let left_shadow = store
+        .append(make_text_node(&session_id, "left-shadow"))
+        .unwrap();
+    let right_shadow = store
+        .append(make_text_node(&session_id, "right-shadow"))
+        .unwrap();
+    let err = store
+        .append(NewNode {
+            parent: session_id,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![
+                    MergeParent::shadow(left_shadow.clone()),
+                    MergeParent::shadow(right_shadow.clone()),
+                ],
+                PromptAnchor {
+                    prompt: "shadow prompt".to_owned(),
+                },
+            )),
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::MultipleShadowParents { ids }
+            if ids == vec![left_shadow, right_shadow]
     ));
 }
 
@@ -1343,7 +1383,7 @@ where
     };
     assert_eq!(rebased_prompt.parent, rebased_merge_source.id);
     assert_ne!(rebased_session.id, session_id);
-    assert_eq!(anchor.merge_parents(), [session_id.as_str()]);
+    assert_eq!(anchor.merge_parent_node_ids(), [session_id.as_str()]);
 }
 
 fn assert_rebase_session_keeps_other_branches_on_old_chain<F>()
@@ -1703,6 +1743,11 @@ macro_rules! define_common_store_tests {
             #[test]
             fn append_prompt_anchor_rejects_duplicate_merge_parents() {
                 assert_append_prompt_anchor_rejects_duplicate_merge_parents::<$factory>();
+            }
+
+            #[test]
+            fn append_prompt_anchor_rejects_multiple_shadow_parents() {
+                assert_append_prompt_anchor_rejects_multiple_shadow_parents::<$factory>();
             }
 
             #[test]

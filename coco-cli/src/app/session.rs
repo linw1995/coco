@@ -555,7 +555,7 @@ fn build_session_graph_entries(
                     let mut parents = Vec::new();
                     for merge_parent in anchor.merge_parents() {
                         let Some(parent_id) =
-                            resolve_visible_parent(&visible_node_ids, merge_parent)
+                            resolve_visible_parent(&visible_node_ids, merge_parent.node_id())
                         else {
                             continue;
                         };
@@ -702,7 +702,12 @@ fn collect_visible_graph_nodes(
 
         pending.push(node.parent.clone());
         if let Kind::Anchor(anchor) = &node.kind {
-            pending.extend(anchor.merge_parents().iter().cloned());
+            pending.extend(
+                anchor
+                    .merge_parents()
+                    .iter()
+                    .map(|parent| parent.node_id().to_owned()),
+            );
         }
         if is_use_skill_tool_use(&node) {
             collect_visible_anchor_child_subtrees(store, &node.id, &mut pending)?;
@@ -1113,7 +1118,7 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
                 if anchor.merge_parents.is_empty() {
                     "[]".to_owned()
                 } else {
-                    format!("[{}]", anchor.merge_parents.join(", "))
+                    format!("[{}]", anchor.merge_parent_node_ids().join(", "))
                 }
             ));
             match &anchor.payload {

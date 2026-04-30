@@ -1,6 +1,6 @@
 use coco_mem::{
-    Anchor, BranchStore, Kind, MemoryStore, NewNode, NodeStore, Role, SessionAnchor, SessionRole,
-    SessionState, Tool,
+    Anchor, BranchStore, Kind, MemoryStore, MergeParent, NewNode, NodeStore, Role, SessionAnchor,
+    SessionRole, SessionState, Tool,
 };
 use serde_json::json;
 
@@ -68,7 +68,10 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
             parent: left.clone(),
             role: Role::System,
             metadata: None,
-            kind: Kind::Anchor(Anchor::session(vec![right.clone()], session_anchor())),
+            kind: Kind::Anchor(Anchor::session(
+                vec![MergeParent::merge(right.clone())],
+                session_anchor(),
+            )),
         })
         .unwrap();
     store.set_branch_head("main", &left, &merged).unwrap();
