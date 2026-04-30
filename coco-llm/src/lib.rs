@@ -203,7 +203,7 @@ pub enum CompletionInput {
     Prompt {
         text: String,
         merge_parents: Vec<MergeParent>,
-        session_patch: Option<SessionConfigPatch>,
+        session_patch: Option<Box<SessionConfigPatch>>,
     },
 }
 
@@ -1096,7 +1096,7 @@ where
             input: CompletionInput::Prompt {
                 text: request.prompt,
                 merge_parents: request.merge_parents,
-                session_patch: request.session_patch,
+                session_patch: request.session_patch.map(Box::new),
             },
             overrides: CompletionOverrides::default(),
         })
@@ -1127,7 +1127,7 @@ where
                 &reference_id,
                 text,
                 merge_parents,
-                session_patch.as_ref(),
+                session_patch.as_deref(),
             )?,
         };
         let session = self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
