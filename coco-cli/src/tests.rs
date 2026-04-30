@@ -24,8 +24,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::{
     Cli,
     app::{
-        config::ProviderProfiles,
-        daemon::{resume_incomplete_jobs, start_daemon_server},
+        config::{ChannelConfigs, ProviderProfiles},
+        daemon::{DaemonServerOptions, resume_incomplete_jobs, start_daemon_server},
         resolve_session_config, run_forwarded_with_services, run_with_backend,
         runtime::{ForwardedRuntimeInputs, RuntimeServices},
     },
@@ -3856,18 +3856,47 @@ default_model = "gpt-4.1-mini"
 
 [providers.work-openai.secrets]
 api_key = "${COCO_WORK_OPENAI_API_KEY}"
+
+[channels.telegram]
+enabled = true
+token = "${COCO_TELEGRAM_BOT_TOKEN}"
+branch = "telegram"
+poll_timeout_secs = 15
+allowed_chat_ids = ["123", "-456"]
 "#,
     )
     .unwrap();
 
-    let profiles = crate::app::config::load_provider_profiles_from(&config_path).unwrap();
-    let profile = profiles.get_provider_profile("work-openai").unwrap();
+    let config = crate::app::config::load_config_from(&config_path).unwrap();
+    let profile = config
+        .provider_profiles
+        .get_provider_profile("work-openai")
+        .unwrap();
     assert_eq!(profile.provider, "openai");
     assert_eq!(
         profile.secrets.get("api_key").map(String::as_str),
         Some("${COCO_WORK_OPENAI_API_KEY}")
     );
     assert_eq!(profile.default_model.as_deref(), Some("gpt-4.1-mini"));
+    let telegram = config.channels.telegram.unwrap();
+    assert!(telegram.enabled);
+    assert_eq!(telegram.token, "${COCO_TELEGRAM_BOT_TOKEN}");
+    assert_eq!(telegram.branch, "telegram");
+    assert_eq!(telegram.poll_timeout_secs, 15);
+    assert!(telegram.allowed_chat_ids.contains("123"));
+    assert!(telegram.allowed_chat_ids.contains("-456"));
+}
+
+#[tokio::test]
+async fn channel_secret_resolves_env_placeholder() {
+    with_coco_env_async(&[("COCO_TELEGRAM_BOT_TOKEN", "secret-token")], || async {
+        let token =
+            crate::app::config::resolve_channel_secret("telegram", "${COCO_TELEGRAM_BOT_TOKEN}")
+                .unwrap();
+
+        assert_eq!(token, "secret-token");
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -4947,8 +4976,11 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
         &llm,
         shared_test_provider_profiles(),
         &engine,
-        None,
-        None,
+        DaemonServerOptions {
+            channel_configs: &ChannelConfigs::default(),
+            console_config: None,
+            console_publisher: None,
+        },
     ) {
         Ok(server) => server,
         Err(crate::Error::BindDaemonSocket { source, .. })

@@ -49,7 +49,9 @@ where
         command,
     } = cli;
     let shared_store = open_store_for_command(&store_path, &command)?;
-    let provider_profiles = config::load_cwd_provider_profiles()?;
+    let config = config::load_cwd_config()?;
+    let provider_profiles = config.provider_profiles;
+    let channel_configs = config.channels;
     let provider_configs = resolve_provider_runtime_configs(&provider_profiles)?;
     match command {
         Command::Daemon(command) => {
@@ -66,6 +68,7 @@ where
                 &shared_store,
                 &llm,
                 &provider_profiles,
+                &channel_configs,
                 Some(console_publisher),
             )
             .await

@@ -198,6 +198,7 @@ where
                 services.shared_store,
                 services.llm,
                 services.provider_profiles,
+                &Default::default(),
                 None,
             )
             .await

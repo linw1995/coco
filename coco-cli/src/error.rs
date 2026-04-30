@@ -41,6 +41,15 @@ pub enum Error {
         value: String,
     },
 
+    #[snafu(display("Invalid channel secret reference {value:?} for channel {channel:?}"))]
+    InvalidChannelSecretReference { channel: String, value: String },
+
+    #[snafu(display("Failed to read channel secret env var {name:?}: {source}"))]
+    ReadChannelSecretEnv {
+        name: String,
+        source: std::env::VarError,
+    },
+
     #[snafu(display("Invalid tool value {value:?} from {source_name:?}"))]
     InvalidToolConfiguration {
         source_name: &'static str,
@@ -97,6 +106,12 @@ pub enum Error {
 
     #[snafu(display("Daemon server task failed: {source}"))]
     JoinDaemonServer { source: tokio::task::JoinError },
+
+    #[snafu(display("Channel task failed: {source}"))]
+    JoinChannelTask { source: tokio::task::JoinError },
+
+    #[snafu(display("{source}"))]
+    Channel { source: coco_channel::Error },
 
     #[snafu(display("{source}"))]
     Console { source: coco_console::Error },

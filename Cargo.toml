@@ -1,5 +1,12 @@
 [workspace]
-members = ["coco-cli", "coco-console", "coco-core", "coco-llm", "coco-mem"]
+members = [
+  "coco-channel",
+  "coco-cli",
+  "coco-console",
+  "coco-core",
+  "coco-llm",
+  "coco-mem",
+]
 resolver = "2"
 
 [workspace.package]

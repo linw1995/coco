@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+coco-channel = { path = "../coco-channel" }
 coco-llm = { path = "../coco-llm" }
 futures = "0.3.31"
 indoc = "2.0.6"

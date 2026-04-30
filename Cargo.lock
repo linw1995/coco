@@ -335,11 +335,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "coco-channel"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+]
+
+[[package]]
 name = "coco-cli"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
+ "coco-channel",
  "coco-console",
  "coco-core",
  "coco-llm",
@@ -372,6 +385,7 @@ name = "coco-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "coco-channel",
  "coco-llm",
  "futures",
  "indoc",

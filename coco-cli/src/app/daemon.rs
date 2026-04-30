@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use coco_channel::{ChannelRuntime, InboundMessage, MessageHandler, OutboundMessage};
+use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
-use coco_core::ConversationEngine;
+use coco_core::{ConversationEngine, CoreService, FixedBranchResolver};
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{SessionRole, Store};
 use snafu::prelude::*;
@@ -10,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 
 use super::{
-    config::ProviderProfiles,
+    config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
     run_forwarded_with_services,
     runtime::{ForwardedRuntimeInputs, RuntimeServices},
 };
@@ -18,7 +21,8 @@ use crate::{
     Result,
     cli::{DaemonCommand, DaemonSubcommand},
     error::{
-        BindDaemonSocketSnafu, ConsoleSnafu, JoinDaemonServerSnafu, ResolveDaemonSocketRootSnafu,
+        BindDaemonSocketSnafu, ChannelSnafu, ConsoleSnafu, JoinChannelTaskSnafu,
+        JoinDaemonServerSnafu, ResolveDaemonSocketRootSnafu,
     },
 };
 
@@ -26,7 +30,14 @@ use crate::{
 pub(crate) struct CocoCliDaemonServerHandle {
     socket_path: PathBuf,
     socket_task: tokio::task::JoinHandle<()>,
+    channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
     console: Option<ConsoleServerHandle>,
+}
+
+pub(crate) struct DaemonServerOptions<'a> {
+    pub channel_configs: &'a ChannelConfigs,
+    pub console_config: Option<ConsoleConfig>,
+    pub console_publisher: Option<ConsolePublisher>,
 }
 
 pub(super) async fn run_daemon_command<B, S>(
@@ -34,6 +45,7 @@ pub(super) async fn run_daemon_command<B, S>(
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
     provider_profiles: &ProviderProfiles,
+    channel_configs: &ChannelConfigs,
     console_publisher: Option<ConsolePublisher>,
 ) -> Result<Option<String>>
 where
@@ -57,8 +69,11 @@ where
             llm,
             provider_profiles,
             &shared_engine,
-            console_config,
-            console_publisher,
+            DaemonServerOptions {
+                channel_configs,
+                console_config,
+                console_publisher,
+            },
         )?,
     };
     spawn_resume_incomplete_jobs(shared_engine);
@@ -124,8 +139,7 @@ pub(crate) fn start_daemon_server<B, S>(
     llm: &Arc<LlmService<B, S>>,
     provider_profiles: &ProviderProfiles,
     shared_engine: &Arc<ConversationEngine<B, S>>,
-    console_config: Option<ConsoleConfig>,
-    console_publisher: Option<ConsolePublisher>,
+    options: DaemonServerOptions<'_>,
 ) -> Result<CocoCliDaemonServerHandle>
 where
     B: CompletionBackend + 'static,
@@ -150,12 +164,14 @@ where
     let llm = llm.clone();
     let provider_profiles = provider_profiles.clone();
     let shared_engine = shared_engine.clone();
-    let console = match console_config {
+    let console = match options.console_config {
         Some(config) => Some(
             start_console_server(
                 config,
                 shared_store.clone(),
-                console_publisher.expect("console publisher should exist when console is enabled"),
+                options
+                    .console_publisher
+                    .expect("console publisher should exist when console is enabled"),
             )
             .context(ConsoleSnafu)?,
         ),
@@ -164,6 +180,7 @@ where
     if let Some(console) = &console {
         eprintln!("coco console listening on http://{}", console.addr());
     }
+    let channel_task = start_channel_task(options.channel_configs, &shared_engine)?;
 
     let socket_task = tokio::spawn(async move {
         loop {
@@ -193,8 +210,66 @@ where
     Ok(CocoCliDaemonServerHandle {
         socket_path,
         socket_task,
+        channel_task,
         console,
     })
+}
+
+fn start_channel_task<B, S>(
+    channel_configs: &ChannelConfigs,
+    shared_engine: &Arc<ConversationEngine<B, S>>,
+) -> Result<Option<tokio::task::JoinHandle<Result<()>>>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let Some(config) = channel_configs
+        .telegram
+        .as_ref()
+        .filter(|config| config.enabled)
+    else {
+        return Ok(None);
+    };
+
+    let token = resolve_channel_secret("telegram", &config.token)?;
+    let channel = TelegramChannel::from_config(coco_channel::telegram::TelegramChannelConfig {
+        token,
+        poll_timeout_secs: config.poll_timeout_secs,
+        allowed_chat_ids: config.allowed_chat_ids.clone(),
+    })
+    .context(ChannelSnafu)?;
+    let handler =
+        CoreChannelMessageHandler::new(config.branch.clone(), shared_engine.as_ref().clone());
+
+    Ok(Some(tokio::spawn(async move {
+        channel.run(&handler).await.context(ChannelSnafu)
+    })))
+}
+
+struct CoreChannelMessageHandler<B, S> {
+    service: CoreService<FixedBranchResolver, B, S>,
+}
+
+impl<B, S> CoreChannelMessageHandler<B, S> {
+    fn new(branch: impl Into<String>, engine: ConversationEngine<B, S>) -> Self {
+        Self {
+            service: CoreService::new(FixedBranchResolver::new(branch), engine),
+        }
+    }
+}
+
+#[async_trait]
+impl<B, S> MessageHandler for CoreChannelMessageHandler<B, S>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    async fn handle(&self, message: InboundMessage) -> coco_channel::Result<OutboundMessage> {
+        self.service
+            .handle_message(message)
+            .await
+            .map_err(ChannelError::handler)
+    }
 }
 
 impl CocoCliDaemonServerHandle {
@@ -202,45 +277,89 @@ impl CocoCliDaemonServerHandle {
         let Self {
             socket_path,
             socket_task,
+            channel_task,
             console,
         } = self;
 
-        match console {
-            Some(mut console) => {
-                tokio::select! {
-                    socket_result = socket_task => {
-                        cleanup_socket(&socket_path);
-                        console.shutdown().await.context(ConsoleSnafu)?;
-                        socket_result.context(JoinDaemonServerSnafu).map(|_| ())
-                    }
-                    console_result = console.wait_mut() => {
-                        cleanup_socket(&socket_path);
-                        console_result.context(ConsoleSnafu)
-                    }
-                }
-            }
-            None => {
-                let result = socket_task.await.context(JoinDaemonServerSnafu);
-                cleanup_socket(&socket_path);
-                result.map(|_| ())
-            }
-        }
+        wait_daemon_tasks(socket_path, socket_task, console, channel_task).await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn shutdown(self) -> Result<()> {
         self.socket_task.abort();
-        let result = self.socket_task.await;
+        if let Some(channel_task) = &self.channel_task {
+            channel_task.abort();
+        }
+        let socket_result = self.socket_task.await;
+        if let Some(channel_task) = self.channel_task {
+            match channel_task.await {
+                Ok(result) => result?,
+                Err(source) if source.is_cancelled() => {}
+                Err(source) => return Err(source).context(JoinChannelTaskSnafu),
+            }
+        }
         if let Some(console) = self.console {
             console.shutdown().await.context(ConsoleSnafu)?;
         }
         cleanup_socket(&self.socket_path);
-        match result {
+        match socket_result {
             Ok(()) => Ok(()),
             Err(source) if source.is_cancelled() => Ok(()),
             Err(source) => Err(source).context(JoinDaemonServerSnafu),
         }
     }
+}
+
+async fn wait_daemon_tasks(
+    socket_path: PathBuf,
+    socket_task: tokio::task::JoinHandle<()>,
+    mut console: Option<ConsoleServerHandle>,
+    mut channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    tokio::select! {
+        socket_result = socket_task => {
+            shutdown_console(console).await?;
+            abort_channel_task(channel_task).await?;
+            cleanup_socket(&socket_path);
+            socket_result.context(JoinDaemonServerSnafu).map(|_| ())
+        }
+        console_result = async { console.as_mut().expect("console task should exist").wait_mut().await }, if console.is_some() => {
+            abort_channel_task(channel_task).await?;
+            cleanup_socket(&socket_path);
+            console_result.context(ConsoleSnafu)
+        }
+        channel_result = async { channel_task.as_mut().expect("channel task should exist").await }, if channel_task.is_some() => {
+            shutdown_console(console).await?;
+            cleanup_socket(&socket_path);
+            channel_result.context(JoinChannelTaskSnafu)??;
+            Ok(())
+        }
+        else => {
+            cleanup_socket(&socket_path);
+            Ok(())
+        }
+    }
+}
+
+async fn shutdown_console(console: Option<ConsoleServerHandle>) -> Result<()> {
+    if let Some(console) = console {
+        console.shutdown().await.context(ConsoleSnafu)?;
+    }
+    Ok(())
+}
+
+async fn abort_channel_task(
+    channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    if let Some(channel_task) = channel_task {
+        channel_task.abort();
+        match channel_task.await {
+            Ok(result) => result,
+            Err(source) if source.is_cancelled() => Ok(()),
+            Err(source) => Err(source).context(JoinChannelTaskSnafu),
+        }?;
+    }
+    Ok(())
 }
 
 async fn handle_client<B, S>(
