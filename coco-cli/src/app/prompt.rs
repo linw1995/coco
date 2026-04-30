@@ -10,7 +10,7 @@ use coco_core::{
 use coco_llm::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, CompletionBackend, LlmService,
 };
-use coco_mem::{AnchorPayload, JobStore, Kind, NodeStore, Store};
+use coco_mem::{AnchorPayload, JobStore, Kind, MergeParent, NodeStore, Store};
 use serde::Serialize;
 use snafu::prelude::*;
 use tokio::process::Command;
@@ -46,14 +46,14 @@ struct PromptBaseNodeView {
     node_id: String,
     kind: &'static str,
     prompt: String,
-    merge_parents: Vec<String>,
+    merge_parents: Vec<MergeParent>,
 }
 
 #[derive(Debug)]
 struct PromptAnchorDetails {
     node_id: String,
     prompt: String,
-    merge_parents: Vec<String>,
+    merge_parents: Vec<MergeParent>,
 }
 
 pub(super) async fn run_prompt_command<B, R, S>(
@@ -322,11 +322,7 @@ fn load_prompt_anchor_details(
             AnchorPayload::Prompt(prompt_anchor) => Ok(PromptAnchorDetails {
                 node_id: node.id,
                 prompt: prompt_anchor.prompt.clone(),
-                merge_parents: anchor
-                    .merge_parent_node_ids()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
+                merge_parents: anchor.merge_parents().to_vec(),
             }),
             _ => Err(EngineError::EngineFailed {
                 message: format!(
@@ -360,11 +356,12 @@ fn render_job_queued_text(view: &JobQueuedView) -> String {
 
 fn render_prompt_status_text(view: &PromptJobStatusView) -> String {
     format!(
-        "{}\nbase_node: {}\nbase_kind: {}\nprompt: {}",
+        "{}\nbase_node: {}\nbase_kind: {}\nprompt: {}\nmerge_parents: {}",
         render_job_status_snapshot_text(&view.job),
         view.base_node.node_id,
         view.base_node.kind,
-        view.base_node.prompt
+        view.base_node.prompt,
+        render_merge_parents(&view.base_node.merge_parents)
     )
 }
 
@@ -382,4 +379,24 @@ fn render_job_status_snapshot_text(snapshot: &JobStatusSnapshot) -> String {
             .map(|finished_at| finished_at.to_string())
             .unwrap_or_else(|| "null".to_owned())
     )
+}
+
+fn render_merge_parents(parents: &[MergeParent]) -> String {
+    if parents.is_empty() {
+        return "[]".to_owned();
+    }
+
+    let rendered = parents
+        .iter()
+        .map(|parent| {
+            let kind = if parent.is_shadow() {
+                "shadow"
+            } else {
+                "merge"
+            };
+            format!("{kind}:{}", parent.node_id())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{rendered}]")
 }

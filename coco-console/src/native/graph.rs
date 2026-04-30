@@ -1,7 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use coco_mem::{
-    AnchorPayload, BranchStore, Kind, Node, NodeStore, PauseReason, SessionState, SessionStore,
+    AnchorPayload, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, SessionState,
+    SessionStore,
 };
 use serde::Serialize;
 use snafu::prelude::*;
@@ -44,6 +45,7 @@ pub struct GraphEdge {
 pub enum GraphEdgeKind {
     PrimaryParent,
     MergeParent,
+    ShadowParent,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -63,7 +65,7 @@ struct GraphBranchLabel {
 struct GraphNodeEntry {
     node: Node,
     primary_parent: Option<String>,
-    merge_parents: Vec<String>,
+    merge_parents: Vec<MergeParent>,
     labels: Vec<GraphBranchLabel>,
 }
 
@@ -107,11 +109,15 @@ pub fn build_graph_snapshot(
                     .iter()
                     .filter_map(|merge_parent| {
                         resolve_visible_parent(&visible_node_ids, merge_parent.node_id())
+                            .map(|parent_id| visible_merge_parent(merge_parent, parent_id))
                     })
-                    .filter(|parent_id| primary_parent.as_ref() != Some(parent_id))
-                    .fold(Vec::<String>::new(), |mut parents, parent_id| {
-                        if !parents.iter().any(|existing| existing == &parent_id) {
-                            parents.push(parent_id);
+                    .filter(|parent| primary_parent.as_deref() != Some(parent.node_id()))
+                    .fold(Vec::<MergeParent>::new(), |mut parents, parent| {
+                        if !parents
+                            .iter()
+                            .any(|existing| existing.node_id() == parent.node_id())
+                        {
+                            parents.push(parent);
                         }
                         parents
                     }),
@@ -146,9 +152,13 @@ pub fn build_graph_snapshot(
         }
         for parent in &entry.merge_parents {
             edges.push(GraphEdge {
-                source: parent.clone(),
+                source: parent.node_id().to_owned(),
                 target: entry.node.id.clone(),
-                kind: GraphEdgeKind::MergeParent,
+                kind: if parent.is_shadow() {
+                    GraphEdgeKind::ShadowParent
+                } else {
+                    GraphEdgeKind::MergeParent
+                },
             });
         }
         nodes.push(GraphNode {
@@ -251,6 +261,14 @@ fn resolve_visible_parent(visible_node_ids: &BTreeSet<String>, start_id: &str) -
     visible_node_ids
         .contains(start_id)
         .then(|| start_id.to_owned())
+}
+
+fn visible_merge_parent(parent: &MergeParent, node_id: String) -> MergeParent {
+    if parent.is_shadow() {
+        MergeParent::shadow(node_id)
+    } else {
+        MergeParent::merge(node_id)
+    }
 }
 
 fn graph_kind_name(node: &Node) -> &'static str {

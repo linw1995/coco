@@ -154,6 +154,51 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
 }
 
 #[test]
+fn graph_snapshot_contains_shadow_parent_edges() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &session).unwrap();
+    let shadow_parent = store
+        .append(NewNode {
+            parent: root,
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("shadow".to_owned()),
+        })
+        .unwrap();
+    let prompt = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![MergeParent::shadow(shadow_parent.clone())],
+                coco_mem::PromptAnchor {
+                    prompt: String::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store.set_branch_head("main", &session, &prompt).unwrap();
+
+    let snapshot = build_graph_snapshot(&store, 8).unwrap();
+
+    assert!(snapshot.edges.contains(&GraphEdge {
+        source: shadow_parent,
+        target: prompt,
+        kind: GraphEdgeKind::ShadowParent,
+    }));
+}
+
+#[test]
 fn layout_expands_empty_columns_from_event_order() {
     let snapshot = GraphSnapshot {
         version: 1,

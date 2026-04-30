@@ -392,6 +392,16 @@ fn session_graph_cli(store_path: std::path::PathBuf) -> Cli {
     }
 }
 
+fn session_graph_json_cli(store_path: std::path::PathBuf) -> Cli {
+    Cli {
+        daemon_socket: None,
+        store_path,
+        command: Command::Session(SessionCommand {
+            command: SessionSubcommand::Graph(SessionGraphCommand { json: true }),
+        }),
+    }
+}
+
 fn session_show_cli(store_path: std::path::PathBuf, reference: &str, json: bool) -> Cli {
     Cli {
         daemon_socket: None,
@@ -1426,6 +1436,57 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
     assert!(serde_json::from_str::<serde_json::Value>(&branch_text_output).is_err());
     assert!(branch_text_output.contains("status: Finished"));
     assert!(branch_text_output.contains("branch: main"));
+}
+
+#[tokio::test]
+async fn prompt_status_json_preserves_shadow_parent_kind() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_head = store.get_branch_head("main").unwrap();
+    let shadow_parent = append_tool_use_node(&store, &session_head, "tool-call-1", "bash");
+    let prompt_anchor_id = store
+        .append(NewNode {
+            parent: session_head,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![MergeParent::shadow(shadow_parent.clone())],
+                PromptAnchor {
+                    prompt: "hello".to_owned(),
+                },
+            )),
+        })
+        .unwrap();
+    let job = store.submit_job("main", &prompt_anchor_id).unwrap();
+
+    let status_output = run_with_backend(
+        prompt_status_cli(store_path, &job.job_id),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value: Value = serde_json::from_str(&status_output).unwrap();
+
+    assert_eq!(
+        value["base_node"]["merge_parents"],
+        json!([{"kind": "shadow", "node_id": shadow_parent}])
+    );
 }
 
 #[tokio::test]
@@ -2952,6 +3013,91 @@ async fn session_show_json_includes_children_ids() {
     let value = serde_json::from_str::<Value>(&output).unwrap();
 
     assert_eq!(value["children"], json!([primary_child_id, merge_child_id]));
+}
+
+#[tokio::test]
+async fn session_show_and_graph_preserve_shadow_parent_kind() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_id = store.get_branch_head("main").unwrap();
+    let shadow_parent = append_tool_use_node(&store, &session_id, "tool-call-1", "bash");
+    let shadow_anchor_id = store
+        .append(NewNode {
+            parent: session_id.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![MergeParent::shadow(shadow_parent.clone())],
+                PromptAnchor {
+                    prompt: String::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &session_id, &shadow_anchor_id)
+        .unwrap();
+
+    let show_text = run_with_backend(
+        session_show_cli(store_path.clone(), &shadow_anchor_id, false),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(show_text.contains(&format!("merge_parents: [shadow:{shadow_parent}]")));
+
+    let show_json = run_with_backend(
+        session_show_cli(store_path.clone(), &shadow_anchor_id, true),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let show_value = serde_json::from_str::<Value>(&show_json).unwrap();
+    assert_eq!(
+        show_value["node"]["kind"]["Anchor"]["merge_parents"],
+        json!([{"kind": "shadow", "node_id": shadow_parent}])
+    );
+
+    let graph_text = run_with_backend(
+        session_graph_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(graph_text.contains("shadow=["));
+
+    let graph_json = run_with_backend(
+        session_graph_json_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let graph_value = serde_json::from_str::<Value>(&graph_json).unwrap();
+    assert!(graph_value.as_array().unwrap().iter().any(
+        |entry| entry["merge_parents"] == json!([{"kind": "shadow", "node_id": shadow_parent}])
+    ));
 }
 
 #[tokio::test]

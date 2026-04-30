@@ -6,7 +6,7 @@ use coco_llm::{
     CompletionBackend, LlmService, SessionConfig, SessionConfigPatch, SessionFeedback, SessionMerge,
 };
 use coco_mem::{
-    AnchorPayload, BranchConfigStore, BranchStore, Kind, Node, NodeStore, PauseReason,
+    AnchorPayload, BranchConfigStore, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason,
     ProviderProfileStore, SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
 };
 use serde::Serialize;
@@ -104,7 +104,7 @@ struct GraphBranchLabel {
 struct GraphNodeEntry {
     node: Node,
     primary_parent: Option<String>,
-    merge_parents: Vec<String>,
+    merge_parents: Vec<MergeParent>,
     labels: Vec<GraphBranchLabel>,
 }
 
@@ -560,11 +560,13 @@ fn build_session_graph_entries(
                             continue;
                         };
                         if primary_parent.as_ref() == Some(&parent_id)
-                            || parents.iter().any(|existing| existing == &parent_id)
+                            || parents
+                                .iter()
+                                .any(|existing: &MergeParent| existing.node_id() == parent_id)
                         {
                             continue;
                         }
-                        parents.push(parent_id);
+                        parents.push(visible_merge_parent(merge_parent, parent_id));
                     }
                     parents
                 }
@@ -616,7 +618,7 @@ fn topologically_sort_graph_entries(entries: Vec<GraphNodeEntry>) -> Vec<GraphNo
             *count += 1;
         }
         for merge_parent in &entry.merge_parents {
-            if let Some(count) = pending_children.get_mut(merge_parent) {
+            if let Some(count) = pending_children.get_mut(merge_parent.node_id()) {
                 *count += 1;
             }
         }
@@ -645,7 +647,12 @@ fn topologically_sort_graph_entries(entries: Vec<GraphNodeEntry>) -> Vec<GraphNo
         if let Some(primary_parent) = &entry.primary_parent {
             parents.push(primary_parent.clone());
         }
-        parents.extend(entry.merge_parents.iter().cloned());
+        parents.extend(
+            entry
+                .merge_parents
+                .iter()
+                .map(|parent| parent.node_id().to_owned()),
+        );
 
         for parent_id in parents {
             let Some(count) = pending_children.get_mut(&parent_id) else {
@@ -803,6 +810,14 @@ fn resolve_visible_parent(visible_node_ids: &BTreeSet<String>, start_id: &str) -
     }
 }
 
+fn visible_merge_parent(parent: &MergeParent, node_id: String) -> MergeParent {
+    if parent.is_shadow() {
+        MergeParent::shadow(node_id)
+    } else {
+        MergeParent::merge(node_id)
+    }
+}
+
 fn render_graph_entries(entries: &[GraphNodeEntry]) -> String {
     let mut output = String::new();
     let mut active_columns = Vec::<String>::new();
@@ -876,10 +891,11 @@ fn build_graph_transition(
         .and_then(|primary_parent| next.iter().position(|node_id| node_id == primary_parent))
         .map_or_else(|| current_col.min(next.len()), |index| index + 1);
     for merge_parent in &entry.merge_parents {
-        if next.iter().any(|node_id| node_id == merge_parent) {
+        let merge_parent_id = merge_parent.node_id();
+        if next.iter().any(|node_id| node_id == merge_parent_id) {
             continue;
         }
-        next.insert(insert_at, merge_parent.clone());
+        next.insert(insert_at, merge_parent_id.to_owned());
         insert_at += 1;
     }
 
@@ -915,10 +931,10 @@ fn render_graph_connector_row(
     let merge_parent_cols = entry
         .merge_parents
         .iter()
-        .filter_map(|node_id| {
+        .filter_map(|parent| {
             next_columns
                 .iter()
-                .position(|candidate| candidate == node_id)
+                .position(|candidate| candidate == parent.node_id())
         })
         .collect::<Vec<_>>();
 
@@ -995,24 +1011,37 @@ fn render_graph_summary(entry: &GraphNodeEntry) -> String {
     let created_at = entry.node.created_at.to_string();
     let labels = render_graph_labels(&entry.labels);
     let summary = summarize_node(&entry.node);
-    let merge_suffix = if entry.merge_parents.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " merge=[{}]",
-            entry
-                .merge_parents
-                .iter()
-                .map(|node_id| shorten_id(node_id))
-                .collect::<Vec<_>>()
-                .join(",")
-        )
-    };
+    let merge_suffix = render_graph_merge_suffix(&entry.merge_parents);
 
     if labels.is_empty() {
         format!("{short_id} {kind} {created_at} {summary}{merge_suffix}")
     } else {
         format!("{short_id} {kind} {created_at} [{labels}] {summary}{merge_suffix}")
+    }
+}
+
+fn render_graph_merge_suffix(parents: &[MergeParent]) -> String {
+    let merge_ids = parents
+        .iter()
+        .filter(|parent| !parent.is_shadow())
+        .map(|parent| shorten_id(parent.node_id()))
+        .collect::<Vec<_>>();
+    let shadow_ids = parents
+        .iter()
+        .filter(|parent| parent.is_shadow())
+        .map(|parent| shorten_id(parent.node_id()))
+        .collect::<Vec<_>>();
+    let mut parts = Vec::new();
+    if !merge_ids.is_empty() {
+        parts.push(format!("merge=[{}]", merge_ids.join(",")));
+    }
+    if !shadow_ids.is_empty() {
+        parts.push(format!("shadow=[{}]", shadow_ids.join(",")));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join(" "))
     }
 }
 
@@ -1118,7 +1147,7 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
                 if anchor.merge_parents.is_empty() {
                     "[]".to_owned()
                 } else {
-                    format!("[{}]", anchor.merge_parent_node_ids().join(", "))
+                    format!("[{}]", render_merge_parent_list(anchor.merge_parents()))
                 }
             ));
             match &anchor.payload {
@@ -1209,6 +1238,21 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
     }
 
     lines.join("\n")
+}
+
+fn render_merge_parent_list(parents: &[MergeParent]) -> String {
+    parents
+        .iter()
+        .map(|parent| {
+            let kind = if parent.is_shadow() {
+                "shadow"
+            } else {
+                "merge"
+            };
+            format!("{kind}:{}", parent.node_id())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn truncate_summary(text: &str) -> String {

@@ -59,6 +59,13 @@ pub enum GraphLayoutEdgeKind {
     MergeParent,
 }
 
+fn is_merge_like_edge(kind: GraphEdgeKind) -> bool {
+    matches!(
+        kind,
+        GraphEdgeKind::MergeParent | GraphEdgeKind::ShadowParent
+    )
+}
+
 #[derive(Debug)]
 struct LanePlan {
     label: String,
@@ -341,7 +348,7 @@ pub fn layout_graph(snapshot: &GraphSnapshot) -> GraphLayout {
     let mut merge_edges = snapshot
         .edges
         .iter()
-        .filter(|edge| edge.kind == GraphEdgeKind::MergeParent)
+        .filter(|edge| is_merge_like_edge(edge.kind))
         .filter_map(|edge| {
             let source = *first_occurrence_by_node.get(&edge.source)?;
             let target = *first_occurrence_by_node.get(&edge.target)?;
@@ -444,7 +451,7 @@ fn relax_lane_columns(
         for edge in snapshot
             .edges
             .iter()
-            .filter(|edge| edge.kind == GraphEdgeKind::MergeParent)
+            .filter(|edge| is_merge_like_edge(edge.kind))
         {
             let Some(source) = first_location_by_node.get(&edge.source) else {
                 continue;
