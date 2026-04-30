@@ -4,3 +4,8 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+snafu.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

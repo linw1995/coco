@@ -337,6 +337,11 @@ dependencies = [
 [[package]]
 name = "coco-channel"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "snafu",
+ "tokio",
+]
 
 [[package]]
 name = "coco-cli"
