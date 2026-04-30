@@ -23,6 +23,9 @@ pub struct PromptRunCommand {
 
     #[arg(value_name = "TEXT")]
     pub text: Vec<String>,
+
+    #[arg(skip)]
+    pub shadow_parent: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -59,4 +62,7 @@ pub struct PromptBranchStatusCommand {
 pub struct PromptWorkerCommand {
     #[arg(long)]
     pub job: String,
+
+    #[arg(skip)]
+    pub shadow_parent: Option<String>,
 }

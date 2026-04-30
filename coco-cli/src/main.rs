@@ -2,8 +2,9 @@ use std::io::{ErrorKind, IsTerminal, Read};
 
 use clap::Parser;
 use coco_llm::{
-    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_SESSION_BRANCH_ENV,
-    COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
+    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_TOOL_USE_ID_ENV,
+    COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest,
+    CocoCliRuntimeResponse,
 };
 use coco_mem::SessionRole;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -267,6 +268,7 @@ async fn forward_to_socket(socket_path: &str, args: &[String]) -> Result<(), For
             .ok()
             .and_then(|value| SessionRole::parse(&value)),
         store_path_env: std::env::var(COCO_STORE_PATH_ENV).ok(),
+        parent_tool_use_id_env: std::env::var(COCO_PARENT_TOOL_USE_ID_ENV).ok(),
     };
     let payload =
         serde_json::to_vec(&request).expect("failed to serialize coco-cli daemon request");

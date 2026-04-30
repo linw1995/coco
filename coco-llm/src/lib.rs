@@ -41,6 +41,7 @@ pub const COCO_SESSION_ROLE_ENV: &str = "COCO_SESSION_ROLE";
 pub const COCO_STORE_PATH_ENV: &str = "COCO_STORE_PATH";
 pub const COCO_CLI_RUNTIME_SOCKET_ENV: &str = "COCO_CLI_RUNTIME_SOCKET";
 pub const COCO_COMMAND_SHIM_MODE_ENV: &str = "COCO_COMMAND_SHIM_MODE";
+pub const COCO_PARENT_TOOL_USE_ID_ENV: &str = "COCO_PARENT_TOOL_USE_ID";
 
 pub type CompletionMessage = rig::completion::message::Message;
 pub type CompletionToolCall = rig::completion::message::ToolCall;
@@ -184,6 +185,7 @@ pub struct CompletionRequest {
     pub branch: String,
     pub origin: CompletionOrigin,
     pub input: CompletionInput,
+    pub shadow_parent: Option<String>,
     pub overrides: CompletionOverrides,
 }
 
@@ -441,6 +443,7 @@ pub struct CocoCliRuntimeRequest {
     pub branch_env: Option<String>,
     pub session_role: Option<SessionRole>,
     pub store_path_env: Option<String>,
+    pub parent_tool_use_id_env: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1068,7 +1071,7 @@ where
     ) -> Result<String> {
         let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
         let anchor_id =
-            self.append_prompt_anchor_to_parent(&original_head, prompt, merge_parents)?;
+            self.append_prompt_anchor_to_parent(&original_head, prompt, merge_parents, None)?;
         self.store
             .set_branch_head(branch, &original_head, &anchor_id)
             .context(MemorySnafu)?;
@@ -1125,6 +1128,7 @@ where
                 text: request.prompt,
                 merge_parents: request.merge_parents,
             },
+            shadow_parent: None,
             overrides: CompletionOverrides::default(),
         })
         .await
@@ -1145,11 +1149,19 @@ where
             CompletionOrigin::Reference(reference) => self.resolve_reference_id(reference)?,
         };
         let retry_from_node_id = match &request.input {
-            CompletionInput::Continue => reference_id,
+            CompletionInput::Continue => self.append_shadow_prompt_anchor_to_parent(
+                &reference_id,
+                request.shadow_parent.as_deref(),
+            )?,
             CompletionInput::Prompt {
                 text,
                 merge_parents,
-            } => self.append_prompt_anchor_to_parent(&reference_id, text, merge_parents)?,
+            } => self.append_prompt_anchor_to_parent(
+                &reference_id,
+                text,
+                merge_parents,
+                request.shadow_parent.as_deref(),
+            )?,
         };
         let session = self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
         let trace_node_appender = TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
@@ -1331,6 +1343,7 @@ where
         parent_id: &str,
         prompt: &str,
         merge_parents: &[String],
+        shadow_parent: Option<&str>,
     ) -> Result<String> {
         let merge_parents = merge_parents
             .iter()
@@ -1347,7 +1360,20 @@ where
                     .context(MemorySnafu)
             })
             .collect::<Result<Vec<_>>>()?;
-        let merge_parents = merge_parents.into_iter().map(MergeParent::merge).collect();
+        let mut merge_parents = merge_parents
+            .into_iter()
+            .map(MergeParent::merge)
+            .collect::<Vec<_>>();
+        if let Some(shadow_parent) = shadow_parent {
+            let shadow_parent = self.resolve_reference_id(shadow_parent)?;
+            if shadow_parent != parent_id
+                && !merge_parents
+                    .iter()
+                    .any(|merge_parent| merge_parent.node_id() == shadow_parent)
+            {
+                merge_parents.push(MergeParent::shadow(shadow_parent));
+            }
+        }
         self.store
             .append(NewNode {
                 parent: parent_id.to_owned(),
@@ -1361,6 +1387,17 @@ where
                 )),
             })
             .context(MemorySnafu)
+    }
+
+    fn append_shadow_prompt_anchor_to_parent(
+        &self,
+        parent_id: &str,
+        shadow_parent: Option<&str>,
+    ) -> Result<String> {
+        let Some(shadow_parent) = shadow_parent else {
+            return Ok(parent_id.to_owned());
+        };
+        self.append_prompt_anchor_to_parent(parent_id, "", &[], Some(shadow_parent))
     }
 
     fn append_backend_events(
@@ -3297,6 +3334,7 @@ mod tests {
             branch: branch.to_owned(),
             origin: CompletionOrigin::BranchHead,
             input: CompletionInput::Continue,
+            shadow_parent: None,
             overrides: CompletionOverrides::default(),
         }
     }
@@ -3977,6 +4015,7 @@ mod tests {
                 branch: "main".to_owned(),
                 origin: CompletionOrigin::Reference(first.response_node_id.clone()),
                 input: CompletionInput::Continue,
+                shadow_parent: None,
                 overrides: CompletionOverrides::default(),
             })
             .await
@@ -4011,6 +4050,7 @@ mod tests {
                     text: "resume from base".to_owned(),
                     merge_parents: vec![],
                 },
+                shadow_parent: None,
                 overrides: CompletionOverrides::default(),
             })
             .await

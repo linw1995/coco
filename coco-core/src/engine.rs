@@ -93,6 +93,18 @@ where
         Ok(self.run_prompt_job(branch, prompt, vec![]).await?.text)
     }
 
+    pub async fn reply_with_shadow_parent(
+        &self,
+        branch: &str,
+        prompt: &str,
+        shadow_parent: Option<String>,
+    ) -> std::result::Result<String, EngineError> {
+        Ok(self
+            .run_prompt_job_with_shadow_parent(branch, prompt, vec![], shadow_parent)
+            .await?
+            .text)
+    }
+
     pub async fn reply_many(
         &self,
         items: Vec<BranchPromptRequest>,
@@ -151,7 +163,20 @@ where
         prompt: &str,
         merge_parents: Vec<String>,
     ) -> std::result::Result<PromptReply, EngineError> {
-        let job = self.submit_job(branch, prompt, merge_parents).await?;
+        self.run_prompt_job_with_shadow_parent(branch, prompt, merge_parents, None)
+            .await
+    }
+
+    async fn run_prompt_job_with_shadow_parent(
+        &self,
+        branch: &str,
+        prompt: &str,
+        merge_parents: Vec<String>,
+        shadow_parent: Option<String>,
+    ) -> std::result::Result<PromptReply, EngineError> {
+        let job = self
+            .submit_job_with_shadow_parent(branch, prompt, merge_parents, shadow_parent)
+            .await?;
         let snapshot = self.drive_job_for_prompt(&job.job_id).await?;
         let job = self.service.store().get_job(&job.job_id)?;
         build_prompt_reply(self.service.store(), &job, &snapshot)
@@ -163,11 +188,35 @@ where
         prompt: &str,
         merge_parents: Vec<String>,
     ) -> std::result::Result<Job, EngineError> {
-        let merge_parent_ids = resolve_reference_ids(self.service.store(), &merge_parents)?
+        self.submit_job_with_shadow_parent(branch, prompt, merge_parents, None)
+            .await
+    }
+
+    pub async fn submit_job_with_shadow_parent(
+        &self,
+        branch: &str,
+        prompt: &str,
+        merge_parents: Vec<String>,
+        shadow_parent: Option<String>,
+    ) -> std::result::Result<Job, EngineError> {
+        let mut merge_parent_ids = resolve_reference_ids(self.service.store(), &merge_parents)?
             .into_iter()
             .map(MergeParent::merge)
-            .collect();
+            .collect::<Vec<_>>();
         let base = self.service.store().get_branch_head(branch)?;
+        if let Some(shadow_parent) = shadow_parent {
+            let shadow_parent = resolve_reference_ids(self.service.store(), &[shadow_parent])?
+                .into_iter()
+                .next()
+                .expect("single shadow parent reference should resolve to one node");
+            if shadow_parent != base
+                && !merge_parent_ids
+                    .iter()
+                    .any(|merge_parent| merge_parent.node_id() == shadow_parent)
+            {
+                merge_parent_ids.push(MergeParent::shadow(shadow_parent));
+            }
+        }
         let base = self.service.store().append(NewNode {
             parent: base,
             role: Role::System,
@@ -208,7 +257,16 @@ where
         &self,
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let _ = self.drive_job_singleflight(job_id).await;
+        let _ = self.drive_job_singleflight(job_id, None).await;
+        self.get_job(job_id)
+    }
+
+    pub async fn drive_job_with_shadow_parent(
+        &self,
+        job_id: &str,
+        shadow_parent: Option<String>,
+    ) -> std::result::Result<JobStatusSnapshot, EngineError> {
+        let _ = self.drive_job_singleflight(job_id, shadow_parent).await;
         self.get_job(job_id)
     }
 
@@ -216,16 +274,17 @@ where
         &self,
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        self.drive_job_singleflight(job_id).await?;
+        self.drive_job_singleflight(job_id, None).await?;
         self.get_job(job_id)
     }
 
     async fn drive_job_singleflight(
         &self,
         job_id: &str,
+        shadow_parent: Option<String>,
     ) -> std::result::Result<String, EngineError> {
         let job_id = job_id.to_owned();
-        let inflight_job = self.get_or_start_inflight_job(&job_id).await;
+        let inflight_job = self.get_or_start_inflight_job(&job_id, shadow_parent).await;
         let result = inflight_job.clone().await;
 
         self.inflight_jobs.lock().await.remove(&job_id);
@@ -233,7 +292,11 @@ where
         result
     }
 
-    async fn drive_job_once(&self, job_id: &str) -> std::result::Result<String, EngineError> {
+    async fn drive_job_once(
+        &self,
+        job_id: &str,
+        shadow_parent: Option<String>,
+    ) -> std::result::Result<String, EngineError> {
         let mut job = self.service.store().get_job(job_id)?;
 
         if matches!(job.status, JobStatus::Queued) {
@@ -249,7 +312,7 @@ where
             // Prompt jobs must reach a terminal finished state even when execution fails so they
             // remain recoverable and auditable. The caller decides whether to surface the
             // execution error or only inspect the persisted snapshot afterwards.
-            let run_result = self.resume_or_run_job(&job).await;
+            let run_result = self.resume_or_run_job(&job, shadow_parent).await;
             self.finish_job(&job).await?;
             run_result?;
         }
@@ -257,7 +320,11 @@ where
         self.job_head(&job)
     }
 
-    async fn resume_or_run_job(&self, job: &Job) -> std::result::Result<(), EngineError> {
+    async fn resume_or_run_job(
+        &self,
+        job: &Job,
+        shadow_parent: Option<String>,
+    ) -> std::result::Result<(), EngineError> {
         let store = self.service.store();
         let last_node = find_job_last_node(store, job)?;
 
@@ -272,12 +339,14 @@ where
                 branch: job.branch.clone(),
                 origin: CompletionOrigin::Reference(last_node.id),
                 input: CompletionInput::Continue,
+                shadow_parent: shadow_parent.clone(),
                 overrides: CompletionOverrides::default(),
             },
             None => CompletionRequest {
                 branch: job.branch.clone(),
                 origin: CompletionOrigin::Reference(job.base.clone()),
                 input: CompletionInput::Continue,
+                shadow_parent,
                 overrides: CompletionOverrides::default(),
             },
         };
@@ -340,14 +409,18 @@ where
         Ok(())
     }
 
-    async fn get_or_start_inflight_job(&self, job_id: &str) -> InflightJob {
+    async fn get_or_start_inflight_job(
+        &self,
+        job_id: &str,
+        shadow_parent: Option<String>,
+    ) -> InflightJob {
         let mut inflight_jobs = self.inflight_jobs.lock().await;
         inflight_jobs
             .entry(job_id.to_owned())
             .or_insert_with(|| {
                 let engine = self.clone();
                 let job_id = job_id.to_owned();
-                async move { engine.drive_job_once(&job_id).await }
+                async move { engine.drive_job_once(&job_id, shadow_parent).await }
                     .boxed()
                     .shared()
             })

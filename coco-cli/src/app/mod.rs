@@ -163,6 +163,7 @@ where
                             branch_env: request.branch_env.as_deref(),
                             session_role: request.session_role,
                             store_path_env: request.store_path_env.as_deref(),
+                            parent_tool_use_id_env: request.parent_tool_use_id_env.as_deref(),
                         },
                         runtime::RuntimeServices {
                             shared_store: &shared_store,

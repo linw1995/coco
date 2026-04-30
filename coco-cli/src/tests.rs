@@ -254,6 +254,7 @@ fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str
                 asynchronous: false,
                 json: false,
                 text: text.iter().map(|part| (*part).to_owned()).collect(),
+                shadow_parent: None,
             },
         }),
     }
@@ -266,12 +267,14 @@ fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
         command: Command::Prompt(PromptCommand {
             command: Some(PromptSubcommand::Worker(PromptWorkerCommand {
                 job: job.to_owned(),
+                shadow_parent: None,
             })),
             run: PromptRunCommand {
                 branch: "main".to_owned(),
                 asynchronous: false,
                 json: false,
                 text: vec![],
+                shadow_parent: None,
             },
         }),
     }
@@ -291,6 +294,7 @@ fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
                 asynchronous: false,
                 json: false,
                 text: vec![],
+                shadow_parent: None,
             },
         }),
     }
@@ -315,6 +319,7 @@ fn prompt_branch_status_cli(
                 asynchronous: false,
                 json: false,
                 text: vec![],
+                shadow_parent: None,
             },
         }),
     }
@@ -4219,6 +4224,7 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
             branch_env: Some("draft"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4232,6 +4238,73 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
     assert_eq!(response.exit_code, 0);
     assert_eq!(response.stdout, "world\n");
     assert!(response.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("draft")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_head = store.get_branch_head("draft").unwrap();
+    let parent_tool_use = append_tool_use_node(&store, &session_head, "tool-call-1", "bash");
+    let llm = llm_with_test_provider_config(
+        store.clone(),
+        FakeBackend::with_responses(&[("draft", &[Ok("world")])]),
+    );
+
+    let response = run_forwarded_with_services(
+        ForwardedRuntimeInputs {
+            args: &["prompt".to_owned(), "hello".to_owned()],
+            stdin: &[],
+            branch_env: Some("draft"),
+            session_role: Some(SessionRole::Orchestrator),
+            store_path_env: None,
+            parent_tool_use_id_env: Some(&parent_tool_use),
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
+            shared_engine: None,
+        },
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 0);
+    assert_eq!(response.stdout, "world\n");
+    assert!(response.stderr.is_empty());
+
+    let ancestry = store.ancestry("draft").unwrap();
+    let prompt_anchor = ancestry
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor)
+                if anchor
+                    .as_prompt()
+                    .is_some_and(|prompt| prompt.prompt == "hello") =>
+            {
+                Some(anchor)
+            }
+            _ => None,
+        })
+        .expect("expected forwarded prompt anchor");
+    assert_eq!(
+        prompt_anchor.merge_parents(),
+        [MergeParent::shadow(parent_tool_use)].as_slice()
+    );
 }
 
 #[tokio::test]
@@ -4269,6 +4342,7 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
             branch_env: Some("draft"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4285,6 +4359,80 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
 }
 
 #[tokio::test]
+async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_head = store.get_branch_head("main").unwrap();
+    let parent_tool_use = append_tool_use_node(&store, &session_head, "tool-call-1", "bash");
+    let job = submit_prompt_job(&store, "main", "hello");
+    let llm = llm_with_test_provider_config(
+        store.clone(),
+        FakeBackend::with_responses(&[("main", &[Ok("done")])]),
+    );
+
+    let response = run_forwarded_with_services(
+        ForwardedRuntimeInputs {
+            args: &[
+                "prompt".to_owned(),
+                "worker".to_owned(),
+                "--job".to_owned(),
+                job.job_id.clone(),
+            ],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Orchestrator),
+            store_path_env: None,
+            parent_tool_use_id_env: Some(&parent_tool_use),
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
+            shared_engine: None,
+        },
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 0);
+    assert!(response.stdout.is_empty());
+    assert!(response.stderr.is_empty());
+
+    let ancestry = store.ancestry("main").unwrap();
+    let shadow_anchor = ancestry
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor)
+                if anchor
+                    .as_prompt()
+                    .is_some_and(|prompt| prompt.prompt.is_empty())
+                    && !anchor.merge_parents().is_empty() =>
+            {
+                Some(anchor)
+            }
+            _ => None,
+        })
+        .expect("expected forwarded continue shadow anchor");
+    assert_eq!(
+        shadow_anchor.merge_parents(),
+        [MergeParent::shadow(parent_tool_use)].as_slice()
+    );
+}
+
+#[tokio::test]
 async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
     let (_tempdir, store_path) = temp_store_path();
     let store = open_store(&store_path).unwrap();
@@ -4297,6 +4445,7 @@ async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4330,6 +4479,7 @@ async fn forwarded_runtime_runner_session_help_hides_write_subcommands() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4365,6 +4515,7 @@ async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4394,6 +4545,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4427,6 +4579,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4456,6 +4609,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4480,6 +4634,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4516,6 +4671,7 @@ async fn forwarded_runtime_rejects_store_path_override() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_tool_use_id_env: None,
         },
         RuntimeServices {
             shared_store: &store,
@@ -4583,6 +4739,7 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
         branch_env: Some("main".to_owned()),
         session_role: Some(SessionRole::Orchestrator),
         store_path_env: None,
+        parent_tool_use_id_env: None,
     };
 
     let payload = serde_json::to_vec(&request).unwrap();

@@ -265,6 +265,7 @@ where
                         branch_env: request.branch_env.as_deref(),
                         session_role: request.session_role.or(Some(SessionRole::Orchestrator)),
                         store_path_env: request.store_path_env.as_deref(),
+                        parent_tool_use_id_env: request.parent_tool_use_id_env.as_deref(),
                     },
                     RuntimeServices {
                         shared_store,

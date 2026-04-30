@@ -14,9 +14,9 @@ use tokio::process::Command;
 use std::os::unix::ffi::OsStrExt;
 
 use crate::{
-    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_SESSION_BRANCH_ENV,
-    COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
-    ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv,
+    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_TOOL_USE_ID_ENV,
+    COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest,
+    CocoCliRuntimeResponse, ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv,
 };
 
 #[derive(Debug, Clone)]
@@ -41,6 +41,7 @@ struct BashCommandRequest {
     sandbox_mode: BashSandboxMode,
     timeout_ms: Option<u64>,
     context: ToolRuntimeEnv,
+    parent_tool_use_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -286,6 +287,7 @@ fn resolve_bash_request(
         sandbox_mode: resolve_sandbox_mode()?,
         timeout_ms,
         context,
+        parent_tool_use_id: None,
     })
 }
 
@@ -681,6 +683,7 @@ async fn execute_bash_command(
         .env_remove(COCO_SESSION_ROLE_ENV)
         .env_remove(COCO_STORE_PATH_ENV)
         .env_remove(COCO_CLI_RUNTIME_SOCKET_ENV)
+        .env_remove(COCO_PARENT_TOOL_USE_ID_ENV)
         .env_remove(COCO_COMMAND_SHIM_MODE_ENV);
     if let Some(coco_command) = &coco_command {
         command.env("PATH", &coco_command.path_env);
@@ -693,6 +696,9 @@ async fn execute_bash_command(
             }
             if let Some(runtime_server) = &runtime_server {
                 command.env(COCO_CLI_RUNTIME_SOCKET_ENV, &runtime_server.socket_path);
+            }
+            if let Some(parent_tool_use_id) = &request.parent_tool_use_id {
+                command.env(COCO_PARENT_TOOL_USE_ID_ENV, parent_tool_use_id);
             }
         } else {
             command.env(COCO_COMMAND_SHIM_MODE_ENV, "disabled");
@@ -747,7 +753,7 @@ impl BashToolRuntime {
     pub async fn execute(
         &self,
         args: String,
-        _invocation: ToolInvocationContext,
+        invocation: ToolInvocationContext,
     ) -> std::result::Result<ToolExecutionOutcome, rig::tool::ToolError> {
         use rig::tool::ToolError;
 
@@ -755,7 +761,8 @@ impl BashToolRuntime {
         let context = self.context.clone();
         let result = async {
             let args: Value = serde_json::from_str(&args).context(ParseArgsSnafu)?;
-            let request = resolve_bash_request(&args, &workspace_root, context)?;
+            let mut request = resolve_bash_request(&args, &workspace_root, context)?;
+            request.parent_tool_use_id = invocation.persisted_tool_use_node_id;
             execute_bash_command(request).await
         }
         .await;
@@ -969,6 +976,7 @@ mod tests {
             sandbox_mode: BashSandboxMode::Nono,
             timeout_ms: None,
             context: test_context(),
+            parent_tool_use_id: None,
         };
         let path_env = OsString::from("/tmp/nono-bin:/tmp/bash-bin");
         let spec = resolve_execution_spec(&request, Some(path_env.as_os_str()), &[]);
@@ -985,6 +993,7 @@ mod tests {
             sandbox_mode: BashSandboxMode::Off,
             timeout_ms: None,
             context: test_context(),
+            parent_tool_use_id: None,
         };
         let nono = PathBuf::from("/bin/nono");
         let runtime_dir = temp_root.path().join(".coco-runtime").join("socket-dir");
@@ -1024,6 +1033,7 @@ mod tests {
             sandbox_mode: BashSandboxMode::Off,
             timeout_ms: None,
             context: test_context(),
+            parent_tool_use_id: None,
         };
         let spec = nono_execution_spec(PathBuf::from("/bin/nono"), &request, &[]);
 
@@ -1301,12 +1311,16 @@ mod tests {
                     COCO_CLI_RUNTIME_SOCKET_ENV,
                     Some(OsStr::new("/tmp/stale-runtime.sock")),
                 ),
+                (
+                    COCO_PARENT_TOOL_USE_ID_ENV,
+                    Some(OsStr::new("stale-tool-use")),
+                ),
                 ("COCO_BASH_SANDBOX", Some(OsStr::new("off"))),
             ],
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"command":"printf '%s|%s|%s|%s' \"$COCO_BRANCH\" \"$COCO_SESSION_ROLE\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\"","workdir":"{}"}}"#,
+                        r#"{{"command":"printf '%s|%s|%s|%s|%s' \"$COCO_BRANCH\" \"$COCO_SESSION_ROLE\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\" \"${{COCO_PARENT_TOOL_USE_ID:-}}\"","workdir":"{}"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -1315,7 +1329,47 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(output.contains("stdout:\ndraft|runner||"));
+        assert!(output.contains("stdout:\ndraft|runner|||"));
+    }
+
+    #[tokio::test]
+    async fn bash_runtime_injects_parent_tool_use_env_for_invocation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = runtime(
+            temp_tool(),
+            workspace.path().to_path_buf(),
+            ToolRuntimeEnv {
+                session_branch: "draft".to_owned(),
+                session_role: coco_mem::SessionRole::Orchestrator,
+                store_path: None,
+                enable_coco_shim: true,
+                cli_bridge: crate::BashToolCliBridgeHandle::default(),
+                skill_executor: crate::SkillToolExecutorHandle::default(),
+            },
+        );
+
+        let output = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                runtime
+                    .execute(
+                        format!(
+                            r#"{{"command":"printf '%s' \"${{COCO_PARENT_TOOL_USE_ID:-}}\"","workdir":"{}"}}"#,
+                            workspace.path().display()
+                        ),
+                        ToolInvocationContext {
+                            persisted_tool_use_node_id: Some("tool-use-node".to_owned()),
+                        },
+                    )
+                    .await
+            },
+        )
+        .await
+        .unwrap()
+        .provider_output()
+        .to_owned();
+
+        assert!(output.contains("stdout:\ntool-use-node"));
     }
 
     #[tokio::test]
@@ -1357,6 +1411,7 @@ mod tests {
             branch_env: Some("draft".to_owned()),
             session_role: Some(coco_mem::SessionRole::Runner),
             store_path_env: Some(runtime_store.display().to_string()),
+            parent_tool_use_id_env: None,
         };
         let payload = serde_json::to_vec(&request).unwrap();
 

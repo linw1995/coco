@@ -42,6 +42,7 @@ pub(crate) struct ForwardedRuntimeInputs<'a> {
     pub branch_env: Option<&'a str>,
     pub session_role: Option<SessionRole>,
     pub store_path_env: Option<&'a str>,
+    pub parent_tool_use_id_env: Option<&'a str>,
 }
 
 #[derive(Debug, Parser)]
@@ -114,6 +115,7 @@ impl RunnerCli {
                     asynchronous: false,
                     json: false,
                     text: vec![],
+                    shadow_parent: None,
                 },
             }),
             RunnerCommand::Session(command) => Command::Session(SessionCommand {
@@ -224,8 +226,10 @@ where
     apply_forwarded_defaults(
         &mut cli,
         inputs.args,
+        scope,
         inputs.branch_env,
         inputs.store_path_env,
+        inputs.parent_tool_use_id_env,
     );
 
     match run_with_services(cli, &mut std::io::Cursor::new(inputs.stdin), services, true).await {
@@ -312,11 +316,19 @@ fn has_explicit_flag(args: &[String], name: &str) -> bool {
 fn apply_forwarded_defaults(
     cli: &mut Cli,
     args: &[String],
+    scope: ForwardedRuntimeScope,
     branch_env: Option<&str>,
     store_path_env: Option<&str>,
+    parent_tool_use_id_env: Option<&str>,
 ) {
     if let Some(store_path_env) = store_path_env {
         cli.store_path = std::path::PathBuf::from(store_path_env);
+    }
+
+    if scope == ForwardedRuntimeScope::Orchestrator
+        && let Some(parent_tool_use_id) = parent_tool_use_id_env
+    {
+        apply_forwarded_shadow_parent(cli, parent_tool_use_id.to_owned());
     }
 
     if has_explicit_flag(args, "branch") {
@@ -351,5 +363,15 @@ fn apply_forwarded_defaults(
         },
         Command::Skill(_) => {}
         Command::Daemon(_) => {}
+    }
+}
+
+fn apply_forwarded_shadow_parent(cli: &mut Cli, shadow_parent: String) {
+    if let Command::Prompt(command) = &mut cli.command {
+        match &mut command.command {
+            None => command.run.shadow_parent = Some(shadow_parent),
+            Some(PromptSubcommand::Worker(command)) => command.shadow_parent = Some(shadow_parent),
+            Some(PromptSubcommand::Status(_)) | Some(PromptSubcommand::BranchStatus(_)) => {}
+        }
     }
 }

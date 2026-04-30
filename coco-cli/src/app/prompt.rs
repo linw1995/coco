@@ -139,7 +139,12 @@ where
     let input = resolve_prompt_input(&command, reader)?;
     if command.asynchronous {
         let job = engine
-            .submit_job(&command.branch, &input, vec![])
+            .submit_job_with_shadow_parent(
+                &command.branch,
+                &input,
+                vec![],
+                command.shadow_parent.clone(),
+            )
             .await
             .context(CoreEngineSnafu)?;
         let store_path = if forwarded_runtime {
@@ -169,6 +174,14 @@ where
         } else {
             render_job_queued_text(&view)
         }));
+    }
+
+    if command.shadow_parent.is_some() {
+        return engine
+            .reply_with_shadow_parent(&command.branch, &input, command.shadow_parent)
+            .await
+            .map(Some)
+            .context(CoreEngineSnafu);
     }
 
     let service = CoreService::new(FixedBranchResolver::new(command.branch), (*engine).clone());
@@ -235,7 +248,7 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     engine
-        .drive_job(&command.job)
+        .drive_job_with_shadow_parent(&command.job, command.shadow_parent)
         .await
         .context(CoreEngineSnafu)?;
     Ok(None)
