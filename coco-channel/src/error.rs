@@ -15,4 +15,24 @@ pub enum Error {
     InvalidInput { message: String },
 }
 
+impl Error {
+    pub fn handler(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Handler {
+            source: Box::new(source),
+        }
+    }
+
+    pub fn transport(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Transport {
+            source: Box::new(source),
+        }
+    }
+
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            message: message.into(),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

@@ -339,6 +339,9 @@ name = "coco-channel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
  "snafu",
  "tokio",
 ]
