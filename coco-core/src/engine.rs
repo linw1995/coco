@@ -6,7 +6,7 @@ use coco_llm::coco_mem::{
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
-    LlmService, MergeParentRef, RigBackend,
+    LlmService, RigBackend,
 };
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jiff::Timestamp;
@@ -97,7 +97,7 @@ where
         &self,
         branch: &str,
         prompt: &str,
-        merge_parents: Vec<MergeParentRef>,
+        merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<String, EngineError> {
         Ok(self
             .run_prompt_job(branch, prompt, merge_parents)
@@ -161,7 +161,7 @@ where
         &self,
         branch: &str,
         prompt: &str,
-        merge_parents: Vec<MergeParentRef>,
+        merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<PromptReply, EngineError> {
         let job = self.submit_job(branch, prompt, merge_parents).await?;
         let snapshot = self.drive_job_for_prompt(&job.job_id).await?;
@@ -173,11 +173,10 @@ where
         &self,
         branch: &str,
         prompt: &str,
-        merge_parents: Vec<MergeParentRef>,
+        merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<Job, EngineError> {
         let base = self.service.store().get_branch_head(branch)?;
-        let merge_parent_ids =
-            resolve_merge_parent_refs(self.service.store(), merge_parents, &base)?;
+        let merge_parent_ids = normalize_merge_parents(merge_parents, &base);
         let base = self.service.store().append(NewNode {
             parent: base,
             role: Role::System,
@@ -225,7 +224,7 @@ where
     pub async fn drive_job_with_merge_parents(
         &self,
         job_id: &str,
-        merge_parents: Vec<MergeParentRef>,
+        merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         let _ = self.drive_job_singleflight(job_id, merge_parents).await;
         self.get_job(job_id)
@@ -242,7 +241,7 @@ where
     async fn drive_job_singleflight(
         &self,
         job_id: &str,
-        merge_parents: Vec<MergeParentRef>,
+        merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<String, EngineError> {
         let job_id = job_id.to_owned();
         let inflight_job = self.get_or_start_inflight_job(&job_id, merge_parents).await;
@@ -256,7 +255,7 @@ where
     async fn drive_job_once(
         &self,
         job_id: &str,
-        merge_parents: Vec<MergeParentRef>,
+        merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<String, EngineError> {
         let mut job = self.service.store().get_job(job_id)?;
 
@@ -284,7 +283,7 @@ where
     async fn resume_or_run_job(
         &self,
         job: &Job,
-        merge_parents: Vec<MergeParentRef>,
+        merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<(), EngineError> {
         let store = self.service.store();
         let last_node = find_job_last_node(store, job)?;
@@ -375,7 +374,7 @@ where
     async fn get_or_start_inflight_job(
         &self,
         job_id: &str,
-        merge_parents: Vec<MergeParentRef>,
+        merge_parents: Vec<MergeParent>,
     ) -> InflightJob {
         let mut inflight_jobs = self.inflight_jobs.lock().await;
         inflight_jobs
@@ -447,29 +446,20 @@ where
     }
 }
 
-fn resolve_merge_parent_refs<S>(
-    store: &S,
-    merge_parents: Vec<MergeParentRef>,
+fn normalize_merge_parents(
+    merge_parents: Vec<MergeParent>,
     primary_parent: &str,
-) -> std::result::Result<Vec<MergeParent>, EngineError>
-where
-    S: NodeStore,
-{
-    let mut resolved = Vec::new();
+) -> Vec<MergeParent> {
+    let mut normalized = Vec::new();
     for merge_parent in merge_parents {
-        let node_id = store
-            .ancestry(merge_parent.reference())?
-            .into_iter()
-            .next()
-            .expect("ancestry should always include the head node")
-            .id;
+        let node_id = merge_parent.node_id();
         if node_id != primary_parent
-            && !resolved
+            && !normalized
                 .iter()
                 .any(|parent: &MergeParent| parent.node_id() == node_id)
         {
-            resolved.push(merge_parent.into_resolved_parent(node_id));
+            normalized.push(merge_parent);
         }
     }
-    Ok(resolved)
+    normalized
 }

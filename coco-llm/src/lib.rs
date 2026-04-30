@@ -147,7 +147,7 @@ pub struct SessionConfig {
 pub struct PromptRequest {
     pub branch: String,
     pub prompt: String,
-    pub merge_parents: Vec<MergeParentRef>,
+    pub merge_parents: Vec<MergeParent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,35 +188,6 @@ pub struct CompletionRequest {
     pub overrides: CompletionOverrides,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MergeParentRef {
-    Merge(String),
-    Shadow(String),
-}
-
-impl MergeParentRef {
-    pub fn merge(reference: impl Into<String>) -> Self {
-        Self::Merge(reference.into())
-    }
-
-    pub fn shadow(reference: impl Into<String>) -> Self {
-        Self::Shadow(reference.into())
-    }
-
-    pub fn reference(&self) -> &str {
-        match self {
-            Self::Merge(reference) | Self::Shadow(reference) => reference,
-        }
-    }
-
-    pub fn into_resolved_parent(self, node_id: String) -> MergeParent {
-        match self {
-            Self::Merge(_) => MergeParent::merge(node_id),
-            Self::Shadow(_) => MergeParent::shadow(node_id),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CompletionOrigin {
     #[default]
@@ -230,7 +201,7 @@ pub enum CompletionInput {
     Continue,
     Prompt {
         text: String,
-        merge_parents: Vec<MergeParentRef>,
+        merge_parents: Vec<MergeParent>,
     },
 }
 
@@ -1345,7 +1316,7 @@ where
         &self,
         branch: &str,
         prompt: &str,
-        merge_parents: &[MergeParentRef],
+        merge_parents: &[MergeParent],
     ) -> Result<String> {
         let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
         let anchor_id =
@@ -1366,17 +1337,17 @@ where
         &self,
         parent_id: &str,
         prompt: &str,
-        merge_parents: &[MergeParentRef],
+        merge_parents: &[MergeParent],
     ) -> Result<String> {
-        let mut resolved_parents = Vec::new();
+        let mut normalized_parents = Vec::new();
         for merge_parent in merge_parents {
-            let node_id = self.resolve_reference_id(merge_parent.reference())?;
+            let node_id = merge_parent.node_id();
             if node_id != parent_id
-                && !resolved_parents
+                && !normalized_parents
                     .iter()
                     .any(|parent: &MergeParent| parent.node_id() == node_id)
             {
-                resolved_parents.push(merge_parent.clone().into_resolved_parent(node_id));
+                normalized_parents.push(merge_parent.clone());
             }
         }
         self.store
@@ -1385,7 +1356,7 @@ where
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::prompt(
-                    resolved_parents,
+                    normalized_parents,
                     PromptAnchor {
                         prompt: prompt.to_owned(),
                     },
@@ -1558,7 +1529,7 @@ where
         };
 
         let source_head_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
-        let merge_parents = vec![MergeParentRef::merge(source_head_id.clone())];
+        let merge_parents = vec![MergeParent::merge(source_head_id.clone())];
         let merged_anchor_id =
             self.append_prompt_anchor_to_branch(&resolved_target_branch, prompt, &merge_parents)?;
         self.store
@@ -1618,7 +1589,7 @@ where
             }
         }
 
-        let merge_parents = vec![MergeParentRef::merge(source_anchor_id.clone())];
+        let merge_parents = vec![MergeParent::merge(source_anchor_id.clone())];
         let feedback_anchor_id =
             self.append_prompt_anchor_to_branch(branch, prompt, &merge_parents)?;
         self.store
@@ -3785,7 +3756,7 @@ mod tests {
             ("main", &[Ok("main answer"), Ok("merge answer")]),
             ("draft", &[Ok("draft answer")]),
         ]);
-        let service = LlmService::new(store, backend);
+        let service = LlmService::new(store.clone(), backend);
         service
             .create_session(session_config("main"))
             .await
@@ -3801,12 +3772,13 @@ mod tests {
             .prompt(prompt_request("draft", "draft question"))
             .await
             .unwrap();
+        let draft_head = store.get_branch_head("draft").unwrap();
 
         let result = service
             .prompt(PromptRequest {
                 branch: "main".to_owned(),
                 prompt: "merge them".to_owned(),
-                merge_parents: vec![MergeParentRef::merge("draft")],
+                merge_parents: vec![MergeParent::merge(draft_head)],
             })
             .await
             .unwrap();

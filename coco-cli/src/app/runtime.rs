@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use coco_core::ConversationEngine;
-use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService, MergeParentRef};
-use coco_mem::{SessionRole, Store};
+use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
+use coco_mem::{MergeParent, SessionRole, Store};
 
 use super::{
     config::ProviderProfiles, daemon::run_daemon_command, preset::run_preset_command,
@@ -372,10 +372,10 @@ fn apply_forwarded_shadow_parent(cli: &mut Cli, shadow_parent: String) {
             None => command
                 .run
                 .merge_parents
-                .push(MergeParentRef::shadow(shadow_parent)),
+                .push(MergeParent::shadow(shadow_parent)),
             Some(PromptSubcommand::Worker(command)) => command
                 .merge_parents
-                .push(MergeParentRef::shadow(shadow_parent)),
+                .push(MergeParent::shadow(shadow_parent)),
             Some(PromptSubcommand::Status(_)) | Some(PromptSubcommand::BranchStatus(_)) => {}
         }
     }

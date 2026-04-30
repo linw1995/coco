@@ -1,6 +1,6 @@
 use std::fmt;
 
-use coco_llm::MergeParentRef;
+use coco_llm::coco_mem::MergeParent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
@@ -82,7 +82,7 @@ pub struct OutboundMessage {
 pub struct BranchPromptRequest {
     pub branch: String,
     pub prompt: String,
-    pub merge_parents: Vec<MergeParentRef>,
+    pub merge_parents: Vec<MergeParent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
