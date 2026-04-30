@@ -7,18 +7,27 @@ version.workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+# Serialization shared by native and wasm builds.
 serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Workspace crates.
 coco-mem = { path = "../coco-mem" }
+
+# Native server runtime and UI rendering.
 leptos.workspace = true
-snafu.workspace = true
 tokio.workspace = true
 
+# Error handling.
+snafu.workspace = true
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# Wasm bindings.
 wasm-bindgen = "0.2.114"
 wasm-bindgen-futures = "0.4.64"
+
+# Browser APIs.
 web-sys = { version = "0.3.91", features = [
   "console",
   "Document",
@@ -35,4 +44,5 @@ web-sys = { version = "0.3.91", features = [
 ] }
 
 [build-dependencies]
+# Build script error handling.
 snafu.workspace = true

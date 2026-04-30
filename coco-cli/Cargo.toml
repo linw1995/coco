@@ -4,21 +4,33 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
-clap.workspace = true
+# Workspace crates.
 coco-channel = { path = "../coco-channel", features = ["telegram"] }
 coco-core = { path = "../coco-core" }
 coco-console = { path = "../coco-console" }
 coco-llm = { path = "../coco-llm" }
 coco-mem = { path = "../coco-mem" }
+
+# Async runtime and traits.
+async-trait.workspace = true
+tokio.workspace = true
+
+# CLI and configuration.
+clap.workspace = true
+toml.workspace = true
+
+# Serialization.
 serde.workspace = true
 serde_json.workspace = true
+
+# Error handling.
 snafu.workspace = true
-tokio.workspace = true
-toml.workspace = true
+
+# Observability.
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Test fixtures.
 tempfile = "3.23.0"

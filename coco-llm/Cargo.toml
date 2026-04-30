@@ -4,18 +4,32 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
+# Workspace crates.
 coco-mem = { path = "../coco-mem" }
-indoc = "2.0.6"
-nanoid = "0.4.0"
+
+# Async runtime and traits.
+async-trait.workspace = true
+tokio.workspace = true
+
+# LLM backend.
 rig = { package = "rig-core", git = "https://github.com/0xPlaygrounds/rig", branch = "main", features = [
   "derive",
 ] }
+
+# Serialization.
 serde.workspace = true
 serde_json.workspace = true
+
+# Error handling.
 snafu.workspace = true
-tokio.workspace = true
+
+# Observability.
 tracing.workspace = true
 
+# Identifiers and test helpers.
+indoc = "2.0.6"
+nanoid = "0.4.0"
+
 [dev-dependencies]
+# Test fixtures.
 tempfile = "3.20.0"

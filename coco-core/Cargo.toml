@@ -4,18 +4,32 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
+# Workspace crates.
 coco-channel = { path = "../coco-channel" }
 coco-llm = { path = "../coco-llm" }
+
+# Async runtime and traits.
+async-trait.workspace = true
 futures = "0.3.31"
-indoc = "2.0.6"
+tokio.workspace = true
+
+# Time and identifiers.
 jiff = { version = "0.2.23", features = ["serde"] }
 nanoid.workspace = true
+
+# Serialization.
 serde.workspace = true
 serde_json.workspace = true
+
+# Error handling.
 snafu.workspace = true
-tokio.workspace = true
+
+# Observability.
 tracing.workspace = true
 
+# Test helpers.
+indoc = "2.0.6"
+
 [dev-dependencies]
+# Test fixtures.
 tempfile = "3.20.0"
