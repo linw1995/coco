@@ -129,7 +129,7 @@ impl FromStr for Provider {
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub branch: String,
-    pub merge_parents: Vec<String>,
+    pub merge_parents: Vec<MergeParent>,
     pub provider_profile: Option<String>,
     pub role: SessionRole,
     pub provider: Provider,
@@ -1006,23 +1006,7 @@ where
         let provider = provider_profile
             .is_none()
             .then(|| config.provider.as_str().to_owned());
-        let merge_parents = config
-            .merge_parents
-            .iter()
-            .map(|reference| {
-                self.store
-                    .ancestry(reference)
-                    .map(|nodes| {
-                        nodes
-                            .into_iter()
-                            .next()
-                            .expect("ancestry should always include the head node")
-                            .id
-                    })
-                    .context(MemorySnafu)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let merge_parents = merge_parents.into_iter().map(MergeParent::merge).collect();
+        let merge_parents = normalize_merge_parents(config.merge_parents, &root_id);
         let anchor_id = self
             .store
             .append(NewNode {
@@ -1622,6 +1606,24 @@ where
         let context = self.resolve_context(branch)?;
         self.session_from_context(branch, context)
     }
+}
+
+fn normalize_merge_parents(
+    merge_parents: Vec<MergeParent>,
+    primary_parent: &str,
+) -> Vec<MergeParent> {
+    let mut normalized = Vec::new();
+    for merge_parent in merge_parents {
+        let node_id = merge_parent.node_id();
+        if node_id != primary_parent
+            && !normalized
+                .iter()
+                .any(|parent: &MergeParent| parent.node_id() == node_id)
+        {
+            normalized.push(merge_parent);
+        }
+    }
+    normalized
 }
 
 impl<B, S> LlmService<B, S>
@@ -3587,11 +3589,12 @@ mod tests {
             .create_session(session_config("main"))
             .await
             .unwrap();
+        let main_head = store.get_branch_head("main").unwrap();
 
         let draft_session = service
             .create_session(SessionConfig {
                 branch: "draft".to_owned(),
-                merge_parents: vec!["main".to_owned()],
+                merge_parents: vec![MergeParent::merge(main_head)],
                 provider_profile: None,
                 role: SessionRole::Orchestrator,
                 provider: Provider::OpenAi,
