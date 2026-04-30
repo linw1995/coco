@@ -10,10 +10,19 @@ use coco_mem::SessionRole;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use coco_cli::{COCO_DAEMON_SOCKET_ENV, Cli, resolve_default_daemon_socket_path, run};
+use coco_cli::{
+    COCO_DAEMON_SOCKET_ENV, Cli, init_tracing, resolve_default_daemon_socket_path, run,
+};
 
 #[tokio::main]
 async fn main() {
+    let _logging_guard = match init_tracing() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("{error}");
+            None
+        }
+    };
     let args = std::env::args().collect::<Vec<_>>();
     if shim_mode_is_disabled() {
         eprintln!(

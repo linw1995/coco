@@ -614,7 +614,10 @@ async fn start_coco_cli_runtime_server(
                 };
                 let payload = encode_runtime_response(&response);
                 if let Err(error) = stream.write_all(&payload).await {
-                    eprintln!("failed to write coco-cli runtime response: {error}");
+                    tracing::error!(
+                        error = %error,
+                        "failed to write coco-cli runtime response"
+                    );
                 }
             });
         }

@@ -11,3 +11,4 @@ coco-console/pkg
 .codex
 skills-lock.json
 config.toml
+logs

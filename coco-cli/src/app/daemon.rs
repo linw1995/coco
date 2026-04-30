@@ -99,7 +99,10 @@ where
 {
     tokio::spawn(async move {
         if let Err(error) = resume_incomplete_jobs(engine.as_ref()).await {
-            eprintln!("failed to resume incomplete prompt jobs on daemon startup: {error}");
+            tracing::error!(
+                error = %error,
+                "failed to resume incomplete prompt jobs on daemon startup"
+            );
         }
     });
 }
@@ -178,7 +181,7 @@ where
         None => None,
     };
     if let Some(console) = &console {
-        eprintln!("coco console listening on http://{}", console.addr());
+        tracing::info!(addr = %console.addr(), "coco console listening");
     }
     let channel_task = start_channel_task(options.channel_configs, &shared_engine)?;
 
