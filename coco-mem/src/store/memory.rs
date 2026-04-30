@@ -1,10 +1,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use super::Store;
 use super::state::StoreState;
+use super::{
+    BranchConfigStore, BranchStore, JobStore, NodeStore, ProviderProfileStore, RuntimeStore,
+    SessionStore, SkillStore,
+};
 use crate::StoreResult as Result;
-use crate::{NewNode, Node, SessionAnchorPatch, SessionState};
+use crate::{
+    BranchConfig, BranchConfigRecord, Job, JobStatus, NewNode, Node, ProviderProfile,
+    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
+    SkillVersionSpec,
+};
 
 #[derive(Clone, Debug)]
 pub struct MemoryStore {
@@ -30,7 +37,7 @@ impl MemoryStore {
     }
 }
 
-impl Store for MemoryStore {
+impl NodeStore for MemoryStore {
     fn root_id(&self) -> String {
         self.inner
             .read()
@@ -45,6 +52,35 @@ impl Store for MemoryStore {
         state.insert_existing_node(node)
     }
 
+    fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .ancestry(head_ref)
+            .map(|nodes| nodes.into_iter().cloned().collect())
+    }
+
+    fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .log(base_ref, head_ref)
+            .map(|nodes| nodes.into_iter().cloned().collect())
+    }
+
+    fn get_node(&self, id: &str) -> Result<Node> {
+        self.inner.read().expect("store lock poisoned").get_node(id)
+    }
+
+    fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .list_children(node_id)
+    }
+}
+
+impl BranchStore for MemoryStore {
     fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
         let mut state = self.inner.write().expect("store lock poisoned");
         let plan = state.plan_fork(name, from_ref)?;
@@ -73,27 +109,9 @@ impl Store for MemoryStore {
             .expect("store lock poisoned")
             .apply_set_branch_head(name.to_owned(), expected_old_head, new_head.to_owned())
     }
+}
 
-    fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .ancestry(head_ref)
-            .map(|nodes| nodes.into_iter().cloned().collect())
-    }
-
-    fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .log(base_ref, head_ref)
-            .map(|nodes| nodes.into_iter().cloned().collect())
-    }
-
-    fn get_node(&self, id: &str) -> Result<Node> {
-        self.inner.read().expect("store lock poisoned").get_node(id)
-    }
-
+impl SessionStore for MemoryStore {
     fn list_session_states(&self) -> Result<HashMap<String, SessionState>> {
         Ok(self
             .inner
@@ -132,3 +150,166 @@ impl Store for MemoryStore {
         Ok(plan.new_head)
     }
 }
+
+impl BranchConfigStore for MemoryStore {
+    fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .list_branch_configs()
+    }
+
+    fn list_branch_config_records(&self) -> Result<HashMap<String, BranchConfigRecord>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_branch_config_records())
+    }
+
+    fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_branch_config(name)
+    }
+
+    fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_branch_config_record(name)
+    }
+
+    fn set_branch_config(&self, name: &str, config: BranchConfig) -> Result<BranchConfigRecord> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .set_branch_config(name, config)
+    }
+
+    fn rollback_branch_config(
+        &self,
+        name: &str,
+        target_version: u64,
+    ) -> Result<BranchConfigRecord> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .rollback_branch_config(name, target_version)
+    }
+
+    fn delete_branch_config(&self, name: &str) -> Result<()> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .delete_branch_config(name)
+    }
+}
+
+impl ProviderProfileStore for MemoryStore {
+    fn list_provider_profiles(&self) -> Result<HashMap<String, ProviderProfile>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_provider_profiles())
+    }
+
+    fn get_provider_profile(&self, name: &str) -> Result<ProviderProfile> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_provider_profile(name)
+    }
+}
+
+impl SkillStore for MemoryStore {
+    fn skill_groups(&self) -> Result<SkillGroups> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .skill_groups())
+    }
+
+    fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_skills(role))
+    }
+
+    fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_skill(role, name)
+    }
+
+    fn add_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        spec: SkillVersionSpec,
+    ) -> Result<SkillRecord> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .add_skill(role, name, spec)
+    }
+
+    fn update_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        patch: &SkillUpdatePatch,
+    ) -> Result<SkillRecord> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .update_skill(role, name, patch)
+    }
+
+    fn rollback_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        target_version: u64,
+    ) -> Result<SkillRecord> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .rollback_skill(role, name, target_version)
+    }
+}
+
+impl JobStore for MemoryStore {
+    fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .submit_job(branch, base)
+    }
+
+    fn get_job(&self, job_id: &str) -> Result<Job> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_job(job_id)
+    }
+
+    fn list_jobs(&self) -> Result<HashMap<String, Job>> {
+        Ok(self.inner.read().expect("store lock poisoned").list_jobs())
+    }
+
+    fn set_job_status(&self, job_id: &str, expected: JobStatus, next: JobStatus) -> Result<Job> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .set_job_status(job_id, expected, next)
+    }
+}
+
+impl RuntimeStore for MemoryStore {}

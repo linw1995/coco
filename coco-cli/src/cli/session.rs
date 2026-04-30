@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand};
 
-use super::{CliProvider, CliTool};
+use super::{CliProvider, CliSessionRole, CliTool};
 
 #[derive(Debug, Args)]
 pub struct SessionCommand {
@@ -12,10 +12,11 @@ pub struct SessionCommand {
 pub enum SessionSubcommand {
     Create(SessionCreateCommand),
     Fork(SessionForkCommand),
-    List,
+    List(SessionListCommand),
     Get(SessionBranchCommand),
     Graph(SessionGraphCommand),
     Show(SessionShowCommand),
+    Delete(SessionBranchCommand),
     Rebase(SessionRebaseCommand),
     #[command(name = "reopen")]
     Reopen(SessionBranchCommand),
@@ -29,9 +30,21 @@ pub enum SessionSubcommand {
 }
 
 #[derive(Debug, Args)]
+pub struct SessionListCommand {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct SessionCreateCommand {
     #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
+
+    #[arg(long, value_enum, default_value = "orchestrator")]
+    pub role: CliSessionRole,
+
+    #[arg(long)]
+    pub provider_profile: Option<String>,
 
     #[arg(long)]
     pub system_prompt: String,
@@ -45,6 +58,9 @@ pub struct SessionCreateCommand {
     #[arg(long)]
     pub max_tokens: Option<u64>,
 
+    #[arg(long, value_name = "JSON")]
+    pub additional_params: Option<String>,
+
     #[arg(long = "tool", value_enum)]
     pub tools: Vec<CliTool>,
 }
@@ -56,16 +72,25 @@ pub struct SessionForkCommand {
 
     #[arg(long, default_value = "main")]
     pub from_ref: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct SessionBranchCommand {
     #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
-pub struct SessionGraphCommand {}
+pub struct SessionGraphCommand {
+    #[arg(long)]
+    pub json: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct SessionShowCommand {
@@ -80,6 +105,15 @@ pub struct SessionShowCommand {
 pub struct SessionRebaseCommand {
     #[arg(long, env = "COCO_BRANCH", default_value = "main")]
     pub branch: String,
+
+    #[arg(long)]
+    pub preset: Option<String>,
+
+    #[arg(long)]
+    pub provider_profile: Option<String>,
+
+    #[arg(long, value_enum)]
+    pub role: Option<CliSessionRole>,
 
     #[arg(long)]
     pub provider: Option<CliProvider>,
@@ -110,6 +144,9 @@ pub struct SessionRebaseCommand {
 
     #[arg(long)]
     pub clear_tools: bool,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -119,6 +156,9 @@ pub struct SessionPrCommand {
 
     #[arg(long)]
     pub target_branch: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -128,6 +168,9 @@ pub struct SessionCloseCommand {
 
     #[arg(long, default_value = "")]
     pub target_branch: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -140,6 +183,9 @@ pub struct SessionMergeCommand {
 
     #[arg(long)]
     pub prompt: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -152,4 +198,7 @@ pub struct SessionFeedbackCommand {
 
     #[arg(long)]
     pub from_ref: Option<String>,
+
+    #[arg(long)]
+    pub json: bool,
 }

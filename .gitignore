@@ -1,2 +1,15 @@
 # Rust artifacts
 target
+coco-console/pkg
+
+# Ignore scripts by default
+*.sh
+!scripts/run-cov.sh
+
+# Agent artifacts
+.agents/
+.coco-store/
+.codex
+skills-lock.json
+config.toml
+logs

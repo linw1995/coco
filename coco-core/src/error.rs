@@ -2,6 +2,7 @@ use coco_llm::coco_mem::StoreError;
 use snafu::prelude::*;
 
 use crate::ChannelKind;
+use crate::skill::SkillError;
 
 #[derive(Debug, Snafu, Clone, PartialEq, Eq)]
 pub enum BranchResolveError {
@@ -22,12 +23,13 @@ impl From<coco_llm::Error> for EngineError {
     fn from(error: coco_llm::Error) -> Self {
         match error {
             coco_llm::Error::MissingAnchor { branch } => Self::SessionMissing { branch },
-            coco_llm::Error::Memory {
-                source: StoreError::BranchNotFound { name },
-            } => Self::SessionMissing { branch: name },
-            coco_llm::Error::Memory {
-                source: StoreError::MissingSessionAnchor { branch },
-            } => Self::SessionMissing { branch },
+            coco_llm::Error::Memory { source } => match *source {
+                StoreError::BranchNotFound { name } => Self::SessionMissing { branch: name },
+                StoreError::MissingSessionAnchor { branch } => Self::SessionMissing { branch },
+                other => Self::EngineFailed {
+                    message: other.to_string(),
+                },
+            },
             other => Self::EngineFailed {
                 message: other.to_string(),
             },
@@ -43,6 +45,14 @@ impl From<StoreError> for EngineError {
             other => Self::EngineFailed {
                 message: other.to_string(),
             },
+        }
+    }
+}
+
+impl From<SkillError> for EngineError {
+    fn from(error: SkillError) -> Self {
+        Self::EngineFailed {
+            message: error.to_string(),
         }
     }
 }

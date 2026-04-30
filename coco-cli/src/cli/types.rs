@@ -1,11 +1,12 @@
 use clap::ValueEnum;
 use coco_llm::Provider;
-use coco_mem::Tool;
+use coco_mem::SessionRole;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum CliProvider {
     Openai,
     Anthropic,
+    Chatgpt,
 }
 
 impl CliProvider {
@@ -13,6 +14,7 @@ impl CliProvider {
         match value {
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
+            "chatgpt" => Some(Self::Chatgpt),
             _ => None,
         }
     }
@@ -23,48 +25,51 @@ impl From<CliProvider> for Provider {
         match value {
             CliProvider::Openai => Provider::OpenAi,
             CliProvider::Anthropic => Provider::Anthropic,
+            CliProvider::Chatgpt => Provider::ChatGpt,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum CliTool {
+    #[value(name = "bash")]
     Bash,
+    #[value(name = "search_skill")]
+    SearchSkill,
+    #[value(name = "use_skill")]
+    UseSkill,
 }
 
 impl CliTool {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "bash" => Some(Self::Bash),
+            "search_skill" => Some(Self::SearchSkill),
+            "use_skill" => Some(Self::UseSkill),
             _ => None,
         }
     }
 
-    pub fn to_tool(self) -> Tool {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Bash => Tool {
-                name: "bash".to_owned(),
-                description: "Run a bash command.".to_owned(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The bash command to execute."
-                        },
-                        "workdir": {
-                            "type": "string",
-                            "description": "Optional working directory."
-                        },
-                        "timeout_ms": {
-                            "type": "integer",
-                            "description": "Optional timeout in milliseconds."
-                        }
-                    },
-                    "required": ["command"],
-                    "additionalProperties": false
-                }),
-            },
+            Self::Bash => "bash",
+            Self::SearchSkill => "search_skill",
+            Self::UseSkill => "use_skill",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum CliSessionRole {
+    Orchestrator,
+    Runner,
+}
+
+impl From<CliSessionRole> for SessionRole {
+    fn from(value: CliSessionRole) -> Self {
+        match value {
+            CliSessionRole::Orchestrator => SessionRole::Orchestrator,
+            CliSessionRole::Runner => SessionRole::Runner,
         }
     }
 }

@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use super::fs::FsStore;
 use super::memory::MemoryStore;
 use super::state::StoreState;
-use crate::Store as StoreTrait;
 use crate::{
-    Anchor, Kind, NewNode, Node, PauseReason, PromptAnchor, Role, SessionAnchor,
-    SessionAnchorPatch, SessionState, StoreError as Error,
+    Anchor, BranchConfig, BranchConfigStore, BranchStore, JobStatus, JobStore, Kind, MergeParent,
+    NewNode, Node, NodeStore, PauseReason, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch,
+    SessionRole, SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
+    StoreError as Error,
 };
 use serde_json::json;
 
@@ -28,7 +31,9 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
         kind: Kind::Anchor(Anchor::session(
             vec![],
             SessionAnchor {
-                provider: "openai".to_owned(),
+                role: SessionRole::Orchestrator,
+                provider_profile: None,
+                provider: Some("openai".to_owned()),
                 model: "gpt-5.4".to_owned(),
                 tools: vec![],
                 system_prompt: "system".to_owned(),
@@ -36,8 +41,24 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
                 temperature: Some(0.1),
                 max_tokens: Some(64),
                 additional_params: Some(json!({"reasoning_effort": "low"})),
+                enable_coco_shim: false,
             },
         )),
+    }
+}
+
+fn make_branch_config(model: &str, role: SessionRole) -> BranchConfig {
+    BranchConfig {
+        role,
+        provider_profile: "openai".to_owned(),
+        model: model.to_owned(),
+        tools: vec![],
+        system_prompt: "preset system".to_owned(),
+        prompt: "preset prompt".to_owned(),
+        temperature: Some(0.2),
+        max_tokens: Some(256),
+        additional_params: Some(json!({"reasoning_effort": "medium"})),
+        enable_coco_shim: true,
     }
 }
 
@@ -47,9 +68,11 @@ fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> Ne
         role: Role::System,
         metadata: None,
         kind: Kind::Anchor(Anchor::session(
-            vec![merge_parent.to_owned()],
+            vec![MergeParent::merge(merge_parent)],
             SessionAnchor {
-                provider: "openai".to_owned(),
+                role: SessionRole::Orchestrator,
+                provider_profile: None,
+                provider: Some("openai".to_owned()),
                 model: "gpt-5.4".to_owned(),
                 tools: vec![],
                 system_prompt: "system".to_owned(),
@@ -57,6 +80,7 @@ fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> Ne
                 temperature: Some(0.1),
                 max_tokens: Some(64),
                 additional_params: Some(json!({"reasoning_effort": "low"})),
+                enable_coco_shim: false,
             },
         )),
     }
@@ -68,7 +92,10 @@ fn make_prompt_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
         role: Role::System,
         metadata: None,
         kind: Kind::Anchor(Anchor::prompt(
-            merge_parents.iter().map(|id| (*id).to_owned()).collect(),
+            merge_parents
+                .iter()
+                .map(|id| MergeParent::merge(*id))
+                .collect(),
             PromptAnchor {
                 prompt: "merge prompt".to_owned(),
             },
@@ -76,7 +103,36 @@ fn make_prompt_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
     }
 }
 
+fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> crate::Job
+where
+    S: BranchStore + JobStore + NodeStore,
+{
+    let parent = store.get_branch_head(branch).unwrap();
+    let prompt_anchor_id = store
+        .append(NewNode {
+            parent,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![],
+                PromptAnchor {
+                    prompt: prompt.to_owned(),
+                },
+            )),
+        })
+        .unwrap();
+    store.submit_job(branch, &prompt_anchor_id).unwrap()
+}
+
 fn read_jsonl_nodes(path: &Path) -> Vec<Node> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn read_jsonl_values(path: &Path) -> Vec<serde_json::Value> {
     fs::read_to_string(path)
         .unwrap()
         .lines()
@@ -95,9 +151,15 @@ trait InspectableStore {
 }
 
 trait TestStoreFactory {
-    type Store: StoreTrait + InspectableStore;
+    type Backend: BranchConfigStore
+        + BranchStore
+        + InspectableStore
+        + JobStore
+        + NodeStore
+        + SessionStore
+        + SkillStore;
 
-    fn create() -> Self::Store;
+    fn create() -> Self::Backend;
 }
 
 impl InspectableStore for MemoryStore {
@@ -115,9 +177,9 @@ impl InspectableStore for FsStore {
 struct MemoryFactory;
 
 impl TestStoreFactory for MemoryFactory {
-    type Store = MemoryStore;
+    type Backend = MemoryStore;
 
-    fn create() -> Self::Store {
+    fn create() -> Self::Backend {
         MemoryStore::new()
     }
 }
@@ -125,9 +187,9 @@ impl TestStoreFactory for MemoryFactory {
 struct FsFactory;
 
 impl TestStoreFactory for FsFactory {
-    type Store = FsStore;
+    type Backend = FsStore;
 
-    fn create() -> Self::Store {
+    fn create() -> Self::Backend {
         let tempdir = tempfile::tempdir().expect("temporary directory should be created");
         let path = tempdir.path().join("store");
         let store = FsStore::open(&path).expect("file system store should open");
@@ -281,6 +343,43 @@ where
     ));
 }
 
+fn assert_append_prompt_anchor_rejects_multiple_shadow_parents<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let left_shadow = store
+        .append(make_text_node(&session_id, "left-shadow"))
+        .unwrap();
+    let right_shadow = store
+        .append(make_text_node(&session_id, "right-shadow"))
+        .unwrap();
+    let err = store
+        .append(NewNode {
+            parent: session_id,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![
+                    MergeParent::shadow(left_shadow.clone()),
+                    MergeParent::shadow(right_shadow.clone()),
+                ],
+                PromptAnchor {
+                    prompt: "shadow prompt".to_owned(),
+                },
+            )),
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::MultipleShadowParents { ids }
+            if ids == vec![left_shadow, right_shadow]
+    ));
+}
+
 fn assert_append_prompt_anchor_rejects_merge_parent_matching_primary_parent<F>()
 where
     F: TestStoreFactory,
@@ -336,6 +435,50 @@ where
     let ids: Vec<_> = ancestry.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![b_id, a_id, session_id, root_id]);
+}
+
+fn assert_list_children_returns_primary_and_merge_children_in_stable_order<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let left_id = store.append(make_text_node(&session_id, "left")).unwrap();
+    let right_id = store
+        .append(make_prompt_anchor_node(&left_id, &[&session_id]))
+        .unwrap();
+
+    let nodes = store.list_children(&session_id).unwrap();
+    let ids = nodes.into_iter().map(|node| node.id).collect::<Vec<_>>();
+
+    assert_eq!(ids, vec![left_id, right_id]);
+}
+
+fn assert_list_children_returns_empty_for_leaf_node<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let leaf_id = store.append(make_text_node(&session_id, "leaf")).unwrap();
+
+    let children = store.list_children(&leaf_id).unwrap();
+
+    assert!(children.is_empty());
+}
+
+fn assert_list_children_returns_not_found_for_missing_node<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let missing_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let err = store.list_children(missing_id).unwrap_err();
+
+    assert!(matches!(err, Error::NotFound { id } if id == missing_id));
 }
 
 fn assert_log_returns_nodes_from_head_back_to_base_inclusive<F>()
@@ -823,6 +966,246 @@ where
     );
 }
 
+fn assert_branch_config_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let preset_name = "coding";
+    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+
+    let stored = store
+        .set_branch_config(preset_name, config.clone())
+        .unwrap();
+
+    assert_eq!(stored.current_version, 1);
+    assert_eq!(stored.current_config(), Some(config.clone()));
+    assert_eq!(stored.versions.keys().copied().collect::<Vec<_>>(), vec![1]);
+    assert_eq!(store.get_branch_config(preset_name).unwrap(), config);
+    assert_eq!(
+        store
+            .get_branch_config_record(preset_name)
+            .unwrap()
+            .current_version,
+        1
+    );
+    assert_eq!(
+        store.list_branch_configs().unwrap().get(preset_name),
+        Some(&config)
+    );
+    assert_eq!(
+        store
+            .list_branch_config_records()
+            .unwrap()
+            .get(preset_name)
+            .unwrap()
+            .current_config(),
+        Some(config)
+    );
+}
+
+fn assert_branch_config_replaces_existing_value<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let preset_name = "coding";
+    store
+        .set_branch_config(
+            preset_name,
+            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+        )
+        .unwrap();
+    let updated = make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner);
+
+    let stored = store
+        .set_branch_config(preset_name, updated.clone())
+        .unwrap();
+
+    assert_eq!(stored.current_version, 2);
+    assert_eq!(stored.current_config(), Some(updated.clone()));
+    assert_eq!(
+        stored.versions.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        stored.versions.get(&1).unwrap().to_config(),
+        make_branch_config("gpt-5.4", SessionRole::Orchestrator)
+    );
+    assert_eq!(stored.versions.get(&2).unwrap().to_config(), updated);
+    assert_eq!(store.get_branch_config(preset_name).unwrap(), updated);
+}
+
+fn assert_rollback_branch_config_creates_new_current_version<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let preset_name = "coding";
+    let original = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+    let updated = make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner);
+    store
+        .set_branch_config(preset_name, original.clone())
+        .unwrap();
+    store
+        .set_branch_config(preset_name, updated.clone())
+        .unwrap();
+
+    let rolled_back = store.rollback_branch_config(preset_name, 1).unwrap();
+
+    assert_eq!(rolled_back.current_version, 3);
+    assert_eq!(
+        rolled_back.versions.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(rolled_back.current_config(), Some(original.clone()));
+    assert_eq!(rolled_back.versions.get(&2).unwrap().to_config(), updated);
+    assert_eq!(store.get_branch_config(preset_name).unwrap(), original);
+}
+
+fn assert_delete_branch_config_removes_only_config<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let preset_name = "coding";
+    store.fork("main", &root_id).unwrap();
+    store
+        .set_branch_config(
+            preset_name,
+            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+        )
+        .unwrap();
+
+    store.delete_branch_config(preset_name).unwrap();
+
+    assert!(store.list_branch_configs().unwrap().is_empty());
+    assert!(matches!(
+        store.get_branch_config(preset_name),
+        Err(Error::BranchConfigNotFound { name }) if name == preset_name
+    ));
+    assert_eq!(store.get_branch_head("main").unwrap(), root_id);
+}
+
+fn assert_delete_branch_preserves_branch_config_preset<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let preset_name = "coding";
+    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+    store.fork("main", &root_id).unwrap();
+    store
+        .set_branch_config(preset_name, config.clone())
+        .unwrap();
+
+    store.delete_branch("main").unwrap();
+
+    assert!(matches!(
+        store.get_branch_head("main"),
+        Err(Error::BranchNotFound { name }) if name == "main"
+    ));
+    assert_eq!(store.get_branch_config(preset_name).unwrap(), config);
+}
+
+fn assert_get_branch_config_rejects_missing_config<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+
+    let err = store.get_branch_config("missing-preset").unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::BranchConfigNotFound { name } if name == "missing-preset"
+    ));
+}
+
+fn assert_delete_branch_config_rejects_missing_config<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+
+    let err = store.delete_branch_config("missing-preset").unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::BranchConfigNotFound { name } if name == "missing-preset"
+    ));
+}
+
+fn assert_get_node_supports_branch_name<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let branch_head = store.fork("draft", &root_id).unwrap();
+
+    let node = store.get_node("draft").unwrap();
+
+    assert_eq!(node.id, branch_head);
+}
+
+fn assert_get_node_supports_prefix_after_branch_delete<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("draft", &root_id).unwrap();
+    let draft_node = store
+        .append(make_text_node(&root_id, "draft only"))
+        .unwrap();
+    store
+        .set_branch_head("draft", &root_id, &draft_node)
+        .unwrap();
+    store.delete_branch("draft").unwrap();
+
+    let prefix = &draft_node[..8];
+    let node = store.get_node(prefix).unwrap();
+
+    assert_eq!(node.id, draft_node);
+}
+
+fn assert_get_node_rejects_ambiguous_prefix<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let mut ids = vec![root_id.clone()];
+    for index in 0..32 {
+        ids.push(
+            store
+                .append(make_text_node(&root_id, &format!("node-{index}")))
+                .unwrap(),
+        );
+    }
+
+    let ambiguous = ids
+        .into_iter()
+        .fold(HashMap::<String, Vec<String>>::new(), |mut groups, id| {
+            groups.entry(id[..1].to_owned()).or_default().push(id);
+            groups
+        })
+        .into_iter()
+        .find_map(|(prefix, matches)| (matches.len() > 1).then_some((prefix, matches)))
+        .expect("expected at least one ambiguous one-character prefix");
+
+    let err = store.get_node(&ambiguous.0).unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::AmbiguousNodePrefix { prefix, matches }
+            if prefix == ambiguous.0 && matches.len() == ambiguous.1.len()
+    ));
+}
+
 fn assert_set_branch_head_requires_matching_expected_head<F>()
 where
     F: TestStoreFactory,
@@ -922,7 +1305,7 @@ where
         .rebase_session(
             "main",
             &SessionAnchorPatch {
-                provider: Some("anthropic".to_owned()),
+                provider: Some(Some("anthropic".to_owned())),
                 model: Some("claude-sonnet-4-20250514".to_owned()),
                 temperature: Some(None),
                 ..SessionAnchorPatch::default()
@@ -941,7 +1324,7 @@ where
         panic!("expected session anchor");
     };
     let session = anchor.as_session().expect("expected session anchor");
-    assert_eq!(session.provider, "anthropic");
+    assert_eq!(session.provider.as_deref(), Some("anthropic"));
     assert_eq!(session.model, "claude-sonnet-4-20250514");
     assert_eq!(session.temperature, None);
     assert_eq!(
@@ -960,7 +1343,10 @@ where
     let Kind::Anchor(old_anchor) = &old_session.kind else {
         panic!("expected original session anchor");
     };
-    assert_eq!(old_anchor.as_session().unwrap().provider, "openai");
+    assert_eq!(
+        old_anchor.as_session().unwrap().provider.as_deref(),
+        Some("openai")
+    );
 }
 
 fn assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes<F>()
@@ -997,7 +1383,7 @@ where
     };
     assert_eq!(rebased_prompt.parent, rebased_merge_source.id);
     assert_ne!(rebased_session.id, session_id);
-    assert_eq!(anchor.merge_parents(), [session_id.as_str()]);
+    assert_eq!(anchor.merge_parent_node_ids(), [session_id.as_str()]);
 }
 
 fn assert_rebase_session_keeps_other_branches_on_old_chain<F>()
@@ -1015,7 +1401,7 @@ where
         .rebase_session(
             "main",
             &SessionAnchorPatch {
-                provider: Some("anthropic".to_owned()),
+                provider: Some(Some("anthropic".to_owned())),
                 ..SessionAnchorPatch::default()
             },
         )
@@ -1027,7 +1413,10 @@ where
     let Kind::Anchor(anchor) = &draft_ancestry[1].kind else {
         panic!("expected session anchor");
     };
-    assert_eq!(anchor.as_session().unwrap().provider, "openai");
+    assert_eq!(
+        anchor.as_session().unwrap().provider.as_deref(),
+        Some("openai")
+    );
     assert_eq!(draft_ancestry[1].id, session_id);
 }
 
@@ -1066,7 +1455,7 @@ where
         .rebase_session(
             "main",
             &SessionAnchorPatch {
-                provider: Some("anthropic".to_owned()),
+                provider: Some(Some("anthropic".to_owned())),
                 ..SessionAnchorPatch::default()
             },
         )
@@ -1076,6 +1465,240 @@ where
     assert_eq!(ancestry[0].created_at, child_created_at);
     assert_eq!(ancestry[1].created_at, session_created_at);
     assert_eq!(ancestry[2].id, root_id);
+}
+
+fn assert_job_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    assert_eq!(store.get_job(&job.job_id).unwrap(), job);
+}
+
+fn assert_create_job_generates_unique_ids<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("draft", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    let second = submit_prompt_job(&store, "draft", "world");
+
+    assert!(!first.job_id.is_empty());
+    assert!(!second.job_id.is_empty());
+    assert_ne!(first.job_id, second.job_id);
+}
+
+fn assert_finished_job_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    let running = store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    assert!(running.finished_at.is_none());
+    let finished = store
+        .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+        .unwrap();
+
+    assert!(finished.finished_at.is_some());
+    assert_eq!(store.get_job(&job.job_id).unwrap(), finished);
+}
+
+fn assert_submit_job_rejects_second_active_job_on_same_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+
+    let second_parent = store.get_branch_head("main").unwrap();
+    let second_anchor_id = store
+        .append(NewNode {
+            parent: second_parent,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![],
+                PromptAnchor {
+                    prompt: "world".to_owned(),
+                },
+            )),
+        })
+        .unwrap();
+    let err = store.submit_job("main", &second_anchor_id).unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::PromptJobActiveOnBranch { branch, job_id }
+            if branch == "main" && job_id == first.job_id
+    ));
+}
+
+fn assert_submit_job_allows_new_job_after_previous_job_finishes<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_status(&first.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    store
+        .set_job_status(&first.job_id, JobStatus::Running, JobStatus::Finished)
+        .unwrap();
+
+    let second = submit_prompt_job(&store, "main", "world");
+
+    assert_ne!(first.job_id, second.job_id);
+    assert_eq!(second.status, JobStatus::Queued);
+}
+
+fn assert_add_skill_starts_at_version_one<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let record = store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "custom-orchestrator",
+            SkillVersionSpec {
+                description: "first".to_owned(),
+                body: "body".to_owned(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(record.current_version, 1);
+    assert_eq!(record.versions.keys().copied().collect::<Vec<_>>(), vec![1]);
+    assert_eq!(record.current().unwrap().description, "first");
+}
+
+fn assert_update_skill_creates_new_version<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "custom-runner",
+            SkillVersionSpec {
+                description: "v1".to_owned(),
+                body: "body-v1".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+
+    let updated = store
+        .update_skill(
+            SessionRole::Runner,
+            "custom-runner",
+            &SkillUpdatePatch {
+                description: Some("v2".to_owned()),
+                body: None,
+                enable_coco_shim: Some(true),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(updated.current_version, 2);
+    assert_eq!(
+        updated.versions.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(updated.versions.get(&1).unwrap().description, "v1");
+    let current = updated.current().unwrap();
+    assert_eq!(current.description, "v2");
+    assert_eq!(current.body, "body-v1");
+    assert!(current.enable_coco_shim);
+}
+
+fn assert_rollback_skill_creates_new_current_version<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "custom-orchestrator",
+            SkillVersionSpec {
+                description: "v1".to_owned(),
+                body: "body-v1".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+    store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "custom-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("v2".to_owned()),
+                body: Some("body-v2".to_owned()),
+                enable_coco_shim: Some(true),
+            },
+        )
+        .unwrap();
+
+    let rolled_back = store
+        .rollback_skill(SessionRole::Orchestrator, "custom-orchestrator", 1)
+        .unwrap();
+
+    assert_eq!(rolled_back.current_version, 3);
+    assert_eq!(
+        rolled_back.versions.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    let current = rolled_back.current().unwrap();
+    assert_eq!(current.description, "v1");
+    assert_eq!(current.body, "body-v1");
+    assert!(!current.enable_coco_shim);
+}
+
+fn assert_new_store_seeds_default_skills<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+
+    let orchestrator = store
+        .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+        .unwrap();
+    let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
+
+    assert_eq!(orchestrator.current_version, 1);
+    assert_eq!(runner.current_version, 1);
+    assert!(orchestrator.current().unwrap().enable_coco_shim);
+    assert!(runner.current().unwrap().enable_coco_shim);
+    assert!(
+        orchestrator
+            .current()
+            .unwrap()
+            .body
+            .contains("fork from the node before the `use_skill` ToolUse")
+    );
+    assert!(orchestrator.current().unwrap().body.contains(
+        "coco prompt --branch \"$RUNNER_BRANCH\" --role runner --tool bash --tool search_skill"
+    ));
 }
 
 macro_rules! define_common_store_tests {
@@ -1119,6 +1742,11 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
+            fn append_prompt_anchor_rejects_multiple_shadow_parents() {
+                assert_append_prompt_anchor_rejects_multiple_shadow_parents::<$factory>();
+            }
+
+            #[test]
             fn append_prompt_anchor_rejects_merge_parent_matching_primary_parent() {
                 assert_append_prompt_anchor_rejects_merge_parent_matching_primary_parent::<$factory>();
             }
@@ -1131,6 +1759,21 @@ macro_rules! define_common_store_tests {
             #[test]
             fn ancestry_returns_nodes_back_to_root() {
                 assert_ancestry_returns_nodes_back_to_root::<$factory>();
+            }
+
+            #[test]
+            fn list_children_returns_primary_and_merge_children_in_stable_order() {
+                assert_list_children_returns_primary_and_merge_children_in_stable_order::<$factory>();
+            }
+
+            #[test]
+            fn list_children_returns_empty_for_leaf_node() {
+                assert_list_children_returns_empty_for_leaf_node::<$factory>();
+            }
+
+            #[test]
+            fn list_children_returns_not_found_for_missing_node() {
+                assert_list_children_returns_not_found_for_missing_node::<$factory>();
             }
 
             #[test]
@@ -1234,6 +1877,56 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
+            fn branch_config_round_trip() {
+                assert_branch_config_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn branch_config_replaces_existing_value() {
+                assert_branch_config_replaces_existing_value::<$factory>();
+            }
+
+            #[test]
+            fn rollback_branch_config_creates_new_current_version() {
+                assert_rollback_branch_config_creates_new_current_version::<$factory>();
+            }
+
+            #[test]
+            fn delete_branch_config_removes_only_config() {
+                assert_delete_branch_config_removes_only_config::<$factory>();
+            }
+
+            #[test]
+            fn delete_branch_preserves_branch_config_preset() {
+                assert_delete_branch_preserves_branch_config_preset::<$factory>();
+            }
+
+            #[test]
+            fn get_branch_config_rejects_missing_config() {
+                assert_get_branch_config_rejects_missing_config::<$factory>();
+            }
+
+            #[test]
+            fn delete_branch_config_rejects_missing_config() {
+                assert_delete_branch_config_rejects_missing_config::<$factory>();
+            }
+
+            #[test]
+            fn get_node_supports_branch_name() {
+                assert_get_node_supports_branch_name::<$factory>();
+            }
+
+            #[test]
+            fn get_node_supports_prefix_after_branch_delete() {
+                assert_get_node_supports_prefix_after_branch_delete::<$factory>();
+            }
+
+            #[test]
+            fn get_node_rejects_ambiguous_prefix() {
+                assert_get_node_rejects_ambiguous_prefix::<$factory>();
+            }
+
+            #[test]
             fn log_supports_branch_name_on_head_ref() {
                 assert_log_supports_branch_name_on_head_ref::<$factory>();
             }
@@ -1277,6 +1970,52 @@ macro_rules! define_common_store_tests {
             fn rebase_session_preserves_created_at_across_rewritten_chain() {
                 assert_rebase_session_preserves_created_at_across_rewritten_chain::<$factory>();
             }
+
+            #[test]
+            fn job_round_trip() {
+                assert_job_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn create_job_generates_unique_ids() {
+                assert_create_job_generates_unique_ids::<$factory>();
+            }
+
+            #[test]
+            fn add_skill_starts_at_version_one() {
+                assert_add_skill_starts_at_version_one::<$factory>();
+            }
+
+            #[test]
+            fn new_store_seeds_default_skills() {
+                assert_new_store_seeds_default_skills::<$factory>();
+            }
+
+            #[test]
+            fn update_skill_creates_new_version() {
+                assert_update_skill_creates_new_version::<$factory>();
+            }
+
+            #[test]
+            fn rollback_skill_creates_new_current_version() {
+                assert_rollback_skill_creates_new_current_version::<$factory>();
+            }
+
+            #[test]
+            fn finished_job_round_trip() {
+                assert_finished_job_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn submit_job_rejects_second_active_job_on_same_branch() {
+                assert_submit_job_rejects_second_active_job_on_same_branch::<$factory>();
+            }
+
+            #[test]
+            fn submit_job_allows_new_job_after_previous_job_finishes() {
+                assert_submit_job_allows_new_job_after_previous_job_finishes::<$factory>();
+            }
+
         }
     };
 }
@@ -1330,13 +2069,274 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     let store = FsStore::open(&path).unwrap();
 
     assert!(path.join("meta.json").is_file());
+    assert!(path.join("store.lock").is_file());
     assert!(path.join("nodes.jsonl").is_file());
     assert!(path.join("sessions.json").is_file());
+    assert!(path.join("branch-configs.json").is_file());
+    assert!(path.join("skills.json").is_file());
     assert!(path.join("branches").is_dir());
+    assert!(path.join("branch-config-history").is_dir());
+    assert!(path.join("skill-history").is_dir());
+    assert!(path.join("skill-history/shared").is_dir());
+    assert!(path.join("skill-history/orchestrator").is_dir());
+    assert!(path.join("skill-history/runner").is_dir());
+    assert!(
+        path.join("skill-history/orchestrator/coco-orchestrator.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/runner/coco-runner.jsonl")
+            .is_file()
+    );
 
     let nodes = fs::read_to_string(path.join("nodes.jsonl")).unwrap();
     assert!(nodes.lines().count() >= 1);
     assert_eq!(store.ancestry(&store.root_id()).unwrap().len(), 1);
+}
+
+#[test]
+fn open_rejects_store_locked_by_another_owner() {
+    let (_tempdir, path) = temp_store_path();
+    fs::create_dir_all(&path).unwrap();
+    let lock_path = path.join("store.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(result, 0);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::StoreLocked { path: locked } if locked == path));
+}
+
+#[test]
+fn open_read_only_allows_store_locked_by_another_owner() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    drop(store);
+
+    let lock_path = path.join("store.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(result, 0);
+
+    let read_only = FsStore::open_read_only(&path).unwrap();
+
+    assert_eq!(read_only.get_branch_head("main").unwrap(), root_id);
+    let err = read_only
+        .append(make_text_node(&root_id, "read-only write"))
+        .unwrap_err();
+    assert!(matches!(err, Error::StoreReadOnly { path: locked } if locked == path));
+}
+
+#[test]
+fn open_read_only_does_not_create_missing_history_directories() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    drop(store);
+
+    fs::write(
+        path.join("skills.json"),
+        r#"{"orchestrator":{},"runner":{}}"#,
+    )
+    .unwrap();
+    fs::remove_dir_all(path.join("branch-config-history")).unwrap();
+    fs::remove_dir_all(path.join("skill-history")).unwrap();
+
+    let lock_path = path.join("store.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(result, 0);
+
+    let read_only = FsStore::open_read_only(&path).unwrap();
+
+    assert_eq!(read_only.root_id(), root_id);
+    assert!(!path.join("branch-config-history").exists());
+    assert!(!path.join("skill-history").exists());
+}
+
+#[test]
+fn open_replays_branch_configs() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let preset_name = "coding";
+    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+    let updated = make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner);
+    store
+        .set_branch_config(preset_name, config.clone())
+        .unwrap();
+    store
+        .set_branch_config(preset_name, updated.clone())
+        .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.get_branch_config(preset_name).unwrap(), updated);
+    let record = reopened.get_branch_config_record(preset_name).unwrap();
+    assert_eq!(record.current_version, 2);
+    assert_eq!(record.versions.get(&1).unwrap().to_config(), config);
+    assert_eq!(record.versions.get(&2).unwrap().to_config(), updated);
+}
+
+#[test]
+fn branch_configs_json_only_stores_current_snapshots() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let preset_name = "coding";
+    store
+        .set_branch_config(
+            preset_name,
+            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+        )
+        .unwrap();
+    store
+        .set_branch_config(
+            preset_name,
+            make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner),
+        )
+        .unwrap();
+
+    let configs: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("branch-configs.json")).unwrap())
+            .unwrap();
+    let coding = &configs[preset_name];
+
+    assert_eq!(coding["current_version"], 2);
+    assert!(coding.get("versions").is_none());
+    assert_eq!(coding["model"], "claude-sonnet-4-20250514");
+    assert_eq!(coding["role"], "runner");
+}
+
+#[test]
+fn branch_config_history_is_appended_in_history_directory() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let preset_name = "coding";
+    store
+        .set_branch_config(
+            preset_name,
+            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+        )
+        .unwrap();
+    store
+        .set_branch_config(
+            preset_name,
+            make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner),
+        )
+        .unwrap();
+    store.rollback_branch_config(preset_name, 1).unwrap();
+
+    let history = read_jsonl_values(&path.join("branch-config-history/coding.jsonl"));
+
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0]["name"], preset_name);
+    assert_eq!(history[0]["version"], 1);
+    assert_eq!(history[1]["version"], 2);
+    assert_eq!(history[2]["version"], 3);
+    assert_eq!(history[2]["model"], history[0]["model"]);
+    assert_eq!(history[2]["role"], history[0]["role"]);
+}
+
+#[test]
+fn open_creates_missing_branch_config_metadata_for_legacy_store() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    fs::remove_file(path.join("branch-configs.json")).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert!(reopened.list_branch_configs().unwrap().is_empty());
+    assert!(path.join("branch-configs.json").is_file());
+}
+
+#[test]
+fn open_does_not_restore_deleted_branch_config() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let preset_name = "coding";
+    store
+        .set_branch_config(
+            preset_name,
+            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+        )
+        .unwrap();
+
+    store.delete_branch_config(preset_name).unwrap();
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert!(matches!(
+        reopened.get_branch_config(preset_name),
+        Err(Error::BranchConfigNotFound { name }) if name == preset_name
+    ));
+    assert!(!path.join("branch-config-history/coding.jsonl").exists());
+}
+
+#[test]
+fn open_migrates_legacy_branch_config_values() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let preset_name = "coding";
+    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+    let legacy_configs = HashMap::from([(preset_name.to_owned(), config.clone())]);
+    fs::write(
+        path.join("branch-configs.json"),
+        serde_json::to_string_pretty(&legacy_configs).unwrap(),
+    )
+    .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.get_branch_config(preset_name).unwrap(), config);
+    let record = reopened.get_branch_config_record(preset_name).unwrap();
+    assert_eq!(record.current_version, 1);
+    assert_eq!(record.current_config(), Some(config));
+
+    let repaired: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("branch-configs.json")).unwrap())
+            .unwrap();
+    assert_eq!(repaired[preset_name]["current_version"], 1);
+    assert!(repaired[preset_name].get("versions").is_none());
+    let history = read_jsonl_values(&path.join("branch-config-history/coding.jsonl"));
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["name"], preset_name);
+    assert_eq!(history[0]["version"], 1);
+}
+
+#[test]
+fn open_upgrades_legacy_store_format_version() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!(6);
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    FsStore::open(&path).unwrap();
+
+    let upgraded: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(upgraded["version"], 7);
 }
 
 #[test]
@@ -1375,6 +2375,30 @@ fn open_rejects_missing_session_metadata_file() {
     let err = FsStore::open(&path).unwrap_err();
 
     assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_reads_legacy_jobs_without_finished_at() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    let jobs_path = path.join("jobs.json");
+    let mut jobs: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(&jobs_path).unwrap()).unwrap();
+    let entry = jobs
+        .get_mut(&job.job_id)
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    entry.remove("finished_at");
+    fs::write(&jobs_path, serde_json::to_vec_pretty(&jobs).unwrap()).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+    let reopened_job = reopened.get_job(&job.job_id).unwrap();
+
+    assert!(reopened_job.finished_at.is_none());
 }
 
 #[test]
@@ -1522,6 +2546,294 @@ fn open_rejects_corrupted_jsonl_logs() {
 }
 
 #[test]
+fn open_seeds_default_skills_when_skills_file_is_empty() {
+    let (_tempdir, path) = temp_store_path();
+    let _store = FsStore::open(&path).unwrap();
+    fs::write(
+        path.join("skills.json"),
+        "{\n  \"orchestrator\": {},\n  \"runner\": {}\n}\n",
+    )
+    .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert!(
+        reopened
+            .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+            .is_ok()
+    );
+    assert!(
+        reopened
+            .get_skill(SessionRole::Runner, "coco-runner")
+            .is_ok()
+    );
+    assert!(
+        path.join("skill-history/orchestrator/coco-orchestrator.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/runner/coco-runner.jsonl")
+            .is_file()
+    );
+}
+
+#[test]
+fn skills_json_only_stores_current_snapshots() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "coco-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("updated".to_owned()),
+                body: None,
+                enable_coco_shim: None,
+            },
+        )
+        .unwrap();
+
+    let skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    let orchestrator = &skills["orchestrator"]["coco-orchestrator"];
+
+    assert_eq!(orchestrator["current_version"], 2);
+    assert!(orchestrator.get("versions").is_none());
+    assert_eq!(orchestrator["description"], "updated");
+}
+
+#[test]
+fn skill_history_is_appended_in_central_directory() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+
+    store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "coco-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("updated".to_owned()),
+                body: Some("body-v2".to_owned()),
+                enable_coco_shim: Some(false),
+            },
+        )
+        .unwrap();
+    store
+        .rollback_skill(SessionRole::Orchestrator, "coco-orchestrator", 1)
+        .unwrap();
+
+    let history =
+        read_jsonl_values(&path.join("skill-history/orchestrator/coco-orchestrator.jsonl"));
+
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0]["role"], "orchestrator");
+    assert_eq!(history[0]["version"], 1);
+    assert_eq!(history[1]["version"], 2);
+    assert_eq!(history[2]["version"], 3);
+    assert_eq!(history[2]["description"], history[0]["description"]);
+    assert_eq!(history[2]["body"], history[0]["body"]);
+}
+
+#[test]
+fn shared_skill_history_uses_shared_scope_directory() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "coco-orchestrator",
+            SkillVersionSpec {
+                description: "shared".to_owned(),
+                body: "runner-shared".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+
+    assert!(
+        path.join("skill-history/shared/coco-orchestrator.jsonl")
+            .is_file()
+    );
+    assert!(
+        !path
+            .join("skill-history/orchestrator/coco-orchestrator.jsonl")
+            .exists()
+    );
+    assert!(
+        !path
+            .join("skill-history/runner/coco-orchestrator.jsonl")
+            .exists()
+    );
+
+    let history = read_jsonl_values(&path.join("skill-history/shared/coco-orchestrator.jsonl"));
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["role"], "orchestrator");
+    assert_eq!(history[1]["role"], "runner");
+}
+
+#[test]
+fn skill_history_paths_do_not_collide_for_role_suffixed_names() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "foo",
+            SkillVersionSpec {
+                description: "runner only".to_owned(),
+                body: "runner-only".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+    store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "foo.runner",
+            SkillVersionSpec {
+                description: "shared orchestrator".to_owned(),
+                body: "orchestrator".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "foo.runner",
+            SkillVersionSpec {
+                description: "shared runner".to_owned(),
+                body: "runner".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+
+    assert!(path.join("skill-history/runner/foo.jsonl").is_file());
+    assert!(path.join("skill-history/shared/foo.runner.jsonl").is_file());
+
+    let runner_only = read_jsonl_values(&path.join("skill-history/runner/foo.jsonl"));
+    let shared = read_jsonl_values(&path.join("skill-history/shared/foo.runner.jsonl"));
+
+    assert_eq!(runner_only.len(), 1);
+    assert_eq!(runner_only[0]["name"], "foo");
+    assert_eq!(runner_only[0]["role"], "runner");
+    assert_eq!(shared.len(), 2);
+    assert_eq!(shared[0]["name"], "foo.runner");
+    assert_eq!(shared[1]["name"], "foo.runner");
+
+    let reopened = FsStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Runner, "foo")
+            .unwrap()
+            .current_version,
+        1
+    );
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Orchestrator, "foo.runner")
+            .unwrap()
+            .current_version,
+        1
+    );
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Runner, "foo.runner")
+            .unwrap()
+            .current_version,
+        1
+    );
+}
+
+#[test]
+fn skill_update_does_not_advance_when_history_append_fails() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store.fail_next_skill_history_append();
+
+    let err = store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "coco-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("should-not-persist".to_owned()),
+                body: None,
+                enable_coco_shim: None,
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, Error::WriteStoreLog { .. }));
+    assert_eq!(
+        store
+            .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+            .unwrap()
+            .current_version,
+        1
+    );
+
+    let skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    assert_eq!(
+        skills["orchestrator"]["coco-orchestrator"]["current_version"],
+        1
+    );
+
+    let reopened = FsStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+            .unwrap()
+            .current_version,
+        1
+    );
+}
+
+#[test]
+fn skill_add_recovers_from_history_when_snapshot_write_fails() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store.fail_next_skill_snapshot_write();
+
+    let created = store
+        .add_skill(
+            SessionRole::Runner,
+            "wal-only",
+            SkillVersionSpec {
+                description: "checkpoint can lag".to_owned(),
+                body: "history is authoritative".to_owned(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(created.current_version, 1);
+    assert!(store.get_skill(SessionRole::Runner, "wal-only").is_ok());
+
+    let skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    assert!(skills["runner"].get("wal-only").is_none());
+
+    let history = read_jsonl_values(&path.join("skill-history/runner/wal-only.jsonl"));
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["name"], "wal-only");
+    assert_eq!(history[0]["role"], "runner");
+
+    let reopened = FsStore::open(&path).unwrap();
+    let reopened_skill = reopened.get_skill(SessionRole::Runner, "wal-only").unwrap();
+    assert_eq!(reopened_skill.current_version, 1);
+    assert_eq!(
+        reopened_skill.current().unwrap().description,
+        "checkpoint can lag"
+    );
+
+    let repaired_skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    assert_eq!(repaired_skills["runner"]["wal-only"]["current_version"], 1);
+}
+
+#[test]
 fn open_rejects_paused_merged_state_with_anchor_outside_target_branch() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
@@ -1578,7 +2890,7 @@ fn rebase_rewrites_branch_view_but_preserves_dangling_nodes() {
         .rebase_session(
             "main",
             &SessionAnchorPatch {
-                provider: Some("anthropic".to_owned()),
+                provider: Some(Some("anthropic".to_owned())),
                 ..SessionAnchorPatch::default()
             },
         )

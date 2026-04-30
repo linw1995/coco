@@ -6,25 +6,35 @@ use snafu::prelude::*;
 
 use crate::StoreResult as Result;
 use crate::error::{
+    AmbiguousNodePrefixSnafu, BranchConfigNotFoundSnafu, BranchConfigVersionNotFoundSnafu,
     BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu, DuplicateMergeParentSnafu,
-    InvalidAnchorSnafu, MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, NotFoundSnafu,
-    ParentNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
+    InvalidAnchorSnafu, InvalidSkillNameSnafu, MergeParentMatchesParentSnafu,
+    MissingSessionAnchorSnafu, MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu,
+    PromptJobActiveOnBranchSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
+    ProviderProfileNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
+    SkillAlreadyExistsSnafu, SkillNotFoundSnafu, SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
-    Anchor, AnchorPayload, Kind, NewNode, Node, PauseReason, Role, SessionAnchorPatch, SessionState,
+    Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind, NewNode, Node,
+    PauseReason, ProviderProfile, Role, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
+    SkillRecord, SkillUpdatePatch, SkillVersionSpec, default_skill_groups,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct StoreState {
+pub struct StoreState {
     pub nodes: HashMap<String, Node>,
     pub children: HashMap<String, HashSet<String>>,
     pub root: String,
     pub branches: HashMap<String, String>,
     pub sessions: HashMap<String, SessionState>,
+    pub branch_configs: HashMap<String, BranchConfigRecord>,
+    pub provider_profiles: HashMap<String, ProviderProfile>,
+    pub jobs: HashMap<String, Job>,
+    pub skill_groups: SkillGroups,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RebasePlan {
+pub struct RebasePlan {
     pub branch: String,
     pub expected_old_head: String,
     pub new_head: String,
@@ -32,7 +42,7 @@ pub(crate) struct RebasePlan {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ForkPlan {
+pub struct ForkPlan {
     pub head_id: String,
 }
 
@@ -64,6 +74,10 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
+            branch_configs: HashMap::new(),
+            provider_profiles: HashMap::new(),
+            jobs: HashMap::new(),
+            skill_groups: default_skill_groups(),
         }
     }
 
@@ -78,6 +92,10 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
+            branch_configs: HashMap::new(),
+            provider_profiles: HashMap::new(),
+            jobs: HashMap::new(),
+            skill_groups: default_skill_groups(),
         }
     }
 
@@ -227,10 +245,31 @@ impl StoreState {
     }
 
     pub fn get_node(&self, id: &str) -> Result<Node> {
-        self.nodes
-            .get(id)
-            .cloned()
-            .context(NotFoundSnafu { id: id.to_owned() })
+        self.resolve_node_ref(id).cloned()
+    }
+
+    pub fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
+        self.nodes.get(node_id).context(NotFoundSnafu {
+            id: node_id.to_owned(),
+        })?;
+
+        let mut nodes = self
+            .children
+            .get(node_id)
+            .into_iter()
+            .flat_map(|children| children.iter())
+            .map(|child_id| {
+                self.nodes.get(child_id).cloned().context(NotFoundSnafu {
+                    id: child_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        nodes.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(nodes)
     }
 
     pub fn list_session_states(&self) -> HashMap<String, SessionState> {
@@ -271,6 +310,269 @@ impl StoreState {
         })?;
         *state = next;
         Ok(state.clone())
+    }
+
+    pub fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
+        self.branch_configs
+            .iter()
+            .map(|(name, record)| {
+                let config = record
+                    .current_config()
+                    .context(BranchConfigVersionNotFoundSnafu {
+                        name: name.clone(),
+                        version: record.current_version,
+                    })?;
+                Ok((name.clone(), config))
+            })
+            .collect()
+    }
+
+    pub fn list_branch_config_records(&self) -> HashMap<String, BranchConfigRecord> {
+        self.branch_configs.clone()
+    }
+
+    pub fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
+        let record = self.get_branch_config_record(name)?;
+        record
+            .current_config()
+            .context(BranchConfigVersionNotFoundSnafu {
+                name: name.to_owned(),
+                version: record.current_version,
+            })
+    }
+
+    pub fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {
+        self.branch_configs
+            .get(name)
+            .cloned()
+            .context(BranchConfigNotFoundSnafu {
+                name: name.to_owned(),
+            })
+    }
+
+    pub fn set_branch_config(
+        &mut self,
+        name: &str,
+        config: BranchConfig,
+    ) -> Result<BranchConfigRecord> {
+        let record = if let Some(record) = self.branch_configs.get_mut(name) {
+            let current_version = record.current_version;
+            record
+                .update(config)
+                .context(BranchConfigVersionNotFoundSnafu {
+                    name: name.to_owned(),
+                    version: current_version,
+                })?;
+            record.clone()
+        } else {
+            let record = BranchConfigRecord::new(name.to_owned(), config);
+            self.branch_configs.insert(name.to_owned(), record.clone());
+            record
+        };
+        Ok(record)
+    }
+
+    pub fn rollback_branch_config(
+        &mut self,
+        name: &str,
+        target_version: u64,
+    ) -> Result<BranchConfigRecord> {
+        let record = self
+            .branch_configs
+            .get_mut(name)
+            .context(BranchConfigNotFoundSnafu {
+                name: name.to_owned(),
+            })?;
+        record
+            .rollback(target_version)
+            .context(BranchConfigVersionNotFoundSnafu {
+                name: name.to_owned(),
+                version: target_version,
+            })?;
+        Ok(record.clone())
+    }
+
+    pub fn delete_branch_config(&mut self, name: &str) -> Result<()> {
+        self.branch_configs
+            .remove(name)
+            .map(|_| ())
+            .context(BranchConfigNotFoundSnafu {
+                name: name.to_owned(),
+            })
+    }
+
+    pub fn list_provider_profiles(&self) -> HashMap<String, ProviderProfile> {
+        self.provider_profiles.clone()
+    }
+
+    pub fn get_provider_profile(&self, name: &str) -> Result<ProviderProfile> {
+        self.provider_profiles
+            .get(name)
+            .cloned()
+            .context(ProviderProfileNotFoundSnafu {
+                name: name.to_owned(),
+            })
+    }
+
+    pub fn submit_job(&mut self, branch: &str, base: &str) -> Result<Job> {
+        self.get_branch_head(branch)?;
+        self.get_node(base)?;
+        if let Some(active_job) = self
+            .jobs
+            .values()
+            .find(|job| job.branch == branch && !matches!(job.status, JobStatus::Finished))
+        {
+            return PromptJobActiveOnBranchSnafu {
+                branch: branch.to_owned(),
+                job_id: active_job.job_id.clone(),
+            }
+            .fail();
+        }
+        let job = Job::new(self.next_job_id(), branch, base);
+        self.jobs.insert(job.job_id.clone(), job.clone());
+        Ok(job)
+    }
+
+    pub fn skill_groups(&self) -> SkillGroups {
+        self.skill_groups.clone()
+    }
+
+    pub fn list_skills(&self, role: SessionRole) -> Vec<SkillRecord> {
+        self.skill_groups.for_role(role).values().cloned().collect()
+    }
+
+    pub fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
+        self.skill_groups
+            .for_role(role)
+            .get(name)
+            .cloned()
+            .context(SkillNotFoundSnafu {
+                role: role.as_str().to_owned(),
+                name: name.to_owned(),
+            })
+    }
+
+    pub fn add_skill(
+        &mut self,
+        role: SessionRole,
+        name: &str,
+        spec: SkillVersionSpec,
+    ) -> Result<SkillRecord> {
+        validate_skill_name(name)?;
+        let skills = self.skill_groups.for_role_mut(role);
+        ensure!(
+            !skills.contains_key(name),
+            SkillAlreadyExistsSnafu {
+                role: role.as_str().to_owned(),
+                name: name.to_owned(),
+            }
+        );
+
+        let record = SkillRecord::new(name.to_owned(), spec);
+        skills.insert(name.to_owned(), record.clone());
+        Ok(record)
+    }
+
+    pub fn update_skill(
+        &mut self,
+        role: SessionRole,
+        name: &str,
+        patch: &SkillUpdatePatch,
+    ) -> Result<SkillRecord> {
+        ensure!(
+            !patch.is_empty(),
+            SkillUpdateEmptySnafu {
+                role: role.as_str().to_owned(),
+                name: name.to_owned(),
+            }
+        );
+
+        let record =
+            self.skill_groups
+                .for_role_mut(role)
+                .get_mut(name)
+                .context(SkillNotFoundSnafu {
+                    role: role.as_str().to_owned(),
+                    name: name.to_owned(),
+                })?;
+        let current_version = record.current_version;
+        record.update(patch).context(SkillVersionNotFoundSnafu {
+            role: role.as_str().to_owned(),
+            name: name.to_owned(),
+            version: current_version,
+        })?;
+        Ok(record.clone())
+    }
+
+    pub fn rollback_skill(
+        &mut self,
+        role: SessionRole,
+        name: &str,
+        target_version: u64,
+    ) -> Result<SkillRecord> {
+        let record =
+            self.skill_groups
+                .for_role_mut(role)
+                .get_mut(name)
+                .context(SkillNotFoundSnafu {
+                    role: role.as_str().to_owned(),
+                    name: name.to_owned(),
+                })?;
+        record
+            .rollback(target_version)
+            .context(SkillVersionNotFoundSnafu {
+                role: role.as_str().to_owned(),
+                name: name.to_owned(),
+                version: target_version,
+            })?;
+        Ok(record.clone())
+    }
+
+    pub fn get_job(&self, job_id: &str) -> Result<Job> {
+        self.jobs
+            .get(job_id)
+            .cloned()
+            .context(PromptJobNotFoundSnafu {
+                job_id: job_id.to_owned(),
+            })
+    }
+
+    pub fn list_jobs(&self) -> HashMap<String, Job> {
+        self.jobs.clone()
+    }
+
+    pub fn set_job_status(
+        &mut self,
+        job_id: &str,
+        expected: JobStatus,
+        next: JobStatus,
+    ) -> Result<Job> {
+        let job = self.jobs.get_mut(job_id).context(PromptJobNotFoundSnafu {
+            job_id: job_id.to_owned(),
+        })?;
+        ensure!(
+            job.status == expected,
+            PromptJobMovedSnafu {
+                job_id: job_id.to_owned(),
+                expected: format!("{expected:?}"),
+                actual: format!("{:?}", job.status),
+            }
+        );
+        job.status = next;
+        job.finished_at = match next {
+            JobStatus::Finished => Some(Timestamp::now()),
+            _ => None,
+        };
+        Ok(job.clone())
+    }
+
+    fn next_job_id(&self) -> String {
+        loop {
+            let candidate = format!("job-{}", nanoid::nanoid!());
+            if !self.jobs.contains_key(&candidate) {
+                return candidate;
+            }
+        }
     }
 
     pub fn plan_rebase_session(
@@ -446,32 +748,76 @@ impl StoreState {
         .fail()
     }
 
+    fn resolve_node_ref<'a>(&'a self, reference: &str) -> Result<&'a Node> {
+        if let Some(head_id) = self.branches.get(reference) {
+            return self.nodes.get(head_id).context(NotFoundSnafu {
+                id: head_id.clone(),
+            });
+        }
+
+        if let Some(node) = self.nodes.get(reference) {
+            return Ok(node);
+        }
+
+        let matches = self
+            .nodes
+            .keys()
+            .filter(|node_id| node_id.starts_with(reference))
+            .cloned()
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [matched] => self.nodes.get(matched).context(NotFoundSnafu {
+                id: matched.clone(),
+            }),
+            [] => NotFoundSnafu {
+                id: reference.to_owned(),
+            }
+            .fail(),
+            _ => AmbiguousNodePrefixSnafu {
+                prefix: reference.to_owned(),
+                matches,
+            }
+            .fail(),
+        }
+    }
+
     fn validate_anchor_merge_parents(&self, parent: &str, kind: &Kind) -> Result<()> {
         let Kind::Anchor(anchor) = kind else {
             return Ok(());
         };
 
         let mut seen = HashSet::new();
+        let mut shadow_parents = Vec::new();
         for merge_parent in anchor.merge_parents() {
+            let node_id = merge_parent.node_id();
             ensure!(
-                merge_parent != parent,
+                node_id != parent,
                 MergeParentMatchesParentSnafu {
-                    id: merge_parent.clone(),
+                    id: node_id.to_owned(),
                 }
             );
             ensure!(
-                seen.insert(merge_parent.as_str()),
+                seen.insert(node_id),
                 DuplicateMergeParentSnafu {
-                    id: merge_parent.clone(),
+                    id: node_id.to_owned(),
                 }
             );
             ensure!(
-                self.nodes.contains_key(merge_parent),
+                self.nodes.contains_key(node_id),
                 ParentNotFoundSnafu {
-                    id: merge_parent.clone(),
+                    id: node_id.to_owned(),
                 }
             );
+            if merge_parent.is_shadow() {
+                shadow_parents.push(node_id.to_owned());
+            }
         }
+        ensure!(
+            shadow_parents.len() <= 1,
+            MultipleShadowParentsSnafu {
+                ids: shadow_parents,
+            }
+        );
 
         Ok(())
     }
@@ -537,10 +883,29 @@ fn is_node_id(reference: &str) -> bool {
     reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn validate_skill_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    ensure!(
+        !trimmed.is_empty(),
+        InvalidSkillNameSnafu {
+            name: name.to_owned(),
+            message: "name must not be empty".to_owned(),
+        }
+    );
+    ensure!(
+        trimmed == name,
+        InvalidSkillNameSnafu {
+            name: name.to_owned(),
+            message: "name must not have leading or trailing whitespace".to_owned(),
+        }
+    );
+    Ok(())
+}
+
 fn parent_ids(node: &Node) -> Vec<&str> {
     let mut parents = vec![node.parent.as_str()];
     if let Kind::Anchor(anchor) = &node.kind {
-        parents.extend(anchor.merge_parents().iter().map(String::as_str));
+        parents.extend(anchor.merge_parents().iter().map(|parent| parent.node_id()));
     }
     parents
 }

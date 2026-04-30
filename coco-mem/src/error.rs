@@ -14,8 +14,17 @@ pub enum StoreError {
     #[snafu(display("Merge parent ID {id:?} matches the primary parent"))]
     MergeParentMatchesParent { id: String },
 
+    #[snafu(display("Anchor has multiple shadow parents: {ids:?}"))]
+    MultipleShadowParents { ids: Vec<String> },
+
     #[snafu(display("ID {id:?} not found"))]
     NotFound { id: String },
+
+    #[snafu(display("Node prefix {prefix:?} matched multiple node IDs: {matches:?}"))]
+    AmbiguousNodePrefix {
+        prefix: String,
+        matches: Vec<String>,
+    },
 
     #[snafu(display("ID {id:?} is not an anchor"))]
     InvalidAnchor { id: String },
@@ -25,6 +34,15 @@ pub enum StoreError {
 
     #[snafu(display("Branch {name:?} already exists"))]
     BranchExists { name: String },
+
+    #[snafu(display("Branch preset config {name:?} not found"))]
+    BranchConfigNotFound { name: String },
+
+    #[snafu(display("Branch preset config {name:?} version {version} not found"))]
+    BranchConfigVersionNotFound { name: String, version: u64 },
+
+    #[snafu(display("Provider profile {name:?} not found"))]
+    ProviderProfileNotFound { name: String },
 
     #[snafu(display("Branch {name:?} moved from {expected:?} to {actual:?}"))]
     BranchHeadMoved {
@@ -40,6 +58,38 @@ pub enum StoreError {
         actual: String,
     },
 
+    #[snafu(display("Prompt job {job_id:?} not found"))]
+    PromptJobNotFound { job_id: String },
+
+    #[snafu(display("Prompt job {job_id:?} moved from {expected:?} to {actual:?}"))]
+    PromptJobMoved {
+        job_id: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[snafu(display("Branch {branch:?} already has an active prompt job {job_id:?}"))]
+    PromptJobActiveOnBranch { branch: String, job_id: String },
+
+    #[snafu(display("Skill {name:?} already exists for role {role:?}"))]
+    SkillAlreadyExists { role: String, name: String },
+
+    #[snafu(display("Skill {name:?} not found for role {role:?}"))]
+    SkillNotFound { role: String, name: String },
+
+    #[snafu(display("Skill {name:?} version {version} not found for role {role:?}"))]
+    SkillVersionNotFound {
+        role: String,
+        name: String,
+        version: u64,
+    },
+
+    #[snafu(display("Skill {name:?} update is empty for role {role:?}"))]
+    SkillUpdateEmpty { role: String, name: String },
+
+    #[snafu(display("Invalid skill name {name:?}: {message}"))]
+    InvalidSkillName { name: String, message: String },
+
     #[snafu(display("Ref {base_ref:?} is not an ancestor of {head_ref:?}"))]
     RefsNotConnected { base_ref: String, head_ref: String },
 
@@ -48,6 +98,12 @@ pub enum StoreError {
 
     #[snafu(display("Store path {path:?} is not a directory"))]
     StorePathIsNotDirectory { path: PathBuf },
+
+    #[snafu(display("Store at {path:?} is locked by another process"))]
+    StoreLocked { path: PathBuf },
+
+    #[snafu(display("Store at {path:?} was opened read-only"))]
+    StoreReadOnly { path: PathBuf },
 
     #[snafu(display("Failed to create or access store directory {path:?}: {source}"))]
     WriteStoreDirectory {
