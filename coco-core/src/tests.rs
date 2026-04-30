@@ -364,7 +364,7 @@ async fn llm_engine_calls_prompt_and_returns_text() {
 }
 
 #[tokio::test]
-async fn llm_engine_prompt_session_patch_appends_session_anchor() {
+async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[("runner", &[Ok("runner done")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -395,11 +395,13 @@ async fn llm_engine_prompt_session_patch_appends_session_anchor() {
     ));
     assert!(matches!(&ancestry[1].kind, Kind::Anchor(anchor) if anchor.as_prompt().is_some()));
     let Kind::Anchor(anchor) = &ancestry[2].kind else {
-        panic!("expected patched session anchor");
+        panic!("expected session patch anchor");
     };
-    let session = anchor.as_session().expect("expected session anchor");
-    assert_eq!(session.role, SessionRole::Runner);
-    assert_eq!(session.tools, vec![bash_tool]);
+    let patch = anchor
+        .as_session_patch()
+        .expect("expected session patch anchor");
+    assert_eq!(patch.role, Some(SessionRole::Runner));
+    assert_eq!(patch.tools, Some(vec![bash_tool]));
     assert_eq!(ancestry[2].parent, main_session.anchor_id);
 }
 

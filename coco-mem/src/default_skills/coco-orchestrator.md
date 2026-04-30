@@ -32,6 +32,8 @@ Rules:
 - On a `*/skill/*` branch, fork from the node before the `use_skill` ToolUse
   that invoked this skill, not from the skill session anchor.
 - After forking, apply the runner role and restricted tools on the runner prompt.
+  Prompt-level role/tool changes are session patches; they preserve the forked
+  branch history while changing the runner configuration.
 
 Example:
 

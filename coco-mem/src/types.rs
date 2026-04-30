@@ -56,6 +56,7 @@ pub enum MergeParent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AnchorPayload {
     Session(Box<SessionAnchor>),
+    SessionPatch(SessionAnchorPatch),
     Prompt(PromptAnchor),
     SkillResult(SkillResultAnchor),
 }
@@ -444,6 +445,13 @@ impl Anchor {
         }
     }
 
+    pub fn session_patch(merge_parents: Vec<MergeParent>, patch: SessionAnchorPatch) -> Self {
+        Self {
+            merge_parents,
+            payload: AnchorPayload::SessionPatch(patch),
+        }
+    }
+
     pub fn prompt(merge_parents: Vec<MergeParent>, anchor: PromptAnchor) -> Self {
         Self {
             merge_parents,
@@ -472,20 +480,35 @@ impl Anchor {
     pub fn as_session(&self) -> Option<&SessionAnchor> {
         match &self.payload {
             AnchorPayload::Session(anchor) => Some(anchor.as_ref()),
-            AnchorPayload::Prompt(_) | AnchorPayload::SkillResult(_) => None,
+            AnchorPayload::SessionPatch(_)
+            | AnchorPayload::Prompt(_)
+            | AnchorPayload::SkillResult(_) => None,
+        }
+    }
+
+    pub fn as_session_patch(&self) -> Option<&SessionAnchorPatch> {
+        match &self.payload {
+            AnchorPayload::SessionPatch(patch) => Some(patch),
+            AnchorPayload::Session(_)
+            | AnchorPayload::Prompt(_)
+            | AnchorPayload::SkillResult(_) => None,
         }
     }
 
     pub fn as_prompt(&self) -> Option<&PromptAnchor> {
         match &self.payload {
-            AnchorPayload::Session(_) | AnchorPayload::SkillResult(_) => None,
+            AnchorPayload::Session(_)
+            | AnchorPayload::SessionPatch(_)
+            | AnchorPayload::SkillResult(_) => None,
             AnchorPayload::Prompt(anchor) => Some(anchor),
         }
     }
 
     pub fn as_skill_result(&self) -> Option<&SkillResultAnchor> {
         match &self.payload {
-            AnchorPayload::Session(_) | AnchorPayload::Prompt(_) => None,
+            AnchorPayload::Session(_)
+            | AnchorPayload::SessionPatch(_)
+            | AnchorPayload::Prompt(_) => None,
             AnchorPayload::SkillResult(anchor) => Some(anchor),
         }
     }

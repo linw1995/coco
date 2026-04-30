@@ -1356,16 +1356,13 @@ where
     ) -> Result<String> {
         let prompt_parent_id = match session_patch {
             Some(patch) => {
-                let context = self.resolve_context(parent_id)?;
+                self.resolve_context(parent_id)?;
                 self.store
                     .append(NewNode {
                         parent: parent_id.to_owned(),
                         role: Role::System,
                         metadata: None,
-                        kind: Kind::Anchor(Anchor::session(
-                            vec![],
-                            context.session_anchor.apply_patch(patch),
-                        )),
+                        kind: Kind::Anchor(Anchor::session_patch(vec![], patch.clone())),
                     })
                     .context(MemorySnafu)?
             }
@@ -1814,6 +1811,17 @@ where
                         session_anchor: session_anchor.as_ref().clone(),
                         tail_entries,
                     });
+                }
+                AnchorPayload::SessionPatch(patch) => {
+                    let Some(context) = state.as_mut() else {
+                        return MissingAnchorSnafu {
+                            branch: reference.to_owned(),
+                        }
+                        .fail();
+                    };
+
+                    context.session_anchor = context.session_anchor.apply_patch(patch);
+                    context.active_anchor_id = node.id.clone();
                 }
                 AnchorPayload::Prompt(prompt_anchor) => {
                     let Some(context) = state.as_mut() else {
@@ -3893,16 +3901,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_with_session_patch_appends_session_anchor_without_rewriting_base() {
+    async fn prompt_with_session_patch_appends_patch_anchor_without_truncating_history() {
         let store = MemoryStore::new();
-        let backend = FakeBackend::with_responses(&[("runner", &[Ok("runner answer")])]);
+        let backend = FakeBackend::with_responses(&[
+            ("main", &[Ok("main answer")]),
+            ("runner", &[Ok("runner answer")]),
+        ]);
         let calls = backend.calls.clone();
         let service = LlmService::new(store.clone(), backend);
-        let main_session = service
+        service
             .create_session(session_config("main"))
             .await
             .unwrap();
-        service.fork("runner", &main_session.anchor_id).unwrap();
+        service
+            .prompt(PromptRequest {
+                branch: "main".to_owned(),
+                prompt: "keep this".to_owned(),
+                merge_parents: vec![],
+                session_patch: None,
+            })
+            .await
+            .unwrap();
+        let main_head = store.get_branch_head("main").unwrap();
+        service.fork("runner", &main_head).unwrap();
         let bash_tool = builtin_tool_definition("bash").unwrap();
 
         let result = service
@@ -3920,9 +3941,30 @@ mod tests {
             .unwrap();
 
         let calls = calls.lock().await;
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0.config.role, SessionRole::Runner);
-        assert_eq!(calls[0].0.config.tools, vec![bash_tool.clone()]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0.config.role, SessionRole::Runner);
+        assert_eq!(calls[1].0.config.tools, vec![bash_tool.clone()]);
+        assert_eq!(
+            text_messages_from_entries(&calls[1].0.conversation),
+            vec![
+                ConversationMessage {
+                    role: MessageRole::User,
+                    text: "Conversation start.".to_owned(),
+                },
+                ConversationMessage {
+                    role: MessageRole::User,
+                    text: "keep this".to_owned(),
+                },
+                ConversationMessage {
+                    role: MessageRole::Assistant,
+                    text: "main answer".to_owned(),
+                },
+                ConversationMessage {
+                    role: MessageRole::User,
+                    text: "run date".to_owned(),
+                },
+            ]
+        );
         drop(calls);
 
         let ancestry = store.ancestry("runner").unwrap();
@@ -3936,13 +3978,14 @@ mod tests {
             Kind::Anchor(anchor) if matches!(anchor.payload, AnchorPayload::Prompt(_))
         ));
         let Kind::Anchor(anchor) = &ancestry[2].kind else {
-            panic!("expected patched session anchor");
+            panic!("expected session patch anchor");
         };
-        let session = anchor.as_session().expect("expected session anchor");
-        assert_eq!(session.role, SessionRole::Runner);
-        assert_eq!(session.tools, vec![bash_tool]);
-        assert_eq!(ancestry[2].parent, main_session.anchor_id);
-        assert_eq!(ancestry[3].id, main_session.anchor_id);
+        let patch = anchor
+            .as_session_patch()
+            .expect("expected session patch anchor");
+        assert_eq!(patch.role, Some(SessionRole::Runner));
+        assert_eq!(patch.tools, Some(vec![bash_tool]));
+        assert_eq!(ancestry[2].parent, main_head);
     }
 
     #[tokio::test]

@@ -275,6 +275,7 @@ fn graph_kind_name(node: &Node) -> &'static str {
     match &node.kind {
         Kind::Anchor(anchor) => match &anchor.payload {
             AnchorPayload::Session(_) => "session",
+            AnchorPayload::SessionPatch(_) => "session_patch",
             AnchorPayload::Prompt(_) => "prompt",
             AnchorPayload::SkillResult(_) => "skill_result",
         },
@@ -298,6 +299,9 @@ fn render_node_content(node: &Node) -> String {
                 } else {
                     session.prompt.clone()
                 }
+            }
+            AnchorPayload::SessionPatch(patch) => {
+                serde_json::to_string(patch).expect("session patch should serialize")
             }
             AnchorPayload::Prompt(prompt) => prompt.prompt.clone(),
             AnchorPayload::SkillResult(skill_result) => skill_result.output.clone(),
