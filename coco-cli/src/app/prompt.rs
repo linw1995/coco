@@ -139,12 +139,7 @@ where
     let input = resolve_prompt_input(&command, reader)?;
     if command.asynchronous {
         let job = engine
-            .submit_job_with_shadow_parent(
-                &command.branch,
-                &input,
-                vec![],
-                command.shadow_parent.clone(),
-            )
+            .submit_job(&command.branch, &input, command.merge_parents)
             .await
             .context(CoreEngineSnafu)?;
         let store_path = if forwarded_runtime {
@@ -176,9 +171,9 @@ where
         }));
     }
 
-    if command.shadow_parent.is_some() {
+    if !command.merge_parents.is_empty() {
         return engine
-            .reply_with_shadow_parent(&command.branch, &input, command.shadow_parent)
+            .reply_with_merge_parents(&command.branch, &input, command.merge_parents)
             .await
             .map(Some)
             .context(CoreEngineSnafu);
@@ -248,7 +243,7 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     engine
-        .drive_job_with_shadow_parent(&command.job, command.shadow_parent)
+        .drive_job_with_merge_parents(&command.job, command.merge_parents)
         .await
         .context(CoreEngineSnafu)?;
     Ok(None)

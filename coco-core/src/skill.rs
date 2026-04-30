@@ -283,7 +283,6 @@ where
                 branch: child_branch.clone(),
                 origin: CompletionOrigin::BranchHead,
                 input: CompletionInput::Continue,
-                shadow_parent: None,
                 overrides: CompletionOverrides::default(),
             })
             .await;

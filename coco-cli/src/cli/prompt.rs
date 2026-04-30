@@ -1,4 +1,5 @@
 use clap::{Args, Subcommand};
+use coco_llm::MergeParentRef;
 
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
@@ -25,7 +26,7 @@ pub struct PromptRunCommand {
     pub text: Vec<String>,
 
     #[arg(skip)]
-    pub shadow_parent: Option<String>,
+    pub merge_parents: Vec<MergeParentRef>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -64,5 +65,5 @@ pub struct PromptWorkerCommand {
     pub job: String,
 
     #[arg(skip)]
-    pub shadow_parent: Option<String>,
+    pub merge_parents: Vec<MergeParentRef>,
 }

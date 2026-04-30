@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use coco_core::ConversationEngine;
-use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
+use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService, MergeParentRef};
 use coco_mem::{SessionRole, Store};
 
 use super::{
@@ -115,7 +115,7 @@ impl RunnerCli {
                     asynchronous: false,
                     json: false,
                     text: vec![],
-                    shadow_parent: None,
+                    merge_parents: vec![],
                 },
             }),
             RunnerCommand::Session(command) => Command::Session(SessionCommand {
@@ -369,8 +369,13 @@ fn apply_forwarded_defaults(
 fn apply_forwarded_shadow_parent(cli: &mut Cli, shadow_parent: String) {
     if let Command::Prompt(command) = &mut cli.command {
         match &mut command.command {
-            None => command.run.shadow_parent = Some(shadow_parent),
-            Some(PromptSubcommand::Worker(command)) => command.shadow_parent = Some(shadow_parent),
+            None => command
+                .run
+                .merge_parents
+                .push(MergeParentRef::shadow(shadow_parent)),
+            Some(PromptSubcommand::Worker(command)) => command
+                .merge_parents
+                .push(MergeParentRef::shadow(shadow_parent)),
             Some(PromptSubcommand::Status(_)) | Some(PromptSubcommand::BranchStatus(_)) => {}
         }
     }

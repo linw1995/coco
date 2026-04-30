@@ -254,7 +254,7 @@ fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str
                 asynchronous: false,
                 json: false,
                 text: text.iter().map(|part| (*part).to_owned()).collect(),
-                shadow_parent: None,
+                merge_parents: vec![],
             },
         }),
     }
@@ -267,14 +267,14 @@ fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
         command: Command::Prompt(PromptCommand {
             command: Some(PromptSubcommand::Worker(PromptWorkerCommand {
                 job: job.to_owned(),
-                shadow_parent: None,
+                merge_parents: vec![],
             })),
             run: PromptRunCommand {
                 branch: "main".to_owned(),
                 asynchronous: false,
                 json: false,
                 text: vec![],
-                shadow_parent: None,
+                merge_parents: vec![],
             },
         }),
     }
@@ -294,7 +294,7 @@ fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
                 asynchronous: false,
                 json: false,
                 text: vec![],
-                shadow_parent: None,
+                merge_parents: vec![],
             },
         }),
     }
@@ -319,7 +319,7 @@ fn prompt_branch_status_cli(
                 asynchronous: false,
                 json: false,
                 text: vec![],
-                shadow_parent: None,
+                merge_parents: vec![],
             },
         }),
     }

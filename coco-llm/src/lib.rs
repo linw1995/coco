@@ -147,7 +147,7 @@ pub struct SessionConfig {
 pub struct PromptRequest {
     pub branch: String,
     pub prompt: String,
-    pub merge_parents: Vec<String>,
+    pub merge_parents: Vec<MergeParentRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,8 +185,36 @@ pub struct CompletionRequest {
     pub branch: String,
     pub origin: CompletionOrigin,
     pub input: CompletionInput,
-    pub shadow_parent: Option<String>,
     pub overrides: CompletionOverrides,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeParentRef {
+    Merge(String),
+    Shadow(String),
+}
+
+impl MergeParentRef {
+    pub fn merge(reference: impl Into<String>) -> Self {
+        Self::Merge(reference.into())
+    }
+
+    pub fn shadow(reference: impl Into<String>) -> Self {
+        Self::Shadow(reference.into())
+    }
+
+    pub fn reference(&self) -> &str {
+        match self {
+            Self::Merge(reference) | Self::Shadow(reference) => reference,
+        }
+    }
+
+    pub fn into_resolved_parent(self, node_id: String) -> MergeParent {
+        match self {
+            Self::Merge(_) => MergeParent::merge(node_id),
+            Self::Shadow(_) => MergeParent::shadow(node_id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -202,7 +230,7 @@ pub enum CompletionInput {
     Continue,
     Prompt {
         text: String,
-        merge_parents: Vec<String>,
+        merge_parents: Vec<MergeParentRef>,
     },
 }
 
@@ -1062,22 +1090,6 @@ where
         let branch = branch.into();
         self.store.fork(&branch, from_ref).context(MemorySnafu)
     }
-
-    fn append_prompt_anchor_to_branch(
-        &self,
-        branch: &str,
-        prompt: &str,
-        merge_parents: &[String],
-    ) -> Result<String> {
-        let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
-        let anchor_id =
-            self.append_prompt_anchor_to_parent(&original_head, prompt, merge_parents, None)?;
-        self.store
-            .set_branch_head(branch, &original_head, &anchor_id)
-            .context(MemorySnafu)?;
-
-        Ok(anchor_id)
-    }
 }
 
 impl<B, S> LlmService<B, S>
@@ -1128,7 +1140,6 @@ where
                 text: request.prompt,
                 merge_parents: request.merge_parents,
             },
-            shadow_parent: None,
             overrides: CompletionOverrides::default(),
         })
         .await
@@ -1149,19 +1160,11 @@ where
             CompletionOrigin::Reference(reference) => self.resolve_reference_id(reference)?,
         };
         let retry_from_node_id = match &request.input {
-            CompletionInput::Continue => self.append_shadow_prompt_anchor_to_parent(
-                &reference_id,
-                request.shadow_parent.as_deref(),
-            )?,
+            CompletionInput::Continue => reference_id,
             CompletionInput::Prompt {
                 text,
                 merge_parents,
-            } => self.append_prompt_anchor_to_parent(
-                &reference_id,
-                text,
-                merge_parents,
-                request.shadow_parent.as_deref(),
-            )?,
+            } => self.append_prompt_anchor_to_parent(&reference_id, text, merge_parents)?,
         };
         let session = self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
         let trace_node_appender = TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
@@ -1336,42 +1339,44 @@ fn resolve_session_model(anchor: &SessionAnchor, config: Option<&ProviderRuntime
 
 impl<B, S> LlmService<B, S>
 where
+    S: NodeStore + BranchStore,
+{
+    fn append_prompt_anchor_to_branch(
+        &self,
+        branch: &str,
+        prompt: &str,
+        merge_parents: &[MergeParentRef],
+    ) -> Result<String> {
+        let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let anchor_id =
+            self.append_prompt_anchor_to_parent(&original_head, prompt, merge_parents)?;
+        self.store
+            .set_branch_head(branch, &original_head, &anchor_id)
+            .context(MemorySnafu)?;
+
+        Ok(anchor_id)
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
     S: NodeStore,
 {
     fn append_prompt_anchor_to_parent(
         &self,
         parent_id: &str,
         prompt: &str,
-        merge_parents: &[String],
-        shadow_parent: Option<&str>,
+        merge_parents: &[MergeParentRef],
     ) -> Result<String> {
-        let merge_parents = merge_parents
-            .iter()
-            .map(|reference| {
-                self.store
-                    .ancestry(reference)
-                    .map(|nodes| {
-                        nodes
-                            .into_iter()
-                            .next()
-                            .expect("ancestry should always include the head node")
-                            .id
-                    })
-                    .context(MemorySnafu)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut merge_parents = merge_parents
-            .into_iter()
-            .map(MergeParent::merge)
-            .collect::<Vec<_>>();
-        if let Some(shadow_parent) = shadow_parent {
-            let shadow_parent = self.resolve_reference_id(shadow_parent)?;
-            if shadow_parent != parent_id
-                && !merge_parents
+        let mut resolved_parents = Vec::new();
+        for merge_parent in merge_parents {
+            let node_id = self.resolve_reference_id(merge_parent.reference())?;
+            if node_id != parent_id
+                && !resolved_parents
                     .iter()
-                    .any(|merge_parent| merge_parent.node_id() == shadow_parent)
+                    .any(|parent: &MergeParent| parent.node_id() == node_id)
             {
-                merge_parents.push(MergeParent::shadow(shadow_parent));
+                resolved_parents.push(merge_parent.clone().into_resolved_parent(node_id));
             }
         }
         self.store
@@ -1380,24 +1385,13 @@ where
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::prompt(
-                    merge_parents,
+                    resolved_parents,
                     PromptAnchor {
                         prompt: prompt.to_owned(),
                     },
                 )),
             })
             .context(MemorySnafu)
-    }
-
-    fn append_shadow_prompt_anchor_to_parent(
-        &self,
-        parent_id: &str,
-        shadow_parent: Option<&str>,
-    ) -> Result<String> {
-        let Some(shadow_parent) = shadow_parent else {
-            return Ok(parent_id.to_owned());
-        };
-        self.append_prompt_anchor_to_parent(parent_id, "", &[], Some(shadow_parent))
     }
 
     fn append_backend_events(
@@ -1564,11 +1558,9 @@ where
         };
 
         let source_head_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
-        let merged_anchor_id = self.append_prompt_anchor_to_branch(
-            &resolved_target_branch,
-            prompt,
-            std::slice::from_ref(&source_head_id),
-        )?;
+        let merge_parents = vec![MergeParentRef::merge(source_head_id.clone())];
+        let merged_anchor_id =
+            self.append_prompt_anchor_to_branch(&resolved_target_branch, prompt, &merge_parents)?;
         self.store
             .set_session_state(
                 branch,
@@ -1626,11 +1618,9 @@ where
             }
         }
 
-        let feedback_anchor_id = self.append_prompt_anchor_to_branch(
-            branch,
-            prompt,
-            std::slice::from_ref(&source_anchor_id),
-        )?;
+        let merge_parents = vec![MergeParentRef::merge(source_anchor_id.clone())];
+        let feedback_anchor_id =
+            self.append_prompt_anchor_to_branch(branch, prompt, &merge_parents)?;
         self.store
             .set_session_state(
                 branch,
@@ -3334,7 +3324,6 @@ mod tests {
             branch: branch.to_owned(),
             origin: CompletionOrigin::BranchHead,
             input: CompletionInput::Continue,
-            shadow_parent: None,
             overrides: CompletionOverrides::default(),
         }
     }
@@ -3817,7 +3806,7 @@ mod tests {
             .prompt(PromptRequest {
                 branch: "main".to_owned(),
                 prompt: "merge them".to_owned(),
-                merge_parents: vec!["draft".to_owned()],
+                merge_parents: vec![MergeParentRef::merge("draft")],
             })
             .await
             .unwrap();
@@ -4015,7 +4004,6 @@ mod tests {
                 branch: "main".to_owned(),
                 origin: CompletionOrigin::Reference(first.response_node_id.clone()),
                 input: CompletionInput::Continue,
-                shadow_parent: None,
                 overrides: CompletionOverrides::default(),
             })
             .await
@@ -4050,7 +4038,6 @@ mod tests {
                     text: "resume from base".to_owned(),
                     merge_parents: vec![],
                 },
-                shadow_parent: None,
                 overrides: CompletionOverrides::default(),
             })
             .await
