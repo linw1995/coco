@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 async-trait.workspace = true
 clap.workspace = true
+coco-channel = { path = "../coco-channel", features = ["telegram"] }
 coco-core = { path = "../coco-core" }
 coco-console = { path = "../coco-console" }
 coco-llm = { path = "../coco-llm" }
