@@ -914,7 +914,7 @@ async fn prompt_supports_explicit_branch_override() {
 }
 
 #[tokio::test]
-async fn prompt_role_and_tool_flags_append_session_anchor() {
+async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
@@ -971,12 +971,15 @@ async fn prompt_role_and_tool_flags_append_session_anchor() {
     ));
     assert!(matches!(&ancestry[1].kind, Kind::Anchor(anchor) if anchor.as_prompt().is_some()));
     let Kind::Anchor(anchor) = &ancestry[2].kind else {
-        panic!("expected patched session anchor");
+        panic!("expected session patch anchor");
     };
-    let session = anchor.as_session().expect("expected session anchor");
-    assert_eq!(session.role, SessionRole::Runner);
-    assert_eq!(session.tools.len(), 1);
-    assert_eq!(session.tools[0].name, "bash");
+    let patch = anchor
+        .as_session_patch()
+        .expect("expected session patch anchor");
+    assert_eq!(patch.role, Some(SessionRole::Runner));
+    let tools = patch.tools.as_ref().expect("expected tools patch");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "bash");
     assert_eq!(ancestry[2].parent, original_main_head);
     assert_eq!(ancestry[3].id, original_main_head);
 }
