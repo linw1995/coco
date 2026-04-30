@@ -9,6 +9,7 @@ use coco_core::{
 };
 use coco_llm::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, CompletionBackend, LlmService,
+    SessionConfigPatch,
 };
 use coco_mem::{AnchorPayload, JobStore, Kind, MergeParent, NodeStore, Store};
 use serde::Serialize;
@@ -18,7 +19,7 @@ use tokio::process::Command;
 use crate::{
     COCO_DAEMON_SOCKET_ENV, Result,
     cli::{
-        PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
+        CliTool, PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
         PromptSubcommand, PromptWorkerCommand,
     },
     error::{
@@ -137,9 +138,15 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let input = resolve_prompt_input(&command, reader)?;
+    let session_patch = resolve_prompt_session_patch(&command);
     if command.asynchronous {
         let job = engine
-            .submit_job(&command.branch, &input, command.merge_parents)
+            .submit_job_with_session_patch(
+                &command.branch,
+                &input,
+                command.merge_parents,
+                session_patch,
+            )
             .await
             .context(CoreEngineSnafu)?;
         let store_path = if forwarded_runtime {
@@ -171,9 +178,14 @@ where
         }));
     }
 
-    if !command.merge_parents.is_empty() {
+    if !command.merge_parents.is_empty() || session_patch.is_some() {
         return engine
-            .reply_with_merge_parents(&command.branch, &input, command.merge_parents)
+            .reply_with_session_patch(
+                &command.branch,
+                &input,
+                command.merge_parents,
+                session_patch,
+            )
             .await
             .map(Some)
             .context(CoreEngineSnafu);
@@ -185,6 +197,37 @@ where
         .await
         .context(crate::error::CoreSnafu)?;
     Ok(Some(response.text))
+}
+
+fn resolve_prompt_session_patch(command: &PromptRunCommand) -> Option<SessionConfigPatch> {
+    let mut patch = SessionConfigPatch::default();
+    let mut has_patch = false;
+
+    if let Some(role) = command.role {
+        patch.role = Some(role.into());
+        has_patch = true;
+    }
+    if command.clear_tools {
+        patch.tools = Some(vec![]);
+        has_patch = true;
+    } else if !command.tools.is_empty() {
+        patch.tools = Some(resolve_cli_tools(&command.tools));
+        has_patch = true;
+    }
+
+    has_patch.then_some(patch)
+}
+
+fn resolve_cli_tools(tools: &[CliTool]) -> Vec<coco_mem::Tool> {
+    tools
+        .iter()
+        .copied()
+        .map(CliTool::as_str)
+        .map(|name| {
+            coco_llm::builtin_tool_definition(name)
+                .expect("CliTool names should always map to built-in tool definitions")
+        })
+        .collect()
 }
 
 async fn run_prompt_status<B, S>(

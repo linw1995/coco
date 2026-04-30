@@ -1,6 +1,8 @@
 use clap::{Args, Subcommand};
 use coco_mem::MergeParent;
 
+use super::{CliSessionRole, CliTool};
+
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct PromptCommand {
@@ -24,6 +26,15 @@ pub struct PromptRunCommand {
 
     #[arg(value_name = "TEXT")]
     pub text: Vec<String>,
+
+    #[arg(long, value_enum)]
+    pub role: Option<CliSessionRole>,
+
+    #[arg(long = "tool", value_enum, conflicts_with = "clear_tools")]
+    pub tools: Vec<CliTool>,
+
+    #[arg(long)]
+    pub clear_tools: bool,
 
     #[arg(skip)]
     pub merge_parents: Vec<MergeParent>,

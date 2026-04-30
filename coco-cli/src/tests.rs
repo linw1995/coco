@@ -254,6 +254,9 @@ fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str
                 asynchronous: false,
                 json: false,
                 text: text.iter().map(|part| (*part).to_owned()).collect(),
+                role: None,
+                tools: vec![],
+                clear_tools: false,
                 merge_parents: vec![],
             },
         }),
@@ -274,6 +277,9 @@ fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
                 asynchronous: false,
                 json: false,
                 text: vec![],
+                role: None,
+                tools: vec![],
+                clear_tools: false,
                 merge_parents: vec![],
             },
         }),
@@ -294,6 +300,9 @@ fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
                 asynchronous: false,
                 json: false,
                 text: vec![],
+                role: None,
+                tools: vec![],
+                clear_tools: false,
                 merge_parents: vec![],
             },
         }),
@@ -319,6 +328,9 @@ fn prompt_branch_status_cli(
                 asynchronous: false,
                 json: false,
                 text: vec![],
+                role: None,
+                tools: vec![],
+                clear_tools: false,
                 merge_parents: vec![],
             },
         }),
@@ -899,6 +911,74 @@ async fn prompt_supports_explicit_branch_override() {
     .unwrap();
 
     assert_eq!(output, Some("world".to_owned()));
+}
+
+#[tokio::test]
+async fn prompt_role_and_tool_flags_append_session_anchor() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+    let original_main_head = open_store(&store_path)
+        .unwrap()
+        .get_branch_head("main")
+        .unwrap();
+    run_with_backend(
+        session_fork_cli(store_path.clone(), "runner", Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "prompt",
+            "--branch",
+            "runner",
+            "--role",
+            "runner",
+            "--tool",
+            "bash",
+            "run date",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[("runner", &[Ok("runner done")])]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output, Some("runner done".to_owned()));
+    let store = open_store(&store_path).unwrap();
+    let ancestry = store.ancestry("runner").unwrap();
+    assert!(matches!(
+        &ancestry[0].kind,
+        Kind::Text(text) if text == "runner done"
+    ));
+    assert!(matches!(&ancestry[1].kind, Kind::Anchor(anchor) if anchor.as_prompt().is_some()));
+    let Kind::Anchor(anchor) = &ancestry[2].kind else {
+        panic!("expected patched session anchor");
+    };
+    let session = anchor.as_session().expect("expected session anchor");
+    assert_eq!(session.role, SessionRole::Runner);
+    assert_eq!(session.tools.len(), 1);
+    assert_eq!(session.tools[0].name, "bash");
+    assert_eq!(ancestry[2].parent, original_main_head);
+    assert_eq!(ancestry[3].id, original_main_head);
 }
 
 #[tokio::test]
