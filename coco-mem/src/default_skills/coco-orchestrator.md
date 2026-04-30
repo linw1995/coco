@@ -27,11 +27,11 @@ Rules:
 
 - You are already in `coco-orchestrator`; do not call `use_skill` for it again.
 - Prefer `coco` commands over direct store edits.
-- Hand off bounded work with `coco session fork`, `coco session rebase`, and
-  `coco prompt`; do not use `use_skill` as the handoff mechanism here.
+- Hand off bounded work with `coco session fork` and `coco prompt`; do not use
+  `use_skill` as the handoff mechanism here.
 - On a `*/skill/*` branch, fork from the node before the `use_skill` ToolUse
   that invoked this skill, not from the skill session anchor.
-- After forking, rebase the runner and restrict its tools.
+- After forking, apply the runner role and restricted tools on the runner prompt.
 
 Example:
 
@@ -40,5 +40,5 @@ ANCHOR=$(coco session get --json --branch "$COCO_BRANCH" | jq -r '.anchor_id')
 USE_SKILL=$(coco session show --json "$ANCHOR" | jq -r '.node.parent')
 BASE=$(coco session show --json "$USE_SKILL" | jq -r '.node.parent')
 coco session fork --branch "$RUNNER_BRANCH" --from-ref "$BASE"
-coco session rebase --branch "$RUNNER_BRANCH" --role runner --tool bash --tool search_skill
+coco prompt --branch "$RUNNER_BRANCH" --role runner --tool bash --tool search_skill "<task>"
 ```
