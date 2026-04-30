@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  nix-check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -19,7 +19,9 @@ jobs:
       - name: Run repository checks
         run: nix develop --command prek -a
 
-  coverage:
+  test:
+    needs:
+      - lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -43,6 +45,8 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
   nix-build:
+    needs:
+      - lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
