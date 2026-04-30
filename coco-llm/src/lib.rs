@@ -216,6 +216,34 @@ pub struct CompletionOverrides {
     pub additional_params: Option<Value>,
 }
 
+fn completion_origin_kind(origin: &CompletionOrigin) -> &'static str {
+    match origin {
+        CompletionOrigin::BranchHead => "branch_head",
+        CompletionOrigin::Reference(_) => "reference",
+    }
+}
+
+fn completion_input_kind(input: &CompletionInput) -> &'static str {
+    match input {
+        CompletionInput::Continue => "continue",
+        CompletionInput::Prompt { .. } => "prompt",
+    }
+}
+
+fn completion_input_merge_parent_count(input: &CompletionInput) -> usize {
+    match input {
+        CompletionInput::Continue => 0,
+        CompletionInput::Prompt { merge_parents, .. } => merge_parents.len(),
+    }
+}
+
+fn completion_input_has_session_patch(input: &CompletionInput) -> bool {
+    match input {
+        CompletionInput::Continue => false,
+        CompletionInput::Prompt { session_patch, .. } => session_patch.is_some(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionResult {
     pub branch: String,
@@ -991,9 +1019,20 @@ where
 {
     pub async fn rebase_session(&self, branch: &str, patch: SessionConfigPatch) -> Result<String> {
         let _guard = self.lock_branch(branch).await;
-        self.store
+        let has_tool_patch = patch.tools.is_some();
+        let has_model_patch = patch.model.is_some();
+        let anchor_id = self
+            .store
             .rebase_session(branch, &patch)
-            .context(MemorySnafu)
+            .context(MemorySnafu)?;
+        tracing::info!(
+            branch = %branch,
+            anchor_id = %anchor_id,
+            has_tool_patch,
+            has_model_patch,
+            "rebased session"
+        );
+        Ok(anchor_id)
     }
 }
 
@@ -1003,6 +1042,13 @@ where
 {
     pub async fn create_session(&self, config: SessionConfig) -> Result<BranchSession> {
         let _guard = self.lock_branch(&config.branch).await;
+        let branch = config.branch.clone();
+        let role = config.role;
+        let configured_provider = config.provider;
+        let model = config.model.clone();
+        let logged_provider_profile = config.provider_profile.clone();
+        let tool_count = config.tools.len();
+        let merge_parent_count = config.merge_parents.len();
         let root_id = self.store.root_id();
         let provider_profile = config.provider_profile;
         let provider = provider_profile
@@ -1037,6 +1083,17 @@ where
             .fork(&config.branch, &anchor_id)
             .context(MemorySnafu)?;
 
+        tracing::info!(
+            branch = %branch,
+            anchor_id = %anchor_id,
+            role = ?role,
+            provider = %configured_provider.as_str(),
+            model = %model,
+            provider_profile = ?logged_provider_profile,
+            tool_count,
+            merge_parent_count,
+            "created session"
+        );
         Ok(BranchSession {
             branch: config.branch,
             anchor_id,
@@ -1045,7 +1102,14 @@ where
 
     pub fn fork(&self, branch: impl Into<String>, from_ref: &str) -> Result<String> {
         let branch = branch.into();
-        self.store.fork(&branch, from_ref).context(MemorySnafu)
+        let anchor_id = self.store.fork(&branch, from_ref).context(MemorySnafu)?;
+        tracing::info!(
+            branch = %branch,
+            from_ref = %from_ref,
+            anchor_id = %anchor_id,
+            "forked session branch"
+        );
+        Ok(anchor_id)
     }
 }
 
@@ -1075,6 +1139,12 @@ where
             )
             .context(MemorySnafu)?;
 
+        tracing::info!(
+            branch = %branch,
+            target_branch = %target_branch,
+            base_head_id = %base_head_id,
+            "opened session pull request"
+        );
         Ok(PullRequest {
             branch: branch.to_owned(),
             target_branch: target_branch.to_owned(),
@@ -1090,6 +1160,12 @@ where
 {
     pub async fn prompt(&self, request: PromptRequest) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
+        tracing::info!(
+            branch = %request.branch,
+            merge_parent_count = request.merge_parents.len(),
+            has_session_patch = request.session_patch.is_some(),
+            "received prompt request"
+        );
         self.run_locked(CompletionRequest {
             branch: request.branch,
             origin: CompletionOrigin::BranchHead,
@@ -1105,10 +1181,21 @@ where
 
     pub async fn run(&self, request: CompletionRequest) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
+        tracing::debug!(
+            branch = %request.branch,
+            origin = completion_origin_kind(&request.origin),
+            input = completion_input_kind(&request.input),
+            "received completion request"
+        );
         self.run_locked(request).await
     }
 
     async fn run_locked(&self, request: CompletionRequest) -> Result<CompletionResult> {
+        let branch = request.branch.clone();
+        let origin_kind = completion_origin_kind(&request.origin);
+        let input_kind = completion_input_kind(&request.input);
+        let merge_parent_count = completion_input_merge_parent_count(&request.input);
+        let has_session_patch = completion_input_has_session_patch(&request.input);
         let original_head = self
             .store
             .get_branch_head(&request.branch)
@@ -1118,7 +1205,7 @@ where
             CompletionOrigin::Reference(reference) => self.resolve_reference_id(reference)?,
         };
         let retry_from_node_id = match &request.input {
-            CompletionInput::Continue => reference_id,
+            CompletionInput::Continue => reference_id.clone(),
             CompletionInput::Prompt {
                 text,
                 merge_parents,
@@ -1131,6 +1218,21 @@ where
             )?,
         };
         let session = self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
+        tracing::info!(
+            branch = %branch,
+            original_head = %original_head,
+            reference_id = %reference_id,
+            retry_from_node_id = %retry_from_node_id,
+            anchor_id = %session.anchor_id,
+            origin = origin_kind,
+            input = input_kind,
+            merge_parent_count,
+            has_session_patch,
+            provider = %session.config.provider.as_str(),
+            model = %session.config.model,
+            tool_count = session.config.tools.len(),
+            "starting completion"
+        );
         let trace_node_appender = TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
             store: self.store.clone(),
             head_id: StdMutex::new(retry_from_node_id.clone()),
@@ -1173,6 +1275,14 @@ where
                         };
                         self.move_branch_head(&resolved.branch, &original_head, &response_node_id)?;
 
+                        tracing::info!(
+                            branch = %resolved.branch,
+                            execution_id = %last_execution_id,
+                            response_node_id = %response_node_id,
+                            branch_head = %response_node_id,
+                            step_count = steps.len(),
+                            "completion succeeded"
+                        );
                         Ok(CompletionResult {
                             branch: resolved.branch,
                             anchor_id: session.anchor_id,
@@ -1217,6 +1327,15 @@ where
                             &original_head,
                             &retry_from_node_id,
                         )?;
+                        tracing::warn!(
+                            branch = %resolved.branch,
+                            execution_id = %execution_id,
+                            error_node_id = %error_node_id,
+                            retry_from_node_id = %retry_from_node_id,
+                            step_count = steps.len(),
+                            error = %message,
+                            "completion failed with backend outcome"
+                        );
                         Err(BackendSnafu {
                             context: Box::new(BackendFailureContext {
                                 branch: resolved.branch,
@@ -1246,6 +1365,14 @@ where
                     )?,
                 };
                 self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
+                tracing::error!(
+                    branch = %resolved.branch,
+                    execution_id = %execution_id,
+                    error_node_id = %error_node_id,
+                    retry_from_node_id = %retry_from_node_id,
+                    error = %source,
+                    "completion backend returned error"
+                );
                 Err(BackendSnafu {
                     context: Box::new(BackendFailureContext {
                         branch: resolved.branch,
@@ -1588,6 +1715,13 @@ where
             )
             .context(MemorySnafu)?;
 
+        tracing::info!(
+            branch = %branch,
+            target_branch = %resolved_target_branch,
+            source_head_id = %source_head_id,
+            merged_anchor_id = %merged_anchor_id,
+            "merged session"
+        );
         Ok(SessionMerge {
             branch: branch.to_owned(),
             target_branch: resolved_target_branch,
@@ -1646,6 +1780,13 @@ where
             )
             .context(MemorySnafu)?;
 
+        tracing::info!(
+            branch = %branch,
+            target_branch = %target_branch,
+            source_anchor_id = %source_anchor_id,
+            feedback_anchor_id = %feedback_anchor_id,
+            "applied session feedback"
+        );
         Ok(SessionFeedback {
             branch: branch.to_owned(),
             target_branch,

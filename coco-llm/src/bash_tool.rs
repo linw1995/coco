@@ -587,36 +587,80 @@ async fn start_coco_cli_runtime_server(
     let socket_path = socket_dir.join("coco-cli.sock");
     validate_runtime_socket_path(&socket_path)?;
     let listener = UnixListener::bind(&socket_path).context(BindRuntimeSocketSnafu)?;
+    tracing::debug!(
+        socket_path = %socket_path.display(),
+        branch = %context.session_branch,
+        role = ?context.session_role,
+        "started coco cli runtime socket"
+    );
     let task = tokio::spawn(async move {
         loop {
             let accepted = listener.accept().await;
-            let Ok((mut stream, _)) = accepted else {
-                break;
+            let (mut stream, _) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(error = %error, "coco cli runtime socket accept failed");
+                    break;
+                }
             };
             let cli_bridge = cli_bridge.clone();
             tokio::spawn(async move {
                 let mut input = Vec::new();
                 let response = match stream.read_to_end(&mut input).await {
                     Ok(_) => match serde_json::from_slice::<CocoCliRuntimeRequest>(&input) {
-                        Ok(request) => match cli_bridge.execute_coco_cli(request).await {
-                            Ok(response) => response,
-                            Err(error) => runtime_error_response(1, error.to_string()),
-                        },
-                        Err(error) => runtime_error_response(
-                            2,
-                            format!("invalid coco-cli runtime request: {error}"),
-                        ),
+                        Ok(request) => {
+                            tracing::debug!(
+                                arg_count = request.args.len(),
+                                stdin_bytes = request.stdin.len(),
+                                session_role = ?request.session_role,
+                                "received coco cli runtime request"
+                            );
+                            match cli_bridge.execute_coco_cli(request).await {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "coco cli runtime bridge failed"
+                                    );
+                                    runtime_error_response(1, error.to_string())
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                request_bytes = input.len(),
+                                "invalid coco cli runtime request"
+                            );
+                            runtime_error_response(
+                                2,
+                                format!("invalid coco-cli runtime request: {error}"),
+                            )
+                        }
                     },
-                    Err(error) => runtime_error_response(
-                        2,
-                        format!("failed to read coco-cli runtime request: {error}"),
-                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to read coco cli runtime request"
+                        );
+                        runtime_error_response(
+                            2,
+                            format!("failed to read coco-cli runtime request: {error}"),
+                        )
+                    }
                 };
                 let payload = encode_runtime_response(&response);
                 if let Err(error) = stream.write_all(&payload).await {
                     tracing::error!(
                         error = %error,
                         "failed to write coco-cli runtime response"
+                    );
+                } else {
+                    tracing::debug!(
+                        exit_code = response.exit_code,
+                        stdout_bytes = response.stdout.len(),
+                        stderr_bytes = response.stderr.len(),
+                        "handled coco cli runtime request"
                     );
                 }
             });
@@ -674,6 +718,14 @@ async fn execute_bash_command(
             .map(|command| command.path_env.as_os_str()),
         &extra_allow_paths,
     )?;
+    tracing::info!(
+        program = %execution.program.display(),
+        arg_count = execution.args.len(),
+        workdir = %request.workdir.display(),
+        timeout_ms = ?request.timeout_ms,
+        shim_enabled = request.context.enable_coco_shim,
+        "starting bash tool command"
+    );
     let mut command = Command::new(&execution.program);
     command
         .args(&execution.args)
@@ -735,6 +787,14 @@ async fn execute_bash_command(
     if let Some(runtime_server) = runtime_server {
         runtime_server.shutdown().await?;
     }
+    tracing::info!(
+        program = %execution.program.display(),
+        exit_code = ?status.as_ref().and_then(std::process::ExitStatus::code),
+        timed_out = status.is_none(),
+        stdout_bytes = stdout.len(),
+        stderr_bytes = stderr.len(),
+        "bash tool command completed"
+    );
 
     Ok(format_bash_result(
         status.as_ref().and_then(std::process::ExitStatus::code),

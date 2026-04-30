@@ -122,6 +122,11 @@ where
         max_concurrency: usize,
     ) -> BatchPromptResult {
         let limit = max_concurrency.max(1);
+        tracing::info!(
+            item_count = items.len(),
+            max_concurrency = limit,
+            "starting batch prompt"
+        );
         let semaphore = Arc::new(Semaphore::new(limit));
         let mut tasks = JoinSet::new();
 
@@ -200,13 +205,24 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<Job, EngineError> {
+        let merge_parent_count = merge_parents.len();
+        let has_session_patch = session_patch.is_some();
         let base = self.service.append_prompt_job_base(
             branch,
             prompt,
             &merge_parents,
             session_patch.as_ref(),
         )?;
-        Ok(self.service.store().submit_job(branch, &base)?)
+        let job = self.service.store().submit_job(branch, &base)?;
+        tracing::info!(
+            job_id = %job.job_id,
+            branch = %job.branch,
+            base = %job.base,
+            merge_parent_count,
+            has_session_patch,
+            "submitted prompt job"
+        );
+        Ok(job)
     }
 
     pub fn get_job(&self, job_id: &str) -> std::result::Result<JobStatusSnapshot, EngineError> {
@@ -222,6 +238,11 @@ where
 
     pub async fn resume_incomplete_jobs(&self) -> std::result::Result<(), EngineError> {
         let jobs = self.list_jobs()?;
+        let incomplete_count = jobs
+            .values()
+            .filter(|job| !matches!(job.status, JobStatus::Finished))
+            .count();
+        tracing::info!(incomplete_count, "resuming incomplete prompt jobs");
         for (job_id, job) in jobs {
             if matches!(job.status, JobStatus::Finished) {
                 continue;
@@ -262,6 +283,12 @@ where
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<String, EngineError> {
         let job_id = job_id.to_owned();
+        let merge_parent_count = merge_parents.len();
+        tracing::debug!(
+            job_id = %job_id,
+            merge_parent_count,
+            "joining prompt job singleflight"
+        );
         let inflight_job = self.get_or_start_inflight_job(&job_id, merge_parents).await;
         let result = inflight_job.clone().await;
 
@@ -276,6 +303,14 @@ where
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<String, EngineError> {
         let mut job = self.service.store().get_job(job_id)?;
+        tracing::info!(
+            job_id = %job.job_id,
+            branch = %job.branch,
+            base = %job.base,
+            status = ?job.status,
+            merge_parent_count = merge_parents.len(),
+            "driving prompt job"
+        );
 
         if matches!(job.status, JobStatus::Queued) {
             job = self.service.store().set_job_status(
@@ -283,6 +318,11 @@ where
                 JobStatus::Queued,
                 JobStatus::Running,
             )?;
+            tracing::info!(
+                job_id = %job.job_id,
+                branch = %job.branch,
+                "prompt job started"
+            );
         }
 
         if matches!(job.status, JobStatus::Running) {
@@ -295,7 +335,14 @@ where
             run_result?;
         }
 
-        self.job_head(&job)
+        let head = self.job_head(&job)?;
+        tracing::info!(
+            job_id = %job.job_id,
+            branch = %job.branch,
+            head = %head,
+            "prompt job drive completed"
+        );
+        Ok(head)
     }
 
     async fn resume_or_run_job(
@@ -309,6 +356,12 @@ where
         if let Some(last_node) = last_node.as_ref()
             && is_terminal_job_last_node(last_node)
         {
+            tracing::info!(
+                job_id = %job.job_id,
+                branch = %job.branch,
+                head = %last_node.id,
+                "prompt job already has terminal node"
+            );
             return Ok(());
         }
 
@@ -316,6 +369,10 @@ where
             Some(last_node) => last_node.id,
             None => job.base.clone(),
         });
+        let origin_node = match &origin {
+            CompletionOrigin::BranchHead => "<branch-head>",
+            CompletionOrigin::Reference(node_id) => node_id.as_str(),
+        };
         let input = if merge_parents.is_empty() {
             CompletionInput::Continue
         } else {
@@ -325,6 +382,13 @@ where
                 session_patch: None,
             }
         };
+        tracing::info!(
+            job_id = %job.job_id,
+            branch = %job.branch,
+            origin = %origin_node,
+            input = completion_input_kind(&input),
+            "running prompt job completion"
+        );
         let request = CompletionRequest {
             branch: job.branch.clone(),
             origin,
@@ -345,6 +409,11 @@ where
             JobStatus::Running,
             JobStatus::Finished,
         )?;
+        tracing::info!(
+            job_id = %job.job_id,
+            branch = %job.branch,
+            "prompt job finished"
+        );
         Ok(())
     }
 
@@ -380,6 +449,12 @@ where
                 && other.branch == job.branch
                 && !matches!(other.status, JobStatus::Finished)
         }) {
+            tracing::warn!(
+                branch = %job.branch,
+                active_job_id = %active_job.job_id,
+                job_id = %job.job_id,
+                "prompt job conflicts with another active job"
+            );
             return Err(EngineError::EngineFailed {
                 message: format!(
                     "branch {:?} already has conflicting active prompt jobs {:?} and {:?}",
@@ -396,6 +471,12 @@ where
         merge_parents: Vec<MergeParent>,
     ) -> InflightJob {
         let mut inflight_jobs = self.inflight_jobs.lock().await;
+        let exists = inflight_jobs.contains_key(job_id);
+        if exists {
+            tracing::debug!(job_id = %job_id, "reusing inflight prompt job");
+        } else {
+            tracing::debug!(job_id = %job_id, "starting inflight prompt job");
+        }
         inflight_jobs
             .entry(job_id.to_owned())
             .or_insert_with(|| {
@@ -406,6 +487,13 @@ where
                     .shared()
             })
             .clone()
+    }
+}
+
+fn completion_input_kind(input: &CompletionInput) -> &'static str {
+    match input {
+        CompletionInput::Continue => "continue",
+        CompletionInput::Prompt { .. } => "prompt",
     }
 }
 

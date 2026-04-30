@@ -167,6 +167,12 @@ where
     R: Read,
     S: Store + Clone + Send + Sync + 'static,
 {
+    tracing::debug!(
+        command = command_name(&cli.command),
+        store_path = %cli.store_path.display(),
+        forwarded_runtime,
+        "dispatching cli command"
+    );
     match cli.command {
         Command::Preset(command) => {
             run_preset_command(command, services.shared_store, services.provider_profiles).await
@@ -215,7 +221,19 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let scope = forwarded_runtime_scope(inputs.session_role);
+    tracing::debug!(
+        scope = forwarded_runtime_scope_name(scope),
+        arg_count = inputs.args.len(),
+        stdin_bytes = inputs.stdin.len(),
+        has_branch_env = inputs.branch_env.is_some(),
+        has_store_path_env = inputs.store_path_env.is_some(),
+        "handling forwarded runtime request"
+    );
     if contains_store_path_flag(inputs.args) {
+        tracing::warn!(
+            scope = forwarded_runtime_scope_name(scope),
+            "rejected forwarded runtime request with store path override"
+        );
         return unsupported_store_path_response();
     }
 
@@ -236,22 +254,49 @@ where
         inputs.parent_tool_use_id_env,
     );
 
-    match run_with_services(cli, &mut std::io::Cursor::new(inputs.stdin), services, true).await {
-        Ok(Some(output)) => CocoCliRuntimeResponse {
-            exit_code: 0,
-            stdout: format!("{output}\n"),
-            stderr: String::new(),
-        },
-        Ok(None) => CocoCliRuntimeResponse {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        },
-        Err(error) => CocoCliRuntimeResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: format!("{error}\n"),
-        },
+    let response =
+        match run_with_services(cli, &mut std::io::Cursor::new(inputs.stdin), services, true).await
+        {
+            Ok(Some(output)) => CocoCliRuntimeResponse {
+                exit_code: 0,
+                stdout: format!("{output}\n"),
+                stderr: String::new(),
+            },
+            Ok(None) => CocoCliRuntimeResponse {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            Err(error) => {
+                tracing::warn!(
+                    scope = forwarded_runtime_scope_name(scope),
+                    error = %error,
+                    "forwarded runtime command failed"
+                );
+                CocoCliRuntimeResponse {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: format!("{error}\n"),
+                }
+            }
+        };
+    tracing::debug!(
+        scope = forwarded_runtime_scope_name(scope),
+        exit_code = response.exit_code,
+        stdout_bytes = response.stdout.len(),
+        stderr_bytes = response.stderr.len(),
+        "forwarded runtime request completed"
+    );
+    response
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Preset(_) => "preset",
+        Command::Prompt(_) => "prompt",
+        Command::Session(_) => "session",
+        Command::Skill(_) => "skill",
+        Command::Daemon(_) => "daemon",
     }
 }
 
@@ -259,6 +304,13 @@ fn forwarded_runtime_scope(session_role: Option<SessionRole>) -> ForwardedRuntim
     match session_role {
         Some(SessionRole::Runner) => ForwardedRuntimeScope::Runner,
         Some(SessionRole::Orchestrator) | None => ForwardedRuntimeScope::Orchestrator,
+    }
+}
+
+fn forwarded_runtime_scope_name(scope: ForwardedRuntimeScope) -> &'static str {
+    match scope {
+        ForwardedRuntimeScope::Orchestrator => "orchestrator",
+        ForwardedRuntimeScope::Runner => "runner",
     }
 }
 

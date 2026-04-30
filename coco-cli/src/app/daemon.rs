@@ -162,6 +162,7 @@ where
     let listener = UnixListener::bind(socket_path).context(BindDaemonSocketSnafu {
         path: socket_path.to_path_buf(),
     })?;
+    tracing::info!(socket_path = %socket_path.display(), "daemon socket bound");
     let socket_path = socket_path.to_path_buf();
     let shared_store = shared_store.clone();
     let llm = llm.clone();
@@ -188,8 +189,12 @@ where
     let socket_task = tokio::spawn(async move {
         loop {
             let accepted = listener.accept().await;
-            let Ok((mut stream, _)) = accepted else {
-                break;
+            let (mut stream, _) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(error = %error, "daemon socket accept failed");
+                    break;
+                }
             };
             let shared_store = shared_store.clone();
             let llm = llm.clone();
@@ -205,7 +210,20 @@ where
                 )
                 .await;
                 let payload = encode_runtime_response(&response);
-                let _ = stream.write_all(&payload).await;
+                if let Err(error) = stream.write_all(&payload).await {
+                    tracing::warn!(
+                        error = %error,
+                        exit_code = response.exit_code,
+                        "failed to write daemon client response"
+                    );
+                } else {
+                    tracing::debug!(
+                        exit_code = response.exit_code,
+                        stdout_bytes = response.stdout.len(),
+                        stderr_bytes = response.stderr.len(),
+                        "handled daemon client request"
+                    );
+                }
             });
         }
     });
@@ -235,6 +253,12 @@ where
     };
 
     let token = resolve_channel_secret("telegram", &config.token)?;
+    tracing::info!(
+        branch = %config.branch,
+        poll_timeout_secs = config.poll_timeout_secs,
+        allowed_chat_count = config.allowed_chat_ids.len(),
+        "starting telegram channel"
+    );
     let channel = TelegramChannel::from_config(coco_channel::telegram::TelegramChannelConfig {
         token,
         poll_timeout_secs: config.poll_timeout_secs,
@@ -380,6 +404,13 @@ where
     match stream.read_to_end(&mut input).await {
         Ok(_) => match serde_json::from_slice::<CocoCliRuntimeRequest>(&input) {
             Ok(request) => {
+                tracing::debug!(
+                    arg_count = request.args.len(),
+                    stdin_bytes = request.stdin.len(),
+                    session_role = ?request.session_role,
+                    has_branch_env = request.branch_env.is_some(),
+                    "received daemon client request"
+                );
                 run_forwarded_with_services(
                     ForwardedRuntimeInputs {
                         args: &request.args,
@@ -399,13 +430,21 @@ where
                 .await
             }
             Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    request_bytes = input.len(),
+                    "invalid daemon client request"
+                );
                 runtime_error_response(2, format!("invalid coco-cli daemon request: {error}"))
             }
         },
-        Err(error) => runtime_error_response(
-            2,
-            format!("failed to read coco-cli daemon request: {error}"),
-        ),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to read daemon client request");
+            runtime_error_response(
+                2,
+                format!("failed to read coco-cli daemon request: {error}"),
+            )
+        }
     }
 }
 

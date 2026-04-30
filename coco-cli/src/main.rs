@@ -32,7 +32,13 @@ async fn main() {
     }
     match resolve_forwarding_target(&args[1..]) {
         Ok(Some(ForwardingTarget::RuntimeSocket { socket_path })) => {
+            tracing::debug!(
+                socket_path = %socket_path,
+                arg_count = args.len().saturating_sub(1),
+                "forwarding cli command to runtime socket"
+            );
             if let Err(error) = forward_to_socket(&socket_path, &args[1..]).await {
+                tracing::warn!(socket_path = %socket_path, error = %error, "runtime socket forwarding failed");
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -42,10 +48,22 @@ async fn main() {
             forwarded_args,
             source,
         })) => {
+            tracing::debug!(
+                socket_path = %socket_path,
+                arg_count = forwarded_args.len(),
+                source = ?source,
+                "forwarding cli command to daemon socket"
+            );
             if let Err(error) = forward_to_socket(&socket_path, &forwarded_args).await {
                 if should_fallback_to_local(source, &error) {
+                    tracing::info!(
+                        socket_path = %socket_path,
+                        error = %error,
+                        "daemon socket unavailable; falling back to local execution"
+                    );
                     let _ = std::fs::remove_file(&socket_path);
                 } else {
+                    tracing::warn!(socket_path = %socket_path, error = %error, "daemon socket forwarding failed");
                     eprintln!("{error}");
                     std::process::exit(1);
                 }
@@ -53,6 +71,7 @@ async fn main() {
         }
         Ok(None) => {}
         Err(error) => {
+            tracing::warn!(error = %error, "failed to resolve cli forwarding target");
             eprintln!("{error}");
             std::process::exit(1);
         }
@@ -64,6 +83,7 @@ async fn main() {
         Ok(Some(output)) => println!("{output}"),
         Ok(None) => {}
         Err(error) => {
+            tracing::warn!(error = %error, "cli command failed");
             eprintln!("{error}");
             std::process::exit(1);
         }
