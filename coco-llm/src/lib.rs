@@ -148,6 +148,7 @@ pub struct PromptRequest {
     pub branch: String,
     pub prompt: String,
     pub merge_parents: Vec<MergeParent>,
+    pub session_patch: Option<SessionConfigPatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,13 +196,14 @@ pub enum CompletionOrigin {
     Reference(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum CompletionInput {
     #[default]
     Continue,
     Prompt {
         text: String,
         merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionConfigPatch>,
     },
 }
 
@@ -1094,6 +1096,7 @@ where
             input: CompletionInput::Prompt {
                 text: request.prompt,
                 merge_parents: request.merge_parents,
+                session_patch: request.session_patch,
             },
             overrides: CompletionOverrides::default(),
         })
@@ -1119,7 +1122,13 @@ where
             CompletionInput::Prompt {
                 text,
                 merge_parents,
-            } => self.append_prompt_anchor_to_parent(&reference_id, text, merge_parents)?,
+                session_patch,
+            } => self.append_prompt_anchor_to_parent_with_session_patch(
+                &reference_id,
+                text,
+                merge_parents,
+                session_patch.as_ref(),
+            )?,
         };
         let session = self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
         let trace_node_appender = TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
@@ -1294,6 +1303,27 @@ fn resolve_session_model(anchor: &SessionAnchor, config: Option<&ProviderRuntime
 
 impl<B, S> LlmService<B, S>
 where
+    S: NodeStore + BranchStore + RuntimeStore,
+{
+    pub fn append_prompt_job_base(
+        &self,
+        branch: &str,
+        prompt: &str,
+        merge_parents: &[MergeParent],
+        session_patch: Option<&SessionConfigPatch>,
+    ) -> Result<String> {
+        let parent_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        self.append_prompt_anchor_to_parent_with_session_patch(
+            &parent_id,
+            prompt,
+            merge_parents,
+            session_patch,
+        )
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
     S: NodeStore + BranchStore,
 {
     fn append_prompt_anchor_to_branch(
@@ -1310,6 +1340,38 @@ where
             .context(MemorySnafu)?;
 
         Ok(anchor_id)
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
+    S: NodeStore + RuntimeStore,
+{
+    fn append_prompt_anchor_to_parent_with_session_patch(
+        &self,
+        parent_id: &str,
+        prompt: &str,
+        merge_parents: &[MergeParent],
+        session_patch: Option<&SessionConfigPatch>,
+    ) -> Result<String> {
+        let prompt_parent_id = match session_patch {
+            Some(patch) => {
+                let context = self.resolve_context(parent_id)?;
+                self.store
+                    .append(NewNode {
+                        parent: parent_id.to_owned(),
+                        role: Role::System,
+                        metadata: None,
+                        kind: Kind::Anchor(Anchor::session(
+                            vec![],
+                            context.session_anchor.apply_patch(patch),
+                        )),
+                    })
+                    .context(MemorySnafu)?
+            }
+            None => parent_id.to_owned(),
+        };
+        self.append_prompt_anchor_to_parent(&prompt_parent_id, prompt, merge_parents)
     }
 }
 
@@ -3306,6 +3368,7 @@ mod tests {
             branch: branch.to_owned(),
             prompt: prompt.to_owned(),
             merge_parents: vec![],
+            session_patch: None,
         }
     }
 
@@ -3782,6 +3845,7 @@ mod tests {
                 branch: "main".to_owned(),
                 prompt: "merge them".to_owned(),
                 merge_parents: vec![MergeParent::merge(draft_head)],
+                session_patch: None,
             })
             .await
             .unwrap();
@@ -3826,6 +3890,59 @@ mod tests {
             &ancestry[1].kind,
             Kind::Anchor(anchor) if matches!(anchor.payload, AnchorPayload::Prompt(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn prompt_with_session_patch_appends_session_anchor_without_rewriting_base() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[("runner", &[Ok("runner answer")])]);
+        let calls = backend.calls.clone();
+        let service = LlmService::new(store.clone(), backend);
+        let main_session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        service.fork("runner", &main_session.anchor_id).unwrap();
+        let bash_tool = builtin_tool_definition("bash").unwrap();
+
+        let result = service
+            .prompt(PromptRequest {
+                branch: "runner".to_owned(),
+                prompt: "run date".to_owned(),
+                merge_parents: vec![],
+                session_patch: Some(SessionConfigPatch {
+                    role: Some(SessionRole::Runner),
+                    tools: Some(vec![bash_tool.clone()]),
+                    ..SessionConfigPatch::default()
+                }),
+            })
+            .await
+            .unwrap();
+
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.config.role, SessionRole::Runner);
+        assert_eq!(calls[0].0.config.tools, vec![bash_tool.clone()]);
+        drop(calls);
+
+        let ancestry = store.ancestry("runner").unwrap();
+        assert!(matches!(
+            &ancestry[0].kind,
+            Kind::Text(text) if text == "runner answer"
+        ));
+        assert_eq!(ancestry[1].id, result.anchor_id);
+        assert!(matches!(
+            &ancestry[1].kind,
+            Kind::Anchor(anchor) if matches!(anchor.payload, AnchorPayload::Prompt(_))
+        ));
+        let Kind::Anchor(anchor) = &ancestry[2].kind else {
+            panic!("expected patched session anchor");
+        };
+        let session = anchor.as_session().expect("expected session anchor");
+        assert_eq!(session.role, SessionRole::Runner);
+        assert_eq!(session.tools, vec![bash_tool]);
+        assert_eq!(ancestry[2].parent, main_session.anchor_id);
+        assert_eq!(ancestry[3].id, main_session.anchor_id);
     }
 
     #[tokio::test]
@@ -4012,6 +4129,7 @@ mod tests {
                 input: CompletionInput::Prompt {
                     text: "resume from base".to_owned(),
                     merge_parents: vec![],
+                    session_patch: None,
                 },
                 overrides: CompletionOverrides::default(),
             })

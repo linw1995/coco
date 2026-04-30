@@ -1,12 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
 use coco_llm::coco_mem::{
-    Anchor, BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, NewNode, Node,
-    NodeStore, PromptAnchor, Role, RuntimeStore, SessionStore,
+    BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, Node, NodeStore,
+    RuntimeStore, SessionStore,
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
-    LlmService, RigBackend,
+    LlmService, RigBackend, SessionConfigPatch,
 };
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jiff::Timestamp;
@@ -99,8 +99,19 @@ where
         prompt: &str,
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<String, EngineError> {
+        self.reply_with_session_patch(branch, prompt, merge_parents, None)
+            .await
+    }
+
+    pub async fn reply_with_session_patch(
+        &self,
+        branch: &str,
+        prompt: &str,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionConfigPatch>,
+    ) -> std::result::Result<String, EngineError> {
         Ok(self
-            .run_prompt_job(branch, prompt, merge_parents)
+            .run_prompt_job(branch, prompt, merge_parents, session_patch)
             .await?
             .text)
     }
@@ -124,7 +135,7 @@ where
                     .expect("batch prompt semaphore should stay open");
                 let branch = item.branch;
                 match engine
-                    .run_prompt_job(&branch, &item.prompt, item.merge_parents)
+                    .run_prompt_job(&branch, &item.prompt, item.merge_parents, None)
                     .await
                 {
                     Ok(result) => (
@@ -162,8 +173,11 @@ where
         branch: &str,
         prompt: &str,
         merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<PromptReply, EngineError> {
-        let job = self.submit_job(branch, prompt, merge_parents).await?;
+        let job = self
+            .submit_job_with_session_patch(branch, prompt, merge_parents, session_patch)
+            .await?;
         let snapshot = self.drive_job_for_prompt(&job.job_id).await?;
         let job = self.service.store().get_job(&job.job_id)?;
         build_prompt_reply(self.service.store(), &job, &snapshot)
@@ -175,19 +189,23 @@ where
         prompt: &str,
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<Job, EngineError> {
-        let base = self.service.store().get_branch_head(branch)?;
-        let merge_parent_ids = normalize_merge_parents(merge_parents, &base);
-        let base = self.service.store().append(NewNode {
-            parent: base,
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::prompt(
-                merge_parent_ids,
-                PromptAnchor {
-                    prompt: prompt.to_owned(),
-                },
-            )),
-        })?;
+        self.submit_job_with_session_patch(branch, prompt, merge_parents, None)
+            .await
+    }
+
+    pub async fn submit_job_with_session_patch(
+        &self,
+        branch: &str,
+        prompt: &str,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionConfigPatch>,
+    ) -> std::result::Result<Job, EngineError> {
+        let base = self.service.append_prompt_job_base(
+            branch,
+            prompt,
+            &merge_parents,
+            session_patch.as_ref(),
+        )?;
         Ok(self.service.store().submit_job(branch, &base)?)
     }
 
@@ -304,6 +322,7 @@ where
             CompletionInput::Prompt {
                 text: String::new(),
                 merge_parents,
+                session_patch: None,
             }
         };
         let request = CompletionRequest {
@@ -444,22 +463,4 @@ where
             ),
         }),
     }
-}
-
-fn normalize_merge_parents(
-    merge_parents: Vec<MergeParent>,
-    primary_parent: &str,
-) -> Vec<MergeParent> {
-    let mut normalized = Vec::new();
-    for merge_parent in merge_parents {
-        let node_id = merge_parent.node_id();
-        if node_id != primary_parent
-            && !normalized
-                .iter()
-                .any(|parent: &MergeParent| parent.node_id() == node_id)
-        {
-            normalized.push(merge_parent);
-        }
-    }
-    normalized
 }

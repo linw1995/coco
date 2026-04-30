@@ -11,7 +11,7 @@ use coco_llm::coco_mem::{
 };
 use coco_llm::{
     BackendError, BackendEventPayload, BackendTurn, CompletionBackend, CompletionMessage,
-    LlmService, Provider, SessionConfig, StepContext,
+    LlmService, Provider, SessionConfig, SessionConfigPatch, StepContext, builtin_tool_definition,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
@@ -361,6 +361,46 @@ async fn llm_engine_calls_prompt_and_returns_text() {
     assert_eq!(job.status, JobStatus::Finished);
     assert_eq!(job.finished_at, persisted_job.finished_at);
     assert!(job.finished_at.is_some());
+}
+
+#[tokio::test]
+async fn llm_engine_prompt_session_patch_appends_session_anchor() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[("runner", &[Ok("runner done")])]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let main_session = llm.create_session(session_config("main")).await.unwrap();
+    llm.fork("runner", &main_session.anchor_id).unwrap();
+    let bash_tool = builtin_tool_definition("bash").unwrap();
+    let engine = ConversationEngine::new(llm);
+
+    let response = engine
+        .reply_with_session_patch(
+            "runner",
+            "run date",
+            vec![],
+            Some(SessionConfigPatch {
+                role: Some(SessionRole::Runner),
+                tools: Some(vec![bash_tool.clone()]),
+                ..SessionConfigPatch::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "runner done");
+    let ancestry = store.ancestry("runner").unwrap();
+    assert!(matches!(
+        &ancestry[0].kind,
+        Kind::Text(text) if text == "runner done"
+    ));
+    assert!(matches!(&ancestry[1].kind, Kind::Anchor(anchor) if anchor.as_prompt().is_some()));
+    let Kind::Anchor(anchor) = &ancestry[2].kind else {
+        panic!("expected patched session anchor");
+    };
+    let session = anchor.as_session().expect("expected session anchor");
+    assert_eq!(session.role, SessionRole::Runner);
+    assert_eq!(session.tools, vec![bash_tool]);
+    assert_eq!(ancestry[2].parent, main_session.anchor_id);
 }
 
 #[tokio::test]
