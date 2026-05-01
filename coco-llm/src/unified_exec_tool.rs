@@ -819,7 +819,11 @@ fn allow_paths_for_linked_library(library_path: &Path) -> Vec<PathBuf> {
         return vec![package_path];
     }
 
-    vec![library_path.to_path_buf()]
+    if library_path.exists() {
+        return vec![library_path.to_path_buf()];
+    }
+
+    Vec::new()
 }
 
 fn linked_library_allow_paths(binary_path: &Path) -> Vec<PathBuf> {
@@ -2473,6 +2477,10 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
 
     #[test]
     fn allow_paths_for_linked_library_prefers_nix_package_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let library_path = temp_dir.path().join("libexample.dylib");
+        std::fs::write(&library_path, "").unwrap();
+
         assert_eq!(
             allow_paths_for_linked_library(Path::new(
                 "/nix/store/example-jemalloc/lib/libjemalloc.2.dylib"
@@ -2480,8 +2488,12 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
             vec![PathBuf::from("/nix/store/example-jemalloc")]
         );
         assert_eq!(
+            allow_paths_for_linked_library(&library_path),
+            vec![library_path]
+        );
+        assert_eq!(
             allow_paths_for_linked_library(Path::new("/usr/lib/libSystem.B.dylib")),
-            vec![PathBuf::from("/usr/lib/libSystem.B.dylib")]
+            Vec::<PathBuf>::new()
         );
     }
 
