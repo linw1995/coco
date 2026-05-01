@@ -1,7 +1,7 @@
 # CoCo Runner Workflow
 
-Use the injected `coco` command through `bash` for runner-safe inspection.
-Default output is human-readable; use `--json` for scripts.
+Use the injected `coco` command through `exec_command` for runner-safe
+inspection. Default output is human-readable; use `--json` for scripts.
 
 Useful commands:
 

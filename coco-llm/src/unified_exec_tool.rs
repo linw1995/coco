@@ -1,14 +1,18 @@
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use coco_mem::Tool;
 use serde_json::Value;
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::process::Command;
+use tokio::process::{ChildStdin, Command};
+use tokio::sync::{Mutex, Notify};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -20,38 +24,106 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub(crate) struct BashToolRuntime {
+pub(crate) struct UnifiedExecToolRuntime {
     definition: Tool,
     workspace_root: PathBuf,
     context: ToolRuntimeEnv,
+    kind: UnifiedExecToolKind,
+    sessions: UnifiedExecSessionStoreHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BashSandboxMode {
+pub(crate) enum UnifiedExecToolKind {
+    ExecCommand,
+    WriteStdin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecSandboxMode {
     Auto,
     Nono,
     Off,
 }
 
 #[derive(Debug, Clone)]
-struct BashCommandRequest {
-    command: String,
+struct ExecCommandRequest {
+    cmd: String,
     workdir: PathBuf,
     workspace_root: PathBuf,
-    sandbox_mode: BashSandboxMode,
-    timeout_ms: Option<u64>,
+    sandbox_mode: ExecSandboxMode,
+    shell: OsString,
+    yield_time_ms: u64,
+    max_output_tokens: Option<u64>,
     context: ToolRuntimeEnv,
     parent_tool_use_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WriteStdinRequest {
+    session_id: u64,
+    chars: String,
+    yield_time_ms: u64,
+    max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug)]
 struct CocoCliRuntimeServer {
     socket_dir: PathBuf,
     socket_path: PathBuf,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct UnifiedExecSessionStoreHandle {
+    inner: Arc<Mutex<UnifiedExecSessionStore>>,
+}
+
+impl Clone for UnifiedExecSessionStoreHandle {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct UnifiedExecSessionStore {
+    next_session_id: u64,
+    sessions: HashMap<u64, UnifiedExecSession>,
+}
+
+#[derive(Debug)]
+struct UnifiedExecSession {
+    stdin: Option<ChildStdin>,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout_cursor: usize,
+    stderr_cursor: usize,
+    notify: Arc<Notify>,
+    wait_task: Option<tokio::task::JoinHandle<io::Result<std::process::ExitStatus>>>,
+    stdout_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    stderr_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    runtime_server: Option<CocoCliRuntimeServer>,
+    _coco_command: Option<CocoCommandPathInjection>,
+}
+
+impl Drop for UnifiedExecSession {
+    fn drop(&mut self) {
+        if let Some(wait_task) = &self.wait_task {
+            wait_task.abort();
+        }
+        if let Some(stdout_task) = &self.stdout_task {
+            stdout_task.abort();
+        }
+        if let Some(stderr_task) = &self.stderr_task {
+            stderr_task.abort();
+        }
+    }
 }
 
 const MAX_RUNTIME_SOCKET_PATH_LEN: usize = 107;
+const DEFAULT_YIELD_TIME_MS: u64 = 1_000;
+const SESSION_POLL_INTERVAL_MS: u64 = 25;
 const COCO_DAEMON_SOCKET_ENV: &str = "COCO_DAEMON_SOCKET";
 
 #[cfg(unix)]
@@ -61,7 +133,7 @@ const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
 const NONO_DEFAULT_ALLOW_FILES: &[&str] = &[];
 
 #[derive(Debug, Snafu)]
-pub enum BashToolError {
+pub enum UnifiedExecToolError {
     #[snafu(display("failed to resolve workspace root: {source}"))]
     ResolveWorkspaceRoot { source: io::Error },
 
@@ -75,69 +147,89 @@ pub enum BashToolError {
     ResolveCurrentExe { source: io::Error },
 
     #[snafu(display(
-        "bash tool sandbox mode must be one of \"auto\", \"nono\", or \"off\", got {value:?}"
+        "unified exec tool sandbox mode must be one of \"auto\", \"nono\", or \"off\", got {value:?}"
     ))]
     InvalidSandboxMode { value: String },
 
-    #[snafu(display("bash tool workspace override could not resolve: {source}"))]
+    #[snafu(display("unified exec tool workspace override could not resolve: {source}"))]
     ResolveWorkspaceOverride { source: io::Error },
 
-    #[snafu(display("bash tool workspace override must point to an existing directory"))]
+    #[snafu(display("unified exec tool workspace override must point to an existing directory"))]
     InvalidWorkspaceOverride,
 
-    #[snafu(display("bash tool runtime root must stay isolated from the configured workspace"))]
+    #[snafu(display(
+        "unified exec tool runtime root must stay isolated from the configured workspace"
+    ))]
     RuntimeRootOverlapsWorkspace,
 
-    #[snafu(display("bash tool expects a JSON object input"))]
+    #[snafu(display("unified exec tool expects a JSON object input"))]
     InvalidInputType,
 
-    #[snafu(display("bash tool requires a string field `command`"))]
+    #[snafu(display("exec_command requires a string field `cmd`"))]
     MissingCommand,
 
-    #[snafu(display("bash tool could not resolve workdir: {source}"))]
+    #[snafu(display("write_stdin requires an integer field `session_id`"))]
+    MissingSessionId,
+
+    #[snafu(display("unified exec tool input includes unsupported field `{field}`"))]
+    UnsupportedInputField { field: String },
+
+    #[snafu(display("unified exec tool session {session_id:?} was not found"))]
+    SessionNotFound { session_id: u64 },
+
+    #[snafu(display("unified exec tool could not resolve workdir: {source}"))]
     ResolveWorkdir { source: io::Error },
 
-    #[snafu(display("bash tool workdir must point to an existing directory"))]
+    #[snafu(display("unified exec tool workdir must point to an existing directory"))]
     InvalidWorkdir,
 
-    #[snafu(display("bash tool workdir must stay within the configured workspace"))]
+    #[snafu(display("unified exec tool workdir must stay within the configured workspace"))]
     WorkdirOutsideWorkspace,
 
-    #[snafu(display("bash tool arguments must be valid JSON: {source}"))]
+    #[snafu(display("unified exec tool arguments must be valid JSON: {source}"))]
     ParseArgs { source: serde_json::Error },
 
-    #[snafu(display("bash tool could not locate `nono` in PATH"))]
+    #[snafu(display("unified exec tool could not locate `nono` in PATH"))]
     NonoNotFound,
 
-    #[snafu(display("bash tool could not spawn process: {source}"))]
+    #[snafu(display("unified exec tool could not spawn process: {source}"))]
     SpawnProcess { source: io::Error },
 
-    #[snafu(display("bash tool could not wait for process: {source}"))]
+    #[snafu(display("unified exec tool could not wait for process: {source}"))]
     WaitProcess { source: io::Error },
 
-    #[snafu(display("bash tool could not join stdout task: {source}"))]
+    #[snafu(display("unified exec tool process wait task failed: {source}"))]
+    JoinProcess { source: tokio::task::JoinError },
+
+    #[snafu(display("unified exec tool could not join stdout task: {source}"))]
     JoinStdout { source: tokio::task::JoinError },
 
-    #[snafu(display("bash tool could not join stderr task: {source}"))]
+    #[snafu(display("unified exec tool could not join stderr task: {source}"))]
     JoinStderr { source: tokio::task::JoinError },
 
-    #[snafu(display("bash tool could not read stdout: {source}"))]
+    #[snafu(display("unified exec tool could not read stdout: {source}"))]
     ReadStdout { source: io::Error },
 
-    #[snafu(display("bash tool could not read stderr: {source}"))]
+    #[snafu(display("unified exec tool could not read stderr: {source}"))]
     ReadStderr { source: io::Error },
 
-    #[snafu(display("bash tool could not bind coco-cli runtime socket: {source}"))]
+    #[snafu(display("unified exec tool session stdin is closed"))]
+    StdinClosed,
+
+    #[snafu(display("unified exec tool could not write to session stdin: {source}"))]
+    WriteStdin { source: io::Error },
+
+    #[snafu(display("unified exec tool could not bind coco-cli runtime socket: {source}"))]
     BindRuntimeSocket { source: io::Error },
 
-    #[snafu(display("bash tool could not create coco command shim directory: {source}"))]
+    #[snafu(display("unified exec tool could not create coco command shim directory: {source}"))]
     CreateCocoCommandShimDir { source: io::Error },
 
-    #[snafu(display("bash tool could not create coco command shim at {path:?}: {source}"))]
+    #[snafu(display("unified exec tool could not create coco command shim at {path:?}: {source}"))]
     CreateCocoCommandShim { path: PathBuf, source: io::Error },
 
     #[snafu(display(
-        "bash tool runtime socket path is too long for a Unix socket: {path:?} ({length} bytes, max {max})"
+        "unified exec tool runtime socket path is too long for a Unix socket: {path:?} ({length} bytes, max {max})"
     ))]
     RuntimeSocketPathTooLong {
         path: PathBuf,
@@ -145,11 +237,11 @@ pub enum BashToolError {
         max: usize,
     },
 
-    #[snafu(display("bash tool runtime socket server task failed: {source}"))]
+    #[snafu(display("unified exec tool runtime socket server task failed: {source}"))]
     JoinRuntimeSocketTask { source: tokio::task::JoinError },
 }
 
-pub fn resolve_workspace_root() -> std::result::Result<PathBuf, BashToolError> {
+pub fn resolve_workspace_root() -> std::result::Result<PathBuf, UnifiedExecToolError> {
     let current_dir = std::env::current_dir().context(ResolveWorkspaceRootSnafu)?;
     let workspace_raw = std::env::var_os("COCO_BASH_WORKSPACE");
     let path = match workspace_raw {
@@ -178,17 +270,40 @@ pub fn resolve_workspace_root() -> std::result::Result<PathBuf, BashToolError> {
     Ok(path)
 }
 
-pub(crate) fn runtime(
+#[cfg(test)]
+fn runtime(
     definition: Tool,
     workspace_root: PathBuf,
     context: ToolRuntimeEnv,
-) -> BashToolRuntime {
-    let workspace_root = canonicalize_existing_path(&workspace_root);
-    BashToolRuntime {
+) -> UnifiedExecToolRuntime {
+    runtime_with_sessions(
         definition,
         workspace_root,
         context,
+        UnifiedExecToolKind::ExecCommand,
+        UnifiedExecSessionStoreHandle::default(),
+    )
+}
+
+pub(crate) fn runtime_with_sessions(
+    definition: Tool,
+    workspace_root: PathBuf,
+    context: ToolRuntimeEnv,
+    kind: UnifiedExecToolKind,
+    sessions: UnifiedExecSessionStoreHandle,
+) -> UnifiedExecToolRuntime {
+    let workspace_root = canonicalize_existing_path(&workspace_root);
+    UnifiedExecToolRuntime {
+        definition,
+        workspace_root,
+        context,
+        kind,
+        sessions,
     }
+}
+
+pub(crate) fn session_store() -> UnifiedExecSessionStoreHandle {
+    UnifiedExecSessionStoreHandle::default()
 }
 
 #[cfg(test)]
@@ -200,14 +315,14 @@ pub fn runtime_tool(
     Box::new(runtime(definition, workspace_root, context))
 }
 
-fn resolve_sandbox_mode() -> std::result::Result<BashSandboxMode, BashToolError> {
+fn resolve_sandbox_mode() -> std::result::Result<ExecSandboxMode, UnifiedExecToolError> {
     let Some(value) = std::env::var_os("COCO_BASH_SANDBOX") else {
-        return Ok(BashSandboxMode::Auto);
+        return Ok(ExecSandboxMode::Auto);
     };
     match value.to_string_lossy().as_ref() {
-        "auto" => Ok(BashSandboxMode::Auto),
-        "nono" => Ok(BashSandboxMode::Nono),
-        "off" => Ok(BashSandboxMode::Off),
+        "auto" => Ok(ExecSandboxMode::Auto),
+        "nono" => Ok(ExecSandboxMode::Nono),
+        "off" => Ok(ExecSandboxMode::Off),
         other => InvalidSandboxModeSnafu {
             value: other.to_owned(),
         }
@@ -227,7 +342,15 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn resolve_runtime_root(workspace_root: &Path) -> std::result::Result<PathBuf, BashToolError> {
+fn default_shell() -> OsString {
+    std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| OsString::from("bash"))
+}
+
+fn resolve_runtime_root(
+    workspace_root: &Path,
+) -> std::result::Result<PathBuf, UnifiedExecToolError> {
     let current_dir = std::env::current_dir().context(ResolveRuntimeRootSnafu)?;
     let runtime_root = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(path) => {
@@ -251,19 +374,38 @@ fn resolve_runtime_root(workspace_root: &Path) -> std::result::Result<PathBuf, B
     Ok(runtime_root)
 }
 
-fn resolve_bash_request(
+fn resolve_exec_command_request(
     args: &Value,
     workspace_root: &Path,
     context: ToolRuntimeEnv,
-) -> std::result::Result<BashCommandRequest, BashToolError> {
+) -> std::result::Result<ExecCommandRequest, UnifiedExecToolError> {
     let workspace_root = canonicalize_existing_path(workspace_root);
+    validate_tool_input_fields(
+        args,
+        &[
+            "cmd",
+            "workdir",
+            "shell",
+            "yield_time_ms",
+            "max_output_tokens",
+        ],
+    )?;
     let object = args.as_object().context(InvalidInputTypeSnafu)?;
-    let command = object
-        .get("command")
+    let cmd = object
+        .get("cmd")
         .and_then(Value::as_str)
         .context(MissingCommandSnafu)?;
+    let shell = object
+        .get("shell")
+        .and_then(Value::as_str)
+        .map(OsString::from)
+        .unwrap_or_else(default_shell);
 
-    let timeout_ms = object.get("timeout_ms").and_then(Value::as_u64);
+    let yield_time_ms = object
+        .get("yield_time_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_YIELD_TIME_MS);
+    let max_output_tokens = object.get("max_output_tokens").and_then(Value::as_u64);
 
     let workdir_raw = object.get("workdir").and_then(Value::as_str).unwrap_or(".");
     let workdir_candidate = Path::new(workdir_raw);
@@ -280,45 +422,94 @@ fn resolve_bash_request(
         return WorkdirOutsideWorkspaceSnafu.fail();
     }
 
-    Ok(BashCommandRequest {
-        command: command.to_owned(),
+    Ok(ExecCommandRequest {
+        cmd: cmd.to_owned(),
         workdir,
         workspace_root,
         sandbox_mode: resolve_sandbox_mode()?,
-        timeout_ms,
+        shell,
+        yield_time_ms,
+        max_output_tokens,
         context,
         parent_tool_use_id: None,
     })
 }
 
-async fn read_child_pipe<R>(reader: Option<R>) -> io::Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let Some(mut reader) = reader else {
-        return Ok(Vec::new());
-    };
-    let mut output = Vec::new();
-    reader.read_to_end(&mut output).await?;
-    Ok(output)
+fn validate_tool_input_fields(
+    args: &Value,
+    allowed_fields: &[&str],
+) -> std::result::Result<(), UnifiedExecToolError> {
+    let object = args.as_object().context(InvalidInputTypeSnafu)?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed_fields.contains(&field.as_str()))
+    {
+        return UnsupportedInputFieldSnafu {
+            field: field.clone(),
+        }
+        .fail();
+    }
+    Ok(())
 }
 
-fn format_bash_result(
+fn resolve_write_stdin_request(
+    args: &Value,
+) -> std::result::Result<WriteStdinRequest, UnifiedExecToolError> {
+    validate_tool_input_fields(
+        args,
+        &["session_id", "chars", "yield_time_ms", "max_output_tokens"],
+    )?;
+    let object = args.as_object().context(InvalidInputTypeSnafu)?;
+    let session_id = object
+        .get("session_id")
+        .and_then(Value::as_u64)
+        .context(MissingSessionIdSnafu)?;
+    let chars = object
+        .get("chars")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let yield_time_ms = object
+        .get("yield_time_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_YIELD_TIME_MS);
+    let max_output_tokens = object.get("max_output_tokens").and_then(Value::as_u64);
+
+    Ok(WriteStdinRequest {
+        session_id,
+        chars: chars.to_owned(),
+        yield_time_ms,
+        max_output_tokens,
+    })
+}
+
+fn format_exec_result(
+    session_id: Option<&str>,
     exit_status: Option<i32>,
     stdout: String,
     stderr: String,
-    timed_out: bool,
+    running: bool,
 ) -> String {
-    let status = match (timed_out, exit_status) {
-        (true, _) => "timed_out".to_owned(),
+    let status = match (running, exit_status) {
+        (true, _) => "running".to_owned(),
         (false, Some(code)) => code.to_string(),
         (false, None) => "terminated_by_signal".to_owned(),
     };
-    format!(
+    let mut output = String::new();
+    match (running, session_id) {
+        (true, Some(session_id)) => {
+            output.push_str(&format!("Process running with session ID {session_id}\n"));
+            output.push_str(&format!("session_id: {session_id}\n"));
+        }
+        (false, _) => match exit_status {
+            Some(code) => output.push_str(&format!("Process exited with code {code}\n")),
+            None => output.push_str("Process terminated by signal\n"),
+        },
+        (true, None) => output.push_str("Process running\n"),
+    }
+    output.push_str(&format!(
         "exit_status: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        stdout = stdout,
-        stderr = stderr,
-    )
+    ));
+    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,10 +555,14 @@ fn find_program_in_path(name: &str, path_env: Option<&OsStr>) -> Option<PathBuf>
     None
 }
 
-fn bash_execution_spec(command: &str) -> ExecutionSpec {
+fn shell_execution_args(command: &str) -> Vec<OsString> {
+    vec![OsString::from("-c"), OsString::from(command.to_owned())]
+}
+
+fn shell_execution_spec(request: &ExecCommandRequest) -> ExecutionSpec {
     ExecutionSpec {
-        program: PathBuf::from("bash"),
-        args: vec![OsString::from("-lc"), OsString::from(command.to_owned())],
+        program: PathBuf::from(&request.shell),
+        args: shell_execution_args(&request.cmd),
     }
 }
 
@@ -418,7 +613,7 @@ fn coco_cli_binary_name() -> &'static str {
     }
 }
 
-fn resolve_coco_cli_executable() -> std::result::Result<PathBuf, BashToolError> {
+fn resolve_coco_cli_executable() -> std::result::Result<PathBuf, UnifiedExecToolError> {
     let current_exe = std::env::current_exe().context(ResolveCurrentExeSnafu)?;
     let current_exe = canonicalize_existing_path(&current_exe);
     let binary_name = coco_cli_binary_name();
@@ -450,7 +645,7 @@ fn resolve_coco_cli_executable() -> std::result::Result<PathBuf, BashToolError> 
 fn prepare_coco_command_path_injection(
     workspace_root: &Path,
     mode: CocoCommandShimMode,
-) -> std::result::Result<CocoCommandPathInjection, BashToolError> {
+) -> std::result::Result<CocoCommandPathInjection, UnifiedExecToolError> {
     let runtime_root = resolve_runtime_root(workspace_root)?;
     std::fs::create_dir_all(&runtime_root).context(CreateCocoCommandShimDirSnafu)?;
 
@@ -481,7 +676,7 @@ fn prepare_coco_command_path_injection(
 
 fn nono_execution_spec(
     nono: PathBuf,
-    request: &BashCommandRequest,
+    request: &ExecCommandRequest,
     extra_allow_paths: &[PathBuf],
 ) -> ExecutionSpec {
     let mut args = vec![
@@ -498,12 +693,8 @@ fn nono_execution_spec(
         args.push(OsString::from("--allow"));
         args.push(extra_allow_path.as_os_str().to_owned());
     }
-    args.extend([
-        OsString::from("--"),
-        OsString::from("bash"),
-        OsString::from("-lc"),
-        OsString::from(request.command.to_owned()),
-    ]);
+    args.extend([OsString::from("--"), request.shell.clone()]);
+    args.extend(shell_execution_args(&request.cmd));
     ExecutionSpec {
         program: nono,
         args,
@@ -511,17 +702,17 @@ fn nono_execution_spec(
 }
 
 fn resolve_execution_spec(
-    request: &BashCommandRequest,
+    request: &ExecCommandRequest,
     path_env: Option<&OsStr>,
     extra_allow_paths: &[PathBuf],
-) -> std::result::Result<ExecutionSpec, BashToolError> {
+) -> std::result::Result<ExecutionSpec, UnifiedExecToolError> {
     match request.sandbox_mode {
-        BashSandboxMode::Off => Ok(bash_execution_spec(&request.command)),
-        BashSandboxMode::Auto => match find_program_in_path("nono", path_env) {
+        ExecSandboxMode::Off => Ok(shell_execution_spec(request)),
+        ExecSandboxMode::Auto => match find_program_in_path("nono", path_env) {
             Some(nono) => Ok(nono_execution_spec(nono, request, extra_allow_paths)),
-            None => Ok(bash_execution_spec(&request.command)),
+            None => Ok(shell_execution_spec(request)),
         },
-        BashSandboxMode::Nono => {
+        ExecSandboxMode::Nono => {
             let nono = find_program_in_path("nono", path_env).context(NonoNotFoundSnafu)?;
             Ok(nono_execution_spec(nono, request, extra_allow_paths))
         }
@@ -532,7 +723,7 @@ fn next_runtime_socket_dir(runtime_root: &Path) -> PathBuf {
     runtime_root.join(nanoid::nanoid!(6))
 }
 
-fn validate_runtime_socket_path(path: &Path) -> std::result::Result<(), BashToolError> {
+fn validate_runtime_socket_path(path: &Path) -> std::result::Result<(), UnifiedExecToolError> {
     #[cfg(unix)]
     {
         let length = path.as_os_str().as_bytes().len();
@@ -574,7 +765,7 @@ fn encode_runtime_response(response: &CocoCliRuntimeResponse) -> Vec<u8> {
 async fn start_coco_cli_runtime_server(
     workspace_root: &Path,
     context: &ToolRuntimeEnv,
-) -> std::result::Result<Option<CocoCliRuntimeServer>, BashToolError> {
+) -> std::result::Result<Option<CocoCliRuntimeServer>, UnifiedExecToolError> {
     if !context.cli_bridge.is_available() {
         return Ok(None);
     }
@@ -670,17 +861,19 @@ async fn start_coco_cli_runtime_server(
     Ok(Some(CocoCliRuntimeServer {
         socket_dir,
         socket_path,
-        task,
+        task: Some(task),
     }))
 }
 
 impl CocoCliRuntimeServer {
-    async fn shutdown(self) -> std::result::Result<(), BashToolError> {
-        self.task.abort();
-        match self.task.await {
-            Ok(()) => {}
-            Err(source) if source.is_cancelled() => {}
-            Err(source) => return Err(BashToolError::JoinRuntimeSocketTask { source }),
+    async fn shutdown(mut self) -> std::result::Result<(), UnifiedExecToolError> {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            match task.await {
+                Ok(()) => {}
+                Err(source) if source.is_cancelled() => {}
+                Err(source) => return Err(UnifiedExecToolError::JoinRuntimeSocketTask { source }),
+            }
         }
         let _ = std::fs::remove_file(&self.socket_path);
         let _ = std::fs::remove_dir(&self.socket_dir);
@@ -688,9 +881,186 @@ impl CocoCliRuntimeServer {
     }
 }
 
-async fn execute_bash_command(
-    request: BashCommandRequest,
-) -> std::result::Result<String, BashToolError> {
+impl Drop for CocoCliRuntimeServer {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_dir(&self.socket_dir);
+    }
+}
+
+async fn stream_child_pipe<R>(
+    reader: Option<R>,
+    output: Arc<Mutex<Vec<u8>>>,
+    notify: Arc<Notify>,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return Ok(());
+    };
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            notify.notify_waiters();
+            return Ok(());
+        }
+        output.lock().await.extend_from_slice(&buffer[..read]);
+        notify.notify_waiters();
+    }
+}
+
+fn output_text_since(buffer: &[u8], cursor: &mut usize) -> String {
+    let start = (*cursor).min(buffer.len());
+    *cursor = buffer.len();
+    String::from_utf8_lossy(&buffer[start..]).into_owned()
+}
+
+fn limit_output_text(output: String, max_output_tokens: Option<u64>) -> String {
+    let Some(max_output_tokens) = max_output_tokens else {
+        return output;
+    };
+    let max_bytes = max_output_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
+    if max_bytes == 0 || output.len() <= max_bytes {
+        return output;
+    }
+
+    let mut start = output.len() - max_bytes;
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[output truncated: showing last {} bytes]\n{}",
+        output.len() - start,
+        &output[start..]
+    )
+}
+
+async fn read_session_output(
+    session: &mut UnifiedExecSession,
+    max_output_tokens: Option<u64>,
+) -> (String, String) {
+    let stdout_guard = session.stdout.lock().await;
+    let stdout = output_text_since(&stdout_guard, &mut session.stdout_cursor);
+    drop(stdout_guard);
+
+    let stderr_guard = session.stderr.lock().await;
+    let stderr = output_text_since(&stderr_guard, &mut session.stderr_cursor);
+    drop(stderr_guard);
+
+    (
+        limit_output_text(stdout, max_output_tokens),
+        limit_output_text(stderr, max_output_tokens),
+    )
+}
+
+async fn finish_bash_session(
+    session_id: u64,
+    mut session: UnifiedExecSession,
+    max_output_tokens: Option<u64>,
+) -> std::result::Result<String, UnifiedExecToolError> {
+    let wait_task = session
+        .wait_task
+        .take()
+        .expect("unified exec session should have a process wait task");
+    let status = wait_task
+        .await
+        .context(JoinProcessSnafu)?
+        .context(WaitProcessSnafu)?;
+
+    let stdout_task = session
+        .stdout_task
+        .take()
+        .expect("unified exec session should have a stdout task");
+    stdout_task
+        .await
+        .context(JoinStdoutSnafu)?
+        .context(ReadStdoutSnafu)?;
+
+    let stderr_task = session
+        .stderr_task
+        .take()
+        .expect("unified exec session should have a stderr task");
+    stderr_task
+        .await
+        .context(JoinStderrSnafu)?
+        .context(ReadStderrSnafu)?;
+
+    let (stdout, stderr) = read_session_output(&mut session, max_output_tokens).await;
+    if let Some(runtime_server) = session.runtime_server.take() {
+        runtime_server.shutdown().await?;
+    }
+
+    tracing::info!(
+        session_id,
+        exit_code = ?status.code(),
+        stdout_bytes = stdout.len(),
+        stderr_bytes = stderr.len(),
+        "unified exec tool session completed"
+    );
+
+    Ok(format_exec_result(
+        Some(&session_id.to_string()),
+        status.code(),
+        stdout,
+        stderr,
+        false,
+    ))
+}
+
+async fn collect_session_until_deadline(
+    sessions: UnifiedExecSessionStoreHandle,
+    session_id: u64,
+    yield_time_ms: u64,
+    max_output_tokens: Option<u64>,
+) -> std::result::Result<String, UnifiedExecToolError> {
+    let deadline = Instant::now() + Duration::from_millis(yield_time_ms);
+    loop {
+        let notify = {
+            let mut store = sessions.inner.lock().await;
+            let session = store
+                .sessions
+                .get_mut(&session_id)
+                .context(SessionNotFoundSnafu { session_id })?;
+            if session
+                .wait_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                let session = store
+                    .sessions
+                    .remove(&session_id)
+                    .expect("unified exec session should still exist");
+                drop(store);
+                return finish_bash_session(session_id, session, max_output_tokens).await;
+            }
+            if Instant::now() >= deadline {
+                let (stdout, stderr) = read_session_output(session, max_output_tokens).await;
+                return Ok(format_exec_result(
+                    Some(&session_id.to_string()),
+                    None,
+                    stdout,
+                    stderr,
+                    true,
+                ));
+            }
+            session.notify.clone()
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let poll = Duration::from_millis(SESSION_POLL_INTERVAL_MS).min(remaining);
+        let _ = tokio::time::timeout(poll, notify.notified()).await;
+    }
+}
+
+async fn execute_command(
+    request: ExecCommandRequest,
+    sessions: UnifiedExecSessionStoreHandle,
+) -> std::result::Result<String, UnifiedExecToolError> {
     let coco_command = Some(prepare_coco_command_path_injection(
         &request.workspace_root,
         if request.context.enable_coco_shim {
@@ -722,15 +1092,16 @@ async fn execute_bash_command(
         program = %execution.program.display(),
         arg_count = execution.args.len(),
         workdir = %request.workdir.display(),
-        timeout_ms = ?request.timeout_ms,
+        yield_time_ms = request.yield_time_ms,
         shim_enabled = request.context.enable_coco_shim,
-        "starting bash tool command"
+        "starting unified exec tool command"
     );
     let mut command = Command::new(&execution.program);
+    command.kill_on_drop(true);
     command
         .args(&execution.args)
         .current_dir(&request.workdir)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove(COCO_DAEMON_SOCKET_ENV)
@@ -760,51 +1131,100 @@ async fn execute_bash_command(
         }
     }
     let mut child = command.spawn().context(SpawnProcessSnafu)?;
+    let stdin = child.stdin.take();
 
-    let stdout_handle = tokio::spawn(read_child_pipe(child.stdout.take()));
-    let stderr_handle = tokio::spawn(read_child_pipe(child.stderr.take()));
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let notify = Arc::new(Notify::new());
+    let stdout_task = tokio::spawn(stream_child_pipe(
+        child.stdout.take(),
+        stdout.clone(),
+        notify.clone(),
+    ));
+    let stderr_task = tokio::spawn(stream_child_pipe(
+        child.stderr.take(),
+        stderr.clone(),
+        notify.clone(),
+    ));
+    let wait_notify = notify.clone();
+    let wait_task = tokio::spawn(async move {
+        let status = child.wait().await;
+        wait_notify.notify_waiters();
+        status
+    });
 
-    let status = match request.timeout_ms {
-        Some(timeout_ms) => {
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child.wait())
-                .await
-            {
-                Ok(result) => Some(result.context(WaitProcessSnafu)?),
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    None
-                }
-            }
-        }
-        None => Some(child.wait().await.context(WaitProcessSnafu)?),
+    let session_id = {
+        let mut store = sessions.inner.lock().await;
+        store.next_session_id += 1;
+        let session_id = store.next_session_id;
+        store.sessions.insert(
+            session_id,
+            UnifiedExecSession {
+                stdin,
+                stdout,
+                stderr,
+                stdout_cursor: 0,
+                stderr_cursor: 0,
+                notify,
+                wait_task: Some(wait_task),
+                stdout_task: Some(stdout_task),
+                stderr_task: Some(stderr_task),
+                runtime_server,
+                _coco_command: coco_command,
+            },
+        );
+        session_id
     };
 
-    let stdout = stdout_handle.await.context(JoinStdoutSnafu)?;
-    let stdout = stdout.context(ReadStdoutSnafu)?;
-    let stderr = stderr_handle.await.context(JoinStderrSnafu)?;
-    let stderr = stderr.context(ReadStderrSnafu)?;
-    if let Some(runtime_server) = runtime_server {
-        runtime_server.shutdown().await?;
-    }
-    tracing::info!(
-        program = %execution.program.display(),
-        exit_code = ?status.as_ref().and_then(std::process::ExitStatus::code),
-        timed_out = status.is_none(),
-        stdout_bytes = stdout.len(),
-        stderr_bytes = stderr.len(),
-        "bash tool command completed"
-    );
-
-    Ok(format_bash_result(
-        status.as_ref().and_then(std::process::ExitStatus::code),
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
-        status.is_none(),
-    ))
+    collect_session_until_deadline(
+        sessions,
+        session_id,
+        request.yield_time_ms,
+        request.max_output_tokens,
+    )
+    .await
 }
 
-impl BashToolRuntime {
+async fn write_stdin(
+    request: WriteStdinRequest,
+    sessions: UnifiedExecSessionStoreHandle,
+) -> std::result::Result<String, UnifiedExecToolError> {
+    if !request.chars.is_empty() {
+        let mut stdin = {
+            let mut store = sessions.inner.lock().await;
+            let session =
+                store
+                    .sessions
+                    .get_mut(&request.session_id)
+                    .context(SessionNotFoundSnafu {
+                        session_id: request.session_id,
+                    })?;
+            session.stdin.take().context(StdinClosedSnafu)?
+        };
+
+        if !request.chars.is_empty() {
+            stdin
+                .write_all(request.chars.as_bytes())
+                .await
+                .context(WriteStdinSnafu)?;
+        }
+
+        let mut store = sessions.inner.lock().await;
+        if let Some(session) = store.sessions.get_mut(&request.session_id) {
+            session.stdin = Some(stdin);
+        }
+    }
+
+    collect_session_until_deadline(
+        sessions,
+        request.session_id,
+        request.yield_time_ms,
+        request.max_output_tokens,
+    )
+    .await
+}
+
+impl UnifiedExecToolRuntime {
     pub fn tool_definition(&self) -> rig::completion::ToolDefinition {
         rig::completion::ToolDefinition {
             name: self.definition.name.clone(),
@@ -822,11 +1242,21 @@ impl BashToolRuntime {
 
         let workspace_root = self.workspace_root.clone();
         let context = self.context.clone();
+        let sessions = self.sessions.clone();
         let result = async {
             let args: Value = serde_json::from_str(&args).context(ParseArgsSnafu)?;
-            let mut request = resolve_bash_request(&args, &workspace_root, context)?;
-            request.parent_tool_use_id = invocation.persisted_tool_use_node_id;
-            execute_bash_command(request).await
+            match self.kind {
+                UnifiedExecToolKind::ExecCommand => {
+                    let mut request =
+                        resolve_exec_command_request(&args, &workspace_root, context)?;
+                    request.parent_tool_use_id = invocation.persisted_tool_use_node_id;
+                    execute_command(request, sessions).await
+                }
+                UnifiedExecToolKind::WriteStdin => {
+                    let request = resolve_write_stdin_request(&args)?;
+                    write_stdin(request, sessions).await
+                }
+            }
         }
         .await;
         match result {
@@ -836,7 +1266,7 @@ impl BashToolRuntime {
     }
 }
 
-impl rig::tool::ToolDyn for BashToolRuntime {
+impl rig::tool::ToolDyn for UnifiedExecToolRuntime {
     fn name(&self) -> String {
         self.definition.name.clone()
     }
@@ -884,7 +1314,7 @@ mod tests {
             session_role: coco_mem::SessionRole::Orchestrator,
             store_path: None,
             enable_coco_shim,
-            cli_bridge: crate::BashToolCliBridgeHandle::default(),
+            cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
             skill_executor: crate::SkillToolExecutorHandle::default(),
         }
     }
@@ -895,11 +1325,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::BashToolCliBridge for FakeCliBridge {
+    impl crate::UnifiedExecCliBridge for FakeCliBridge {
         async fn execute_coco_cli(
             &self,
             request: CocoCliRuntimeRequest,
-        ) -> std::result::Result<CocoCliRuntimeResponse, crate::BashToolCliBridgeError> {
+        ) -> std::result::Result<CocoCliRuntimeResponse, crate::UnifiedExecCliBridgeError> {
             self.requests.lock().await.push(request);
             Ok(CocoCliRuntimeResponse {
                 exit_code: 0,
@@ -909,18 +1339,39 @@ mod tests {
         }
     }
 
-    fn temp_tool() -> Tool {
+    fn temp_exec_command_tool() -> Tool {
         Tool {
-            name: "bash".to_owned(),
-            description: "Run a bash command".to_owned(),
+            name: "exec_command".to_owned(),
+            description: "Run a command".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string"},
+                    "cmd": {"type": "string"},
                     "workdir": {"type": "string"},
-                    "timeout_ms": {"type": "integer"}
+                    "shell": {"type": "string"},
+                    "yield_time_ms": {"type": "integer"},
+                    "max_output_tokens": {"type": "integer"}
                 },
-                "required": ["command"]
+                "required": ["cmd"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn temp_write_stdin_tool() -> Tool {
+        Tool {
+            name: "write_stdin".to_owned(),
+            description: "Write stdin".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "integer"},
+                    "chars": {"type": "string"},
+                    "yield_time_ms": {"type": "integer"},
+                    "max_output_tokens": {"type": "integer"}
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
             }),
         }
     }
@@ -944,6 +1395,38 @@ mod tests {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn parse_session_id(output: &str) -> u64 {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix("session_id: "))
+            .expect("output should include session_id")
+            .parse()
+            .expect("session_id should be numeric")
+    }
+
+    fn runtime_pair(
+        workspace_root: PathBuf,
+        context: ToolRuntimeEnv,
+    ) -> (Box<dyn rig::tool::ToolDyn>, Box<dyn rig::tool::ToolDyn>) {
+        let sessions = session_store();
+        (
+            Box::new(runtime_with_sessions(
+                temp_exec_command_tool(),
+                workspace_root.clone(),
+                context.clone(),
+                UnifiedExecToolKind::ExecCommand,
+                sessions.clone(),
+            )),
+            Box::new(runtime_with_sessions(
+                temp_write_stdin_tool(),
+                workspace_root,
+                context,
+                UnifiedExecToolKind::WriteStdin,
+                sessions,
+            )),
+        )
     }
 
     #[tokio::test]
@@ -1013,7 +1496,10 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(error, BashToolError::RuntimeRootOverlapsWorkspace));
+        assert!(matches!(
+            error,
+            UnifiedExecToolError::RuntimeRootOverlapsWorkspace
+        ));
     }
 
     #[test]
@@ -1025,36 +1511,40 @@ mod tests {
 
         assert!(matches!(
             error,
-            BashToolError::RuntimeSocketPathTooLong { .. }
+            UnifiedExecToolError::RuntimeSocketPathTooLong { .. }
         ));
     }
 
     #[test]
     fn resolve_execution_spec_uses_nono_when_available_in_nono_mode() {
         let temp_root = tempfile::tempdir().unwrap();
-        let request = BashCommandRequest {
-            command: "pwd".to_owned(),
+        let request = ExecCommandRequest {
+            cmd: "pwd".to_owned(),
             workdir: temp_root.path().to_path_buf(),
             workspace_root: temp_root.path().to_path_buf(),
-            sandbox_mode: BashSandboxMode::Nono,
-            timeout_ms: None,
+            sandbox_mode: ExecSandboxMode::Nono,
+            shell: OsString::from("bash"),
+            yield_time_ms: DEFAULT_YIELD_TIME_MS,
+            max_output_tokens: None,
             context: test_context(),
             parent_tool_use_id: None,
         };
         let path_env = OsString::from("/tmp/nono-bin:/tmp/bash-bin");
         let spec = resolve_execution_spec(&request, Some(path_env.as_os_str()), &[]);
-        assert!(matches!(spec, Err(BashToolError::NonoNotFound)));
+        assert!(matches!(spec, Err(UnifiedExecToolError::NonoNotFound)));
     }
 
     #[test]
     fn resolve_execution_spec_adds_runtime_socket_allow_path() {
         let temp_root = tempfile::tempdir().unwrap();
-        let request = BashCommandRequest {
-            command: "pwd".to_owned(),
+        let request = ExecCommandRequest {
+            cmd: "pwd".to_owned(),
             workdir: temp_root.path().to_path_buf(),
             workspace_root: temp_root.path().to_path_buf(),
-            sandbox_mode: BashSandboxMode::Off,
-            timeout_ms: None,
+            sandbox_mode: ExecSandboxMode::Off,
+            shell: OsString::from("bash"),
+            yield_time_ms: DEFAULT_YIELD_TIME_MS,
+            max_output_tokens: None,
             context: test_context(),
             parent_tool_use_id: None,
         };
@@ -1078,7 +1568,7 @@ mod tests {
             runtime_dir.as_os_str().to_owned(),
             OsString::from("--"),
             OsString::from("bash"),
-            OsString::from("-lc"),
+            OsString::from("-c"),
             OsString::from("pwd"),
         ]);
 
@@ -1089,12 +1579,14 @@ mod tests {
     #[test]
     fn resolve_execution_spec_allows_dev_null_by_default() {
         let temp_root = tempfile::tempdir().unwrap();
-        let request = BashCommandRequest {
-            command: "pwd".to_owned(),
+        let request = ExecCommandRequest {
+            cmd: "pwd".to_owned(),
             workdir: temp_root.path().to_path_buf(),
             workspace_root: temp_root.path().to_path_buf(),
-            sandbox_mode: BashSandboxMode::Off,
-            timeout_ms: None,
+            sandbox_mode: ExecSandboxMode::Off,
+            shell: OsString::from("bash"),
+            yield_time_ms: DEFAULT_YIELD_TIME_MS,
+            max_output_tokens: None,
             context: test_context(),
             parent_tool_use_id: None,
         };
@@ -1109,29 +1601,69 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bash_request_rejects_workdir_outside_workspace() {
+    fn resolve_exec_command_request_rejects_workdir_outside_workspace() {
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let args = serde_json::json!({
-            "command": "pwd",
+            "cmd": "pwd",
             "workdir": outside.path(),
         });
 
-        let error = resolve_bash_request(&args, workspace.path(), test_context()).unwrap_err();
-        assert!(matches!(error, BashToolError::WorkdirOutsideWorkspace));
+        let error =
+            resolve_exec_command_request(&args, workspace.path(), test_context()).unwrap_err();
+        assert!(matches!(
+            error,
+            UnifiedExecToolError::WorkdirOutsideWorkspace
+        ));
+    }
+
+    #[test]
+    fn resolve_exec_command_request_rejects_removed_timeout_field() {
+        let workspace = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "cmd": "pwd",
+            "timeout_ms": 10,
+        });
+
+        let error =
+            resolve_exec_command_request(&args, workspace.path(), test_context()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            UnifiedExecToolError::UnsupportedInputField { field } if field == "timeout_ms"
+        ));
+    }
+
+    #[test]
+    fn resolve_write_stdin_request_rejects_removed_timeout_field() {
+        let args = serde_json::json!({
+            "session_id": 1,
+            "timeout_ms": 10,
+        });
+
+        let error = resolve_write_stdin_request(&args).unwrap_err();
+
+        assert!(matches!(
+            error,
+            UnifiedExecToolError::UnsupportedInputField { field } if field == "timeout_ms"
+        ));
     }
 
     #[tokio::test]
-    async fn bash_runtime_off_mode_allows_writes_inside_workspace() {
+    async fn exec_command_runtime_off_mode_allows_writes_inside_workspace() {
         let workspace = tempfile::tempdir().unwrap();
-        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            test_context(),
+        );
 
         let output = crate::with_process_env_async(
             &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"command":"printf 'hello' > trace.txt; cat trace.txt","workdir":"{}"}}"#,
+                        r#"{{"cmd":"printf 'hello' > trace.txt; cat trace.txt","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -1149,13 +1681,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_runtime_auto_mode_falls_back_without_nono() {
+    async fn exec_command_runtime_auto_mode_falls_back_without_nono() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
         let bash_path = resolve_bash_path_locked().await;
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
-        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            test_context(),
+        );
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
         let output = crate::with_process_env_async(
@@ -1166,7 +1702,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"command":"printf 'fallback'","workdir":"{}"}}"#,
+                        r#"{{"cmd":"printf 'fallback'","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -1180,13 +1716,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_runtime_masks_host_coco_with_injected_alias_by_default() {
+    async fn exec_command_runtime_masks_host_coco_with_injected_alias_by_default() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
         let bash_path = resolve_bash_path_locked().await;
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
-        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            test_context(),
+        );
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
         let output = crate::with_process_env_async(
@@ -1197,7 +1737,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"command":"command -v coco","workdir":"{}"}}"#,
+                        r#"{{"cmd":"command -v coco","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -1234,14 +1774,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_runtime_injects_coco_command_when_enabled() {
+    async fn exec_command_runtime_injects_coco_command_when_enabled() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
         let bash_path = resolve_bash_path_locked().await;
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
         let runtime = runtime_tool(
-            temp_tool(),
+            temp_exec_command_tool(),
             workspace.path().to_path_buf(),
             test_context_with_shim(true),
         );
@@ -1255,7 +1795,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"command":"command -v coco","workdir":"{}"}}"#,
+                        r#"{{"cmd":"command -v coco","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -1269,13 +1809,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_runtime_nono_mode_errors_when_binary_missing() {
+    async fn exec_command_runtime_nono_mode_errors_when_binary_missing() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
         let bash_path = resolve_bash_path_locked().await;
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
-        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            test_context(),
+        );
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
         let error = crate::with_process_env_async(
@@ -1286,7 +1830,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"command":"printf 'blocked'","workdir":"{}"}}"#,
+                        r#"{{"cmd":"printf 'blocked'","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -1299,7 +1843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_runtime_nono_mode_wraps_command_with_allow_workspace() {
+    async fn exec_command_runtime_nono_mode_wraps_command_with_allow_workspace() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
         let observed_args = workspace.path().join("nono-args.txt");
@@ -1313,7 +1857,11 @@ mod tests {
                 observed_args.display()
             ),
         );
-        let runtime = runtime_tool(temp_tool(), workspace.path().to_path_buf(), test_context());
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            test_context(),
+        );
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
         let output = crate::with_process_env_async(
@@ -1324,7 +1872,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"command":"printf 'sandboxed'","workdir":"{}"}}"#,
+                        r#"{{"cmd":"printf 'sandboxed'","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -1346,21 +1894,21 @@ mod tests {
         assert!(args.contains("/dev/null"));
         assert!(args.contains("--"));
         assert!(args.contains("bash"));
-        assert!(args.contains("-lc"));
+        assert!(args.contains("-c"));
     }
 
     #[tokio::test]
-    async fn bash_runtime_clears_stale_runtime_env_before_injecting_context() {
+    async fn exec_command_runtime_clears_stale_runtime_env_before_injecting_context() {
         let workspace = tempfile::tempdir().unwrap();
         let runtime = runtime_tool(
-            temp_tool(),
+            temp_exec_command_tool(),
             workspace.path().to_path_buf(),
             ToolRuntimeEnv {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Runner,
                 store_path: None,
                 enable_coco_shim: true,
-                cli_bridge: crate::BashToolCliBridgeHandle::default(),
+                cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
                 skill_executor: crate::SkillToolExecutorHandle::default(),
             },
         );
@@ -1383,7 +1931,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"command":"printf '%s|%s|%s|%s|%s' \"$COCO_BRANCH\" \"$COCO_SESSION_ROLE\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\" \"${{COCO_PARENT_TOOL_USE_ID:-}}\"","workdir":"{}"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s' \"$COCO_BRANCH\" \"$COCO_SESSION_ROLE\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\" \"${{COCO_PARENT_TOOL_USE_ID:-}}\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -1396,17 +1944,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_runtime_injects_parent_tool_use_env_for_invocation() {
+    async fn exec_command_runtime_injects_parent_tool_use_env_for_invocation() {
         let workspace = tempfile::tempdir().unwrap();
         let runtime = runtime(
-            temp_tool(),
+            temp_exec_command_tool(),
             workspace.path().to_path_buf(),
             ToolRuntimeEnv {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Orchestrator,
                 store_path: None,
                 enable_coco_shim: true,
-                cli_bridge: crate::BashToolCliBridgeHandle::default(),
+                cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
                 skill_executor: crate::SkillToolExecutorHandle::default(),
             },
         );
@@ -1417,7 +1965,7 @@ mod tests {
                 runtime
                     .execute(
                         format!(
-                            r#"{{"command":"printf '%s' \"${{COCO_PARENT_TOOL_USE_ID:-}}\"","workdir":"{}"}}"#,
+                            r#"{{"cmd":"printf '%s' \"${{COCO_PARENT_TOOL_USE_ID:-}}\"","workdir":"{}","shell":"bash"}}"#,
                             workspace.path().display()
                         ),
                         ToolInvocationContext {
@@ -1436,11 +1984,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_command_runtime_returns_running_session_and_later_exit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (exec_command, write_stdin) =
+            runtime_pair(workspace.path().to_path_buf(), test_context());
+
+        let first = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                exec_command
+                    .call(format!(
+                        r#"{{"cmd":"printf first; sleep 0.2; printf second","workdir":"{}","shell":"bash","yield_time_ms":10}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(first.contains("Process running with session ID"));
+        assert!(first.contains("exit_status: running"));
+        assert!(first.contains("stdout:\nfirst"));
+
+        let session_id = parse_session_id(&first);
+        let second = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                write_stdin
+                    .call(format!(
+                        r#"{{"session_id":{},"chars":"","yield_time_ms":1000}}"#,
+                        session_id
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(second.contains("Process exited with code 0"));
+        assert!(second.contains("exit_status: 0"));
+        assert!(second.contains("stdout:\nsecond"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_runtime_writes_stdin_to_running_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (exec_command, write_stdin) =
+            runtime_pair(workspace.path().to_path_buf(), test_context());
+
+        let first = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                exec_command
+                    .call(format!(
+                        r#"{{"cmd":"read line; printf 'got:%s' \"$line\"","workdir":"{}","shell":"bash","yield_time_ms":10}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(first.contains("exit_status: running"));
+
+        let session_id = parse_session_id(&first);
+        let second = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                write_stdin
+                    .call(format!(
+                        r#"{{"session_id":{},"chars":"hello\n","yield_time_ms":1000}}"#,
+                        session_id
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(second.contains("Process exited with code 0"));
+        assert!(second.contains("stdout:\ngot:hello"));
+    }
+
+    #[tokio::test]
     async fn coco_cli_runtime_socket_forwards_requests_to_bridge() {
         let workspace = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let bridge = crate::BashToolCliBridgeHandle::new(Arc::new(FakeCliBridge {
+        let bridge = crate::UnifiedExecCliBridgeHandle::new(Arc::new(FakeCliBridge {
             requests: requests.clone(),
         }));
         let runtime_store = workspace.path().join("runtime-store");
@@ -1460,7 +2093,7 @@ mod tests {
         let server = match server {
             Ok(Some(server)) => server,
             Ok(None) => panic!("runtime server should be started"),
-            Err(BashToolError::BindRuntimeSocket { source })
+            Err(UnifiedExecToolError::BindRuntimeSocket { source })
                 if source.kind() == std::io::ErrorKind::PermissionDenied =>
             {
                 return;

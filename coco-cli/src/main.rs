@@ -26,7 +26,11 @@ async fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     if shim_mode_is_disabled() {
         eprintln!(
-            "coco command is not enabled for this bash session; enable the coco shim to use CoCo CLI commands."
+            "{}",
+            concat!(
+                "coco command is not enabled for this unified exec session; ",
+                "enable the coco shim to use CoCo CLI commands."
+            )
         );
         std::process::exit(1);
     }
@@ -37,7 +41,13 @@ async fn main() {
                 arg_count = args.len().saturating_sub(1),
                 "forwarding cli command to runtime socket"
             );
-            if let Err(error) = forward_to_socket(&socket_path, &args[1..]).await {
+            if let Err(error) = forward_to_socket(
+                &socket_path,
+                &args[1..],
+                should_forward_runtime_stdin(&args[1..]),
+            )
+            .await
+            {
                 tracing::warn!(socket_path = %socket_path, error = %error, "runtime socket forwarding failed");
                 eprintln!("{error}");
                 std::process::exit(1);
@@ -54,7 +64,7 @@ async fn main() {
                 source = ?source,
                 "forwarding cli command to daemon socket"
             );
-            if let Err(error) = forward_to_socket(&socket_path, &forwarded_args).await {
+            if let Err(error) = forward_to_socket(&socket_path, &forwarded_args, true).await {
                 if should_fallback_to_local(source, &error) {
                     tracing::info!(
                         socket_path = %socket_path,
@@ -286,8 +296,16 @@ fn should_fallback_to_local(source: DaemonSocketSource, error: &ForwardSocketErr
     )
 }
 
-async fn forward_to_socket(socket_path: &str, args: &[String]) -> Result<(), ForwardSocketError> {
-    let stdin = read_forwarded_stdin();
+async fn forward_to_socket(
+    socket_path: &str,
+    args: &[String],
+    forward_stdin: bool,
+) -> Result<(), ForwardSocketError> {
+    let stdin = if forward_stdin {
+        read_forwarded_stdin()
+    } else {
+        Vec::new()
+    };
 
     let request = CocoCliRuntimeRequest {
         args: args.to_vec(),
@@ -351,6 +369,58 @@ where
     stdin
 }
 
+fn should_forward_runtime_stdin(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--store-path" || arg == "--daemon-socket" {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--store-path=") || arg.starts_with("--daemon-socket=") {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    if args.get(index).map(String::as_str) != Some("prompt") {
+        return false;
+    }
+    index += 1;
+
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "status" | "branch-status" | "worker" => return false,
+            "--" => return index + 1 == args.len(),
+            "--branch" | "--role" | "--tool" => {
+                index += 2;
+            }
+            "--async" | "--json" | "--clear-tools" => {
+                index += 1;
+            }
+            value
+                if value.starts_with("--branch=")
+                    || value.starts_with("--role=")
+                    || value.starts_with("--tool=") =>
+            {
+                index += 1;
+            }
+            value if value.starts_with('-') => {
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};
@@ -358,6 +428,7 @@ mod tests {
     use super::{
         DaemonSocketSource, ForwardSocketError, ForwardingTarget, collect_forwarded_stdin,
         is_daemon_serve_command, resolve_forwarding_target, should_fallback_to_local,
+        should_forward_runtime_stdin,
     };
     use coco_cli::{COCO_DAEMON_SOCKET_ENV, resolve_default_daemon_socket_path};
     use coco_llm::COCO_CLI_RUNTIME_SOCKET_ENV;
@@ -532,6 +603,31 @@ mod tests {
         let stdin = collect_forwarded_stdin(&mut reader, false);
 
         assert_eq!(stdin, b"hello\n");
+    }
+
+    #[test]
+    fn runtime_socket_stdin_is_only_forwarded_for_prompt_without_text() {
+        assert!(!should_forward_runtime_stdin(&[
+            "session".to_owned(),
+            "list".to_owned(),
+        ]));
+        assert!(!should_forward_runtime_stdin(&[
+            "prompt".to_owned(),
+            "status".to_owned(),
+            "--job".to_owned(),
+            "job-1".to_owned(),
+        ]));
+        assert!(!should_forward_runtime_stdin(&[
+            "prompt".to_owned(),
+            "--branch".to_owned(),
+            "draft".to_owned(),
+            "hello".to_owned(),
+        ]));
+        assert!(should_forward_runtime_stdin(&[
+            "prompt".to_owned(),
+            "--branch".to_owned(),
+            "draft".to_owned(),
+        ]));
     }
 
     #[test]

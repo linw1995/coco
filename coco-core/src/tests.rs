@@ -370,7 +370,7 @@ async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let main_session = llm.create_session(session_config("main")).await.unwrap();
     llm.fork("runner", &main_session.anchor_id).unwrap();
-    let bash_tool = builtin_tool_definition("bash").unwrap();
+    let exec_tool = builtin_tool_definition("exec_command").unwrap();
     let engine = ConversationEngine::new(llm);
 
     let response = engine
@@ -380,7 +380,7 @@ async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
             vec![],
             Some(SessionConfigPatch {
                 role: Some(SessionRole::Runner),
-                tools: Some(vec![bash_tool.clone()]),
+                tools: Some(vec![exec_tool.clone()]),
                 ..SessionConfigPatch::default()
             }),
         )
@@ -401,7 +401,7 @@ async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
         .as_session_patch()
         .expect("expected session patch anchor");
     assert_eq!(patch.role, Some(SessionRole::Runner));
-    assert_eq!(patch.tools, Some(vec![bash_tool]));
+    assert_eq!(patch.tools, Some(vec![exec_tool]));
     assert_eq!(ancestry[2].parent, main_session.anchor_id);
 }
 
@@ -717,8 +717,8 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
                 .build(),
             kind: Kind::ToolUse(ToolUse {
                 id: "tool-call-1".to_owned(),
-                name: "bash".to_owned(),
-                input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
+                name: "exec_command".to_owned(),
+                input: serde_json::json!({"cmd": "printf 'hello' > trace.txt"}),
             }),
         })
         .unwrap();

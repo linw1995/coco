@@ -1,7 +1,8 @@
 # CoCo Orchestrator Workflow
 
-Use the injected `coco` command through `bash` for branch-aware workflow control.
-Default output is human-readable; use `--json` whenever piping to `jq` or scripts.
+Use the injected `coco` command through `exec_command` for branch-aware
+workflow control. Default output is human-readable; use `--json` whenever
+piping to `jq` or scripts.
 
 Useful commands:
 
@@ -31,9 +32,11 @@ Rules:
   `use_skill` as the handoff mechanism here.
 - On a `*/skill/*` branch, fork from the node before the `use_skill` ToolUse
   that invoked this skill, not from the skill session anchor.
-- After forking, apply the runner role and restricted tools on the runner prompt.
-  Prompt-level role/tool changes are session patches; they preserve the forked
-  branch history while changing the runner configuration.
+- After forking, apply the runner role and restricted tools on the runner
+  prompt. Prompt-level role/tool changes are session patches; they preserve
+  the forked branch history while changing the runner configuration.
+- When the runner work finishes, include the runner branch and final observed
+  status in the result sent back to the caller.
 
 Example:
 
@@ -42,5 +45,6 @@ ANCHOR=$(coco session get --json --branch "$COCO_BRANCH" | jq -r '.anchor_id')
 USE_SKILL=$(coco session show --json "$ANCHOR" | jq -r '.node.parent')
 BASE=$(coco session show --json "$USE_SKILL" | jq -r '.node.parent')
 coco session fork --branch "$RUNNER_BRANCH" --from-ref "$BASE"
-coco prompt --branch "$RUNNER_BRANCH" --role runner --tool bash --tool search_skill "<task>"
+coco prompt --branch "$RUNNER_BRANCH" --role runner \
+  --tool exec_command --tool search_skill "<task>"
 ```

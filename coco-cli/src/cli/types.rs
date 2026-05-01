@@ -32,8 +32,10 @@ impl From<CliProvider> for Provider {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum CliTool {
-    #[value(name = "bash")]
-    Bash,
+    #[value(name = "exec_command")]
+    ExecCommand,
+    #[value(name = "write_stdin")]
+    WriteStdin,
     #[value(name = "search_skill")]
     SearchSkill,
     #[value(name = "use_skill")]
@@ -43,7 +45,8 @@ pub enum CliTool {
 impl CliTool {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "bash" => Some(Self::Bash),
+            "exec_command" => Some(Self::ExecCommand),
+            "write_stdin" => Some(Self::WriteStdin),
             "search_skill" => Some(Self::SearchSkill),
             "use_skill" => Some(Self::UseSkill),
             _ => None,
@@ -52,7 +55,8 @@ impl CliTool {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Bash => "bash",
+            Self::ExecCommand => "exec_command",
+            Self::WriteStdin => "write_stdin",
             Self::SearchSkill => "search_skill",
             Self::UseSkill => "use_skill",
         }

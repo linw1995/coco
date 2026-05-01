@@ -952,7 +952,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
             "--role",
             "runner",
             "--tool",
-            "bash",
+            "exec_command",
             "run date",
         ])
         .unwrap(),
@@ -979,7 +979,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
     assert_eq!(patch.role, Some(SessionRole::Runner));
     let tools = patch.tools.as_ref().expect("expected tools patch");
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].name, "bash");
+    assert_eq!(tools[0].name, "exec_command");
     assert_eq!(ancestry[2].parent, original_main_head);
     assert_eq!(ancestry[3].id, original_main_head);
 }
@@ -1540,7 +1540,7 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
 
     let store = open_store(&store_path).unwrap();
     let session_head = store.get_branch_head("main").unwrap();
-    let shadow_parent = append_tool_use_node(&store, &session_head, "tool-call-1", "bash");
+    let shadow_parent = append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
     let prompt_anchor_id = store
         .append(NewNode {
             parent: session_head,
@@ -2796,7 +2796,7 @@ async fn session_graph_shows_tool_and_failure_nodes() {
 
     let store = open_store(&store_path).unwrap();
     let session_head = store.get_branch_head("main").unwrap();
-    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "bash");
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command");
     store
         .set_branch_head("main", &session_head, &tool_use_id)
         .unwrap();
@@ -3117,7 +3117,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
 
     let store = open_store(&store_path).unwrap();
     let session_id = store.get_branch_head("main").unwrap();
-    let shadow_parent = append_tool_use_node(&store, &session_id, "tool-call-1", "bash");
+    let shadow_parent = append_tool_use_node(&store, &session_id, "tool-call-1", "exec_command");
     let shadow_anchor_id = store
         .append(NewNode {
             parent: session_id.clone(),
@@ -3822,7 +3822,7 @@ fn preset_set_parses_name_and_patch_flags() {
         "--system-prompt",
         "You are precise.",
         "--tool",
-        "bash",
+        "exec_command",
         "--additional-params",
         "{\"reasoning_effort\":\"medium\"}",
         "--enable-coco-shim",
@@ -3841,7 +3841,7 @@ fn preset_set_parses_name_and_patch_flags() {
     assert_eq!(command.provider_profile, "anthropic-main");
     assert_eq!(command.model.as_deref(), Some("claude-sonnet-4-20250514"));
     assert_eq!(command.system_prompt, "You are precise.");
-    assert_eq!(command.tools, vec![crate::cli::CliTool::Bash]);
+    assert_eq!(command.tools, vec![crate::cli::CliTool::ExecCommand]);
     assert!(command.enable_coco_shim);
     assert!(!command.json);
 }
@@ -4008,7 +4008,7 @@ async fn preset_commands_manage_versions_in_store() {
             "--additional-params",
             "{\"reasoning_effort\":\"low\"}",
             "--tool",
-            "bash",
+            "exec_command",
             "--json",
         ])
         .unwrap(),
@@ -4029,7 +4029,7 @@ async fn preset_commands_manage_versions_in_store() {
         first_json["config"]["additional_params"],
         json!({"reasoning_effort": "low"})
     );
-    assert_eq!(first_json["config"]["tools"][0]["name"], "bash");
+    assert_eq!(first_json["config"]["tools"][0]["name"], "exec_command");
 
     let second_output = run_with_backend_and_provider_profiles(
         Cli::try_parse_from([
@@ -4517,7 +4517,8 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
 
     let store = open_store(&store_path).unwrap();
     let session_head = store.get_branch_head("draft").unwrap();
-    let parent_tool_use = append_tool_use_node(&store, &session_head, "tool-call-1", "bash");
+    let parent_tool_use =
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("draft", &[Ok("world")])]),
@@ -4635,7 +4636,8 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
 
     let store = open_store(&store_path).unwrap();
     let session_head = store.get_branch_head("main").unwrap();
-    let parent_tool_use = append_tool_use_node(&store, &session_head, "tool-call-1", "bash");
+    let parent_tool_use =
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
     let job = submit_prompt_job(&store, "main", "hello");
     let llm = llm_with_test_provider_config(
         store.clone(),
@@ -5174,7 +5176,10 @@ fn resolve_session_config_reads_tools_from_env() {
             &[
                 ("COCO_PROVIDER", "openai"),
                 ("COCO_MODEL", "gpt-4.1-mini"),
-                ("COCO_TOOLS", "bash,search_skill,use_skill"),
+                (
+                    "COCO_TOOLS",
+                    "exec_command,write_stdin,search_skill,use_skill",
+                ),
             ],
             || async {
                 resolve_session_config(SessionCreateCommand {
@@ -5198,7 +5203,7 @@ fn resolve_session_config_reads_tools_from_env() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["bash", "search_skill", "use_skill"]
+        vec!["exec_command", "write_stdin", "search_skill", "use_skill"]
     );
 }
 
