@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coco_mem::Tool;
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{ChildKiller, CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use serde_json::Value;
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -105,6 +105,7 @@ struct UnifiedExecSession {
     wait_task: Option<tokio::task::JoinHandle<io::Result<Option<i32>>>>,
     stdout_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
     stderr_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    pty_child_killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     runtime_server: Option<CocoCliRuntimeServer>,
     _coco_command: Option<CocoCommandPathInjection>,
 }
@@ -123,6 +124,9 @@ impl std::fmt::Debug for UnifiedExecSessionStdin {
 
 impl Drop for UnifiedExecSession {
     fn drop(&mut self) {
+        if let Some(mut killer) = self.pty_child_killer.take() {
+            let _ = killer.kill();
+        }
         if let Some(wait_task) = &self.wait_task {
             wait_task.abort();
         }
@@ -1042,6 +1046,7 @@ async fn finish_bash_session(
         .await
         .context(JoinProcessSnafu)?
         .context(WaitProcessSnafu)?;
+    session.pty_child_killer.take();
 
     let stdout_task = session
         .stdout_task
@@ -1245,6 +1250,7 @@ async fn execute_command(
                 wait_task: Some(wait_task),
                 stdout_task: Some(stdout_task),
                 stderr_task: Some(stderr_task),
+                pty_child_killer: None,
                 runtime_server,
                 _coco_command: coco_command,
             },
@@ -1326,6 +1332,7 @@ async fn execute_pty_command(
             message: source.to_string(),
         }
     })?;
+    let pty_child_killer = Some(child.clone_killer());
     drop(pair.slave);
 
     let stdout = Arc::new(Mutex::new(Vec::new()));
@@ -1360,6 +1367,7 @@ async fn execute_pty_command(
                 wait_task: Some(wait_task),
                 stdout_task: Some(stdout_task),
                 stderr_task: Some(stderr_task),
+                pty_child_killer,
                 runtime_server,
                 _coco_command: coco_command,
             },
@@ -1593,6 +1601,16 @@ mod tests {
             .expect("output should include session_id")
             .parse()
             .expect("session_id should be numeric")
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid)
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     fn runtime_pair(
@@ -2320,6 +2338,50 @@ mod tests {
 
         assert!(second.contains("Process exited with code 0"));
         assert!(second.contains("got:hello"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_tty_session_kills_child_process() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (exec_command, write_stdin) =
+            runtime_pair(workspace.path().to_path_buf(), test_context());
+
+        let first = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                exec_command
+                    .call(format!(
+                        r#"{{"cmd":"printf 'pid:%s\n' $$; read _","workdir":"{}","shell":"bash","tty":true,"yield_time_ms":100}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(first.contains("exit_status: running"));
+        let pid = first
+            .lines()
+            .find_map(|line| line.trim_end_matches('\r').strip_prefix("pid:"))
+            .expect("expected child pid in output")
+            .trim()
+            .to_owned();
+        assert!(process_exists(&pid), "child process should be running");
+
+        drop(exec_command);
+        drop(write_stdin);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_exists(&pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            !process_exists(&pid),
+            "dropping the tty session should kill child process {pid}"
+        );
     }
 
     #[tokio::test]
