@@ -1,5 +1,10 @@
 # CoCo
 
+[![CI](https://img.shields.io/github/actions/workflow/status/linw1995/coco/CI.yaml?branch=main&label=CI)](https://github.com/linw1995/coco/actions/workflows/CI.yaml)
+[![CD](https://img.shields.io/github/actions/workflow/status/linw1995/coco/CD.yaml?branch=main&label=CD)](https://github.com/linw1995/coco/actions/workflows/CD.yaml)
+[![codecov](https://codecov.io/gh/linw1995/coco/graph/badge.svg?token=A99GUI386I)](https://codecov.io/gh/linw1995/coco)
+[![ghcr](https://img.shields.io/badge/ghcr.io-linw1995%2Fcoco-blue?logo=github)](https://github.com/linw1995/coco/pkgs/container/coco)
+
 An AI Copilot.
 
 ## Docker
