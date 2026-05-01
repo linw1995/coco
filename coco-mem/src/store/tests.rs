@@ -9,8 +9,8 @@ use super::state::StoreState;
 use crate::{
     Anchor, BranchConfig, BranchConfigStore, BranchStore, JobStatus, JobStore, Kind, MergeParent,
     NewNode, Node, NodeStore, PauseReason, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch,
-    SessionRole, SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
-    StoreError as Error,
+    SessionRole, SessionState, SessionStore, SkillScript, SkillStore, SkillUpdatePatch,
+    SkillVersionSpec, StoreError as Error,
 };
 use serde_json::json;
 
@@ -42,6 +42,7 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
                 max_tokens: Some(64),
                 additional_params: Some(json!({"reasoning_effort": "low"})),
                 enable_coco_shim: false,
+                active_skill: None,
             },
         )),
     }
@@ -81,6 +82,7 @@ fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> Ne
                 max_tokens: Some(64),
                 additional_params: Some(json!({"reasoning_effort": "low"})),
                 enable_coco_shim: false,
+                active_skill: None,
             },
         )),
     }
@@ -1580,6 +1582,7 @@ where
             SkillVersionSpec {
                 description: "first".to_owned(),
                 body: "body".to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: true,
             },
         )
@@ -1595,6 +1598,14 @@ where
     F: TestStoreFactory,
 {
     let store = F::create();
+    let first_script = SkillScript {
+        path: "scripts/inspect.py".to_owned(),
+        content: "print('v1')".to_owned(),
+    };
+    let second_script = SkillScript {
+        path: "scripts/inspect.py".to_owned(),
+        content: "print('v2')".to_owned(),
+    };
     store
         .add_skill(
             SessionRole::Runner,
@@ -1602,6 +1613,7 @@ where
             SkillVersionSpec {
                 description: "v1".to_owned(),
                 body: "body-v1".to_owned(),
+                scripts: vec![first_script.clone()],
                 enable_coco_shim: false,
             },
         )
@@ -1614,6 +1626,7 @@ where
             &SkillUpdatePatch {
                 description: Some("v2".to_owned()),
                 body: None,
+                scripts: Some(vec![second_script.clone()]),
                 enable_coco_shim: Some(true),
             },
         )
@@ -1625,9 +1638,14 @@ where
         vec![1, 2]
     );
     assert_eq!(updated.versions.get(&1).unwrap().description, "v1");
+    assert_eq!(
+        updated.versions.get(&1).unwrap().scripts,
+        vec![first_script]
+    );
     let current = updated.current().unwrap();
     assert_eq!(current.description, "v2");
     assert_eq!(current.body, "body-v1");
+    assert_eq!(current.scripts, vec![second_script]);
     assert!(current.enable_coco_shim);
 }
 
@@ -1636,6 +1654,10 @@ where
     F: TestStoreFactory,
 {
     let store = F::create();
+    let first_script = SkillScript {
+        path: "scripts/rollback.py".to_owned(),
+        content: "print('v1')".to_owned(),
+    };
     store
         .add_skill(
             SessionRole::Orchestrator,
@@ -1643,6 +1665,7 @@ where
             SkillVersionSpec {
                 description: "v1".to_owned(),
                 body: "body-v1".to_owned(),
+                scripts: vec![first_script.clone()],
                 enable_coco_shim: false,
             },
         )
@@ -1654,6 +1677,10 @@ where
             &SkillUpdatePatch {
                 description: Some("v2".to_owned()),
                 body: Some("body-v2".to_owned()),
+                scripts: Some(vec![SkillScript {
+                    path: "scripts/rollback.py".to_owned(),
+                    content: "print('v2')".to_owned(),
+                }]),
                 enable_coco_shim: Some(true),
             },
         )
@@ -1671,6 +1698,7 @@ where
     let current = rolled_back.current().unwrap();
     assert_eq!(current.description, "v1");
     assert_eq!(current.body, "body-v1");
+    assert_eq!(current.scripts, vec![first_script]);
     assert!(!current.enable_coco_shim);
 }
 
@@ -2607,6 +2635,7 @@ fn skills_json_only_stores_current_snapshots() {
             &SkillUpdatePatch {
                 description: Some("updated".to_owned()),
                 body: None,
+                scripts: None,
                 enable_coco_shim: None,
             },
         )
@@ -2633,6 +2662,10 @@ fn skill_history_is_appended_in_central_directory() {
             &SkillUpdatePatch {
                 description: Some("updated".to_owned()),
                 body: Some("body-v2".to_owned()),
+                scripts: Some(vec![SkillScript {
+                    path: "scripts/history.py".to_owned(),
+                    content: "print('history')".to_owned(),
+                }]),
                 enable_coco_shim: Some(false),
             },
         )
@@ -2651,6 +2684,8 @@ fn skill_history_is_appended_in_central_directory() {
     assert_eq!(history[2]["version"], 3);
     assert_eq!(history[2]["description"], history[0]["description"]);
     assert_eq!(history[2]["body"], history[0]["body"]);
+    assert_eq!(history[1]["scripts"][0]["path"], "scripts/history.py");
+    assert_eq!(history[2]["scripts"], history[0]["scripts"]);
 }
 
 #[test]
@@ -2664,6 +2699,7 @@ fn shared_skill_history_uses_shared_scope_directory() {
             SkillVersionSpec {
                 description: "shared".to_owned(),
                 body: "runner-shared".to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: false,
             },
         )
@@ -2701,6 +2737,7 @@ fn skill_history_paths_do_not_collide_for_role_suffixed_names() {
             SkillVersionSpec {
                 description: "runner only".to_owned(),
                 body: "runner-only".to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: false,
             },
         )
@@ -2712,6 +2749,7 @@ fn skill_history_paths_do_not_collide_for_role_suffixed_names() {
             SkillVersionSpec {
                 description: "shared orchestrator".to_owned(),
                 body: "orchestrator".to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: false,
             },
         )
@@ -2723,6 +2761,7 @@ fn skill_history_paths_do_not_collide_for_role_suffixed_names() {
             SkillVersionSpec {
                 description: "shared runner".to_owned(),
                 body: "runner".to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: false,
             },
         )
@@ -2778,6 +2817,7 @@ fn skill_update_does_not_advance_when_history_append_fails() {
             &SkillUpdatePatch {
                 description: Some("should-not-persist".to_owned()),
                 body: None,
+                scripts: None,
                 enable_coco_shim: None,
             },
         )
@@ -2822,6 +2862,7 @@ fn skill_add_recovers_from_history_when_snapshot_write_fails() {
             SkillVersionSpec {
                 description: "checkpoint can lag".to_owned(),
                 body: "history is authoritative".to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: false,
             },
         )

@@ -76,12 +76,13 @@ rec {
               pkgs.bash
               pkgs.coreutils
               pkgs.nono
+              pkgs.uv
               pkgs.cacert
               pkgs.tzdata
             ];
             config = {
               Env = [
-                "PATH=${lib.makeBinPath [coco-cli pkgs.bash pkgs.coreutils pkgs.nono]}"
+                "PATH=${lib.makeBinPath [coco-cli pkgs.bash pkgs.coreutils pkgs.nono pkgs.uv]}"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
                 "TZDIR=${pkgs.tzdata}/share/zoneinfo"
                 "XDG_CONFIG_HOME=/data/.config"
@@ -132,6 +133,7 @@ rec {
               wasm-bindgen-cli
 
               nono
+              uv
             ];
           };
         };

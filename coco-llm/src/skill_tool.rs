@@ -268,6 +268,7 @@ mod tests {
             session_branch: "main".to_owned(),
             session_role: coco_mem::SessionRole::Orchestrator,
             current_skill_name: None,
+            active_skill: None,
             store_path: None,
             enable_coco_shim: false,
             cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),

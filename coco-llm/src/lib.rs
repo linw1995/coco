@@ -18,7 +18,7 @@ use coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
     MergeParent, NewNode, NodeStore, PauseReason, PromptAnchor, ProviderMetadata, Role,
     RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
-    StoreError, Tool, ToolResult, ToolUse,
+    SkillRuntimeContext, StoreError, Tool, ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +42,8 @@ pub const COCO_STORE_PATH_ENV: &str = "COCO_STORE_PATH";
 pub const COCO_CLI_RUNTIME_SOCKET_ENV: &str = "COCO_CLI_RUNTIME_SOCKET";
 pub const COCO_COMMAND_SHIM_MODE_ENV: &str = "COCO_COMMAND_SHIM_MODE";
 pub const COCO_PARENT_TOOL_USE_ID_ENV: &str = "COCO_PARENT_TOOL_USE_ID";
+pub const COCO_SKILL_NAME_ENV: &str = "COCO_SKILL_NAME";
+pub const COCO_SKILL_DIR_ENV: &str = "COCO_SKILL_DIR";
 
 pub type CompletionMessage = rig::completion::message::Message;
 pub type CompletionToolCall = rig::completion::message::ToolCall;
@@ -622,6 +624,7 @@ pub struct ToolRuntimeEnv {
     pub session_branch: String,
     pub session_role: SessionRole,
     pub current_skill_name: Option<String>,
+    pub active_skill: Option<SkillRuntimeContext>,
     pub store_path: Option<PathBuf>,
     pub enable_coco_shim: bool,
     pub cli_bridge: UnifiedExecCliBridgeHandle,
@@ -635,6 +638,7 @@ impl std::fmt::Debug for ToolRuntimeEnv {
             .field("session_branch", &self.session_branch)
             .field("session_role", &self.session_role)
             .field("current_skill_name", &self.current_skill_name)
+            .field("active_skill", &self.active_skill)
             .field("store_path", &self.store_path)
             .field("enable_coco_shim", &self.enable_coco_shim)
             .field("cli_bridge", &self.cli_bridge)
@@ -1091,6 +1095,7 @@ where
                         max_tokens: config.max_tokens,
                         additional_params: config.additional_params,
                         enable_coco_shim: config.enable_coco_shim,
+                        active_skill: None,
                     },
                 )),
             })
@@ -1926,6 +1931,7 @@ where
                 session_branch: branch.to_owned(),
                 session_role: context.session_anchor.role,
                 current_skill_name: current_skill_name_from_prompt(&context.session_anchor.prompt),
+                active_skill: context.session_anchor.active_skill.clone(),
                 store_path: self.store.runtime_store_path(),
                 enable_coco_shim: context.session_anchor.enable_coco_shim,
                 cli_bridge: self.runtime.unified_exec_cli_bridge.clone(),
@@ -5556,6 +5562,7 @@ mod tests {
                 session_branch: "main".to_owned(),
                 session_role: SessionRole::Orchestrator,
                 current_skill_name: None,
+                active_skill: None,
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: UnifiedExecCliBridgeHandle::default(),

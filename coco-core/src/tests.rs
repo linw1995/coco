@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -7,7 +9,7 @@ use async_trait::async_trait;
 use coco_llm::coco_mem::{
     Anchor, BackendMetadata, BranchStore, ExecutionMetadata, JobStatus, JobStore, Kind,
     MemoryStore, NewNode, NodeStore, PromptAnchor, ProviderMetadata, Role, SessionRole,
-    SessionStore, ToolResult, ToolUse,
+    SessionStore, SkillScript, SkillStore, SkillVersionSpec, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEventPayload, BackendTurn, CompletionBackend, CompletionMessage,
@@ -45,6 +47,15 @@ where
             }),
         })
         .unwrap()
+}
+
+fn skill_runtime_contains_body(path: &Path, expected_body: &str) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        fs::read_to_string(entry.path().join("SKILL.md")).is_ok_and(|body| body == expected_body)
+    })
 }
 
 #[derive(Debug)]
@@ -868,6 +879,115 @@ enable_coco_shim: true
     assert_eq!(provider_contexts.len(), 1);
     assert!(provider_contexts[0].contains(caller_task));
     assert!(!provider_contexts[0].contains("use_skill"));
+}
+
+#[tokio::test]
+async fn llm_engine_materializes_store_skill_scripts() {
+    let store = MemoryStore::new();
+    store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "scripted-skill",
+            SkillVersionSpec {
+                description: "Run a uv single-file script.".to_owned(),
+                body: "# Scripted Skill".to_owned(),
+                scripts: vec![SkillScript {
+                    path: "scripts/inspect.py".to_owned(),
+                    content: "print('inspect')\n".to_owned(),
+                }],
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
+
+    let backend = AnyBranchBackend::new("script result");
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let base_session = llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let tool_use_id = append_use_skill_node(&store, &base_session.anchor_id, "scripted-skill");
+
+    with_env_async(&[("COCO_SKILLS_DIRS", None)], || async {
+        engine
+            .execute_skill(
+                Path::new("."),
+                "main",
+                SessionRole::Orchestrator,
+                &tool_use_id,
+                "scripted-skill",
+            )
+            .await
+    })
+    .await
+    .unwrap();
+
+    let children = store.list_children(&tool_use_id).unwrap();
+    let child_session_anchor = children
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor.as_session().map(|session| (node, session)),
+            _ => None,
+        })
+        .expect("child execution should persist a child session anchor");
+    let active_skill = child_session_anchor
+        .1
+        .active_skill
+        .as_ref()
+        .expect("scripted skill should persist runtime context");
+
+    assert_eq!(active_skill.name, "scripted-skill");
+    assert_eq!(active_skill.scripts, vec!["scripts/inspect.py"]);
+    assert!(
+        child_session_anchor
+            .1
+            .prompt
+            .contains("uv run --script \"$COCO_SKILL_DIR/scripts/inspect.py\"")
+    );
+    assert!(!active_skill.directory.exists());
+}
+
+#[tokio::test]
+async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
+    let runtime_root = std::env::temp_dir().join("coco").join("skill-sessions");
+    let body = format!("# Bad Scripted Skill {}", nanoid::nanoid!());
+    let store = MemoryStore::new();
+    store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "bad-scripted-skill",
+            SkillVersionSpec {
+                description: "Has an invalid script path.".to_owned(),
+                body: body.clone(),
+                scripts: vec![SkillScript {
+                    path: "../escape.py".to_owned(),
+                    content: "print('escape')\n".to_owned(),
+                }],
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
+
+    let backend = AnyBranchBackend::new("should not run");
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let base_session = llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let tool_use_id = append_use_skill_node(&store, &base_session.anchor_id, "bad-scripted-skill");
+
+    let error = with_env_async(&[("COCO_SKILLS_DIRS", None)], || async {
+        engine
+            .execute_skill(
+                Path::new("."),
+                "main",
+                SessionRole::Orchestrator,
+                &tool_use_id,
+                "bad-scripted-skill",
+            )
+            .await
+    })
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("invalid skill script path"));
+    assert!(!skill_runtime_contains_body(&runtime_root, &body));
 }
 
 #[tokio::test]

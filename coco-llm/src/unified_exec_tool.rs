@@ -20,8 +20,9 @@ use std::os::unix::ffi::OsStrExt;
 
 use crate::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_TOOL_USE_ID_ENV,
-    COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest,
-    CocoCliRuntimeResponse, ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv,
+    COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_SKILL_DIR_ENV, COCO_SKILL_NAME_ENV,
+    COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse, ToolExecutionOutcome,
+    ToolInvocationContext, ToolRuntimeEnv,
 };
 
 #[derive(Debug, Clone)]
@@ -210,6 +211,7 @@ const SESSION_POLL_INTERVAL_MS: u64 = 25;
 const COCO_DAEMON_SOCKET_ENV: &str = "COCO_DAEMON_SOCKET";
 const COCO_EXEC_SANDBOX_ENV: &str = "COCO_EXEC_SANDBOX";
 const COCO_EXEC_WORKSPACE_ENV: &str = "COCO_EXEC_WORKSPACE";
+const UV_CACHE_DIR_ENV: &str = "UV_CACHE_DIR";
 
 #[cfg(unix)]
 const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
@@ -792,6 +794,14 @@ fn prepare_coco_command_path_injection(
     })
 }
 
+fn prepare_skill_uv_cache(
+    workspace_root: &Path,
+) -> std::result::Result<PathBuf, UnifiedExecToolError> {
+    let cache_dir = resolve_runtime_root(workspace_root)?.join("uv-cache");
+    std::fs::create_dir_all(&cache_dir).context(CreateCocoCommandShimDirSnafu)?;
+    Ok(cache_dir)
+}
+
 fn nono_execution_spec(
     nono: PathBuf,
     request: &ExecCommandRequest,
@@ -1262,6 +1272,16 @@ async fn execute_command(
     if let Some(runtime_server) = &runtime_server {
         extra_allow_paths.push(runtime_server.socket_dir.clone());
     }
+    let skill_uv_cache_dir = if request.context.active_skill.is_some() {
+        let cache_dir = prepare_skill_uv_cache(&request.workspace_root)?;
+        extra_allow_paths.push(cache_dir.clone());
+        Some(cache_dir)
+    } else {
+        None
+    };
+    if let Some(active_skill) = &request.context.active_skill {
+        extra_allow_paths.push(active_skill.directory.clone());
+    }
     let execution = resolve_execution_spec(
         &request,
         coco_command
@@ -1279,8 +1299,15 @@ async fn execute_command(
         "starting unified exec tool command"
     );
     if request.tty {
-        return execute_pty_command(request, execution, runtime_server, coco_command, sessions)
-            .await;
+        return execute_pty_command(
+            request,
+            execution,
+            runtime_server,
+            coco_command,
+            skill_uv_cache_dir,
+            sessions,
+        )
+        .await;
     }
 
     let mut command = Command::new(&execution.program);
@@ -1297,6 +1324,9 @@ async fn execute_command(
         .env_remove(COCO_STORE_PATH_ENV)
         .env_remove(COCO_CLI_RUNTIME_SOCKET_ENV)
         .env_remove(COCO_PARENT_TOOL_USE_ID_ENV)
+        .env_remove(COCO_SKILL_NAME_ENV)
+        .env_remove(COCO_SKILL_DIR_ENV)
+        .env_remove(UV_CACHE_DIR_ENV)
         .env_remove(COCO_COMMAND_SHIM_MODE_ENV);
     if let Some(coco_command) = &coco_command {
         command.env("PATH", &coco_command.path_env);
@@ -1316,6 +1346,14 @@ async fn execute_command(
         } else {
             command.env(COCO_COMMAND_SHIM_MODE_ENV, "disabled");
         }
+    }
+    if let Some(active_skill) = &request.context.active_skill {
+        command
+            .env(COCO_SKILL_NAME_ENV, &active_skill.name)
+            .env(COCO_SKILL_DIR_ENV, &active_skill.directory);
+    }
+    if let Some(skill_uv_cache_dir) = &skill_uv_cache_dir {
+        command.env(UV_CACHE_DIR_ENV, skill_uv_cache_dir);
     }
     let mut child = command.spawn().context(SpawnProcessSnafu)?;
 
@@ -1380,6 +1418,7 @@ async fn execute_pty_command(
     execution: ExecutionSpec,
     runtime_server: Option<CocoCliRuntimeServer>,
     coco_command: Option<CocoCommandPathInjection>,
+    skill_uv_cache_dir: Option<PathBuf>,
     sessions: UnifiedExecSessionStoreHandle,
 ) -> std::result::Result<String, UnifiedExecToolError> {
     let pty_system = NativePtySystem::default();
@@ -1415,6 +1454,9 @@ async fn execute_pty_command(
     command.env_remove(COCO_STORE_PATH_ENV);
     command.env_remove(COCO_CLI_RUNTIME_SOCKET_ENV);
     command.env_remove(COCO_PARENT_TOOL_USE_ID_ENV);
+    command.env_remove(COCO_SKILL_NAME_ENV);
+    command.env_remove(COCO_SKILL_DIR_ENV);
+    command.env_remove(UV_CACHE_DIR_ENV);
     command.env_remove(COCO_COMMAND_SHIM_MODE_ENV);
     if let Some(coco_command) = &coco_command {
         command.env("PATH", &coco_command.path_env);
@@ -1433,6 +1475,13 @@ async fn execute_pty_command(
         } else {
             command.env(COCO_COMMAND_SHIM_MODE_ENV, "disabled");
         }
+    }
+    if let Some(active_skill) = &request.context.active_skill {
+        command.env(COCO_SKILL_NAME_ENV, &active_skill.name);
+        command.env(COCO_SKILL_DIR_ENV, &active_skill.directory);
+    }
+    if let Some(skill_uv_cache_dir) = &skill_uv_cache_dir {
+        command.env(UV_CACHE_DIR_ENV, skill_uv_cache_dir);
     }
 
     let mut child = pair.slave.spawn_command(command).map_err(|source| {
@@ -1619,6 +1668,7 @@ mod tests {
             session_branch: "main".to_owned(),
             session_role: coco_mem::SessionRole::Orchestrator,
             current_skill_name: None,
+            active_skill: None,
             store_path: None,
             enable_coco_shim,
             cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -2290,6 +2340,7 @@ mod tests {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Runner,
                 current_skill_name: None,
+                active_skill: None,
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -2328,6 +2379,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_command_runtime_injects_active_skill_env() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            ToolRuntimeEnv {
+                session_branch: "draft".to_owned(),
+                session_role: coco_mem::SessionRole::Runner,
+                current_skill_name: Some("scripted".to_owned()),
+                active_skill: Some(coco_mem::SkillRuntimeContext {
+                    name: "scripted".to_owned(),
+                    directory: skill_dir.path().to_path_buf(),
+                    scripts: vec!["scripts/inspect.py".to_owned()],
+                }),
+                store_path: None,
+                enable_coco_shim: false,
+                cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
+                skill_executor: crate::SkillToolExecutorHandle::default(),
+            },
+        );
+
+        let output = crate::with_process_env_async(
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                runtime
+                    .call(format!(
+                        r#"{{"cmd":"printf '%s|%s|%s' \"$COCO_SKILL_NAME\" \"$COCO_SKILL_DIR\" \"$UV_CACHE_DIR\"","workdir":"{}","shell":"bash"}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains(&format!(
+            "stdout:\nscripted|{}|",
+            skill_dir.path().display()
+        )));
+        assert!(output.contains("/uv-cache"));
+    }
+
+    #[tokio::test]
     async fn exec_command_runtime_injects_parent_tool_use_env_for_invocation() {
         let workspace = tempfile::tempdir().unwrap();
         let runtime = runtime(
@@ -2337,6 +2432,7 @@ mod tests {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Orchestrator,
                 current_skill_name: None,
+                active_skill: None,
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -2444,7 +2540,7 @@ mod tests {
 
         let session_id = parse_session_id(&first);
         let mut retained = String::new();
-        for _ in 0..20 {
+        for _ in 0..100 {
             let store = sessions.inner.lock().await;
             let session = store.sessions.get(&session_id).unwrap();
             let stdout = session.stdout.lock().await;
@@ -2735,6 +2831,7 @@ mod tests {
             session_branch: "draft".to_owned(),
             session_role: coco_mem::SessionRole::Runner,
             current_skill_name: None,
+            active_skill: None,
             store_path: Some(runtime_store.clone()),
             enable_coco_shim: true,
             cli_bridge: bridge,

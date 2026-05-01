@@ -1,13 +1,13 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Weak;
 
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
     Anchor, BranchStore, Kind, NewNode, NodeStore, Role, RuntimeStore, SessionAnchor, SessionRole,
-    SessionStore, SkillRecord, SkillStore, ToolUse,
+    SessionStore, SkillRecord, SkillRuntimeContext, SkillScript, SkillStore, ToolUse,
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
@@ -38,6 +38,7 @@ struct SkillEntry {
     description: String,
     path: PathBuf,
     body: String,
+    scripts: Vec<SkillScript>,
     session_role: SessionRole,
     enable_coco_shim: bool,
     search_blob: String,
@@ -74,6 +75,21 @@ pub(crate) enum SkillError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[snafu(display("failed to create skill runtime directory {path:?}: {source}"))]
+    CreateSkillRuntimeDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("failed to write skill runtime file {path:?}: {source}"))]
+    WriteSkillRuntimeFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("invalid skill script path {path:?}: {message}"))]
+    InvalidSkillScriptPath { path: String, message: String },
 
     #[snafu(display("invalid session_role {value:?} in skill file {path:?}"))]
     InvalidSkillSessionRole { path: PathBuf, value: String },
@@ -185,12 +201,14 @@ where
             skill_description: skill.description,
             skill_path: skill.path.display().to_string(),
             skill_body: skill.body,
+            scripts: skill.scripts,
             session_role: skill.session_role,
             enable_coco_shim: skill.enable_coco_shim,
         };
 
+        let runtime = materialize_skill_runtime(&skill_request)?;
         engine
-            .execute_resolved_skill(skill_request)
+            .execute_resolved_skill(skill_request, runtime)
             .await
             .map_err(executor_error_from_llm_error)
     }
@@ -202,6 +220,146 @@ fn executor_error_from_llm_error(error: LlmError) -> ExecutorError {
         message,
         source: Some(Box::new(error)),
     }
+}
+
+#[derive(Debug)]
+struct MaterializedSkillRuntime {
+    context: Option<SkillRuntimeContext>,
+    directory: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct SkillRuntimeDirectoryGuard {
+    directory: Option<PathBuf>,
+}
+
+impl Drop for MaterializedSkillRuntime {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.directory {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+}
+
+impl SkillRuntimeDirectoryGuard {
+    fn new(directory: PathBuf) -> Self {
+        Self {
+            directory: Some(directory),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.directory
+            .as_deref()
+            .expect("skill runtime directory guard should own a directory")
+    }
+
+    fn into_runtime(mut self, context: SkillRuntimeContext) -> MaterializedSkillRuntime {
+        MaterializedSkillRuntime {
+            context: Some(context),
+            directory: self.directory.take(),
+        }
+    }
+}
+
+impl Drop for SkillRuntimeDirectoryGuard {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.directory {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+}
+
+fn materialize_skill_runtime(
+    request: &SkillToolRequest,
+) -> std::result::Result<MaterializedSkillRuntime, SkillError> {
+    if request.scripts.is_empty() {
+        return Ok(MaterializedSkillRuntime {
+            context: None,
+            directory: None,
+        });
+    }
+
+    let directory = std::env::temp_dir()
+        .join("coco")
+        .join("skill-sessions")
+        .join(nanoid::nanoid!(10));
+    fs::create_dir_all(&directory).context(CreateSkillRuntimeDirectorySnafu {
+        path: directory.clone(),
+    })?;
+    let runtime_dir = SkillRuntimeDirectoryGuard::new(directory);
+
+    let skill_file = runtime_dir.path().join("SKILL.md");
+    fs::write(&skill_file, &request.skill_body)
+        .context(WriteSkillRuntimeFileSnafu { path: skill_file })?;
+
+    let mut script_paths = Vec::with_capacity(request.scripts.len());
+    for script in &request.scripts {
+        let relative_path = validate_runtime_script_path(&script.path)?;
+        let target = runtime_dir.path().join(&relative_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).context(CreateSkillRuntimeDirectorySnafu {
+                path: parent.to_path_buf(),
+            })?;
+        }
+        fs::write(&target, &script.content).context(WriteSkillRuntimeFileSnafu { path: target })?;
+        script_paths.push(relative_path);
+    }
+
+    let context = SkillRuntimeContext {
+        name: request.skill_name.clone(),
+        directory: runtime_dir.path().to_path_buf(),
+        scripts: script_paths,
+    };
+    Ok(runtime_dir.into_runtime(context))
+}
+
+fn validate_runtime_script_path(path: &str) -> std::result::Result<String, SkillError> {
+    let source_path = Path::new(path);
+    let mut normalized = PathBuf::new();
+    for component in source_path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return InvalidSkillScriptPathSnafu {
+                    path: path.to_owned(),
+                    message: "path must be relative and stay under scripts/".to_owned(),
+                }
+                .fail();
+            }
+        }
+    }
+
+    let starts_with_scripts = normalized.components().next().is_some_and(
+        |component| matches!(component, Component::Normal(part) if part == OsStr::new("scripts")),
+    );
+    if !starts_with_scripts {
+        return InvalidSkillScriptPathSnafu {
+            path: path.to_owned(),
+            message: "path must start with scripts/".to_owned(),
+        }
+        .fail();
+    }
+
+    let Some(script_path) = normalized.to_str() else {
+        return InvalidSkillScriptPathSnafu {
+            path: path.to_owned(),
+            message: "path must be valid UTF-8".to_owned(),
+        }
+        .fail();
+    };
+    if !script_path.ends_with(".py") && !script_path.ends_with(".py.lock") {
+        return InvalidSkillScriptPathSnafu {
+            path: path.to_owned(),
+            message: "path must end with .py or .py.lock".to_owned(),
+        }
+        .fail();
+    }
+
+    Ok(script_path.to_owned())
 }
 
 impl<B, S> ConversationEngine<B, S>
@@ -255,10 +413,12 @@ where
             skill_description: skill.description.clone(),
             skill_path: skill.path.display().to_string(),
             skill_body: skill.body,
+            scripts: skill.scripts,
             session_role: skill.session_role,
             enable_coco_shim: skill.enable_coco_shim,
         };
-        self.execute_resolved_skill(request)
+        let runtime = materialize_skill_runtime(&request)?;
+        self.execute_resolved_skill(request, runtime)
             .await
             .map_err(EngineError::from)
     }
@@ -266,12 +426,14 @@ where
     async fn execute_resolved_skill(
         &self,
         request: SkillToolRequest,
+        runtime: MaterializedSkillRuntime,
     ) -> std::result::Result<SkillToolExecutionResult, LlmError> {
         let service = self.service();
         let store = service.store();
         let child_branch = temporary_skill_branch_name(&request.base_branch, &request.skill_name);
         ensure_use_skill_node(store, &request.parent_tool_use_id)?;
-        let child_session_anchor_id = append_skill_session_anchor(store, &request)?;
+        let child_session_anchor_id =
+            append_skill_session_anchor(store, &request, runtime.context.clone())?;
 
         store
             .fork(&child_branch, &child_session_anchor_id)
@@ -331,6 +493,7 @@ where
 fn append_skill_session_anchor<S>(
     store: &S,
     request: &SkillToolRequest,
+    active_skill: Option<SkillRuntimeContext>,
 ) -> std::result::Result<String, LlmError>
 where
     S: NodeStore,
@@ -355,6 +518,7 @@ where
                     max_tokens: inherited.max_tokens,
                     additional_params: inherited.additional_params,
                     enable_coco_shim: request.enable_coco_shim,
+                    active_skill,
                 },
             )),
         })
@@ -420,6 +584,7 @@ fn temporary_skill_branch_name(base_branch: &str, skill_name: &str) -> String {
 }
 
 fn skill_execution_prompt(request: &SkillToolRequest) -> String {
+    let script_instructions = skill_script_instructions(request);
     formatdoc!(
         "
         You are executing the skill `{}` on an isolated child branch forked from `{}`.
@@ -435,6 +600,8 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         Skill session role:
         {}
 
+        {}
+
         Skill instructions:
         {}
         ",
@@ -443,7 +610,31 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         request.skill_description,
         request.skill_path,
         request.session_role.as_str(),
+        script_instructions,
         request.skill_body,
+    )
+}
+
+fn skill_script_instructions(request: &SkillToolRequest) -> String {
+    let python_scripts = request
+        .scripts
+        .iter()
+        .filter(|script| script.path.ends_with(".py"))
+        .map(|script| {
+            format!(
+                "- {}\n  Run with: uv run --script \"$COCO_SKILL_DIR/{}\"",
+                script.path, script.path
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if python_scripts.is_empty() {
+        return "Skill scripts:\nNo uv single-file scripts are attached.".to_owned();
+    }
+
+    format!(
+        "Skill scripts:\n{}\nUse COCO_SKILL_DIR as the materialized skill directory. Do not edit the skill source in the store.",
+        python_scripts.join("\n")
     )
 }
 
@@ -578,6 +769,7 @@ fn load_skill(path: &Path) -> std::result::Result<SkillEntry, SkillError> {
         description,
         path: path.to_path_buf(),
         body: normalized_body,
+        scripts: Vec::new(),
         session_role,
         enable_coco_shim,
         search_blob,
@@ -616,6 +808,7 @@ fn skill_entries_from_store_records(role: SessionRole, records: &[SkillRecord]) 
                 description: current.description.clone(),
                 path: synthetic_skill_path(role, &record.name, current.version),
                 body: current.body.clone(),
+                scripts: current.scripts.clone(),
                 session_role: role,
                 enable_coco_shim: current.enable_coco_shim,
                 search_blob,
@@ -829,6 +1022,10 @@ mod tests {
             skill_description: "Find relevant skills.".to_owned(),
             skill_path: "/tmp/find-skills/SKILL.md".to_owned(),
             skill_body: "# Find Skills".to_owned(),
+            scripts: vec![SkillScript {
+                path: "scripts/inspect.py".to_owned(),
+                content: "print('inspect')".to_owned(),
+            }],
             session_role: SessionRole::Runner,
             enable_coco_shim: true,
         });
@@ -838,6 +1035,7 @@ mod tests {
         assert!(prompt.contains("Skill description:\nFind relevant skills."));
         assert!(prompt.contains("Skill source:\n/tmp/find-skills/SKILL.md"));
         assert!(prompt.contains("Skill session role:\nrunner"));
+        assert!(prompt.contains("uv run --script \"$COCO_SKILL_DIR/scripts/inspect.py\""));
         assert!(prompt.contains("Skill instructions:\n# Find Skills"));
         assert!(!prompt.contains("Additional task from caller:"));
     }

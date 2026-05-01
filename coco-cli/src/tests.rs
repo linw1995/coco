@@ -716,6 +716,7 @@ fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> 
                     max_tokens: Some(64),
                     additional_params: None,
                     enable_coco_shim: true,
+                    active_skill: None,
                 },
             )),
         })
@@ -3342,6 +3343,44 @@ fn skill_show_parses_name_and_role_flags() {
     assert_eq!(command.name, "coco-runner");
 }
 
+#[test]
+fn skill_add_parses_script_inputs() {
+    let cli = Cli::try_parse_from([
+        "coco-cli",
+        "skill",
+        "add",
+        "--role",
+        "runner",
+        "--name",
+        "scripted",
+        "--description",
+        "scripted skill",
+        "--file",
+        "skill.md",
+        "--script",
+        "scripts/inspect.py",
+        "--script-dir",
+        "scripts",
+    ])
+    .unwrap();
+
+    let Command::Skill(command) = cli.command else {
+        panic!("expected skill command");
+    };
+    let crate::cli::SkillSubcommand::Add(command) = command.command else {
+        panic!("expected skill add command");
+    };
+
+    assert_eq!(
+        command.scripts,
+        vec![std::path::PathBuf::from("scripts/inspect.py")]
+    );
+    assert_eq!(
+        command.script_dir.as_deref(),
+        Some(std::path::Path::new("scripts"))
+    );
+}
+
 #[tokio::test]
 async fn skill_add_defaults_to_text_and_supports_json() {
     let (_tempdir, store_path) = temp_store_path();
@@ -3404,6 +3443,106 @@ async fn skill_add_defaults_to_text_and_supports_json() {
     let skill: serde_json::Value = serde_json::from_str(&json_output).unwrap();
     assert_eq!(skill["name"], "json-skill");
     assert_eq!(skill["current_version"], 1);
+}
+
+#[tokio::test]
+async fn skill_add_and_update_manage_script_assets() {
+    let (tempdir, store_path) = temp_store_path();
+    let skill_file = tempdir.path().join("scripted-skill.md");
+    let scripts_dir = tempdir.path().join("scripts");
+    fs::create_dir_all(&scripts_dir).unwrap();
+    fs::write(&skill_file, "# scripted\n").unwrap();
+    fs::write(
+        scripts_dir.join("inspect.py"),
+        "# /// script\n# dependencies = []\n# ///\nprint('inspect')\n",
+    )
+    .unwrap();
+    fs::write(scripts_dir.join("inspect.py.lock"), "version = 1\n").unwrap();
+
+    run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "add",
+            "--role",
+            "runner",
+            "--name",
+            "scripted",
+            "--description",
+            "scripted skill",
+            "--file",
+            skill_file.to_str().unwrap(),
+            "--script-dir",
+            scripts_dir.to_str().unwrap(),
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let show_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "show",
+            "--role",
+            "runner",
+            "--name",
+            "scripted",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let show_json: serde_json::Value = serde_json::from_str(&show_output).unwrap();
+    assert_eq!(
+        show_json["versions"][0]["scripts"][0]["path"],
+        "scripts/inspect.py"
+    );
+    assert!(
+        show_json["versions"][0]["scripts"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("print('inspect')")
+    );
+    assert_eq!(
+        show_json["versions"][0]["scripts"][1]["path"],
+        "scripts/inspect.py.lock"
+    );
+
+    let update_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "skill",
+            "update",
+            "--role",
+            "runner",
+            "--name",
+            "scripted",
+            "--clear-scripts",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let update_json: serde_json::Value = serde_json::from_str(&update_output).unwrap();
+    assert_eq!(update_json["scripts"], json!([]));
 }
 
 #[tokio::test]
