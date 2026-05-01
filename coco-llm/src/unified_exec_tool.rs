@@ -720,12 +720,12 @@ fn prepend_path_entry(path_env: Option<OsString>, entry: &Path) -> OsString {
 fn coco_cli_binary_name() -> &'static str {
     #[cfg(windows)]
     {
-        "coco-cli.exe"
+        "coco.exe"
     }
 
     #[cfg(not(windows))]
     {
-        "coco-cli"
+        "coco"
     }
 }
 
