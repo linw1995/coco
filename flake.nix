@@ -75,21 +75,26 @@ rec {
               coco-cli
               pkgs.bash
               pkgs.coreutils
+              pkgs.nono
               pkgs.cacert
               pkgs.tzdata
             ];
             config = {
               Env = [
-                "PATH=${lib.makeBinPath [coco-cli pkgs.bash pkgs.coreutils]}"
+                "PATH=${lib.makeBinPath [coco-cli pkgs.bash pkgs.coreutils pkgs.nono]}"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
                 "TZDIR=${pkgs.tzdata}/share/zoneinfo"
+                "XDG_CONFIG_HOME=/data/.config"
                 "COCO_STORE_PATH=/data/.coco-store"
                 "COCO_LOG_DIR=/data/logs"
                 "COCO_LOG=info"
+                "COCO_EXEC_SANDBOX=nono"
+                "COCO_EXEC_WORKSPACE=/workspace"
               ];
               WorkingDir = "/data";
               Volumes = {
                 "/data" = {};
+                "/workspace" = {};
               };
               ExposedPorts = {
                 "17667/tcp" = {};
