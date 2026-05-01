@@ -339,6 +339,20 @@ pub fn default_skill_groups() -> SkillGroups {
             },
         ),
     );
+    groups.orchestrator.insert(
+        "new-skill".to_owned(),
+        SkillRecord::new(
+            "new-skill",
+            SkillVersionSpec {
+                description: "Create or update dynamic CoCo skills through the skill add workflow."
+                    .to_owned(),
+                body: include_str!("default_skills/new-skill.md")
+                    .trim()
+                    .to_owned(),
+                enable_coco_shim: true,
+            },
+        ),
+    );
     groups.runner.insert(
         "coco-runner".to_owned(),
         SkillRecord::new(

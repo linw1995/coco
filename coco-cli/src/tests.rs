@@ -3776,6 +3776,7 @@ async fn skill_list_defaults_to_text_and_supports_json() {
 
     assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
     assert!(text_output.contains("coco-orchestrator"));
+    assert!(text_output.contains("new-skill"));
     assert!(text_output.contains("coco-runner"));
 
     let json_output = run_with_backend(
@@ -3802,6 +3803,13 @@ async fn skill_list_defaults_to_text_and_supports_json() {
             .unwrap()
             .iter()
             .any(|skill| { skill["role"] == "runner" && skill["name"] == "coco-runner" })
+    );
+    assert!(
+        skills
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill| { skill["role"] == "orchestrator" && skill["name"] == "new-skill" })
     );
 }
 
