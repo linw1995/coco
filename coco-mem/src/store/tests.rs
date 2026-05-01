@@ -1701,7 +1701,7 @@ where
             .current()
             .unwrap()
             .body
-            .contains("--tool exec_command --tool search_skill")
+            .contains("--tool exec_command --tool write_stdin --tool search_skill")
     );
 }
 
