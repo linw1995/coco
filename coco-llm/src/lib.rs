@@ -621,6 +621,7 @@ impl Default for SkillToolExecutorHandle {
 pub struct ToolRuntimeEnv {
     pub session_branch: String,
     pub session_role: SessionRole,
+    pub current_skill_name: Option<String>,
     pub store_path: Option<PathBuf>,
     pub enable_coco_shim: bool,
     pub cli_bridge: UnifiedExecCliBridgeHandle,
@@ -633,6 +634,7 @@ impl std::fmt::Debug for ToolRuntimeEnv {
             .debug_struct("ToolRuntimeEnv")
             .field("session_branch", &self.session_branch)
             .field("session_role", &self.session_role)
+            .field("current_skill_name", &self.current_skill_name)
             .field("store_path", &self.store_path)
             .field("enable_coco_shim", &self.enable_coco_shim)
             .field("cli_bridge", &self.cli_bridge)
@@ -1923,6 +1925,7 @@ where
             tool_runtime_env: ToolRuntimeEnv {
                 session_branch: branch.to_owned(),
                 session_role: context.session_anchor.role,
+                current_skill_name: current_skill_name_from_prompt(&context.session_anchor.prompt),
                 store_path: self.store.runtime_store_path(),
                 enable_coco_shim: context.session_anchor.enable_coco_shim,
                 cli_bridge: self.runtime.unified_exec_cli_bridge.clone(),
@@ -2103,7 +2106,15 @@ fn is_skill_execution_anchor(node: &coco_mem::Node) -> bool {
 }
 
 fn is_skill_execution_prompt(prompt: &str) -> bool {
-    prompt.starts_with("You are executing the skill `")
+    current_skill_name_from_prompt(prompt).is_some()
+}
+
+fn current_skill_name_from_prompt(prompt: &str) -> Option<String> {
+    prompt
+        .strip_prefix("You are executing the skill `")
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(name, _)| name.to_owned())
+        .filter(|name| !name.is_empty())
 }
 
 impl<B, S> LlmService<B, S> {
@@ -3600,6 +3611,17 @@ mod tests {
                 ConversationEntry::ToolUse(_) | ConversationEntry::ToolResult(_) => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn current_skill_name_from_prompt_extracts_skill_context() {
+        let prompt = "You are executing the skill `catgirl-role` on an isolated child branch.";
+
+        assert_eq!(
+            current_skill_name_from_prompt(prompt),
+            Some("catgirl-role".to_owned())
+        );
+        assert_eq!(current_skill_name_from_prompt("regular prompt"), None);
     }
 
     fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<BackendMetadata> {
@@ -5533,6 +5555,7 @@ mod tests {
             ToolRuntimeEnv {
                 session_branch: "main".to_owned(),
                 session_role: SessionRole::Orchestrator,
+                current_skill_name: None,
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: UnifiedExecCliBridgeHandle::default(),

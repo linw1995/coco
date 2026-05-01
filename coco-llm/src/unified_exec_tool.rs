@@ -1616,6 +1616,7 @@ mod tests {
         ToolRuntimeEnv {
             session_branch: "main".to_owned(),
             session_role: coco_mem::SessionRole::Orchestrator,
+            current_skill_name: None,
             store_path: None,
             enable_coco_shim,
             cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -2242,6 +2243,7 @@ mod tests {
             ToolRuntimeEnv {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Runner,
+                current_skill_name: None,
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -2288,6 +2290,7 @@ mod tests {
             ToolRuntimeEnv {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Orchestrator,
+                current_skill_name: None,
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -2682,6 +2685,7 @@ mod tests {
         let context = ToolRuntimeEnv {
             session_branch: "draft".to_owned(),
             session_role: coco_mem::SessionRole::Runner,
+            current_skill_name: None,
             store_path: Some(runtime_store.clone()),
             enable_coco_shim: true,
             cli_bridge: bridge,
