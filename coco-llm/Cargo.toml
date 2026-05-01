@@ -9,6 +9,7 @@ coco-mem = { path = "../coco-mem" }
 
 # Async runtime and traits.
 async-trait.workspace = true
+portable-pty = "0.9.0"
 tokio.workspace = true
 
 # LLM backend.

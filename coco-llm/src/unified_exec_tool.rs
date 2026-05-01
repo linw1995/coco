@@ -1,17 +1,18 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coco_mem::Tool;
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use serde_json::Value;
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::process::{ChildStdin, Command};
+use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
 
 #[cfg(unix)]
@@ -52,6 +53,7 @@ struct ExecCommandRequest {
     workspace_root: PathBuf,
     sandbox_mode: ExecSandboxMode,
     shell: OsString,
+    tty: bool,
     yield_time_ms: u64,
     max_output_tokens: Option<u64>,
     context: ToolRuntimeEnv,
@@ -94,17 +96,29 @@ struct UnifiedExecSessionStore {
 
 #[derive(Debug)]
 struct UnifiedExecSession {
-    stdin: Option<ChildStdin>,
+    stdin: Option<UnifiedExecSessionStdin>,
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     stdout_cursor: usize,
     stderr_cursor: usize,
     notify: Arc<Notify>,
-    wait_task: Option<tokio::task::JoinHandle<io::Result<std::process::ExitStatus>>>,
+    wait_task: Option<tokio::task::JoinHandle<io::Result<Option<i32>>>>,
     stdout_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
     stderr_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
     runtime_server: Option<CocoCliRuntimeServer>,
     _coco_command: Option<CocoCommandPathInjection>,
+}
+
+enum UnifiedExecSessionStdin {
+    Blocking(Box<dyn Write + Send>),
+}
+
+impl std::fmt::Debug for UnifiedExecSessionStdin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Blocking(_) => formatter.write_str("Blocking(..)"),
+        }
+    }
 }
 
 impl Drop for UnifiedExecSession {
@@ -201,6 +215,9 @@ pub enum UnifiedExecToolError {
     #[snafu(display("unified exec tool process wait task failed: {source}"))]
     JoinProcess { source: tokio::task::JoinError },
 
+    #[snafu(display("unified exec tool stdin write task failed: {source}"))]
+    JoinStdin { source: tokio::task::JoinError },
+
     #[snafu(display("unified exec tool could not join stdout task: {source}"))]
     JoinStdout { source: tokio::task::JoinError },
 
@@ -216,8 +233,25 @@ pub enum UnifiedExecToolError {
     #[snafu(display("unified exec tool session stdin is closed"))]
     StdinClosed,
 
+    #[snafu(display(
+        "unified exec tool session does not support stdin writes; start exec_command with tty=true"
+    ))]
+    StdinUnavailable,
+
     #[snafu(display("unified exec tool could not write to session stdin: {source}"))]
     WriteStdin { source: io::Error },
+
+    #[snafu(display("unified exec tool could not open PTY: {message}"))]
+    OpenPty { message: String },
+
+    #[snafu(display("unified exec tool could not clone PTY reader: {message}"))]
+    ClonePtyReader { message: String },
+
+    #[snafu(display("unified exec tool could not take PTY writer: {message}"))]
+    TakePtyWriter { message: String },
+
+    #[snafu(display("unified exec tool could not spawn PTY process: {message}"))]
+    SpawnPtyProcess { message: String },
 
     #[snafu(display("unified exec tool could not bind coco-cli runtime socket: {source}"))]
     BindRuntimeSocket { source: io::Error },
@@ -386,6 +420,7 @@ fn resolve_exec_command_request(
             "cmd",
             "workdir",
             "shell",
+            "tty",
             "yield_time_ms",
             "max_output_tokens",
         ],
@@ -400,6 +435,7 @@ fn resolve_exec_command_request(
         .and_then(Value::as_str)
         .map(OsString::from)
         .unwrap_or_else(default_shell);
+    let tty = object.get("tty").and_then(Value::as_bool).unwrap_or(false);
 
     let yield_time_ms = object
         .get("yield_time_ms")
@@ -428,6 +464,7 @@ fn resolve_exec_command_request(
         workspace_root,
         sandbox_mode: resolve_sandbox_mode()?,
         shell,
+        tty,
         yield_time_ms,
         max_output_tokens,
         context,
@@ -914,6 +951,40 @@ where
     }
 }
 
+fn stream_blocking_reader(
+    mut reader: Box<dyn Read + Send>,
+    output: Arc<Mutex<Vec<u8>>>,
+    notify: Arc<Notify>,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            notify.notify_waiters();
+            return Ok(());
+        }
+        output.blocking_lock().extend_from_slice(&buffer[..read]);
+        notify.notify_waiters();
+    }
+}
+
+async fn write_session_stdin(
+    mut stdin: UnifiedExecSessionStdin,
+    chars: String,
+) -> std::result::Result<UnifiedExecSessionStdin, UnifiedExecToolError> {
+    match &mut stdin {
+        UnifiedExecSessionStdin::Blocking(_) => tokio::task::spawn_blocking(move || {
+            let UnifiedExecSessionStdin::Blocking(mut writer) = stdin;
+            writer.write_all(chars.as_bytes())?;
+            writer.flush()?;
+            Ok(UnifiedExecSessionStdin::Blocking(writer))
+        })
+        .await
+        .context(JoinStdinSnafu)?
+        .context(WriteStdinSnafu),
+    }
+}
+
 fn output_text_since(buffer: &[u8], cursor: &mut usize) -> String {
     let start = (*cursor).min(buffer.len());
     *cursor = buffer.len();
@@ -967,7 +1038,7 @@ async fn finish_bash_session(
         .wait_task
         .take()
         .expect("unified exec session should have a process wait task");
-    let status = wait_task
+    let exit_code = wait_task
         .await
         .context(JoinProcessSnafu)?
         .context(WaitProcessSnafu)?;
@@ -997,7 +1068,7 @@ async fn finish_bash_session(
 
     tracing::info!(
         session_id,
-        exit_code = ?status.code(),
+        exit_code = ?exit_code,
         stdout_bytes = stdout.len(),
         stderr_bytes = stderr.len(),
         "unified exec tool session completed"
@@ -1005,7 +1076,7 @@ async fn finish_bash_session(
 
     Ok(format_exec_result(
         Some(&session_id.to_string()),
-        status.code(),
+        exit_code,
         stdout,
         stderr,
         false,
@@ -1093,15 +1164,21 @@ async fn execute_command(
         arg_count = execution.args.len(),
         workdir = %request.workdir.display(),
         yield_time_ms = request.yield_time_ms,
+        tty = request.tty,
         shim_enabled = request.context.enable_coco_shim,
         "starting unified exec tool command"
     );
+    if request.tty {
+        return execute_pty_command(request, execution, runtime_server, coco_command, sessions)
+            .await;
+    }
+
     let mut command = Command::new(&execution.program);
     command.kill_on_drop(true);
     command
         .args(&execution.args)
         .current_dir(&request.workdir)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove(COCO_DAEMON_SOCKET_ENV)
@@ -1131,7 +1208,6 @@ async fn execute_command(
         }
     }
     let mut child = command.spawn().context(SpawnProcessSnafu)?;
-    let stdin = child.stdin.take();
 
     let stdout = Arc::new(Mutex::new(Vec::new()));
     let stderr = Arc::new(Mutex::new(Vec::new()));
@@ -1148,7 +1224,7 @@ async fn execute_command(
     ));
     let wait_notify = notify.clone();
     let wait_task = tokio::spawn(async move {
-        let status = child.wait().await;
+        let status = child.wait().await.map(|status| status.code());
         wait_notify.notify_waiters();
         status
     });
@@ -1160,7 +1236,122 @@ async fn execute_command(
         store.sessions.insert(
             session_id,
             UnifiedExecSession {
-                stdin,
+                stdin: None,
+                stdout,
+                stderr,
+                stdout_cursor: 0,
+                stderr_cursor: 0,
+                notify,
+                wait_task: Some(wait_task),
+                stdout_task: Some(stdout_task),
+                stderr_task: Some(stderr_task),
+                runtime_server,
+                _coco_command: coco_command,
+            },
+        );
+        session_id
+    };
+
+    collect_session_until_deadline(
+        sessions,
+        session_id,
+        request.yield_time_ms,
+        request.max_output_tokens,
+    )
+    .await
+}
+
+async fn execute_pty_command(
+    request: ExecCommandRequest,
+    execution: ExecutionSpec,
+    runtime_server: Option<CocoCliRuntimeServer>,
+    coco_command: Option<CocoCommandPathInjection>,
+    sessions: UnifiedExecSessionStoreHandle,
+) -> std::result::Result<String, UnifiedExecToolError> {
+    let pty_system = NativePtySystem::default();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|source| UnifiedExecToolError::OpenPty {
+            message: source.to_string(),
+        })?;
+    let reader =
+        pair.master
+            .try_clone_reader()
+            .map_err(|source| UnifiedExecToolError::ClonePtyReader {
+                message: source.to_string(),
+            })?;
+    let writer =
+        pair.master
+            .take_writer()
+            .map_err(|source| UnifiedExecToolError::TakePtyWriter {
+                message: source.to_string(),
+            })?;
+
+    let mut command = CommandBuilder::new(execution.program.as_os_str());
+    command.args(execution.args.iter().map(OsString::as_os_str));
+    command.cwd(&request.workdir);
+    command.env_remove(COCO_DAEMON_SOCKET_ENV);
+    command.env_remove(COCO_SESSION_BRANCH_ENV);
+    command.env_remove(COCO_SESSION_ROLE_ENV);
+    command.env_remove(COCO_STORE_PATH_ENV);
+    command.env_remove(COCO_CLI_RUNTIME_SOCKET_ENV);
+    command.env_remove(COCO_PARENT_TOOL_USE_ID_ENV);
+    command.env_remove(COCO_COMMAND_SHIM_MODE_ENV);
+    if let Some(coco_command) = &coco_command {
+        command.env("PATH", &coco_command.path_env);
+        if request.context.enable_coco_shim {
+            command.env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch);
+            command.env(COCO_SESSION_ROLE_ENV, request.context.session_role.as_str());
+            if let Some(store_path) = &request.context.store_path {
+                command.env(COCO_STORE_PATH_ENV, store_path);
+            }
+            if let Some(runtime_server) = &runtime_server {
+                command.env(COCO_CLI_RUNTIME_SOCKET_ENV, &runtime_server.socket_path);
+            }
+            if let Some(parent_tool_use_id) = &request.parent_tool_use_id {
+                command.env(COCO_PARENT_TOOL_USE_ID_ENV, parent_tool_use_id);
+            }
+        } else {
+            command.env(COCO_COMMAND_SHIM_MODE_ENV, "disabled");
+        }
+    }
+
+    let mut child = pair.slave.spawn_command(command).map_err(|source| {
+        UnifiedExecToolError::SpawnPtyProcess {
+            message: source.to_string(),
+        }
+    })?;
+    drop(pair.slave);
+
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let notify = Arc::new(Notify::new());
+    let stdout_task = tokio::task::spawn_blocking({
+        let stdout = stdout.clone();
+        let notify = notify.clone();
+        move || stream_blocking_reader(reader, stdout, notify)
+    });
+    let stderr_task = tokio::spawn(async { Ok(()) });
+    let wait_notify = notify.clone();
+    let wait_task = tokio::task::spawn_blocking(move || {
+        let status = child.wait()?;
+        wait_notify.notify_waiters();
+        Ok(Some(status.exit_code() as i32))
+    });
+
+    let session_id = {
+        let mut store = sessions.inner.lock().await;
+        store.next_session_id += 1;
+        let session_id = store.next_session_id;
+        store.sessions.insert(
+            session_id,
+            UnifiedExecSession {
+                stdin: Some(UnifiedExecSessionStdin::Blocking(writer)),
                 stdout,
                 stderr,
                 stdout_cursor: 0,
@@ -1190,7 +1381,7 @@ async fn write_stdin(
     sessions: UnifiedExecSessionStoreHandle,
 ) -> std::result::Result<String, UnifiedExecToolError> {
     if !request.chars.is_empty() {
-        let mut stdin = {
+        let stdin = {
             let mut store = sessions.inner.lock().await;
             let session =
                 store
@@ -1199,15 +1390,13 @@ async fn write_stdin(
                     .context(SessionNotFoundSnafu {
                         session_id: request.session_id,
                     })?;
-            session.stdin.take().context(StdinClosedSnafu)?
+            match session.stdin.take() {
+                Some(stdin) => stdin,
+                None => return StdinUnavailableSnafu.fail(),
+            }
         };
 
-        if !request.chars.is_empty() {
-            stdin
-                .write_all(request.chars.as_bytes())
-                .await
-                .context(WriteStdinSnafu)?;
-        }
+        let stdin = write_session_stdin(stdin, request.chars.clone()).await?;
 
         let mut store = sessions.inner.lock().await;
         if let Some(session) = store.sessions.get_mut(&request.session_id) {
@@ -1524,6 +1713,7 @@ mod tests {
             workspace_root: temp_root.path().to_path_buf(),
             sandbox_mode: ExecSandboxMode::Nono,
             shell: OsString::from("bash"),
+            tty: false,
             yield_time_ms: DEFAULT_YIELD_TIME_MS,
             max_output_tokens: None,
             context: test_context(),
@@ -1543,6 +1733,7 @@ mod tests {
             workspace_root: temp_root.path().to_path_buf(),
             sandbox_mode: ExecSandboxMode::Off,
             shell: OsString::from("bash"),
+            tty: false,
             yield_time_ms: DEFAULT_YIELD_TIME_MS,
             max_output_tokens: None,
             context: test_context(),
@@ -1585,6 +1776,7 @@ mod tests {
             workspace_root: temp_root.path().to_path_buf(),
             sandbox_mode: ExecSandboxMode::Off,
             shell: OsString::from("bash"),
+            tty: false,
             yield_time_ms: DEFAULT_YIELD_TIME_MS,
             max_output_tokens: None,
             context: test_context(),
@@ -2028,7 +2220,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_command_runtime_writes_stdin_to_running_session() {
+    async fn exec_command_runtime_uses_null_stdin_without_tty() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (exec_command, _) = runtime_pair(workspace.path().to_path_buf(), test_context());
+
+        let output = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                exec_command
+                    .call(format!(
+                        r#"{{"cmd":"cat; printf done","workdir":"{}","shell":"bash","yield_time_ms":1000}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("Process exited with code 0"));
+        assert!(output.contains("stdout:\ndone"));
+    }
+
+    #[tokio::test]
+    async fn write_stdin_rejects_non_tty_session() {
         let workspace = tempfile::tempdir().unwrap();
         let (exec_command, write_stdin) =
             runtime_pair(workspace.path().to_path_buf(), test_context());
@@ -2038,7 +2253,46 @@ mod tests {
             || async {
                 exec_command
                     .call(format!(
-                        r#"{{"cmd":"read line; printf 'got:%s' \"$line\"","workdir":"{}","shell":"bash","yield_time_ms":10}}"#,
+                        r#"{{"cmd":"sleep 0.2","workdir":"{}","shell":"bash","yield_time_ms":10}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(first.contains("exit_status: running"));
+        let session_id = parse_session_id(&first);
+        let error = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                write_stdin
+                    .call(format!(
+                        r#"{{"session_id":{},"chars":"hello\n","yield_time_ms":1000}}"#,
+                        session_id
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("tty=true"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_runtime_writes_stdin_to_tty_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (exec_command, write_stdin) =
+            runtime_pair(workspace.path().to_path_buf(), test_context());
+
+        let first = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                exec_command
+                    .call(format!(
+                        r#"{{"cmd":"read line; printf 'got:%s' \"$line\"","workdir":"{}","shell":"bash","tty":true,"yield_time_ms":10}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -2065,7 +2319,7 @@ mod tests {
         .unwrap();
 
         assert!(second.contains("Process exited with code 0"));
-        assert!(second.contains("stdout:\ngot:hello"));
+        assert!(second.contains("got:hello"));
     }
 
     #[tokio::test]

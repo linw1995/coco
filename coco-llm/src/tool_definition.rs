@@ -22,6 +22,10 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                         "type": "string",
                         "description": "Optional shell binary to launch. Defaults to the user's SHELL, or bash when SHELL is unset."
                     },
+                    "tty": {
+                        "type": "boolean",
+                        "description": "Whether to allocate a PTY for interactive commands. Defaults to false; write_stdin is only available for tty sessions."
+                    },
                     "yield_time_ms": {
                         "type": "integer",
                         "description": "How long to wait in milliseconds for output before yielding. This is a time slice, not a process timeout; defaults to 1000."
