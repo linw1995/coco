@@ -1713,6 +1713,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn parse_pid(output: &str) -> Option<String> {
+        output
+            .lines()
+            .find_map(|line| line.trim_end_matches('\r').strip_prefix("pid:"))
+            .map(str::trim)
+            .map(str::to_owned)
+    }
+
+    #[cfg(unix)]
     fn process_exists(pid: &str) -> bool {
         std::process::Command::new("kill")
             .arg("-0")
@@ -1732,6 +1741,30 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_session_pid(
+        write_stdin: &dyn rig::tool::ToolDyn,
+        session_id: &str,
+    ) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let output = write_stdin
+                .call(format!(
+                    r#"{{"session_id":"{}","chars":"","yield_time_ms":100}}"#,
+                    session_id
+                ))
+                .await
+                .unwrap();
+            if let Some(pid) = parse_pid(&output) {
+                return pid;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("expected child pid in output");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     fn runtime_pair(
@@ -2553,12 +2586,13 @@ mod tests {
         .unwrap();
 
         assert!(first.contains("exit_status: running"));
-        let pid = first
-            .lines()
-            .find_map(|line| line.trim_end_matches('\r').strip_prefix("pid:"))
-            .expect("expected child pid in output")
-            .trim()
-            .to_owned();
+        let pid = match parse_pid(&first) {
+            Some(pid) => pid,
+            None => {
+                let session_id = parse_session_id(&first);
+                wait_for_session_pid(write_stdin.as_ref(), &session_id).await
+            }
+        };
         assert!(
             wait_for_process(&pid).await,
             "child process should be running"
@@ -2583,7 +2617,7 @@ mod tests {
     async fn removing_branch_kills_tty_sessions_for_branch() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = session_store();
-        let (exec_command, _write_stdin) = runtime_pair_with_sessions(
+        let (exec_command, write_stdin) = runtime_pair_with_sessions(
             workspace.path().to_path_buf(),
             ToolRuntimeEnv {
                 session_branch: "draft".to_owned(),
@@ -2607,12 +2641,13 @@ mod tests {
         .unwrap();
 
         assert!(first.contains("exit_status: running"));
-        let pid = first
-            .lines()
-            .find_map(|line| line.trim_end_matches('\r').strip_prefix("pid:"))
-            .expect("expected child pid in output")
-            .trim()
-            .to_owned();
+        let pid = match parse_pid(&first) {
+            Some(pid) => pid,
+            None => {
+                let session_id = parse_session_id(&first);
+                wait_for_session_pid(write_stdin.as_ref(), &session_id).await
+            }
+        };
         assert!(
             wait_for_process(&pid).await,
             "child process should be running"
@@ -2641,7 +2676,7 @@ mod tests {
     async fn removing_all_sessions_kills_tty_sessions() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = session_store();
-        let (exec_command, _write_stdin) = runtime_pair_with_sessions(
+        let (exec_command, write_stdin) = runtime_pair_with_sessions(
             workspace.path().to_path_buf(),
             test_context(),
             sessions.clone(),
@@ -2662,12 +2697,13 @@ mod tests {
         .unwrap();
 
         assert!(first.contains("exit_status: running"));
-        let pid = first
-            .lines()
-            .find_map(|line| line.trim_end_matches('\r').strip_prefix("pid:"))
-            .expect("expected child pid in output")
-            .trim()
-            .to_owned();
+        let pid = match parse_pid(&first) {
+            Some(pid) => pid,
+            None => {
+                let session_id = parse_session_id(&first);
+                wait_for_session_pid(write_stdin.as_ref(), &session_id).await
+            }
+        };
         assert!(
             wait_for_process(&pid).await,
             "child process should be running"
