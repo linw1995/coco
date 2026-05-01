@@ -129,7 +129,11 @@ omit `--provider-profile`.
 
 ### Telegram
 
-CoCo can also poll Telegram and route incoming messages to a CoCo branch.
+CoCo can poll Telegram and route incoming messages to a CoCo branch. The
+Telegram channel is receive-only: outbound replies must be sent by the built-in
+`telegram` skill. Telegram inbound prompts automatically include the target
+`chat_id` and `reply_to_message_id`, and CoCo injects the tools needed to call
+that skill for the reply.
 
 Create a Telegram bot and get its token:
 
@@ -169,7 +173,9 @@ EOF
 `allowed_chat_ids` is recommended. If it is empty or omitted, the bot accepts
 messages from any chat that can reach it.
 
-Start the daemon with both ChatGPT and Telegram secrets:
+Start the daemon with both ChatGPT and Telegram secrets. The `telegram` skill
+uses `COCO_TELEGRAM_TOKEN`, `TELEGRAM_BOT_TOKEN`, or `BUB_TELEGRAM_TOKEN` for
+Bot API calls:
 
 ```bash
 docker run --rm -it \
