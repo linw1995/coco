@@ -1128,6 +1128,23 @@ where
 
 impl<B, S> LlmService<B, S>
 where
+    S: BranchStore,
+{
+    pub async fn delete_session_branch(&self, branch: &str) -> Result<()> {
+        let _guard = self.lock_branch(branch).await;
+        self.store.delete_branch(branch).context(MemorySnafu)?;
+        let cleaned_session_count = self.runtime.unified_exec_sessions.remove_branch(branch).await;
+        tracing::info!(
+            branch,
+            cleaned_session_count,
+            "deleted session branch"
+        );
+        Ok(())
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
     S: BranchStore + SessionStore,
 {
     pub async fn open_pull_request(

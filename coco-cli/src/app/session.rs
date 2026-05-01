@@ -207,7 +207,9 @@ where
             command.json,
         )?)),
         SessionSubcommand::Delete(command) => {
-            store.delete_branch(&command.branch).context(StoreSnafu)?;
+            llm.delete_session_branch(&command.branch)
+                .await
+                .context(LlmSnafu)?;
             let result = SessionDeleteResult {
                 branch: command.branch,
             };

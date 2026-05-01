@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -91,6 +91,50 @@ impl Clone for UnifiedExecSessionStoreHandle {
 #[derive(Debug, Default)]
 struct UnifiedExecSessionStore {
     sessions: HashMap<String, UnifiedExecSession>,
+    by_branch: HashMap<String, HashSet<String>>,
+}
+
+impl UnifiedExecSessionStore {
+    fn insert_session(&mut self, session_id: String, session: UnifiedExecSession) {
+        self.by_branch
+            .entry(session.branch.clone())
+            .or_default()
+            .insert(session_id.clone());
+        self.sessions.insert(session_id, session);
+    }
+
+    fn remove_session(&mut self, session_id: &str) -> Option<UnifiedExecSession> {
+        let session = self.sessions.remove(session_id)?;
+        if let Some(session_ids) = self.by_branch.get_mut(&session.branch) {
+            session_ids.remove(session_id);
+            if session_ids.is_empty() {
+                self.by_branch.remove(&session.branch);
+            }
+        }
+        Some(session)
+    }
+
+    fn remove_branch(&mut self, branch: &str) -> Vec<UnifiedExecSession> {
+        let Some(session_ids) = self.by_branch.remove(branch) else {
+            return vec![];
+        };
+        session_ids
+            .into_iter()
+            .filter_map(|session_id| self.sessions.remove(&session_id))
+            .collect()
+    }
+}
+
+impl UnifiedExecSessionStoreHandle {
+    pub(crate) async fn remove_branch(&self, branch: &str) -> usize {
+        let sessions = {
+            let mut store = self.inner.lock().await;
+            store.remove_branch(branch)
+        };
+        let count = sessions.len();
+        drop(sessions);
+        count
+    }
 }
 
 #[derive(Debug, Default)]
@@ -101,12 +145,12 @@ struct UnifiedExecOutputBuffer {
 
 #[derive(Debug)]
 struct UnifiedExecSession {
+    branch: String,
     stdin: Option<UnifiedExecSessionStdin>,
     stdout: Arc<Mutex<UnifiedExecOutputBuffer>>,
     stderr: Arc<Mutex<UnifiedExecOutputBuffer>>,
     stdout_cursor: usize,
     stderr_cursor: usize,
-    output_limit_bytes: Option<usize>,
     notify: Arc<Notify>,
     wait_task: Option<tokio::task::JoinHandle<io::Result<Option<i32>>>>,
     stdout_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
@@ -1153,8 +1197,7 @@ async fn collect_session_until_deadline(
                 .is_some_and(tokio::task::JoinHandle::is_finished)
             {
                 let session = store
-                    .sessions
-                    .remove(&session_id)
+                    .remove_session(&session_id)
                     .expect("unified exec session should still exist");
                 drop(store);
                 return finish_bash_session(session_id, session, max_output_tokens).await;
@@ -1285,15 +1328,15 @@ async fn execute_command(
     let session_id = {
         let mut store = sessions.inner.lock().await;
         let session_id = next_session_id(&store);
-        store.sessions.insert(
+        store.insert_session(
             session_id.clone(),
             UnifiedExecSession {
+                branch: request.context.session_branch.clone(),
                 stdin: None,
                 stdout,
                 stderr,
                 stdout_cursor: 0,
                 stderr_cursor: 0,
-                output_limit_bytes,
                 notify,
                 wait_task: Some(wait_task),
                 stdout_task: Some(stdout_task),
@@ -1403,15 +1446,15 @@ async fn execute_pty_command(
     let session_id = {
         let mut store = sessions.inner.lock().await;
         let session_id = next_session_id(&store);
-        store.sessions.insert(
+        store.insert_session(
             session_id.clone(),
             UnifiedExecSession {
+                branch: request.context.session_branch.clone(),
                 stdin: Some(UnifiedExecSessionStdin::Blocking(writer)),
                 stdout,
                 stderr,
                 stdout_cursor: 0,
                 stderr_cursor: 0,
-                output_limit_bytes,
                 notify,
                 wait_task: Some(wait_task),
                 stdout_task: Some(stdout_task),
@@ -2330,7 +2373,6 @@ mod tests {
             let session = store.sessions.get(&session_id).unwrap();
             let stdout = session.stdout.lock().await;
             retained = String::from_utf8_lossy(&stdout.bytes).into_owned();
-            assert_eq!(session.output_limit_bytes, Some(8));
             assert!(stdout.bytes.len() <= 8);
             if retained == "89abcdef" {
                 break;
@@ -2487,6 +2529,58 @@ mod tests {
         assert!(
             !process_exists(&pid),
             "dropping the tty session should kill child process {pid}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removing_branch_kills_tty_sessions_for_branch() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = session_store();
+        let (exec_command, _write_stdin) = runtime_pair_with_sessions(
+            workspace.path().to_path_buf(),
+            ToolRuntimeEnv {
+                session_branch: "draft".to_owned(),
+                ..test_context()
+            },
+            sessions.clone(),
+        );
+
+        let first = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                exec_command
+                    .call(format!(
+                        r#"{{"cmd":"printf 'pid:%s\n' $$; read _","workdir":"{}","shell":"bash","tty":true,"yield_time_ms":100}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(first.contains("exit_status: running"));
+        let pid = first
+            .lines()
+            .find_map(|line| line.trim_end_matches('\r').strip_prefix("pid:"))
+            .expect("expected child pid in output")
+            .trim()
+            .to_owned();
+        assert!(process_exists(&pid), "child process should be running");
+
+        assert_eq!(sessions.remove_branch("other").await, 0);
+        assert!(process_exists(&pid), "unrelated branch cleanup should not kill child");
+        assert_eq!(sessions.remove_branch("draft").await, 1);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_exists(&pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            !process_exists(&pid),
+            "removing the branch should kill child process {pid}"
         );
     }
 
