@@ -29,7 +29,7 @@ tracing.workspace = true
 
 # Identifiers and test helpers.
 indoc = "2.0.6"
-nanoid = "0.4.0"
+nanoid = "0.5.0"
 
 [dev-dependencies]
 # Test fixtures.
