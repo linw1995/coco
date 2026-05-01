@@ -315,6 +315,7 @@ pub struct ResolvedCompletionRequest {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
+    runtime: RuntimeCapabilities,
     trace_node_appender: Option<TraceNodeAppenderHandle>,
 }
 
@@ -823,10 +824,21 @@ pub trait CompletionBackend: Send + Sync {
 type BranchLockTable = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 type WorkflowLock = Arc<Mutex<()>>;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RuntimeCapabilities {
     pub unified_exec_cli_bridge: UnifiedExecCliBridgeHandle,
     pub skill_tool_executor: SkillToolExecutorHandle,
+    unified_exec_sessions: unified_exec_tool::UnifiedExecSessionStoreHandle,
+}
+
+impl Default for RuntimeCapabilities {
+    fn default() -> Self {
+        Self {
+            unified_exec_cli_bridge: UnifiedExecCliBridgeHandle::default(),
+            skill_tool_executor: SkillToolExecutorHandle::default(),
+            unified_exec_sessions: unified_exec_tool::session_store(),
+        }
+    }
 }
 
 pub struct LlmService<B = RigBackend, S = MemoryStore> {
@@ -956,6 +968,7 @@ impl<B, S> LlmServiceBuilder<B, S> {
             runtime: RuntimeCapabilities {
                 unified_exec_cli_bridge: self.unified_exec_cli_bridge.unwrap_or_default(),
                 skill_tool_executor: self.skill_tool_executor.unwrap_or_default(),
+                unified_exec_sessions: unified_exec_tool::session_store(),
             },
             branch_locks: Arc::new(Mutex::new(HashMap::new())),
             workflow_lock: Arc::new(Mutex::new(())),
@@ -2108,6 +2121,7 @@ impl<B, S> LlmService<B, S> {
                 .overrides
                 .additional_params
                 .or_else(|| session.config.additional_params.clone()),
+            runtime: self.runtime.clone(),
             trace_node_appender,
         }
     }
@@ -2256,10 +2270,10 @@ impl RuntimeToolSet {
 fn build_runtime_tools(
     session: &ResolvedSession,
     workspace_root: std::path::PathBuf,
+    exec_sessions: unified_exec_tool::UnifiedExecSessionStoreHandle,
 ) -> std::result::Result<RuntimeToolSet, BackendError> {
     let mut definitions = Vec::with_capacity(session.config.tools.len());
     let mut tools = HashMap::with_capacity(session.config.tools.len());
-    let exec_sessions = unified_exec_tool::session_store();
 
     for tool in &session.config.tools {
         let runtime_tool = match tool.name.as_str() {
@@ -2302,13 +2316,18 @@ fn build_runtime_tools(
 
 fn build_runtime_tools_for_session(
     session: &ResolvedSession,
+    runtime: &RuntimeCapabilities,
 ) -> std::result::Result<RuntimeToolSet, BackendError> {
     let workspace_root = unified_exec_tool::resolve_workspace_root().map_err(|source| {
         BackendError::UnifiedExecTool {
             message: source.to_string(),
         }
     })?;
-    build_runtime_tools(session, workspace_root)
+    build_runtime_tools(
+        session,
+        workspace_root,
+        runtime.unified_exec_sessions.clone(),
+    )
 }
 
 fn configure_completion_request_builder<M>(
@@ -2708,7 +2727,7 @@ impl CompletionRunner {
         let Some((prompt, history)) = history.split_last() else {
             return Err(BackendError::failed("completion requires history"));
         };
-        let runtime_tools = build_runtime_tools_for_session(&session)?;
+        let runtime_tools = build_runtime_tools_for_session(&session, &request.runtime)?;
         let tool_definitions = runtime_tools.definition_list();
 
         Ok(Self {

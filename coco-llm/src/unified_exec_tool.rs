@@ -93,13 +93,20 @@ struct UnifiedExecSessionStore {
     sessions: HashMap<String, UnifiedExecSession>,
 }
 
+#[derive(Debug, Default)]
+struct UnifiedExecOutputBuffer {
+    start_offset: usize,
+    bytes: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct UnifiedExecSession {
     stdin: Option<UnifiedExecSessionStdin>,
-    stdout: Arc<Mutex<Vec<u8>>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout: Arc<Mutex<UnifiedExecOutputBuffer>>,
+    stderr: Arc<Mutex<UnifiedExecOutputBuffer>>,
     stdout_cursor: usize,
     stderr_cursor: usize,
+    output_limit_bytes: Option<usize>,
     notify: Arc<Notify>,
     wait_task: Option<tokio::task::JoinHandle<io::Result<Option<i32>>>>,
     stdout_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
@@ -943,7 +950,8 @@ impl Drop for CocoCliRuntimeServer {
 
 async fn stream_child_pipe<R>(
     reader: Option<R>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Arc<Mutex<UnifiedExecOutputBuffer>>,
+    output_limit_bytes: Option<usize>,
     notify: Arc<Notify>,
 ) -> io::Result<()>
 where
@@ -959,14 +967,18 @@ where
             notify.notify_waiters();
             return Ok(());
         }
-        output.lock().await.extend_from_slice(&buffer[..read]);
+        output
+            .lock()
+            .await
+            .append(&buffer[..read], output_limit_bytes);
         notify.notify_waiters();
     }
 }
 
 fn stream_blocking_reader(
     mut reader: Box<dyn Read + Send>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Arc<Mutex<UnifiedExecOutputBuffer>>,
+    output_limit_bytes: Option<usize>,
     notify: Arc<Notify>,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 8192];
@@ -976,7 +988,9 @@ fn stream_blocking_reader(
             notify.notify_waiters();
             return Ok(());
         }
-        output.blocking_lock().extend_from_slice(&buffer[..read]);
+        output
+            .blocking_lock()
+            .append(&buffer[..read], output_limit_bytes);
         notify.notify_waiters();
     }
 }
@@ -998,10 +1012,30 @@ async fn write_session_stdin(
     }
 }
 
-fn output_text_since(buffer: &[u8], cursor: &mut usize) -> String {
-    let start = (*cursor).min(buffer.len());
-    *cursor = buffer.len();
-    String::from_utf8_lossy(&buffer[start..]).into_owned()
+impl UnifiedExecOutputBuffer {
+    fn append(&mut self, bytes: &[u8], limit_bytes: Option<usize>) {
+        self.bytes.extend_from_slice(bytes);
+
+        if let Some(limit_bytes) = limit_bytes
+            && self.bytes.len() > limit_bytes
+        {
+            let dropped = self.bytes.len() - limit_bytes;
+            self.bytes.drain(..dropped);
+            self.start_offset = self.start_offset.saturating_add(dropped);
+        }
+    }
+
+    fn text_since(&self, cursor: &mut usize) -> String {
+        let buffer_end = self.start_offset + self.bytes.len();
+        let absolute_start = (*cursor).max(self.start_offset).min(buffer_end);
+        let relative_start = absolute_start - self.start_offset;
+        *cursor = buffer_end;
+        String::from_utf8_lossy(&self.bytes[relative_start..]).into_owned()
+    }
+}
+
+fn output_limit_bytes(max_output_tokens: Option<u64>) -> Option<usize> {
+    max_output_tokens.map(|tokens| tokens.saturating_mul(4).min(usize::MAX as u64) as usize)
 }
 
 fn limit_output_text(output: String, max_output_tokens: Option<u64>) -> String {
@@ -1029,11 +1063,11 @@ async fn read_session_output(
     max_output_tokens: Option<u64>,
 ) -> (String, String) {
     let stdout_guard = session.stdout.lock().await;
-    let stdout = output_text_since(&stdout_guard, &mut session.stdout_cursor);
+    let stdout = stdout_guard.text_since(&mut session.stdout_cursor);
     drop(stdout_guard);
 
     let stderr_guard = session.stderr.lock().await;
-    let stderr = output_text_since(&stderr_guard, &mut session.stderr_cursor);
+    let stderr = stderr_guard.text_since(&mut session.stderr_cursor);
     drop(stderr_guard);
 
     (
@@ -1225,17 +1259,20 @@ async fn execute_command(
     }
     let mut child = command.spawn().context(SpawnProcessSnafu)?;
 
-    let stdout = Arc::new(Mutex::new(Vec::new()));
-    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let output_limit_bytes = output_limit_bytes(request.max_output_tokens);
+    let stdout = Arc::new(Mutex::new(UnifiedExecOutputBuffer::default()));
+    let stderr = Arc::new(Mutex::new(UnifiedExecOutputBuffer::default()));
     let notify = Arc::new(Notify::new());
     let stdout_task = tokio::spawn(stream_child_pipe(
         child.stdout.take(),
         stdout.clone(),
+        output_limit_bytes,
         notify.clone(),
     ));
     let stderr_task = tokio::spawn(stream_child_pipe(
         child.stderr.take(),
         stderr.clone(),
+        output_limit_bytes,
         notify.clone(),
     ));
     let wait_notify = notify.clone();
@@ -1256,6 +1293,7 @@ async fn execute_command(
                 stderr,
                 stdout_cursor: 0,
                 stderr_cursor: 0,
+                output_limit_bytes,
                 notify,
                 wait_task: Some(wait_task),
                 stdout_task: Some(stdout_task),
@@ -1345,13 +1383,14 @@ async fn execute_pty_command(
     let pty_child_killer = Some(child.clone_killer());
     drop(pair.slave);
 
-    let stdout = Arc::new(Mutex::new(Vec::new()));
-    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let output_limit_bytes = output_limit_bytes(request.max_output_tokens);
+    let stdout = Arc::new(Mutex::new(UnifiedExecOutputBuffer::default()));
+    let stderr = Arc::new(Mutex::new(UnifiedExecOutputBuffer::default()));
     let notify = Arc::new(Notify::new());
     let stdout_task = tokio::task::spawn_blocking({
         let stdout = stdout.clone();
         let notify = notify.clone();
-        move || stream_blocking_reader(reader, stdout, notify)
+        move || stream_blocking_reader(reader, stdout, output_limit_bytes, notify)
     });
     let stderr_task = tokio::spawn(async { Ok(()) });
     let wait_notify = notify.clone();
@@ -1372,6 +1411,7 @@ async fn execute_pty_command(
                 stderr,
                 stdout_cursor: 0,
                 stderr_cursor: 0,
+                output_limit_bytes,
                 notify,
                 wait_task: Some(wait_task),
                 stdout_task: Some(stdout_task),
@@ -1626,6 +1666,14 @@ mod tests {
         context: ToolRuntimeEnv,
     ) -> (Box<dyn rig::tool::ToolDyn>, Box<dyn rig::tool::ToolDyn>) {
         let sessions = session_store();
+        runtime_pair_with_sessions(workspace_root, context, sessions)
+    }
+
+    fn runtime_pair_with_sessions(
+        workspace_root: PathBuf,
+        context: ToolRuntimeEnv,
+        sessions: UnifiedExecSessionStoreHandle,
+    ) -> (Box<dyn rig::tool::ToolDyn>, Box<dyn rig::tool::ToolDyn>) {
         (
             Box::new(runtime_with_sessions(
                 temp_exec_command_tool(),
@@ -2243,6 +2291,56 @@ mod tests {
         assert!(second.contains("Process exited with code 0"));
         assert!(second.contains("exit_status: 0"));
         assert!(second.contains("stdout:\nsecond"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_runtime_retains_limited_session_output() {
+        let workspace = tempfile::tempdir().unwrap();
+        let script = workspace.path().join("slow-output.sh");
+        write_executable_script(
+            &script,
+            "#!/usr/bin/env bash\nprintf '0123456789abcdef'; sleep 0.2\n",
+        );
+        let sessions = session_store();
+        let (exec_command, _write_stdin) = runtime_pair_with_sessions(
+            workspace.path().to_path_buf(),
+            test_context(),
+            sessions.clone(),
+        );
+
+        let first = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                exec_command
+                    .call(format!(
+                        r#"{{"cmd":"{}","workdir":"{}","yield_time_ms":10,"max_output_tokens":2}}"#,
+                        script.display(),
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        let session_id = parse_session_id(&first);
+        let mut retained = String::new();
+        for _ in 0..20 {
+            let store = sessions.inner.lock().await;
+            let session = store.sessions.get(&session_id).unwrap();
+            let stdout = session.stdout.lock().await;
+            retained = String::from_utf8_lossy(&stdout.bytes).into_owned();
+            assert_eq!(session.output_limit_bytes, Some(8));
+            assert!(stdout.bytes.len() <= 8);
+            if retained == "89abcdef" {
+                break;
+            }
+            drop(stdout);
+            drop(store);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(retained, "89abcdef");
     }
 
     #[tokio::test]
