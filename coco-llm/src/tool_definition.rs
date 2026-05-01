@@ -48,7 +48,7 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                 "type": "object",
                 "properties": {
                     "session_id": {
-                        "type": "integer",
+                        "type": "string",
                         "description": "Identifier of the running exec_command session."
                     },
                     "chars": {

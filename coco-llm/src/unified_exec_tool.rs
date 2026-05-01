@@ -62,7 +62,7 @@ struct ExecCommandRequest {
 
 #[derive(Debug, Clone)]
 struct WriteStdinRequest {
-    session_id: u64,
+    session_id: String,
     chars: String,
     yield_time_ms: u64,
     max_output_tokens: Option<u64>,
@@ -90,8 +90,7 @@ impl Clone for UnifiedExecSessionStoreHandle {
 
 #[derive(Debug, Default)]
 struct UnifiedExecSessionStore {
-    next_session_id: u64,
-    sessions: HashMap<u64, UnifiedExecSession>,
+    sessions: HashMap<String, UnifiedExecSession>,
 }
 
 #[derive(Debug)]
@@ -186,14 +185,14 @@ pub enum UnifiedExecToolError {
     #[snafu(display("exec_command requires a string field `cmd`"))]
     MissingCommand,
 
-    #[snafu(display("write_stdin requires an integer field `session_id`"))]
+    #[snafu(display("write_stdin requires a string field `session_id`"))]
     MissingSessionId,
 
     #[snafu(display("unified exec tool input includes unsupported field `{field}`"))]
     UnsupportedInputField { field: String },
 
     #[snafu(display("unified exec tool session {session_id:?} was not found"))]
-    SessionNotFound { session_id: u64 },
+    SessionNotFound { session_id: String },
 
     #[snafu(display("unified exec tool could not resolve workdir: {source}"))]
     ResolveWorkdir { source: io::Error },
@@ -342,6 +341,15 @@ pub(crate) fn runtime_with_sessions(
 
 pub(crate) fn session_store() -> UnifiedExecSessionStoreHandle {
     UnifiedExecSessionStoreHandle::default()
+}
+
+fn next_session_id(store: &UnifiedExecSessionStore) -> String {
+    loop {
+        let candidate = format!("exec-{}", nanoid::nanoid!());
+        if !store.sessions.contains_key(&candidate) {
+            return candidate;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -503,8 +511,9 @@ fn resolve_write_stdin_request(
     let object = args.as_object().context(InvalidInputTypeSnafu)?;
     let session_id = object
         .get("session_id")
-        .and_then(Value::as_u64)
-        .context(MissingSessionIdSnafu)?;
+        .and_then(Value::as_str)
+        .context(MissingSessionIdSnafu)?
+        .to_owned();
     let chars = object
         .get("chars")
         .and_then(Value::as_str)
@@ -1034,7 +1043,7 @@ async fn read_session_output(
 }
 
 async fn finish_bash_session(
-    session_id: u64,
+    session_id: String,
     mut session: UnifiedExecSession,
     max_output_tokens: Option<u64>,
 ) -> std::result::Result<String, UnifiedExecToolError> {
@@ -1080,7 +1089,7 @@ async fn finish_bash_session(
     );
 
     Ok(format_exec_result(
-        Some(&session_id.to_string()),
+        Some(&session_id),
         exit_code,
         stdout,
         stderr,
@@ -1090,7 +1099,7 @@ async fn finish_bash_session(
 
 async fn collect_session_until_deadline(
     sessions: UnifiedExecSessionStoreHandle,
-    session_id: u64,
+    session_id: String,
     yield_time_ms: u64,
     max_output_tokens: Option<u64>,
 ) -> std::result::Result<String, UnifiedExecToolError> {
@@ -1101,7 +1110,9 @@ async fn collect_session_until_deadline(
             let session = store
                 .sessions
                 .get_mut(&session_id)
-                .context(SessionNotFoundSnafu { session_id })?;
+                .context(SessionNotFoundSnafu {
+                    session_id: session_id.clone(),
+                })?;
             if session
                 .wait_task
                 .as_ref()
@@ -1117,7 +1128,7 @@ async fn collect_session_until_deadline(
             if Instant::now() >= deadline {
                 let (stdout, stderr) = read_session_output(session, max_output_tokens).await;
                 return Ok(format_exec_result(
-                    Some(&session_id.to_string()),
+                    Some(&session_id),
                     None,
                     stdout,
                     stderr,
@@ -1236,10 +1247,9 @@ async fn execute_command(
 
     let session_id = {
         let mut store = sessions.inner.lock().await;
-        store.next_session_id += 1;
-        let session_id = store.next_session_id;
+        let session_id = next_session_id(&store);
         store.sessions.insert(
-            session_id,
+            session_id.clone(),
             UnifiedExecSession {
                 stdin: None,
                 stdout,
@@ -1353,10 +1363,9 @@ async fn execute_pty_command(
 
     let session_id = {
         let mut store = sessions.inner.lock().await;
-        store.next_session_id += 1;
-        let session_id = store.next_session_id;
+        let session_id = next_session_id(&store);
         store.sessions.insert(
-            session_id,
+            session_id.clone(),
             UnifiedExecSession {
                 stdin: Some(UnifiedExecSessionStdin::Blocking(writer)),
                 stdout,
@@ -1396,7 +1405,7 @@ async fn write_stdin(
                     .sessions
                     .get_mut(&request.session_id)
                     .context(SessionNotFoundSnafu {
-                        session_id: request.session_id,
+                        session_id: request.session_id.clone(),
                     })?;
             match session.stdin.take() {
                 Some(stdin) => stdin,
@@ -1562,7 +1571,7 @@ mod tests {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "integer"},
+                    "session_id": {"type": "string"},
                     "chars": {"type": "string"},
                     "yield_time_ms": {"type": "integer"},
                     "max_output_tokens": {"type": "integer"}
@@ -1594,13 +1603,12 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
-    fn parse_session_id(output: &str) -> u64 {
+    fn parse_session_id(output: &str) -> String {
         output
             .lines()
             .find_map(|line| line.strip_prefix("session_id: "))
             .expect("output should include session_id")
-            .parse()
-            .expect("session_id should be numeric")
+            .to_owned()
     }
 
     #[cfg(unix)]
@@ -1847,7 +1855,7 @@ mod tests {
     #[test]
     fn resolve_write_stdin_request_rejects_removed_timeout_field() {
         let args = serde_json::json!({
-            "session_id": 1,
+            "session_id": "exec-test",
             "timeout_ms": 10,
         });
 
@@ -2223,7 +2231,7 @@ mod tests {
             || async {
                 write_stdin
                     .call(format!(
-                        r#"{{"session_id":{},"chars":"","yield_time_ms":1000}}"#,
+                        r#"{{"session_id":"{}","chars":"","yield_time_ms":1000}}"#,
                         session_id
                     ))
                     .await
@@ -2287,7 +2295,7 @@ mod tests {
             || async {
                 write_stdin
                     .call(format!(
-                        r#"{{"session_id":{},"chars":"hello\n","yield_time_ms":1000}}"#,
+                        r#"{{"session_id":"{}","chars":"hello\n","yield_time_ms":1000}}"#,
                         session_id
                     ))
                     .await
@@ -2327,7 +2335,7 @@ mod tests {
             || async {
                 write_stdin
                     .call(format!(
-                        r#"{{"session_id":{},"chars":"hello\n","yield_time_ms":1000}}"#,
+                        r#"{{"session_id":"{}","chars":"hello\n","yield_time_ms":1000}}"#,
                         session_id
                     ))
                     .await
