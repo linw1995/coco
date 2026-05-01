@@ -17,7 +17,8 @@ docker load < result
 ```
 
 The image starts `coco-cli daemon serve` by default. It listens on port
-`17667` and stores runtime data under `/data`.
+`17667`, stores CoCo config and runtime data under `/data`, and exposes
+`/workspace` as the isolated exec tool workspace.
 
 ```bash
 mkdir -p .coco-data
@@ -25,6 +26,7 @@ docker run --rm -it \
   --name coco \
   -p 17667:17667 \
   -v "$PWD/.coco-data:/data" \
+  -v "$PWD:/workspace" \
   coco:latest
 ```
 
@@ -51,8 +53,8 @@ persist its cache under `/data/.config`.
 
 ```bash
 docker run --rm -it \
-  -e XDG_CONFIG_HOME=/data/.config \
   -v "$PWD/.coco-data:/data" \
+  -v "$PWD:/workspace" \
   coco:latest \
   coco-cli session create \
     --provider-profile gpt-subscription \
@@ -102,6 +104,7 @@ docker run --rm -it \
   --name coco \
   -p 17667:17667 \
   -v "$PWD/.coco-data:/data" \
+  -v "$PWD:/workspace" \
   -e CHATGPT_ACCESS_TOKEN="$CHATGPT_ACCESS_TOKEN" \
   -e CHATGPT_ACCOUNT_ID="$CHATGPT_ACCOUNT_ID" \
   coco:latest
@@ -112,6 +115,7 @@ Create the first session:
 ```bash
 docker run --rm -it \
   -v "$PWD/.coco-data:/data" \
+  -v "$PWD:/workspace" \
   -e CHATGPT_ACCESS_TOKEN="$CHATGPT_ACCESS_TOKEN" \
   -e CHATGPT_ACCOUNT_ID="$CHATGPT_ACCOUNT_ID" \
   coco:latest \
@@ -172,6 +176,7 @@ docker run --rm -it \
   --name coco \
   -p 17667:17667 \
   -v "$PWD/.coco-data:/data" \
+  -v "$PWD:/workspace" \
   -e CHATGPT_ACCESS_TOKEN="$CHATGPT_ACCESS_TOKEN" \
   -e CHATGPT_ACCOUNT_ID="$CHATGPT_ACCOUNT_ID" \
   -e TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \

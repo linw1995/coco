@@ -5563,7 +5563,7 @@ mod tests {
             },
         );
         let output = with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 runtime
                     .call(format!(

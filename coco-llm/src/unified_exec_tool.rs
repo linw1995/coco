@@ -208,6 +208,8 @@ const MAX_RUNTIME_SOCKET_PATH_LEN: usize = 107;
 const DEFAULT_YIELD_TIME_MS: u64 = 1_000;
 const SESSION_POLL_INTERVAL_MS: u64 = 25;
 const COCO_DAEMON_SOCKET_ENV: &str = "COCO_DAEMON_SOCKET";
+const COCO_EXEC_SANDBOX_ENV: &str = "COCO_EXEC_SANDBOX";
+const COCO_EXEC_WORKSPACE_ENV: &str = "COCO_EXEC_WORKSPACE";
 
 #[cfg(unix)]
 const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
@@ -346,7 +348,7 @@ pub enum UnifiedExecToolError {
 
 pub fn resolve_workspace_root() -> std::result::Result<PathBuf, UnifiedExecToolError> {
     let current_dir = std::env::current_dir().context(ResolveWorkspaceRootSnafu)?;
-    let workspace_raw = std::env::var_os("COCO_BASH_WORKSPACE");
+    let workspace_raw = std::env::var_os(COCO_EXEC_WORKSPACE_ENV);
     let path = match workspace_raw {
         Some(workspace_raw) => {
             let configured = PathBuf::from(workspace_raw);
@@ -428,8 +430,8 @@ pub fn runtime_tool(
 }
 
 fn resolve_sandbox_mode() -> std::result::Result<ExecSandboxMode, UnifiedExecToolError> {
-    let Some(value) = std::env::var_os("COCO_BASH_SANDBOX") else {
-        return Ok(ExecSandboxMode::Auto);
+    let Some(value) = std::env::var_os(COCO_EXEC_SANDBOX_ENV) else {
+        return Ok(ExecSandboxMode::Nono);
     };
     match value.to_string_lossy().as_ref() {
         "auto" => Ok(ExecSandboxMode::Auto),
@@ -1772,7 +1774,7 @@ mod tests {
         let relative = OsString::from("workspace");
 
         let resolved = crate::with_process_env_async(
-            &[("COCO_BASH_WORKSPACE", Some(relative.as_os_str()))],
+            &[(COCO_EXEC_WORKSPACE_ENV, Some(relative.as_os_str()))],
             || async {
                 std::env::set_current_dir(temp_root.path()).unwrap();
                 let result = resolve_workspace_root();
@@ -1784,6 +1786,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved, nested.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_sandbox_mode_defaults_to_nono() {
+        let resolved = crate::with_process_env_async(&[(COCO_EXEC_SANDBOX_ENV, None)], || async {
+            resolve_sandbox_mode()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, ExecSandboxMode::Nono);
     }
 
     #[tokio::test]
@@ -1996,7 +2009,7 @@ mod tests {
         );
 
         let output = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 runtime
                     .call(format!(
@@ -2033,7 +2046,7 @@ mod tests {
 
         let output = crate::with_process_env_async(
             &[
-                ("COCO_BASH_SANDBOX", Some(OsStr::new("auto"))),
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("auto"))),
                 ("PATH", Some(path_env.as_os_str())),
             ],
             || async {
@@ -2068,7 +2081,7 @@ mod tests {
 
         let output = crate::with_process_env_async(
             &[
-                ("COCO_BASH_SANDBOX", Some(OsStr::new("off"))),
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("off"))),
                 ("PATH", Some(path_env.as_os_str())),
             ],
             || async {
@@ -2126,7 +2139,7 @@ mod tests {
 
         let output = crate::with_process_env_async(
             &[
-                ("COCO_BASH_SANDBOX", Some(OsStr::new("off"))),
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("off"))),
                 ("PATH", Some(path_env.as_os_str())),
             ],
             || async {
@@ -2161,7 +2174,7 @@ mod tests {
 
         let error = crate::with_process_env_async(
             &[
-                ("COCO_BASH_SANDBOX", Some(OsStr::new("nono"))),
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("nono"))),
                 ("PATH", Some(path_env.as_os_str())),
             ],
             || async {
@@ -2203,7 +2216,7 @@ mod tests {
 
         let output = crate::with_process_env_async(
             &[
-                ("COCO_BASH_SANDBOX", Some(OsStr::new("nono"))),
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("nono"))),
                 ("PATH", Some(path_env.as_os_str())),
             ],
             || async {
@@ -2264,7 +2277,7 @@ mod tests {
                     COCO_PARENT_TOOL_USE_ID_ENV,
                     Some(OsStr::new("stale-tool-use")),
                 ),
-                ("COCO_BASH_SANDBOX", Some(OsStr::new("off"))),
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("off"))),
             ],
             || async {
                 runtime
@@ -2299,7 +2312,7 @@ mod tests {
         );
 
         let output = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 runtime
                     .execute(
@@ -2329,7 +2342,7 @@ mod tests {
             runtime_pair(workspace.path().to_path_buf(), test_context());
 
         let first = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 exec_command
                     .call(format!(
@@ -2348,7 +2361,7 @@ mod tests {
 
         let session_id = parse_session_id(&first);
         let second = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 write_stdin
                     .call(format!(
@@ -2382,7 +2395,7 @@ mod tests {
         );
 
         let first = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 exec_command
                     .call(format!(
@@ -2421,7 +2434,7 @@ mod tests {
         let (exec_command, _) = runtime_pair(workspace.path().to_path_buf(), test_context());
 
         let output = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 exec_command
                     .call(format!(
@@ -2445,7 +2458,7 @@ mod tests {
             runtime_pair(workspace.path().to_path_buf(), test_context());
 
         let first = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 exec_command
                     .call(format!(
@@ -2461,7 +2474,7 @@ mod tests {
         assert!(first.contains("exit_status: running"));
         let session_id = parse_session_id(&first);
         let error = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 write_stdin
                     .call(format!(
@@ -2484,7 +2497,7 @@ mod tests {
             runtime_pair(workspace.path().to_path_buf(), test_context());
 
         let first = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 exec_command
                     .call(format!(
@@ -2501,7 +2514,7 @@ mod tests {
 
         let session_id = parse_session_id(&first);
         let second = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 write_stdin
                     .call(format!(
@@ -2526,7 +2539,7 @@ mod tests {
             runtime_pair(workspace.path().to_path_buf(), test_context());
 
         let first = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 exec_command
                     .call(format!(
@@ -2580,7 +2593,7 @@ mod tests {
         );
 
         let first = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 exec_command
                     .call(format!(
@@ -2635,7 +2648,7 @@ mod tests {
         );
 
         let first = crate::with_process_env_async(
-            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 exec_command
                     .call(format!(
