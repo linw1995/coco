@@ -3,9 +3,8 @@
 Agent-facing execution guide for Telegram outbound communication.
 
 Use this skill whenever you need to send, reply to, or edit Telegram messages.
-Assume a Telegram bot token is available from `COCO_TELEGRAM_TOKEN`,
-`TELEGRAM_BOT_TOKEN`, or `BUB_TELEGRAM_TOKEN` unless an explicit `--token` is
-provided.
+Assume a Telegram bot token is available from `COCO_TELEGRAM_BOT_TOKEN` unless
+an explicit `--token` is provided.
 
 ## Required Inputs
 

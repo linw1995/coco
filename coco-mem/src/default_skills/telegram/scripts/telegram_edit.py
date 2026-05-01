@@ -6,7 +6,7 @@ import sys
 import urllib.error
 import urllib.request
 
-TOKEN_ENV_NAMES = ("COCO_TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN", "BUB_TELEGRAM_TOKEN")
+TOKEN_ENV_NAMES = ("COCO_TELEGRAM_BOT_TOKEN",)
 
 
 def resolve_token(explicit_token: str | None) -> str:
@@ -17,8 +17,7 @@ def resolve_token(explicit_token: str | None) -> str:
         if value:
             return value
     raise SystemExit(
-        "Telegram token is missing. Set COCO_TELEGRAM_TOKEN, TELEGRAM_BOT_TOKEN, "
-        "or pass --token."
+        "Telegram token is missing. Set COCO_TELEGRAM_BOT_TOKEN or pass --token."
     )
 
 

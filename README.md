@@ -140,10 +140,10 @@ Create a Telegram bot and get its token:
 1. Open Telegram and talk to `@BotFather`.
 2. Run `/newbot`.
 3. Follow the prompts and copy the bot token.
-4. Export it as `TELEGRAM_BOT_TOKEN`.
+4. Export it as `COCO_TELEGRAM_BOT_TOKEN`.
 
 ```bash
-export TELEGRAM_BOT_TOKEN="123456:replace-with-your-bot-token"
+export COCO_TELEGRAM_BOT_TOKEN="123456:replace-with-your-bot-token"
 ```
 
 Get the chat id you want to allow:
@@ -153,7 +153,7 @@ Get the chat id you want to allow:
 3. Read `message.chat.id` from the JSON response.
 
 ```bash
-curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates"
+curl "https://api.telegram.org/bot${COCO_TELEGRAM_BOT_TOKEN}/getUpdates"
 ```
 
 Add Telegram configuration to `.coco-data/config.toml`:
@@ -163,7 +163,7 @@ cat >> .coco-data/config.toml <<'EOF'
 
 [channels.telegram]
 enabled = true
-token = "${TELEGRAM_BOT_TOKEN}"
+token = "${COCO_TELEGRAM_BOT_TOKEN}"
 branch = "main"
 poll_timeout_secs = 30
 allowed_chat_ids = ["123456789"]
@@ -174,8 +174,7 @@ EOF
 messages from any chat that can reach it.
 
 Start the daemon with both ChatGPT and Telegram secrets. The `telegram` skill
-uses `COCO_TELEGRAM_TOKEN`, `TELEGRAM_BOT_TOKEN`, or `BUB_TELEGRAM_TOKEN` for
-Bot API calls:
+uses `COCO_TELEGRAM_BOT_TOKEN` for Bot API calls:
 
 ```bash
 docker run --rm -it \
@@ -185,6 +184,6 @@ docker run --rm -it \
   -v "$PWD:/workspace" \
   -e CHATGPT_ACCESS_TOKEN="$CHATGPT_ACCESS_TOKEN" \
   -e CHATGPT_ACCOUNT_ID="$CHATGPT_ACCOUNT_ID" \
-  -e TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
+  -e COCO_TELEGRAM_BOT_TOKEN="$COCO_TELEGRAM_BOT_TOKEN" \
   coco:latest
 ```
