@@ -19,6 +19,25 @@ coco skill show --role runner --name <skill-name>
 body should contain the operating instructions only; `coco skill add` stores
 the name and description separately.
 
+1. If the skill needs Python helpers, organize them as uv single-file scripts.
+Each script should live under a `scripts/` directory and carry its dependencies
+in PEP 723 inline metadata:
+
+```python
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "httpx",
+# ]
+# ///
+
+print("hello from a skill script")
+```
+
+Use `uv lock --script scripts/<name>.py` when a lockfile is needed. Add script
+assets with `--script-dir scripts` or with repeated `--script scripts/<name>.py`
+arguments.
+
 1. Add the skill with the appropriate role:
 
 ```bash
@@ -27,6 +46,7 @@ coco skill add \
   --name <skill-name> \
   --description "<when to use this skill>" \
   --file /path/to/skill-body.md \
+  --script-dir scripts \
   --enable-coco-shim
 ```
 
@@ -72,5 +92,9 @@ coco skill update \
   --role orchestrator \
   --name <skill-name> \
   --description "<updated trigger>" \
-  --file /path/to/skill-body.md
+  --file /path/to/skill-body.md \
+  --script-dir scripts
 ```
+
+Use `--clear-scripts` when the next skill version should remove all script
+assets.

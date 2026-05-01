@@ -2507,7 +2507,7 @@ mod tests {
 
         let session_id = parse_session_id(&first);
         let mut retained = String::new();
-        for _ in 0..20 {
+        for _ in 0..100 {
             let store = sessions.inner.lock().await;
             let session = store.sessions.get(&session_id).unwrap();
             let stdout = session.stdout.lock().await;
