@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -698,6 +698,150 @@ fn create_command_alias(target: &Path, alias_path: &Path) -> std::result::Result
     }
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn nix_store_package_path(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        return None;
+    }
+    if !matches!(components.next(), Some(std::path::Component::Normal(name)) if name == OsStr::new("nix"))
+    {
+        return None;
+    }
+    if !matches!(components.next(), Some(std::path::Component::Normal(name)) if name == OsStr::new("store"))
+    {
+        return None;
+    }
+    let package = components.next()?;
+    let std::path::Component::Normal(package) = package else {
+        return None;
+    };
+    Some(PathBuf::from("/nix").join("store").join(package))
+}
+
+fn nix_store_closure_paths(package_path: &Path) -> Vec<PathBuf> {
+    let Ok(output) = StdCommand::new("nix-store")
+        .arg("-qR")
+        .arg(package_path)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn nix_store_allow_paths(package_path: &Path) -> Vec<PathBuf> {
+    let closure_paths = nix_store_closure_paths(package_path);
+    if !closure_paths.is_empty() {
+        return closure_paths;
+    }
+
+    vec![package_path.to_path_buf()]
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_otool_library_paths(output: &str) -> Vec<PathBuf> {
+    output
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let path = line
+                .trim()
+                .split_once(" (")
+                .map_or(line.trim(), |(path, _)| path);
+            path.starts_with('/').then(|| PathBuf::from(path))
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_ldd_library_paths(output: &str) -> Vec<PathBuf> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let path = if let Some((_, path)) = line.split_once("=>") {
+                path.split_whitespace().next()
+            } else {
+                line.split_whitespace().next()
+            }?;
+            path.starts_with('/').then(|| PathBuf::from(path))
+        })
+        .collect()
+}
+
+fn linked_library_paths(binary_path: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(output) = StdCommand::new("otool").arg("-L").arg(binary_path).output() else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        parse_otool_library_paths(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(output) = StdCommand::new("ldd").arg(binary_path).output() else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        parse_ldd_library_paths(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = binary_path;
+        Vec::new()
+    }
+}
+
+fn allow_paths_for_linked_library(library_path: &Path) -> Vec<PathBuf> {
+    if let Some(package_path) = nix_store_package_path(library_path) {
+        return vec![package_path];
+    }
+
+    vec![library_path.to_path_buf()]
+}
+
+fn linked_library_allow_paths(binary_path: &Path) -> Vec<PathBuf> {
+    let mut allow_paths = Vec::new();
+    let mut pending = linked_library_paths(binary_path);
+    let mut visited = HashSet::new();
+
+    while let Some(library_path) = pending.pop() {
+        if !visited.insert(library_path.clone()) {
+            continue;
+        }
+        for allow_path in allow_paths_for_linked_library(&library_path) {
+            push_unique_path(&mut allow_paths, allow_path);
+        }
+        if visited.len() < 128 {
+            pending.extend(linked_library_paths(&library_path));
+        }
+    }
+
+    allow_paths
+}
+
 fn prepend_path_entry(path_env: Option<OsString>, entry: &Path) -> OsString {
     let paths = std::iter::once(entry.to_path_buf())
         .chain(
@@ -719,6 +863,15 @@ fn prepend_path_entry(path_env: Option<OsString>, entry: &Path) -> OsString {
         }
         fallback
     })
+}
+
+fn prepend_path_entries(path_env: Option<OsString>, entries: &[PathBuf]) -> OsString {
+    entries
+        .iter()
+        .rev()
+        .fold(path_env.unwrap_or_default(), |path_env, entry| {
+            prepend_path_entry(Some(path_env), entry)
+        })
 }
 
 fn coco_cli_binary_name() -> &'static str {
@@ -765,6 +918,7 @@ fn resolve_coco_cli_executable() -> std::result::Result<PathBuf, UnifiedExecTool
 fn prepare_coco_command_path_injection(
     workspace_root: &Path,
     mode: CocoCommandShimMode,
+    include_uv_path: bool,
 ) -> std::result::Result<CocoCommandPathInjection, UnifiedExecToolError> {
     let runtime_root = resolve_runtime_root(workspace_root)?;
     std::fs::create_dir_all(&runtime_root).context(CreateCocoCommandShimDirSnafu)?;
@@ -786,10 +940,28 @@ fn prepare_coco_command_path_injection(
     {
         extra_allow_paths.push(parent.to_path_buf());
     }
+    let source_path_env = std::env::var_os("PATH");
+    let mut extra_path_entries = vec![bin_dir.clone()];
+    if include_uv_path && let Some(uv_path) = find_program_in_path("uv", source_path_env.as_deref())
+    {
+        let uv_path = canonicalize_existing_path(&uv_path);
+        if let Some(parent) = uv_path.parent() {
+            extra_path_entries.push(parent.to_path_buf());
+            push_unique_path(&mut extra_allow_paths, parent.to_path_buf());
+        }
+        if let Some(package_path) = nix_store_package_path(&uv_path) {
+            for allow_path in nix_store_allow_paths(&package_path) {
+                push_unique_path(&mut extra_allow_paths, allow_path);
+            }
+        }
+        for allow_path in linked_library_allow_paths(&uv_path) {
+            push_unique_path(&mut extra_allow_paths, allow_path);
+        }
+    }
 
     Ok(CocoCommandPathInjection {
         root_dir,
-        path_env: prepend_path_entry(std::env::var_os("PATH"), &bin_dir),
+        path_env: prepend_path_entries(source_path_env, &extra_path_entries),
         extra_allow_paths,
     })
 }
@@ -1259,6 +1431,7 @@ async fn execute_command(
         } else {
             CocoCommandShimMode::Disabled
         },
+        request.context.active_skill.is_some(),
     )?);
     let runtime_server = if request.context.enable_coco_shim {
         start_coco_cli_runtime_server(&request.workspace_root, &request.context).await?
@@ -2186,9 +2359,12 @@ mod tests {
     #[test]
     fn disabled_coco_shim_uses_binary_alias_instead_of_script() {
         let workspace = tempfile::tempdir().unwrap();
-        let injection =
-            prepare_coco_command_path_injection(workspace.path(), CocoCommandShimMode::Disabled)
-                .unwrap();
+        let injection = prepare_coco_command_path_injection(
+            workspace.path(),
+            CocoCommandShimMode::Disabled,
+            false,
+        )
+        .unwrap();
         let alias_path = injection.root_dir.join("bin").join("coco");
         let expected = resolve_coco_cli_executable().unwrap();
 
@@ -2204,6 +2380,109 @@ mod tests {
                 std::fs::read(expected).unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn active_skill_coco_shim_adds_uv_directory_from_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fake_bin = tempfile::tempdir().unwrap();
+        let fake_uv = fake_bin.path().join("uv");
+        std::fs::write(&fake_uv, "#!/bin/sh\n").unwrap();
+
+        let injection = crate::with_process_env_async(
+            &[
+                ("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str())),
+                ("PATH", Some(fake_bin.path().as_os_str())),
+            ],
+            || async {
+                prepare_coco_command_path_injection(
+                    workspace.path(),
+                    CocoCommandShimMode::Disabled,
+                    true,
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+        let expected_uv_parent = fake_uv
+            .canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(injection.extra_allow_paths.contains(&expected_uv_parent));
+        let path_entries = std::env::split_paths(&injection.path_env).collect::<Vec<_>>();
+        assert_eq!(path_entries.first(), Some(&injection.root_dir.join("bin")));
+        assert_eq!(path_entries.get(1), Some(&expected_uv_parent));
+    }
+
+    #[test]
+    fn nix_store_package_path_returns_package_root() {
+        assert_eq!(
+            nix_store_package_path(Path::new("/nix/store/abc123-uv-0.8.0/bin/uv")),
+            Some(PathBuf::from("/nix/store/abc123-uv-0.8.0"))
+        );
+        assert_eq!(nix_store_package_path(Path::new("/usr/bin/uv")), None);
+    }
+
+    #[test]
+    fn nix_store_allow_paths_falls_back_to_package_root() {
+        let package_path = Path::new("/nix/store/not-real-uv");
+
+        let allow_paths = nix_store_allow_paths(package_path);
+
+        assert_eq!(allow_paths, vec![package_path.to_path_buf()]);
+    }
+
+    #[test]
+    fn parse_otool_library_paths_extracts_absolute_dependencies() {
+        let output = "\
+/nix/store/example-uv/bin/uv:
+\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)
+\t@rpath/libignored.dylib (compatibility version 1.0.0, current version 1.0.0)
+\t/nix/store/example-jemalloc/lib/libjemalloc.2.dylib (compatibility version 0.0.0, current version 0.0.0)
+";
+
+        assert_eq!(
+            parse_otool_library_paths(output),
+            vec![
+                PathBuf::from("/usr/lib/libSystem.B.dylib"),
+                PathBuf::from("/nix/store/example-jemalloc/lib/libjemalloc.2.dylib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ldd_library_paths_extracts_absolute_dependencies() {
+        let output = "\
+linux-vdso.so.1 (0x00007ffc)
+libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
+/lib64/ld-linux-x86-64.so.2 (0x00007f)
+";
+
+        assert_eq!(
+            parse_ldd_library_paths(output),
+            vec![
+                PathBuf::from("/nix/store/example-glibc/lib/libc.so.6"),
+                PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_paths_for_linked_library_prefers_nix_package_root() {
+        assert_eq!(
+            allow_paths_for_linked_library(Path::new(
+                "/nix/store/example-jemalloc/lib/libjemalloc.2.dylib"
+            )),
+            vec![PathBuf::from("/nix/store/example-jemalloc")]
+        );
+        assert_eq!(
+            allow_paths_for_linked_library(Path::new("/usr/lib/libSystem.B.dylib")),
+            vec![PathBuf::from("/usr/lib/libSystem.B.dylib")]
+        );
     }
 
     #[tokio::test]
@@ -2328,6 +2607,71 @@ mod tests {
         assert!(args.contains("--"));
         assert!(args.contains("bash"));
         assert!(args.contains("-c"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_runtime_nono_mode_allows_active_skill_uv_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let fake_bin = tempfile::tempdir().unwrap();
+        let skill_dir = tempfile::tempdir().unwrap();
+        let observed_args = workspace.path().join("nono-args.txt");
+        let bash_path = resolve_bash_path_locked().await;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
+        write_executable_script(&fake_bin.path().join("uv"), "#!/bin/sh\nexit 0\n");
+        write_executable_script(
+            &fake_bin.path().join("nono"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--\" ]; then\n    shift\n    break\n  fi\n  shift\ndone\nexec \"$@\"\n",
+                observed_args.display()
+            ),
+        );
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            ToolRuntimeEnv {
+                session_branch: "draft".to_owned(),
+                session_role: coco_mem::SessionRole::Runner,
+                current_skill_name: Some("scripted".to_owned()),
+                active_skill: Some(coco_mem::SkillRuntimeContext {
+                    name: "scripted".to_owned(),
+                    directory: skill_dir.path().to_path_buf(),
+                    scripts: vec!["scripts/inspect.py".to_owned()],
+                }),
+                store_path: None,
+                enable_coco_shim: false,
+                cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
+                skill_executor: crate::SkillToolExecutorHandle::default(),
+            },
+        );
+        let path_env = OsString::from(fake_bin.path().as_os_str());
+
+        let output = crate::with_process_env_async(
+            &[
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("nono"))),
+                ("PATH", Some(path_env.as_os_str())),
+                ("XDG_RUNTIME_DIR", Some(runtime_root.path().as_os_str())),
+            ],
+            || async {
+                runtime
+                    .call(format!(
+                        r#"{{"cmd":"printf '%s|%s' \"$(command -v uv)\" \"$UV_CACHE_DIR\"","workdir":"{}","shell":"bash"}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("exit_status: 0"));
+        assert!(output.contains("uv|"));
+        assert!(output.contains("/uv-cache"));
+        let args = std::fs::read_to_string(&observed_args).unwrap();
+        assert!(args.contains(&fake_bin.path().display().to_string()));
+        assert!(args.contains(&skill_dir.path().display().to_string()));
+        assert!(args.contains("/uv-cache"));
     }
 
     #[tokio::test]
