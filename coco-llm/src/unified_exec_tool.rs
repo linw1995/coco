@@ -123,6 +123,11 @@ impl UnifiedExecSessionStore {
             .filter_map(|session_id| self.sessions.remove(&session_id))
             .collect()
     }
+
+    fn remove_all(&mut self) -> Vec<UnifiedExecSession> {
+        self.by_branch.clear();
+        self.sessions.drain().map(|(_, session)| session).collect()
+    }
 }
 
 impl UnifiedExecSessionStoreHandle {
@@ -130,6 +135,16 @@ impl UnifiedExecSessionStoreHandle {
         let sessions = {
             let mut store = self.inner.lock().await;
             store.remove_branch(branch)
+        };
+        let count = sessions.len();
+        drop(sessions);
+        count
+    }
+
+    pub(crate) async fn remove_all(&self) -> usize {
+        let sessions = {
+            let mut store = self.inner.lock().await;
+            store.remove_all()
         };
         let count = sessions.len();
         drop(sessions);
@@ -1704,6 +1719,18 @@ mod tests {
             .is_ok_and(|status| status.success())
     }
 
+    #[cfg(unix)]
+    async fn wait_for_process(pid: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if process_exists(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
     fn runtime_pair(
         workspace_root: PathBuf,
         context: ToolRuntimeEnv,
@@ -2516,7 +2543,10 @@ mod tests {
             .expect("expected child pid in output")
             .trim()
             .to_owned();
-        assert!(process_exists(&pid), "child process should be running");
+        assert!(
+            wait_for_process(&pid).await,
+            "child process should be running"
+        );
 
         drop(exec_command);
         drop(write_stdin);
@@ -2567,10 +2597,16 @@ mod tests {
             .expect("expected child pid in output")
             .trim()
             .to_owned();
-        assert!(process_exists(&pid), "child process should be running");
+        assert!(
+            wait_for_process(&pid).await,
+            "child process should be running"
+        );
 
         assert_eq!(sessions.remove_branch("other").await, 0);
-        assert!(process_exists(&pid), "unrelated branch cleanup should not kill child");
+        assert!(
+            process_exists(&pid),
+            "unrelated branch cleanup should not kill child"
+        );
         assert_eq!(sessions.remove_branch("draft").await, 1);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -2581,6 +2617,56 @@ mod tests {
         assert!(
             !process_exists(&pid),
             "removing the branch should kill child process {pid}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removing_all_sessions_kills_tty_sessions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = session_store();
+        let (exec_command, _write_stdin) = runtime_pair_with_sessions(
+            workspace.path().to_path_buf(),
+            test_context(),
+            sessions.clone(),
+        );
+
+        let first = crate::with_process_env_async(
+            &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
+            || async {
+                exec_command
+                    .call(format!(
+                        r#"{{"cmd":"printf 'pid:%s\n' $$; read _","workdir":"{}","shell":"bash","tty":true,"yield_time_ms":100}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(first.contains("exit_status: running"));
+        let pid = first
+            .lines()
+            .find_map(|line| line.trim_end_matches('\r').strip_prefix("pid:"))
+            .expect("expected child pid in output")
+            .trim()
+            .to_owned();
+        assert!(
+            wait_for_process(&pid).await,
+            "child process should be running"
+        );
+
+        assert_eq!(sessions.remove_all().await, 1);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_exists(&pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            !process_exists(&pid),
+            "removing all sessions should kill child process {pid}"
         );
     }
 

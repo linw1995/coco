@@ -26,9 +26,9 @@ use crate::{
     },
 };
 
-#[derive(Debug)]
-pub(crate) struct CocoCliDaemonServerHandle {
+pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
+    llm: Arc<LlmService<B, S>>,
     socket_task: tokio::task::JoinHandle<()>,
     channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
     console: Option<ConsoleServerHandle>,
@@ -143,7 +143,7 @@ pub(crate) fn start_daemon_server<B, S>(
     provider_profiles: &ProviderProfiles,
     shared_engine: &Arc<ConversationEngine<B, S>>,
     options: DaemonServerOptions<'_>,
-) -> Result<CocoCliDaemonServerHandle>
+) -> Result<CocoCliDaemonServerHandle<B, S>>
 where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
@@ -185,6 +185,7 @@ where
         tracing::info!(addr = %console.addr(), "coco console listening");
     }
     let channel_task = start_channel_task(options.channel_configs, &shared_engine)?;
+    let handle_llm = llm.clone();
 
     let socket_task = tokio::spawn(async move {
         loop {
@@ -230,6 +231,7 @@ where
 
     Ok(CocoCliDaemonServerHandle {
         socket_path,
+        llm: handle_llm,
         socket_task,
         channel_task,
         console,
@@ -299,16 +301,17 @@ where
     }
 }
 
-impl CocoCliDaemonServerHandle {
+impl<B, S> CocoCliDaemonServerHandle<B, S> {
     pub(crate) async fn wait(self) -> Result<()> {
         let Self {
             socket_path,
+            llm,
             socket_task,
             channel_task,
             console,
         } = self;
 
-        wait_daemon_tasks(socket_path, socket_task, console, channel_task).await
+        wait_daemon_tasks(socket_path, llm, socket_task, console, channel_task).await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -328,6 +331,7 @@ impl CocoCliDaemonServerHandle {
         if let Some(console) = self.console {
             console.shutdown().await.context(ConsoleSnafu)?;
         }
+        self.llm.cleanup_runtime_processes().await;
         cleanup_socket(&self.socket_path);
         match socket_result {
             Ok(()) => Ok(()),
@@ -337,8 +341,9 @@ impl CocoCliDaemonServerHandle {
     }
 }
 
-async fn wait_daemon_tasks(
+async fn wait_daemon_tasks<B, S>(
     socket_path: PathBuf,
+    llm: Arc<LlmService<B, S>>,
     socket_task: tokio::task::JoinHandle<()>,
     mut console: Option<ConsoleServerHandle>,
     mut channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -347,21 +352,25 @@ async fn wait_daemon_tasks(
         socket_result = socket_task => {
             shutdown_console(console).await?;
             abort_channel_task(channel_task).await?;
+            llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             socket_result.context(JoinDaemonServerSnafu).map(|_| ())
         }
         console_result = async { console.as_mut().expect("console task should exist").wait_mut().await }, if console.is_some() => {
             abort_channel_task(channel_task).await?;
+            llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             console_result.context(ConsoleSnafu)
         }
         channel_result = async { channel_task.as_mut().expect("channel task should exist").await }, if channel_task.is_some() => {
             shutdown_console(console).await?;
+            llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             channel_result.context(JoinChannelTaskSnafu)??;
             Ok(())
         }
         else => {
+            llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             Ok(())
         }

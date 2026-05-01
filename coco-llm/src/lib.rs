@@ -1024,6 +1024,12 @@ impl<B, S> LlmService<B, S> {
         }
         guards
     }
+
+    pub async fn cleanup_runtime_processes(&self) -> usize {
+        let cleaned_session_count = self.runtime.unified_exec_sessions.remove_all().await;
+        tracing::info!(cleaned_session_count, "cleaned runtime processes");
+        cleaned_session_count
+    }
 }
 
 impl<B, S> LlmService<B, S>
@@ -1133,12 +1139,12 @@ where
     pub async fn delete_session_branch(&self, branch: &str) -> Result<()> {
         let _guard = self.lock_branch(branch).await;
         self.store.delete_branch(branch).context(MemorySnafu)?;
-        let cleaned_session_count = self.runtime.unified_exec_sessions.remove_branch(branch).await;
-        tracing::info!(
-            branch,
-            cleaned_session_count,
-            "deleted session branch"
-        );
+        let cleaned_session_count = self
+            .runtime
+            .unified_exec_sessions
+            .remove_branch(branch)
+            .await;
+        tracing::info!(branch, cleaned_session_count, "deleted session branch");
         Ok(())
     }
 }
