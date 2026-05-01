@@ -212,6 +212,9 @@ const COCO_DAEMON_SOCKET_ENV: &str = "COCO_DAEMON_SOCKET";
 const COCO_EXEC_SANDBOX_ENV: &str = "COCO_EXEC_SANDBOX";
 const COCO_EXEC_WORKSPACE_ENV: &str = "COCO_EXEC_WORKSPACE";
 const UV_CACHE_DIR_ENV: &str = "UV_CACHE_DIR";
+const UV_PYTHON_INSTALL_DIR_ENV: &str = "UV_PYTHON_INSTALL_DIR";
+const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
+const HOME_ENV: &str = "HOME";
 
 #[cfg(unix)]
 const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
@@ -846,6 +849,43 @@ fn linked_library_allow_paths(binary_path: &Path) -> Vec<PathBuf> {
     allow_paths
 }
 
+fn uv_python_install_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = std::env::var_os(UV_PYTHON_INSTALL_DIR_ENV).filter(|path| !path.is_empty())
+    {
+        push_unique_path(&mut candidates, PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os(XDG_DATA_HOME_ENV).filter(|path| !path.is_empty()) {
+        push_unique_path(
+            &mut candidates,
+            PathBuf::from(path).join("uv").join("python"),
+        );
+    }
+    if let Some(path) = std::env::var_os(HOME_ENV).filter(|path| !path.is_empty()) {
+        push_unique_path(
+            &mut candidates,
+            PathBuf::from(path)
+                .join(".local")
+                .join("share")
+                .join("uv")
+                .join("python"),
+        );
+    }
+
+    candidates
+}
+
+fn uv_python_install_allow_paths() -> Vec<PathBuf> {
+    let mut allow_paths = Vec::new();
+    for candidate in uv_python_install_dir_candidates() {
+        if candidate.exists() {
+            push_unique_path(&mut allow_paths, canonicalize_existing_path(&candidate));
+        }
+    }
+    allow_paths
+}
+
 fn prepend_path_entry(path_env: Option<OsString>, entry: &Path) -> OsString {
     let paths = std::iter::once(entry.to_path_buf())
         .chain(
@@ -959,6 +999,9 @@ fn prepare_coco_command_path_injection(
             }
         }
         for allow_path in linked_library_allow_paths(&uv_path) {
+            push_unique_path(&mut extra_allow_paths, allow_path);
+        }
+        for allow_path in uv_python_install_allow_paths() {
             push_unique_path(&mut extra_allow_paths, allow_path);
         }
     }
@@ -2494,6 +2537,81 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         assert_eq!(
             allow_paths_for_linked_library(Path::new("/usr/lib/libSystem.B.dylib")),
             Vec::<PathBuf>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn uv_python_install_allow_paths_include_existing_install_dirs() {
+        let explicit_dir = tempfile::tempdir().unwrap();
+        let xdg_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let xdg_uv_python_dir = xdg_dir.path().join("uv").join("python");
+        let home_uv_python_dir = home_dir
+            .path()
+            .join(".local")
+            .join("share")
+            .join("uv")
+            .join("python");
+        std::fs::create_dir_all(&xdg_uv_python_dir).unwrap();
+        std::fs::create_dir_all(&home_uv_python_dir).unwrap();
+
+        let allow_paths = crate::with_process_env_async(
+            &[
+                (
+                    UV_PYTHON_INSTALL_DIR_ENV,
+                    Some(explicit_dir.path().as_os_str()),
+                ),
+                (XDG_DATA_HOME_ENV, Some(xdg_dir.path().as_os_str())),
+                (HOME_ENV, Some(home_dir.path().as_os_str())),
+            ],
+            || async { uv_python_install_allow_paths() },
+        )
+        .await;
+
+        assert!(allow_paths.contains(&explicit_dir.path().canonicalize().unwrap()));
+        assert!(allow_paths.contains(&xdg_uv_python_dir.canonicalize().unwrap()));
+        assert!(allow_paths.contains(&home_uv_python_dir.canonicalize().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn active_skill_coco_shim_allows_uv_managed_python_dir() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fake_bin = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let fake_uv = fake_bin.path().join("uv");
+        let uv_python_dir = home_dir
+            .path()
+            .join(".local")
+            .join("share")
+            .join("uv")
+            .join("python");
+        std::fs::write(&fake_uv, "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(&uv_python_dir).unwrap();
+
+        let injection = crate::with_process_env_async(
+            &[
+                ("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str())),
+                ("PATH", Some(fake_bin.path().as_os_str())),
+                (HOME_ENV, Some(home_dir.path().as_os_str())),
+                (XDG_DATA_HOME_ENV, None),
+                (UV_PYTHON_INSTALL_DIR_ENV, None),
+            ],
+            || async {
+                prepare_coco_command_path_injection(
+                    workspace.path(),
+                    CocoCommandShimMode::Disabled,
+                    true,
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            injection
+                .extra_allow_paths
+                .contains(&uv_python_dir.canonicalize().unwrap())
         );
     }
 
