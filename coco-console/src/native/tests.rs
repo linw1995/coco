@@ -25,6 +25,7 @@ fn session_anchor() -> SessionAnchor {
         max_tokens: None,
         additional_params: None,
         enable_coco_shim: false,
+        active_skill: None,
     }
 }
 

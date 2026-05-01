@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,8 @@ pub struct SessionAnchor {
     pub additional_params: Option<Value>,
     #[serde(default)]
     pub enable_coco_shim: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_skill: Option<SkillRuntimeContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,6 +199,13 @@ pub struct BranchConfigRecord {
 pub struct SkillScript {
     pub path: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillRuntimeContext {
+    pub name: String,
+    pub directory: PathBuf,
+    pub scripts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -574,6 +584,7 @@ impl SessionAnchor {
                 .clone()
                 .unwrap_or_else(|| self.additional_params.clone()),
             enable_coco_shim: patch.enable_coco_shim.unwrap_or(self.enable_coco_shim),
+            active_skill: self.active_skill.clone(),
         }
     }
 }
@@ -876,6 +887,7 @@ mod tests {
             max_tokens: Some(128),
             additional_params: Some(json!({"service_tier": "default"})),
             enable_coco_shim: false,
+            active_skill: None,
         }
     }
 

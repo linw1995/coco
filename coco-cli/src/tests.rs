@@ -716,6 +716,7 @@ fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> 
                     max_tokens: Some(64),
                     additional_params: None,
                     enable_coco_shim: true,
+                    active_skill: None,
                 },
             )),
         })

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use coco_mem::SessionRole;
+use coco_mem::{SessionRole, SkillScript};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
@@ -13,6 +13,8 @@ pub struct SkillToolRequest {
     pub skill_description: String,
     pub skill_path: String,
     pub skill_body: String,
+    #[serde(default)]
+    pub scripts: Vec<SkillScript>,
     pub session_role: SessionRole,
     pub enable_coco_shim: bool,
 }

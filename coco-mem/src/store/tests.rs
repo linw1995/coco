@@ -42,6 +42,7 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
                 max_tokens: Some(64),
                 additional_params: Some(json!({"reasoning_effort": "low"})),
                 enable_coco_shim: false,
+                active_skill: None,
             },
         )),
     }
@@ -81,6 +82,7 @@ fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> Ne
                 max_tokens: Some(64),
                 additional_params: Some(json!({"reasoning_effort": "low"})),
                 enable_coco_shim: false,
+                active_skill: None,
             },
         )),
     }
