@@ -43,6 +43,16 @@ use crate::{
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
+#[test]
+fn cli_help_uses_coco_command_name() {
+    let error = Cli::try_parse_from(["coco", "--help"]).unwrap_err();
+    let help = error.to_string();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+    assert!(help.contains("Usage: coco "));
+    assert!(!help.contains("Usage: coco-cli"));
+}
+
 fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> coco_mem::Job
 where
     S: BranchStore + JobStore + NodeStore,

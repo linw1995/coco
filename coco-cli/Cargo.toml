@@ -3,6 +3,10 @@ name = "coco-cli"
 edition.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "coco"
+path = "src/main.rs"
+
 [dependencies]
 # Workspace crates.
 coco-channel = { path = "../coco-channel", features = ["telegram"] }
