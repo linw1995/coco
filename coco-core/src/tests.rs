@@ -135,6 +135,7 @@ struct BlockingBackend {
 struct AnyBranchBackend {
     calls: Arc<AsyncMutex<Vec<String>>>,
     provider_contexts: Arc<AsyncMutex<Vec<String>>>,
+    tool_definition_names: Arc<AsyncMutex<Vec<Vec<String>>>>,
     text: String,
 }
 
@@ -143,6 +144,7 @@ impl AnyBranchBackend {
         Self {
             calls: Arc::new(AsyncMutex::new(Vec::new())),
             provider_contexts: Arc::new(AsyncMutex::new(Vec::new())),
+            tool_definition_names: Arc::new(AsyncMutex::new(Vec::new())),
             text: text.to_owned(),
         }
     }
@@ -156,6 +158,12 @@ impl CompletionBackend for AnyBranchBackend {
             .lock()
             .await
             .push(format!("{:?}\n{:?}", ctx.history, ctx.prompt));
+        self.tool_definition_names.lock().await.push(
+            ctx.tool_definitions
+                .iter()
+                .map(|definition| definition.name.clone())
+                .collect(),
+        );
         Ok(FakeBackend::finished_turn(&self.text))
     }
 }
@@ -351,6 +359,42 @@ async fn core_service_returns_branch_resolution_error_context() {
             source: BranchResolveError::ResolveFailed { .. },
         } if conversation_id == "chat-1"
     ));
+}
+
+#[tokio::test]
+async fn core_service_requires_telegram_skill_for_telegram_replies() {
+    let store = MemoryStore::new();
+    let backend = AnyBranchBackend::new("telegram reply delegated");
+    let provider_contexts = backend.provider_contexts.clone();
+    let tool_definition_names = backend.tool_definition_names.clone();
+    let llm = Arc::new(LlmService::new(store, backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let service = CoreService::new(
+        FixedBranchResolver::new("main"),
+        ConversationEngine::new(llm),
+    );
+
+    let response = service
+        .handle_message(InboundMessage::telegram_with_message_id(
+            "-42", "7", "1000", "hello",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.text, "telegram reply delegated");
+    let provider_contexts = provider_contexts.lock().await;
+    assert_eq!(provider_contexts.len(), 1);
+    assert!(provider_contexts[0].contains("chat_id: -42"));
+    assert!(provider_contexts[0].contains("reply_to_message_id: 1000"));
+    assert!(provider_contexts[0].contains("calling the `telegram` skill"));
+    assert!(provider_contexts[0].contains("Incoming message:"));
+    assert!(provider_contexts[0].contains("hello"));
+
+    let tool_definition_names = tool_definition_names.lock().await;
+    assert_eq!(
+        tool_definition_names.as_slice(),
+        &[vec!["exec_command".to_owned(), "use_skill".to_owned()]]
+    );
 }
 
 #[tokio::test]
