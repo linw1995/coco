@@ -31,7 +31,7 @@ jobs:
         run: nix develop --command bash scripts/run-cov.sh
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: target/coverage/result/
