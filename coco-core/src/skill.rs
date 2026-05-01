@@ -228,7 +228,41 @@ struct MaterializedSkillRuntime {
     directory: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct SkillRuntimeDirectoryGuard {
+    directory: Option<PathBuf>,
+}
+
 impl Drop for MaterializedSkillRuntime {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.directory {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+}
+
+impl SkillRuntimeDirectoryGuard {
+    fn new(directory: PathBuf) -> Self {
+        Self {
+            directory: Some(directory),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.directory
+            .as_deref()
+            .expect("skill runtime directory guard should own a directory")
+    }
+
+    fn into_runtime(mut self, context: SkillRuntimeContext) -> MaterializedSkillRuntime {
+        MaterializedSkillRuntime {
+            context: Some(context),
+            directory: self.directory.take(),
+        }
+    }
+}
+
+impl Drop for SkillRuntimeDirectoryGuard {
     fn drop(&mut self) {
         if let Some(directory) = &self.directory {
             let _ = fs::remove_dir_all(directory);
@@ -253,15 +287,16 @@ fn materialize_skill_runtime(
     fs::create_dir_all(&directory).context(CreateSkillRuntimeDirectorySnafu {
         path: directory.clone(),
     })?;
+    let runtime_dir = SkillRuntimeDirectoryGuard::new(directory);
 
-    let skill_file = directory.join("SKILL.md");
+    let skill_file = runtime_dir.path().join("SKILL.md");
     fs::write(&skill_file, &request.skill_body)
         .context(WriteSkillRuntimeFileSnafu { path: skill_file })?;
 
     let mut script_paths = Vec::with_capacity(request.scripts.len());
     for script in &request.scripts {
         let relative_path = validate_runtime_script_path(&script.path)?;
-        let target = directory.join(&relative_path);
+        let target = runtime_dir.path().join(&relative_path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).context(CreateSkillRuntimeDirectorySnafu {
                 path: parent.to_path_buf(),
@@ -271,14 +306,12 @@ fn materialize_skill_runtime(
         script_paths.push(relative_path);
     }
 
-    Ok(MaterializedSkillRuntime {
-        context: Some(SkillRuntimeContext {
-            name: request.skill_name.clone(),
-            directory: directory.clone(),
-            scripts: script_paths,
-        }),
-        directory: Some(directory),
-    })
+    let context = SkillRuntimeContext {
+        name: request.skill_name.clone(),
+        directory: runtime_dir.path().to_path_buf(),
+        scripts: script_paths,
+    };
+    Ok(runtime_dir.into_runtime(context))
 }
 
 fn validate_runtime_script_path(path: &str) -> std::result::Result<String, SkillError> {
