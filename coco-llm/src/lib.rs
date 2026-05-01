@@ -906,11 +906,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to clean up temporary use_skill branch {branch:?}: {source}"))]
-    UseSkillCleanup {
-        branch: String,
-        #[snafu(source(from(coco_mem::StoreError, Box::new)))]
-        source: Box<coco_mem::StoreError>,
-    },
+    UseSkillCleanup { branch: String, source: Box<Error> },
 
     #[snafu(display(
         "use_skill workflow failed and cleanup of temporary branch {branch:?} also failed: workflow={workflow}; cleanup={cleanup}"
@@ -918,8 +914,7 @@ pub enum Error {
     UseSkillWorkflowFailedCleanup {
         branch: String,
         workflow: Box<Error>,
-        #[snafu(source(from(coco_mem::StoreError, Box::new)))]
-        cleanup: Box<coco_mem::StoreError>,
+        cleanup: Box<Error>,
     },
 }
 

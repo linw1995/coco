@@ -286,7 +286,7 @@ where
                 overrides: CompletionOverrides::default(),
             })
             .await;
-        let cleanup_result = store.delete_branch(&child_branch);
+        let cleanup_result = service.delete_session_branch(&child_branch).await;
 
         match (prompt_result, cleanup_result) {
             (Ok(result), Ok(())) => Ok(SkillToolExecutionResult {
