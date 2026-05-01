@@ -33,6 +33,12 @@ pub struct SkillAddCommand {
     #[arg(long)]
     pub file: PathBuf,
 
+    #[arg(long = "script")]
+    pub scripts: Vec<PathBuf>,
+
+    #[arg(long)]
+    pub script_dir: Option<PathBuf>,
+
     #[arg(long)]
     pub enable_coco_shim: bool,
 
@@ -53,6 +59,15 @@ pub struct SkillUpdateCommand {
 
     #[arg(long)]
     pub file: Option<PathBuf>,
+
+    #[arg(long = "script", conflicts_with = "clear_scripts")]
+    pub scripts: Vec<PathBuf>,
+
+    #[arg(long, conflicts_with = "clear_scripts")]
+    pub script_dir: Option<PathBuf>,
+
+    #[arg(long, conflicts_with_all = ["scripts", "script_dir"])]
+    pub clear_scripts: bool,
 
     #[arg(long, conflicts_with = "disable_coco_shim")]
     pub enable_coco_shim: bool,

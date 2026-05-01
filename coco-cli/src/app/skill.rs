@@ -1,7 +1,11 @@
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use coco_mem::{
-    SessionRole, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersion, SkillVersionSpec,
+    SessionRole, SkillRecord, SkillScript, SkillStore, SkillUpdatePatch, SkillVersion,
+    SkillVersionSpec,
 };
 use serde::Serialize;
 use snafu::prelude::*;
@@ -12,7 +16,9 @@ use crate::{
         SkillAddCommand, SkillCommand, SkillListCommand, SkillRollbackCommand, SkillShowCommand,
         SkillSubcommand, SkillUpdateCommand,
     },
-    error::{ReadSkillFileSnafu, StoreSnafu},
+    error::{
+        InvalidSkillScriptPathSnafu, ReadSkillFileSnafu, ReadSkillScriptDirectorySnafu, StoreSnafu,
+    },
 };
 
 #[derive(Debug, Serialize)]
@@ -22,6 +28,7 @@ struct SkillSummaryView {
     current_version: u64,
     available_versions: Vec<u64>,
     description: String,
+    scripts: Vec<String>,
     enable_coco_shim: bool,
 }
 
@@ -39,6 +46,7 @@ struct SkillVersionView {
     created_at: String,
     description: String,
     enable_coco_shim: bool,
+    scripts: Vec<SkillScript>,
     body: String,
 }
 
@@ -97,6 +105,7 @@ pub(super) async fn run_skill_command(
 
 fn run_skill_add(command: SkillAddCommand, store: &impl SkillStore) -> Result<SkillSummaryView> {
     let body = read_skill_body(&command.file)?;
+    let scripts = read_skill_scripts(command.scripts, command.script_dir)?;
     let record = store
         .add_skill(
             command.role.into(),
@@ -104,7 +113,7 @@ fn run_skill_add(command: SkillAddCommand, store: &impl SkillStore) -> Result<Sk
             SkillVersionSpec {
                 description: command.description,
                 body,
-                scripts: Vec::new(),
+                scripts,
                 enable_coco_shim: command.enable_coco_shim,
             },
         )
@@ -116,6 +125,13 @@ fn run_skill_update(
     command: SkillUpdateCommand,
     store: &impl SkillStore,
 ) -> Result<SkillSummaryView> {
+    let scripts = if command.clear_scripts {
+        Some(Vec::new())
+    } else if !command.scripts.is_empty() || command.script_dir.is_some() {
+        Some(read_skill_scripts(command.scripts, command.script_dir)?)
+    } else {
+        None
+    };
     let patch = SkillUpdatePatch {
         description: command.description,
         body: command
@@ -123,7 +139,7 @@ fn run_skill_update(
             .as_ref()
             .map(|path| read_skill_body(path.as_path()))
             .transpose()?,
-        scripts: None,
+        scripts,
         enable_coco_shim: if command.enable_coco_shim {
             Some(true)
         } else if command.disable_coco_shim {
@@ -196,6 +212,125 @@ fn read_skill_body(path: &std::path::Path) -> Result<String> {
         .to_owned())
 }
 
+fn read_skill_scripts(
+    explicit_scripts: Vec<PathBuf>,
+    script_dir: Option<PathBuf>,
+) -> Result<Vec<SkillScript>> {
+    let mut paths = explicit_scripts
+        .into_iter()
+        .map(|path| SkillScriptInput {
+            source_path: path.clone(),
+            stored_path: path,
+        })
+        .collect::<Vec<_>>();
+    if let Some(script_dir) = script_dir {
+        let entries = fs::read_dir(&script_dir).context(ReadSkillScriptDirectorySnafu {
+            path: script_dir.clone(),
+        })?;
+        for entry in entries {
+            let entry = entry.context(ReadSkillScriptDirectorySnafu {
+                path: script_dir.clone(),
+            })?;
+            let file_type = entry.file_type().context(ReadSkillScriptDirectorySnafu {
+                path: script_dir.clone(),
+            })?;
+            if file_type.is_file() && is_script_asset_name(&entry.file_name()) {
+                paths.push(SkillScriptInput {
+                    source_path: entry.path(),
+                    stored_path: PathBuf::from("scripts").join(entry.file_name()),
+                });
+            }
+        }
+    }
+
+    let mut scripts = paths
+        .into_iter()
+        .map(read_skill_script)
+        .collect::<Result<Vec<_>>>()?;
+    scripts.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut seen = HashSet::new();
+    for script in &scripts {
+        if !seen.insert(script.path.clone()) {
+            return InvalidSkillScriptPathSnafu {
+                path: PathBuf::from(&script.path),
+                message: "duplicate script asset path".to_owned(),
+            }
+            .fail();
+        }
+    }
+
+    Ok(scripts)
+}
+
+struct SkillScriptInput {
+    source_path: PathBuf,
+    stored_path: PathBuf,
+}
+
+fn read_skill_script(input: SkillScriptInput) -> Result<SkillScript> {
+    let script_path = normalized_skill_script_path(&input.stored_path)?;
+    let content = fs::read_to_string(&input.source_path).context(ReadSkillFileSnafu {
+        path: input.source_path,
+    })?;
+    Ok(SkillScript {
+        path: script_path,
+        content,
+    })
+}
+
+fn normalized_skill_script_path(path: &Path) -> Result<String> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return InvalidSkillScriptPathSnafu {
+                    path: path.to_path_buf(),
+                    message: "path must be relative and stay under scripts/".to_owned(),
+                }
+                .fail();
+            }
+        }
+    }
+
+    let starts_with_scripts = normalized.components().next().is_some_and(
+        |component| matches!(component, Component::Normal(part) if part == OsStr::new("scripts")),
+    );
+    if !starts_with_scripts {
+        return InvalidSkillScriptPathSnafu {
+            path: path.to_path_buf(),
+            message: "path must start with scripts/".to_owned(),
+        }
+        .fail();
+    }
+
+    let Some(script_path) = normalized.to_str() else {
+        return InvalidSkillScriptPathSnafu {
+            path: path.to_path_buf(),
+            message: "path must be valid UTF-8".to_owned(),
+        }
+        .fail();
+    };
+    if !script_path.ends_with(".py") && !script_path.ends_with(".py.lock") {
+        return InvalidSkillScriptPathSnafu {
+            path: path.to_path_buf(),
+            message: "path must end with .py or .py.lock".to_owned(),
+        }
+        .fail();
+    }
+
+    Ok(script_path.to_owned())
+}
+
+fn is_script_asset_name(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.ends_with(".py") || name.ends_with(".py.lock")
+}
+
 fn skill_summary_view(role: SessionRole, record: &SkillRecord) -> SkillSummaryView {
     let current = record
         .current()
@@ -206,6 +341,7 @@ fn skill_summary_view(role: SessionRole, record: &SkillRecord) -> SkillSummaryVi
         current_version: record.current_version,
         available_versions: record.versions.keys().copied().collect(),
         description: current.description.clone(),
+        scripts: script_paths(&current.scripts),
         enable_coco_shim: current.enable_coco_shim,
     }
 }
@@ -216,8 +352,13 @@ fn skill_version_view(version: &SkillVersion) -> SkillVersionView {
         created_at: version.created_at.to_string(),
         description: version.description.clone(),
         enable_coco_shim: version.enable_coco_shim,
+        scripts: version.scripts.clone(),
         body: version.body.clone(),
     }
+}
+
+fn script_paths(scripts: &[SkillScript]) -> Vec<String> {
+    scripts.iter().map(|script| script.path.clone()).collect()
 }
 
 fn render_skill_list_text(skills: &[SkillSummaryView]) -> String {
@@ -229,7 +370,7 @@ fn render_skill_list_text(skills: &[SkillSummaryView]) -> String {
         .iter()
         .map(|skill| {
             format!(
-                "{} {} current={} available=[{}] shim={} - {}",
+                "{} {} current={} available=[{}] scripts=[{}] shim={} - {}",
                 skill.role,
                 skill.name,
                 skill.current_version,
@@ -239,6 +380,7 @@ fn render_skill_list_text(skills: &[SkillSummaryView]) -> String {
                     .map(u64::to_string)
                     .collect::<Vec<_>>()
                     .join(","),
+                skill.scripts.join(","),
                 skill.enable_coco_shim,
                 skill.description
             )
@@ -249,7 +391,7 @@ fn render_skill_list_text(skills: &[SkillSummaryView]) -> String {
 
 fn render_skill_summary_text(skill: &SkillSummaryView) -> String {
     format!(
-        "role: {}\nname: {}\ncurrent_version: {}\navailable_versions: [{}]\nshim: {}\ndescription: {}",
+        "role: {}\nname: {}\ncurrent_version: {}\navailable_versions: [{}]\nscripts: [{}]\nshim: {}\ndescription: {}",
         skill.role,
         skill.name,
         skill.current_version,
@@ -259,6 +401,7 @@ fn render_skill_summary_text(skill: &SkillSummaryView) -> String {
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(","),
+        skill.scripts.join(","),
         skill.enable_coco_shim,
         skill.description
     )
@@ -275,8 +418,12 @@ fn render_skill_show_text(skill: &SkillShowView) -> String {
     for version in &skill.versions {
         lines.extend([
             format!(
-                "- version={} created_at={} shim={} description={}",
-                version.version, version.created_at, version.enable_coco_shim, version.description
+                "- version={} created_at={} shim={} scripts=[{}] description={}",
+                version.version,
+                version.created_at,
+                version.enable_coco_shim,
+                script_paths(&version.scripts).join(","),
+                version.description
             ),
             "  body:".to_owned(),
         ]);

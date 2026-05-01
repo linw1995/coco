@@ -89,6 +89,12 @@ pub enum Error {
     #[snafu(display("Failed to read skill file {path:?}: {source}"))]
     ReadSkillFile { path: PathBuf, source: io::Error },
 
+    #[snafu(display("Failed to read skill script directory {path:?}: {source}"))]
+    ReadSkillScriptDirectory { path: PathBuf, source: io::Error },
+
+    #[snafu(display("Invalid skill script path {path:?}: {message}"))]
+    InvalidSkillScriptPath { path: PathBuf, message: String },
+
     #[snafu(display("Failed to resolve current executable: {source}"))]
     ResolveCurrentExe { source: io::Error },
 
