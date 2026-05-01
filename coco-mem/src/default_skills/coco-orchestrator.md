@@ -26,7 +26,6 @@ coco prompt branch-status --job <job> --branch <branch>
 
 Rules:
 
-- You are already in `coco-orchestrator`; do not call `use_skill` for it again.
 - Prefer `coco` commands over direct store edits.
 - Hand off bounded work with `coco session fork` and `coco prompt`; do not use
   `use_skill` as the handoff mechanism here.

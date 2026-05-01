@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use coco_mem::Tool;
@@ -152,9 +153,20 @@ fn parse_use_request(
 
 impl SkillToolRuntime {
     pub fn tool_definition(&self) -> rig::completion::ToolDefinition {
+        let mut description = self.definition.description.clone();
+        if matches!(self.kind, SkillToolKind::Use)
+            && let Some(skill_name) = &self.context.current_skill_name
+        {
+            write!(
+                &mut description,
+                "\n\nCurrent skill status: already executing `{skill_name}`. Do not call `use_skill` for `{skill_name}` again; apply the loaded skill instructions directly."
+            )
+            .expect("writing to String should not fail");
+        }
+
         rig::completion::ToolDefinition {
             name: self.definition.name.clone(),
-            description: self.definition.description.clone(),
+            description,
             parameters: self.definition.input_schema.clone(),
         }
     }
@@ -255,6 +267,7 @@ mod tests {
         ToolRuntimeEnv {
             session_branch: "main".to_owned(),
             session_role: coco_mem::SessionRole::Orchestrator,
+            current_skill_name: None,
             store_path: None,
             enable_coco_shim: false,
             cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -381,6 +394,34 @@ mod tests {
         );
         assert_eq!(requests[0].parent_tool_use_id, "tool-use-node");
         assert_eq!(requests[0].skill_name, "find-skills");
+    }
+
+    #[test]
+    fn use_skill_definition_reports_current_skill_status() {
+        let executor = Arc::new(FakeExecutor {
+            search_requests: Arc::new(Mutex::new(Vec::new())),
+            use_requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mut context = run_context(executor);
+        context.current_skill_name = Some("catgirl-role".to_owned());
+        let runtime = run_runtime(
+            run_tool_definition(),
+            Path::new("/tmp").to_path_buf(),
+            context,
+        );
+
+        let definition = runtime.tool_definition();
+
+        assert!(
+            definition
+                .description
+                .contains("Current skill status: already executing `catgirl-role`.")
+        );
+        assert!(
+            definition
+                .description
+                .contains("Do not call `use_skill` for `catgirl-role` again")
+        );
     }
 
     #[tokio::test]

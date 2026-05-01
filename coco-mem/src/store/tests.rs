@@ -1683,11 +1683,16 @@ where
     let orchestrator = store
         .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
         .unwrap();
+    let new_skill = store
+        .get_skill(SessionRole::Orchestrator, "new-skill")
+        .unwrap();
     let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
 
     assert_eq!(orchestrator.current_version, 1);
+    assert_eq!(new_skill.current_version, 1);
     assert_eq!(runner.current_version, 1);
     assert!(orchestrator.current().unwrap().enable_coco_shim);
+    assert!(new_skill.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
     assert!(
         orchestrator
@@ -1703,6 +1708,7 @@ where
             .body
             .contains("--tool exec_command --tool write_stdin --tool search_skill")
     );
+    assert!(new_skill.current().unwrap().body.contains("coco skill add"));
 }
 
 macro_rules! define_common_store_tests {
@@ -2568,11 +2574,20 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
     );
     assert!(
         reopened
+            .get_skill(SessionRole::Orchestrator, "new-skill")
+            .is_ok()
+    );
+    assert!(
+        reopened
             .get_skill(SessionRole::Runner, "coco-runner")
             .is_ok()
     );
     assert!(
         path.join("skill-history/orchestrator/coco-orchestrator.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/orchestrator/new-skill.jsonl")
             .is_file()
     );
     assert!(
