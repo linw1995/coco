@@ -257,7 +257,7 @@ mod tests {
             session_role: coco_mem::SessionRole::Orchestrator,
             store_path: None,
             enable_coco_shim: false,
-            cli_bridge: crate::BashToolCliBridgeHandle::default(),
+            cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
             skill_executor: crate::SkillToolExecutorHandle::new(executor),
         }
     }

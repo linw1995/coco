@@ -1696,9 +1696,13 @@ where
             .body
             .contains("fork from the node before the `use_skill` ToolUse")
     );
-    assert!(orchestrator.current().unwrap().body.contains(
-        "coco prompt --branch \"$RUNNER_BRANCH\" --role runner --tool bash --tool search_skill"
-    ));
+    assert!(
+        orchestrator
+            .current()
+            .unwrap()
+            .body
+            .contains("--tool exec_command --tool write_stdin --tool search_skill")
+    );
 }
 
 macro_rules! define_common_store_tests {

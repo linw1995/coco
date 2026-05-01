@@ -1,8 +1,8 @@
-mod bash_tool;
 mod runtime_bridge;
 mod skill;
 mod skill_tool;
 mod tool_definition;
+mod unified_exec_tool;
 
 use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
@@ -315,6 +315,7 @@ pub struct ResolvedCompletionRequest {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
+    runtime: RuntimeCapabilities,
     trace_node_appender: Option<TraceNodeAppenderHandle>,
 }
 
@@ -483,13 +484,13 @@ pub struct CocoCliRuntimeResponse {
 }
 
 #[derive(Debug, Snafu, Clone, PartialEq, Eq)]
-pub enum BashToolCliBridgeError {
+pub enum UnifiedExecCliBridgeError {
     #[snafu(display("coco-cli runtime bridge is unavailable"))]
     Unavailable,
 }
 
 #[async_trait]
-pub trait BashToolCliBridge: Send + Sync {
+pub trait UnifiedExecCliBridge: Send + Sync {
     fn is_available(&self) -> bool {
         true
     }
@@ -497,14 +498,14 @@ pub trait BashToolCliBridge: Send + Sync {
     async fn execute_coco_cli(
         &self,
         request: CocoCliRuntimeRequest,
-    ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError>;
+    ) -> std::result::Result<CocoCliRuntimeResponse, UnifiedExecCliBridgeError>;
 }
 
 #[derive(Debug)]
-struct UnavailableBashToolCliBridge;
+struct UnavailableUnifiedExecCliBridge;
 
 #[async_trait]
-impl BashToolCliBridge for UnavailableBashToolCliBridge {
+impl UnifiedExecCliBridge for UnavailableUnifiedExecCliBridge {
     fn is_available(&self) -> bool {
         false
     }
@@ -512,23 +513,23 @@ impl BashToolCliBridge for UnavailableBashToolCliBridge {
     async fn execute_coco_cli(
         &self,
         _request: CocoCliRuntimeRequest,
-    ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError> {
-        Err(BashToolCliBridgeError::Unavailable)
+    ) -> std::result::Result<CocoCliRuntimeResponse, UnifiedExecCliBridgeError> {
+        Err(UnifiedExecCliBridgeError::Unavailable)
     }
 }
 
 #[derive(Clone)]
-pub struct BashToolCliBridgeHandle {
-    inner: Arc<dyn BashToolCliBridge>,
+pub struct UnifiedExecCliBridgeHandle {
+    inner: Arc<dyn UnifiedExecCliBridge>,
 }
 
-impl BashToolCliBridgeHandle {
-    pub fn new(inner: Arc<dyn BashToolCliBridge>) -> Self {
+impl UnifiedExecCliBridgeHandle {
+    pub fn new(inner: Arc<dyn UnifiedExecCliBridge>) -> Self {
         Self { inner }
     }
 
     pub fn unavailable() -> Self {
-        Self::new(Arc::new(UnavailableBashToolCliBridge))
+        Self::new(Arc::new(UnavailableUnifiedExecCliBridge))
     }
 
     pub fn is_available(&self) -> bool {
@@ -538,18 +539,18 @@ impl BashToolCliBridgeHandle {
     pub async fn execute_coco_cli(
         &self,
         request: CocoCliRuntimeRequest,
-    ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError> {
+    ) -> std::result::Result<CocoCliRuntimeResponse, UnifiedExecCliBridgeError> {
         self.inner.execute_coco_cli(request).await
     }
 }
 
-impl std::fmt::Debug for BashToolCliBridgeHandle {
+impl std::fmt::Debug for UnifiedExecCliBridgeHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BashToolCliBridgeHandle(..)")
+        formatter.write_str("UnifiedExecCliBridgeHandle(..)")
     }
 }
 
-impl Default for BashToolCliBridgeHandle {
+impl Default for UnifiedExecCliBridgeHandle {
     fn default() -> Self {
         Self::unavailable()
     }
@@ -622,7 +623,7 @@ pub struct ToolRuntimeEnv {
     pub session_role: SessionRole,
     pub store_path: Option<PathBuf>,
     pub enable_coco_shim: bool,
-    pub cli_bridge: BashToolCliBridgeHandle,
+    pub cli_bridge: UnifiedExecCliBridgeHandle,
     pub skill_executor: SkillToolExecutorHandle,
 }
 
@@ -783,7 +784,7 @@ pub enum BackendError {
     Failed { message: String },
 
     #[snafu(display("{message}"))]
-    BashTool { message: String },
+    UnifiedExecTool { message: String },
 }
 
 impl BackendError {
@@ -823,10 +824,21 @@ pub trait CompletionBackend: Send + Sync {
 type BranchLockTable = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 type WorkflowLock = Arc<Mutex<()>>;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RuntimeCapabilities {
-    pub bash_tool_cli_bridge: BashToolCliBridgeHandle,
+    pub unified_exec_cli_bridge: UnifiedExecCliBridgeHandle,
     pub skill_tool_executor: SkillToolExecutorHandle,
+    unified_exec_sessions: unified_exec_tool::UnifiedExecSessionStoreHandle,
+}
+
+impl Default for RuntimeCapabilities {
+    fn default() -> Self {
+        Self {
+            unified_exec_cli_bridge: UnifiedExecCliBridgeHandle::default(),
+            skill_tool_executor: SkillToolExecutorHandle::default(),
+            unified_exec_sessions: unified_exec_tool::session_store(),
+        }
+    }
 }
 
 pub struct LlmService<B = RigBackend, S = MemoryStore> {
@@ -842,7 +854,7 @@ pub struct LlmServiceBuilder<B, S> {
     store: S,
     backend: B,
     provider_configs: HashMap<String, ProviderRuntimeConfig>,
-    bash_tool_cli_bridge: Option<BashToolCliBridgeHandle>,
+    unified_exec_cli_bridge: Option<UnifiedExecCliBridgeHandle>,
     skill_tool_executor: Option<SkillToolExecutorHandle>,
 }
 
@@ -894,11 +906,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to clean up temporary use_skill branch {branch:?}: {source}"))]
-    UseSkillCleanup {
-        branch: String,
-        #[snafu(source(from(coco_mem::StoreError, Box::new)))]
-        source: Box<coco_mem::StoreError>,
-    },
+    UseSkillCleanup { branch: String, source: Box<Error> },
 
     #[snafu(display(
         "use_skill workflow failed and cleanup of temporary branch {branch:?} also failed: workflow={workflow}; cleanup={cleanup}"
@@ -906,8 +914,7 @@ pub enum Error {
     UseSkillWorkflowFailedCleanup {
         branch: String,
         workflow: Box<Error>,
-        #[snafu(source(from(coco_mem::StoreError, Box::new)))]
-        cleanup: Box<coco_mem::StoreError>,
+        cleanup: Box<Error>,
     },
 }
 
@@ -938,8 +945,8 @@ impl<B, S> LlmServiceBuilder<B, S> {
         self
     }
 
-    pub fn with_bash_tool_cli_bridge(mut self, bridge: BashToolCliBridgeHandle) -> Self {
-        self.bash_tool_cli_bridge = Some(bridge);
+    pub fn with_unified_exec_cli_bridge(mut self, bridge: UnifiedExecCliBridgeHandle) -> Self {
+        self.unified_exec_cli_bridge = Some(bridge);
         self
     }
 
@@ -954,8 +961,9 @@ impl<B, S> LlmServiceBuilder<B, S> {
             backend: self.backend,
             provider_configs: self.provider_configs,
             runtime: RuntimeCapabilities {
-                bash_tool_cli_bridge: self.bash_tool_cli_bridge.unwrap_or_default(),
+                unified_exec_cli_bridge: self.unified_exec_cli_bridge.unwrap_or_default(),
                 skill_tool_executor: self.skill_tool_executor.unwrap_or_default(),
+                unified_exec_sessions: unified_exec_tool::session_store(),
             },
             branch_locks: Arc::new(Mutex::new(HashMap::new())),
             workflow_lock: Arc::new(Mutex::new(())),
@@ -969,7 +977,7 @@ impl<B, S> LlmService<B, S> {
             store,
             backend,
             provider_configs: HashMap::new(),
-            bash_tool_cli_bridge: None,
+            unified_exec_cli_bridge: None,
             skill_tool_executor: None,
         }
     }
@@ -1010,6 +1018,12 @@ impl<B, S> LlmService<B, S> {
             guards.push(self.lock_branch(&branch).await);
         }
         guards
+    }
+
+    pub async fn cleanup_runtime_processes(&self) -> usize {
+        let cleaned_session_count = self.runtime.unified_exec_sessions.remove_all().await;
+        tracing::info!(cleaned_session_count, "cleaned runtime processes");
+        cleaned_session_count
     }
 }
 
@@ -1110,6 +1124,23 @@ where
             "forked session branch"
         );
         Ok(anchor_id)
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
+    S: BranchStore,
+{
+    pub async fn delete_session_branch(&self, branch: &str) -> Result<()> {
+        let _guard = self.lock_branch(branch).await;
+        self.store.delete_branch(branch).context(MemorySnafu)?;
+        let cleaned_session_count = self
+            .runtime
+            .unified_exec_sessions
+            .remove_branch(branch)
+            .await;
+        tracing::info!(branch, cleaned_session_count, "deleted session branch");
+        Ok(())
     }
 }
 
@@ -1894,7 +1925,7 @@ where
                 session_role: context.session_anchor.role,
                 store_path: self.store.runtime_store_path(),
                 enable_coco_shim: context.session_anchor.enable_coco_shim,
-                cli_bridge: self.runtime.bash_tool_cli_bridge.clone(),
+                cli_bridge: self.runtime.unified_exec_cli_bridge.clone(),
                 skill_executor: self.runtime.skill_tool_executor.clone(),
             },
         })
@@ -2108,6 +2139,7 @@ impl<B, S> LlmService<B, S> {
                 .overrides
                 .additional_params
                 .or_else(|| session.config.additional_params.clone()),
+            runtime: self.runtime.clone(),
             trace_node_appender,
         }
     }
@@ -2204,7 +2236,8 @@ struct RuntimeToolSet {
 }
 
 enum RuntimeTool {
-    Bash(bash_tool::BashToolRuntime),
+    ExecCommand(unified_exec_tool::UnifiedExecToolRuntime),
+    WriteStdin(unified_exec_tool::UnifiedExecToolRuntime),
     SearchSkill(skill_tool::SkillToolRuntime),
     UseSkill(skill_tool::SkillToolRuntime),
 }
@@ -2212,7 +2245,7 @@ enum RuntimeTool {
 impl RuntimeTool {
     fn definition(&self) -> CompletionToolDefinition {
         match self {
-            Self::Bash(tool) => tool.tool_definition(),
+            Self::ExecCommand(tool) | Self::WriteStdin(tool) => tool.tool_definition(),
             Self::SearchSkill(tool) | Self::UseSkill(tool) => tool.tool_definition(),
         }
     }
@@ -2223,7 +2256,9 @@ impl RuntimeTool {
         invocation: ToolInvocationContext,
     ) -> std::result::Result<ToolExecutionOutcome, rig::tool::ToolError> {
         match self {
-            Self::Bash(tool) => tool.execute(args, invocation).await,
+            Self::ExecCommand(tool) | Self::WriteStdin(tool) => {
+                tool.execute(args, invocation).await
+            }
             Self::SearchSkill(tool) | Self::UseSkill(tool) => tool.execute(args, invocation).await,
         }
     }
@@ -2253,16 +2288,26 @@ impl RuntimeToolSet {
 fn build_runtime_tools(
     session: &ResolvedSession,
     workspace_root: std::path::PathBuf,
+    exec_sessions: unified_exec_tool::UnifiedExecSessionStoreHandle,
 ) -> std::result::Result<RuntimeToolSet, BackendError> {
     let mut definitions = Vec::with_capacity(session.config.tools.len());
     let mut tools = HashMap::with_capacity(session.config.tools.len());
 
     for tool in &session.config.tools {
         let runtime_tool = match tool.name.as_str() {
-            "bash" => RuntimeTool::Bash(bash_tool::runtime(
+            "exec_command" => RuntimeTool::ExecCommand(unified_exec_tool::runtime_with_sessions(
                 tool.clone(),
                 workspace_root.clone(),
                 session.tool_runtime_env.clone(),
+                unified_exec_tool::UnifiedExecToolKind::ExecCommand,
+                exec_sessions.clone(),
+            )),
+            "write_stdin" => RuntimeTool::WriteStdin(unified_exec_tool::runtime_with_sessions(
+                tool.clone(),
+                workspace_root.clone(),
+                session.tool_runtime_env.clone(),
+                unified_exec_tool::UnifiedExecToolKind::WriteStdin,
+                exec_sessions.clone(),
             )),
             "search_skill" => RuntimeTool::SearchSkill(skill_tool::search_runtime(
                 tool.clone(),
@@ -2276,7 +2321,7 @@ fn build_runtime_tools(
             )),
             other => {
                 return Err(BackendError::failed(format!(
-                    "unsupported tool {other:?}; only \"bash\", \"search_skill\", and \"use_skill\" are implemented"
+                    "unsupported tool {other:?}; only \"exec_command\", \"write_stdin\", \"search_skill\", and \"use_skill\" are implemented"
                 )));
             }
         };
@@ -2289,12 +2334,18 @@ fn build_runtime_tools(
 
 fn build_runtime_tools_for_session(
     session: &ResolvedSession,
+    runtime: &RuntimeCapabilities,
 ) -> std::result::Result<RuntimeToolSet, BackendError> {
-    let workspace_root =
-        bash_tool::resolve_workspace_root().map_err(|source| BackendError::BashTool {
+    let workspace_root = unified_exec_tool::resolve_workspace_root().map_err(|source| {
+        BackendError::UnifiedExecTool {
             message: source.to_string(),
-        })?;
-    build_runtime_tools(session, workspace_root)
+        }
+    })?;
+    build_runtime_tools(
+        session,
+        workspace_root,
+        runtime.unified_exec_sessions.clone(),
+    )
 }
 
 fn configure_completion_request_builder<M>(
@@ -2694,7 +2745,7 @@ impl CompletionRunner {
         let Some((prompt, history)) = history.split_last() else {
             return Err(BackendError::failed("completion requires history"));
         };
-        let runtime_tools = build_runtime_tools_for_session(&session)?;
+        let runtime_tools = build_runtime_tools_for_session(&session, &request.runtime)?;
         let tool_definitions = runtime_tools.definition_list();
 
         Ok(Self {
@@ -3376,8 +3427,8 @@ mod tests {
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    name: "bash".to_owned(),
-                    input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "printf 'hello' > trace.txt"}),
                 }),
                 Some("execution-step-1"),
                 Some("tool-call-1"),
@@ -3442,8 +3493,8 @@ mod tests {
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    name: "bash".to_owned(),
-                    input: serde_json::json!({"command": "printf done"}),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "printf done"}),
                 }),
                 Some("execution-step-1"),
                 Some("tool-call-1"),
@@ -3537,8 +3588,8 @@ mod tests {
         }
     }
 
-    fn bash_tool() -> Tool {
-        crate::builtin_tool_definition("bash").expect("builtin tool should exist")
+    fn exec_command_tool() -> Tool {
+        crate::builtin_tool_definition("exec_command").expect("builtin tool should exist")
     }
 
     fn text_messages_from_entries(entries: &[ConversationEntry]) -> Vec<ConversationMessage> {
@@ -4065,7 +4116,7 @@ mod tests {
             .unwrap();
         let main_head = store.get_branch_head("main").unwrap();
         service.fork("runner", &main_head).unwrap();
-        let bash_tool = builtin_tool_definition("bash").unwrap();
+        let exec_tool = builtin_tool_definition("exec_command").unwrap();
 
         let result = service
             .prompt(PromptRequest {
@@ -4074,7 +4125,7 @@ mod tests {
                 merge_parents: vec![],
                 session_patch: Some(SessionConfigPatch {
                     role: Some(SessionRole::Runner),
-                    tools: Some(vec![bash_tool.clone()]),
+                    tools: Some(vec![exec_tool.clone()]),
                     ..SessionConfigPatch::default()
                 }),
             })
@@ -4084,7 +4135,7 @@ mod tests {
         let calls = calls.lock().await;
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].0.config.role, SessionRole::Runner);
-        assert_eq!(calls[1].0.config.tools, vec![bash_tool.clone()]);
+        assert_eq!(calls[1].0.config.tools, vec![exec_tool.clone()]);
         assert_eq!(
             text_messages_from_entries(&calls[1].0.conversation),
             vec![
@@ -4125,7 +4176,7 @@ mod tests {
             .as_session_patch()
             .expect("expected session patch anchor");
         assert_eq!(patch.role, Some(SessionRole::Runner));
-        assert_eq!(patch.tools, Some(vec![bash_tool]));
+        assert_eq!(patch.tools, Some(vec![exec_tool]));
         assert_eq!(ancestry[2].parent, main_head);
     }
 
@@ -4692,8 +4743,8 @@ mod tests {
                         events: vec![backend_event(
                             BackendEventPayload::ToolUse(ToolUse {
                                 id: "tool-call-1".to_owned(),
-                                name: "bash".to_owned(),
-                                input: serde_json::json!({"command": "rg --files"}),
+                                name: "exec_command".to_owned(),
+                                input: serde_json::json!({"cmd": "rg --files"}),
                             }),
                             Some("execution-step-1"),
                             Some("tool-call-1"),
@@ -4760,8 +4811,8 @@ mod tests {
             &tool_use.kind,
             Kind::ToolUse(ToolUse { id, name, input, .. })
                 if id == "tool-call-1"
-                    && name == "bash"
-                    && input == &serde_json::json!({"command": "rg --files"})
+                    && name == "exec_command"
+                    && input == &serde_json::json!({"cmd": "rg --files"})
         ));
         assert_eq!(
             tool_use.metadata.as_ref().unwrap().execution_id.as_deref(),
@@ -4919,8 +4970,8 @@ mod tests {
                         events: vec![backend_event(
                             BackendEventPayload::ToolUse(ToolUse {
                                 id: "tool-call-1".to_owned(),
-                                name: "bash".to_owned(),
-                                input: serde_json::json!({"command": "rg --files"}),
+                                name: "exec_command".to_owned(),
+                                input: serde_json::json!({"cmd": "rg --files"}),
                             }),
                             Some("execution-step-1"),
                             Some("tool-call-1"),
@@ -4984,8 +5035,8 @@ mod tests {
                 }),
                 ConversationEntry::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    name: "bash".to_owned(),
-                    input: serde_json::json!({"command": "rg --files"}),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "rg --files"}),
                 }),
                 ConversationEntry::ToolResult(ToolResult {
                     id: "tool-call-1".to_owned(),
@@ -5020,16 +5071,16 @@ mod tests {
                 metadata: metadata(Some("execution-1"), Some("call-1")),
                 entry: ConversationEntry::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    name: "bash".to_owned(),
-                    input: serde_json::json!({"command": "ls"}),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "ls"}),
                 }),
             },
             ConversationTraceEntry {
                 metadata: metadata(Some("execution-1"), Some("call-2")),
                 entry: ConversationEntry::ToolUse(ToolUse {
                     id: "tool-call-2".to_owned(),
-                    name: "bash".to_owned(),
-                    input: serde_json::json!({"command": "pwd"}),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "pwd"}),
                 }),
             },
             ConversationTraceEntry {
@@ -5126,8 +5177,8 @@ mod tests {
                 metadata: metadata(Some("execution-1"), Some("call-legacy")),
                 entry: ConversationEntry::ToolUse(ToolUse {
                     id: "tool-call-legacy".to_owned(),
-                    name: "bash".to_owned(),
-                    input: serde_json::json!({"command": "pwd"}),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "pwd"}),
                 }),
             },
             ConversationTraceEntry {
@@ -5168,8 +5219,8 @@ mod tests {
                 metadata: metadata(Some("execution-1"), None),
                 entry: ConversationEntry::ToolUse(ToolUse {
                     id: "tool-call-legacy".to_owned(),
-                    name: "bash".to_owned(),
-                    input: serde_json::json!({"command": "pwd"}),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "pwd"}),
                 }),
             },
             ConversationTraceEntry {
@@ -5208,14 +5259,14 @@ mod tests {
         let choice = rig::OneOrMany::many(vec![
             rig::message::AssistantContent::tool_call(
                 "tool-call-1",
-                "bash",
-                serde_json::json!({"command": "pwd"}),
+                "exec_command",
+                serde_json::json!({"cmd": "pwd"}),
             ),
             rig::message::AssistantContent::tool_call_with_call_id(
                 "tool-call-2",
                 "call-2".to_owned(),
-                "bash",
-                serde_json::json!({"command": "ls"}),
+                "exec_command",
+                serde_json::json!({"cmd": "ls"}),
             ),
         ])
         .expect("assistant choice should be non-empty");
@@ -5253,8 +5304,8 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolUse(ToolUse {
                                     id: "tool-call-1".to_owned(),
-                                    name: "bash".to_owned(),
-                                    input: serde_json::json!({"command": "ls"}),
+                                    name: "exec_command".to_owned(),
+                                    input: serde_json::json!({"cmd": "ls"}),
                                 }),
                                 Some("execution-step-1"),
                                 Some("tool-call-1"),
@@ -5354,8 +5405,8 @@ mod tests {
                         events: vec![backend_event(
                             BackendEventPayload::ToolUse(ToolUse {
                                 id: "tool-call-1".to_owned(),
-                                name: "bash".to_owned(),
-                                input: serde_json::json!({"command": "printf 'hello' > trace.txt"}),
+                                name: "exec_command".to_owned(),
+                                input: serde_json::json!({"cmd": "printf 'hello' > trace.txt"}),
                             }),
                             Some("execution-step-1"),
                             Some("tool-call-1"),
@@ -5419,7 +5470,7 @@ mod tests {
         assert!(matches!(
             &tool_use.kind,
             Kind::ToolUse(ToolUse { id, name, .. })
-                if id == "tool-call-1" && name == "bash"
+                if id == "tool-call-1" && name == "exec_command"
         ));
         assert_eq!(tool_use.parent, context.retry_from_node_id);
 
@@ -5474,17 +5525,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_tool_runtime_allows_writes_within_configured_workspace() {
+    async fn exec_command_runtime_allows_writes_within_configured_workspace() {
         let temp_root = tempfile::tempdir().unwrap();
-        let runtime = bash_tool::runtime_tool(
-            bash_tool(),
+        let runtime = unified_exec_tool::runtime_tool(
+            exec_command_tool(),
             temp_root.path().to_path_buf(),
             ToolRuntimeEnv {
                 session_branch: "main".to_owned(),
                 session_role: SessionRole::Orchestrator,
                 store_path: None,
                 enable_coco_shim: false,
-                cli_bridge: BashToolCliBridgeHandle::default(),
+                cli_bridge: UnifiedExecCliBridgeHandle::default(),
                 skill_executor: SkillToolExecutorHandle::default(),
             },
         );
@@ -5492,11 +5543,11 @@ mod tests {
             &[("COCO_BASH_SANDBOX", Some(OsStr::new("off")))],
             || async {
                 runtime
-                .call(format!(
-                    r#"{{"command":"printf 'hello' > trace.txt; cat trace.txt","workdir":"{}"}}"#,
-                    temp_root.path().display()
-                ))
-                .await
+                    .call(format!(
+                        r#"{{"cmd":"printf 'hello' > trace.txt; cat trace.txt","workdir":"{}"}}"#,
+                        temp_root.path().display()
+                    ))
+                    .await
             },
         )
         .await

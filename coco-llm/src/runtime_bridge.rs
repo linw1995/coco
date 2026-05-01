@@ -5,8 +5,8 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 
 use crate::{
-    BashToolCliBridge, BashToolCliBridgeError, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
-    CompletionBackend, LlmService,
+    CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService,
+    UnifiedExecCliBridge, UnifiedExecCliBridgeError,
 };
 
 type CocoCliForwarder<B, S> = dyn Fn(
@@ -44,7 +44,7 @@ where
 }
 
 #[async_trait]
-impl<B, S> BashToolCliBridge for LlmRuntimeBridge<B, S>
+impl<B, S> UnifiedExecCliBridge for LlmRuntimeBridge<B, S>
 where
     B: CompletionBackend + 'static,
     S: Send + Sync + 'static,
@@ -52,11 +52,11 @@ where
     async fn execute_coco_cli(
         &self,
         request: CocoCliRuntimeRequest,
-    ) -> std::result::Result<CocoCliRuntimeResponse, BashToolCliBridgeError> {
+    ) -> std::result::Result<CocoCliRuntimeResponse, UnifiedExecCliBridgeError> {
         let llm = self
             .llm
             .upgrade()
-            .ok_or(BashToolCliBridgeError::Unavailable)?;
+            .ok_or(UnifiedExecCliBridgeError::Unavailable)?;
         Ok((self.cli_forwarder)(request, llm).await)
     }
 }

@@ -353,7 +353,8 @@ fn unsupported_store_path_response() -> CocoCliRuntimeResponse {
     CocoCliRuntimeResponse {
         exit_code: 1,
         stdout: String::new(),
-        stderr: "coco command \"--store-path\" is not available in bash tool runtime\n".to_owned(),
+        stderr: "coco command \"--store-path\" is not available in unified exec runtime\n"
+            .to_owned(),
     }
 }
 

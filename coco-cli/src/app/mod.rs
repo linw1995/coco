@@ -6,8 +6,8 @@ use coco_console::{ConsolePublisher, ConsoleStore};
 use coco_core::ConversationEngine;
 use coco_core::CoreSkillToolExecutor;
 use coco_llm::{
-    BashToolCliBridgeHandle, CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge,
-    LlmService, ProviderRuntimeConfig, RigBackend,
+    CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge, LlmService, ProviderRuntimeConfig,
+    RigBackend, UnifiedExecCliBridgeHandle,
 };
 use coco_mem::{ProviderProfileStore, Store};
 use snafu::prelude::*;
@@ -153,7 +153,7 @@ where
 {
     Arc::new_cyclic(|weak_llm| {
         let provider_profiles = provider_profiles.clone();
-        let bash_bridge_impl = Arc::new(LlmRuntimeBridge::new(weak_llm.clone(), {
+        let unified_exec_bridge_impl = Arc::new(LlmRuntimeBridge::new(weak_llm.clone(), {
             let shared_store = shared_store.clone();
             move |request, llm| {
                 let shared_store = shared_store.clone();
@@ -179,11 +179,11 @@ where
                 }
             }
         }));
-        let bash_bridge = BashToolCliBridgeHandle::new(bash_bridge_impl);
+        let unified_exec_bridge = UnifiedExecCliBridgeHandle::new(unified_exec_bridge_impl);
         let skill_bridge = Arc::new(CoreSkillToolExecutor::new(weak_llm.clone()));
         LlmService::builder(shared_store.clone(), backend)
             .with_provider_configs(provider_configs)
-            .with_bash_tool_cli_bridge(bash_bridge)
+            .with_unified_exec_cli_bridge(unified_exec_bridge)
             .with_skill_tool_executor(skill_bridge)
             .build()
     })

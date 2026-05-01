@@ -2,26 +2,69 @@ use coco_mem::Tool;
 
 pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
     match name {
-        "bash" => Some(Tool {
-            name: "bash".to_owned(),
-            description: "Run a bash command.".to_owned(),
+        "exec_command" => Some(Tool {
+            name: "exec_command".to_owned(),
+            description:
+                "Runs a command, returning output or a session_id for ongoing interaction."
+                    .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": {
+                    "cmd": {
                         "type": "string",
-                        "description": "The bash command to execute."
+                        "description": "Shell command to execute."
                     },
                     "workdir": {
                         "type": "string",
-                        "description": "Optional working directory."
+                        "description": "Optional working directory to run the command in. Relative paths resolve under the configured workspace; defaults to the workspace root."
                     },
-                    "timeout_ms": {
+                    "shell": {
+                        "type": "string",
+                        "description": "Optional shell binary to launch. Defaults to the user's SHELL, or bash when SHELL is unset."
+                    },
+                    "tty": {
+                        "type": "boolean",
+                        "description": "Whether to allocate a PTY for interactive commands. Defaults to false; write_stdin is only available for tty sessions."
+                    },
+                    "yield_time_ms": {
                         "type": "integer",
-                        "description": "Optional timeout in milliseconds."
+                        "description": "How long to wait in milliseconds for output before yielding. This is a time slice, not a process timeout; defaults to 1000."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Maximum approximate number of tokens to return. Excess output is truncated from the front."
                     }
                 },
-                "required": ["command"],
+                "required": ["cmd"],
+                "additionalProperties": false
+            }),
+        }),
+        "write_stdin" => Some(Tool {
+            name: "write_stdin".to_owned(),
+            description:
+                "Writes characters to an existing exec_command session and returns recent output."
+                    .to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Identifier of the running exec_command session."
+                    },
+                    "chars": {
+                        "type": "string",
+                        "description": "Bytes to write to stdin. May be empty to poll for recent output."
+                    },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "description": "How long to wait in milliseconds for output before yielding. Defaults to 1000."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Maximum approximate number of tokens to return. Excess output is truncated from the front."
+                    }
+                },
+                "required": ["session_id"],
                 "additionalProperties": false
             }),
         }),
