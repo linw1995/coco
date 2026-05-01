@@ -387,6 +387,7 @@ async fn core_service_requires_telegram_skill_for_telegram_replies() {
     assert!(provider_contexts[0].contains("chat_id: -42"));
     assert!(provider_contexts[0].contains("reply_to_message_id: 1000"));
     assert!(provider_contexts[0].contains("calling the `telegram` skill"));
+    assert!(provider_contexts[0].contains("Telegram reply sent."));
     assert!(provider_contexts[0].contains("Incoming message:"));
     assert!(provider_contexts[0].contains("hello"));
 
