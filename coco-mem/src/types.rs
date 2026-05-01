@@ -193,9 +193,17 @@ pub struct BranchConfigRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillScript {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillVersionSpec {
     pub description: String,
     pub body: String,
+    #[serde(default)]
+    pub scripts: Vec<SkillScript>,
     #[serde(default)]
     pub enable_coco_shim: bool,
 }
@@ -204,6 +212,7 @@ pub struct SkillVersionSpec {
 pub struct SkillUpdatePatch {
     pub description: Option<String>,
     pub body: Option<String>,
+    pub scripts: Option<Vec<SkillScript>>,
     pub enable_coco_shim: Option<bool>,
 }
 
@@ -213,6 +222,8 @@ pub struct SkillVersion {
     pub created_at: Timestamp,
     pub description: String,
     pub body: String,
+    #[serde(default)]
+    pub scripts: Vec<SkillScript>,
     #[serde(default)]
     pub enable_coco_shim: bool,
 }
@@ -235,7 +246,10 @@ pub struct SkillGroups {
 
 impl SkillUpdatePatch {
     pub fn is_empty(&self) -> bool {
-        self.description.is_none() && self.body.is_none() && self.enable_coco_shim.is_none()
+        self.description.is_none()
+            && self.body.is_none()
+            && self.scripts.is_none()
+            && self.enable_coco_shim.is_none()
     }
 }
 
@@ -246,6 +260,7 @@ impl SkillVersion {
             created_at: Timestamp::now(),
             description: spec.description,
             body: spec.body,
+            scripts: spec.scripts,
             enable_coco_shim: spec.enable_coco_shim,
         }
     }
@@ -277,6 +292,7 @@ impl SkillRecord {
             created_at: Timestamp::now(),
             description: patch.description.clone().unwrap_or(current.description),
             body: patch.body.clone().unwrap_or(current.body),
+            scripts: patch.scripts.clone().unwrap_or(current.scripts),
             enable_coco_shim: patch.enable_coco_shim.unwrap_or(current.enable_coco_shim),
         };
 
@@ -293,6 +309,7 @@ impl SkillRecord {
             created_at: Timestamp::now(),
             description: target.description,
             body: target.body,
+            scripts: target.scripts,
             enable_coco_shim: target.enable_coco_shim,
         };
 
@@ -335,6 +352,7 @@ pub fn default_skill_groups() -> SkillGroups {
                 body: include_str!("default_skills/coco-orchestrator.md")
                     .trim()
                     .to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: true,
             },
         ),
@@ -349,6 +367,7 @@ pub fn default_skill_groups() -> SkillGroups {
                 body: include_str!("default_skills/new-skill.md")
                     .trim()
                     .to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: true,
             },
         ),
@@ -364,6 +383,7 @@ pub fn default_skill_groups() -> SkillGroups {
                 body: include_str!("default_skills/coco-runner.md")
                     .trim()
                     .to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: true,
             },
         ),

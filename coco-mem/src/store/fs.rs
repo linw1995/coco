@@ -27,8 +27,9 @@ use crate::error::{
 };
 use crate::{
     BranchConfig, BranchConfigRecord, BranchConfigVersion, Job, JobStatus, NewNode, Node,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
-    SkillVersion, SkillVersionSpec, StoreError, StoreResult as Result, default_skill_groups,
+    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillScript,
+    SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError, StoreResult as Result,
+    default_skill_groups,
 };
 
 const STORE_FORMAT_VERSION: u64 = 7;
@@ -116,6 +117,8 @@ struct PersistedSkillRecord {
     description: String,
     body: String,
     #[serde(default)]
+    scripts: Vec<SkillScript>,
+    #[serde(default)]
     enable_coco_shim: bool,
 }
 
@@ -135,6 +138,8 @@ struct SkillHistoryEntry {
     created_at: jiff::Timestamp,
     description: String,
     body: String,
+    #[serde(default)]
+    scripts: Vec<SkillScript>,
     #[serde(default)]
     enable_coco_shim: bool,
 }
@@ -242,6 +247,7 @@ impl VersionedSnapshot for PersistedSkillRecord {
         version.created_at == self.created_at
             && version.description == self.description
             && version.body == self.body
+            && version.scripts == self.scripts
             && version.enable_coco_shim == self.enable_coco_shim
     }
 }
@@ -281,6 +287,7 @@ impl PersistedSkillRecord {
             created_at: current.created_at,
             description: current.description.clone(),
             body: current.body.clone(),
+            scripts: current.scripts.clone(),
             enable_coco_shim: current.enable_coco_shim,
         }
     }
@@ -316,6 +323,7 @@ impl SkillHistoryEntry {
             created_at: version.created_at,
             description: version.description.clone(),
             body: version.body.clone(),
+            scripts: version.scripts.clone(),
             enable_coco_shim: version.enable_coco_shim,
         }
     }
@@ -326,6 +334,7 @@ impl SkillHistoryEntry {
             created_at: self.created_at,
             description: self.description,
             body: self.body,
+            scripts: self.scripts,
             enable_coco_shim: self.enable_coco_shim,
         }
     }

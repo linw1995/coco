@@ -104,6 +104,7 @@ fn run_skill_add(command: SkillAddCommand, store: &impl SkillStore) -> Result<Sk
             SkillVersionSpec {
                 description: command.description,
                 body,
+                scripts: Vec::new(),
                 enable_coco_shim: command.enable_coco_shim,
             },
         )
@@ -122,6 +123,7 @@ fn run_skill_update(
             .as_ref()
             .map(|path| read_skill_body(path.as_path()))
             .transpose()?,
+        scripts: None,
         enable_coco_shim: if command.enable_coco_shim {
             Some(true)
         } else if command.disable_coco_shim {
