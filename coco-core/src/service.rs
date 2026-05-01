@@ -1,7 +1,7 @@
 use snafu::prelude::*;
 
+use coco_llm::CompletionBackend;
 use coco_llm::coco_mem::{BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore};
-use coco_llm::{CompletionBackend, SessionConfigPatch, builtin_tool_definition};
 use std::collections::HashSet;
 
 use crate::{
@@ -55,13 +55,7 @@ where
             })?;
 
         let prompt = channel_prompt(&message, text);
-        let session_patch = channel_session_patch(&message);
-
-        match self
-            .engine
-            .reply_with_session_patch(&branch, &prompt, vec![], session_patch)
-            .await
-        {
+        match self.engine.reply(&branch, &prompt).await {
             Ok(text) => Ok(OutboundMessage { text }),
             Err(EngineError::SessionMissing { branch }) => Err(Error::MissingSession { branch }),
             Err(source @ EngineError::EngineFailed { .. }) => {
@@ -122,23 +116,4 @@ fn channel_prompt(message: &InboundMessage, text: &str) -> String {
         "You are handling an inbound Telegram message.\n\nTelegram reply target:\n- chat_id: {chat_id}\n- reply_to_message_id: {reply_to_message_id}\n\nRequired response policy:\n- Reply by calling the `telegram` skill through `use_skill`.\n- Use the target chat_id and reply_to_message_id above when sending the Telegram reply.\n- After the skill call completes, return a short local completion note such as `Telegram reply sent.`.\n- Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.\n\nIncoming message:\n{text}",
         chat_id = message.conversation_id,
     )
-}
-
-fn channel_session_patch(message: &InboundMessage) -> Option<SessionConfigPatch> {
-    if message.channel_kind != coco_channel::ChannelKind::Telegram {
-        return None;
-    }
-
-    Some(SessionConfigPatch {
-        tools: Some(
-            ["exec_command", "use_skill"]
-                .into_iter()
-                .map(|name| {
-                    builtin_tool_definition(name)
-                        .expect("telegram channel tools should be built-in definitions")
-                })
-                .collect(),
-        ),
-        ..SessionConfigPatch::default()
-    })
 }

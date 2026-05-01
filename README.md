@@ -132,8 +132,8 @@ omit `--provider-profile`.
 CoCo can poll Telegram and route incoming messages to a CoCo branch. The
 Telegram channel is receive-only: outbound replies must be sent by the built-in
 `telegram` skill. Telegram inbound prompts automatically include the target
-`chat_id` and `reply_to_message_id`, and CoCo injects the tools needed to call
-that skill for the reply.
+`chat_id` and `reply_to_message_id`. Configure the target session with the
+tools needed to call that skill for the reply.
 
 Create a Telegram bot and get its token:
 
