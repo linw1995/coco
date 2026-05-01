@@ -14,7 +14,7 @@ futures = "0.3.31"
 tokio.workspace = true
 
 # Time and identifiers.
-jiff = { version = "0.2.23", features = ["serde"] }
+jiff = { version = "0.2.24", features = ["serde"] }
 nanoid.workspace = true
 
 # Serialization.
