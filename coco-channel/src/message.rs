@@ -28,6 +28,7 @@ pub struct InboundMessage {
     pub channel_kind: ChannelKind,
     pub conversation_id: String,
     pub sender_id: String,
+    pub source_message_id: Option<String>,
     pub text: String,
 }
 
@@ -48,6 +49,17 @@ impl InboundMessage {
         Self::new(ChannelKind::Telegram, conversation_id, sender_id, text)
     }
 
+    pub fn telegram_with_message_id(
+        conversation_id: impl Into<String>,
+        sender_id: impl Into<String>,
+        source_message_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        let mut message = Self::telegram(conversation_id, sender_id, text);
+        message.source_message_id = Some(source_message_id.into());
+        message
+    }
+
     pub fn discord(
         conversation_id: impl Into<String>,
         sender_id: impl Into<String>,
@@ -66,6 +78,7 @@ impl InboundMessage {
             channel_kind,
             conversation_id: conversation_id.into(),
             sender_id: sender_id.into(),
+            source_message_id: None,
             text: text.into(),
         }
     }
