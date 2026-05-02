@@ -64,7 +64,7 @@ rec {
 
             meta = {
               inherit description;
-              mainProgram = "coco-cli";
+              mainProgram = "coco";
             };
           };
 
@@ -101,7 +101,7 @@ rec {
                 "17667/tcp" = {};
               };
               Cmd = [
-                "${coco-cli}/bin/coco-cli"
+                "${coco-cli}/bin/coco"
                 "daemon"
                 "serve"
                 "--console-addr"
