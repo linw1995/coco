@@ -20,7 +20,7 @@ nix build .#coco-image
 docker load < result
 ```
 
-The image starts `coco-cli daemon serve` by default. It listens on port
+The image starts `coco daemon serve` by default. It listens on port
 `17667`, stores CoCo config and runtime data under `/data`, and exposes
 `/workspace` as the isolated exec tool workspace.
 
@@ -60,7 +60,7 @@ docker run --rm -it \
   -v "$PWD/.coco-data:/data" \
   -v "$PWD:/workspace" \
   coco:latest \
-  coco-cli session create \
+  coco session create \
     --provider-profile gpt-subscription \
     --system-prompt "You are a pragmatic coding assistant."
 ```
@@ -123,7 +123,7 @@ docker run --rm -it \
   -e CHATGPT_ACCESS_TOKEN="$CHATGPT_ACCESS_TOKEN" \
   -e CHATGPT_ACCOUNT_ID="$CHATGPT_ACCOUNT_ID" \
   coco:latest \
-  coco-cli session create \
+  coco session create \
     --provider-profile gpt-subscription \
     --system-prompt "You are a pragmatic coding assistant."
 ```
