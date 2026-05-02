@@ -7,6 +7,10 @@
 
 An AI Copilot.
 
+## Acknowledgements
+
+Thanks to `codex` and `bub` for the inspiration and implementation references.
+
 ## Docker
 
 Build and load the image with Nix:
