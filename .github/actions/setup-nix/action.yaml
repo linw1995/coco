@@ -12,8 +12,8 @@ runs:
     - name: Restore and save Nix store
       uses: nix-community/cache-nix-action@v6
       with:
-        # Use rolling keys so nix build outputs can be saved after each successful run.
-        primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ github.sha }}
+        # Cache crane's nix build dependency artifacts by Cargo.lock and flake inputs.
+        primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'flake.nix', 'flake.lock') }}
         restore-prefixes-first-match: |
           nix-${{ runner.os }}-${{ github.job }}-
           nix-${{ runner.os }}-
