@@ -737,7 +737,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
     let engine = ConversationEngine::new(llm);
     store
         .add_skill(
-            SessionRole::Orchestrator,
+            SessionRole::Runner,
             "fast-rust",
             SkillVersionSpec {
                 description: "Review Rust changes.".to_owned(),
@@ -807,7 +807,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
         })
         .expect("child execution should persist a child session anchor");
     assert_eq!(child_session_anchor.0.parent, tool_use_id);
-    assert_eq!(child_session_anchor.1.role, SessionRole::Orchestrator);
+    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
     assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
         child_session_anchor
@@ -946,7 +946,7 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
     let engine = ConversationEngine::new(llm);
     store
         .add_skill(
-            SessionRole::Orchestrator,
+            SessionRole::Runner,
             "fast-rust",
             SkillVersionSpec {
                 description: "Review Rust changes.".to_owned(),

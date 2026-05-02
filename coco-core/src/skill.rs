@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -621,8 +622,24 @@ fn collect_store_skills<S>(
 where
     S: SkillStore,
 {
-    let records = store.list_skills(session_role).context(LoadSkillsSnafu)?;
-    Ok(skill_entries_from_store_records(session_role, &records))
+    let mut seen_names = HashSet::new();
+    let mut skills = Vec::new();
+    for role in accessible_skill_roles(session_role) {
+        let records = store.list_skills(role).context(LoadSkillsSnafu)?;
+        for skill in skill_entries_from_store_records(role, &records) {
+            if seen_names.insert(skill.name.clone()) {
+                skills.push(skill);
+            }
+        }
+    }
+    Ok(skills)
+}
+
+fn accessible_skill_roles(session_role: SessionRole) -> Vec<SessionRole> {
+    match session_role {
+        SessionRole::Orchestrator => vec![SessionRole::Orchestrator, SessionRole::Runner],
+        SessionRole::Runner => vec![SessionRole::Runner],
+    }
 }
 
 fn skill_entries_from_store_records(role: SessionRole, records: &[SkillRecord]) -> Vec<SkillEntry> {
@@ -847,7 +864,7 @@ description: "External skill."
     }
 
     #[test]
-    fn collect_store_skills_only_returns_templates_for_current_session_role() {
+    fn collect_store_skills_respects_role_hierarchy() {
         let store = coco_llm::coco_mem::MemoryStore::new();
 
         let runner = collect_store_skills(&store, SessionRole::Runner).unwrap();
@@ -865,7 +882,37 @@ description: "External skill."
                 .iter()
                 .map(|skill| skill.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["coco-orchestrator", "new-skill"]
+            vec!["coco-orchestrator", "new-skill", "coco-runner", "telegram"]
         );
+    }
+
+    #[test]
+    fn collect_store_skills_prefers_current_role_on_name_conflict() {
+        let store = coco_llm::coco_mem::MemoryStore::new();
+        for role in [SessionRole::Orchestrator, SessionRole::Runner] {
+            store
+                .add_skill(
+                    role,
+                    "shared-skill",
+                    SkillVersionSpec {
+                        description: format!("{} copy", role.as_str()),
+                        body: "# Shared Skill".to_owned(),
+                        scripts: Vec::new(),
+                        enable_coco_shim: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        let skill = resolve_skill(
+            Path::new("."),
+            &store,
+            SessionRole::Orchestrator,
+            "shared-skill",
+        )
+        .unwrap();
+
+        assert_eq!(skill.session_role, SessionRole::Orchestrator);
+        assert_eq!(skill.description, "orchestrator copy");
     }
 }

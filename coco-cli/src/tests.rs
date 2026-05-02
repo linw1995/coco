@@ -1007,7 +1007,7 @@ async fn prompt_wires_skill_executor_for_use_skill() {
     open_store(&store_path)
         .unwrap()
         .add_skill(
-            SessionRole::Orchestrator,
+            SessionRole::Runner,
             "fast-rust",
             SkillVersionSpec {
                 description: "Review Rust changes.".to_owned(),
@@ -1111,7 +1111,7 @@ async fn prompt_wires_skill_executor_for_use_skill() {
         })
         .expect("expected child session anchor under use_skill");
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
-    assert_eq!(child_session_anchor.1.role, SessionRole::Orchestrator);
+    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
     assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
         child_session_anchor
@@ -1166,7 +1166,7 @@ async fn prompt_keeps_failed_use_skill_child_visible_under_tool_use() {
     open_store(&store_path)
         .unwrap()
         .add_skill(
-            SessionRole::Orchestrator,
+            SessionRole::Runner,
             "fast-rust",
             SkillVersionSpec {
                 description: "Review Rust changes.".to_owned(),
@@ -1249,7 +1249,7 @@ async fn prompt_keeps_failed_use_skill_child_visible_under_tool_use() {
         Kind::Anchor(anchor) if anchor.as_skill_result().is_some()
     )));
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
-    assert_eq!(child_session_anchor.1.role, SessionRole::Orchestrator);
+    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
     assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
         child_session_anchor
