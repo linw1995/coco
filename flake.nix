@@ -26,47 +26,52 @@ rec {
           ];
         };
         lib = pkgs.lib;
-        rustToolchain = with pkgs.fenix;
-          combine [
-            stable.cargo
-            stable.rustc
-            targets.wasm32-unknown-unknown.stable.rust-std
+        rustToolchainFor = p:
+          with p.fenix;
+            combine [
+              stable.cargo
+              stable.rustc
+              targets.wasm32-unknown-unknown.stable.rust-std
+            ];
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchainFor;
+        src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            (craneLib.fileset.commonCargoSources ./.)
+            (lib.fileset.maybeMissing ./coco-console/src/native/style.css)
+            (lib.fileset.maybeMissing ./coco-mem/src/default_skills)
           ];
-        rustPlatform = pkgs.makeRustPlatform {
-          cargo = rustToolchain;
-          rustc = rustToolchain;
         };
+        cargoArgs = {
+          pname = "coco-cli";
+          inherit version src;
+          strictDeps = true;
+
+          cargoExtraArgs = "--package coco-cli";
+
+          outputHashes = {
+            "git+https://github.com/0xPlaygrounds/rig?branch=main#6dc36d803adaf4f89de774577b9c4f7ac9057644" = "sha256-tnSi5EOq9BCEXlJxj2bFzlynG33qB+UuPDufW92kAj8=";
+          };
+
+          nativeBuildInputs = [
+            pkgs.wasm-bindgen-cli
+          ];
+        };
+        cargoArtifacts = craneLib.buildDepsOnly cargoArgs;
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       in {
         packages = rec {
           default = coco-cli;
 
-          coco-cli = rustPlatform.buildRustPackage {
-            pname = "coco-cli";
-            inherit version;
+          coco-cli = craneLib.buildPackage (cargoArgs
+            // {
+              inherit cargoArtifacts;
 
-            src = lib.cleanSource ./.;
-            strictDeps = true;
-
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              outputHashes = {
-                "rig-core-0.35.0" = "sha256-tnSi5EOq9BCEXlJxj2bFzlynG33qB+UuPDufW92kAj8=";
-                "rig-derive-0.1.12" = "sha256-tnSi5EOq9BCEXlJxj2bFzlynG33qB+UuPDufW92kAj8=";
+              meta = {
+                inherit description;
+                mainProgram = "coco-cli";
               };
-            };
-            cargoBuildFlags = ["--package" "coco-cli"];
-            cargoTestFlags = ["--package" "coco-cli"];
-
-            nativeBuildInputs = [
-              pkgs.wasm-bindgen-cli
-            ];
-
-            meta = {
-              inherit description;
-              mainProgram = "coco";
-            };
-          };
+            });
 
           coco-image = pkgs.dockerTools.buildLayeredImage {
             name = "coco";

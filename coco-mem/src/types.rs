@@ -382,6 +382,31 @@ pub fn default_skill_groups() -> SkillGroups {
             },
         ),
     );
+    groups.orchestrator.insert(
+        "telegram".to_owned(),
+        SkillRecord::new(
+            "telegram",
+            SkillVersionSpec {
+                description:
+                    "Send, reply to, and edit Telegram messages through the Telegram Bot API."
+                        .to_owned(),
+                body: include_str!("default_skills/telegram.md").trim().to_owned(),
+                scripts: vec![
+                    SkillScript {
+                        path: "scripts/telegram_send.py".to_owned(),
+                        content: include_str!("default_skills/telegram/scripts/telegram_send.py")
+                            .to_owned(),
+                    },
+                    SkillScript {
+                        path: "scripts/telegram_edit.py".to_owned(),
+                        content: include_str!("default_skills/telegram/scripts/telegram_edit.py")
+                            .to_owned(),
+                    },
+                ],
+                enable_coco_shim: true,
+            },
+        ),
+    );
     groups.runner.insert(
         "coco-runner".to_owned(),
         SkillRecord::new(

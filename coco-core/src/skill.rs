@@ -1166,7 +1166,7 @@ description: "Second copy."
                 .iter()
                 .map(|skill| skill.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["coco-orchestrator", "new-skill"]
+            vec!["coco-orchestrator", "new-skill", "telegram"]
         );
     }
 }

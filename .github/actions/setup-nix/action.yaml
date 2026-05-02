@@ -12,8 +12,11 @@ runs:
     - name: Restore and save Nix store
       uses: nix-community/cache-nix-action@v6
       with:
-        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-        restore-prefixes-first-match: nix-${{ runner.os }}-
+        # Cache crane's nix build dependency artifacts by Cargo.lock and flake inputs.
+        primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'flake.nix', 'flake.lock') }}
+        restore-prefixes-first-match: |
+          nix-${{ runner.os }}-${{ github.job }}-
+          nix-${{ runner.os }}-
         gc-max-store-size-linux: 15G
 
     - name: Cache Cargo dependencies
@@ -23,8 +26,9 @@ runs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-${{ github.job }}-${{ github.sha }}
         restore-keys: |
+          ${{ runner.os }}-cargo-${{ github.job }}-
           ${{ runner.os }}-cargo-
 
     - name: Setup nix develop env
