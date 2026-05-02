@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::Parser;
 use coco_llm::coco_mem::{
-    Anchor, BackendMetadata, BranchStore, JobStore, Kind, MergeParent, NewNode, NodeStore,
-    PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionStore,
+    Anchor, AnchorPayload, BackendMetadata, BranchStore, JobStore, Kind, MergeParent, NewNode,
+    NodeStore, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionStore,
     SkillResultAnchor, ToolResult, ToolUse,
 };
 use coco_llm::{
@@ -25,7 +25,10 @@ use crate::{
     Cli,
     app::{
         config::{ChannelConfigs, ProviderProfiles},
-        daemon::{DaemonServerOptions, resume_incomplete_jobs, start_daemon_server},
+        daemon::{
+            DaemonServerOptions, ensure_initial_session, resume_incomplete_jobs,
+            start_daemon_server,
+        },
         resolve_session_config, run_forwarded_with_services, run_with_backend,
         runtime::{ForwardedRuntimeInputs, RuntimeServices},
     },
@@ -5176,6 +5179,49 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
     assert!(response.stderr.is_empty());
 
     server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_startup_creates_default_session_when_store_is_empty() {
+    let (_tempdir, store_path) = temp_store_path();
+    let store = open_store(&store_path).unwrap();
+    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
+
+    ensure_initial_session(&store, &llm, shared_test_provider_profiles())
+        .await
+        .unwrap();
+
+    let states = store.list_session_states().unwrap();
+    assert_eq!(states.get("main"), Some(&SessionState::Active));
+
+    let head = store.get_branch_head("main").unwrap();
+    let node = store.get_node(&head).unwrap();
+    let Kind::Anchor(anchor) = node.kind else {
+        panic!("expected default session anchor");
+    };
+    let AnchorPayload::Session(session) = anchor.payload else {
+        panic!("expected session anchor payload");
+    };
+    assert_eq!(session.role, SessionRole::Orchestrator);
+    assert_eq!(session.provider_profile.as_deref(), Some("openai-codex"));
+    assert_eq!(session.provider, None);
+    assert_eq!(session.model, "gpt-5.4");
+    assert_eq!(session.system_prompt, "You are CoCo. An AI copilot");
+    assert_eq!(session.prompt, "");
+    assert_eq!(session.max_tokens, Some(32_000));
+    assert_eq!(
+        session
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["exec_command", "write_stdin", "search_skill", "use_skill"]
+    );
+
+    ensure_initial_session(&store, &llm, shared_test_provider_profiles())
+        .await
+        .unwrap();
+    assert_eq!(store.get_branch_head("main").unwrap(), head);
 }
 
 #[test]
