@@ -114,6 +114,13 @@ where
             if !self.allowed_chat_ids.is_empty()
                 && !self.allowed_chat_ids.contains(&inbound.conversation_id)
             {
+                tracing::info!(
+                    conversation_id = %inbound.conversation_id,
+                    sender_id = %inbound.sender_id,
+                    text = %inbound.text,
+                    allowed_chat_ids = ?self.allowed_chat_ids,
+                    "filtered telegram inbound message by allowed_chat_ids"
+                );
                 continue;
             }
 
