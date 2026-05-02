@@ -382,7 +382,23 @@ pub fn default_skill_groups() -> SkillGroups {
             },
         ),
     );
-    groups.orchestrator.insert(
+    groups.runner.insert(
+        "coco-runner".to_owned(),
+        SkillRecord::new(
+            "coco-runner",
+            SkillVersionSpec {
+                description:
+                    "Guide a runner session through the CoCo commands available in runner scope."
+                        .to_owned(),
+                body: include_str!("default_skills/coco-runner.md")
+                    .trim()
+                    .to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        ),
+    );
+    groups.runner.insert(
         "telegram".to_owned(),
         SkillRecord::new(
             "telegram",
@@ -403,22 +419,6 @@ pub fn default_skill_groups() -> SkillGroups {
                             .to_owned(),
                     },
                 ],
-                enable_coco_shim: true,
-            },
-        ),
-    );
-    groups.runner.insert(
-        "coco-runner".to_owned(),
-        SkillRecord::new(
-            "coco-runner",
-            SkillVersionSpec {
-                description:
-                    "Guide a runner session through the CoCo commands available in runner scope."
-                        .to_owned(),
-                body: include_str!("default_skills/coco-runner.md")
-                    .trim()
-                    .to_owned(),
-                scripts: Vec::new(),
                 enable_coco_shim: true,
             },
         ),
