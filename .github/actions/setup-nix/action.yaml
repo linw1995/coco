@@ -16,7 +16,6 @@ runs:
         primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'flake.nix', 'flake.lock') }}
         restore-prefixes-first-match: |
           nix-${{ runner.os }}-${{ github.job }}-
-          nix-${{ runner.os }}-
         gc-max-store-size-linux: 15G
 
     - name: Cache Cargo dependencies
@@ -29,7 +28,6 @@ runs:
         key: ${{ runner.os }}-cargo-${{ github.job }}-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-cargo-${{ github.job }}-
-          ${{ runner.os }}-cargo-
 
     - name: Setup nix develop env
       shell: bash
