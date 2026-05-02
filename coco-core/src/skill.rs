@@ -1159,14 +1159,14 @@ description: "Second copy."
                 .iter()
                 .map(|skill| skill.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["coco-runner"]
+            vec!["coco-runner", "telegram"]
         );
         assert_eq!(
             orchestrator
                 .iter()
                 .map(|skill| skill.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["coco-orchestrator", "new-skill", "telegram"]
+            vec!["coco-orchestrator", "new-skill"]
         );
     }
 }

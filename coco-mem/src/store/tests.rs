@@ -1714,10 +1714,8 @@ where
     let new_skill = store
         .get_skill(SessionRole::Orchestrator, "new-skill")
         .unwrap();
-    let telegram = store
-        .get_skill(SessionRole::Orchestrator, "telegram")
-        .unwrap();
     let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
+    let telegram = store.get_skill(SessionRole::Runner, "telegram").unwrap();
 
     assert_eq!(orchestrator.current_version, 1);
     assert_eq!(new_skill.current_version, 1);
@@ -2136,13 +2134,10 @@ fn open_creates_jsonl_store_directory_with_root_node() {
             .is_file()
     );
     assert!(
-        path.join("skill-history/orchestrator/telegram.jsonl")
-            .is_file()
-    );
-    assert!(
         path.join("skill-history/runner/coco-runner.jsonl")
             .is_file()
     );
+    assert!(path.join("skill-history/runner/telegram.jsonl").is_file());
 
     let nodes = fs::read_to_string(path.join("nodes.jsonl")).unwrap();
     assert!(nodes.lines().count() >= 1);
@@ -2624,14 +2619,10 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
     );
     assert!(
         reopened
-            .get_skill(SessionRole::Orchestrator, "telegram")
-            .is_ok()
-    );
-    assert!(
-        reopened
             .get_skill(SessionRole::Runner, "coco-runner")
             .is_ok()
     );
+    assert!(reopened.get_skill(SessionRole::Runner, "telegram").is_ok());
     assert!(
         path.join("skill-history/orchestrator/coco-orchestrator.jsonl")
             .is_file()
@@ -2641,13 +2632,10 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
             .is_file()
     );
     assert!(
-        path.join("skill-history/orchestrator/telegram.jsonl")
-            .is_file()
-    );
-    assert!(
         path.join("skill-history/runner/coco-runner.jsonl")
             .is_file()
     );
+    assert!(path.join("skill-history/runner/telegram.jsonl").is_file());
 }
 
 #[test]
