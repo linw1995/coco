@@ -39,6 +39,15 @@ impl Error {
             message: message.into(),
         }
     }
+
+    pub(crate) fn is_transport_failure(&self) -> bool {
+        match self {
+            Self::Transport { .. } => true,
+            #[cfg(feature = "telegram")]
+            Self::TelegramTransport { .. } => true,
+            Self::Handler { .. } | Self::InvalidInput { .. } => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

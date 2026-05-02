@@ -32,6 +32,9 @@ serde_json = { workspace = true, optional = true }
 # Error handling.
 snafu.workspace = true
 
+# Observability.
+tracing = { workspace = true, optional = true }
+
 [dev-dependencies]
 # Test runtime.
 tokio.workspace = true

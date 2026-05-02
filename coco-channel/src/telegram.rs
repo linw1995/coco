@@ -9,6 +9,7 @@ use crate::error::TelegramTransportSnafu;
 use crate::{ChannelRuntime, Error, InboundMessage, MessageHandler, Result};
 
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 30;
+const TRANSPORT_RETRY_DELAY_SECS: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramChannelConfig {
@@ -120,6 +121,10 @@ where
 
         Ok(handled)
     }
+
+    async fn sleep_after_transport_error(&self) {
+        tokio::time::sleep(Duration::from_secs(TRANSPORT_RETRY_DELAY_SECS)).await;
+    }
 }
 
 #[async_trait]
@@ -132,7 +137,18 @@ where
         H: MessageHandler,
     {
         loop {
-            self.run_once(handler).await?;
+            match self.run_once(handler).await {
+                Ok(_) => {}
+                Err(error) if error.is_transport_failure() => {
+                    tracing::warn!(
+                        error = %error,
+                        retry_delay_secs = TRANSPORT_RETRY_DELAY_SECS,
+                        "telegram channel polling failed; retrying"
+                    );
+                    self.sleep_after_transport_error().await;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 }
@@ -302,6 +318,15 @@ mod tests {
         }
     }
 
+    struct FailingTransport;
+
+    #[async_trait]
+    impl TelegramTransport for FailingTransport {
+        async fn get_updates(&self, _request: GetUpdatesRequest) -> Result<GetUpdatesResponse> {
+            Err(Error::transport(std::io::Error::other("temporary outage")))
+        }
+    }
+
     #[async_trait]
     impl TelegramTransport for FakeTransport {
         async fn get_updates(&self, request: GetUpdatesRequest) -> Result<GetUpdatesResponse> {
@@ -335,6 +360,15 @@ mod tests {
             Ok(OutboundMessage {
                 text: "ignored by telegram channel".to_owned(),
             })
+        }
+    }
+
+    struct FailingHandler;
+
+    #[async_trait]
+    impl MessageHandler for FailingHandler {
+        async fn handle(&self, _message: InboundMessage) -> Result<OutboundMessage> {
+            Err(Error::handler(std::io::Error::other("handler failed")))
         }
     }
 
@@ -414,6 +448,31 @@ mod tests {
         assert_eq!(message.sender_id, "-42");
         assert_eq!(message.source_message_id.as_deref(), Some("1000"));
         assert_eq!(message.text, "hello");
+    }
+
+    #[tokio::test]
+    async fn run_retries_transport_failures_instead_of_exiting() {
+        let channel = TelegramChannel::new(FailingTransport, 30, BTreeSet::new());
+        let handler = RecordingHandler::default();
+
+        let task = tokio::spawn(async move { channel.run(&handler).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(!task.is_finished());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_still_returns_handler_failures() {
+        let channel = TelegramChannel::new(
+            FakeTransport::with_updates(vec![text_update(100, 42, 7, "hello")]),
+            30,
+            BTreeSet::new(),
+        );
+
+        let result = channel.run(&FailingHandler).await;
+
+        assert!(matches!(result, Err(Error::Handler { .. })));
     }
 
     fn text_update(update_id: i64, chat_id: i64, user_id: i64, text: &str) -> TelegramUpdate {
