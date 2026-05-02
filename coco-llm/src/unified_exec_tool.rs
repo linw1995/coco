@@ -1013,12 +1013,24 @@ fn prepare_coco_command_path_injection(
     })
 }
 
-fn prepare_skill_uv_cache(
+#[derive(Clone, Debug)]
+struct SkillUvRuntimeDirs {
+    cache_dir: PathBuf,
+    python_install_dir: PathBuf,
+}
+
+fn prepare_skill_uv_runtime_dirs(
     workspace_root: &Path,
-) -> std::result::Result<PathBuf, UnifiedExecToolError> {
-    let cache_dir = resolve_runtime_root(workspace_root)?.join("uv-cache");
+) -> std::result::Result<SkillUvRuntimeDirs, UnifiedExecToolError> {
+    let runtime_root = resolve_runtime_root(workspace_root)?;
+    let cache_dir = runtime_root.join("uv-cache");
+    let python_install_dir = runtime_root.join("uv-python");
     std::fs::create_dir_all(&cache_dir).context(CreateCocoCommandShimDirSnafu)?;
-    Ok(cache_dir)
+    std::fs::create_dir_all(&python_install_dir).context(CreateCocoCommandShimDirSnafu)?;
+    Ok(SkillUvRuntimeDirs {
+        cache_dir,
+        python_install_dir,
+    })
 }
 
 fn nono_execution_spec(
@@ -1492,10 +1504,11 @@ async fn execute_command(
     if let Some(runtime_server) = &runtime_server {
         extra_allow_paths.push(runtime_server.socket_dir.clone());
     }
-    let skill_uv_cache_dir = if request.context.active_skill.is_some() {
-        let cache_dir = prepare_skill_uv_cache(&request.workspace_root)?;
-        extra_allow_paths.push(cache_dir.clone());
-        Some(cache_dir)
+    let skill_uv_runtime_dirs = if request.context.active_skill.is_some() {
+        let runtime_dirs = prepare_skill_uv_runtime_dirs(&request.workspace_root)?;
+        extra_allow_paths.push(runtime_dirs.cache_dir.clone());
+        extra_allow_paths.push(runtime_dirs.python_install_dir.clone());
+        Some(runtime_dirs)
     } else {
         None
     };
@@ -1524,7 +1537,7 @@ async fn execute_command(
             execution,
             runtime_server,
             coco_command,
-            skill_uv_cache_dir,
+            skill_uv_runtime_dirs,
             sessions,
         )
         .await;
@@ -1547,6 +1560,7 @@ async fn execute_command(
         .env_remove(COCO_SKILL_NAME_ENV)
         .env_remove(COCO_SKILL_DIR_ENV)
         .env_remove(UV_CACHE_DIR_ENV)
+        .env_remove(UV_PYTHON_INSTALL_DIR_ENV)
         .env_remove(COCO_COMMAND_SHIM_MODE_ENV);
     if let Some(coco_command) = &coco_command {
         command.env("PATH", &coco_command.path_env);
@@ -1572,8 +1586,13 @@ async fn execute_command(
             .env(COCO_SKILL_NAME_ENV, &active_skill.name)
             .env(COCO_SKILL_DIR_ENV, &active_skill.directory);
     }
-    if let Some(skill_uv_cache_dir) = &skill_uv_cache_dir {
-        command.env(UV_CACHE_DIR_ENV, skill_uv_cache_dir);
+    if let Some(skill_uv_runtime_dirs) = &skill_uv_runtime_dirs {
+        command
+            .env(UV_CACHE_DIR_ENV, &skill_uv_runtime_dirs.cache_dir)
+            .env(
+                UV_PYTHON_INSTALL_DIR_ENV,
+                &skill_uv_runtime_dirs.python_install_dir,
+            );
     }
     let mut child = command.spawn().context(SpawnProcessSnafu)?;
 
@@ -1638,7 +1657,7 @@ async fn execute_pty_command(
     execution: ExecutionSpec,
     runtime_server: Option<CocoCliRuntimeServer>,
     coco_command: Option<CocoCommandPathInjection>,
-    skill_uv_cache_dir: Option<PathBuf>,
+    skill_uv_runtime_dirs: Option<SkillUvRuntimeDirs>,
     sessions: UnifiedExecSessionStoreHandle,
 ) -> std::result::Result<String, UnifiedExecToolError> {
     let pty_system = NativePtySystem::default();
@@ -1677,6 +1696,7 @@ async fn execute_pty_command(
     command.env_remove(COCO_SKILL_NAME_ENV);
     command.env_remove(COCO_SKILL_DIR_ENV);
     command.env_remove(UV_CACHE_DIR_ENV);
+    command.env_remove(UV_PYTHON_INSTALL_DIR_ENV);
     command.env_remove(COCO_COMMAND_SHIM_MODE_ENV);
     if let Some(coco_command) = &coco_command {
         command.env("PATH", &coco_command.path_env);
@@ -1700,8 +1720,12 @@ async fn execute_pty_command(
         command.env(COCO_SKILL_NAME_ENV, &active_skill.name);
         command.env(COCO_SKILL_DIR_ENV, &active_skill.directory);
     }
-    if let Some(skill_uv_cache_dir) = &skill_uv_cache_dir {
-        command.env(UV_CACHE_DIR_ENV, skill_uv_cache_dir);
+    if let Some(skill_uv_runtime_dirs) = &skill_uv_runtime_dirs {
+        command.env(UV_CACHE_DIR_ENV, &skill_uv_runtime_dirs.cache_dir);
+        command.env(
+            UV_PYTHON_INSTALL_DIR_ENV,
+            &skill_uv_runtime_dirs.python_install_dir,
+        );
     }
 
     let mut child = pair.slave.spawn_command(command).map_err(|source| {
@@ -2786,7 +2810,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s' \"$(command -v uv)\" \"$UV_CACHE_DIR\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s' \"$(command -v uv)\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -2798,10 +2822,12 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         assert!(output.contains("exit_status: 0"));
         assert!(output.contains("uv|"));
         assert!(output.contains("/uv-cache"));
+        assert!(output.contains("/uv-python"));
         let args = std::fs::read_to_string(&observed_args).unwrap();
         assert!(args.contains(&fake_bin.path().display().to_string()));
         assert!(args.contains(&skill_dir.path().display().to_string()));
         assert!(args.contains("/uv-cache"));
+        assert!(args.contains("/uv-python"));
     }
 
     #[tokio::test]
@@ -2880,7 +2906,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s|%s' \"$COCO_SKILL_NAME\" \"$COCO_SKILL_DIR\" \"$UV_CACHE_DIR\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s' \"$COCO_SKILL_NAME\" \"$COCO_SKILL_DIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -2894,6 +2920,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
             skill_dir.path().display()
         )));
         assert!(output.contains("/uv-cache"));
+        assert!(output.contains("/uv-python"));
     }
 
     #[tokio::test]
