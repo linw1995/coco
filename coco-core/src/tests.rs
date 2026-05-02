@@ -1,9 +1,8 @@
 use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
@@ -254,44 +253,6 @@ fn submit_prompt_job(store: &MemoryStore, branch: &str, prompt: &str) -> coco_ll
         })
         .unwrap();
     store.submit_job(branch, &prompt_anchor_id).unwrap()
-}
-
-async fn with_env_async<T, F, Fut>(entries: &[(&str, Option<&OsStr>)], run: F) -> T
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = T>,
-{
-    static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-
-    let _guard = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
-    let previous: Vec<_> = entries
-        .iter()
-        .map(|(name, _)| ((*name).to_owned(), std::env::var_os(name)))
-        .collect();
-
-    for (name, value) in entries {
-        match value {
-            Some(value) => unsafe { std::env::set_var(name, value) },
-            None => unsafe { std::env::remove_var(name) },
-        }
-    }
-
-    let output = run().await;
-
-    for (name, value) in previous {
-        match value {
-            Some(value) => unsafe { std::env::set_var(name, value) },
-            None => unsafe { std::env::remove_var(name) },
-        }
-    }
-
-    output
-}
-
-fn write_skill(root: &std::path::Path, relative_dir: &str, body: &str) {
-    let dir = root.join(relative_dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("SKILL.md"), body).unwrap();
 }
 
 #[tokio::test]
@@ -774,21 +735,18 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
-    let root = tempfile::tempdir().unwrap();
-    write_skill(
-        root.path(),
-        "fast-rust",
-        r#"---
-name: "fast-rust"
-description: "Review Rust changes."
-session_role: "runner"
-enable_coco_shim: true
----
-
-# Fast Rust
-"#,
-    );
-    let path_env = std::env::join_paths([root.path()]).unwrap();
+    store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "fast-rust",
+            SkillVersionSpec {
+                description: "Review Rust changes.".to_owned(),
+                body: "# Fast Rust".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
     let caller_task = "Review the inherited task from the parent prompt.";
     let caller_prompt_id = store
         .append(NewNode {
@@ -805,22 +763,16 @@ enable_coco_shim: true
         .unwrap();
     let tool_use_id = append_use_skill_node(&store, &caller_prompt_id, "fast-rust");
 
-    let result = with_env_async(
-        &[("COCO_SKILLS_DIRS", Some(path_env.as_os_str()))],
-        || async {
-            engine
-                .execute_skill(
-                    root.path(),
-                    "main",
-                    SessionRole::Orchestrator,
-                    &tool_use_id,
-                    "fast-rust",
-                )
-                .await
-        },
-    )
-    .await
-    .unwrap();
+    let result = engine
+        .execute_skill(
+            Path::new("."),
+            "main",
+            SessionRole::Orchestrator,
+            &tool_use_id,
+            "fast-rust",
+        )
+        .await
+        .unwrap();
 
     assert_eq!(result.result.text, "child result");
     let response_node = store.get_node(&result.response_node_id).unwrap();
@@ -855,7 +807,7 @@ enable_coco_shim: true
         })
         .expect("child execution should persist a child session anchor");
     assert_eq!(child_session_anchor.0.parent, tool_use_id);
-    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
+    assert_eq!(child_session_anchor.1.role, SessionRole::Orchestrator);
     assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
         child_session_anchor
@@ -906,19 +858,16 @@ async fn llm_engine_materializes_store_skill_scripts() {
     let engine = ConversationEngine::new(llm);
     let tool_use_id = append_use_skill_node(&store, &base_session.anchor_id, "scripted-skill");
 
-    with_env_async(&[("COCO_SKILLS_DIRS", None)], || async {
-        engine
-            .execute_skill(
-                Path::new("."),
-                "main",
-                SessionRole::Orchestrator,
-                &tool_use_id,
-                "scripted-skill",
-            )
-            .await
-    })
-    .await
-    .unwrap();
+    engine
+        .execute_skill(
+            Path::new("."),
+            "main",
+            SessionRole::Orchestrator,
+            &tool_use_id,
+            "scripted-skill",
+        )
+        .await
+        .unwrap();
 
     let children = store.list_children(&tool_use_id).unwrap();
     let child_session_anchor = children
@@ -972,19 +921,16 @@ async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
     let engine = ConversationEngine::new(llm);
     let tool_use_id = append_use_skill_node(&store, &base_session.anchor_id, "bad-scripted-skill");
 
-    let error = with_env_async(&[("COCO_SKILLS_DIRS", None)], || async {
-        engine
-            .execute_skill(
-                Path::new("."),
-                "main",
-                SessionRole::Orchestrator,
-                &tool_use_id,
-                "bad-scripted-skill",
-            )
-            .await
-    })
-    .await
-    .unwrap_err();
+    let error = engine
+        .execute_skill(
+            Path::new("."),
+            "main",
+            SessionRole::Orchestrator,
+            &tool_use_id,
+            "bad-scripted-skill",
+        )
+        .await
+        .unwrap_err();
 
     assert!(error.to_string().contains("invalid skill script path"));
     assert!(!skill_runtime_contains_body(&runtime_root, &body));
@@ -998,37 +944,30 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
-    let root = tempfile::tempdir().unwrap();
-    write_skill(
-        root.path(),
-        "fast-rust",
-        r#"---
-name: "fast-rust"
-description: "Review Rust changes."
----
-
-# Fast Rust
-"#,
-    );
-    let path_env = std::env::join_paths([root.path()]).unwrap();
+    store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "fast-rust",
+            SkillVersionSpec {
+                description: "Review Rust changes.".to_owned(),
+                body: "# Fast Rust".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
     let tool_use_id = append_use_skill_node(&store, &base_session.anchor_id, "fast-rust");
 
-    let error = with_env_async(
-        &[("COCO_SKILLS_DIRS", Some(path_env.as_os_str()))],
-        || async {
-            engine
-                .execute_skill(
-                    root.path(),
-                    "main",
-                    SessionRole::Orchestrator,
-                    &tool_use_id,
-                    "fast-rust",
-                )
-                .await
-        },
-    )
-    .await
-    .unwrap_err();
+    let error = engine
+        .execute_skill(
+            Path::new("."),
+            "main",
+            SessionRole::Orchestrator,
+            &tool_use_id,
+            "fast-rust",
+        )
+        .await
+        .unwrap_err();
 
     assert!(matches!(error, EngineError::EngineFailed { .. }));
     let calls = calls.lock().await;

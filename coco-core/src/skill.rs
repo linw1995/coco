@@ -49,33 +49,6 @@ pub(crate) enum SkillError {
     #[snafu(display("failed to serialize skill tool output: {source}"))]
     SerializeOutput { source: serde_json::Error },
 
-    #[snafu(display("failed to resolve configured skill root {path:?}: {source}"))]
-    ResolveConfiguredRoot {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("configured skill root {path:?} must point to an existing directory"))]
-    InvalidConfiguredRoot { path: PathBuf },
-
-    #[snafu(display("failed to read skill file {path:?}: {source}"))]
-    ReadSkillFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("failed to read skill directory {path:?}: {source}"))]
-    ReadSkillDirectory {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("failed to inspect skill path {path:?}: {source}"))]
-    InspectSkillPath {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
     #[snafu(display("failed to create skill runtime directory {path:?}: {source}"))]
     CreateSkillRuntimeDirectory {
         path: PathBuf,
@@ -90,12 +63,6 @@ pub(crate) enum SkillError {
 
     #[snafu(display("invalid skill script path {path:?}: {message}"))]
     InvalidSkillScriptPath { path: String, message: String },
-
-    #[snafu(display("invalid session_role {value:?} in skill file {path:?}"))]
-    InvalidSkillSessionRole { path: PathBuf, value: String },
-
-    #[snafu(display("invalid enable_coco_shim value {value:?} in skill file {path:?}"))]
-    InvalidSkillCocoShim { path: PathBuf, value: String },
 
     #[snafu(display("failed to load skills from store: {source}"))]
     LoadSkills {
@@ -638,144 +605,6 @@ fn skill_script_instructions(request: &SkillToolRequest) -> String {
     )
 }
 
-fn configured_skill_roots(workspace_root: &Path) -> std::result::Result<Vec<PathBuf>, SkillError> {
-    let Some(raw) = std::env::var_os("COCO_SKILLS_DIRS") else {
-        return Ok(default_skill_roots(workspace_root));
-    };
-
-    let mut roots = Vec::new();
-    for path in std::env::split_paths(&raw) {
-        let resolved = path
-            .canonicalize()
-            .context(ResolveConfiguredRootSnafu { path: path.clone() })?;
-        if !resolved.is_dir() {
-            return InvalidConfiguredRootSnafu { path: resolved }.fail();
-        }
-        roots.push(resolved);
-    }
-
-    Ok(roots)
-}
-
-fn default_skill_roots(workspace_root: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![
-        workspace_root.join(".codex/skills"),
-        workspace_root.join(".agents/skills"),
-    ];
-
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        roots.push(home.join(".codex/skills"));
-        roots.push(home.join(".agents/skills"));
-    }
-
-    roots
-        .into_iter()
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>()
-}
-
-fn parse_frontmatter_value(value: &str) -> String {
-    let value = value.trim();
-    if value.len() >= 2 {
-        let first = value.as_bytes()[0];
-        let last = value.as_bytes()[value.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return value[1..value.len() - 1].to_owned();
-        }
-    }
-    value.to_owned()
-}
-
-fn parse_frontmatter_bool(value: &str) -> Option<bool> {
-    match parse_frontmatter_value(value).to_ascii_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
-fn split_frontmatter(contents: &str) -> (Option<&str>, &str) {
-    let mut lines = contents.lines();
-    if lines.next() != Some("---") {
-        return (None, contents);
-    }
-
-    let mut end_offset = "---\n".len();
-    for line in lines {
-        end_offset += line.len() + 1;
-        if line == "---" {
-            let frontmatter = &contents["---\n".len()..end_offset - line.len() - 1];
-            let body = &contents[end_offset..];
-            return (Some(frontmatter), body);
-        }
-    }
-
-    (None, contents)
-}
-
-fn load_skill(path: &Path) -> std::result::Result<SkillEntry, SkillError> {
-    let contents = fs::read_to_string(path).context(ReadSkillFileSnafu {
-        path: path.to_path_buf(),
-    })?;
-    let (frontmatter, body) = split_frontmatter(&contents);
-
-    let mut name = None;
-    let mut description = None;
-    let mut session_role = SessionRole::Runner;
-    let mut enable_coco_shim = false;
-    if let Some(frontmatter) = frontmatter {
-        for line in frontmatter.lines() {
-            let Some((key, value)) = line.split_once(':') else {
-                continue;
-            };
-            match key.trim() {
-                "name" => name = Some(parse_frontmatter_value(value)),
-                "description" => description = Some(parse_frontmatter_value(value)),
-                "session_role" => {
-                    let value = parse_frontmatter_value(value);
-                    session_role =
-                        SessionRole::parse(&value).context(InvalidSkillSessionRoleSnafu {
-                            path: path.to_path_buf(),
-                            value,
-                        })?;
-                }
-                "enable_coco_shim" => {
-                    let raw = parse_frontmatter_value(value);
-                    enable_coco_shim =
-                        parse_frontmatter_bool(value).context(InvalidSkillCocoShimSnafu {
-                            path: path.to_path_buf(),
-                            value: raw,
-                        })?;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let name = name.unwrap_or_else(|| {
-        path.parent()
-            .and_then(Path::file_name)
-            .unwrap_or_else(|| OsStr::new("unknown-skill"))
-            .to_string_lossy()
-            .into_owned()
-    });
-    let description = description.unwrap_or_default();
-    let normalized_body = body.trim().to_owned();
-    let search_blob = format!("{name}\n{description}\n{normalized_body}").to_ascii_lowercase();
-
-    Ok(SkillEntry {
-        name,
-        description,
-        path: path.to_path_buf(),
-        body: normalized_body,
-        scripts: Vec::new(),
-        session_role,
-        enable_coco_shim,
-        search_blob,
-    })
-}
-
 fn synthetic_skill_path(role: SessionRole, name: &str, version: u64) -> PathBuf {
     PathBuf::from(format!(
         "store://skills/{}/{}@{}",
@@ -817,55 +646,15 @@ fn skill_entries_from_store_records(role: SessionRole, records: &[SkillRecord]) 
         .collect()
 }
 
-fn collect_skills_from_dir(
-    root: &Path,
-    skills: &mut Vec<SkillEntry>,
-) -> std::result::Result<(), SkillError> {
-    let entries = fs::read_dir(root).context(ReadSkillDirectorySnafu {
-        path: root.to_path_buf(),
-    })?;
-
-    for entry in entries {
-        let entry = entry.context(ReadSkillDirectorySnafu {
-            path: root.to_path_buf(),
-        })?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .context(InspectSkillPathSnafu { path: path.clone() })?;
-
-        if file_type.is_dir() {
-            collect_skills_from_dir(&path, skills)?;
-            continue;
-        }
-
-        if file_type.is_file()
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("SKILL.md")
-        {
-            skills.push(load_skill(&path)?);
-        }
-    }
-
-    Ok(())
-}
-
 fn collect_skills<S>(
-    workspace_root: &Path,
+    _workspace_root: &Path,
     store: &S,
     session_role: SessionRole,
 ) -> std::result::Result<Vec<SkillEntry>, SkillError>
 where
     S: SkillStore,
 {
-    let roots = configured_skill_roots(workspace_root)?;
-    let mut skills = Vec::new();
-    for root in roots {
-        collect_skills_from_dir(&root, &mut skills)?;
-    }
-    skills.extend(collect_store_skills(store, session_role)?);
+    let mut skills = collect_store_skills(store, session_role)?;
     skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
     Ok(skills)
 }
@@ -967,51 +756,9 @@ fn resolve_skill(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use std::future::Future;
-    use std::sync::OnceLock;
-
-    use tokio::sync::Mutex;
+    use coco_llm::coco_mem::SkillVersionSpec;
 
     use super::*;
-
-    async fn with_env_async<T, F, Fut>(entries: &[(&str, Option<&OsStr>)], run: F) -> T
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T>,
-    {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
-        let previous: Vec<_> = entries
-            .iter()
-            .map(|(name, _)| ((*name).to_owned(), std::env::var_os(name)))
-            .collect();
-
-        for (name, value) in entries {
-            match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-
-        let output = run().await;
-
-        for (name, value) in previous {
-            match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-
-        output
-    }
-
-    fn write_skill(root: &Path, relative_dir: &str, body: &str) {
-        let dir = root.join(relative_dir);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("SKILL.md"), body).unwrap();
-    }
 
     #[test]
     fn skill_execution_prompt_includes_skill_context() {
@@ -1040,111 +787,63 @@ mod tests {
         assert!(!prompt.contains("Additional task from caller:"));
     }
 
-    #[tokio::test]
-    async fn search_skills_finds_matches_by_name_and_description() {
-        let root = tempfile::tempdir().unwrap();
-        write_skill(
-            root.path(),
-            "openai-docs",
-            r#"---
-name: "openai-docs"
-description: "Find OpenAI API documentation."
----
-
-# OpenAI Docs
-"#,
-        );
-        write_skill(
-            root.path(),
-            "rust-review",
-            r#"---
-name: "rust-review"
-description: "Review Rust changes."
----
-
-# Rust Review
-"#,
-        );
-        let path_env = std::env::join_paths([root.path()]).unwrap();
+    #[test]
+    fn search_skills_finds_store_matches_by_name_and_description() {
         let store = coco_llm::coco_mem::MemoryStore::new();
+        store
+            .add_skill(
+                SessionRole::Orchestrator,
+                "openai-docs",
+                SkillVersionSpec {
+                    description: "Find OpenAI API documentation.".to_owned(),
+                    body: "# OpenAI Docs".to_owned(),
+                    scripts: Vec::new(),
+                    enable_coco_shim: false,
+                },
+            )
+            .unwrap();
 
-        let result = with_env_async(
-            &[("COCO_SKILLS_DIRS", Some(path_env.as_os_str()))],
-            || async {
-                search_skills(
-                    root.path(),
-                    &store,
-                    SessionRole::Orchestrator,
-                    "openai docs",
-                    1,
-                )
-            },
+        let result = search_skills(
+            Path::new("."),
+            &store,
+            SessionRole::Orchestrator,
+            "openai docs",
+            1,
         )
-        .await
         .unwrap();
 
         assert_eq!(result.skills.len(), 1);
         assert_eq!(result.skills[0].name, "openai-docs");
     }
 
-    #[tokio::test]
-    async fn resolve_skill_rejects_ambiguous_names() {
-        let first_root = tempfile::tempdir().unwrap();
-        let second_root = tempfile::tempdir().unwrap();
-        write_skill(
-            first_root.path(),
-            "shared-skill",
+    #[test]
+    fn search_skills_ignores_external_skill_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let skill_dir = root.path().join("external-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
             r#"---
-name: "shared-skill"
-description: "First copy."
+name: "external-skill"
+description: "External skill."
 ---
 
-# Shared Skill
+# External Skill
 "#,
-        );
-        write_skill(
-            second_root.path(),
-            "shared-skill",
-            r#"---
-name: "shared-skill"
-description: "Second copy."
----
-
-# Shared Skill
-"#,
-        );
-        let path_env = std::env::join_paths([first_root.path(), second_root.path()]).unwrap();
+        )
+        .unwrap();
         let store = coco_llm::coco_mem::MemoryStore::new();
 
-        let error = with_env_async(
-            &[("COCO_SKILLS_DIRS", Some(path_env.as_os_str()))],
-            || async {
-                resolve_skill(
-                    first_root.path(),
-                    &store,
-                    SessionRole::Orchestrator,
-                    "shared-skill",
-                )
-            },
+        let result = search_skills(
+            root.path(),
+            &store,
+            SessionRole::Orchestrator,
+            "external-skill",
+            10,
         )
-        .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("multiple installed skills"));
-    }
-
-    #[tokio::test]
-    async fn configured_skill_roots_validate_existing_directories() {
-        let missing = OsString::from("/tmp/coco-core-skill-missing");
-
-        let error = with_env_async(
-            &[("COCO_SKILLS_DIRS", Some(missing.as_os_str()))],
-            || async { configured_skill_roots(Path::new(".")) },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, SkillError::ResolveConfiguredRoot { .. }));
+        assert!(result.skills.is_empty());
     }
 
     #[test]

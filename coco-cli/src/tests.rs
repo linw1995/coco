@@ -14,7 +14,10 @@ use coco_llm::{
     BackendError, BackendEvent, BackendEventPayload, BackendTurn, CompletionBackend,
     CompletionMessage, CompletionToolCall, Provider, ProviderRuntimeConfig, StepContext,
 };
-use coco_mem::{BranchConfigStore, ProviderProfile, ProviderProfileStore, SessionState};
+use coco_mem::{
+    BranchConfigStore, ProviderProfile, ProviderProfileStore, SessionState, SkillStore,
+    SkillVersionSpec,
+};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1000,31 +1003,26 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
 
 #[tokio::test]
 async fn prompt_wires_skill_executor_for_use_skill() {
-    let (tempdir, store_path) = temp_store_path();
-    let skills_root = tempdir.path().join("skills");
-    let skill_dir = skills_root.join("fast-rust");
-    std::fs::create_dir_all(&skill_dir).unwrap();
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        r#"---
-name: "fast-rust"
-description: "Review Rust changes."
-session_role: "runner"
-enable_coco_shim: true
----
-
-# Fast Rust
-"#,
-    )
-    .unwrap();
-    let skills_env = std::env::join_paths([skills_root.as_path()]).unwrap();
+    let (_tempdir, store_path) = temp_store_path();
+    open_store(&store_path)
+        .unwrap()
+        .add_skill(
+            SessionRole::Orchestrator,
+            "fast-rust",
+            SkillVersionSpec {
+                description: "Review Rust changes.".to_owned(),
+                body: "# Fast Rust".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
 
     with_coco_env_async(
         &[
             ("COCO_PROVIDER", "openai"),
             ("COCO_MODEL", "gpt-4.1-mini"),
             ("COCO_TOOLS", "use_skill"),
-            ("COCO_SKILLS_DIRS", skills_env.to_str().unwrap()),
         ],
         || async {
             run_with_backend(
@@ -1043,7 +1041,6 @@ enable_coco_shim: true
             ("COCO_PROVIDER", "openai"),
             ("COCO_MODEL", "gpt-4.1-mini"),
             ("COCO_TOOLS", "use_skill"),
-            ("COCO_SKILLS_DIRS", skills_env.to_str().unwrap()),
         ],
         || async {
             run_with_backend(
@@ -1114,7 +1111,7 @@ enable_coco_shim: true
         })
         .expect("expected child session anchor under use_skill");
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
-    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
+    assert_eq!(child_session_anchor.1.role, SessionRole::Orchestrator);
     assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
         child_session_anchor
@@ -1166,29 +1163,25 @@ async fn prompt_reads_text_from_stdin() {
 #[tokio::test]
 async fn prompt_keeps_failed_use_skill_child_visible_under_tool_use() {
     let (_tempdir, store_path) = temp_store_path();
-    let skills_root = tempdir().unwrap();
-    std::fs::create_dir_all(skills_root.path().join("fast-rust")).unwrap();
-    std::fs::write(
-        skills_root.path().join("fast-rust").join("SKILL.md"),
-        r#"---
-name: "fast-rust"
-description: "Review Rust changes."
-session_role: "runner"
-enable_coco_shim: true
----
-
-# Fast Rust
-"#,
-    )
-    .unwrap();
-    let skills_env = std::env::join_paths([skills_root.path()]).unwrap();
+    open_store(&store_path)
+        .unwrap()
+        .add_skill(
+            SessionRole::Orchestrator,
+            "fast-rust",
+            SkillVersionSpec {
+                description: "Review Rust changes.".to_owned(),
+                body: "# Fast Rust".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
 
     with_coco_env_async(
         &[
             ("COCO_PROVIDER", "openai"),
             ("COCO_MODEL", "gpt-4.1-mini"),
             ("COCO_TOOLS", "use_skill"),
-            ("COCO_SKILLS_DIRS", skills_env.to_str().unwrap()),
         ],
         || async {
             run_with_backend(
@@ -1207,7 +1200,6 @@ enable_coco_shim: true
             ("COCO_PROVIDER", "openai"),
             ("COCO_MODEL", "gpt-4.1-mini"),
             ("COCO_TOOLS", "use_skill"),
-            ("COCO_SKILLS_DIRS", skills_env.to_str().unwrap()),
         ],
         || async {
             run_with_backend(
@@ -1257,7 +1249,7 @@ enable_coco_shim: true
         Kind::Anchor(anchor) if anchor.as_skill_result().is_some()
     )));
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
-    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
+    assert_eq!(child_session_anchor.1.role, SessionRole::Orchestrator);
     assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
         child_session_anchor
