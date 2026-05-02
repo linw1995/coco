@@ -214,7 +214,10 @@ impl ReqwestTelegramTransport {
 #[derive(Debug, Snafu)]
 pub enum TelegramError {
     #[snafu(display("Telegram API request failed: {source}"))]
-    Request { source: reqwest::Error },
+    Request {
+        #[snafu(source(from(reqwest::Error, reqwest::Error::without_url)))]
+        source: reqwest::Error,
+    },
 
     #[snafu(display("Telegram API returned an error: {description}"))]
     Api { description: String },
@@ -473,6 +476,29 @@ mod tests {
         let result = channel.run(&FailingHandler).await;
 
         assert!(matches!(result, Err(Error::Handler { .. })));
+    }
+
+    #[tokio::test]
+    async fn request_error_display_does_not_include_token_url() {
+        let token = "123456:secret-token";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let source = reqwest::Client::new()
+            .post(format!("http://{address}/bot{token}/getUpdates"))
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .unwrap_err();
+        assert!(source.url().unwrap().as_str().contains(token));
+
+        let error = Err::<(), _>(source).context(RequestSnafu).unwrap_err();
+        let message = error.to_string();
+
+        assert!(!message.contains(token));
+        assert!(!message.contains("/bot"));
     }
 
     fn text_update(update_id: i64, chat_id: i64, user_id: i64, text: &str) -> TelegramUpdate {
