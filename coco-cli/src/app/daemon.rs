@@ -16,15 +16,20 @@ use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
     run_forwarded_with_services,
     runtime::{ForwardedRuntimeInputs, RuntimeServices},
+    session::resolve_session_config,
 };
 use crate::{
     Result,
-    cli::{DaemonCommand, DaemonSubcommand},
+    cli::{CliSessionRole, CliTool, DaemonCommand, DaemonSubcommand, SessionCreateCommand},
     error::{
         BindDaemonSocketSnafu, ChannelSnafu, ConsoleSnafu, JoinChannelTaskSnafu,
-        JoinDaemonServerSnafu, ResolveDaemonSocketRootSnafu,
+        JoinDaemonServerSnafu, LlmSnafu, ResolveDaemonSocketRootSnafu, StoreSnafu,
     },
 };
+
+const DEFAULT_SESSION_BRANCH: &str = "main";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
+const DEFAULT_MAX_TOKENS: u64 = 32_000;
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
@@ -63,22 +68,72 @@ where
         _ => None,
     };
     let server = match command.command {
-        DaemonSubcommand::Serve(_) => start_daemon_server(
-            &socket_path,
-            shared_store,
-            llm,
-            provider_profiles,
-            &shared_engine,
-            DaemonServerOptions {
-                channel_configs,
-                console_config,
-                console_publisher,
-            },
-        )?,
+        DaemonSubcommand::Serve(_) => {
+            ensure_initial_session(shared_store, llm, provider_profiles).await?;
+            start_daemon_server(
+                &socket_path,
+                shared_store,
+                llm,
+                provider_profiles,
+                &shared_engine,
+                DaemonServerOptions {
+                    channel_configs,
+                    console_config,
+                    console_publisher,
+                },
+            )?
+        }
     };
     spawn_resume_incomplete_jobs(shared_engine);
     server.wait().await?;
     Ok(None)
+}
+
+pub(crate) async fn ensure_initial_session<B, S>(
+    shared_store: &S,
+    llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
+) -> Result<()>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    if !shared_store
+        .list_session_states()
+        .context(StoreSnafu)?
+        .is_empty()
+    {
+        return Ok(());
+    }
+
+    let config = resolve_session_config(default_session_create_command(), provider_profiles)?;
+    tracing::info!(
+        branch = %config.branch,
+        max_tokens = config.max_tokens,
+        tool_count = config.tools.len(),
+        "creating default session on empty store"
+    );
+    llm.create_session(config).await.context(LlmSnafu)?;
+    Ok(())
+}
+
+fn default_session_create_command() -> SessionCreateCommand {
+    SessionCreateCommand {
+        branch: DEFAULT_SESSION_BRANCH.to_owned(),
+        role: CliSessionRole::Orchestrator,
+        provider_profile: None,
+        system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
+        prompt: String::new(),
+        temperature: None,
+        max_tokens: Some(DEFAULT_MAX_TOKENS),
+        additional_params: None,
+        tools: vec![
+            CliTool::ExecCommand,
+            CliTool::WriteStdin,
+            CliTool::SearchSkill,
+            CliTool::UseSkill,
+        ],
+    }
 }
 
 pub(crate) async fn resume_incomplete_jobs<B, S>(engine: &ConversationEngine<B, S>) -> Result<()>
