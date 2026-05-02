@@ -9,7 +9,6 @@ use crate::error::TelegramTransportSnafu;
 use crate::{ChannelRuntime, Error, InboundMessage, MessageHandler, Result};
 
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 30;
-const TELEGRAM_MESSAGE_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramChannelConfig {
@@ -35,12 +34,6 @@ pub struct GetUpdatesRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SendMessageRequest {
-    pub chat_id: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetUpdatesResponse {
     pub updates: Vec<TelegramUpdate>,
 }
@@ -48,8 +41,6 @@ pub struct GetUpdatesResponse {
 #[async_trait]
 pub trait TelegramTransport: Send + Sync {
     async fn get_updates(&self, request: GetUpdatesRequest) -> Result<GetUpdatesResponse>;
-
-    async fn send_message(&self, request: SendMessageRequest) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -124,25 +115,11 @@ where
                 continue;
             }
 
-            let chat_id = inbound.conversation_id.clone();
-            let outbound = handler.handle(inbound).await?;
-            self.send_text(&chat_id, &outbound.text).await?;
+            handler.handle(inbound).await?;
             handled += 1;
         }
 
         Ok(handled)
-    }
-
-    async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
-        for chunk in split_telegram_text(text) {
-            self.transport
-                .send_message(SendMessageRequest {
-                    chat_id: chat_id.to_owned(),
-                    text: chunk,
-                })
-                .await?;
-        }
-        Ok(())
     }
 }
 
@@ -189,16 +166,6 @@ impl TelegramTransport for ReqwestTelegramTransport {
             .post_api::<_, Vec<TelegramUpdate>>("getUpdates", &request)
             .await?;
         Ok(GetUpdatesResponse { updates })
-    }
-
-    async fn send_message(&self, request: SendMessageRequest) -> Result<()> {
-        let request = TelegramSendMessageRequest {
-            chat_id: request.chat_id,
-            text: request.text,
-        };
-        self.post_api::<_, serde_json::Value>("sendMessage", &request)
-            .await?;
-        Ok(())
     }
 }
 
@@ -248,12 +215,6 @@ struct TelegramGetUpdatesRequest<'a> {
     allowed_updates: [&'a str; 1],
 }
 
-#[derive(Debug, Serialize)]
-struct TelegramSendMessageRequest {
-    chat_id: String,
-    text: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct TelegramApiResponse<T> {
     ok: bool,
@@ -292,9 +253,10 @@ impl TelegramUpdate {
             .map(|user| user.id.to_string())
             .unwrap_or_else(|| message.chat.id.to_string());
 
-        Some(InboundMessage::telegram(
+        Some(InboundMessage::telegram_with_message_id(
             message.chat.id.to_string(),
             sender_id,
+            message.message_id.to_string(),
             text.clone(),
         ))
     }
@@ -302,6 +264,7 @@ impl TelegramUpdate {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct TelegramMessage {
+    pub message_id: i64,
     pub chat: TelegramChat,
     pub from: Option<TelegramUser>,
     pub text: Option<String>,
@@ -317,26 +280,6 @@ pub struct TelegramUser {
     pub id: i64,
 }
 
-fn split_telegram_text(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for character in text.chars() {
-        if current.chars().count() == TELEGRAM_MESSAGE_LIMIT {
-            chunks.push(current);
-            current = String::new();
-        }
-        current.push(character);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -349,7 +292,6 @@ mod tests {
     struct FakeTransport {
         update_batches: Mutex<VecDeque<Vec<TelegramUpdate>>>,
         get_updates_requests: Mutex<Vec<GetUpdatesRequest>>,
-        send_message_requests: Mutex<Vec<SendMessageRequest>>,
     }
 
     impl FakeTransport {
@@ -357,12 +299,7 @@ mod tests {
             Self {
                 update_batches: Mutex::new(VecDeque::from([updates])),
                 get_updates_requests: Mutex::new(Vec::new()),
-                send_message_requests: Mutex::new(Vec::new()),
             }
-        }
-
-        fn send_message_requests(&self) -> Vec<SendMessageRequest> {
-            self.send_message_requests.lock().unwrap().clone()
         }
     }
 
@@ -379,49 +316,47 @@ mod tests {
                     .unwrap_or_default(),
             })
         }
+    }
 
-        async fn send_message(&self, request: SendMessageRequest) -> Result<()> {
-            self.send_message_requests.lock().unwrap().push(request);
-            Ok(())
+    #[derive(Default)]
+    struct RecordingHandler {
+        messages: Mutex<Vec<InboundMessage>>,
+    }
+
+    impl RecordingHandler {
+        fn messages(&self) -> Vec<InboundMessage> {
+            self.messages.lock().unwrap().clone()
         }
     }
 
-    struct EchoHandler;
-
     #[async_trait]
-    impl MessageHandler for EchoHandler {
+    impl MessageHandler for RecordingHandler {
         async fn handle(&self, message: InboundMessage) -> Result<OutboundMessage> {
+            self.messages.lock().unwrap().push(message);
             Ok(OutboundMessage {
-                text: format!("pong: {}", message.text),
-            })
-        }
-    }
-
-    struct LongReplyHandler;
-
-    #[async_trait]
-    impl MessageHandler for LongReplyHandler {
-        async fn handle(&self, _message: InboundMessage) -> Result<OutboundMessage> {
-            Ok(OutboundMessage {
-                text: "a".repeat(TELEGRAM_MESSAGE_LIMIT + 1),
+                text: "ignored by telegram channel".to_owned(),
             })
         }
     }
 
     #[tokio::test]
-    async fn run_once_maps_text_update_and_sends_reply() {
+    async fn run_once_maps_text_update_without_sending_reply() {
         let transport = FakeTransport::with_updates(vec![text_update(100, 42, 7, "hello")]);
         let mut channel = TelegramChannel::new(transport, 30, BTreeSet::new());
+        let handler = RecordingHandler::default();
 
-        let handled = channel.run_once(&EchoHandler).await.unwrap();
+        let handled = channel.run_once(&handler).await.unwrap();
 
         assert_eq!(handled, 1);
         assert_eq!(channel.offset(), Some(101));
         assert_eq!(
-            channel.transport.send_message_requests(),
-            vec![SendMessageRequest {
-                chat_id: "42".to_owned(),
-                text: "pong: hello".to_owned(),
+            handler.messages(),
+            vec![InboundMessage {
+                channel_kind: crate::ChannelKind::Telegram,
+                conversation_id: "42".to_owned(),
+                sender_id: "7".to_owned(),
+                source_message_id: Some("1000".to_owned()),
+                text: "hello".to_owned(),
             }]
         );
     }
@@ -431,18 +366,20 @@ mod tests {
         let transport = FakeTransport::with_updates(vec![TelegramUpdate {
             update_id: 100,
             message: Some(TelegramMessage {
+                message_id: 1000,
                 chat: TelegramChat { id: 42 },
                 from: Some(TelegramUser { id: 7 }),
                 text: None,
             }),
         }]);
         let mut channel = TelegramChannel::new(transport, 30, BTreeSet::new());
+        let handler = RecordingHandler::default();
 
-        let handled = channel.run_once(&EchoHandler).await.unwrap();
+        let handled = channel.run_once(&handler).await.unwrap();
 
         assert_eq!(handled, 0);
         assert_eq!(channel.offset(), Some(101));
-        assert!(channel.transport.send_message_requests().is_empty());
+        assert!(handler.messages().is_empty());
     }
 
     #[tokio::test]
@@ -451,26 +388,13 @@ mod tests {
         let mut allowed_chat_ids = BTreeSet::new();
         allowed_chat_ids.insert("99".to_owned());
         let mut channel = TelegramChannel::new(transport, 30, allowed_chat_ids);
+        let handler = RecordingHandler::default();
 
-        let handled = channel.run_once(&EchoHandler).await.unwrap();
+        let handled = channel.run_once(&handler).await.unwrap();
 
         assert_eq!(handled, 0);
         assert_eq!(channel.offset(), Some(101));
-        assert!(channel.transport.send_message_requests().is_empty());
-    }
-
-    #[tokio::test]
-    async fn send_text_splits_long_replies() {
-        let transport = FakeTransport::with_updates(vec![text_update(100, 42, 7, "hello")]);
-        let mut channel = TelegramChannel::new(transport, 30, BTreeSet::new());
-
-        let handled = channel.run_once(&LongReplyHandler).await.unwrap();
-
-        let requests = channel.transport.send_message_requests();
-        assert_eq!(handled, 1);
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].text.chars().count(), TELEGRAM_MESSAGE_LIMIT);
-        assert_eq!(requests[1].text, "a");
+        assert!(handler.messages().is_empty());
     }
 
     #[test]
@@ -478,6 +402,7 @@ mod tests {
         let update = TelegramUpdate {
             update_id: 100,
             message: Some(TelegramMessage {
+                message_id: 1000,
                 chat: TelegramChat { id: -42 },
                 from: None,
                 text: Some("hello".to_owned()),
@@ -488,6 +413,7 @@ mod tests {
 
         assert_eq!(message.conversation_id, "-42");
         assert_eq!(message.sender_id, "-42");
+        assert_eq!(message.source_message_id.as_deref(), Some("1000"));
         assert_eq!(message.text, "hello");
     }
 
@@ -495,6 +421,7 @@ mod tests {
         TelegramUpdate {
             update_id,
             message: Some(TelegramMessage {
+                message_id: 1000,
                 chat: TelegramChat { id: chat_id },
                 from: Some(TelegramUser { id: user_id }),
                 text: Some(text.to_owned()),

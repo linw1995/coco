@@ -54,7 +54,8 @@ where
                 conversation_id: message.conversation_id.clone(),
             })?;
 
-        match self.engine.reply(&branch, text).await {
+        let prompt = channel_prompt(&message, text);
+        match self.engine.reply(&branch, &prompt).await {
             Ok(text) => Ok(OutboundMessage { text }),
             Err(EngineError::SessionMissing { branch }) => Err(Error::MissingSession { branch }),
             Err(source @ EngineError::EngineFailed { .. }) => {
@@ -102,4 +103,17 @@ where
             .reply_many(request.items, request.max_concurrency)
             .await)
     }
+}
+
+fn channel_prompt(message: &InboundMessage, text: &str) -> String {
+    if message.channel_kind != coco_channel::ChannelKind::Telegram {
+        return text.to_owned();
+    }
+
+    let reply_to_message_id = message.source_message_id.as_deref().unwrap_or("unknown");
+
+    format!(
+        "You are handling an inbound Telegram message.\n\nTelegram reply target:\n- chat_id: {chat_id}\n- reply_to_message_id: {reply_to_message_id}\n\nRequired response policy:\n- Reply by calling the `telegram` skill through `use_skill`.\n- Use the target chat_id and reply_to_message_id above when sending the Telegram reply.\n- After the skill call completes, return a short local completion note such as `Telegram reply sent.`.\n- Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.\n\nIncoming message:\n{text}",
+        chat_id = message.conversation_id,
+    )
 }
