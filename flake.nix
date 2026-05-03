@@ -39,6 +39,12 @@ rec {
           aarch64-linux = "/lib/ld-linux-aarch64.so.1";
           i686-linux = "/lib/ld-linux.so.2";
         };
+        fhsDynamicLinkerSymlink = lib.attrByPath [system] null {
+          x86_64-linux = {
+            link = "/lib64/ld-linux-x86-64.so.2";
+            target = "/lib/ld-linux-x86-64.so.2";
+          };
+        };
         src = lib.fileset.toSource {
           root = ./.;
           fileset = lib.fileset.unions [
@@ -94,10 +100,10 @@ rec {
               ++ lib.optionals (fhsDynamicLinker != null) [
                 pkgs.glibc
               ];
-            extraCommands = lib.optionalString (fhsDynamicLinker != null) ''
-              mkdir -p ./lib .${builtins.dirOf fhsDynamicLinker}
-              if [ ! -e .${fhsDynamicLinker} ]; then
-                ln -s /lib/${builtins.baseNameOf fhsDynamicLinker} .${fhsDynamicLinker}
+            extraCommands = lib.optionalString (fhsDynamicLinkerSymlink != null) ''
+              mkdir -p .${builtins.dirOf fhsDynamicLinkerSymlink.link}
+              if [ ! -e .${fhsDynamicLinkerSymlink.link} ]; then
+                ln -s ${fhsDynamicLinkerSymlink.target} .${fhsDynamicLinkerSymlink.link}
               fi
             '';
             config = {

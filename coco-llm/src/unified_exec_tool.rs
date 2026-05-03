@@ -2248,6 +2248,13 @@ mod tests {
             OsString::from("--allow"),
             temp_root.path().as_os_str().to_owned(),
         ];
+        for default_read_path in NONO_DEFAULT_READ_PATHS {
+            let default_read_path = Path::new(default_read_path);
+            if default_read_path.exists() {
+                expected_args.push(OsString::from("--read"));
+                expected_args.push(default_read_path.as_os_str().to_owned());
+            }
+        }
         for default_allow_file in NONO_DEFAULT_ALLOW_FILES {
             expected_args.push(OsString::from("--allow-file"));
             expected_args.push(OsString::from(default_allow_file));
