@@ -1112,11 +1112,14 @@ fn prepare_skill_uv_runtime_dirs(
         .map(|(_, path)| path.clone())
         .chain(std::iter::once(xdg_bin_dir.clone()));
     let mut allow_paths = Vec::new();
-    for path in created_dirs.filter(|path| path != &config_home).chain(
-        XDG_CONFIG_ALLOW_DIRS
-            .iter()
-            .map(|name| config_home.join(name)),
-    ) {
+    for path in created_dirs
+        .filter(|path| path != &config_home && path != &data_home)
+        .chain(
+            XDG_CONFIG_ALLOW_DIRS
+                .iter()
+                .map(|name| config_home.join(name)),
+        )
+    {
         push_unique_path(&mut allow_paths, path);
     }
 
@@ -2824,7 +2827,8 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         assert!(allow_paths.contains(&cache_home.path().to_path_buf()));
         assert!(!allow_paths.contains(&config_home.path().to_path_buf()));
         assert!(allow_paths.contains(&config_home.path().join("uv")));
-        assert!(allow_paths.contains(&data_home));
+        assert!(!allow_paths.contains(&data_home));
+        assert!(allow_paths.contains(&data_home.join("uv").join("python")));
         assert!(allow_paths.contains(&bin_home.path().to_path_buf()));
         assert!(!allow_paths.contains(&data_root.path().join(".local").join("bin")));
 
@@ -3110,12 +3114,24 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         assert!(args.contains(&skill_dir.path().display().to_string()));
         assert!(args.contains("/.cache"));
         assert!(args.contains("/.config/uv"));
-        assert!(args.contains("/.local"));
+        assert!(args.contains("/.local/share/uv/python"));
+        assert!(args.contains("/.local/bin"));
+        assert!(args.contains("/.local/state"));
         let config_home = runtime_root.path().join("coco").join(".config");
         assert!(
             !args
                 .lines()
                 .any(|arg| arg == config_home.display().to_string())
+        );
+        let data_home = runtime_root
+            .path()
+            .join("coco")
+            .join(".local")
+            .join("share");
+        assert!(
+            !args
+                .lines()
+                .any(|arg| arg == data_home.display().to_string())
         );
     }
 
