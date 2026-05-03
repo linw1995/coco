@@ -9,6 +9,6 @@ pub use store::fs::FsStore;
 pub use store::memory::MemoryStore;
 pub use store::{
     BranchConfigStore, BranchStore, JobStore, NodeStore, ProviderProfileStore, RuntimeStore,
-    SessionStore, SkillStore, Store,
+    SchedulerStore, SessionStore, SkillStore, Store,
 };
 pub use types::*;

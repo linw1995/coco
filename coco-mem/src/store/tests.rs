@@ -8,9 +8,9 @@ use super::memory::MemoryStore;
 use super::state::StoreState;
 use crate::{
     Anchor, BranchConfig, BranchConfigStore, BranchStore, JobStatus, JobStore, Kind, MergeParent,
-    NewNode, Node, NodeStore, PauseReason, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch,
-    SessionRole, SessionState, SessionStore, SkillScript, SkillStore, SkillUpdatePatch,
-    SkillVersionSpec, StoreError as Error,
+    NewNode, NewSchedulerTask, Node, NodeStore, PauseReason, PromptAnchor, Role, SchedulerStore,
+    SchedulerTaskPatch, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore,
+    SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError as Error,
 };
 use serde_json::json;
 
@@ -148,6 +148,21 @@ fn temp_store_path() -> (tempfile::TempDir, std::path::PathBuf) {
     (tempdir, path)
 }
 
+fn timestamp(value: &str) -> jiff::Timestamp {
+    value.parse().unwrap()
+}
+
+fn scheduler_task(id: &str, branch: &str, prompt: &str, next_run_at: &str) -> NewSchedulerTask {
+    NewSchedulerTask {
+        id: id.to_owned(),
+        branch: branch.to_owned(),
+        prompt: prompt.to_owned(),
+        interval_secs: 60,
+        next_run_at: timestamp(next_run_at),
+        enabled: true,
+    }
+}
+
 trait InspectableStore {
     fn snapshot_state(&self) -> StoreState;
 }
@@ -158,6 +173,7 @@ trait TestStoreFactory {
         + InspectableStore
         + JobStore
         + NodeStore
+        + SchedulerStore
         + SessionStore
         + SkillStore;
 
@@ -1609,6 +1625,182 @@ where
     assert_eq!(second.status, JobStatus::Queued);
 }
 
+fn assert_scheduler_task_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+
+    let task = store
+        .add_scheduler_task(scheduler_task(
+            "nightly",
+            "main",
+            "Summarize open work",
+            "2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+
+    assert_eq!(store.get_scheduler_task("nightly").unwrap(), task);
+    assert_eq!(
+        store.list_scheduler_tasks().unwrap().get("nightly"),
+        Some(&task)
+    );
+}
+
+fn assert_scheduler_task_rejects_duplicate_id<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store
+        .add_scheduler_task(scheduler_task(
+            "nightly",
+            "main",
+            "Summarize open work",
+            "2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+
+    let error = store
+        .add_scheduler_task(scheduler_task(
+            "nightly",
+            "main",
+            "Run again",
+            "2026-01-01T01:00:00Z",
+        ))
+        .unwrap_err();
+
+    assert!(matches!(error, Error::SchedulerTaskAlreadyExists { id } if id == "nightly"));
+}
+
+fn assert_scheduler_task_rejects_invalid_input<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+
+    let mut task = scheduler_task("nightly", "main", " ", "2026-01-01T00:00:00Z");
+    let error = store.add_scheduler_task(task.clone()).unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidSchedulerTask { id, message } if id == "nightly" && message == "prompt is empty")
+    );
+
+    task.prompt = "Summarize open work".to_owned();
+    task.interval_secs = 0;
+    let error = store.add_scheduler_task(task).unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidSchedulerTask { id, message } if id == "nightly" && message == "interval_secs must be greater than zero")
+    );
+}
+
+fn assert_scheduler_task_update_and_delete<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("ops", &root_id).unwrap();
+    store
+        .add_scheduler_task(scheduler_task(
+            "nightly",
+            "main",
+            "Summarize open work",
+            "2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+
+    let updated = store
+        .update_scheduler_task(
+            "nightly",
+            &SchedulerTaskPatch {
+                branch: Some("ops".to_owned()),
+                prompt: Some("Run ops review".to_owned()),
+                interval_secs: Some(120),
+                next_run_at: Some(timestamp("2026-01-01T01:00:00Z")),
+                enabled: Some(false),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(updated.branch, "ops");
+    assert_eq!(updated.prompt, "Run ops review");
+    assert_eq!(updated.interval_secs, 120);
+    assert!(!updated.enabled);
+
+    store.delete_scheduler_task("nightly").unwrap();
+    assert!(matches!(
+        store.get_scheduler_task("nightly").unwrap_err(),
+        Error::SchedulerTaskNotFound { id } if id == "nightly"
+    ));
+}
+
+fn assert_claim_due_scheduler_tasks_advances_schedule<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store
+        .add_scheduler_task(scheduler_task(
+            "first",
+            "main",
+            "First due prompt",
+            "2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+    store
+        .add_scheduler_task(scheduler_task(
+            "second",
+            "main",
+            "Second due prompt",
+            "2026-01-01T00:00:30Z",
+        ))
+        .unwrap();
+    store
+        .add_scheduler_task(NewSchedulerTask {
+            enabled: false,
+            ..scheduler_task(
+                "disabled",
+                "main",
+                "Disabled prompt",
+                "2026-01-01T00:00:00Z",
+            )
+        })
+        .unwrap();
+
+    let now = timestamp("2026-01-01T00:01:00Z");
+    let claimed = store.claim_due_scheduler_tasks(now, 1).unwrap();
+
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, "first");
+    let first = store.get_scheduler_task("first").unwrap();
+    assert_eq!(first.last_run_at, Some(now));
+    assert_eq!(first.run_count, 1);
+    assert_eq!(first.next_run_at, timestamp("2026-01-01T00:02:00Z"));
+
+    let claimed = store.claim_due_scheduler_tasks(now, 10).unwrap();
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["second"]
+    );
+    assert_eq!(
+        store.get_scheduler_task("second").unwrap().next_run_at,
+        timestamp("2026-01-01T00:01:30Z")
+    );
+    assert_eq!(store.get_scheduler_task("disabled").unwrap().run_count, 0);
+}
+
 fn assert_add_skill_starts_at_version_one<F>()
 where
     F: TestStoreFactory,
@@ -2109,6 +2301,31 @@ macro_rules! define_common_store_tests {
                 assert_submit_job_allows_new_job_after_previous_job_finishes::<$factory>();
             }
 
+            #[test]
+            fn scheduler_task_round_trip() {
+                assert_scheduler_task_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn scheduler_task_rejects_duplicate_id() {
+                assert_scheduler_task_rejects_duplicate_id::<$factory>();
+            }
+
+            #[test]
+            fn scheduler_task_rejects_invalid_input() {
+                assert_scheduler_task_rejects_invalid_input::<$factory>();
+            }
+
+            #[test]
+            fn scheduler_task_update_and_delete() {
+                assert_scheduler_task_update_and_delete::<$factory>();
+            }
+
+            #[test]
+            fn claim_due_scheduler_tasks_advances_schedule() {
+                assert_claim_due_scheduler_tasks_advances_schedule::<$factory>();
+            }
+
         }
     };
 }
@@ -2166,6 +2383,8 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     assert!(path.join("nodes.jsonl").is_file());
     assert!(path.join("sessions.json").is_file());
     assert!(path.join("branch-configs.json").is_file());
+    assert!(path.join("jobs.json").is_file());
+    assert!(path.join("scheduler-tasks.json").is_file());
     assert!(path.join("skills.json").is_file());
     assert!(path.join("branches").is_dir());
     assert!(path.join("branch-config-history").is_dir());
@@ -2430,7 +2649,7 @@ fn open_upgrades_legacy_store_format_version() {
 
     let upgraded: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(upgraded["version"], 7);
+    assert_eq!(upgraded["version"], 8);
 }
 
 #[test]

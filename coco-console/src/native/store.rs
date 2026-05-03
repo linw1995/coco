@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use coco_mem::{
     BranchConfig, BranchConfigRecord, BranchConfigStore, BranchStore, Job, JobStatus, JobStore,
-    NewNode, Node, NodeStore, ProviderProfile, ProviderProfileStore, RuntimeStore,
-    SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillGroups, SkillRecord,
-    SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    NewNode, NewSchedulerTask, Node, NodeStore, ProviderProfile, ProviderProfileStore,
+    RuntimeStore, SchedulerStore, SchedulerTask, SchedulerTaskPatch, SessionAnchorPatch,
+    SessionRole, SessionState, SessionStore, SkillGroups, SkillRecord, SkillStore,
+    SkillUpdatePatch, SkillVersionSpec, StoreResult, Timestamp,
 };
 
 use crate::ConsolePublisher;
@@ -254,6 +255,43 @@ where
         next: JobStatus,
     ) -> StoreResult<Job> {
         self.notify_if_ok(self.inner.set_job_status(job_id, expected, next))
+    }
+}
+
+impl<S> SchedulerStore for ConsoleStore<S>
+where
+    S: SchedulerStore,
+{
+    fn add_scheduler_task(&self, task: NewSchedulerTask) -> StoreResult<SchedulerTask> {
+        self.notify_if_ok(self.inner.add_scheduler_task(task))
+    }
+
+    fn get_scheduler_task(&self, id: &str) -> StoreResult<SchedulerTask> {
+        self.inner.get_scheduler_task(id)
+    }
+
+    fn list_scheduler_tasks(&self) -> StoreResult<HashMap<String, SchedulerTask>> {
+        self.inner.list_scheduler_tasks()
+    }
+
+    fn update_scheduler_task(
+        &self,
+        id: &str,
+        patch: &SchedulerTaskPatch,
+    ) -> StoreResult<SchedulerTask> {
+        self.notify_if_ok(self.inner.update_scheduler_task(id, patch))
+    }
+
+    fn delete_scheduler_task(&self, id: &str) -> StoreResult<()> {
+        self.notify_if_ok(self.inner.delete_scheduler_task(id))
+    }
+
+    fn claim_due_scheduler_tasks(
+        &self,
+        now: Timestamp,
+        limit: usize,
+    ) -> StoreResult<Vec<SchedulerTask>> {
+        self.notify_if_ok(self.inner.claim_due_scheduler_tasks(now, limit))
     }
 }
 

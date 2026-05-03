@@ -15,8 +15,8 @@ mod tests;
 
 use crate::{
     BranchConfig, BranchConfigRecord, Job, JobStatus, NewNode, Node, ProviderProfile,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
-    SkillVersionSpec, StoreResult,
+    SchedulerTask, SchedulerTaskPatch, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
+    SkillRecord, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 /// Node graph storage API used by CoCo services.
@@ -187,6 +187,35 @@ pub trait JobStore {
     ) -> StoreResult<Job>;
 }
 
+/// Scheduler task storage API.
+pub trait SchedulerStore {
+    /// Creates a new scheduler task.
+    fn add_scheduler_task(&self, task: crate::NewSchedulerTask) -> StoreResult<SchedulerTask>;
+
+    /// Returns one scheduler task by id.
+    fn get_scheduler_task(&self, id: &str) -> StoreResult<SchedulerTask>;
+
+    /// Returns all scheduler tasks keyed by id.
+    fn list_scheduler_tasks(&self) -> StoreResult<HashMap<String, SchedulerTask>>;
+
+    /// Patches an existing scheduler task.
+    fn update_scheduler_task(
+        &self,
+        id: &str,
+        patch: &SchedulerTaskPatch,
+    ) -> StoreResult<SchedulerTask>;
+
+    /// Deletes one scheduler task by id.
+    fn delete_scheduler_task(&self, id: &str) -> StoreResult<()>;
+
+    /// Claims enabled tasks due at or before `now` and advances their schedule.
+    fn claim_due_scheduler_tasks(
+        &self,
+        now: crate::Timestamp,
+        limit: usize,
+    ) -> StoreResult<Vec<SchedulerTask>>;
+}
+
 /// Optional runtime metadata for stores with a process-shareable backing path.
 pub trait RuntimeStore {
     /// Returns the backing store directory when the store is process-shareable.
@@ -197,7 +226,14 @@ pub trait RuntimeStore {
 
 /// Complete storage API used by CoCo application services.
 pub trait Store:
-    NodeStore + BranchStore + SessionStore + BranchConfigStore + SkillStore + JobStore + RuntimeStore
+    NodeStore
+    + BranchStore
+    + SessionStore
+    + BranchConfigStore
+    + SkillStore
+    + JobStore
+    + SchedulerStore
+    + RuntimeStore
 {
 }
 
@@ -208,6 +244,7 @@ impl<T> Store for T where
         + BranchConfigStore
         + SkillStore
         + JobStore
+        + SchedulerStore
         + RuntimeStore
 {
 }

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use jiff::Timestamp;
+pub use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -131,6 +131,43 @@ pub struct Job {
     pub status: JobStatus,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NewSchedulerTask {
+    pub id: String,
+    pub branch: String,
+    pub prompt: String,
+    pub interval_secs: u64,
+    pub next_run_at: Timestamp,
+    #[serde(default = "default_scheduler_task_enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerTaskPatch {
+    pub branch: Option<String>,
+    pub prompt: Option<String>,
+    pub interval_secs: Option<u64>,
+    pub next_run_at: Option<Timestamp>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerTask {
+    pub id: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub branch: String,
+    pub prompt: String,
+    pub interval_secs: u64,
+    pub next_run_at: Timestamp,
+    #[serde(default)]
+    pub last_run_at: Option<Timestamp>,
+    #[serde(default)]
+    pub run_count: u64,
+    #[serde(default = "default_scheduler_task_enabled")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchorPatch {
     pub role: Option<SessionRole>,
@@ -255,6 +292,16 @@ impl SkillUpdatePatch {
             && self.body.is_none()
             && self.scripts.is_none()
             && self.enable_coco_shim.is_none()
+    }
+}
+
+impl SchedulerTaskPatch {
+    pub fn is_empty(&self) -> bool {
+        self.branch.is_none()
+            && self.prompt.is_none()
+            && self.interval_secs.is_none()
+            && self.next_run_at.is_none()
+            && self.enabled.is_none()
     }
 }
 
@@ -675,6 +722,69 @@ impl Job {
             status: JobStatus::Queued,
         }
     }
+}
+
+impl SchedulerTask {
+    pub fn new(task: NewSchedulerTask) -> Self {
+        let now = Timestamp::now();
+        Self {
+            id: task.id,
+            created_at: now,
+            updated_at: now,
+            branch: task.branch,
+            prompt: task.prompt,
+            interval_secs: task.interval_secs,
+            next_run_at: task.next_run_at,
+            last_run_at: None,
+            run_count: 0,
+            enabled: task.enabled,
+        }
+    }
+
+    pub fn apply_patch(&mut self, patch: &SchedulerTaskPatch) {
+        if let Some(branch) = &patch.branch {
+            self.branch = branch.clone();
+        }
+        if let Some(prompt) = &patch.prompt {
+            self.prompt = prompt.clone();
+        }
+        if let Some(interval_secs) = patch.interval_secs {
+            self.interval_secs = interval_secs;
+        }
+        if let Some(next_run_at) = patch.next_run_at {
+            self.next_run_at = next_run_at;
+        }
+        if let Some(enabled) = patch.enabled {
+            self.enabled = enabled;
+        }
+        self.updated_at = Timestamp::now();
+    }
+
+    pub fn mark_claimed(&mut self, now: Timestamp) {
+        self.last_run_at = Some(now);
+        self.run_count = self.run_count.saturating_add(1);
+        self.next_run_at = next_scheduler_run_after(self.next_run_at, now, self.interval_secs);
+        self.updated_at = Timestamp::now();
+    }
+}
+
+fn next_scheduler_run_after(
+    mut next_run_at: Timestamp,
+    now: Timestamp,
+    interval_secs: u64,
+) -> Timestamp {
+    while next_run_at <= now {
+        let Ok(next) = next_run_at.checked_add(std::time::Duration::from_secs(interval_secs))
+        else {
+            return Timestamp::MAX;
+        };
+        next_run_at = next;
+    }
+    next_run_at
+}
+
+fn default_scheduler_task_enabled() -> bool {
+    true
 }
 
 impl ExecutionMetadata {

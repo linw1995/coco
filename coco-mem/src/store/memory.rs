@@ -4,13 +4,13 @@ use std::sync::{Arc, RwLock};
 use super::state::StoreState;
 use super::{
     BranchConfigStore, BranchStore, JobStore, NodeStore, ProviderProfileStore, RuntimeStore,
-    SessionStore, SkillStore,
+    SchedulerStore, SessionStore, SkillStore,
 };
 use crate::StoreResult as Result;
 use crate::{
-    BranchConfig, BranchConfigRecord, Job, JobStatus, NewNode, Node, ProviderProfile,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
-    SkillVersionSpec,
+    BranchConfig, BranchConfigRecord, Job, JobStatus, NewNode, NewSchedulerTask, Node,
+    ProviderProfile, SchedulerTask, SchedulerTaskPatch, SessionAnchorPatch, SessionRole,
+    SessionState, SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
 };
 
 #[derive(Clone, Debug)]
@@ -325,6 +325,56 @@ impl JobStore for MemoryStore {
             .write()
             .expect("store lock poisoned")
             .set_job_status(job_id, expected, next)
+    }
+}
+
+impl SchedulerStore for MemoryStore {
+    fn add_scheduler_task(&self, task: NewSchedulerTask) -> Result<SchedulerTask> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .add_scheduler_task(task)
+    }
+
+    fn get_scheduler_task(&self, id: &str) -> Result<SchedulerTask> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_scheduler_task(id)
+    }
+
+    fn list_scheduler_tasks(&self) -> Result<HashMap<String, SchedulerTask>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_scheduler_tasks())
+    }
+
+    fn update_scheduler_task(&self, id: &str, patch: &SchedulerTaskPatch) -> Result<SchedulerTask> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .update_scheduler_task(id, patch)
+    }
+
+    fn delete_scheduler_task(&self, id: &str) -> Result<()> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .delete_scheduler_task(id)
+    }
+
+    fn claim_due_scheduler_tasks(
+        &self,
+        now: crate::Timestamp,
+        limit: usize,
+    ) -> Result<Vec<SchedulerTask>> {
+        Ok(self
+            .inner
+            .write()
+            .expect("store lock poisoned")
+            .claim_due_scheduler_tasks(now, limit))
     }
 }
 

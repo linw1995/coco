@@ -71,6 +71,18 @@ pub enum StoreError {
     #[snafu(display("Branch {branch:?} already has an active prompt job {job_id:?}"))]
     PromptJobActiveOnBranch { branch: String, job_id: String },
 
+    #[snafu(display("Scheduler task {id:?} already exists"))]
+    SchedulerTaskAlreadyExists { id: String },
+
+    #[snafu(display("Scheduler task {id:?} not found"))]
+    SchedulerTaskNotFound { id: String },
+
+    #[snafu(display("Invalid scheduler task {id:?}: {message}"))]
+    InvalidSchedulerTask { id: String, message: String },
+
+    #[snafu(display("Scheduler task {id:?} update is empty"))]
+    SchedulerTaskUpdateEmpty { id: String },
+
     #[snafu(display("Skill {name:?} already exists for role {role:?}"))]
     SkillAlreadyExists { role: String, name: String },
 

@@ -18,7 +18,8 @@ use super::versioned::{
     validate_snapshot_in_collection, versions_from_history,
 };
 use super::{
-    BranchConfigStore, BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore, SkillStore,
+    BranchConfigStore, BranchStore, JobStore, NodeStore, RuntimeStore, SchedulerStore,
+    SessionStore, SkillStore,
 };
 use crate::error::{
     CorruptedStoreSnafu, ParseStoreLogSnafu, ParseStoreMetaSnafu, SerializeStoreRecordSnafu,
@@ -26,19 +27,20 @@ use crate::error::{
     WriteStoreLogSnafu, WriteStoreMetaSnafu,
 };
 use crate::{
-    BranchConfig, BranchConfigRecord, BranchConfigVersion, Job, JobStatus, NewNode, Node,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillScript,
-    SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError, StoreResult as Result,
-    default_skill_groups,
+    BranchConfig, BranchConfigRecord, BranchConfigVersion, Job, JobStatus, NewNode,
+    NewSchedulerTask, Node, SchedulerTask, SchedulerTaskPatch, SessionAnchorPatch, SessionRole,
+    SessionState, SkillGroups, SkillRecord, SkillScript, SkillUpdatePatch, SkillVersion,
+    SkillVersionSpec, StoreError, StoreResult as Result, default_skill_groups,
 };
 
-const STORE_FORMAT_VERSION: u64 = 7;
-const LEGACY_STORE_FORMAT_VERSION: u64 = 6;
+const STORE_FORMAT_VERSION: u64 = 8;
+const MIN_SUPPORTED_STORE_FORMAT_VERSION: u64 = 6;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
 const BRANCH_CONFIGS_FILE_NAME: &str = "branch-configs.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
+const SCHEDULER_TASKS_FILE_NAME: &str = "scheduler-tasks.json";
 const SKILLS_FILE_NAME: &str = "skills.json";
 const BRANCH_CONFIG_HISTORY_DIR_NAME: &str = "branch-config-history";
 const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
@@ -64,6 +66,7 @@ pub struct Persistence {
     sessions_path: PathBuf,
     branch_configs_path: PathBuf,
     jobs_path: PathBuf,
+    scheduler_tasks_path: PathBuf,
     skills_path: PathBuf,
     branch_config_history_dir: PathBuf,
     skill_history_dir: PathBuf,
@@ -643,6 +646,7 @@ impl Persistence {
             sessions_path: path.join(SESSIONS_FILE_NAME),
             branch_configs_path: path.join(BRANCH_CONFIGS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
+            scheduler_tasks_path: path.join(SCHEDULER_TASKS_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             branch_config_history_dir: path.join(BRANCH_CONFIG_HISTORY_DIR_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
@@ -672,6 +676,7 @@ impl Persistence {
             sessions_path: path.join(SESSIONS_FILE_NAME),
             branch_configs_path: path.join(BRANCH_CONFIGS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
+            scheduler_tasks_path: path.join(SCHEDULER_TASKS_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             branch_config_history_dir: path.join(BRANCH_CONFIG_HISTORY_DIR_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
@@ -882,6 +887,10 @@ impl Persistence {
         )?;
         write_json_file(&self.jobs_path, &HashMap::<String, Job>::new())?;
         write_json_file(
+            &self.scheduler_tasks_path,
+            &HashMap::<String, SchedulerTask>::new(),
+        )?;
+        write_json_file(
             &self.skills_path,
             &PersistedSkillGroups::from_groups(&skill_groups),
         )?;
@@ -939,10 +948,7 @@ impl Persistence {
         }
         let meta = read_json_file::<Meta>(&self.meta_path)?;
         ensure!(
-            matches!(
-                meta.version,
-                LEGACY_STORE_FORMAT_VERSION | STORE_FORMAT_VERSION
-            ),
+            (MIN_SUPPORTED_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION).contains(&meta.version),
             CorruptedStoreSnafu {
                 path: self.meta_path.clone(),
                 message: format!(
@@ -1062,6 +1068,15 @@ impl Persistence {
         validate_branch_config_snapshots(&branch_config_snapshots.current, &branch_configs)?;
         store.branch_configs = branch_configs;
         store.jobs = read_json_file::<HashMap<String, Job>>(&self.jobs_path)?;
+        store.scheduler_tasks = if self.scheduler_tasks_path.is_file() {
+            read_json_file::<HashMap<String, SchedulerTask>>(&self.scheduler_tasks_path)?
+        } else {
+            let scheduler_tasks = HashMap::<String, SchedulerTask>::new();
+            if self.access == StoreAccess::ReadWrite {
+                write_json_file(&self.scheduler_tasks_path, &scheduler_tasks)?;
+            }
+            scheduler_tasks
+        };
         let skill_groups = read_json_file::<PersistedSkillGroups>(&self.skills_path)?;
         if skill_groups.is_empty() {
             store.skill_groups = default_skill_groups();
@@ -1119,6 +1134,11 @@ impl Persistence {
     pub fn persist_jobs(&self, state: &StoreState) -> Result<()> {
         self.ensure_writable()?;
         write_json_file(&self.jobs_path, &state.jobs)
+    }
+
+    pub fn persist_scheduler_tasks(&self, state: &StoreState) -> Result<()> {
+        self.ensure_writable()?;
+        write_json_file(&self.scheduler_tasks_path, &state.scheduler_tasks)
     }
 }
 
@@ -1861,6 +1881,65 @@ impl JobStore for FsStore {
         self.persistence.persist_jobs(&temp)?;
         state.jobs = temp.jobs;
         Ok(updated)
+    }
+}
+
+impl SchedulerStore for FsStore {
+    fn add_scheduler_task(&self, task: NewSchedulerTask) -> Result<SchedulerTask> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let created = temp.add_scheduler_task(task)?;
+        self.persistence.persist_scheduler_tasks(&temp)?;
+        state.scheduler_tasks = temp.scheduler_tasks;
+        Ok(created)
+    }
+
+    fn get_scheduler_task(&self, id: &str) -> Result<SchedulerTask> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_scheduler_task(id)
+    }
+
+    fn list_scheduler_tasks(&self) -> Result<HashMap<String, SchedulerTask>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_scheduler_tasks())
+    }
+
+    fn update_scheduler_task(&self, id: &str, patch: &SchedulerTaskPatch) -> Result<SchedulerTask> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.update_scheduler_task(id, patch)?;
+        self.persistence.persist_scheduler_tasks(&temp)?;
+        state.scheduler_tasks = temp.scheduler_tasks;
+        Ok(updated)
+    }
+
+    fn delete_scheduler_task(&self, id: &str) -> Result<()> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        temp.delete_scheduler_task(id)?;
+        self.persistence.persist_scheduler_tasks(&temp)?;
+        state.scheduler_tasks = temp.scheduler_tasks;
+        Ok(())
+    }
+
+    fn claim_due_scheduler_tasks(
+        &self,
+        now: crate::Timestamp,
+        limit: usize,
+    ) -> Result<Vec<SchedulerTask>> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let claimed = temp.claim_due_scheduler_tasks(now, limit);
+        if !claimed.is_empty() {
+            self.persistence.persist_scheduler_tasks(&temp)?;
+            state.scheduler_tasks = temp.scheduler_tasks;
+        }
+        Ok(claimed)
     }
 }
 

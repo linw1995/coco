@@ -8,17 +8,19 @@ use crate::StoreResult as Result;
 use crate::error::{
     AmbiguousNodePrefixSnafu, BranchConfigNotFoundSnafu, BranchConfigVersionNotFoundSnafu,
     BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu, DuplicateMergeParentSnafu,
-    InvalidAnchorSnafu, InvalidSkillNameSnafu, MergeParentMatchesParentSnafu,
-    MissingSessionAnchorSnafu, MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu,
-    PromptJobActiveOnBranchSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
-    ProviderProfileNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
-    SkillAlreadyExistsSnafu, SkillNotFoundSnafu, SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
+    InvalidAnchorSnafu, InvalidSchedulerTaskSnafu, InvalidSkillNameSnafu,
+    MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, MultipleShadowParentsSnafu,
+    NotFoundSnafu, ParentNotFoundSnafu, PromptJobActiveOnBranchSnafu, PromptJobMovedSnafu,
+    PromptJobNotFoundSnafu, ProviderProfileNotFoundSnafu, RefsNotConnectedSnafu,
+    SchedulerTaskAlreadyExistsSnafu, SchedulerTaskNotFoundSnafu, SchedulerTaskUpdateEmptySnafu,
+    SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu, SkillUpdateEmptySnafu,
+    SkillVersionNotFoundSnafu,
 };
 use crate::{
-    Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind, NewNode, Node,
-    PauseReason, ProviderProfile, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
-    SessionState, SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
-    default_skill_groups,
+    Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind, NewNode,
+    NewSchedulerTask, Node, PauseReason, ProviderProfile, Role, SchedulerTask, SchedulerTaskPatch,
+    SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
+    SkillUpdatePatch, SkillVersionSpec, default_skill_groups,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,7 @@ pub struct StoreState {
     pub branch_configs: HashMap<String, BranchConfigRecord>,
     pub provider_profiles: HashMap<String, ProviderProfile>,
     pub jobs: HashMap<String, Job>,
+    pub scheduler_tasks: HashMap<String, SchedulerTask>,
     pub skill_groups: SkillGroups,
 }
 
@@ -78,6 +81,7 @@ impl StoreState {
             branch_configs: HashMap::new(),
             provider_profiles: HashMap::new(),
             jobs: HashMap::new(),
+            scheduler_tasks: HashMap::new(),
             skill_groups: default_skill_groups(),
         }
     }
@@ -96,6 +100,7 @@ impl StoreState {
             branch_configs: HashMap::new(),
             provider_profiles: HashMap::new(),
             jobs: HashMap::new(),
+            scheduler_tasks: HashMap::new(),
             skill_groups: default_skill_groups(),
         }
     }
@@ -542,6 +547,93 @@ impl StoreState {
         self.jobs.clone()
     }
 
+    pub fn add_scheduler_task(&mut self, task: NewSchedulerTask) -> Result<SchedulerTask> {
+        validate_scheduler_task_input(&task.id, &task.branch, &task.prompt, task.interval_secs)?;
+        self.get_branch_head(&task.branch)?;
+        ensure!(
+            !self.scheduler_tasks.contains_key(&task.id),
+            SchedulerTaskAlreadyExistsSnafu {
+                id: task.id.clone(),
+            }
+        );
+
+        let task = SchedulerTask::new(task);
+        self.scheduler_tasks.insert(task.id.clone(), task.clone());
+        Ok(task)
+    }
+
+    pub fn get_scheduler_task(&self, id: &str) -> Result<SchedulerTask> {
+        self.scheduler_tasks
+            .get(id)
+            .cloned()
+            .context(SchedulerTaskNotFoundSnafu { id: id.to_owned() })
+    }
+
+    pub fn list_scheduler_tasks(&self) -> HashMap<String, SchedulerTask> {
+        self.scheduler_tasks.clone()
+    }
+
+    pub fn update_scheduler_task(
+        &mut self,
+        id: &str,
+        patch: &SchedulerTaskPatch,
+    ) -> Result<SchedulerTask> {
+        ensure!(
+            !patch.is_empty(),
+            SchedulerTaskUpdateEmptySnafu { id: id.to_owned() }
+        );
+
+        let current = self.get_scheduler_task(id)?;
+        let branch = patch.branch.as_deref().unwrap_or(&current.branch);
+        let prompt = patch.prompt.as_deref().unwrap_or(&current.prompt);
+        let interval_secs = patch.interval_secs.unwrap_or(current.interval_secs);
+        validate_scheduler_task_input(id, branch, prompt, interval_secs)?;
+        self.get_branch_head(branch)?;
+
+        let task = self
+            .scheduler_tasks
+            .get_mut(id)
+            .context(SchedulerTaskNotFoundSnafu { id: id.to_owned() })?;
+        task.apply_patch(patch);
+        Ok(task.clone())
+    }
+
+    pub fn delete_scheduler_task(&mut self, id: &str) -> Result<()> {
+        self.scheduler_tasks
+            .remove(id)
+            .map(|_| ())
+            .context(SchedulerTaskNotFoundSnafu { id: id.to_owned() })
+    }
+
+    pub fn claim_due_scheduler_tasks(
+        &mut self,
+        now: Timestamp,
+        limit: usize,
+    ) -> Vec<SchedulerTask> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut due_ids = self
+            .scheduler_tasks
+            .values()
+            .filter(|task| task.enabled && task.next_run_at <= now)
+            .map(|task| (task.next_run_at, task.id.clone()))
+            .collect::<Vec<_>>();
+        due_ids.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+        let mut claimed = Vec::with_capacity(limit.min(due_ids.len()));
+        for (_, id) in due_ids.into_iter().take(limit) {
+            let task = self
+                .scheduler_tasks
+                .get_mut(&id)
+                .expect("due scheduler task should still exist");
+            task.mark_claimed(now);
+            claimed.push(task.clone());
+        }
+        claimed
+    }
+
     pub fn set_job_status(
         &mut self,
         job_id: &str,
@@ -900,6 +992,43 @@ impl StoreState {
         );
         self.validate_ref_on_branch(branch, node_id)
     }
+}
+
+fn validate_scheduler_task_input(
+    id: &str,
+    branch: &str,
+    prompt: &str,
+    interval_secs: u64,
+) -> Result<()> {
+    ensure!(
+        !id.trim().is_empty(),
+        InvalidSchedulerTaskSnafu {
+            id: id.to_owned(),
+            message: "id is empty".to_owned(),
+        }
+    );
+    ensure!(
+        !branch.trim().is_empty(),
+        InvalidSchedulerTaskSnafu {
+            id: id.to_owned(),
+            message: "branch is empty".to_owned(),
+        }
+    );
+    ensure!(
+        !prompt.trim().is_empty(),
+        InvalidSchedulerTaskSnafu {
+            id: id.to_owned(),
+            message: "prompt is empty".to_owned(),
+        }
+    );
+    ensure!(
+        interval_secs > 0,
+        InvalidSchedulerTaskSnafu {
+            id: id.to_owned(),
+            message: "interval_secs must be greater than zero".to_owned(),
+        }
+    );
+    Ok(())
 }
 
 fn is_node_id(reference: &str) -> bool {
