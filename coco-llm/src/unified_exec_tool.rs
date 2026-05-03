@@ -213,7 +213,11 @@ const COCO_EXEC_SANDBOX_ENV: &str = "COCO_EXEC_SANDBOX";
 const COCO_EXEC_WORKSPACE_ENV: &str = "COCO_EXEC_WORKSPACE";
 const UV_CACHE_DIR_ENV: &str = "UV_CACHE_DIR";
 const UV_PYTHON_INSTALL_DIR_ENV: &str = "UV_PYTHON_INSTALL_DIR";
+const TMPDIR_ENV: &str = "TMPDIR";
+const XDG_CACHE_HOME_ENV: &str = "XDG_CACHE_HOME";
+const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
+const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
 const HOME_ENV: &str = "HOME";
 
 #[cfg(unix)]
@@ -1015,22 +1019,101 @@ fn prepare_coco_command_path_injection(
 
 #[derive(Clone, Debug)]
 struct SkillUvRuntimeDirs {
-    cache_dir: PathBuf,
-    python_install_dir: PathBuf,
+    env_vars: Vec<(&'static str, PathBuf)>,
+    allow_paths: Vec<PathBuf>,
+    xdg_bin_dir: PathBuf,
+}
+
+impl SkillUvRuntimeDirs {
+    fn created_dirs(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.allow_paths.iter().cloned()
+    }
+
+    fn allow_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.allow_paths.iter().cloned()
+    }
+
+    fn env_vars(&self) -> impl Iterator<Item = (&'static str, PathBuf)> + '_ {
+        self.env_vars
+            .iter()
+            .map(|(name, path)| (*name, path.clone()))
+    }
+
+    fn xdg_bin_dir(&self) -> &Path {
+        &self.xdg_bin_dir
+    }
+}
+
+fn configured_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path != Path::new("/"))
+}
+
+fn env_path_or(name: &str, fallback: PathBuf) -> PathBuf {
+    configured_env_path(name).unwrap_or(fallback)
 }
 
 fn prepare_skill_uv_runtime_dirs(
     workspace_root: &Path,
 ) -> std::result::Result<SkillUvRuntimeDirs, UnifiedExecToolError> {
     let runtime_root = resolve_runtime_root(workspace_root)?;
-    let cache_dir = runtime_root.join("uv-cache");
-    let python_install_dir = runtime_root.join("uv-python");
-    std::fs::create_dir_all(&cache_dir).context(CreateCocoCommandShimDirSnafu)?;
-    std::fs::create_dir_all(&python_install_dir).context(CreateCocoCommandShimDirSnafu)?;
-    Ok(SkillUvRuntimeDirs {
-        cache_dir,
-        python_install_dir,
-    })
+    let cache_home = env_path_or(XDG_CACHE_HOME_ENV, runtime_root.join(".cache"));
+    let config_home = env_path_or(XDG_CONFIG_HOME_ENV, runtime_root.join(".config"));
+    let data_home = env_path_or(XDG_DATA_HOME_ENV, runtime_root.join(".local").join("share"));
+    let state_home = env_path_or(
+        XDG_STATE_HOME_ENV,
+        runtime_root.join(".local").join("state"),
+    );
+    let tmp_dir = env_path_or(TMPDIR_ENV, cache_home.join("coco").join("tmp"));
+    let cache_dir = env_path_or(UV_CACHE_DIR_ENV, cache_home.join("uv"));
+    let python_install_dir = env_path_or(
+        UV_PYTHON_INSTALL_DIR_ENV,
+        data_home.join("uv").join("python"),
+    );
+    let xdg_bin_dir = data_home
+        .parent()
+        .map(|parent| parent.join("bin"))
+        .unwrap_or_else(|| data_home.join("bin"));
+
+    let env_vars = vec![
+        (TMPDIR_ENV, tmp_dir.clone()),
+        (UV_CACHE_DIR_ENV, cache_dir.clone()),
+        (UV_PYTHON_INSTALL_DIR_ENV, python_install_dir.clone()),
+        (XDG_CACHE_HOME_ENV, cache_home.clone()),
+        (XDG_CONFIG_HOME_ENV, config_home.clone()),
+        (XDG_DATA_HOME_ENV, data_home.clone()),
+        (XDG_STATE_HOME_ENV, state_home.clone()),
+    ];
+    let mut allow_paths = Vec::new();
+    for path in env_vars
+        .iter()
+        .map(|(_, path)| path.clone())
+        .chain(std::iter::once(xdg_bin_dir.clone()))
+    {
+        push_unique_path(&mut allow_paths, path);
+    }
+
+    let dirs = SkillUvRuntimeDirs {
+        env_vars,
+        allow_paths,
+        xdg_bin_dir,
+    };
+    for dir in dirs.created_dirs() {
+        std::fs::create_dir_all(dir).context(CreateCocoCommandShimDirSnafu)?;
+    }
+    Ok(dirs)
+}
+
+fn skill_uv_path_env(
+    coco_command: Option<&CocoCommandPathInjection>,
+    dirs: &SkillUvRuntimeDirs,
+) -> OsString {
+    let path_env = coco_command
+        .map(|command| command.path_env.clone())
+        .or_else(|| std::env::var_os("PATH"));
+    prepend_path_entry(path_env, dirs.xdg_bin_dir())
 }
 
 fn nono_execution_spec(
@@ -1506,8 +1589,7 @@ async fn execute_command(
     }
     let skill_uv_runtime_dirs = if request.context.active_skill.is_some() {
         let runtime_dirs = prepare_skill_uv_runtime_dirs(&request.workspace_root)?;
-        extra_allow_paths.push(runtime_dirs.cache_dir.clone());
-        extra_allow_paths.push(runtime_dirs.python_install_dir.clone());
+        extra_allow_paths.extend(runtime_dirs.allow_paths());
         Some(runtime_dirs)
     } else {
         None
@@ -1587,12 +1669,13 @@ async fn execute_command(
             .env(COCO_SKILL_DIR_ENV, &active_skill.directory);
     }
     if let Some(skill_uv_runtime_dirs) = &skill_uv_runtime_dirs {
-        command
-            .env(UV_CACHE_DIR_ENV, &skill_uv_runtime_dirs.cache_dir)
-            .env(
-                UV_PYTHON_INSTALL_DIR_ENV,
-                &skill_uv_runtime_dirs.python_install_dir,
-            );
+        command.env(
+            "PATH",
+            skill_uv_path_env(coco_command.as_ref(), skill_uv_runtime_dirs),
+        );
+        for (name, value) in skill_uv_runtime_dirs.env_vars() {
+            command.env(name, value);
+        }
     }
     let mut child = command.spawn().context(SpawnProcessSnafu)?;
 
@@ -1721,11 +1804,13 @@ async fn execute_pty_command(
         command.env(COCO_SKILL_DIR_ENV, &active_skill.directory);
     }
     if let Some(skill_uv_runtime_dirs) = &skill_uv_runtime_dirs {
-        command.env(UV_CACHE_DIR_ENV, &skill_uv_runtime_dirs.cache_dir);
         command.env(
-            UV_PYTHON_INSTALL_DIR_ENV,
-            &skill_uv_runtime_dirs.python_install_dir,
+            "PATH",
+            skill_uv_path_env(coco_command.as_ref(), skill_uv_runtime_dirs),
         );
+        for (name, value) in skill_uv_runtime_dirs.env_vars() {
+            command.env(name, value);
+        }
     }
 
     let mut child = pair.slave.spawn_command(command).map_err(|source| {
@@ -2640,6 +2725,51 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
     }
 
     #[tokio::test]
+    async fn skill_uv_runtime_dirs_prefer_configured_xdg_homes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cache_home = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let data_home = data_root.path().join(".local").join("share");
+        let state_home = tempfile::tempdir().unwrap();
+
+        let dirs = crate::with_process_env_async(
+            &[
+                (XDG_CACHE_HOME_ENV, Some(cache_home.path().as_os_str())),
+                (XDG_CONFIG_HOME_ENV, Some(config_home.path().as_os_str())),
+                (XDG_DATA_HOME_ENV, Some(data_home.as_os_str())),
+                (XDG_STATE_HOME_ENV, Some(state_home.path().as_os_str())),
+                (TMPDIR_ENV, None),
+                (UV_CACHE_DIR_ENV, None),
+                (UV_PYTHON_INSTALL_DIR_ENV, None),
+            ],
+            || async { prepare_skill_uv_runtime_dirs(workspace.path()) },
+        )
+        .await
+        .unwrap();
+
+        let env_vars = dirs.env_vars().collect::<HashMap<_, _>>();
+        assert_eq!(
+            env_vars.get(TMPDIR_ENV),
+            Some(&cache_home.path().join("coco").join("tmp"))
+        );
+        assert_eq!(
+            env_vars.get(UV_CACHE_DIR_ENV),
+            Some(&cache_home.path().join("uv"))
+        );
+        assert_eq!(
+            env_vars.get(UV_PYTHON_INSTALL_DIR_ENV),
+            Some(&data_home.join("uv").join("python"))
+        );
+
+        let allow_paths = dirs.allow_paths().collect::<Vec<_>>();
+        assert!(allow_paths.contains(&cache_home.path().to_path_buf()));
+        assert!(allow_paths.contains(&config_home.path().to_path_buf()));
+        assert!(allow_paths.contains(&data_home));
+        assert!(allow_paths.contains(&data_root.path().join(".local").join("bin")));
+    }
+
+    #[tokio::test]
     async fn exec_command_runtime_injects_coco_command_when_enabled() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
@@ -2806,11 +2936,17 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
                 ("COCO_EXEC_SANDBOX", Some(OsStr::new("nono"))),
                 ("PATH", Some(path_env.as_os_str())),
                 ("XDG_RUNTIME_DIR", Some(runtime_root.path().as_os_str())),
+                (HOME_ENV, None),
+                (TMPDIR_ENV, None),
+                (XDG_CACHE_HOME_ENV, None),
+                (XDG_CONFIG_HOME_ENV, None),
+                (XDG_DATA_HOME_ENV, None),
+                (XDG_STATE_HOME_ENV, None),
             ],
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s|%s' \"$(command -v uv)\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$(command -v uv)\" \"$HOME\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\" \"${{PATH%%:*}}\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -2821,13 +2957,20 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
 
         assert!(output.contains("exit_status: 0"));
         assert!(output.contains("uv|"));
-        assert!(output.contains("/uv-cache"));
-        assert!(output.contains("/uv-python"));
+        assert!(output.contains("/.cache/coco/tmp"));
+        assert!(output.contains("/.cache/uv"));
+        assert!(output.contains("/.cache"));
+        assert!(output.contains("/.config"));
+        assert!(output.contains("/.local/share/uv/python"));
+        assert!(output.contains("/.local/share"));
+        assert!(output.contains("/.local/state"));
+        assert!(output.contains("/.local/bin"));
         let args = std::fs::read_to_string(&observed_args).unwrap();
         assert!(args.contains(&fake_bin.path().display().to_string()));
         assert!(args.contains(&skill_dir.path().display().to_string()));
-        assert!(args.contains("/uv-cache"));
-        assert!(args.contains("/uv-python"));
+        assert!(args.contains("/.cache"));
+        assert!(args.contains("/.config"));
+        assert!(args.contains("/.local"));
     }
 
     #[tokio::test]
@@ -2902,11 +3045,19 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         );
 
         let output = crate::with_process_env_async(
-            &[("COCO_EXEC_SANDBOX", Some(OsStr::new("off")))],
+            &[
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("off"))),
+                (HOME_ENV, None),
+                (TMPDIR_ENV, None),
+                (XDG_CACHE_HOME_ENV, None),
+                (XDG_CONFIG_HOME_ENV, None),
+                (XDG_DATA_HOME_ENV, None),
+                (XDG_STATE_HOME_ENV, None),
+            ],
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s|%s|%s' \"$COCO_SKILL_NAME\" \"$COCO_SKILL_DIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$COCO_SKILL_NAME\" \"$COCO_SKILL_DIR\" \"$HOME\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -2919,8 +3070,13 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
             "stdout:\nscripted|{}|",
             skill_dir.path().display()
         )));
-        assert!(output.contains("/uv-cache"));
-        assert!(output.contains("/uv-python"));
+        assert!(output.contains("/.cache/coco/tmp"));
+        assert!(output.contains("/.cache/uv"));
+        assert!(output.contains("/.cache"));
+        assert!(output.contains("/.config"));
+        assert!(output.contains("/.local/share/uv/python"));
+        assert!(output.contains("/.local/share"));
+        assert!(output.contains("/.local/state"));
     }
 
     #[tokio::test]
