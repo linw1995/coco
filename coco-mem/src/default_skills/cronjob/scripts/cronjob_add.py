@@ -1,0 +1,364 @@
+# /// script
+# dependencies = []
+# ///
+"""Install or update a managed CoCo cronjob."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+MANAGED_PREFIX = "coco-cronjob"
+ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def main() -> int:
+    args = parse_args()
+    task_id = normalize_task_id(args.id)
+    branch = args.target or args.branch
+    prompt = resolve_prompt(args)
+    validate_cronexpr(args.cronexpr)
+
+    install_dir = resolve_install_dir(args.install_dir)
+    task_dir = install_dir / "tasks"
+    state_dir = resolve_state_dir(args.state_dir)
+    log_dir = resolve_log_dir(args.log_dir)
+    install_dir.mkdir(parents=True, exist_ok=True)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    runner_path = install_runner(args.runner_source, install_dir)
+    task_path = task_dir / f"{task_id}.json"
+    write_task_config(
+        task_path,
+        {
+            "id": task_id,
+            "branch": branch,
+            "prompt": prompt,
+            "repeat": args.repeat,
+            "coco_bin": args.coco_bin,
+            "state_dir": str(state_dir),
+            "log_dir": str(log_dir),
+        },
+    )
+
+    block = render_crontab_block(
+        task_id=task_id,
+        cronexpr=args.cronexpr,
+        timezone=args.timezone,
+        uv_bin=args.uv_bin,
+        runner_path=runner_path,
+        task_path=task_path,
+        log_path=log_dir / f"{task_id}.log",
+    )
+
+    if args.dry_run:
+        print(block, end="")
+        return 0
+
+    current = read_crontab(args.crontab_bin)
+    updated, action = upsert_managed_block(current, task_id, block)
+    if updated != current:
+        write_crontab(args.crontab_bin, updated)
+    print(
+        json.dumps(
+            {
+                "id": task_id,
+                "action": action,
+                "branch": branch,
+                "cronexpr": args.cronexpr,
+                "repeat": args.repeat,
+                "task_file": str(task_path),
+                "runner": str(runner_path),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--id", required=True, help="Stable cronjob id.")
+    parser.add_argument("--branch", default="main", help="Target CoCo branch.")
+    parser.add_argument("--target", help="Alias for --branch.")
+    parser.add_argument("--cronexpr", required=True, help="Five-field cron expression.")
+    parser.add_argument(
+        "--repeat",
+        choices=("parallel", "serial", "skip"),
+        default="skip",
+        help="Duplicate execution policy.",
+    )
+    parser.add_argument("--prompt", help="Prompt text to submit.")
+    parser.add_argument("--prompt-file", type=Path, help="Read prompt text from a file.")
+    parser.add_argument(
+        "--timezone",
+        help="Optional CRON_TZ value for cron implementations that support it.",
+    )
+    parser.add_argument("--coco-bin", default="coco", help="coco command path.")
+    parser.add_argument("--uv-bin", default="uv", help="uv command path.")
+    parser.add_argument("--crontab-bin", default="crontab", help="crontab command path.")
+    parser.add_argument("--install-dir", type=Path, help="Persistent runner install directory.")
+    parser.add_argument("--state-dir", type=Path, help="Persistent task state directory.")
+    parser.add_argument("--log-dir", type=Path, help="Cronjob log directory.")
+    parser.add_argument(
+        "--runner-source",
+        type=Path,
+        help="Source cronjob_run.py path. Defaults to $COCO_SKILL_DIR/scripts/cronjob_run.py.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print the managed block only.")
+    return parser.parse_args()
+
+
+def normalize_task_id(value: str) -> str:
+    task_id = value.strip()
+    if not ID_PATTERN.fullmatch(task_id):
+        raise SystemExit(
+            "task id must start with an alphanumeric character and contain only "
+            "letters, digits, dot, underscore, or dash"
+        )
+    return task_id
+
+
+def resolve_prompt(args: argparse.Namespace) -> str:
+    sources = [args.prompt is not None, args.prompt_file is not None]
+    if sum(sources) > 1:
+        raise SystemExit("use only one of --prompt or --prompt-file")
+    if args.prompt_file is not None:
+        prompt = args.prompt_file.read_text(encoding="utf-8")
+    elif args.prompt is not None:
+        prompt = args.prompt
+    else:
+        prompt = sys.stdin.read()
+    prompt = prompt.strip()
+    if not prompt:
+        raise SystemExit("prompt must not be empty")
+    return prompt
+
+
+def validate_cronexpr(value: str) -> None:
+    fields = value.split()
+    if len(fields) != 5:
+        raise SystemExit("cronexpr must contain exactly five fields")
+    minutes = expand_minute_field(fields[0])
+    if not minutes:
+        raise SystemExit("minute field must select at least one minute")
+    ordered = sorted(minutes)
+    gaps = [
+        right - left
+        for left, right in zip(ordered, ordered[1:])
+    ]
+    if len(ordered) > 1:
+        gaps.append((ordered[0] + 60) - ordered[-1])
+    if gaps and min(gaps) < 15:
+        raise SystemExit("cronexpr minute granularity must be at least 15 minutes")
+
+
+def expand_minute_field(field: str) -> set[int]:
+    minutes: set[int] = set()
+    for part in field.split(","):
+        if not part:
+            raise SystemExit("empty minute field segment")
+        minutes.update(expand_minute_part(part))
+    return minutes
+
+
+def expand_minute_part(part: str) -> set[int]:
+    base, step = split_step(part)
+    if base == "*":
+        start, end = 0, 59
+    elif "-" in base:
+        left, right = base.split("-", 1)
+        start, end = parse_minute(left), parse_minute(right)
+        if start > end:
+            raise SystemExit("minute ranges must be ascending")
+    else:
+        minute = parse_minute(base)
+        if step is not None:
+            raise SystemExit("single minute values cannot use a step")
+        return {minute}
+    step = step or 1
+    if step < 15:
+        raise SystemExit("minute step must be at least 15")
+    return set(range(start, end + 1, step))
+
+
+def split_step(part: str) -> tuple[str, int | None]:
+    if "/" not in part:
+        return part, None
+    base, step_text = part.split("/", 1)
+    if not base or not step_text:
+        raise SystemExit("minute step syntax must be <range>/<step>")
+    try:
+        step = int(step_text)
+    except ValueError as error:
+        raise SystemExit("minute step must be an integer") from error
+    if step <= 0:
+        raise SystemExit("minute step must be positive")
+    return base, step
+
+
+def parse_minute(value: str) -> int:
+    try:
+        minute = int(value)
+    except ValueError as error:
+        raise SystemExit("minute values must be integers") from error
+    if minute < 0 or minute > 59:
+        raise SystemExit("minute values must be between 0 and 59")
+    return minute
+
+
+def resolve_install_dir(value: Path | None) -> Path:
+    if value is not None:
+        return value.expanduser()
+    data_home = Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser()
+    return data_home / "coco" / "cronjob"
+
+
+def resolve_state_dir(value: Path | None) -> Path:
+    if value is not None:
+        return value.expanduser()
+    state_home = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+    return state_home / "coco" / "cronjob"
+
+
+def resolve_log_dir(value: Path | None) -> Path:
+    if value is not None:
+        return value.expanduser()
+    state_home = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+    return state_home / "coco" / "logs" / "cronjob"
+
+
+def install_runner(source: Path | None, install_dir: Path) -> Path:
+    source_path = source
+    if source_path is None:
+        skill_dir = os.environ.get("COCO_SKILL_DIR")
+        if not skill_dir:
+            raise SystemExit("COCO_SKILL_DIR is required unless --runner-source is provided")
+        source_path = Path(skill_dir) / "scripts" / "cronjob_run.py"
+    if not source_path.is_file():
+        raise SystemExit(f"runner source does not exist: {source_path}")
+    target = install_dir / "cronjob_run.py"
+    shutil.copyfile(source_path, target)
+    target.chmod(0o755)
+    return target
+
+
+def write_task_config(path: Path, config: dict[str, str]) -> None:
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def render_crontab_block(
+    *,
+    task_id: str,
+    cronexpr: str,
+    timezone: str | None,
+    uv_bin: str,
+    runner_path: Path,
+    task_path: Path,
+    log_path: Path,
+) -> str:
+    command = " ".join(
+        shell_quote(part)
+        for part in [
+            uv_bin,
+            "run",
+            "--script",
+            str(runner_path),
+            "--task-file",
+            str(task_path),
+        ]
+    )
+    redirect = f">> {shell_quote(str(log_path))} 2>&1"
+    lines = [begin_marker(task_id)]
+    if timezone:
+        lines.append(f"CRON_TZ={timezone}")
+    lines.append(f"{cronexpr} {command} {redirect}")
+    lines.append(end_marker(task_id))
+    return "\n".join(lines) + "\n"
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def read_crontab(crontab_bin: str) -> str:
+    result = subprocess.run(
+        [crontab_bin, "-l"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout
+    combined = (result.stdout + result.stderr).lower()
+    if "no crontab" in combined or "no crontab for" in combined:
+        return ""
+    raise SystemExit(f"failed to read crontab: {result.stderr.strip()}")
+
+
+def write_crontab(crontab_bin: str, content: str) -> None:
+    result = subprocess.run(
+        [crontab_bin, "-"],
+        input=content,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"failed to install crontab: {result.stderr.strip()}")
+
+
+def upsert_managed_block(current: str, task_id: str, block: str) -> tuple[str, str]:
+    lines = current.splitlines()
+    begin = begin_marker(task_id)
+    end = end_marker(task_id)
+    output: list[str] = []
+    replaced = False
+    index = 0
+    while index < len(lines):
+        if lines[index] == begin:
+            end_index = index + 1
+            while end_index < len(lines) and lines[end_index] != end:
+                end_index += 1
+            if end_index == len(lines):
+                raise SystemExit(f"managed crontab block for {task_id!r} is missing its end marker")
+            if not replaced:
+                output.extend(block.rstrip("\n").splitlines())
+                replaced = True
+            index = end_index + 1
+            continue
+        output.append(lines[index])
+        index += 1
+
+    if not replaced:
+        if output and output[-1] != "":
+            output.append("")
+        output.extend(block.rstrip("\n").splitlines())
+    return "\n".join(output).rstrip("\n") + "\n", "updated" if replaced else "added"
+
+
+def begin_marker(task_id: str) -> str:
+    return f"# BEGIN {MANAGED_PREFIX} id={task_id}"
+
+
+def end_marker(task_id: str) -> str:
+    return f"# END {MANAGED_PREFIX} id={task_id}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
