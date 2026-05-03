@@ -94,6 +94,20 @@ rec {
                 pkgs.coreutils
                 pkgs.nono
                 pkgs.uv
+              ]
+              ++ [
+                pkgs.diffutils
+                pkgs.findutils
+                pkgs.gawk
+                pkgs.gnugrep
+                pkgs.gnused
+                pkgs.jq
+                pkgs.less
+                pkgs.procps
+                pkgs.ripgrep
+                pkgs.which
+              ]
+              ++ [
                 pkgs.cacert
                 pkgs.tzdata
               ]
@@ -111,7 +125,7 @@ rec {
             '';
             config = {
               Env = [
-                "PATH=${lib.makeBinPath [coco-cli pkgs.bash pkgs.coreutils pkgs.nono pkgs.uv]}"
+                "PATH=/bin"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
                 "TZDIR=${pkgs.tzdata}/share/zoneinfo"
                 "HOME=/data"
