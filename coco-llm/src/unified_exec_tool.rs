@@ -649,7 +649,7 @@ struct ExecutionSpec {
 #[derive(Debug)]
 struct CocoCommandPathInjection {
     root_dir: PathBuf,
-    path_env: OsString,
+    path_entries: Vec<PathBuf>,
     extra_allow_paths: Vec<PathBuf>,
 }
 
@@ -891,36 +891,46 @@ fn uv_python_install_allow_paths() -> Vec<PathBuf> {
     allow_paths
 }
 
-fn prepend_path_entry(path_env: Option<OsString>, entry: &Path) -> OsString {
-    let paths = std::iter::once(entry.to_path_buf())
+fn path_entries_with_source(
+    entries: &[PathBuf],
+    source_path_env: Option<OsString>,
+) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .cloned()
         .chain(
-            path_env
+            source_path_env
                 .as_ref()
                 .into_iter()
                 .flat_map(std::env::split_paths),
         )
-        .collect::<Vec<_>>();
-    std::env::join_paths(paths).unwrap_or_else(|_| {
-        let mut fallback = entry.as_os_str().to_owned();
-        if let Some(path_env) = path_env {
-            #[cfg(unix)]
-            let separator = ":";
-            #[cfg(windows)]
-            let separator = ";";
-            fallback.push(separator);
-            fallback.push(path_env);
-        }
-        fallback
-    })
+        .collect()
 }
 
-fn prepend_path_entries(path_env: Option<OsString>, entries: &[PathBuf]) -> OsString {
-    entries
-        .iter()
-        .rev()
-        .fold(path_env.unwrap_or_default(), |path_env, entry| {
-            prepend_path_entry(Some(path_env), entry)
+fn join_path_entries(entries: impl IntoIterator<Item = PathBuf>) -> OsString {
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    std::env::join_paths(&entries).unwrap_or_else(|_| {
+        let separator = {
+            #[cfg(unix)]
+            {
+                ":"
+            }
+            #[cfg(windows)]
+            {
+                ";"
+            }
+        };
+
+        let mut entries = entries.into_iter();
+        let Some(first) = entries.next() else {
+            return OsString::new();
+        };
+        entries.fold(first.into_os_string(), |mut path_env, entry| {
+            path_env.push(separator);
+            path_env.push(entry);
+            path_env
         })
+    })
 }
 
 fn coco_cli_binary_name() -> &'static str {
@@ -1013,7 +1023,7 @@ fn prepare_coco_command_path_injection(
 
     Ok(CocoCommandPathInjection {
         root_dir,
-        path_env: prepend_path_entries(source_path_env, &extra_path_entries),
+        path_entries: path_entries_with_source(&extra_path_entries, source_path_env),
         extra_allow_paths,
     })
 }
@@ -1109,14 +1119,28 @@ fn prepare_skill_uv_runtime_dirs(
     Ok(dirs)
 }
 
+fn skill_uv_path_entries(
+    coco_command: Option<&CocoCommandPathInjection>,
+    dirs: &SkillUvRuntimeDirs,
+) -> Vec<PathBuf> {
+    if let Some(command) = coco_command {
+        let mut path_entries = command.path_entries.clone();
+        let insert_index = if path_entries.is_empty() { 0 } else { 1 };
+        path_entries.insert(insert_index, dirs.xdg_bin_dir().to_path_buf());
+        path_entries
+    } else {
+        path_entries_with_source(
+            &[dirs.xdg_bin_dir().to_path_buf()],
+            std::env::var_os("PATH"),
+        )
+    }
+}
+
 fn skill_uv_path_env(
     coco_command: Option<&CocoCommandPathInjection>,
     dirs: &SkillUvRuntimeDirs,
 ) -> OsString {
-    let path_env = coco_command
-        .map(|command| command.path_env.clone())
-        .or_else(|| std::env::var_os("PATH"));
-    prepend_path_entry(path_env, dirs.xdg_bin_dir())
+    join_path_entries(skill_uv_path_entries(coco_command, dirs))
 }
 
 fn nono_execution_spec(
@@ -1600,13 +1624,10 @@ async fn execute_command(
     if let Some(active_skill) = &request.context.active_skill {
         extra_allow_paths.push(active_skill.directory.clone());
     }
-    let execution = resolve_execution_spec(
-        &request,
-        coco_command
-            .as_ref()
-            .map(|command| command.path_env.as_os_str()),
-        &extra_allow_paths,
-    )?;
+    let path_env = coco_command
+        .as_ref()
+        .map(|command| join_path_entries(command.path_entries.clone()));
+    let execution = resolve_execution_spec(&request, path_env.as_deref(), &extra_allow_paths)?;
     tracing::info!(
         program = %execution.program.display(),
         arg_count = execution.args.len(),
@@ -1648,7 +1669,7 @@ async fn execute_command(
         .env_remove(UV_PYTHON_INSTALL_DIR_ENV)
         .env_remove(COCO_COMMAND_SHIM_MODE_ENV);
     if let Some(coco_command) = &coco_command {
-        command.env("PATH", &coco_command.path_env);
+        command.env("PATH", join_path_entries(coco_command.path_entries.clone()));
         if request.context.enable_coco_shim {
             command
                 .env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch)
@@ -1785,7 +1806,7 @@ async fn execute_pty_command(
     command.env_remove(UV_PYTHON_INSTALL_DIR_ENV);
     command.env_remove(COCO_COMMAND_SHIM_MODE_ENV);
     if let Some(coco_command) = &coco_command {
-        command.env("PATH", &coco_command.path_env);
+        command.env("PATH", join_path_entries(coco_command.path_entries.clone()));
         if request.context.enable_coco_shim {
             command.env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch);
             command.env(COCO_SESSION_ROLE_ENV, request.context.session_role.as_str());
@@ -2572,9 +2593,11 @@ mod tests {
             .unwrap()
             .to_path_buf();
         assert!(injection.extra_allow_paths.contains(&expected_uv_parent));
-        let path_entries = std::env::split_paths(&injection.path_env).collect::<Vec<_>>();
-        assert_eq!(path_entries.first(), Some(&injection.root_dir.join("bin")));
-        assert_eq!(path_entries.get(1), Some(&expected_uv_parent));
+        assert_eq!(
+            injection.path_entries.first(),
+            Some(&injection.root_dir.join("bin"))
+        );
+        assert_eq!(injection.path_entries.get(1), Some(&expected_uv_parent));
     }
 
     #[test]
@@ -2778,9 +2801,31 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         assert!(allow_paths.contains(&bin_home.path().to_path_buf()));
         assert!(!allow_paths.contains(&data_root.path().join(".local").join("bin")));
 
-        let path_entries =
-            std::env::split_paths(&skill_uv_path_env(None, &dirs)).collect::<Vec<_>>();
+        let path_entries = skill_uv_path_entries(None, &dirs);
         assert_eq!(path_entries.first(), Some(&bin_home.path().to_path_buf()));
+    }
+
+    #[test]
+    fn skill_uv_path_env_keeps_coco_shim_ahead_of_xdg_bin() {
+        let shim_root = tempfile::tempdir().unwrap();
+        let shim_bin = shim_root.path().join("bin");
+        let xdg_bin = tempfile::tempdir().unwrap();
+        let rest = tempfile::tempdir().unwrap();
+        let command = CocoCommandPathInjection {
+            root_dir: shim_root.path().to_path_buf(),
+            path_entries: vec![shim_bin.clone(), rest.path().to_path_buf()],
+            extra_allow_paths: Vec::new(),
+        };
+        let dirs = SkillUvRuntimeDirs {
+            env_vars: Vec::new(),
+            allow_paths: Vec::new(),
+            xdg_bin_dir: xdg_bin.path().to_path_buf(),
+        };
+
+        let path_entries = skill_uv_path_entries(Some(&command), &dirs);
+        assert_eq!(path_entries.first(), Some(&shim_bin));
+        assert_eq!(path_entries.get(1), Some(&xdg_bin.path().to_path_buf()));
+        assert_eq!(path_entries.get(2), Some(&rest.path().to_path_buf()));
     }
 
     #[tokio::test]
@@ -2961,7 +3006,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$(command -v uv)\" \"$HOME\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\" \"${{PATH%%:*}}\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$(command -v uv)\" \"$HOME\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_BIN_HOME\" \"$XDG_STATE_HOME\" \"${{PATH%%:*}}\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
