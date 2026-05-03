@@ -222,6 +222,12 @@ const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
 #[cfg(not(unix))]
 const NONO_DEFAULT_ALLOW_FILES: &[&str] = &[];
 
+#[cfg(unix)]
+const NONO_DEFAULT_READ_PATHS: &[&str] = &["/lib", "/lib64"];
+
+#[cfg(not(unix))]
+const NONO_DEFAULT_READ_PATHS: &[&str] = &[];
+
 #[derive(Debug, Snafu)]
 pub enum UnifiedExecToolError {
     #[snafu(display("failed to resolve workspace root: {source}"))]
@@ -1044,6 +1050,13 @@ fn nono_execution_spec(
         OsString::from("--allow"),
         request.workspace_root.as_os_str().to_owned(),
     ];
+    for default_read_path in NONO_DEFAULT_READ_PATHS {
+        let default_read_path = Path::new(default_read_path);
+        if default_read_path.exists() {
+            args.push(OsString::from("--read"));
+            args.push(default_read_path.as_os_str().to_owned());
+        }
+    }
     for default_allow_file in NONO_DEFAULT_ALLOW_FILES {
         args.push(OsString::from("--allow-file"));
         args.push(OsString::from(default_allow_file));
@@ -2235,6 +2248,13 @@ mod tests {
             OsString::from("--allow"),
             temp_root.path().as_os_str().to_owned(),
         ];
+        for default_read_path in NONO_DEFAULT_READ_PATHS {
+            let default_read_path = Path::new(default_read_path);
+            if default_read_path.exists() {
+                expected_args.push(OsString::from("--read"));
+                expected_args.push(default_read_path.as_os_str().to_owned());
+            }
+        }
         for default_allow_file in NONO_DEFAULT_ALLOW_FILES {
             expected_args.push(OsString::from("--allow-file"));
             expected_args.push(OsString::from(default_allow_file));
