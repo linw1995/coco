@@ -424,6 +424,20 @@ pub fn default_skill_groups() -> SkillGroups {
             },
         ),
     );
+    groups.orchestrator.insert(
+        "scheduler".to_owned(),
+        SkillRecord::new(
+            "scheduler",
+            SkillVersionSpec {
+                description: "Manage persisted CoCo scheduler tasks.".to_owned(),
+                body: include_str!("default_skills/scheduler.md")
+                    .trim()
+                    .to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        ),
+    );
     groups.runner.insert(
         "coco-runner".to_owned(),
         SkillRecord::new(

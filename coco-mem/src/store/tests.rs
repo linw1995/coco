@@ -1945,15 +1945,20 @@ where
     let new_skill = store
         .get_skill(SessionRole::Orchestrator, "new-skill")
         .unwrap();
+    let scheduler = store
+        .get_skill(SessionRole::Orchestrator, "scheduler")
+        .unwrap();
     let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
     let telegram = store.get_skill(SessionRole::Runner, "telegram").unwrap();
 
     assert_eq!(orchestrator.current_version, 1);
     assert_eq!(new_skill.current_version, 1);
+    assert_eq!(scheduler.current_version, 1);
     assert_eq!(telegram.current_version, 1);
     assert_eq!(runner.current_version, 1);
     assert!(orchestrator.current().unwrap().enable_coco_shim);
     assert!(new_skill.current().unwrap().enable_coco_shim);
+    assert!(scheduler.current().unwrap().enable_coco_shim);
     assert!(telegram.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
     assert_eq!(telegram.current().unwrap().scripts.len(), 2);
@@ -1972,6 +1977,13 @@ where
             .contains("--tool exec_command --tool write_stdin --tool search_skill")
     );
     assert!(new_skill.current().unwrap().body.contains("coco skill add"));
+    assert!(
+        scheduler
+            .current()
+            .unwrap()
+            .body
+            .contains("coco scheduler add")
+    );
     assert!(
         telegram
             .current()
@@ -2394,6 +2406,10 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     assert!(path.join("skill-history/runner").is_dir());
     assert!(
         path.join("skill-history/orchestrator/coco-orchestrator.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/orchestrator/scheduler.jsonl")
             .is_file()
     );
     assert!(
@@ -2882,6 +2898,11 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
     );
     assert!(
         reopened
+            .get_skill(SessionRole::Orchestrator, "scheduler")
+            .is_ok()
+    );
+    assert!(
+        reopened
             .get_skill(SessionRole::Runner, "coco-runner")
             .is_ok()
     );
@@ -2892,6 +2913,10 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
     );
     assert!(
         path.join("skill-history/orchestrator/new-skill.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/orchestrator/scheduler.jsonl")
             .is_file()
     );
     assert!(

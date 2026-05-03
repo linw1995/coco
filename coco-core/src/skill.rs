@@ -967,7 +967,13 @@ description: "External skill."
                 .iter()
                 .map(|skill| skill.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["coco-orchestrator", "new-skill", "coco-runner", "telegram"]
+            vec![
+                "coco-orchestrator",
+                "new-skill",
+                "scheduler",
+                "coco-runner",
+                "telegram"
+            ]
         );
     }
 
