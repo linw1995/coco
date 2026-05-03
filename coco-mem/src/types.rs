@@ -383,9 +383,7 @@ pub fn default_skill_groups() -> SkillGroups {
             "cronjob",
             SkillVersionSpec {
                 description: "Manage host crontab entries that submit CoCo prompts.".to_owned(),
-                body: include_str!("default_skills/cronjob.md")
-                    .trim()
-                    .to_owned(),
+                body: include_str!("default_skills/cronjob.md").trim().to_owned(),
                 scripts: vec![
                     SkillScript {
                         path: "scripts/cronjob_add.py".to_owned(),
