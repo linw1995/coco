@@ -38,10 +38,10 @@ use crate::{
     cli::{
         Command, DaemonSubcommand, PresetCommand, PresetSetCommand, PresetSubcommand,
         PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
-        PromptSubcommand, PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand,
-        SessionCommand, SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand,
-        SessionGraphCommand, SessionMergeCommand, SessionPrCommand, SessionRebaseCommand,
-        SessionShowCommand, SessionSubcommand,
+        PromptSubcommand, PromptWorkerCommand, SchedulerSubcommand, SessionBranchCommand,
+        SessionCloseCommand, SessionCommand, SessionCreateCommand, SessionFeedbackCommand,
+        SessionForkCommand, SessionGraphCommand, SessionMergeCommand, SessionPrCommand,
+        SessionRebaseCommand, SessionShowCommand, SessionSubcommand,
     },
     store::open_store,
 };
@@ -57,6 +57,39 @@ fn cli_help_uses_coco_command_name() {
     assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
     assert!(help.contains("Usage: coco "));
     assert!(!help.contains("Usage: coco-cli"));
+}
+
+#[test]
+fn scheduler_add_cli_parses_prompt_and_timing() {
+    let cli = Cli::parse_from([
+        "coco",
+        "scheduler",
+        "add",
+        "--id",
+        "nightly",
+        "--branch",
+        "ops",
+        "--interval-secs",
+        "3600",
+        "--next-run-at",
+        "2026-01-01T00:00:00Z",
+        "Review",
+        "open",
+        "work",
+    ]);
+
+    let Command::Scheduler(command) = cli.command else {
+        panic!("expected scheduler command");
+    };
+    let SchedulerSubcommand::Add(command) = command.command else {
+        panic!("expected scheduler add command");
+    };
+
+    assert_eq!(command.id, "nightly");
+    assert_eq!(command.branch, "ops");
+    assert_eq!(command.interval_secs, 3600);
+    assert_eq!(command.next_run_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+    assert_eq!(command.prompt, vec!["Review", "open", "work"]);
 }
 
 fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> coco_mem::Job
@@ -4049,6 +4082,112 @@ async fn channel_secret_resolves_env_placeholder() {
         assert_eq!(token, "secret-token");
     })
     .await;
+}
+
+#[tokio::test]
+async fn scheduler_cli_manages_tasks() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store_path_arg = store_path.display().to_string();
+    let add = Cli::parse_from([
+        "coco",
+        "--store-path",
+        &store_path_arg,
+        "scheduler",
+        "add",
+        "--id",
+        "nightly",
+        "--interval-secs",
+        "3600",
+        "--next-run-at",
+        "2026-01-01T00:00:00Z",
+        "--json",
+        "Review",
+        "open",
+        "work",
+    ]);
+    let output = run_with_backend(add, &mut Cursor::new(""), FakeBackend::with_responses(&[]))
+        .await
+        .unwrap()
+        .unwrap();
+    let created: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(created["id"], "nightly");
+    assert_eq!(created["branch"], "main");
+    assert_eq!(created["prompt"], "Review open work");
+
+    let update = Cli::parse_from([
+        "coco",
+        "--store-path",
+        &store_path_arg,
+        "scheduler",
+        "update",
+        "nightly",
+        "--disable",
+        "--prompt",
+        "Review closed loops",
+        "--interval-secs",
+        "7200",
+        "--json",
+    ]);
+    let output = run_with_backend(
+        update,
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let updated: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(updated["prompt"], "Review closed loops");
+    assert_eq!(updated["interval_secs"], 7200);
+    assert_eq!(updated["enabled"], false);
+
+    let list = Cli::parse_from([
+        "coco",
+        "--store-path",
+        &store_path_arg,
+        "scheduler",
+        "list",
+        "--json",
+    ]);
+    let output = run_with_backend(list, &mut Cursor::new(""), FakeBackend::with_responses(&[]))
+        .await
+        .unwrap()
+        .unwrap();
+    let listed: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], "nightly");
+
+    let delete = Cli::parse_from([
+        "coco",
+        "--store-path",
+        &store_path_arg,
+        "scheduler",
+        "delete",
+        "nightly",
+    ]);
+    let output = run_with_backend(
+        delete,
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output, "deleted scheduler task nightly");
 }
 
 #[tokio::test]

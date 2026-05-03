@@ -28,6 +28,7 @@ pub(crate) mod daemon;
 mod preset;
 mod prompt;
 pub(crate) mod runtime;
+mod scheduler;
 mod session;
 mod skill;
 

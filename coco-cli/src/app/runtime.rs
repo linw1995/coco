@@ -8,14 +8,15 @@ use coco_mem::{MergeParent, SessionRole, Store};
 
 use super::{
     config::ProviderProfiles, daemon::run_daemon_command, preset::run_preset_command,
-    prompt::run_prompt_command, session::run_session_command, skill::run_skill_command,
+    prompt::run_prompt_command, scheduler::run_scheduler_command, session::run_session_command,
+    skill::run_skill_command,
 };
 use crate::{
     Cli, Result,
     cli::{
         Command, PresetCommand, PromptBranchStatusCommand, PromptCommand, PromptRunCommand,
-        PromptStatusCommand, PromptSubcommand, SessionBranchCommand, SessionCommand,
-        SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand,
+        PromptStatusCommand, PromptSubcommand, SchedulerCommand, SessionBranchCommand,
+        SessionCommand, SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand,
     },
 };
 
@@ -56,6 +57,7 @@ struct ForwardedCli {
 enum ForwardedCommand {
     Preset(PresetCommand),
     Prompt(PromptCommand),
+    Scheduler(SchedulerCommand),
     Session(SessionCommand),
     Skill(SkillCommand),
 }
@@ -149,6 +151,7 @@ impl ForwardedCli {
             command: match self.command {
                 ForwardedCommand::Preset(command) => Command::Preset(command),
                 ForwardedCommand::Prompt(command) => Command::Prompt(command),
+                ForwardedCommand::Scheduler(command) => Command::Scheduler(command),
                 ForwardedCommand::Session(command) => Command::Session(command),
                 ForwardedCommand::Skill(command) => Command::Skill(command),
             },
@@ -188,6 +191,7 @@ where
             )
             .await
         }
+        Command::Scheduler(command) => run_scheduler_command(command, services.shared_store).await,
         Command::Session(command) => {
             run_session_command(
                 command,
@@ -294,6 +298,7 @@ fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Preset(_) => "preset",
         Command::Prompt(_) => "prompt",
+        Command::Scheduler(_) => "scheduler",
         Command::Session(_) => "session",
         Command::Skill(_) => "skill",
         Command::Daemon(_) => "daemon",
@@ -398,6 +403,13 @@ fn apply_forwarded_defaults(
 
     match &mut cli.command {
         Command::Preset(_) => {}
+        Command::Scheduler(command) => match &mut command.command {
+            crate::cli::SchedulerSubcommand::Add(command) => command.branch = branch,
+            crate::cli::SchedulerSubcommand::Update(_) => {}
+            crate::cli::SchedulerSubcommand::Delete(_) => {}
+            crate::cli::SchedulerSubcommand::List(_) => {}
+            crate::cli::SchedulerSubcommand::Show(_) => {}
+        },
         Command::Prompt(command) => {
             if command.command.is_none() {
                 command.run.branch = branch;

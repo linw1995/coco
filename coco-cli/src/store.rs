@@ -4,7 +4,10 @@ use snafu::prelude::*;
 
 use crate::{
     Result,
-    cli::{Command, PresetSubcommand, PromptSubcommand, SessionSubcommand, SkillSubcommand},
+    cli::{
+        Command, PresetSubcommand, PromptSubcommand, SchedulerSubcommand, SessionSubcommand,
+        SkillSubcommand,
+    },
     error::StoreSnafu,
 };
 use coco_mem::FsStore;
@@ -31,6 +34,10 @@ fn command_is_read_only(command: &Command) -> bool {
         Command::Prompt(command) => matches!(
             &command.command,
             Some(PromptSubcommand::Status(_)) | Some(PromptSubcommand::BranchStatus(_))
+        ),
+        Command::Scheduler(command) => matches!(
+            &command.command,
+            SchedulerSubcommand::List(_) | SchedulerSubcommand::Show(_)
         ),
         Command::Session(command) => matches!(
             &command.command,

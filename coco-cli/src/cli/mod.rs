@@ -12,6 +12,10 @@ pub use prompt::{
     PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
     PromptSubcommand, PromptWorkerCommand,
 };
+pub use scheduler::{
+    SchedulerAddCommand, SchedulerCommand, SchedulerDeleteCommand, SchedulerListCommand,
+    SchedulerShowCommand, SchedulerSubcommand, SchedulerUpdateCommand,
+};
 pub use session::{SessionBranchCommand, SessionGraphCommand, SessionShowCommand};
 #[cfg(test)]
 pub use session::{
@@ -31,6 +35,7 @@ pub use types::{CliProvider, CliSessionRole, CliTool};
 mod daemon;
 mod preset;
 mod prompt;
+mod scheduler;
 mod session;
 mod skill;
 mod types;
@@ -60,6 +65,7 @@ pub struct Cli {
 pub enum Command {
     Preset(PresetCommand),
     Prompt(PromptCommand),
+    Scheduler(SchedulerCommand),
     Session(SessionCommand),
     Skill(SkillCommand),
     Daemon(DaemonCommand),

@@ -95,6 +95,9 @@ pub enum Error {
     #[snafu(display("Invalid skill script path {path:?}: {message}"))]
     InvalidSkillScriptPath { path: PathBuf, message: String },
 
+    #[snafu(display("Invalid scheduler timestamp {value:?}: {message}"))]
+    InvalidSchedulerTimestamp { value: String, message: String },
+
     #[snafu(display("Failed to resolve current executable: {source}"))]
     ResolveCurrentExe { source: io::Error },
 
