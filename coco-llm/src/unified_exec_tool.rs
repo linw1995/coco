@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -221,6 +221,7 @@ const XDG_BIN_HOME_ENV: &str = "XDG_BIN_HOME";
 const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
 const HOME_ENV: &str = "HOME";
 const XDG_CONFIG_ALLOW_DIRS: &[&str] = &["uv"];
+const XDG_DATA_ALLOW_DIRS: &[&str] = &["uv"];
 
 #[cfg(unix)]
 const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
@@ -229,7 +230,7 @@ const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
 const NONO_DEFAULT_ALLOW_FILES: &[&str] = &[];
 
 #[cfg(unix)]
-const NONO_DEFAULT_READ_PATHS: &[&str] = &["/lib", "/lib64"];
+const NONO_DEFAULT_READ_PATHS: &[&str] = &["/lib", "/lib64", "/nix/store"];
 
 #[cfg(not(unix))]
 const NONO_DEFAULT_READ_PATHS: &[&str] = &[];
@@ -719,148 +720,6 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn nix_store_package_path(path: &Path) -> Option<PathBuf> {
-    let mut components = path.components();
-    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
-        return None;
-    }
-    if !matches!(components.next(), Some(std::path::Component::Normal(name)) if name == OsStr::new("nix"))
-    {
-        return None;
-    }
-    if !matches!(components.next(), Some(std::path::Component::Normal(name)) if name == OsStr::new("store"))
-    {
-        return None;
-    }
-    let package = components.next()?;
-    let std::path::Component::Normal(package) = package else {
-        return None;
-    };
-    Some(PathBuf::from("/nix").join("store").join(package))
-}
-
-fn nix_store_closure_paths(package_path: &Path) -> Vec<PathBuf> {
-    let Ok(output) = StdCommand::new("nix-store")
-        .arg("-qR")
-        .arg(package_path)
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect()
-}
-
-fn nix_store_allow_paths(package_path: &Path) -> Vec<PathBuf> {
-    let closure_paths = nix_store_closure_paths(package_path);
-    if !closure_paths.is_empty() {
-        return closure_paths;
-    }
-
-    vec![package_path.to_path_buf()]
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn parse_otool_library_paths(output: &str) -> Vec<PathBuf> {
-    output
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let path = line
-                .trim()
-                .split_once(" (")
-                .map_or(line.trim(), |(path, _)| path);
-            path.starts_with('/').then(|| PathBuf::from(path))
-        })
-        .collect()
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_ldd_library_paths(output: &str) -> Vec<PathBuf> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let path = if let Some((_, path)) = line.split_once("=>") {
-                path.split_whitespace().next()
-            } else {
-                line.split_whitespace().next()
-            }?;
-            path.starts_with('/').then(|| PathBuf::from(path))
-        })
-        .collect()
-}
-
-fn linked_library_paths(binary_path: &Path) -> Vec<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let Ok(output) = StdCommand::new("otool").arg("-L").arg(binary_path).output() else {
-            return Vec::new();
-        };
-        if !output.status.success() {
-            return Vec::new();
-        }
-        parse_otool_library_paths(&String::from_utf8_lossy(&output.stdout))
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(output) = StdCommand::new("ldd").arg(binary_path).output() else {
-            return Vec::new();
-        };
-        if !output.status.success() {
-            return Vec::new();
-        }
-        parse_ldd_library_paths(&String::from_utf8_lossy(&output.stdout))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = binary_path;
-        Vec::new()
-    }
-}
-
-fn allow_paths_for_linked_library(library_path: &Path) -> Vec<PathBuf> {
-    if let Some(package_path) = nix_store_package_path(library_path) {
-        return vec![package_path];
-    }
-
-    if library_path.exists() {
-        return vec![library_path.to_path_buf()];
-    }
-
-    Vec::new()
-}
-
-fn linked_library_allow_paths(binary_path: &Path) -> Vec<PathBuf> {
-    let mut allow_paths = Vec::new();
-    let mut pending = linked_library_paths(binary_path);
-    let mut visited = HashSet::new();
-
-    while let Some(library_path) = pending.pop() {
-        if !visited.insert(library_path.clone()) {
-            continue;
-        }
-        for allow_path in allow_paths_for_linked_library(&library_path) {
-            push_unique_path(&mut allow_paths, allow_path);
-        }
-        if visited.len() < 128 {
-            pending.extend(linked_library_paths(&library_path));
-        }
-    }
-
-    allow_paths
-}
-
 fn uv_python_install_dir_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -1015,14 +874,6 @@ fn prepare_coco_command_path_injection(
             extra_path_entries.push(parent.to_path_buf());
             push_unique_path(&mut extra_allow_paths, parent.to_path_buf());
         }
-        if let Some(package_path) = nix_store_package_path(&uv_path) {
-            for allow_path in nix_store_allow_paths(&package_path) {
-                push_unique_path(&mut extra_allow_paths, allow_path);
-            }
-        }
-        for allow_path in linked_library_allow_paths(&uv_path) {
-            push_unique_path(&mut extra_allow_paths, allow_path);
-        }
         for allow_path in uv_python_install_allow_paths() {
             push_unique_path(&mut extra_allow_paths, allow_path);
         }
@@ -1119,6 +970,7 @@ fn prepare_skill_uv_runtime_dirs(
                 .iter()
                 .map(|name| config_home.join(name)),
         )
+        .chain(XDG_DATA_ALLOW_DIRS.iter().map(|name| data_home.join(name)))
     {
         push_unique_path(&mut allow_paths, path);
     }
@@ -2629,81 +2481,6 @@ mod tests {
         assert_eq!(injection.path_entries.get(1), Some(&expected_uv_parent));
     }
 
-    #[test]
-    fn nix_store_package_path_returns_package_root() {
-        assert_eq!(
-            nix_store_package_path(Path::new("/nix/store/abc123-uv-0.8.0/bin/uv")),
-            Some(PathBuf::from("/nix/store/abc123-uv-0.8.0"))
-        );
-        assert_eq!(nix_store_package_path(Path::new("/usr/bin/uv")), None);
-    }
-
-    #[test]
-    fn nix_store_allow_paths_falls_back_to_package_root() {
-        let package_path = Path::new("/nix/store/not-real-uv");
-
-        let allow_paths = nix_store_allow_paths(package_path);
-
-        assert_eq!(allow_paths, vec![package_path.to_path_buf()]);
-    }
-
-    #[test]
-    fn parse_otool_library_paths_extracts_absolute_dependencies() {
-        let output = "\
-/nix/store/example-uv/bin/uv:
-\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)
-\t@rpath/libignored.dylib (compatibility version 1.0.0, current version 1.0.0)
-\t/nix/store/example-jemalloc/lib/libjemalloc.2.dylib (compatibility version 0.0.0, current version 0.0.0)
-";
-
-        assert_eq!(
-            parse_otool_library_paths(output),
-            vec![
-                PathBuf::from("/usr/lib/libSystem.B.dylib"),
-                PathBuf::from("/nix/store/example-jemalloc/lib/libjemalloc.2.dylib"),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_ldd_library_paths_extracts_absolute_dependencies() {
-        let output = "\
-linux-vdso.so.1 (0x00007ffc)
-libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
-/lib64/ld-linux-x86-64.so.2 (0x00007f)
-";
-
-        assert_eq!(
-            parse_ldd_library_paths(output),
-            vec![
-                PathBuf::from("/nix/store/example-glibc/lib/libc.so.6"),
-                PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
-            ]
-        );
-    }
-
-    #[test]
-    fn allow_paths_for_linked_library_prefers_nix_package_root() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let library_path = temp_dir.path().join("libexample.dylib");
-        std::fs::write(&library_path, "").unwrap();
-
-        assert_eq!(
-            allow_paths_for_linked_library(Path::new(
-                "/nix/store/example-jemalloc/lib/libjemalloc.2.dylib"
-            )),
-            vec![PathBuf::from("/nix/store/example-jemalloc")]
-        );
-        assert_eq!(
-            allow_paths_for_linked_library(&library_path),
-            vec![library_path]
-        );
-        assert_eq!(
-            allow_paths_for_linked_library(Path::new("/usr/lib/libSystem.B.dylib")),
-            Vec::<PathBuf>::new()
-        );
-    }
-
     #[tokio::test]
     async fn uv_python_install_allow_paths_include_existing_install_dirs() {
         let explicit_dir = tempfile::tempdir().unwrap();
@@ -2828,6 +2605,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         assert!(!allow_paths.contains(&config_home.path().to_path_buf()));
         assert!(allow_paths.contains(&config_home.path().join("uv")));
         assert!(!allow_paths.contains(&data_home));
+        assert!(allow_paths.contains(&data_home.join("uv")));
         assert!(allow_paths.contains(&data_home.join("uv").join("python")));
         assert!(allow_paths.contains(&bin_home.path().to_path_buf()));
         assert!(!allow_paths.contains(&data_root.path().join(".local").join("bin")));
@@ -3114,7 +2892,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         assert!(args.contains(&skill_dir.path().display().to_string()));
         assert!(args.contains("/.cache"));
         assert!(args.contains("/.config/uv"));
-        assert!(args.contains("/.local/share/uv/python"));
+        assert!(args.contains("/.local/share/uv"));
         assert!(args.contains("/.local/bin"));
         assert!(args.contains("/.local/state"));
         let config_home = runtime_root.path().join("coco").join(".config");

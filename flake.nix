@@ -100,7 +100,10 @@ rec {
               ++ lib.optionals (fhsDynamicLinker != null) [
                 pkgs.glibc
               ];
-            extraCommands = lib.optionalString (fhsDynamicLinkerSymlink != null) ''
+            extraCommands = ''
+              mkdir -p tmp
+              chmod 1777 tmp
+            '' + lib.optionalString (fhsDynamicLinkerSymlink != null) ''
               mkdir -p .${builtins.dirOf fhsDynamicLinkerSymlink.link}
               if [ ! -e .${fhsDynamicLinkerSymlink.link} ]; then
                 ln -s ${fhsDynamicLinkerSymlink.target} .${fhsDynamicLinkerSymlink.link}
