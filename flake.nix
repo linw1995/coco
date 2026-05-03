@@ -70,6 +70,27 @@ rec {
         };
         cargoArtifacts = craneLib.buildDepsOnly cargoArgs;
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+        cocoDockerEntrypoint = pkgs.writeShellApplication {
+          name = "coco-docker-entrypoint";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.cronie
+          ];
+          text = ''
+            if [ -n "''${TZ:-}" ] && [ -n "''${TZDIR:-}" ] && [ -f "''${TZDIR}/''${TZ}" ]; then
+              ln -snf "''${TZDIR}/''${TZ}" /etc/localtime 2>/dev/null || true
+              printf '%s\n' "''${TZ}" >/etc/timezone 2>/dev/null || true
+            fi
+
+            if [ "''${COCO_START_CRON:-1}" = "1" ]; then
+              mkdir -p /var/cron /var/cron/tabs /var/run /var/spool/cron /var/spool/cron/crontabs
+              chmod 700 /var/cron/tabs /var/spool/cron/crontabs 2>/dev/null || true
+              crond || printf 'warning: failed to start crond; cronjob skill can still edit crontab but schedules will not run\n' >&2
+            fi
+
+            exec "$@"
+          '';
+        };
       in {
         packages = rec {
           default = coco-cli;
@@ -90,8 +111,10 @@ rec {
             contents =
               [
                 coco-cli
+                cocoDockerEntrypoint
                 pkgs.bash
                 pkgs.coreutils
+                pkgs.cronie
                 pkgs.nono
                 pkgs.uv
               ]
@@ -114,20 +137,27 @@ rec {
               ++ lib.optionals (fhsDynamicLinker != null) [
                 pkgs.glibc
               ];
-            extraCommands = ''
-              mkdir -p tmp
-              chmod 1777 tmp
-            '' + lib.optionalString (fhsDynamicLinkerSymlink != null) ''
-              mkdir -p .${builtins.dirOf fhsDynamicLinkerSymlink.link}
-              if [ ! -e .${fhsDynamicLinkerSymlink.link} ]; then
-                ln -s ${fhsDynamicLinkerSymlink.target} .${fhsDynamicLinkerSymlink.link}
-              fi
-            '';
+            extraCommands =
+              ''
+                mkdir -p tmp
+                chmod 1777 tmp
+                mkdir -p etc var/cron/tabs var/run var/spool/cron/crontabs
+                chmod 700 var/cron/tabs var/spool/cron/crontabs
+                printf '%s\n' 'root:x:0:0:root:/data:/bin/bash' > etc/passwd
+                printf '%s\n' 'root:x:0:' > etc/group
+              ''
+              + lib.optionalString (fhsDynamicLinkerSymlink != null) ''
+                mkdir -p .${builtins.dirOf fhsDynamicLinkerSymlink.link}
+                if [ ! -e .${fhsDynamicLinkerSymlink.link} ]; then
+                  ln -s ${fhsDynamicLinkerSymlink.target} .${fhsDynamicLinkerSymlink.link}
+                fi
+              '';
             config = {
               Env = [
                 "PATH=/bin"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
                 "TZDIR=${pkgs.tzdata}/share/zoneinfo"
+                "TZ=UTC"
                 "HOME=/data"
                 "XDG_CACHE_HOME=/data/.cache"
                 "XDG_CONFIG_HOME=/data/.config"
@@ -148,6 +178,9 @@ rec {
               ExposedPorts = {
                 "17667/tcp" = {};
               };
+              Entrypoint = [
+                "${cocoDockerEntrypoint}/bin/coco-docker-entrypoint"
+              ];
               Cmd = [
                 "${coco-cli}/bin/coco"
                 "daemon"
