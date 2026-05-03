@@ -1059,6 +1059,7 @@ fn configured_env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
         .filter(|path| path != Path::new("/"))
 }
 
@@ -2803,6 +2804,59 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
 
         let path_entries = skill_uv_path_entries(None, &dirs);
         assert_eq!(path_entries.first(), Some(&bin_home.path().to_path_buf()));
+    }
+
+    #[tokio::test]
+    async fn skill_uv_runtime_dirs_ignore_relative_env_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+
+        let dirs = crate::with_process_env_async(
+            &[
+                ("XDG_RUNTIME_DIR", Some(runtime_root.path().as_os_str())),
+                (TMPDIR_ENV, Some(OsStr::new("tmp"))),
+                (UV_CACHE_DIR_ENV, Some(OsStr::new("uv-cache"))),
+                (UV_PYTHON_INSTALL_DIR_ENV, Some(OsStr::new("uv-python"))),
+                (XDG_CACHE_HOME_ENV, Some(OsStr::new(".cache"))),
+                (XDG_CONFIG_HOME_ENV, Some(OsStr::new(".config"))),
+                (XDG_DATA_HOME_ENV, Some(OsStr::new("data"))),
+                (XDG_BIN_HOME_ENV, Some(OsStr::new("bin"))),
+                (XDG_STATE_HOME_ENV, Some(OsStr::new("state"))),
+            ],
+            || async { prepare_skill_uv_runtime_dirs(workspace.path()) },
+        )
+        .await
+        .unwrap();
+
+        let env_vars = dirs.env_vars().collect::<HashMap<_, _>>();
+        let expected_runtime_root = runtime_root.path().join("coco");
+        assert_eq!(
+            env_vars.get(TMPDIR_ENV),
+            Some(
+                &expected_runtime_root
+                    .join(".cache")
+                    .join("coco")
+                    .join("tmp")
+            )
+        );
+        assert_eq!(
+            env_vars.get(UV_CACHE_DIR_ENV),
+            Some(&expected_runtime_root.join(".cache").join("uv"))
+        );
+        assert_eq!(
+            env_vars.get(UV_PYTHON_INSTALL_DIR_ENV),
+            Some(
+                &expected_runtime_root
+                    .join(".local")
+                    .join("share")
+                    .join("uv")
+                    .join("python")
+            )
+        );
+        assert_eq!(
+            env_vars.get(XDG_BIN_HOME_ENV),
+            Some(&expected_runtime_root.join(".local").join("bin"))
+        );
     }
 
     #[test]
