@@ -3,6 +3,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
     Cli,
+    Scheduler,
     Telegram,
     Discord,
 }
@@ -11,6 +12,7 @@ impl ChannelKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cli => "cli",
+            Self::Scheduler => "scheduler",
             Self::Telegram => "telegram",
             Self::Discord => "discord",
         }
@@ -47,6 +49,17 @@ impl InboundMessage {
         text: impl Into<String>,
     ) -> Self {
         Self::new(ChannelKind::Telegram, conversation_id, sender_id, text)
+    }
+
+    pub fn scheduler(
+        branch: impl Into<String>,
+        sender_id: impl Into<String>,
+        task_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        let mut message = Self::new(ChannelKind::Scheduler, branch, sender_id, text);
+        message.source_message_id = Some(task_id.into());
+        message
     }
 
     pub fn telegram_with_message_id(

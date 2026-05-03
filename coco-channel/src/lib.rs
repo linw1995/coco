@@ -1,6 +1,8 @@
 mod error;
 mod message;
 mod runtime;
+#[cfg(feature = "scheduler")]
+pub mod scheduler;
 #[cfg(feature = "telegram")]
 pub mod telegram;
 

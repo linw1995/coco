@@ -1,13 +1,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use coco_channel::{ChannelRuntime, InboundMessage, MessageHandler, OutboundMessage};
-use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
+use coco_channel::{
+    Error as ChannelError,
+    scheduler::{SchedulerChannel, SchedulerTaskSource},
+    telegram::TelegramChannel,
+};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
-use coco_core::{ConversationEngine, CoreService, FixedBranchResolver};
+use coco_core::{
+    BranchResolveError, BranchResolver, ConversationEngine, CoreService, FixedBranchResolver,
+};
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::{SessionRole, Store};
+use coco_mem::{SchedulerStore, SessionRole, Store, Timestamp};
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -30,6 +37,7 @@ use crate::{
 const DEFAULT_SESSION_BRANCH: &str = "main";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
+const DEFAULT_SCHEDULER_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
@@ -43,6 +51,7 @@ pub(crate) struct DaemonServerOptions<'a> {
     pub channel_configs: &'a ChannelConfigs,
     pub console_config: Option<ConsoleConfig>,
     pub console_publisher: Option<ConsolePublisher>,
+    pub scheduler_poll_interval: Duration,
 }
 
 pub(super) async fn run_daemon_command<B, S>(
@@ -80,6 +89,7 @@ where
                     channel_configs,
                     console_config,
                     console_publisher,
+                    scheduler_poll_interval: DEFAULT_SCHEDULER_POLL_INTERVAL,
                 },
             )?
         }
@@ -239,7 +249,12 @@ where
     if let Some(console) = &console {
         tracing::info!(addr = %console.addr(), "coco console listening");
     }
-    let channel_task = start_channel_task(options.channel_configs, &shared_engine)?;
+    let channel_task = start_channel_tasks(
+        options.channel_configs,
+        &shared_store,
+        &shared_engine,
+        options.scheduler_poll_interval,
+    )?;
     let handle_llm = llm.clone();
 
     let socket_task = tokio::spawn(async move {
@@ -293,58 +308,134 @@ where
     })
 }
 
-fn start_channel_task<B, S>(
+fn start_channel_tasks<B, S>(
     channel_configs: &ChannelConfigs,
+    shared_store: &S,
     shared_engine: &Arc<ConversationEngine<B, S>>,
+    scheduler_poll_interval: Duration,
 ) -> Result<Option<tokio::task::JoinHandle<Result<()>>>>
 where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let Some(config) = channel_configs
+    let mut join_set = tokio::task::JoinSet::new();
+
+    let scheduler = SchedulerChannel::new(StoreSchedulerTaskSource::new(shared_store.clone()))
+        .with_poll_interval(scheduler_poll_interval);
+    let scheduler_handler =
+        CoreChannelMessageHandler::new(SchedulerBranchResolver, shared_engine.as_ref().clone());
+    spawn_channel_runtime(
+        &mut join_set,
+        "scheduler".to_owned(),
+        scheduler,
+        scheduler_handler,
+    );
+
+    if let Some(config) = channel_configs
         .telegram
         .as_ref()
         .filter(|config| config.enabled)
-    else {
-        return Ok(None);
-    };
-
-    let token = resolve_channel_secret("telegram", &config.token)?;
-    tracing::info!(
-        branch = %config.branch,
-        poll_timeout_secs = config.poll_timeout_secs,
-        allowed_chat_count = config.allowed_chat_ids.len(),
-        "starting telegram channel"
-    );
-    let channel = TelegramChannel::from_config(coco_channel::telegram::TelegramChannelConfig {
-        token,
-        poll_timeout_secs: config.poll_timeout_secs,
-        allowed_chat_ids: config.allowed_chat_ids.clone(),
-    })
-    .context(ChannelSnafu)?;
-    let handler =
-        CoreChannelMessageHandler::new(config.branch.clone(), shared_engine.as_ref().clone());
+    {
+        let token = resolve_channel_secret("telegram", &config.token)?;
+        tracing::info!(
+            branch = %config.branch,
+            poll_timeout_secs = config.poll_timeout_secs,
+            allowed_chat_count = config.allowed_chat_ids.len(),
+            "starting telegram channel"
+        );
+        let channel = TelegramChannel::from_config(coco_channel::telegram::TelegramChannelConfig {
+            token,
+            poll_timeout_secs: config.poll_timeout_secs,
+            allowed_chat_ids: config.allowed_chat_ids.clone(),
+        })
+        .context(ChannelSnafu)?;
+        let handler = CoreChannelMessageHandler::new(
+            FixedBranchResolver::new(config.branch.clone()),
+            shared_engine.as_ref().clone(),
+        );
+        spawn_channel_runtime(&mut join_set, "telegram".to_owned(), channel, handler);
+    }
 
     Ok(Some(tokio::spawn(async move {
-        channel.run(&handler).await.context(ChannelSnafu)
+        match join_set.join_next().await {
+            Some(Ok((name, Ok(())))) => {
+                tracing::warn!(channel = %name, "channel runtime exited");
+                Ok(())
+            }
+            Some(Ok((name, Err(error)))) => {
+                tracing::error!(channel = %name, error = %error, "channel runtime failed");
+                Err(error)
+            }
+            Some(Err(source)) => Err(source).context(JoinChannelTaskSnafu),
+            None => Ok(()),
+        }
     })))
 }
 
-struct CoreChannelMessageHandler<B, S> {
-    service: CoreService<FixedBranchResolver, B, S>,
+fn spawn_channel_runtime<B, C, R, S>(
+    join_set: &mut tokio::task::JoinSet<(String, Result<()>)>,
+    name: String,
+    channel: C,
+    handler: CoreChannelMessageHandler<R, B, S>,
+) where
+    B: CompletionBackend + 'static,
+    C: ChannelRuntime + 'static,
+    R: BranchResolver + Send + Sync + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    join_set.spawn(async move {
+        let result = channel.run(&handler).await.context(ChannelSnafu);
+        (name, result)
+    });
 }
 
-impl<B, S> CoreChannelMessageHandler<B, S> {
-    fn new(branch: impl Into<String>, engine: ConversationEngine<B, S>) -> Self {
+#[derive(Clone)]
+struct StoreSchedulerTaskSource<S> {
+    store: S,
+}
+
+impl<S> StoreSchedulerTaskSource<S> {
+    fn new(store: S) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl<S> SchedulerTaskSource for StoreSchedulerTaskSource<S>
+where
+    S: SchedulerStore + Send + Sync,
+{
+    async fn claim_due(&self, limit: usize) -> coco_channel::Result<Vec<InboundMessage>> {
+        self.store
+            .claim_due_scheduler_tasks(Timestamp::now(), limit)
+            .map(|tasks| {
+                tasks
+                    .into_iter()
+                    .map(|task| {
+                        InboundMessage::scheduler(task.branch, "scheduler", task.id, task.prompt)
+                    })
+                    .collect()
+            })
+            .map_err(ChannelError::transport)
+    }
+}
+
+struct CoreChannelMessageHandler<R, B, S> {
+    service: CoreService<R, B, S>,
+}
+
+impl<R, B, S> CoreChannelMessageHandler<R, B, S> {
+    fn new(resolver: R, engine: ConversationEngine<B, S>) -> Self {
         Self {
-            service: CoreService::new(FixedBranchResolver::new(branch), engine),
+            service: CoreService::new(resolver, engine),
         }
     }
 }
 
 #[async_trait]
-impl<B, S> MessageHandler for CoreChannelMessageHandler<B, S>
+impl<R, B, S> MessageHandler for CoreChannelMessageHandler<R, B, S>
 where
+    R: BranchResolver,
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
@@ -353,6 +444,18 @@ where
             .handle_message(message)
             .await
             .map_err(ChannelError::handler)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SchedulerBranchResolver;
+
+impl BranchResolver for SchedulerBranchResolver {
+    fn resolve_branch(
+        &self,
+        message: &InboundMessage,
+    ) -> std::result::Result<String, BranchResolveError> {
+        Ok(message.conversation_id.clone())
     }
 }
 

@@ -15,14 +15,15 @@ use coco_llm::{
     CompletionMessage, CompletionToolCall, Provider, ProviderRuntimeConfig, StepContext,
 };
 use coco_mem::{
-    BranchConfigStore, ProviderProfile, ProviderProfileStore, SessionState, SkillStore,
-    SkillVersionSpec,
+    BranchConfigStore, NewSchedulerTask, ProviderProfile, ProviderProfileStore, SchedulerStore,
+    SessionState, SkillStore, SkillVersionSpec,
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::time::{Duration, sleep};
 
 use crate::{
     Cli,
@@ -5273,6 +5274,7 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
             channel_configs: &ChannelConfigs::default(),
             console_config: None,
             console_publisher: None,
+            scheduler_poll_interval: Duration::from_secs(30),
         },
     ) {
         Ok(server) => server,
@@ -5307,6 +5309,84 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
     assert!(response.stderr.is_empty());
 
     server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_server_runs_due_scheduler_tasks() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("scheduled")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let socket_dir = tempfile::Builder::new()
+        .prefix("coco-scheduler-test-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket_path = socket_dir.path().join("coco.sock");
+    let store = open_store(&store_path).unwrap();
+    store
+        .add_scheduler_task(NewSchedulerTask {
+            id: "nightly".to_owned(),
+            branch: "scheduled".to_owned(),
+            prompt: "Run nightly maintenance".to_owned(),
+            interval_secs: 3600,
+            next_run_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            enabled: true,
+        })
+        .unwrap();
+    let llm = llm_with_test_provider_config(
+        store.clone(),
+        FakeBackend::with_responses(&[("scheduled", &[Ok("scheduled-response")])]),
+    );
+    let engine = Arc::new(coco_core::ConversationEngine::new(llm.clone()));
+    let server = match start_daemon_server(
+        &socket_path,
+        &store,
+        &llm,
+        shared_test_provider_profiles(),
+        &engine,
+        DaemonServerOptions {
+            channel_configs: &ChannelConfigs::default(),
+            console_config: None,
+            console_publisher: None,
+            scheduler_poll_interval: Duration::from_millis(10),
+        },
+    ) {
+        Ok(server) => server,
+        Err(crate::Error::BindDaemonSocket { source, .. })
+            if source.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            return;
+        }
+        Err(error) => panic!("failed to start daemon server: {error}"),
+    };
+
+    let mut observed = false;
+    for _ in 0..30 {
+        let head = store.get_branch_head("scheduled").unwrap();
+        let node = store.get_node(&head).unwrap();
+        if matches!(node.kind, Kind::Text(ref text) if text == "scheduled-response") {
+            observed = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    server.shutdown().await.unwrap();
+    assert!(observed, "scheduled prompt did not update branch head");
+    let task = store.get_scheduler_task("nightly").unwrap();
+    assert_eq!(task.run_count, 1);
+    assert!(task.last_run_at.is_some());
 }
 
 #[tokio::test]

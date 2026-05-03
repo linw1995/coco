@@ -5,6 +5,7 @@ version.workspace = true
 
 [features]
 default = []
+scheduler = ["dep:tokio", "dep:tracing"]
 telegram = [
   "dep:reqwest",
   "dep:serde",

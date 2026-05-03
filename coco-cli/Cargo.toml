@@ -9,7 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 # Workspace crates.
-coco-channel = { path = "../coco-channel", features = ["telegram"] }
+coco-channel = { path = "../coco-channel", features = [
+  "scheduler",
+  "telegram",
+] }
 coco-core = { path = "../coco-core" }
 coco-console = { path = "../coco-console" }
 coco-llm = { path = "../coco-llm" }

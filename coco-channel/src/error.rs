@@ -40,6 +40,7 @@ impl Error {
         }
     }
 
+    #[cfg_attr(not(feature = "telegram"), allow(dead_code))]
     pub(crate) fn is_transport_failure(&self) -> bool {
         match self {
             Self::Transport { .. } => true,
