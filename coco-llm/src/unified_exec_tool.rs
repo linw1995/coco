@@ -217,6 +217,7 @@ const TMPDIR_ENV: &str = "TMPDIR";
 const XDG_CACHE_HOME_ENV: &str = "XDG_CACHE_HOME";
 const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
+const XDG_BIN_HOME_ENV: &str = "XDG_BIN_HOME";
 const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
 const HOME_ENV: &str = "HOME";
 
@@ -1072,10 +1073,11 @@ fn prepare_skill_uv_runtime_dirs(
         UV_PYTHON_INSTALL_DIR_ENV,
         data_home.join("uv").join("python"),
     );
-    let xdg_bin_dir = data_home
+    let default_xdg_bin_dir = data_home
         .parent()
         .map(|parent| parent.join("bin"))
         .unwrap_or_else(|| data_home.join("bin"));
+    let xdg_bin_dir = env_path_or(XDG_BIN_HOME_ENV, default_xdg_bin_dir);
 
     let env_vars = vec![
         (TMPDIR_ENV, tmp_dir.clone()),
@@ -1084,6 +1086,7 @@ fn prepare_skill_uv_runtime_dirs(
         (XDG_CACHE_HOME_ENV, cache_home.clone()),
         (XDG_CONFIG_HOME_ENV, config_home.clone()),
         (XDG_DATA_HOME_ENV, data_home.clone()),
+        (XDG_BIN_HOME_ENV, xdg_bin_dir.clone()),
         (XDG_STATE_HOME_ENV, state_home.clone()),
     ];
     let mut allow_paths = Vec::new();
@@ -2731,6 +2734,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         let config_home = tempfile::tempdir().unwrap();
         let data_root = tempfile::tempdir().unwrap();
         let data_home = data_root.path().join(".local").join("share");
+        let bin_home = tempfile::tempdir().unwrap();
         let state_home = tempfile::tempdir().unwrap();
 
         let dirs = crate::with_process_env_async(
@@ -2738,6 +2742,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
                 (XDG_CACHE_HOME_ENV, Some(cache_home.path().as_os_str())),
                 (XDG_CONFIG_HOME_ENV, Some(config_home.path().as_os_str())),
                 (XDG_DATA_HOME_ENV, Some(data_home.as_os_str())),
+                (XDG_BIN_HOME_ENV, Some(bin_home.path().as_os_str())),
                 (XDG_STATE_HOME_ENV, Some(state_home.path().as_os_str())),
                 (TMPDIR_ENV, None),
                 (UV_CACHE_DIR_ENV, None),
@@ -2761,12 +2766,21 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
             env_vars.get(UV_PYTHON_INSTALL_DIR_ENV),
             Some(&data_home.join("uv").join("python"))
         );
+        assert_eq!(
+            env_vars.get(XDG_BIN_HOME_ENV),
+            Some(&bin_home.path().to_path_buf())
+        );
 
         let allow_paths = dirs.allow_paths().collect::<Vec<_>>();
         assert!(allow_paths.contains(&cache_home.path().to_path_buf()));
         assert!(allow_paths.contains(&config_home.path().to_path_buf()));
         assert!(allow_paths.contains(&data_home));
-        assert!(allow_paths.contains(&data_root.path().join(".local").join("bin")));
+        assert!(allow_paths.contains(&bin_home.path().to_path_buf()));
+        assert!(!allow_paths.contains(&data_root.path().join(".local").join("bin")));
+
+        let path_entries =
+            std::env::split_paths(&skill_uv_path_env(None, &dirs)).collect::<Vec<_>>();
+        assert_eq!(path_entries.first(), Some(&bin_home.path().to_path_buf()));
     }
 
     #[tokio::test]
@@ -2941,6 +2955,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
                 (XDG_CACHE_HOME_ENV, None),
                 (XDG_CONFIG_HOME_ENV, None),
                 (XDG_DATA_HOME_ENV, None),
+                (XDG_BIN_HOME_ENV, None),
                 (XDG_STATE_HOME_ENV, None),
             ],
             || async {
@@ -3052,6 +3067,7 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
                 (XDG_CACHE_HOME_ENV, None),
                 (XDG_CONFIG_HOME_ENV, None),
                 (XDG_DATA_HOME_ENV, None),
+                (XDG_BIN_HOME_ENV, None),
                 (XDG_STATE_HOME_ENV, None),
             ],
             || async {
