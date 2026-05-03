@@ -220,6 +220,7 @@ const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
 const XDG_BIN_HOME_ENV: &str = "XDG_BIN_HOME";
 const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
 const HOME_ENV: &str = "HOME";
+const XDG_CONFIG_ALLOW_DIRS: &[&str] = &["uv"];
 
 #[cfg(unix)]
 const NONO_DEFAULT_ALLOW_FILES: &[&str] = &["/dev/null"];
@@ -1106,12 +1107,16 @@ fn prepare_skill_uv_runtime_dirs(
         (XDG_BIN_HOME_ENV, xdg_bin_dir.clone()),
         (XDG_STATE_HOME_ENV, state_home.clone()),
     ];
-    let mut allow_paths = Vec::new();
-    for path in env_vars
+    let created_dirs = env_vars
         .iter()
         .map(|(_, path)| path.clone())
-        .chain(std::iter::once(xdg_bin_dir.clone()))
-    {
+        .chain(std::iter::once(xdg_bin_dir.clone()));
+    let mut allow_paths = Vec::new();
+    for path in created_dirs.filter(|path| path != &config_home).chain(
+        XDG_CONFIG_ALLOW_DIRS
+            .iter()
+            .map(|name| config_home.join(name)),
+    ) {
         push_unique_path(&mut allow_paths, path);
     }
 
@@ -2817,7 +2822,8 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
 
         let allow_paths = dirs.allow_paths().collect::<Vec<_>>();
         assert!(allow_paths.contains(&cache_home.path().to_path_buf()));
-        assert!(allow_paths.contains(&config_home.path().to_path_buf()));
+        assert!(!allow_paths.contains(&config_home.path().to_path_buf()));
+        assert!(allow_paths.contains(&config_home.path().join("uv")));
         assert!(allow_paths.contains(&data_home));
         assert!(allow_paths.contains(&bin_home.path().to_path_buf()));
         assert!(!allow_paths.contains(&data_root.path().join(".local").join("bin")));
@@ -3103,8 +3109,14 @@ libc.so.6 => /nix/store/example-glibc/lib/libc.so.6 (0x00007f)
         assert!(args.contains(&fake_bin.path().display().to_string()));
         assert!(args.contains(&skill_dir.path().display().to_string()));
         assert!(args.contains("/.cache"));
-        assert!(args.contains("/.config"));
+        assert!(args.contains("/.config/uv"));
         assert!(args.contains("/.local"));
+        let config_home = runtime_root.path().join("coco").join(".config");
+        assert!(
+            !args
+                .lines()
+                .any(|arg| arg == config_home.display().to_string())
+        );
     }
 
     #[tokio::test]
