@@ -885,11 +885,25 @@ async fn llm_engine_materializes_store_skill_scripts() {
 
     assert_eq!(active_skill.name, "scripted-skill");
     assert_eq!(active_skill.scripts, vec!["scripts/inspect.py"]);
+    assert!(active_skill.persistent_directory.exists());
+    assert!(
+        active_skill.persistent_directory.ends_with(
+            Path::new(".coco-skills")
+                .join("orchestrator")
+                .join("scripted-skill")
+        )
+    );
     assert!(
         child_session_anchor
             .1
             .prompt
             .contains("uv run --script \"$COCO_SKILL_DIR/scripts/inspect.py\"")
+    );
+    assert!(
+        child_session_anchor
+            .1
+            .prompt
+            .contains("Use $COCO_SKILL_PERSIST_DIR")
     );
     assert!(!active_skill.directory.exists());
 }

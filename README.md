@@ -22,7 +22,9 @@ docker load < result
 
 The image starts `coco daemon serve` by default. It listens on port
 `17667`, stores CoCo config and runtime data under `/data`, and exposes
-`/workspace` as the isolated exec tool workspace.
+`/workspace` as the isolated exec tool workspace. Skill-specific persistent
+directories live under `/data/skills`, so they are kept separate from both the
+workspace mount and the temporary materialized skill source directory.
 
 ```bash
 mkdir -p .coco-data

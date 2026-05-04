@@ -7,6 +7,7 @@ use snafu::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillToolRequest {
+    pub workspace_root: PathBuf,
     pub base_branch: String,
     pub parent_tool_use_id: String,
     pub skill_name: String,

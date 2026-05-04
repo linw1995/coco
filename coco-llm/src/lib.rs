@@ -44,6 +44,8 @@ pub const COCO_COMMAND_SHIM_MODE_ENV: &str = "COCO_COMMAND_SHIM_MODE";
 pub const COCO_PARENT_TOOL_USE_ID_ENV: &str = "COCO_PARENT_TOOL_USE_ID";
 pub const COCO_SKILL_NAME_ENV: &str = "COCO_SKILL_NAME";
 pub const COCO_SKILL_DIR_ENV: &str = "COCO_SKILL_DIR";
+pub const COCO_SKILL_PERSIST_DIR_ENV: &str = "COCO_SKILL_PERSIST_DIR";
+pub const COCO_SKILL_PERSIST_ROOT_ENV: &str = "COCO_SKILL_PERSIST_ROOT";
 
 pub type CompletionMessage = rig::completion::message::Message;
 pub type CompletionToolCall = rig::completion::message::ToolCall;

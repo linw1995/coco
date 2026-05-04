@@ -8,6 +8,7 @@ coco-console/pkg
 
 # Agent artifacts
 .agents/
+.coco-skills/
 .coco-store/
 .codex
 skills-lock.json

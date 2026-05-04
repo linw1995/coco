@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Weak;
@@ -11,9 +11,10 @@ use coco_llm::coco_mem::{
     SessionStore, SkillRecord, SkillRuntimeContext, SkillScript, SkillStore, ToolUse,
 };
 use coco_llm::{
-    CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
-    Error as LlmError, ExecutorError, LlmService, SearchSkillToolRequest, SkillToolExecutionResult,
-    SkillToolExecutor, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
+    COCO_SKILL_PERSIST_DIR_ENV, COCO_SKILL_PERSIST_ROOT_ENV, CompletionBackend, CompletionInput,
+    CompletionOrigin, CompletionOverrides, CompletionRequest, Error as LlmError, ExecutorError,
+    LlmService, SearchSkillToolRequest, SkillToolExecutionResult, SkillToolExecutor,
+    SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
 };
 use indoc::formatdoc;
 use serde::Serialize;
@@ -163,6 +164,7 @@ where
             &request.skill_name,
         )?;
         let skill_request = SkillToolRequest {
+            workspace_root: request.workspace_root,
             base_branch: request.session_branch,
             parent_tool_use_id: request.parent_tool_use_id,
             skill_name: skill.name.clone(),
@@ -241,13 +243,10 @@ impl Drop for SkillRuntimeDirectoryGuard {
 fn materialize_skill_runtime(
     request: &SkillToolRequest,
 ) -> std::result::Result<MaterializedSkillRuntime, SkillError> {
-    if request.scripts.is_empty() {
-        return Ok(MaterializedSkillRuntime {
-            context: None,
-            directory: None,
-        });
-    }
-
+    let persistent_directory = skill_persistent_directory(request);
+    fs::create_dir_all(&persistent_directory).context(CreateSkillRuntimeDirectorySnafu {
+        path: persistent_directory.clone(),
+    })?;
     let directory = std::env::temp_dir()
         .join("coco")
         .join("skill-sessions")
@@ -277,6 +276,7 @@ fn materialize_skill_runtime(
     let context = SkillRuntimeContext {
         name: request.skill_name.clone(),
         directory: runtime_dir.path().to_path_buf(),
+        persistent_directory,
         scripts: script_paths,
     };
     Ok(runtime_dir.into_runtime(context))
@@ -375,6 +375,7 @@ where
             skill_name,
         )?;
         let request = SkillToolRequest {
+            workspace_root: workspace_root.to_path_buf(),
             base_branch: base_branch.to_owned(),
             parent_tool_use_id: parent_tool_use_id.to_owned(),
             skill_name: skill.name.clone(),
@@ -568,6 +569,9 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         Skill session role:
         {}
 
+        Skill persistent directory:
+        Use ${} for files that should survive future runs of this skill. Do not write persistent state under COCO_SKILL_DIR; it is a temporary materialized source directory.
+
         {}
 
         Skill instructions:
@@ -578,9 +582,48 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         request.skill_description,
         request.skill_path,
         request.session_role.as_str(),
+        COCO_SKILL_PERSIST_DIR_ENV,
         script_instructions,
         request.skill_body,
     )
+}
+
+fn skill_persistent_directory(request: &SkillToolRequest) -> PathBuf {
+    skill_persistence_root(&request.workspace_root)
+        .join(request.session_role.as_str())
+        .join(encode_path_segment(&request.skill_name))
+}
+
+fn skill_persistence_root(workspace_root: &Path) -> PathBuf {
+    if let Some(root) = absolute_env_path(COCO_SKILL_PERSIST_ROOT_ENV) {
+        return root;
+    }
+    workspace_root.join(".coco-skills")
+}
+
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| path != Path::new("/"))
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String should not fail");
+        }
+    }
+
+    if encoded.is_empty() {
+        "skill".to_owned()
+    } else {
+        encoded
+    }
 }
 
 fn skill_script_instructions(request: &SkillToolRequest) -> String {
@@ -780,6 +823,7 @@ mod tests {
     #[test]
     fn skill_execution_prompt_includes_skill_context() {
         let prompt = skill_execution_prompt(&SkillToolRequest {
+            workspace_root: PathBuf::from("/workspace"),
             base_branch: "main".to_owned(),
             parent_tool_use_id: "tool-use-node".to_owned(),
             skill_name: "find-skills".to_owned(),
@@ -799,6 +843,7 @@ mod tests {
         assert!(prompt.contains("Skill description:\nFind relevant skills."));
         assert!(prompt.contains("Skill source:\n/tmp/find-skills/SKILL.md"));
         assert!(prompt.contains("Skill session role:\nrunner"));
+        assert!(prompt.contains("Use $COCO_SKILL_PERSIST_DIR"));
         assert!(prompt.contains("uv run --script \"$COCO_SKILL_DIR/scripts/inspect.py\""));
         assert!(prompt.contains("Skill instructions:\n# Find Skills"));
         assert!(!prompt.contains("Additional task from caller:"));
