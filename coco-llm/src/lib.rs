@@ -1905,13 +1905,15 @@ where
     S: NodeStore,
 {
     fn resolve_context(&self, reference: &str) -> Result<ResolvedContext> {
-        let ordered: Vec<_> = self
-            .store
-            .ancestry(reference)
-            .context(MemorySnafu)?
-            .into_iter()
-            .rev()
-            .collect();
+        let mut ordered = Vec::new();
+        for node in self.store.ancestry(reference).context(MemorySnafu)? {
+            let is_context_start = is_provider_context_start(&node);
+            ordered.push(node);
+            if is_context_start {
+                break;
+            }
+        }
+        ordered.reverse();
 
         let mut state: Option<ResolvedContext> = None;
 
@@ -1938,20 +1940,17 @@ where
         match &node.kind {
             Kind::Anchor(anchor) => match &anchor.payload {
                 AnchorPayload::Session(session_anchor) => {
-                    let mut nodes = if is_skill_execution_prompt(&session_anchor.prompt) {
-                        state
-                            .as_ref()
-                            .map(|context| context.nodes.clone())
-                            .unwrap_or_default()
+                    if let Some(context) = state.as_mut() {
+                        context.session_anchor = session_anchor.as_ref().clone();
+                        context.nodes.push(node.clone());
+                        context.active_anchor_id = node.id.clone();
                     } else {
-                        Vec::new()
-                    };
-                    nodes.push(node.clone());
-                    *state = Some(ResolvedContext {
-                        active_anchor_id: node.id.clone(),
-                        session_anchor: session_anchor.as_ref().clone(),
-                        nodes,
-                    });
+                        *state = Some(ResolvedContext {
+                            active_anchor_id: node.id.clone(),
+                            session_anchor: session_anchor.as_ref().clone(),
+                            nodes: vec![node.clone()],
+                        });
+                    }
                 }
                 AnchorPayload::SessionPatch(patch) => {
                     let Some(context) = state.as_mut() else {
@@ -2024,6 +2023,16 @@ fn should_skip_inherited_use_skill_tool_use(
     next: Option<&coco_mem::Node>,
 ) -> bool {
     is_use_skill_tool_use(node) && next.is_some_and(is_skill_execution_anchor)
+}
+
+fn is_provider_context_start(node: &coco_mem::Node) -> bool {
+    matches!(
+        &node.kind,
+        Kind::Anchor(anchor)
+            if anchor
+                .as_session()
+                .is_some_and(|session| !is_skill_execution_prompt(&session.prompt))
+    )
 }
 
 fn is_use_skill_tool_use(node: &coco_mem::Node) -> bool {
