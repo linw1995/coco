@@ -888,7 +888,8 @@ async fn llm_engine_materializes_store_skill_scripts() {
     assert!(active_skill.persistent_directory.exists());
     assert!(
         active_skill.persistent_directory.ends_with(
-            Path::new(".coco-skills")
+            Path::new(".coco-workspace")
+                .join("skills")
                 .join("orchestrator")
                 .join("scripted-skill")
                 .join("data")

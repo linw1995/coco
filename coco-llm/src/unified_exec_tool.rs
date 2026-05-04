@@ -2862,7 +2862,8 @@ mod tests {
         let skill_dir = tempfile::tempdir().unwrap();
         let skill_persist_dir = workspace
             .path()
-            .join(".coco-skills")
+            .join(".coco-workspace")
+            .join("skills")
             .join("scripted")
             .join("data");
         let observed_args = workspace.path().join("nono-args.txt");
@@ -3020,7 +3021,8 @@ mod tests {
         let skill_dir = tempfile::tempdir().unwrap();
         let skill_persist_dir = workspace
             .path()
-            .join(".coco-skills")
+            .join(".coco-workspace")
+            .join("skills")
             .join("scripted")
             .join("data");
         let runtime = runtime_tool(

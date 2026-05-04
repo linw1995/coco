@@ -601,7 +601,7 @@ fn skill_persistence_root(workspace_root: &Path) -> PathBuf {
     if let Some(root) = absolute_env_path(COCO_SKILL_PERSIST_ROOT_ENV) {
         return root;
     }
-    workspace_root.join(".coco-skills")
+    workspace_root.join(".coco-workspace").join("skills")
 }
 
 fn absolute_env_path(name: &str) -> Option<PathBuf> {
