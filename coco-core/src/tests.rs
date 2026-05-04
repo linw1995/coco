@@ -891,6 +891,7 @@ async fn llm_engine_materializes_store_skill_scripts() {
             Path::new(".coco-skills")
                 .join("orchestrator")
                 .join("scripted-skill")
+                .join("data")
         )
     );
     assert!(

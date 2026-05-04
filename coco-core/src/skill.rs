@@ -569,8 +569,10 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         Skill session role:
         {}
 
-        Skill persistent directory:
-        Use ${} for files that should survive future runs of this skill. Do not write persistent state under COCO_SKILL_DIR; it is a temporary materialized source directory.
+        Skill persistent paths:
+        - Use ${} as the skill-specific persistent data directory. Store files here when they should survive future runs of this skill.
+        - HOME is not the skill persistent directory. Do not rely on HOME for skill-specific persistent state.
+        - COCO_SKILL_DIR is a temporary materialized skill source directory. Do not write persistent state there.
 
         {}
 
@@ -592,6 +594,7 @@ fn skill_persistent_directory(request: &SkillToolRequest) -> PathBuf {
     skill_persistence_root(&request.workspace_root)
         .join(request.session_role.as_str())
         .join(encode_path_segment(&request.skill_name))
+        .join("data")
 }
 
 fn skill_persistence_root(workspace_root: &Path) -> PathBuf {
@@ -844,6 +847,10 @@ mod tests {
         assert!(prompt.contains("Skill source:\n/tmp/find-skills/SKILL.md"));
         assert!(prompt.contains("Skill session role:\nrunner"));
         assert!(prompt.contains("Use $COCO_SKILL_PERSIST_DIR"));
+        assert!(prompt.contains("HOME is not the skill persistent directory"));
+        assert!(
+            prompt.contains("COCO_SKILL_DIR is a temporary materialized skill source directory")
+        );
         assert!(prompt.contains("uv run --script \"$COCO_SKILL_DIR/scripts/inspect.py\""));
         assert!(prompt.contains("Skill instructions:\n# Find Skills"));
         assert!(!prompt.contains("Additional task from caller:"));
