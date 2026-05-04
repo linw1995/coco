@@ -3953,6 +3953,142 @@ mod tests {
         );
     }
 
+    async fn skill_child_context_fixture() -> (LlmService<FakeBackend, MemoryStore>, String) {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
+        let base_session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let prompt_id = store
+            .append(NewNode {
+                parent: base_session.anchor_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![],
+                    PromptAnchor {
+                        prompt: "Delegate twice.".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        let use_skill_id = store
+            .append(NewNode {
+                parent: prompt_id,
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::ToolUse(ToolUse {
+                    id: "tool-call-1".to_owned(),
+                    name: "use_skill".to_owned(),
+                    input: serde_json::json!({"name": "fast-rust"}),
+                }),
+            })
+            .unwrap();
+        let child_config = session_config("child");
+        let child_prompt = "You are executing the skill `fast-rust` on an isolated child branch.";
+        let child_anchor_id = store
+            .append(NewNode {
+                parent: use_skill_id,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(
+                    vec![],
+                    SessionAnchor {
+                        role: SessionRole::Runner,
+                        provider_profile: child_config.provider_profile,
+                        provider: Some(child_config.provider.as_str().to_owned()),
+                        model: child_config.model,
+                        tools: child_config.tools,
+                        system_prompt: child_config.system_prompt,
+                        prompt: child_prompt.to_owned(),
+                        temperature: child_config.temperature,
+                        max_tokens: child_config.max_tokens,
+                        additional_params: child_config.additional_params,
+                        enable_coco_shim: child_config.enable_coco_shim,
+                        active_skill: None,
+                    },
+                )),
+            })
+            .unwrap();
+        store.fork("child", &child_anchor_id).unwrap();
+
+        (service, child_prompt.to_owned())
+    }
+
+    #[tokio::test]
+    async fn context_reconstruction_orders_skill_prompt_after_inherited_history() {
+        let (service, child_prompt) = skill_child_context_fixture().await;
+        let session = service.resolve_session("child").unwrap();
+
+        assert_eq!(
+            text_messages_from_provider_history(&session.provider_history),
+            vec![
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "Delegate twice.".to_owned()),
+                (Role::User, child_prompt.to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn context_reconstruction_skips_use_skill_that_created_skill_session() {
+        let (service, _) = skill_child_context_fixture().await;
+        let session = service.resolve_session("child").unwrap();
+
+        assert_eq!(
+            session
+                .provider_history
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        rig::completion::message::Message::Assistant { content, .. }
+                            if content.iter().any(|content| matches!(
+                                content,
+                                rig::completion::message::AssistantContent::ToolCall(_)
+                            ))
+                    )
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn context_reconstruction_updates_session_prompt_in_place() {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
+        let session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let patch_id = store
+            .append(NewNode {
+                parent: session.anchor_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session_patch(
+                    vec![],
+                    SessionConfigPatch {
+                        prompt: Some("Updated start.".to_owned()),
+                        ..SessionConfigPatch::default()
+                    },
+                )),
+            })
+            .unwrap();
+        store
+            .set_branch_head("main", &session.anchor_id, &patch_id)
+            .unwrap();
+
+        let session = service.resolve_session("main").unwrap();
+
+        assert_eq!(
+            text_messages_from_provider_history(&session.provider_history),
+            vec![(Role::User, "Updated start.".to_owned())]
+        );
+    }
+
     #[tokio::test]
     async fn failed_completion_persists_failure_kind_but_not_prompt_history() {
         let store = MemoryStore::new();
