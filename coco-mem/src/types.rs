@@ -205,7 +205,6 @@ pub struct SkillScript {
 pub struct SkillRuntimeContext {
     pub name: String,
     pub directory: PathBuf,
-    #[serde(default)]
     pub persistent_directory: PathBuf,
     pub scripts: Vec<String>,
 }
