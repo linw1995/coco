@@ -1618,29 +1618,47 @@ impl SessionStore for FsStore {
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
         let mut state = self.inner.write().expect("store lock poisoned");
         let plan = state.plan_rebase_session(name, patch)?;
-        let mut persisted_state = state.clone();
-        for node in &plan.nodes {
-            persisted_state.insert_existing_node(node.clone())?;
-        }
-        persisted_state.apply_set_branch_head(
-            plan.branch.clone(),
-            &plan.expected_old_head,
-            plan.new_head.clone(),
-        )?;
-
-        for node in &plan.nodes {
-            self.persistence.append_node(node)?;
-        }
-        self.persistence
-            .rewrite_branch_view(&plan.branch, &plan.new_head, &persisted_state)?;
-        self.persistence.persist_sessions(&persisted_state)?;
-
-        for node in plan.nodes {
-            state.insert_existing_node(node)?;
-        }
-        state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
-        Ok(plan.new_head)
+        apply_rebase_plan(&mut state, &self.persistence, plan)
     }
+
+    fn rebase_session_system_prompt(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        system_prompt: &str,
+    ) -> Result<String> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let plan = state.plan_rebase_session_system_prompt(name, patch, system_prompt)?;
+        apply_rebase_plan(&mut state, &self.persistence, plan)
+    }
+}
+
+fn apply_rebase_plan(
+    state: &mut StoreState,
+    persistence: &Persistence,
+    plan: super::state::RebasePlan,
+) -> Result<String> {
+    let mut persisted_state = state.clone();
+    for node in &plan.nodes {
+        persisted_state.insert_existing_node(node.clone())?;
+    }
+    persisted_state.apply_set_branch_head(
+        plan.branch.clone(),
+        &plan.expected_old_head,
+        plan.new_head.clone(),
+    )?;
+
+    for node in &plan.nodes {
+        persistence.append_node(node)?;
+    }
+    persistence.rewrite_branch_view(&plan.branch, &plan.new_head, &persisted_state)?;
+    persistence.persist_sessions(&persisted_state)?;
+
+    for node in plan.nodes {
+        state.insert_existing_node(node)?;
+    }
+    state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
+    Ok(plan.new_head)
 }
 
 impl BranchConfigStore for FsStore {

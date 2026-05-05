@@ -124,9 +124,6 @@ pub struct SessionRebaseCommand {
     #[arg(long)]
     pub system_prompt: Option<String>,
 
-    #[arg(long)]
-    pub prompt: Option<String>,
-
     #[arg(long, conflicts_with = "clear_temperature")]
     pub temperature: Option<f64>,
 

@@ -469,7 +469,6 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
                 provider: Some(crate::cli::CliProvider::Anthropic),
                 model: Some("claude-sonnet-4-20250514".to_owned()),
                 system_prompt: Some("You are precise.".to_owned()),
-                prompt: Some("Start with a plan.".to_owned()),
                 temperature: None,
                 clear_temperature: true,
                 max_tokens: Some(256),
@@ -2195,8 +2194,6 @@ async fn session_rebase_updates_visible_session_config() {
             "claude-sonnet-4-20250514",
             "--system-prompt",
             "You are precise.",
-            "--prompt",
-            "Start with a plan.",
             "--clear-temperature",
             "--max-tokens",
             "256",
@@ -2241,7 +2238,7 @@ async fn session_rebase_updates_visible_session_config() {
     assert_eq!(value["anchor"]["provider"], "anthropic");
     assert_eq!(value["anchor"]["model"], "claude-sonnet-4-20250514");
     assert_eq!(value["anchor"]["system_prompt"], "You are precise.");
-    assert_eq!(value["anchor"]["prompt"], "Start with a plan.");
+    assert_eq!(value["anchor"]["prompt"], "");
     assert_eq!(value["anchor"]["temperature"], Value::Null);
     assert_eq!(value["anchor"]["max_tokens"], json!(256));
     assert_eq!(value["anchor"]["tools"], json!([]));
@@ -4592,8 +4589,8 @@ async fn session_rebase_applies_preset_patch() {
     assert_eq!(session_json["anchor"]["provider_profile"], "anthropic-main");
     assert_eq!(session_json["anchor"]["provider"], json!(null));
     assert_eq!(session_json["anchor"]["model"], "claude-sonnet-4-20250514");
-    assert_eq!(session_json["anchor"]["system_prompt"], "You are precise.");
-    assert_eq!(session_json["anchor"]["prompt"], "Start with a plan.");
+    assert_eq!(session_json["anchor"]["system_prompt"], "You are helpful.");
+    assert_eq!(session_json["anchor"]["prompt"], "");
     assert_eq!(session_json["anchor"]["temperature"], json!(null));
     assert_eq!(session_json["anchor"]["max_tokens"], 256);
     assert_eq!(

@@ -1049,6 +1049,29 @@ where
         );
         Ok(anchor_id)
     }
+
+    pub async fn rebase_session_system_prompt(
+        &self,
+        branch: &str,
+        patch: SessionConfigPatch,
+        system_prompt: &str,
+    ) -> Result<String> {
+        let _guard = self.lock_branch(branch).await;
+        let has_tool_patch = patch.tools.is_some();
+        let has_model_patch = patch.model.is_some();
+        let anchor_id = self
+            .store
+            .rebase_session_system_prompt(branch, &patch, system_prompt)
+            .context(MemorySnafu)?;
+        tracing::info!(
+            branch = %branch,
+            anchor_id = %anchor_id,
+            has_tool_patch,
+            has_model_patch,
+            "rebased session with system prompt"
+        );
+        Ok(anchor_id)
+    }
 }
 
 impl<B, S> LlmService<B, S>
@@ -2498,7 +2521,6 @@ struct ProviderHistoryBuilder {
     assistant_execution_id: Option<String>,
     tool_results: Vec<rig::completion::message::UserContent>,
     tool_result_execution_id: Option<String>,
-    session_prompt_message_index: Option<usize>,
 }
 
 impl ProviderHistoryBuilder {
@@ -2506,11 +2528,7 @@ impl ProviderHistoryBuilder {
         match &node.kind {
             Kind::Anchor(anchor) => match &anchor.payload {
                 AnchorPayload::Session(session) => self.push_session_prompt(&session.prompt),
-                AnchorPayload::SessionPatch(patch) => {
-                    if let Some(prompt) = &patch.prompt {
-                        self.update_session_prompt(prompt);
-                    }
-                }
+                AnchorPayload::SessionPatch(_) => {}
                 AnchorPayload::Prompt(prompt) => self.push_user_text(&prompt.prompt),
                 AnchorPayload::SkillResult(result) => {
                     self.push_tool_result(node.metadata.as_ref(), &result.tool_id, &result.output)
@@ -2531,31 +2549,10 @@ impl ProviderHistoryBuilder {
 
     fn push_session_prompt(&mut self, prompt: &str) {
         if prompt.is_empty() {
-            self.session_prompt_message_index = None;
             return;
         }
 
         self.push_user_text(prompt);
-        self.session_prompt_message_index = Some(
-            self.messages
-                .len()
-                .checked_sub(1)
-                .expect("session prompt push should append a message"),
-        );
-    }
-
-    fn update_session_prompt(&mut self, prompt: &str) {
-        match (self.session_prompt_message_index, prompt.is_empty()) {
-            (Some(index), true) => {
-                self.messages.remove(index);
-                self.session_prompt_message_index = None;
-            }
-            (Some(index), false) => {
-                self.messages[index] = rig::completion::message::Message::user(prompt.to_owned());
-            }
-            (None, true) => {}
-            (None, false) => self.push_session_prompt(prompt),
-        }
     }
 
     fn push_user_text(&mut self, text: &str) {
@@ -3578,8 +3575,6 @@ mod tests {
             provider_profile: None,
             provider: None,
             model: None,
-            system_prompt: None,
-            prompt: None,
             tools: None,
             temperature: None,
             max_tokens: None,
@@ -4088,40 +4083,6 @@ mod tests {
                 })
                 .count(),
             0
-        );
-    }
-
-    #[tokio::test]
-    async fn context_reconstruction_updates_session_prompt_in_place() {
-        let store = MemoryStore::new();
-        let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
-        let session = service
-            .create_session(session_config("main"))
-            .await
-            .unwrap();
-        let patch_id = store
-            .append(NewNode {
-                parent: session.anchor_id.clone(),
-                role: Role::System,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::session_patch(
-                    vec![],
-                    SessionConfigPatch {
-                        prompt: Some("Updated start.".to_owned()),
-                        ..SessionConfigPatch::default()
-                    },
-                )),
-            })
-            .unwrap();
-        store
-            .set_branch_head("main", &session.anchor_id, &patch_id)
-            .unwrap();
-
-        let session = service.resolve_session("main").unwrap();
-
-        assert_eq!(
-            text_messages_from_provider_history(&session.provider_history),
-            vec![(Role::User, "Updated start.".to_owned())]
         );
     }
 
@@ -4767,7 +4728,6 @@ mod tests {
                 SessionConfigPatch {
                     provider: Some(Some("anthropic".to_owned())),
                     model: Some("claude-sonnet-4-20250514".to_owned()),
-                    system_prompt: Some("You are strict.".to_owned()),
                     temperature: Some(None),
                     max_tokens: Some(Some(128)),
                     additional_params: Some(Some(serde_json::json!({"service_tier": "priority"}))),
@@ -4786,7 +4746,7 @@ mod tests {
         let session = service.resolve_session("main").unwrap();
         assert_eq!(session.config.provider, Provider::Anthropic);
         assert_eq!(session.config.model, "claude-sonnet-4-20250514");
-        assert_eq!(session.config.system_prompt, "You are strict.");
+        assert_eq!(session.config.system_prompt, "You are helpful.");
         assert_eq!(session.config.temperature, None);
         assert_eq!(session.config.max_tokens, Some(128));
         assert_eq!(
@@ -4796,7 +4756,7 @@ mod tests {
 
         let calls = calls.lock().await;
         let last = calls.last().expect("expected backend call");
-        assert_eq!(last.0.config.system_prompt, "You are strict.");
+        assert_eq!(last.0.config.system_prompt, "You are helpful.");
         assert_eq!(last.1.provider, Provider::Anthropic);
         assert_eq!(last.1.model, "claude-sonnet-4-20250514");
         assert_eq!(last.1.temperature, None);
@@ -4805,6 +4765,43 @@ mod tests {
             last.1.additional_params,
             Some(serde_json::json!({"service_tier": "priority"}))
         );
+    }
+
+    #[tokio::test]
+    async fn rebase_session_system_prompt_rebuilds_session_anchor() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[("main", &[Ok("updated")])]);
+        let calls = backend.calls.clone();
+        let service = LlmService::new(store.clone(), backend);
+        let session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let new_head = service
+            .rebase_session_system_prompt("main", session_patch(), "You are strict.")
+            .await
+            .unwrap();
+
+        assert_ne!(new_head, session.anchor_id);
+        let ancestry = store.ancestry("main").unwrap();
+        let Kind::Anchor(anchor) = &ancestry[0].kind else {
+            panic!("expected rebuilt session anchor");
+        };
+        let session_anchor = anchor
+            .as_session()
+            .expect("expected rebuilt session anchor");
+        assert_eq!(session_anchor.system_prompt, "You are strict.");
+
+        let result = service
+            .prompt(prompt_request("main", "after rebase"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "updated");
+        let calls = calls.lock().await;
+        let last = calls.last().expect("expected backend call");
+        assert_eq!(last.0.config.system_prompt, "You are strict.");
     }
 
     #[tokio::test]
