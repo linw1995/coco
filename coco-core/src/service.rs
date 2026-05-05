@@ -1,7 +1,7 @@
-use snafu::prelude::*;
-
 use coco_llm::CompletionBackend;
 use coco_llm::coco_mem::{BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore};
+use indoc::formatdoc;
+use snafu::prelude::*;
 use std::collections::HashSet;
 
 use crate::{
@@ -112,8 +112,28 @@ fn channel_prompt(message: &InboundMessage, text: &str) -> String {
 
     let reply_to_message_id = message.source_message_id.as_deref().unwrap_or("unknown");
 
-    format!(
-        "You are handling an inbound Telegram message.\n\nTelegram reply target:\n- chat_id: {chat_id}\n- reply_to_message_id: {reply_to_message_id}\n\nRequired response policy:\n- Reply by calling the `telegram` skill through `use_skill`.\n- Use the target chat_id and reply_to_message_id above when sending the Telegram reply.\n- After the skill call completes, return a short local completion note such as `Telegram reply sent.`.\n- Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.\n\nIncoming message:\n{text}",
+    formatdoc!(
+        "
+        You are handling an inbound Telegram message.
+
+        Telegram reply target:
+        - chat_id: {chat_id}
+        - reply_to_message_id: {reply_to_message_id}
+
+        Task policy:
+        - Treat the incoming message as the user's task request, not as text to acknowledge.
+        - Complete the requested work using the available tools before sending the final Telegram reply.
+        - Use `telegram` only for Telegram delivery; do not delegate the user task itself to the Telegram skill.
+        - If the work is long-running, you may send one progress update through the `telegram` skill, then continue working.
+        - Send the final user-facing result by calling the `telegram` skill through `use_skill`.
+        - Use the target chat_id and reply_to_message_id above for the first Telegram reply.
+        - After the final Telegram skill call completes, return a short local completion note such as `Telegram task completed.`.
+        - Do not finish after an acknowledgement-only Telegram reply unless the incoming message only asked for acknowledgement.
+        - Do not put the user-facing Telegram reply only in plain final text; it must be sent by the skill.
+
+        Incoming message:
+        {text}
+        ",
         chat_id = message.conversation_id,
     )
 }
