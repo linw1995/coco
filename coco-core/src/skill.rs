@@ -611,9 +611,12 @@ fn absolute_env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn encode_path_segment(value: &str) -> String {
+    let is_dot_only = value.bytes().all(|byte| byte == b'.');
     let mut encoded = String::new();
     for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+        if byte == b'.' && is_dot_only {
+            encoded.push_str("%2E");
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
             encoded.push(char::from(byte));
         } else {
             write!(&mut encoded, "%{byte:02X}").expect("writing to String should not fail");
@@ -852,6 +855,38 @@ mod tests {
         assert!(prompt.contains("uv run --script \"$COCO_SKILL_DIR/scripts/inspect.py\""));
         assert!(prompt.contains("Skill instructions:\n# Find Skills"));
         assert!(!prompt.contains("Additional task from caller:"));
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_dot_only_names() {
+        assert_eq!(encode_path_segment("."), "%2E");
+        assert_eq!(encode_path_segment(".."), "%2E%2E");
+        assert_eq!(encode_path_segment("..."), "%2E%2E%2E");
+        assert_eq!(encode_path_segment(".skill"), ".skill");
+        assert_eq!(encode_path_segment("skill.name"), "skill.name");
+    }
+
+    #[test]
+    fn skill_persistent_directory_keeps_dot_only_names_isolated() {
+        let directory = skill_persistent_directory(&SkillToolRequest {
+            workspace_root: PathBuf::from("/workspace"),
+            base_branch: "main".to_owned(),
+            parent_tool_use_id: "tool-use-node".to_owned(),
+            skill_name: "..".to_owned(),
+            skill_description: "Dot-only skill.".to_owned(),
+            skill_path: "store://skills/runner/..@1".to_owned(),
+            skill_body: "# Dot Skill".to_owned(),
+            scripts: Vec::new(),
+            session_role: SessionRole::Runner,
+            enable_coco_shim: false,
+        });
+
+        assert!(directory.ends_with(Path::new("runner").join("%2E%2E").join("data")));
+        assert!(
+            !directory
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        );
     }
 
     #[test]
