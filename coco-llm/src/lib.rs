@@ -313,7 +313,14 @@ pub(crate) struct ToolInvocationContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolExecutionOutcome {
-    ToolResult { provider_output: String },
+    ToolResult {
+        provider_output: String,
+    },
+    SkillResult {
+        skill_name: String,
+        merge_parent: String,
+        provider_output: String,
+    },
 }
 
 impl ToolExecutionOutcome {
@@ -323,9 +330,24 @@ impl ToolExecutionOutcome {
         }
     }
 
+    pub fn skill_result(
+        skill_name: impl Into<String>,
+        merge_parent: impl Into<String>,
+        provider_output: impl Into<String>,
+    ) -> Self {
+        Self::SkillResult {
+            skill_name: skill_name.into(),
+            merge_parent: merge_parent.into(),
+            provider_output: provider_output.into(),
+        }
+    }
+
     pub fn provider_output(&self) -> &str {
         match self {
             Self::ToolResult { provider_output } => provider_output,
+            Self::SkillResult {
+                provider_output, ..
+            } => provider_output,
         }
     }
 
@@ -333,6 +355,16 @@ impl ToolExecutionOutcome {
         let event = match self {
             Self::ToolResult { provider_output } => BackendEventPayload::ToolResult(ToolResult {
                 id: tool_id,
+                output: provider_output,
+            }),
+            Self::SkillResult {
+                skill_name,
+                merge_parent,
+                provider_output,
+            } => BackendEventPayload::SkillResult(SkillResultEvent {
+                tool_id,
+                skill_name,
+                merge_parent,
                 output: provider_output,
             }),
         };

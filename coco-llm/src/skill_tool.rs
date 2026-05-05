@@ -214,11 +214,16 @@ impl SkillToolRuntime {
                     parent_tool_use_id,
                     args,
                 )?;
+                let skill_name = request.skill_name.clone();
                 match context.skill_executor.execute_skill_tool(request).await {
                     Ok(result) => {
                         let output = serde_json::to_string_pretty(&result.result)
                             .context(SerializeOutputSnafu)?;
-                        Ok(ToolExecutionOutcome::tool_result(output))
+                        Ok(ToolExecutionOutcome::skill_result(
+                            skill_name,
+                            result.response_node_id,
+                            output,
+                        ))
                     }
                     Err(error) => Ok(ToolExecutionOutcome::tool_result(error.to_string())),
                 }
@@ -396,10 +401,18 @@ mod tests {
         assert_eq!(requests[0].parent_tool_use_id, "tool-use-node");
         assert_eq!(requests[0].skill_name, "find-skills");
         assert_eq!(requests[0].handoff, None);
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::SkillResult {
+                skill_name,
+                merge_parent,
+                ..
+            } if skill_name == "find-skills" && merge_parent == "child-response-node"
+        ));
     }
 
     #[tokio::test]
-    async fn use_skill_runtime_passes_string_handoff_as_tool_result() {
+    async fn use_skill_runtime_passes_string_handoff_as_skill_result() {
         let use_requests = Arc::new(Mutex::new(Vec::new()));
         let executor = Arc::new(FakeExecutor {
             search_requests: Arc::new(Mutex::new(Vec::new())),
@@ -428,6 +441,14 @@ mod tests {
             requests[0].handoff.as_deref(),
             Some("Summarize the docs decision.")
         );
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::SkillResult {
+                skill_name,
+                merge_parent,
+                ..
+            } if skill_name == "find-skills" && merge_parent == "child-response-node"
+        ));
     }
 
     #[test]

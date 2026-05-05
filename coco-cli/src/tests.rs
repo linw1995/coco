@@ -1079,16 +1079,20 @@ async fn prompt_wires_skill_executor_for_use_skill() {
             )
         })
         .expect("expected use_skill tool use on main");
-    let tool_result = ancestry
+    let skill_result = ancestry
         .iter()
         .find_map(|node| match &node.kind {
-            Kind::ToolResult(result) if result.id == "tool-call-1" => Some((node, result)),
+            Kind::Anchor(anchor) => anchor
+                .as_skill_result()
+                .filter(|result| result.tool_id == "tool-call-1")
+                .map(|result| (node, anchor, result)),
             _ => None,
         })
-        .expect("expected use_skill tool result on main");
-    let value: serde_json::Value = serde_json::from_str(&tool_result.1.output).unwrap();
+        .expect("expected use_skill skill result anchor on main");
+    let value: serde_json::Value = serde_json::from_str(&skill_result.2.output).unwrap();
     assert_eq!(value["text"], "delegated output");
-    assert_eq!(tool_result.0.parent, tool_use.id);
+    assert_eq!(skill_result.0.parent, tool_use.id);
+    assert_eq!(skill_result.2.skill_name, "fast-rust");
 
     let children = store.list_children(&tool_use.id).unwrap();
     let child_session_anchor = children
@@ -1128,6 +1132,15 @@ async fn prompt_wires_skill_executor_for_use_skill() {
         &node.kind,
         Kind::Text(text) if text == "delegated output"
     )));
+    assert_eq!(
+        skill_result.1.merge_parent_node_ids(),
+        [child_session_children
+            .iter()
+            .find(|node| matches!(&node.kind, Kind::Text(text) if text == "delegated output"))
+            .expect("expected child response node")
+            .id
+            .as_str()]
+    );
     assert!(!child_session_children.iter().any(|node| matches!(
         &node.kind,
         Kind::Anchor(anchor) if anchor.as_prompt().is_some()
