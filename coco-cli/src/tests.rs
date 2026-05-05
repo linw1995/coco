@@ -1078,28 +1078,16 @@ async fn prompt_wires_skill_executor_for_use_skill() {
             )
         })
         .expect("expected use_skill tool use on main");
-    let skill_result = ancestry
+    let tool_result = ancestry
         .iter()
         .find_map(|node| match &node.kind {
-            Kind::Anchor(anchor) => anchor
-                .as_skill_result()
-                .map(|result| (node, anchor, result)),
+            Kind::ToolResult(result) if result.id == "tool-call-1" => Some((node, result)),
             _ => None,
         })
-        .expect("expected use_skill skill result on main");
-    assert_eq!(skill_result.2.tool_id, "tool-call-1");
-    assert_eq!(skill_result.2.skill_name, "fast-rust");
-    let value: serde_json::Value = serde_json::from_str(&skill_result.2.output).unwrap();
+        .expect("expected use_skill tool result on main");
+    let value: serde_json::Value = serde_json::from_str(&tool_result.1.output).unwrap();
     assert_eq!(value["text"], "delegated output");
-    assert_eq!(skill_result.0.parent, tool_use.id);
-    assert_eq!(skill_result.1.merge_parents().len(), 1);
-    let child_response = store
-        .get_node(skill_result.1.merge_parents()[0].node_id())
-        .expect("skill result merge parent should exist");
-    assert!(matches!(
-        &child_response.kind,
-        Kind::Text(text) if text == "delegated output"
-    ));
+    assert_eq!(tool_result.0.parent, tool_use.id);
 
     let children = store.list_children(&tool_use.id).unwrap();
     let child_session_anchor = children
@@ -1112,6 +1100,13 @@ async fn prompt_wires_skill_executor_for_use_skill() {
     assert_eq!(child_session_anchor.0.parent, tool_use.id);
     assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
     assert!(child_session_anchor.1.enable_coco_shim);
+    let active_skill = child_session_anchor
+        .1
+        .active_skill
+        .as_ref()
+        .expect("expected active skill metadata");
+    assert_eq!(active_skill.name, "fast-rust");
+    assert_eq!(active_skill.handoff, None);
     assert!(
         child_session_anchor
             .1
@@ -1125,6 +1120,10 @@ async fn prompt_wires_skill_executor_for_use_skill() {
             .contains("Additional task from caller:")
     );
     let child_session_children = store.list_children(&child_session_anchor.0.id).unwrap();
+    assert!(child_session_children.iter().any(|node| matches!(
+        &node.kind,
+        Kind::Text(text) if text == "delegated output"
+    )));
     assert!(!child_session_children.iter().any(|node| matches!(
         &node.kind,
         Kind::Anchor(anchor) if anchor.as_prompt().is_some()

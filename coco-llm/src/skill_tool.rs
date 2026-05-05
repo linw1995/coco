@@ -38,6 +38,9 @@ pub enum SkillToolError {
     #[snafu(display("use_skill requires a string field `name`"))]
     MissingSkillName,
 
+    #[snafu(display("use_skill field `handoff` must be a non-empty string when present"))]
+    InvalidHandoff,
+
     #[snafu(display("use_skill requires a persisted tool_use node context"))]
     MissingToolUseNode,
 
@@ -142,12 +145,24 @@ fn parse_use_request(
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .context(MissingSkillNameSnafu)?;
+    let handoff = object
+        .get("handoff")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|handoff| !handoff.is_empty())
+                .map(str::to_owned)
+                .context(InvalidHandoffSnafu)
+        })
+        .transpose()?;
     Ok(UseSkillToolRequest {
         workspace_root,
         session_branch,
         session_role,
         parent_tool_use_id,
         skill_name,
+        handoff,
     })
 }
 
@@ -200,15 +215,21 @@ impl SkillToolRuntime {
                     args,
                 )?;
                 let skill_name = request.skill_name.clone();
+                let handoff = request.handoff.clone();
                 match context.skill_executor.execute_skill_tool(request).await {
                     Ok(result) => {
                         let output = serde_json::to_string_pretty(&result.result)
                             .context(SerializeOutputSnafu)?;
-                        Ok(ToolExecutionOutcome::skill_result(
-                            skill_name,
-                            output,
-                            result.response_node_id,
-                        ))
+                        if handoff.is_some() {
+                            Ok(ToolExecutionOutcome::skill_handoff_result(
+                                skill_name,
+                                output,
+                                result.response_node_id,
+                                result.result.text,
+                            ))
+                        } else {
+                            Ok(ToolExecutionOutcome::tool_result(output))
+                        }
                     }
                     Err(error) => Ok(ToolExecutionOutcome::tool_result(error.to_string())),
                 }
@@ -372,20 +393,13 @@ mod tests {
             .await
             .unwrap();
         let requests = use_requests.lock().await;
-        let ToolExecutionOutcome::SkillResult {
-            skill_name,
-            provider_output,
-            merge_parent,
-        } = outcome
-        else {
-            panic!("expected skill result outcome");
+        let ToolExecutionOutcome::ToolResult { provider_output } = outcome else {
+            panic!("expected regular tool result without handoff");
         };
         let value: Value = serde_json::from_str(&provider_output).unwrap();
 
         assert_eq!(value.as_object().expect("expected JSON object").len(), 1);
         assert_eq!(value["text"], "Executed skill result");
-        assert_eq!(skill_name, "find-skills");
-        assert_eq!(merge_parent, "child-response-node");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].workspace_root, workspace_root);
         assert_eq!(requests[0].session_branch, "main");
@@ -395,6 +409,51 @@ mod tests {
         );
         assert_eq!(requests[0].parent_tool_use_id, "tool-use-node");
         assert_eq!(requests[0].skill_name, "find-skills");
+        assert_eq!(requests[0].handoff, None);
+    }
+
+    #[tokio::test]
+    async fn use_skill_runtime_passes_string_handoff_as_terminal_result() {
+        let use_requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = Arc::new(FakeExecutor {
+            search_requests: Arc::new(Mutex::new(Vec::new())),
+            use_requests: use_requests.clone(),
+        });
+        let runtime = run_runtime(
+            run_tool_definition(),
+            Path::new("/tmp").to_path_buf(),
+            run_context(executor),
+        );
+
+        let outcome = runtime
+            .execute(
+                r#"{"name":"find-skills","handoff":"Summarize the docs decision."}"#.to_owned(),
+                ToolInvocationContext {
+                    persisted_tool_use_node_id: Some("tool-use-node".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        let requests = use_requests.lock().await;
+        let ToolExecutionOutcome::SkillResult {
+            skill_name,
+            provider_output,
+            merge_parent,
+            terminal_text,
+        } = outcome
+        else {
+            panic!("expected handoff use_skill to return a terminal skill result");
+        };
+        let value: Value = serde_json::from_str(&provider_output).unwrap();
+
+        assert_eq!(value["text"], "Executed skill result");
+        assert_eq!(skill_name, "find-skills");
+        assert_eq!(merge_parent, "child-response-node");
+        assert_eq!(terminal_text.as_deref(), Some("Executed skill result"));
+        assert_eq!(
+            requests[0].handoff.as_deref(),
+            Some("Summarize the docs decision.")
+        );
     }
 
     #[test]

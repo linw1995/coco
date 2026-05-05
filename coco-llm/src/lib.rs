@@ -320,6 +320,7 @@ pub(crate) enum ToolExecutionOutcome {
         skill_name: String,
         provider_output: String,
         merge_parent: String,
+        terminal_text: Option<String>,
     },
 }
 
@@ -330,15 +331,17 @@ impl ToolExecutionOutcome {
         }
     }
 
-    pub fn skill_result(
+    pub fn skill_handoff_result(
         skill_name: impl Into<String>,
         provider_output: impl Into<String>,
         merge_parent: impl Into<String>,
+        terminal_text: impl Into<String>,
     ) -> Self {
         Self::SkillResult {
             skill_name: skill_name.into(),
             provider_output: provider_output.into(),
             merge_parent: merge_parent.into(),
+            terminal_text: Some(terminal_text.into()),
         }
     }
 
@@ -353,6 +356,16 @@ impl ToolExecutionOutcome {
         }
     }
 
+    pub fn terminal_text(&self) -> Option<&str> {
+        match self {
+            Self::SkillResult {
+                terminal_text: Some(text),
+                ..
+            } => Some(text),
+            Self::ToolResult { .. } | Self::SkillResult { .. } => None,
+        }
+    }
+
     pub fn into_backend_event(self, tool_id: String, call_id: Option<String>) -> BackendEvent {
         let event = match self {
             Self::ToolResult { provider_output } => BackendEventPayload::ToolResult(ToolResult {
@@ -363,6 +376,7 @@ impl ToolExecutionOutcome {
                 skill_name,
                 provider_output,
                 merge_parent,
+                ..
             } => BackendEventPayload::SkillResult(SkillResultEvent {
                 tool_id,
                 skill_name,
@@ -2078,10 +2092,16 @@ fn is_provider_context_start(node: &coco_mem::Node) -> bool {
     matches!(
         &node.kind,
         Kind::Anchor(anchor)
-            if anchor
-                .as_session()
-                .is_some_and(|session| !is_skill_execution_prompt(&session.prompt))
+            if anchor.as_session().is_some_and(is_context_start_session)
     )
+}
+
+fn is_context_start_session(session: &SessionAnchor) -> bool {
+    !is_skill_execution_prompt(&session.prompt)
+        || session
+            .active_skill
+            .as_ref()
+            .is_some_and(|active_skill| active_skill.handoff.is_some())
 }
 
 fn is_use_skill_tool_use(node: &coco_mem::Node) -> bool {
@@ -2417,6 +2437,23 @@ fn tool_result_message(
     }
 }
 
+fn reject_mixed_handoff_use_skill_calls(
+    tool_calls: &[CompletionToolCall],
+) -> std::result::Result<(), BackendError> {
+    let has_handoff_use_skill = tool_calls.iter().any(|tool_call| {
+        tool_call.function.name == "use_skill"
+            && tool_call.function.arguments.get("handoff").is_some()
+    });
+
+    if has_handoff_use_skill && tool_calls.len() != 1 {
+        return Err(BackendError::failed(
+            "use_skill with handoff must be the only tool call in the turn",
+        ));
+    }
+
+    Ok(())
+}
+
 fn rig_tool_call_content(
     id: impl Into<String>,
     call_id: Option<String>,
@@ -2727,6 +2764,12 @@ struct StepState {
     step_events: Vec<BackendEvent>,
 }
 
+struct ToolCallExecution {
+    event: BackendEvent,
+    tool_result: rig::completion::message::UserContent,
+    terminal_text: Option<String>,
+}
+
 enum RunControl {
     Continue,
     Completed(BackendRun),
@@ -2864,8 +2907,7 @@ impl CompletionRunner {
         &mut self,
         next_execution: &ExecutionMetadata,
         tool_call: CompletionToolCall,
-    ) -> std::result::Result<(BackendEvent, rig::completion::message::UserContent), BackendError>
-    {
+    ) -> std::result::Result<ToolCallExecution, BackendError> {
         let tool_use_node_id = self.tool_use_node_ids.remove(&tool_call.id);
         if tool_call.function.name == "use_skill" && tool_use_node_id.is_none() {
             return Err(BackendError::failed(format!(
@@ -2886,6 +2928,7 @@ impl CompletionRunner {
             )
             .await?;
         let provider_output = outcome.provider_output().to_owned();
+        let terminal_text = outcome.terminal_text().map(str::to_owned);
         let call_id = tool_call.call_id.clone();
         let event = outcome.into_backend_event(tool_call.id.clone(), call_id.clone());
         if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
@@ -2896,23 +2939,25 @@ impl CompletionRunner {
             )?);
         }
 
-        Ok((
+        Ok(ToolCallExecution {
             event,
-            rig_tool_result_content(
+            tool_result: rig_tool_result_content(
                 tool_call.id,
                 call_id,
                 rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
                     provider_output,
                 )),
             ),
-        ))
+            terminal_text,
+        })
     }
 
     async fn advance_with_tool_calls(
         &mut self,
         state: StepState,
         turn: BackendTurn,
-    ) -> std::result::Result<(), BackendError> {
+    ) -> std::result::Result<RunControl, BackendError> {
+        reject_mixed_handoff_use_skill_calls(&turn.tool_calls)?;
         self.history.push(self.prompt.clone());
         self.history.push(turn.message);
 
@@ -2920,9 +2965,33 @@ impl CompletionRunner {
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
         for tool_call in turn.tool_calls {
-            let (event, tool_result) = self.execute_tool_call(&next_execution, tool_call).await?;
-            next_events.push(event);
-            tool_results.push(tool_result);
+            let execution = self.execute_tool_call(&next_execution, tool_call).await?;
+            next_events.push(execution.event);
+            tool_results.push(execution.tool_result);
+            if let Some(text) = execution.terminal_text {
+                let assistant_event: BackendEvent =
+                    BackendEventPayload::AssistantText(text.clone()).into();
+                if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
+                    self.head = Some(append_backend_event(
+                        trace_node_appender,
+                        &next_execution,
+                        assistant_event.clone(),
+                    )?);
+                }
+                next_events.push(assistant_event);
+                self.steps.push(BackendStep {
+                    execution: state.execution,
+                    events: state.step_events,
+                });
+                self.steps.push(BackendStep {
+                    execution: next_execution,
+                    events: next_events,
+                });
+                return Ok(RunControl::Completed(
+                    BackendRun::succeeded_with_steps(text, std::mem::take(&mut self.steps))
+                        .with_head(self.head.take()),
+                ));
+            }
         }
 
         self.steps.push(BackendStep {
@@ -2936,7 +3005,7 @@ impl CompletionRunner {
             events: next_events,
         });
         self.prompt = tool_result_message(tool_results);
-        Ok(())
+        Ok(RunControl::Continue)
     }
 
     async fn finish_step(
@@ -2950,8 +3019,7 @@ impl CompletionRunner {
                 .map(RunControl::Completed);
         }
 
-        self.advance_with_tool_calls(state, turn).await?;
-        Ok(RunControl::Continue)
+        self.advance_with_tool_calls(state, turn).await
     }
 
     fn max_turn_failure(&mut self) -> BackendRun {
@@ -3606,6 +3674,13 @@ mod tests {
         crate::builtin_tool_definition("exec_command").expect("builtin tool should exist")
     }
 
+    fn test_tool_call(name: &str, arguments: serde_json::Value) -> CompletionToolCall {
+        match rig_tool_call_content("tool-call-1", None, name, arguments) {
+            rig::message::AssistantContent::ToolCall(tool_call) => tool_call,
+            _ => panic!("expected tool call content"),
+        }
+    }
+
     fn text_messages_from_provider_history(
         messages: &[rig::completion::message::Message],
     ) -> Vec<(Role, String)> {
@@ -3640,6 +3715,31 @@ mod tests {
         }
 
         text_messages
+    }
+
+    #[test]
+    fn handoff_use_skill_must_be_the_only_tool_call() {
+        let use_skill = test_tool_call(
+            "use_skill",
+            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
+        );
+        let exec_command = test_tool_call("exec_command", serde_json::json!({"cmd": "pwd"}));
+
+        let error = reject_mixed_handoff_use_skill_calls(&[use_skill, exec_command]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("use_skill with handoff must be the only tool call")
+        );
+    }
+
+    #[test]
+    fn non_handoff_use_skill_can_share_tool_turn() {
+        let use_skill = test_tool_call("use_skill", serde_json::json!({"name": "fast-rust"}));
+        let exec_command = test_tool_call("exec_command", serde_json::json!({"cmd": "pwd"}));
+
+        reject_mixed_handoff_use_skill_calls(&[use_skill, exec_command]).unwrap();
     }
 
     #[test]
@@ -4068,7 +4168,9 @@ mod tests {
         );
     }
 
-    async fn skill_child_context_fixture() -> (LlmService<FakeBackend, MemoryStore>, String) {
+    async fn skill_child_context_fixture(
+        handoff: Option<String>,
+    ) -> (LlmService<FakeBackend, MemoryStore>, String) {
         let store = MemoryStore::new();
         let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
         let base_session = service
@@ -4121,7 +4223,10 @@ mod tests {
                         max_tokens: child_config.max_tokens,
                         additional_params: child_config.additional_params,
                         enable_coco_shim: child_config.enable_coco_shim,
-                        active_skill: None,
+                        active_skill: Some(coco_mem::SkillRuntimeContext {
+                            name: "fast-rust".to_owned(),
+                            handoff,
+                        }),
                     },
                 )),
             })
@@ -4133,7 +4238,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_reconstruction_orders_skill_prompt_after_inherited_history() {
-        let (service, child_prompt) = skill_child_context_fixture().await;
+        let (service, child_prompt) = skill_child_context_fixture(None).await;
         let session = service.resolve_session("child").unwrap();
 
         assert_eq!(
@@ -4148,7 +4253,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_reconstruction_skips_use_skill_that_created_skill_session() {
-        let (service, _) = skill_child_context_fixture().await;
+        let (service, _) = skill_child_context_fixture(None).await;
         let session = service.resolve_session("child").unwrap();
 
         assert_eq!(
@@ -4167,6 +4272,18 @@ mod tests {
                 })
                 .count(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn context_reconstruction_can_hide_parent_history_for_handoff_skill_child() {
+        let (service, child_prompt) =
+            skill_child_context_fixture(Some("Review the bounded diff.".to_owned())).await;
+        let session = service.resolve_session("child").unwrap();
+
+        assert_eq!(
+            text_messages_from_provider_history(&session.provider_history),
+            vec![(Role::User, child_prompt)]
         );
     }
 

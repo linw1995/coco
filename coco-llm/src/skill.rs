@@ -18,6 +18,7 @@ pub struct SkillToolRequest {
     pub scripts: Vec<SkillScript>,
     pub session_role: SessionRole,
     pub enable_coco_shim: bool,
+    pub handoff: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +47,7 @@ pub struct UseSkillToolRequest {
     pub session_role: SessionRole,
     pub parent_tool_use_id: String,
     pub skill_name: String,
+    pub handoff: Option<String>,
 }
 
 #[derive(Debug, Snafu)]

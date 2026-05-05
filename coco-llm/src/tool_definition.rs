@@ -95,6 +95,10 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                     "name": {
                         "type": "string",
                         "description": "The exact skill name returned by search_skill."
+                    },
+                    "handoff": {
+                        "type": "string",
+                        "description": "Optional explicit handoff content for a bounded skill run. When present, the skill child session does not inherit the parent conversation history and the parent run terminates with the skill result. When omitted, the skill inherits parent context and returns a normal tool result for the parent model to continue."
                     }
                 },
                 "required": ["name"],
