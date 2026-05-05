@@ -11,10 +11,10 @@ use coco_llm::coco_mem::{
     SessionStore, SkillRecord, SkillRuntimeContext, SkillScript, SkillStore, ToolUse,
 };
 use coco_llm::{
-    COCO_SKILL_PERSIST_DIR_ENV, COCO_SKILL_PERSIST_ROOT_ENV, CompletionBackend, CompletionInput,
-    CompletionOrigin, CompletionOverrides, CompletionRequest, Error as LlmError, ExecutorError,
-    LlmService, SearchSkillToolRequest, SkillToolExecutionResult, SkillToolExecutor,
-    SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
+    ActiveSkillRuntimeContext, COCO_SKILL_PERSIST_DIR_ENV, COCO_SKILL_PERSIST_ROOT_ENV,
+    CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
+    Error as LlmError, ExecutorError, LlmService, SearchSkillToolRequest, SkillToolExecutionResult,
+    SkillToolExecutor, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
 };
 use indoc::formatdoc;
 use serde::Serialize;
@@ -194,7 +194,7 @@ fn executor_error_from_llm_error(error: LlmError) -> ExecutorError {
 
 #[derive(Debug)]
 struct MaterializedSkillRuntime {
-    context: Option<SkillRuntimeContext>,
+    context: Option<ActiveSkillRuntimeContext>,
     directory: Option<PathBuf>,
 }
 
@@ -224,7 +224,7 @@ impl SkillRuntimeDirectoryGuard {
             .expect("skill runtime directory guard should own a directory")
     }
 
-    fn into_runtime(mut self, context: SkillRuntimeContext) -> MaterializedSkillRuntime {
+    fn into_runtime(mut self, context: ActiveSkillRuntimeContext) -> MaterializedSkillRuntime {
         MaterializedSkillRuntime {
             context: Some(context),
             directory: self.directory.take(),
@@ -260,7 +260,6 @@ fn materialize_skill_runtime(
     fs::write(&skill_file, &request.skill_body)
         .context(WriteSkillRuntimeFileSnafu { path: skill_file })?;
 
-    let mut script_paths = Vec::with_capacity(request.scripts.len());
     for script in &request.scripts {
         let relative_path = validate_runtime_script_path(&script.path)?;
         let target = runtime_dir.path().join(&relative_path);
@@ -270,14 +269,12 @@ fn materialize_skill_runtime(
             })?;
         }
         fs::write(&target, &script.content).context(WriteSkillRuntimeFileSnafu { path: target })?;
-        script_paths.push(relative_path);
     }
 
-    let context = SkillRuntimeContext {
+    let context = ActiveSkillRuntimeContext {
         name: request.skill_name.clone(),
         directory: runtime_dir.path().to_path_buf(),
         persistent_directory,
-        scripts: script_paths,
     };
     Ok(runtime_dir.into_runtime(context))
 }
@@ -401,8 +398,7 @@ where
         let store = service.store();
         let child_branch = temporary_skill_branch_name(&request.base_branch, &request.skill_name);
         ensure_use_skill_node(store, &request.parent_tool_use_id)?;
-        let child_session_anchor_id =
-            append_skill_session_anchor(store, &request, runtime.context.clone())?;
+        let child_session_anchor_id = append_skill_session_anchor(store, &request)?;
 
         store
             .fork(&child_branch, &child_session_anchor_id)
@@ -415,6 +411,7 @@ where
                 origin: CompletionOrigin::BranchHead,
                 input: CompletionInput::Continue,
                 overrides: CompletionOverrides::default(),
+                active_skill_runtime: runtime.context.clone(),
             })
             .await;
         let cleanup_result = service.delete_session_branch(&child_branch).await;
@@ -462,7 +459,6 @@ where
 fn append_skill_session_anchor<S>(
     store: &S,
     request: &SkillToolRequest,
-    active_skill: Option<SkillRuntimeContext>,
 ) -> std::result::Result<String, LlmError>
 where
     S: NodeStore,
@@ -487,7 +483,9 @@ where
                     max_tokens: inherited.max_tokens,
                     additional_params: inherited.additional_params,
                     enable_coco_shim: request.enable_coco_shim,
-                    active_skill,
+                    active_skill: Some(SkillRuntimeContext {
+                        name: request.skill_name.clone(),
+                    }),
                 },
             )),
         })

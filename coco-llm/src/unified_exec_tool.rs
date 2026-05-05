@@ -2880,11 +2880,10 @@ mod tests {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Runner,
                 current_skill_name: Some("scripted".to_owned()),
-                active_skill: Some(coco_mem::SkillRuntimeContext {
+                active_skill: Some(crate::ActiveSkillRuntimeContext {
                     name: "scripted".to_owned(),
                     directory: skill_dir.path().to_path_buf(),
                     persistent_directory: skill_persist_dir.clone(),
-                    scripts: vec!["scripts/inspect.py".to_owned()],
                 }),
                 store_path: None,
                 enable_coco_shim: false,
@@ -3025,11 +3024,10 @@ mod tests {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Runner,
                 current_skill_name: Some("scripted".to_owned()),
-                active_skill: Some(coco_mem::SkillRuntimeContext {
+                active_skill: Some(crate::ActiveSkillRuntimeContext {
                     name: "scripted".to_owned(),
                     directory: skill_dir.path().to_path_buf(),
                     persistent_directory: skill_persist_dir.clone(),
-                    scripts: vec!["scripts/inspect.py".to_owned()],
                 }),
                 store_path: None,
                 enable_coco_shim: false,

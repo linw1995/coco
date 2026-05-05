@@ -394,6 +394,7 @@ where
             origin,
             input,
             overrides: CompletionOverrides::default(),
+            active_skill_runtime: None,
         };
 
         let _ = self.service.run(request).await?;

@@ -881,20 +881,16 @@ async fn llm_engine_materializes_store_skill_scripts() {
         .1
         .active_skill
         .as_ref()
-        .expect("scripted skill should persist runtime context");
+        .expect("scripted skill should persist identity");
 
     assert_eq!(active_skill.name, "scripted-skill");
-    assert_eq!(active_skill.scripts, vec!["scripts/inspect.py"]);
-    assert!(active_skill.persistent_directory.exists());
-    assert!(
-        active_skill.persistent_directory.ends_with(
-            Path::new(".coco-workspace")
-                .join("skills")
-                .join("orchestrator")
-                .join("scripted-skill")
-                .join("data")
-        )
-    );
+    let expected_persistent_directory = Path::new(".")
+        .join(".coco-workspace")
+        .join("skills")
+        .join("orchestrator")
+        .join("scripted-skill")
+        .join("data");
+    assert!(expected_persistent_directory.exists());
     assert!(
         child_session_anchor
             .1
@@ -907,7 +903,6 @@ async fn llm_engine_materializes_store_skill_scripts() {
             .prompt
             .contains("Use $COCO_SKILL_PERSIST_DIR")
     );
-    assert!(!active_skill.directory.exists());
 }
 
 #[tokio::test]
