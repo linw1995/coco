@@ -256,31 +256,6 @@ pub struct CompletionResult {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MessageRole {
-    User,
-    Assistant,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConversationMessage {
-    pub role: MessageRole,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConversationEntry {
-    Message(ConversationMessage),
-    ToolUse(ToolUse),
-    ToolResult(ToolResult),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ConversationTraceEntry {
-    metadata: Option<BackendMetadata>,
-    entry: ConversationEntry,
-}
-
 #[derive(Debug, Clone)]
 pub struct SessionModelConfig {
     pub role: SessionRole,
@@ -302,7 +277,6 @@ pub struct ResolvedSession {
     pub branch: String,
     pub anchor_id: String,
     pub config: SessionModelConfig,
-    pub conversation: Vec<ConversationEntry>,
     pub provider_history: Vec<rig::completion::message::Message>,
     pub tool_runtime_env: ToolRuntimeEnv,
 }
@@ -930,7 +904,7 @@ type Result<T> = std::result::Result<T, Error>;
 struct ResolvedContext {
     active_anchor_id: String,
     session_anchor: SessionAnchor,
-    tail_entries: Vec<ConversationTraceEntry>,
+    nodes: Vec<coco_mem::Node>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1873,21 +1847,7 @@ where
         branch: &str,
         context: ResolvedContext,
     ) -> Result<ResolvedSession> {
-        let mut conversation = Vec::new();
-        let mut tracked_entries = Vec::new();
-        if !context.session_anchor.prompt.is_empty() {
-            let entry = ConversationEntry::Message(ConversationMessage {
-                role: MessageRole::User,
-                text: context.session_anchor.prompt.clone(),
-            });
-            conversation.push(entry.clone());
-            tracked_entries.push(ConversationTraceEntry {
-                metadata: None,
-                entry,
-            });
-        }
-        conversation.extend(context.tail_entries.iter().map(|entry| entry.entry.clone()));
-        tracked_entries.extend(context.tail_entries);
+        let provider_history = rig_messages_from_nodes(&context.nodes);
 
         let provider_config = context
             .session_anchor
@@ -1925,8 +1885,7 @@ where
                 additional_params: context.session_anchor.additional_params.clone(),
                 enable_coco_shim: context.session_anchor.enable_coco_shim,
             },
-            conversation,
-            provider_history: rig_messages_from_tracked_entries(&tracked_entries),
+            provider_history,
             tool_runtime_env: ToolRuntimeEnv {
                 session_branch: branch.to_owned(),
                 session_role: context.session_anchor.role,
@@ -1946,13 +1905,15 @@ where
     S: NodeStore,
 {
     fn resolve_context(&self, reference: &str) -> Result<ResolvedContext> {
-        let ordered: Vec<_> = self
-            .store
-            .ancestry(reference)
-            .context(MemorySnafu)?
-            .into_iter()
-            .rev()
-            .collect();
+        let mut ordered = Vec::new();
+        for node in self.store.ancestry(reference).context(MemorySnafu)? {
+            let is_context_start = is_provider_context_start(&node);
+            ordered.push(node);
+            if is_context_start {
+                break;
+            }
+        }
+        ordered.reverse();
 
         let mut state: Option<ResolvedContext> = None;
 
@@ -1979,19 +1940,17 @@ where
         match &node.kind {
             Kind::Anchor(anchor) => match &anchor.payload {
                 AnchorPayload::Session(session_anchor) => {
-                    let tail_entries = if is_skill_execution_prompt(&session_anchor.prompt) {
-                        state
-                            .as_ref()
-                            .map(|context| context.tail_entries.clone())
-                            .unwrap_or_default()
+                    if let Some(context) = state.as_mut() {
+                        context.session_anchor = session_anchor.as_ref().clone();
+                        context.nodes.push(node.clone());
+                        context.active_anchor_id = node.id.clone();
                     } else {
-                        Vec::new()
-                    };
-                    *state = Some(ResolvedContext {
-                        active_anchor_id: node.id.clone(),
-                        session_anchor: session_anchor.as_ref().clone(),
-                        tail_entries,
-                    });
+                        *state = Some(ResolvedContext {
+                            active_anchor_id: node.id.clone(),
+                            session_anchor: session_anchor.as_ref().clone(),
+                            nodes: vec![node.clone()],
+                        });
+                    }
                 }
                 AnchorPayload::SessionPatch(patch) => {
                     let Some(context) = state.as_mut() else {
@@ -2002,9 +1961,10 @@ where
                     };
 
                     context.session_anchor = context.session_anchor.apply_patch(patch);
+                    context.nodes.push(node.clone());
                     context.active_anchor_id = node.id.clone();
                 }
-                AnchorPayload::Prompt(prompt_anchor) => {
+                AnchorPayload::Prompt(_) => {
                     let Some(context) = state.as_mut() else {
                         return MissingAnchorSnafu {
                             branch: reference.to_owned(),
@@ -2012,18 +1972,10 @@ where
                         .fail();
                     };
 
-                    if !prompt_anchor.prompt.is_empty() {
-                        context.tail_entries.push(ConversationTraceEntry {
-                            metadata: None,
-                            entry: ConversationEntry::Message(ConversationMessage {
-                                role: MessageRole::User,
-                                text: prompt_anchor.prompt.clone(),
-                            }),
-                        });
-                    }
+                    context.nodes.push(node.clone());
                     context.active_anchor_id = node.id.clone();
                 }
-                AnchorPayload::SkillResult(skill_result) => {
+                AnchorPayload::SkillResult(_) => {
                     let Some(context) = state.as_mut() else {
                         return MissingAnchorSnafu {
                             branch: reference.to_owned(),
@@ -2031,55 +1983,35 @@ where
                         .fail();
                     };
 
-                    context.tail_entries.push(ConversationTraceEntry {
-                        metadata: node.metadata.clone(),
-                        entry: ConversationEntry::ToolResult(ToolResult {
-                            id: skill_result.tool_id.clone(),
-                            output: skill_result.output.clone(),
-                        }),
-                    });
+                    context.nodes.push(node.clone());
                     context.active_anchor_id = node.id.clone();
                 }
             },
-            Kind::Text(text) => {
+            Kind::Text(_) => {
                 let Some(context) = state.as_mut() else {
                     return Ok(());
                 };
 
-                let role = match node.role {
-                    Role::User => Some(MessageRole::User),
-                    Role::LLM => Some(MessageRole::Assistant),
-                    Role::System => None,
-                };
-                if let Some(role) = role {
-                    context.tail_entries.push(ConversationTraceEntry {
-                        metadata: node.metadata.clone(),
-                        entry: ConversationEntry::Message(ConversationMessage {
-                            role,
-                            text: text.clone(),
-                        }),
-                    });
-                }
+                context.nodes.push(node.clone());
             }
-            Kind::ToolUse(tool_use) => {
+            Kind::ToolUse(_) => {
                 let Some(context) = state.as_mut() else {
                     return Ok(());
                 };
-                context.tail_entries.push(ConversationTraceEntry {
-                    metadata: node.metadata.clone(),
-                    entry: ConversationEntry::ToolUse(tool_use.clone()),
-                });
+                context.nodes.push(node.clone());
             }
-            Kind::ToolResult(tool_result) => {
+            Kind::ToolResult(_) => {
                 let Some(context) = state.as_mut() else {
                     return Ok(());
                 };
-                context.tail_entries.push(ConversationTraceEntry {
-                    metadata: node.metadata.clone(),
-                    entry: ConversationEntry::ToolResult(tool_result.clone()),
-                });
+                context.nodes.push(node.clone());
             }
-            Kind::Failure(_) => {}
+            Kind::Failure(_) => {
+                let Some(context) = state.as_mut() else {
+                    return Ok(());
+                };
+                context.nodes.push(node.clone());
+            }
         }
 
         Ok(())
@@ -2091,6 +2023,16 @@ fn should_skip_inherited_use_skill_tool_use(
     next: Option<&coco_mem::Node>,
 ) -> bool {
     is_use_skill_tool_use(node) && next.is_some_and(is_skill_execution_anchor)
+}
+
+fn is_provider_context_start(node: &coco_mem::Node) -> bool {
+    matches!(
+        &node.kind,
+        Kind::Anchor(anchor)
+            if anchor
+                .as_session()
+                .is_some_and(|session| !is_skill_execution_prompt(&session.prompt))
+    )
 }
 
 fn is_use_skill_tool_use(node: &coco_mem::Node) -> bool {
@@ -2513,153 +2455,167 @@ fn append_backend_events(
     Ok(head_id)
 }
 
-fn rig_messages_from_tracked_entries(
-    entries: &[ConversationTraceEntry],
-) -> Vec<rig::completion::message::Message> {
-    fn flush_assistant_contents(
-        messages: &mut Vec<rig::completion::message::Message>,
-        assistant_contents: &mut Vec<rig::completion::message::AssistantContent>,
-        assistant_execution_id: &mut Option<String>,
-    ) {
-        if assistant_contents.is_empty() {
-            return;
-        }
-        messages.push(rig::completion::message::Message::Assistant {
-            id: None,
-            content: rig::OneOrMany::many(std::mem::take(assistant_contents))
-                .expect("assistant content buffer is non-empty"),
-        });
-        *assistant_execution_id = None;
+fn rig_messages_from_nodes(nodes: &[coco_mem::Node]) -> Vec<rig::completion::message::Message> {
+    let mut builder = ProviderHistoryBuilder::default();
+
+    for node in nodes {
+        builder.apply_node(node);
     }
 
-    fn flush_tool_results(
-        messages: &mut Vec<rig::completion::message::Message>,
-        tool_results: &mut Vec<rig::completion::message::UserContent>,
-        tool_result_execution_id: &mut Option<String>,
-    ) {
-        if tool_results.is_empty() {
-            return;
-        }
-        messages.push(rig::completion::message::Message::User {
-            content: rig::OneOrMany::many(std::mem::take(tool_results))
-                .expect("tool result buffer is non-empty"),
-        });
-        *tool_result_execution_id = None;
-    }
+    builder.finish()
+}
 
-    let mut messages = Vec::new();
-    let mut assistant_contents = Vec::new();
-    let mut assistant_execution_id = None;
-    let mut tool_results = Vec::new();
-    let mut tool_result_execution_id = None;
+#[derive(Default)]
+struct ProviderHistoryBuilder {
+    messages: Vec<rig::completion::message::Message>,
+    assistant_contents: Vec<rig::completion::message::AssistantContent>,
+    assistant_execution_id: Option<String>,
+    tool_results: Vec<rig::completion::message::UserContent>,
+    tool_result_execution_id: Option<String>,
+    session_prompt_message_index: Option<usize>,
+}
 
-    for tracked_entry in entries {
-        let execution_id = tracked_entry
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.execution_id.clone());
-        match &tracked_entry.entry {
-            ConversationEntry::Message(message) => match message.role {
-                MessageRole::User => {
-                    flush_assistant_contents(
-                        &mut messages,
-                        &mut assistant_contents,
-                        &mut assistant_execution_id,
-                    );
-                    flush_tool_results(
-                        &mut messages,
-                        &mut tool_results,
-                        &mut tool_result_execution_id,
-                    );
-                    messages.push(rig::completion::message::Message::user(
-                        message.text.clone(),
-                    ));
-                }
-                MessageRole::Assistant => {
-                    flush_tool_results(
-                        &mut messages,
-                        &mut tool_results,
-                        &mut tool_result_execution_id,
-                    );
-                    if !assistant_contents.is_empty() && assistant_execution_id != execution_id {
-                        flush_assistant_contents(
-                            &mut messages,
-                            &mut assistant_contents,
-                            &mut assistant_execution_id,
-                        );
+impl ProviderHistoryBuilder {
+    fn apply_node(&mut self, node: &coco_mem::Node) {
+        match &node.kind {
+            Kind::Anchor(anchor) => match &anchor.payload {
+                AnchorPayload::Session(session) => self.push_session_prompt(&session.prompt),
+                AnchorPayload::SessionPatch(patch) => {
+                    if let Some(prompt) = &patch.prompt {
+                        self.update_session_prompt(prompt);
                     }
-                    assistant_execution_id = execution_id.clone();
-                    assistant_contents
-                        .push(rig::message::AssistantContent::text(message.text.clone()));
+                }
+                AnchorPayload::Prompt(prompt) => self.push_user_text(&prompt.prompt),
+                AnchorPayload::SkillResult(result) => {
+                    self.push_tool_result(node.metadata.as_ref(), &result.tool_id, &result.output)
                 }
             },
-            ConversationEntry::ToolUse(tool_use) => {
-                flush_tool_results(
-                    &mut messages,
-                    &mut tool_results,
-                    &mut tool_result_execution_id,
-                );
-                if !assistant_contents.is_empty() && assistant_execution_id != execution_id {
-                    flush_assistant_contents(
-                        &mut messages,
-                        &mut assistant_contents,
-                        &mut assistant_execution_id,
-                    );
-                }
-                assistant_execution_id = execution_id.clone();
-                let call_id = tracked_entry
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.call_id.clone());
-                assistant_contents.push(rig_tool_call_content(
-                    tool_use.id.clone(),
-                    call_id,
-                    tool_use.name.clone(),
-                    tool_use.input.clone(),
-                ));
+            Kind::Text(text) => match node.role {
+                Role::User => self.push_user_text(text),
+                Role::LLM => self.push_assistant_text(node.metadata.as_ref(), text),
+                Role::System => {}
+            },
+            Kind::ToolUse(tool_use) => self.push_tool_use(node.metadata.as_ref(), tool_use),
+            Kind::ToolResult(tool_result) => {
+                self.push_tool_result(node.metadata.as_ref(), &tool_result.id, &tool_result.output)
             }
-            ConversationEntry::ToolResult(tool_result) => {
-                flush_assistant_contents(
-                    &mut messages,
-                    &mut assistant_contents,
-                    &mut assistant_execution_id,
-                );
-                if !tool_results.is_empty() && tool_result_execution_id != execution_id {
-                    flush_tool_results(
-                        &mut messages,
-                        &mut tool_results,
-                        &mut tool_result_execution_id,
-                    );
-                }
-                tool_result_execution_id = execution_id;
-                let content = rig::OneOrMany::one(
-                    rig::completion::message::ToolResultContent::text(tool_result.output.clone()),
-                );
-                let call_id = tracked_entry
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.call_id.clone());
-                tool_results.push(rig_tool_result_content(
-                    tool_result.id.clone(),
-                    call_id,
-                    content,
-                ));
-            }
+            Kind::Failure(_) => {}
         }
     }
 
-    flush_assistant_contents(
-        &mut messages,
-        &mut assistant_contents,
-        &mut assistant_execution_id,
-    );
-    flush_tool_results(
-        &mut messages,
-        &mut tool_results,
-        &mut tool_result_execution_id,
-    );
+    fn push_session_prompt(&mut self, prompt: &str) {
+        if prompt.is_empty() {
+            self.session_prompt_message_index = None;
+            return;
+        }
 
-    messages
+        self.push_user_text(prompt);
+        self.session_prompt_message_index = Some(
+            self.messages
+                .len()
+                .checked_sub(1)
+                .expect("session prompt push should append a message"),
+        );
+    }
+
+    fn update_session_prompt(&mut self, prompt: &str) {
+        match (self.session_prompt_message_index, prompt.is_empty()) {
+            (Some(index), true) => {
+                self.messages.remove(index);
+                self.session_prompt_message_index = None;
+            }
+            (Some(index), false) => {
+                self.messages[index] = rig::completion::message::Message::user(prompt.to_owned());
+            }
+            (None, true) => {}
+            (None, false) => self.push_session_prompt(prompt),
+        }
+    }
+
+    fn push_user_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        self.flush_assistant_contents();
+        self.flush_tool_results();
+        self.messages
+            .push(rig::completion::message::Message::user(text.to_owned()));
+    }
+
+    fn push_assistant_text(&mut self, metadata: Option<&BackendMetadata>, text: &str) {
+        self.flush_tool_results();
+        let execution_id = metadata.and_then(|metadata| metadata.execution_id.clone());
+        if !self.assistant_contents.is_empty() && self.assistant_execution_id != execution_id {
+            self.flush_assistant_contents();
+        }
+        self.assistant_execution_id = execution_id;
+        self.assistant_contents
+            .push(rig::message::AssistantContent::text(text.to_owned()));
+    }
+
+    fn push_tool_use(&mut self, metadata: Option<&BackendMetadata>, tool_use: &ToolUse) {
+        self.flush_tool_results();
+        let execution_id = metadata.and_then(|metadata| metadata.execution_id.clone());
+        if !self.assistant_contents.is_empty() && self.assistant_execution_id != execution_id {
+            self.flush_assistant_contents();
+        }
+        self.assistant_execution_id = execution_id;
+        let call_id = metadata.and_then(|metadata| metadata.call_id.clone());
+        self.assistant_contents.push(rig_tool_call_content(
+            tool_use.id.clone(),
+            call_id,
+            tool_use.name.clone(),
+            tool_use.input.clone(),
+        ));
+    }
+
+    fn push_tool_result(&mut self, metadata: Option<&BackendMetadata>, id: &str, output: &str) {
+        self.flush_assistant_contents();
+        let execution_id = metadata.and_then(|metadata| metadata.execution_id.clone());
+        if !self.tool_results.is_empty() && self.tool_result_execution_id != execution_id {
+            self.flush_tool_results();
+        }
+        self.tool_result_execution_id = execution_id;
+        let content = rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
+            output.to_owned(),
+        ));
+        let call_id = metadata.and_then(|metadata| metadata.call_id.clone());
+        self.tool_results
+            .push(rig_tool_result_content(id.to_owned(), call_id, content));
+    }
+
+    fn finish(mut self) -> Vec<rig::completion::message::Message> {
+        self.flush_assistant_contents();
+        self.flush_tool_results();
+        self.messages
+    }
+
+    fn flush_assistant_contents(&mut self) {
+        if self.assistant_contents.is_empty() {
+            return;
+        }
+
+        self.messages
+            .push(rig::completion::message::Message::Assistant {
+                id: None,
+                content: rig::OneOrMany::many(std::mem::take(&mut self.assistant_contents))
+                    .expect("assistant content buffer is non-empty"),
+            });
+        self.assistant_execution_id = None;
+    }
+
+    fn flush_tool_results(&mut self) {
+        if self.tool_results.is_empty() {
+            return;
+        }
+
+        self.messages.push(rig::completion::message::Message::User {
+            content: rig::OneOrMany::many(std::mem::take(&mut self.tool_results))
+                .expect("tool result buffer is non-empty"),
+        });
+        self.tool_result_execution_id = None;
+    }
 }
 
 fn push_assistant_text_event(buffer: &mut Vec<String>, events: &mut Vec<BackendEvent>) {
@@ -3609,14 +3565,40 @@ mod tests {
         crate::builtin_tool_definition("exec_command").expect("builtin tool should exist")
     }
 
-    fn text_messages_from_entries(entries: &[ConversationEntry]) -> Vec<ConversationMessage> {
-        entries
-            .iter()
-            .filter_map(|entry| match entry {
-                ConversationEntry::Message(message) => Some(message.clone()),
-                ConversationEntry::ToolUse(_) | ConversationEntry::ToolResult(_) => None,
-            })
-            .collect()
+    fn text_messages_from_provider_history(
+        messages: &[rig::completion::message::Message],
+    ) -> Vec<(Role, String)> {
+        let mut text_messages = Vec::new();
+
+        for message in messages {
+            match message {
+                rig::completion::message::Message::User { content } => {
+                    text_messages.extend(content.iter().filter_map(|content| match content {
+                        rig::completion::message::UserContent::Text(text) => {
+                            Some((Role::User, text.text.clone()))
+                        }
+                        rig::completion::message::UserContent::ToolResult(_)
+                        | rig::completion::message::UserContent::Image(_)
+                        | rig::completion::message::UserContent::Audio(_)
+                        | rig::completion::message::UserContent::Video(_)
+                        | rig::completion::message::UserContent::Document(_) => None,
+                    }));
+                }
+                rig::completion::message::Message::Assistant { content, .. } => {
+                    text_messages.extend(content.iter().filter_map(|content| match content {
+                        rig::completion::message::AssistantContent::Text(text) => {
+                            Some((Role::LLM, text.text.clone()))
+                        }
+                        rig::completion::message::AssistantContent::ToolCall(_)
+                        | rig::completion::message::AssistantContent::Reasoning(_)
+                        | rig::completion::message::AssistantContent::Image(_) => None,
+                    }));
+                }
+                rig::completion::message::Message::System { .. } => {}
+            }
+        }
+
+        text_messages
     }
 
     #[test]
@@ -3639,6 +3621,19 @@ mod tests {
             .maybe_execution(execution.as_ref())
             .maybe_provider(provider.as_ref())
             .build()
+    }
+
+    fn context_node(role: Role, metadata: Option<BackendMetadata>, kind: Kind) -> coco_mem::Node {
+        let store = MemoryStore::new();
+        let id = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role,
+                metadata,
+                kind,
+            })
+            .expect("test node should be appended");
+        store.get_node(&id).expect("test node should exist")
     }
 
     fn execution(execution_id: &str) -> ExecutionMetadata {
@@ -3956,29 +3951,150 @@ mod tests {
         assert_eq!(result.text, "second");
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            text_messages_from_entries(&session.conversation),
+            text_messages_from_provider_history(&session.provider_history),
             vec![
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "Conversation start.".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "round one".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "first".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "round two".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "second".to_owned(),
-                },
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "round one".to_owned()),
+                (Role::LLM, "first".to_owned()),
+                (Role::User, "round two".to_owned()),
+                (Role::LLM, "second".to_owned()),
             ]
+        );
+    }
+
+    async fn skill_child_context_fixture() -> (LlmService<FakeBackend, MemoryStore>, String) {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
+        let base_session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let prompt_id = store
+            .append(NewNode {
+                parent: base_session.anchor_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![],
+                    PromptAnchor {
+                        prompt: "Delegate twice.".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        let use_skill_id = store
+            .append(NewNode {
+                parent: prompt_id,
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::ToolUse(ToolUse {
+                    id: "tool-call-1".to_owned(),
+                    name: "use_skill".to_owned(),
+                    input: serde_json::json!({"name": "fast-rust"}),
+                }),
+            })
+            .unwrap();
+        let child_config = session_config("child");
+        let child_prompt = "You are executing the skill `fast-rust` on an isolated child branch.";
+        let child_anchor_id = store
+            .append(NewNode {
+                parent: use_skill_id,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(
+                    vec![],
+                    SessionAnchor {
+                        role: SessionRole::Runner,
+                        provider_profile: child_config.provider_profile,
+                        provider: Some(child_config.provider.as_str().to_owned()),
+                        model: child_config.model,
+                        tools: child_config.tools,
+                        system_prompt: child_config.system_prompt,
+                        prompt: child_prompt.to_owned(),
+                        temperature: child_config.temperature,
+                        max_tokens: child_config.max_tokens,
+                        additional_params: child_config.additional_params,
+                        enable_coco_shim: child_config.enable_coco_shim,
+                        active_skill: None,
+                    },
+                )),
+            })
+            .unwrap();
+        store.fork("child", &child_anchor_id).unwrap();
+
+        (service, child_prompt.to_owned())
+    }
+
+    #[tokio::test]
+    async fn context_reconstruction_orders_skill_prompt_after_inherited_history() {
+        let (service, child_prompt) = skill_child_context_fixture().await;
+        let session = service.resolve_session("child").unwrap();
+
+        assert_eq!(
+            text_messages_from_provider_history(&session.provider_history),
+            vec![
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "Delegate twice.".to_owned()),
+                (Role::User, child_prompt.to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn context_reconstruction_skips_use_skill_that_created_skill_session() {
+        let (service, _) = skill_child_context_fixture().await;
+        let session = service.resolve_session("child").unwrap();
+
+        assert_eq!(
+            session
+                .provider_history
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        rig::completion::message::Message::Assistant { content, .. }
+                            if content.iter().any(|content| matches!(
+                                content,
+                                rig::completion::message::AssistantContent::ToolCall(_)
+                            ))
+                    )
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn context_reconstruction_updates_session_prompt_in_place() {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
+        let session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let patch_id = store
+            .append(NewNode {
+                parent: session.anchor_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session_patch(
+                    vec![],
+                    SessionConfigPatch {
+                        prompt: Some("Updated start.".to_owned()),
+                        ..SessionConfigPatch::default()
+                    },
+                )),
+            })
+            .unwrap();
+        store
+            .set_branch_head("main", &session.anchor_id, &patch_id)
+            .unwrap();
+
+        let session = service.resolve_session("main").unwrap();
+
+        assert_eq!(
+            text_messages_from_provider_history(&session.provider_history),
+            vec![(Role::User, "Updated start.".to_owned())]
         );
     }
 
@@ -4029,16 +4145,10 @@ mod tests {
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            text_messages_from_entries(&session.conversation),
+            text_messages_from_provider_history(&session.provider_history),
             vec![
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "Conversation start.".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "retry me".to_owned(),
-                },
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "retry me".to_owned()),
             ]
         );
     }
@@ -4082,28 +4192,13 @@ mod tests {
         assert_eq!(session.config.model, "gpt-4.1-mini");
         assert_eq!(session.config.system_prompt, "You are helpful.");
         assert_eq!(
-            text_messages_from_entries(&session.conversation),
+            text_messages_from_provider_history(&session.provider_history),
             vec![
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "Conversation start.".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "main question".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "main answer".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "merge them".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "merge answer".to_owned(),
-                },
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "main question".to_owned()),
+                (Role::LLM, "main answer".to_owned()),
+                (Role::User, "merge them".to_owned()),
+                (Role::LLM, "merge answer".to_owned()),
             ]
         );
 
@@ -4165,24 +4260,12 @@ mod tests {
         assert_eq!(calls[1].0.config.role, SessionRole::Runner);
         assert_eq!(calls[1].0.config.tools, vec![exec_tool.clone()]);
         assert_eq!(
-            text_messages_from_entries(&calls[1].0.conversation),
+            text_messages_from_provider_history(&calls[1].0.provider_history),
             vec![
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "Conversation start.".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "keep this".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "main answer".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "run date".to_owned(),
-                },
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "keep this".to_owned()),
+                (Role::LLM, "main answer".to_owned()),
+                (Role::User, "run date".to_owned()),
             ]
         );
         drop(calls);
@@ -4267,20 +4350,11 @@ mod tests {
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            text_messages_from_entries(&session.conversation),
+            text_messages_from_provider_history(&session.provider_history),
             vec![
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "Conversation start.".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "new prompt".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "prompted".to_owned(),
-                },
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "new prompt".to_owned()),
+                (Role::LLM, "prompted".to_owned()),
             ]
         );
     }
@@ -4323,16 +4397,10 @@ mod tests {
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            text_messages_from_entries(&session.conversation),
+            text_messages_from_provider_history(&session.provider_history),
             vec![
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "Conversation start.".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "retry prompt".to_owned(),
-                },
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "retry prompt".to_owned()),
             ]
         );
 
@@ -5034,104 +5102,81 @@ mod tests {
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            text_messages_from_entries(&session.conversation),
+            text_messages_from_provider_history(&session.provider_history),
             vec![
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "Conversation start.".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "list files".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "done".to_owned(),
-                },
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "list files".to_owned()),
+                (Role::LLM, "done".to_owned()),
             ]
         );
-        assert_eq!(
-            session.conversation,
-            vec![
-                ConversationEntry::Message(ConversationMessage {
-                    role: MessageRole::User,
-                    text: "Conversation start.".to_owned(),
-                }),
-                ConversationEntry::Message(ConversationMessage {
-                    role: MessageRole::User,
-                    text: "list files".to_owned(),
-                }),
-                ConversationEntry::ToolUse(ToolUse {
-                    id: "tool-call-1".to_owned(),
-                    name: "exec_command".to_owned(),
-                    input: serde_json::json!({"cmd": "rg --files"}),
-                }),
-                ConversationEntry::ToolResult(ToolResult {
-                    id: "tool-call-1".to_owned(),
-                    output: "Cargo.toml".to_owned(),
-                }),
-                ConversationEntry::Message(ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "done".to_owned(),
-                }),
-            ]
-        );
+        assert!(matches!(
+            &session.provider_history[2],
+            rig::completion::message::Message::Assistant { content, .. }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::AssistantContent::ToolCall(tool_call)
+                        if tool_call.id == "tool-call-1"
+                )
+        ));
+        assert!(matches!(
+            &session.provider_history[3],
+            rig::completion::message::Message::User { content }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::UserContent::ToolResult(tool_result)
+                        if tool_result.id == "tool-call-1"
+                )
+        ));
     }
 
     #[test]
-    fn rig_messages_from_entries_groups_tool_calls_and_results_by_turn() {
-        let messages = rig_messages_from_tracked_entries(&[
-            ConversationTraceEntry {
-                metadata: None,
-                entry: ConversationEntry::Message(ConversationMessage {
-                    role: MessageRole::User,
-                    text: "list files".to_owned(),
-                }),
-            },
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-1"), None),
-                entry: ConversationEntry::Message(ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "checking".to_owned(),
-                }),
-            },
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-1"), Some("call-1")),
-                entry: ConversationEntry::ToolUse(ToolUse {
+    fn rig_messages_from_nodes_groups_tool_calls_and_results_by_turn() {
+        let messages = rig_messages_from_nodes(&[
+            context_node(Role::User, None, Kind::Text("list files".to_owned())),
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), None),
+                Kind::Text("checking".to_owned()),
+            ),
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), Some("call-1")),
+                Kind::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "ls"}),
                 }),
-            },
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-1"), Some("call-2")),
-                entry: ConversationEntry::ToolUse(ToolUse {
+            ),
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), Some("call-2")),
+                Kind::ToolUse(ToolUse {
                     id: "tool-call-2".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
                 }),
-            },
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-1"), Some("call-1")),
-                entry: ConversationEntry::ToolResult(ToolResult {
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), Some("call-1")),
+                Kind::ToolResult(ToolResult {
                     id: "tool-call-1".to_owned(),
                     output: "Cargo.toml".to_owned(),
                 }),
-            },
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-1"), Some("call-2")),
-                entry: ConversationEntry::ToolResult(ToolResult {
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), Some("call-2")),
+                Kind::ToolResult(ToolResult {
                     id: "tool-call-2".to_owned(),
                     output: "/tmp".to_owned(),
                 }),
-            },
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-2"), None),
-                entry: ConversationEntry::Message(ConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: "done".to_owned(),
-                }),
-            },
+            ),
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-2"), None),
+                Kind::Text("done".to_owned()),
+            ),
         ]);
 
         assert_eq!(messages.len(), 4);
@@ -5199,23 +5244,25 @@ mod tests {
     }
 
     #[test]
-    fn rig_messages_from_entries_preserves_call_id() {
-        let messages = rig_messages_from_tracked_entries(&[
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-1"), Some("call-legacy")),
-                entry: ConversationEntry::ToolUse(ToolUse {
+    fn rig_messages_from_nodes_preserves_call_id() {
+        let messages = rig_messages_from_nodes(&[
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), Some("call-legacy")),
+                Kind::ToolUse(ToolUse {
                     id: "tool-call-legacy".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
                 }),
-            },
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-1"), Some("call-legacy")),
-                entry: ConversationEntry::ToolResult(ToolResult {
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), Some("call-legacy")),
+                Kind::ToolResult(ToolResult {
                     id: "tool-call-legacy".to_owned(),
                     output: "/tmp".to_owned(),
                 }),
-            },
+            ),
         ]);
 
         assert!(matches!(
@@ -5241,23 +5288,25 @@ mod tests {
     }
 
     #[test]
-    fn rig_messages_from_entries_omits_call_id_when_absent() {
-        let messages = rig_messages_from_tracked_entries(&[
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-1"), None),
-                entry: ConversationEntry::ToolUse(ToolUse {
+    fn rig_messages_from_nodes_omits_call_id_when_absent() {
+        let messages = rig_messages_from_nodes(&[
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), None),
+                Kind::ToolUse(ToolUse {
                     id: "tool-call-legacy".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
                 }),
-            },
-            ConversationTraceEntry {
-                metadata: metadata(Some("execution-1"), None),
-                entry: ConversationEntry::ToolResult(ToolResult {
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), None),
+                Kind::ToolResult(ToolResult {
                     id: "tool-call-legacy".to_owned(),
                     output: "/tmp".to_owned(),
                 }),
-            },
+            ),
         ]);
 
         assert!(matches!(
@@ -5504,16 +5553,10 @@ mod tests {
 
         let session = service.resolve_session("main").unwrap();
         assert_eq!(
-            text_messages_from_entries(&session.conversation),
+            text_messages_from_provider_history(&session.provider_history),
             vec![
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "Conversation start.".to_owned(),
-                },
-                ConversationMessage {
-                    role: MessageRole::User,
-                    text: "keep going".to_owned(),
-                },
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "keep going".to_owned()),
             ]
         );
     }
