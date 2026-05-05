@@ -608,7 +608,7 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
 
 fn skill_handoff_completion_instruction(request: &SkillToolRequest) -> &'static str {
     if request.handoff.is_some() {
-        "Return the final result for the caller. The parent run will terminate with this skill result."
+        "Return the final result for the caller as a normal tool result. The parent model will inspect it before it continues."
     } else {
         "Return a normal tool result for the parent model to inspect before it continues."
     }

@@ -172,7 +172,8 @@ impl CompletionBackend for UseSkillBackend {
                         "function": {
                             "name": "use_skill",
                             "arguments": {
-                                "name": "fast-rust"
+                                "name": "fast-rust",
+                                "handoff": "Review the delegated Rust change."
                             }
                         },
                         "signature": null,
@@ -1106,7 +1107,10 @@ async fn prompt_wires_skill_executor_for_use_skill() {
         .as_ref()
         .expect("expected active skill metadata");
     assert_eq!(active_skill.name, "fast-rust");
-    assert_eq!(active_skill.handoff, None);
+    assert_eq!(
+        active_skill.handoff.as_deref(),
+        Some("Review the delegated Rust change.")
+    );
     assert!(
         child_session_anchor
             .1

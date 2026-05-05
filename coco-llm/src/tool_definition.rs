@@ -98,7 +98,7 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                     },
                     "handoff": {
                         "type": "string",
-                        "description": "Optional explicit handoff content for a bounded skill run. When present, the skill child session does not inherit the parent conversation history and the parent run terminates with the skill result. When omitted, the skill inherits parent context and returns a normal tool result for the parent model to continue."
+                        "description": "Optional explicit handoff content for a bounded skill run. When present, the skill child session does not inherit the parent conversation history and uses this content as its bounded task. When omitted, the skill inherits parent context. In both cases, the skill output returns as a normal tool result for the parent model to inspect before it continues."
                     }
                 },
                 "required": ["name"],

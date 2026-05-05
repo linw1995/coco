@@ -214,22 +214,11 @@ impl SkillToolRuntime {
                     parent_tool_use_id,
                     args,
                 )?;
-                let skill_name = request.skill_name.clone();
-                let handoff = request.handoff.clone();
                 match context.skill_executor.execute_skill_tool(request).await {
                     Ok(result) => {
                         let output = serde_json::to_string_pretty(&result.result)
                             .context(SerializeOutputSnafu)?;
-                        if handoff.is_some() {
-                            Ok(ToolExecutionOutcome::skill_handoff_result(
-                                skill_name,
-                                output,
-                                result.response_node_id,
-                                result.result.text,
-                            ))
-                        } else {
-                            Ok(ToolExecutionOutcome::tool_result(output))
-                        }
+                        Ok(ToolExecutionOutcome::tool_result(output))
                     }
                     Err(error) => Ok(ToolExecutionOutcome::tool_result(error.to_string())),
                 }
@@ -393,10 +382,7 @@ mod tests {
             .await
             .unwrap();
         let requests = use_requests.lock().await;
-        let ToolExecutionOutcome::ToolResult { provider_output } = outcome else {
-            panic!("expected regular tool result without handoff");
-        };
-        let value: Value = serde_json::from_str(&provider_output).unwrap();
+        let value: Value = serde_json::from_str(outcome.provider_output()).unwrap();
 
         assert_eq!(value.as_object().expect("expected JSON object").len(), 1);
         assert_eq!(value["text"], "Executed skill result");
@@ -413,7 +399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn use_skill_runtime_passes_string_handoff_as_terminal_result() {
+    async fn use_skill_runtime_passes_string_handoff_as_tool_result() {
         let use_requests = Arc::new(Mutex::new(Vec::new()));
         let executor = Arc::new(FakeExecutor {
             search_requests: Arc::new(Mutex::new(Vec::new())),
@@ -435,21 +421,9 @@ mod tests {
             .await
             .unwrap();
         let requests = use_requests.lock().await;
-        let ToolExecutionOutcome::SkillResult {
-            skill_name,
-            provider_output,
-            merge_parent,
-            terminal_text,
-        } = outcome
-        else {
-            panic!("expected handoff use_skill to return a terminal skill result");
-        };
-        let value: Value = serde_json::from_str(&provider_output).unwrap();
+        let value: Value = serde_json::from_str(outcome.provider_output()).unwrap();
 
         assert_eq!(value["text"], "Executed skill result");
-        assert_eq!(skill_name, "find-skills");
-        assert_eq!(merge_parent, "child-response-node");
-        assert_eq!(terminal_text.as_deref(), Some("Executed skill result"));
         assert_eq!(
             requests[0].handoff.as_deref(),
             Some("Summarize the docs decision.")
@@ -546,10 +520,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let ToolExecutionOutcome::ToolResult { provider_output } = outcome else {
-            panic!("expected tool result outcome");
-        };
 
-        assert_eq!(provider_output, "delegated failure");
+        assert_eq!(outcome.provider_output(), "delegated failure");
     }
 }

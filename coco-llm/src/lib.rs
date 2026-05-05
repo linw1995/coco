@@ -313,15 +313,7 @@ pub(crate) struct ToolInvocationContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolExecutionOutcome {
-    ToolResult {
-        provider_output: String,
-    },
-    SkillResult {
-        skill_name: String,
-        provider_output: String,
-        merge_parent: String,
-        terminal_text: Option<String>,
-    },
+    ToolResult { provider_output: String },
 }
 
 impl ToolExecutionOutcome {
@@ -331,38 +323,9 @@ impl ToolExecutionOutcome {
         }
     }
 
-    pub fn skill_handoff_result(
-        skill_name: impl Into<String>,
-        provider_output: impl Into<String>,
-        merge_parent: impl Into<String>,
-        terminal_text: impl Into<String>,
-    ) -> Self {
-        Self::SkillResult {
-            skill_name: skill_name.into(),
-            provider_output: provider_output.into(),
-            merge_parent: merge_parent.into(),
-            terminal_text: Some(terminal_text.into()),
-        }
-    }
-
     pub fn provider_output(&self) -> &str {
         match self {
-            Self::ToolResult {
-                provider_output, ..
-            }
-            | Self::SkillResult {
-                provider_output, ..
-            } => provider_output,
-        }
-    }
-
-    pub fn terminal_text(&self) -> Option<&str> {
-        match self {
-            Self::SkillResult {
-                terminal_text: Some(text),
-                ..
-            } => Some(text),
-            Self::ToolResult { .. } | Self::SkillResult { .. } => None,
+            Self::ToolResult { provider_output } => provider_output,
         }
     }
 
@@ -370,17 +333,6 @@ impl ToolExecutionOutcome {
         let event = match self {
             Self::ToolResult { provider_output } => BackendEventPayload::ToolResult(ToolResult {
                 id: tool_id,
-                output: provider_output,
-            }),
-            Self::SkillResult {
-                skill_name,
-                provider_output,
-                merge_parent,
-                ..
-            } => BackendEventPayload::SkillResult(SkillResultEvent {
-                tool_id,
-                skill_name,
-                merge_parent,
                 output: provider_output,
             }),
         };
@@ -2767,7 +2719,6 @@ struct StepState {
 struct ToolCallExecution {
     event: BackendEvent,
     tool_result: rig::completion::message::UserContent,
-    terminal_text: Option<String>,
 }
 
 enum RunControl {
@@ -2928,7 +2879,6 @@ impl CompletionRunner {
             )
             .await?;
         let provider_output = outcome.provider_output().to_owned();
-        let terminal_text = outcome.terminal_text().map(str::to_owned);
         let call_id = tool_call.call_id.clone();
         let event = outcome.into_backend_event(tool_call.id.clone(), call_id.clone());
         if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
@@ -2948,7 +2898,6 @@ impl CompletionRunner {
                     provider_output,
                 )),
             ),
-            terminal_text,
         })
     }
 
@@ -2968,30 +2917,6 @@ impl CompletionRunner {
             let execution = self.execute_tool_call(&next_execution, tool_call).await?;
             next_events.push(execution.event);
             tool_results.push(execution.tool_result);
-            if let Some(text) = execution.terminal_text {
-                let assistant_event: BackendEvent =
-                    BackendEventPayload::AssistantText(text.clone()).into();
-                if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
-                    self.head = Some(append_backend_event(
-                        trace_node_appender,
-                        &next_execution,
-                        assistant_event.clone(),
-                    )?);
-                }
-                next_events.push(assistant_event);
-                self.steps.push(BackendStep {
-                    execution: state.execution,
-                    events: state.step_events,
-                });
-                self.steps.push(BackendStep {
-                    execution: next_execution,
-                    events: next_events,
-                });
-                return Ok(RunControl::Completed(
-                    BackendRun::succeeded_with_steps(text, std::mem::take(&mut self.steps))
-                        .with_head(self.head.take()),
-                ));
-            }
         }
 
         self.steps.push(BackendStep {
