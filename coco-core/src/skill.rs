@@ -556,7 +556,8 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         "
         You are executing the skill `{}` on an isolated child branch forked from `{}`.
         Follow the skill instructions below and do all exploration on this child branch only.
-        When finished, return only the final result that should be sent back to the caller.
+        When finished, return final text that summarizes the process and outcome for the caller.
+        Skills are usually single-task. If the caller's request required handling multiple distinct tasks, include a concise multi-task summary in the final text that lists each task, what was done, and its outcome.
 
         Skill description:
         {}
@@ -844,6 +845,9 @@ mod tests {
 
         assert!(prompt.contains("skill `find-skills`"));
         assert!(prompt.contains("forked from `main`"));
+        assert!(prompt.contains("summarizes the process and outcome"));
+        assert!(prompt.contains("Skills are usually single-task."));
+        assert!(prompt.contains("include a concise multi-task summary"));
         assert!(prompt.contains("Skill description:\nFind relevant skills."));
         assert!(prompt.contains("Skill source:\n/tmp/find-skills/SKILL.md"));
         assert!(prompt.contains("Skill session role:\nrunner"));

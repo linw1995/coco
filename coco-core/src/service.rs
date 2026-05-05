@@ -120,16 +120,17 @@ fn channel_prompt(message: &InboundMessage, text: &str) -> String {
         - chat_id: {chat_id}
         - reply_to_message_id: {reply_to_message_id}
 
-        Task policy:
-        - Treat the incoming message as the user's task request, not as text to acknowledge.
-        - Complete the requested work using the available tools before sending the final Telegram reply.
-        - Use `telegram` only for Telegram delivery; do not delegate the user task itself to the Telegram skill.
+        Required response policy:
+        - Treat the incoming message as the user's actual request, not as text to acknowledge.
+        - Complete the requested work using any needed tools or skills before sending the final Telegram reply.
+        - Use the `telegram` skill only for Telegram delivery; do not delegate the user task itself to the `telegram` skill.
         - If the work is long-running, you may send one progress update through the `telegram` skill, then continue working.
-        - Send the final user-facing result by calling the `telegram` skill through `use_skill`.
-        - Use the target chat_id and reply_to_message_id above for the first Telegram reply.
-        - After the final Telegram skill call completes, return a short local completion note such as `Telegram task completed.`.
+        - Call the `telegram` skill through `use_skill` for the final user-facing reply only after the reply content is ready to send.
+        - Use the target chat_id and reply_to_message_id above for the first Telegram message; if you send no progress update, the final reply is that first message.
+        - Do not use the `telegram` skill merely to acknowledge the request unless the incoming message only asks for acknowledgement.
         - Do not finish after an acknowledgement-only Telegram reply unless the incoming message only asked for acknowledgement.
-        - Do not put the user-facing Telegram reply only in plain final text; it must be sent by the skill.
+        - Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.
+        - After the final Telegram skill call completes, return a local completion note. If you handled multiple distinct tasks, include a concise multi-task summary in that final text that lists each task and its outcome.
 
         Incoming message:
         {text}
