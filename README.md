@@ -24,6 +24,8 @@ The image starts `coco daemon serve` by default. It listens on port
 `17667`, stores CoCo config and runtime data under `/data`, and exposes
 `/workspace` as the isolated exec tool workspace.
 
+Skill data is persisted under `/data/skills`.
+
 ```bash
 mkdir -p .coco-data
 docker run --rm -it \

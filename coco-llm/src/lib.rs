@@ -18,7 +18,7 @@ use coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
     MergeParent, NewNode, NodeStore, PauseReason, PromptAnchor, ProviderMetadata, Role,
     RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
-    SkillRuntimeContext, StoreError, Tool, ToolResult, ToolUse,
+    StoreError, Tool, ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +44,8 @@ pub const COCO_COMMAND_SHIM_MODE_ENV: &str = "COCO_COMMAND_SHIM_MODE";
 pub const COCO_PARENT_TOOL_USE_ID_ENV: &str = "COCO_PARENT_TOOL_USE_ID";
 pub const COCO_SKILL_NAME_ENV: &str = "COCO_SKILL_NAME";
 pub const COCO_SKILL_DIR_ENV: &str = "COCO_SKILL_DIR";
+pub const COCO_SKILL_PERSIST_DIR_ENV: &str = "COCO_SKILL_PERSIST_DIR";
+pub const COCO_SKILL_PERSIST_ROOT_ENV: &str = "COCO_SKILL_PERSIST_ROOT";
 
 pub type CompletionMessage = rig::completion::message::Message;
 pub type CompletionToolCall = rig::completion::message::ToolCall;
@@ -189,6 +191,7 @@ pub struct CompletionRequest {
     pub origin: CompletionOrigin,
     pub input: CompletionInput,
     pub overrides: CompletionOverrides,
+    pub active_skill_runtime: Option<ActiveSkillRuntimeContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -594,11 +597,29 @@ impl Default for SkillToolExecutorHandle {
 }
 
 #[derive(Clone)]
+pub struct ActiveSkillRuntimeContext {
+    pub name: String,
+    pub directory: PathBuf,
+    pub persistent_directory: PathBuf,
+}
+
+impl std::fmt::Debug for ActiveSkillRuntimeContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActiveSkillRuntimeContext")
+            .field("name", &self.name)
+            .field("directory", &self.directory)
+            .field("persistent_directory", &self.persistent_directory)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct ToolRuntimeEnv {
     pub session_branch: String,
     pub session_role: SessionRole,
     pub current_skill_name: Option<String>,
-    pub active_skill: Option<SkillRuntimeContext>,
+    pub active_skill: Option<ActiveSkillRuntimeContext>,
     pub store_path: Option<PathBuf>,
     pub enable_coco_shim: bool,
     pub cli_bridge: UnifiedExecCliBridgeHandle,
@@ -1187,6 +1208,7 @@ where
                 session_patch: request.session_patch.map(Box::new),
             },
             overrides: CompletionOverrides::default(),
+            active_skill_runtime: None,
         })
         .await
     }
@@ -1229,7 +1251,11 @@ where
                 session_patch.as_deref(),
             )?,
         };
-        let session = self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
+        let mut session =
+            self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
+        if request.active_skill_runtime.is_some() {
+            session.tool_runtime_env.active_skill = request.active_skill_runtime.clone();
+        }
         tracing::info!(
             branch = %branch,
             original_head = %original_head,
@@ -1890,7 +1916,7 @@ where
                 session_branch: branch.to_owned(),
                 session_role: context.session_anchor.role,
                 current_skill_name: current_skill_name_from_prompt(&context.session_anchor.prompt),
-                active_skill: context.session_anchor.active_skill.clone(),
+                active_skill: None,
                 store_path: self.store.runtime_store_path(),
                 enable_coco_shim: context.session_anchor.enable_coco_shim,
                 cli_bridge: self.runtime.unified_exec_cli_bridge.clone(),
@@ -3533,6 +3559,7 @@ mod tests {
             origin: CompletionOrigin::BranchHead,
             input: CompletionInput::Continue,
             overrides: CompletionOverrides::default(),
+            active_skill_runtime: None,
         }
     }
 
@@ -4428,6 +4455,7 @@ mod tests {
                 origin: CompletionOrigin::Reference(first.response_node_id.clone()),
                 input: CompletionInput::Continue,
                 overrides: CompletionOverrides::default(),
+                active_skill_runtime: None,
             })
             .await
             .unwrap();
@@ -4463,6 +4491,7 @@ mod tests {
                     session_patch: None,
                 },
                 overrides: CompletionOverrides::default(),
+                active_skill_runtime: None,
             })
             .await
             .unwrap();

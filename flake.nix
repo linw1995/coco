@@ -134,6 +134,7 @@ rec {
                 "XDG_DATA_HOME=/data/.local/share"
                 "XDG_STATE_HOME=/data/.local/state"
                 "COCO_STORE_PATH=/data/.coco-store"
+                "COCO_SKILL_PERSIST_ROOT=/data/skills"
                 "COCO_LOG_DIR=/data/logs"
                 "COCO_LOG=info"
                 "COCO_EXEC_SANDBOX=nono"

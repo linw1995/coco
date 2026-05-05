@@ -21,8 +21,8 @@ use std::os::unix::ffi::OsStrExt;
 use crate::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_TOOL_USE_ID_ENV,
     COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_SKILL_DIR_ENV, COCO_SKILL_NAME_ENV,
-    COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse, ToolExecutionOutcome,
-    ToolInvocationContext, ToolRuntimeEnv,
+    COCO_SKILL_PERSIST_DIR_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
+    ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv,
 };
 
 #[derive(Debug, Clone)]
@@ -720,6 +720,14 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+fn current_active_skill_persistent_directory(request: &ExecCommandRequest) -> Option<&Path> {
+    request
+        .context
+        .active_skill
+        .as_ref()
+        .map(|active_skill| active_skill.persistent_directory.as_path())
+}
+
 fn uv_python_install_dir_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -895,7 +903,10 @@ struct SkillUvRuntimeDirs {
 
 impl SkillUvRuntimeDirs {
     fn created_dirs(&self) -> impl Iterator<Item = PathBuf> + '_ {
-        self.allow_paths.iter().cloned()
+        self.env_vars
+            .iter()
+            .map(|(_, path)| path.clone())
+            .chain(self.allow_paths.iter().cloned())
     }
 
     fn allow_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
@@ -913,22 +924,10 @@ impl SkillUvRuntimeDirs {
     }
 }
 
-fn configured_env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .filter(|path| path != Path::new("/"))
-}
-
-fn env_path_or(name: &str, fallback: PathBuf) -> PathBuf {
-    configured_env_path(name).unwrap_or(fallback)
-}
-
 fn prepare_skill_uv_runtime_dirs(
     workspace_root: &Path,
 ) -> std::result::Result<SkillUvRuntimeDirs, UnifiedExecToolError> {
-    let runtime_root = resolve_runtime_root(workspace_root)?;
+    let runtime_root = resolve_runtime_root(workspace_root)?.join("skill-runtime");
     let cache_home = env_path_or(XDG_CACHE_HOME_ENV, runtime_root.join(".cache"));
     let config_home = env_path_or(XDG_CONFIG_HOME_ENV, runtime_root.join(".config"));
     let data_home = env_path_or(XDG_DATA_HOME_ENV, runtime_root.join(".local").join("share"));
@@ -984,6 +983,18 @@ fn prepare_skill_uv_runtime_dirs(
         std::fs::create_dir_all(dir).context(CreateCocoCommandShimDirSnafu)?;
     }
     Ok(dirs)
+}
+
+fn configured_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| path != Path::new("/"))
+}
+
+fn env_path_or(name: &str, fallback: PathBuf) -> PathBuf {
+    configured_env_path(name).unwrap_or(fallback)
 }
 
 fn skill_uv_path_entries(
@@ -1488,13 +1499,17 @@ async fn execute_command(
     if let Some(runtime_server) = &runtime_server {
         extra_allow_paths.push(runtime_server.socket_dir.clone());
     }
-    let skill_uv_runtime_dirs = if request.context.active_skill.is_some() {
-        let runtime_dirs = prepare_skill_uv_runtime_dirs(&request.workspace_root)?;
-        extra_allow_paths.extend(runtime_dirs.allow_paths());
-        Some(runtime_dirs)
-    } else {
-        None
-    };
+    let active_skill_persistent_directory = current_active_skill_persistent_directory(&request);
+    let skill_uv_runtime_dirs =
+        if let Some(persistent_directory) = &active_skill_persistent_directory {
+            std::fs::create_dir_all(persistent_directory).context(CreateCocoCommandShimDirSnafu)?;
+            extra_allow_paths.push(persistent_directory.to_path_buf());
+            let runtime_dirs = prepare_skill_uv_runtime_dirs(&request.workspace_root)?;
+            extra_allow_paths.extend(runtime_dirs.allow_paths());
+            Some(runtime_dirs)
+        } else {
+            None
+        };
     if let Some(active_skill) = &request.context.active_skill {
         extra_allow_paths.push(active_skill.directory.clone());
     }
@@ -1539,6 +1554,7 @@ async fn execute_command(
         .env_remove(COCO_PARENT_TOOL_USE_ID_ENV)
         .env_remove(COCO_SKILL_NAME_ENV)
         .env_remove(COCO_SKILL_DIR_ENV)
+        .env_remove(COCO_SKILL_PERSIST_DIR_ENV)
         .env_remove(UV_CACHE_DIR_ENV)
         .env_remove(UV_PYTHON_INSTALL_DIR_ENV)
         .env_remove(COCO_COMMAND_SHIM_MODE_ENV);
@@ -1565,6 +1581,9 @@ async fn execute_command(
         command
             .env(COCO_SKILL_NAME_ENV, &active_skill.name)
             .env(COCO_SKILL_DIR_ENV, &active_skill.directory);
+        if let Some(persistent_directory) = &active_skill_persistent_directory {
+            command.env(COCO_SKILL_PERSIST_DIR_ENV, persistent_directory);
+        }
     }
     if let Some(skill_uv_runtime_dirs) = &skill_uv_runtime_dirs {
         command.env(
@@ -1676,6 +1695,7 @@ async fn execute_pty_command(
     command.env_remove(COCO_PARENT_TOOL_USE_ID_ENV);
     command.env_remove(COCO_SKILL_NAME_ENV);
     command.env_remove(COCO_SKILL_DIR_ENV);
+    command.env_remove(COCO_SKILL_PERSIST_DIR_ENV);
     command.env_remove(UV_CACHE_DIR_ENV);
     command.env_remove(UV_PYTHON_INSTALL_DIR_ENV);
     command.env_remove(COCO_COMMAND_SHIM_MODE_ENV);
@@ -1697,9 +1717,13 @@ async fn execute_pty_command(
             command.env(COCO_COMMAND_SHIM_MODE_ENV, "disabled");
         }
     }
+    let active_skill_persistent_directory = current_active_skill_persistent_directory(&request);
     if let Some(active_skill) = &request.context.active_skill {
         command.env(COCO_SKILL_NAME_ENV, &active_skill.name);
         command.env(COCO_SKILL_DIR_ENV, &active_skill.directory);
+        if let Some(persistent_directory) = &active_skill_persistent_directory {
+            command.env(COCO_SKILL_PERSIST_DIR_ENV, persistent_directory);
+        }
     }
     if let Some(skill_uv_runtime_dirs) = &skill_uv_runtime_dirs {
         command.env(
@@ -2557,8 +2581,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skill_uv_runtime_dirs_prefer_configured_xdg_homes() {
+    async fn skill_uv_runtime_dirs_prefer_configured_parent_env_paths() {
         let workspace = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let skill_persist_dir = tempfile::tempdir().unwrap();
         let cache_home = tempfile::tempdir().unwrap();
         let config_home = tempfile::tempdir().unwrap();
         let data_root = tempfile::tempdir().unwrap();
@@ -2568,6 +2594,7 @@ mod tests {
 
         let dirs = crate::with_process_env_async(
             &[
+                ("XDG_RUNTIME_DIR", Some(runtime_root.path().as_os_str())),
                 (XDG_CACHE_HOME_ENV, Some(cache_home.path().as_os_str())),
                 (XDG_CONFIG_HOME_ENV, Some(config_home.path().as_os_str())),
                 (XDG_DATA_HOME_ENV, Some(data_home.as_os_str())),
@@ -2583,6 +2610,7 @@ mod tests {
         .unwrap();
 
         let env_vars = dirs.env_vars().collect::<HashMap<_, _>>();
+        assert_eq!(env_vars.get(HOME_ENV), None);
         assert_eq!(
             env_vars.get(TMPDIR_ENV),
             Some(&cache_home.path().join("coco").join("tmp"))
@@ -2608,14 +2636,19 @@ mod tests {
         assert!(allow_paths.contains(&data_home.join("uv")));
         assert!(allow_paths.contains(&data_home.join("uv").join("python")));
         assert!(allow_paths.contains(&bin_home.path().to_path_buf()));
-        assert!(!allow_paths.contains(&data_root.path().join(".local").join("bin")));
+        assert!(allow_paths.contains(&state_home.path().to_path_buf()));
+        assert!(
+            !allow_paths
+                .iter()
+                .any(|path| path.starts_with(skill_persist_dir.path()))
+        );
 
         let path_entries = skill_uv_path_entries(None, &dirs);
         assert_eq!(path_entries.first(), Some(&bin_home.path().to_path_buf()));
     }
 
     #[tokio::test]
-    async fn skill_uv_runtime_dirs_ignore_relative_env_paths() {
+    async fn skill_uv_runtime_dirs_ignore_relative_parent_env_paths() {
         let workspace = tempfile::tempdir().unwrap();
         let runtime_root = tempfile::tempdir().unwrap();
 
@@ -2637,7 +2670,7 @@ mod tests {
         .unwrap();
 
         let env_vars = dirs.env_vars().collect::<HashMap<_, _>>();
-        let expected_runtime_root = runtime_root.path().join("coco");
+        let expected_runtime_root = runtime_root.path().join("coco").join("skill-runtime");
         assert_eq!(
             env_vars.get(TMPDIR_ENV),
             Some(
@@ -2820,6 +2853,12 @@ mod tests {
         let runtime_root = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
         let skill_dir = tempfile::tempdir().unwrap();
+        let skill_persist_dir = workspace
+            .path()
+            .join(".coco-workspace")
+            .join("skills")
+            .join("scripted")
+            .join("data");
         let observed_args = workspace.path().join("nono-args.txt");
         let bash_path = resolve_bash_path_locked().await;
         #[cfg(unix)]
@@ -2828,7 +2867,9 @@ mod tests {
         write_executable_script(
             &fake_bin.path().join("nono"),
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--\" ]; then\n    shift\n    break\n  fi\n  shift\ndone\nexec \"$@\"\n",
+                "#!/bin/sh\ncase \"${{HOME:-}}\" in \"{}\"|\"{}\"/*) echo 'nono state root overlaps active skill persistent data directory' >&2; exit 64;; esac\nprintf '%s\\n' \"$@\" > \"{}\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--\" ]; then\n    shift\n    break\n  fi\n  shift\ndone\nexec \"$@\"\n",
+                skill_persist_dir.display(),
+                skill_persist_dir.display(),
                 observed_args.display()
             ),
         );
@@ -2839,10 +2880,10 @@ mod tests {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Runner,
                 current_skill_name: Some("scripted".to_owned()),
-                active_skill: Some(coco_mem::SkillRuntimeContext {
+                active_skill: Some(crate::ActiveSkillRuntimeContext {
                     name: "scripted".to_owned(),
                     directory: skill_dir.path().to_path_buf(),
-                    scripts: vec!["scripts/inspect.py".to_owned()],
+                    persistent_directory: skill_persist_dir.clone(),
                 }),
                 store_path: None,
                 enable_coco_shim: false,
@@ -2890,6 +2931,7 @@ mod tests {
         let args = std::fs::read_to_string(&observed_args).unwrap();
         assert!(args.contains(&fake_bin.path().display().to_string()));
         assert!(args.contains(&skill_dir.path().display().to_string()));
+        assert!(args.contains(&skill_persist_dir.display().to_string()));
         assert!(args.contains("/.cache"));
         assert!(args.contains("/.config/uv"));
         assert!(args.contains("/.local/share/uv"));
@@ -2944,12 +2986,16 @@ mod tests {
                     COCO_PARENT_TOOL_USE_ID_ENV,
                     Some(OsStr::new("stale-tool-use")),
                 ),
+                (
+                    COCO_SKILL_PERSIST_DIR_ENV,
+                    Some(OsStr::new("/tmp/stale-skill-persist")),
+                ),
                 ("COCO_EXEC_SANDBOX", Some(OsStr::new("off"))),
             ],
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s' \"$COCO_BRANCH\" \"$COCO_SESSION_ROLE\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\" \"${{COCO_PARENT_TOOL_USE_ID:-}}\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s' \"$COCO_BRANCH\" \"$COCO_SESSION_ROLE\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\" \"${{COCO_PARENT_TOOL_USE_ID:-}}\" \"${{COCO_SKILL_PERSIST_DIR:-}}\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -2958,13 +3004,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(output.contains("stdout:\ndraft|runner|||"));
+        assert!(output.contains("stdout:\ndraft|runner||||"));
     }
 
     #[tokio::test]
     async fn exec_command_runtime_injects_active_skill_env() {
         let workspace = tempfile::tempdir().unwrap();
         let skill_dir = tempfile::tempdir().unwrap();
+        let skill_persist_dir = workspace
+            .path()
+            .join(".coco-workspace")
+            .join("skills")
+            .join("scripted")
+            .join("data");
         let runtime = runtime_tool(
             temp_exec_command_tool(),
             workspace.path().to_path_buf(),
@@ -2972,10 +3024,10 @@ mod tests {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Runner,
                 current_skill_name: Some("scripted".to_owned()),
-                active_skill: Some(coco_mem::SkillRuntimeContext {
+                active_skill: Some(crate::ActiveSkillRuntimeContext {
                     name: "scripted".to_owned(),
                     directory: skill_dir.path().to_path_buf(),
-                    scripts: vec!["scripts/inspect.py".to_owned()],
+                    persistent_directory: skill_persist_dir.clone(),
                 }),
                 store_path: None,
                 enable_coco_shim: false,
@@ -2998,7 +3050,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$COCO_SKILL_NAME\" \"$COCO_SKILL_DIR\" \"$HOME\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$COCO_SKILL_NAME\" \"$COCO_SKILL_DIR\" \"$COCO_SKILL_PERSIST_DIR\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -3008,8 +3060,9 @@ mod tests {
         .unwrap();
 
         assert!(output.contains(&format!(
-            "stdout:\nscripted|{}|",
-            skill_dir.path().display()
+            "stdout:\nscripted|{}|{}|",
+            skill_dir.path().display(),
+            skill_persist_dir.display()
         )));
         assert!(output.contains("/.cache/coco/tmp"));
         assert!(output.contains("/.cache/uv"));

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -204,8 +203,6 @@ pub struct SkillScript {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillRuntimeContext {
     pub name: String,
-    pub directory: PathBuf,
-    pub scripts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
