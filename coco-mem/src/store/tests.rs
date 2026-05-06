@@ -1351,6 +1351,45 @@ where
     );
 }
 
+fn assert_rebase_session_system_prompt_rebuilds_branch_chain<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    store.fork("main", &child_id).unwrap();
+
+    let new_head = store
+        .rebase_session_system_prompt(
+            "main",
+            &SessionAnchorPatch {
+                model: Some("claude-sonnet-4-20250514".to_owned()),
+                ..SessionAnchorPatch::default()
+            },
+            "You are strict.",
+        )
+        .unwrap();
+
+    let ancestry = store.ancestry("main").unwrap();
+    assert_eq!(ancestry[0].id, new_head);
+    assert_ne!(ancestry[1].id, session_id);
+    let Kind::Anchor(anchor) = &ancestry[1].kind else {
+        panic!("expected session anchor");
+    };
+    let session = anchor.as_session().expect("expected session anchor");
+    assert_eq!(session.model, "claude-sonnet-4-20250514");
+    assert_eq!(session.system_prompt, "You are strict.");
+
+    let snapshot = store.snapshot_state();
+    let old_session = snapshot.nodes.get(&session_id).unwrap();
+    let Kind::Anchor(old_anchor) = &old_session.kind else {
+        panic!("expected original session anchor");
+    };
+    assert_eq!(old_anchor.as_session().unwrap().system_prompt, "system");
+}
+
 fn assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes<F>()
 where
     F: TestStoreFactory,
@@ -1998,6 +2037,11 @@ macro_rules! define_common_store_tests {
             #[test]
             fn rebase_session_rewrites_branch_chain_with_updated_config() {
                 assert_rebase_session_rewrites_branch_chain_with_updated_config::<$factory>();
+            }
+
+            #[test]
+            fn rebase_session_system_prompt_rebuilds_branch_chain() {
+                assert_rebase_session_system_prompt_rebuilds_branch_chain::<$factory>();
             }
 
             #[test]

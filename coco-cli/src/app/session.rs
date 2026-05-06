@@ -59,6 +59,12 @@ struct SessionRebaseResult {
     head_id: String,
 }
 
+#[derive(Debug, PartialEq)]
+struct ResolvedSessionRebase {
+    patch: SessionConfigPatch,
+    system_prompt: Option<String>,
+}
+
 #[derive(Debug, Serialize, PartialEq)]
 struct SessionForkResult {
     branch: String,
@@ -222,8 +228,15 @@ where
         SessionSubcommand::Rebase(command) => {
             let branch = command.branch.clone();
             let json = command.json;
-            let patch = resolve_session_patch(command, store, provider_profiles)?;
-            let head_id = llm.rebase_session(&branch, patch).await.context(LlmSnafu)?;
+            let rebase = resolve_session_rebase(command, store, provider_profiles)?;
+            let head_id = match rebase.system_prompt {
+                Some(system_prompt) => {
+                    llm.rebase_session_system_prompt(&branch, rebase.patch, &system_prompt)
+                        .await
+                }
+                None => llm.rebase_session(&branch, rebase.patch).await,
+            }
+            .context(LlmSnafu)?;
             let result = SessionRebaseResult { branch, head_id };
             Ok(Some(if json {
                 render_json(result)
@@ -1352,11 +1365,11 @@ fn resolve_visible_session_anchor(
     })
 }
 
-fn resolve_session_patch(
+fn resolve_session_rebase(
     command: SessionRebaseCommand,
     store: &impl BranchConfigStore,
     provider_profiles: &impl ProviderProfileStore,
-) -> Result<SessionConfigPatch> {
+) -> Result<ResolvedSessionRebase> {
     let mut patch = command
         .preset
         .as_deref()
@@ -1388,16 +1401,11 @@ fn resolve_session_patch(
     if command.model.is_some() {
         patch.model = command.model;
     }
+    let system_prompt = command.system_prompt;
     if command.clear_tools {
         patch.tools = Some(vec![]);
     } else if !command.tools.is_empty() {
         patch.tools = Some(resolve_cli_tools(&command.tools));
-    }
-    if command.system_prompt.is_some() {
-        patch.system_prompt = command.system_prompt;
-    }
-    if command.prompt.is_some() {
-        patch.prompt = command.prompt;
     }
     if command.clear_temperature {
         patch.temperature = Some(None);
@@ -1410,7 +1418,10 @@ fn resolve_session_patch(
         patch.max_tokens = Some(Some(max_tokens));
     }
 
-    Ok(patch)
+    Ok(ResolvedSessionRebase {
+        patch,
+        system_prompt,
+    })
 }
 
 fn branch_config_to_session_anchor_patch(

@@ -138,15 +138,13 @@ pub struct SessionAnchorPatch {
     pub provider: Option<Option<String>>,
     pub model: Option<String>,
     pub tools: Option<Vec<Tool>>,
-    pub system_prompt: Option<String>,
-    pub prompt: Option<String>,
     pub temperature: Option<Option<f64>>,
     pub max_tokens: Option<Option<u64>>,
     pub additional_params: Option<Option<Value>>,
     pub enable_coco_shim: Option<bool>,
 }
 
-/// Preset configuration for creating or rebasing branch sessions.
+/// Preset configuration for creating sessions and rebasing runtime defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BranchConfig {
     pub role: SessionRole,
@@ -594,11 +592,8 @@ impl SessionAnchor {
                 .unwrap_or_else(|| self.provider.clone()),
             model: patch.model.clone().unwrap_or_else(|| self.model.clone()),
             tools: patch.tools.clone().unwrap_or_else(|| self.tools.clone()),
-            system_prompt: patch
-                .system_prompt
-                .clone()
-                .unwrap_or_else(|| self.system_prompt.clone()),
-            prompt: patch.prompt.clone().unwrap_or_else(|| self.prompt.clone()),
+            system_prompt: self.system_prompt.clone(),
+            prompt: self.prompt.clone(),
             temperature: patch.temperature.unwrap_or(self.temperature),
             max_tokens: patch.max_tokens.unwrap_or(self.max_tokens),
             additional_params: patch
@@ -612,6 +607,10 @@ impl SessionAnchor {
 }
 
 impl BranchConfig {
+    /// Builds the runtime-only patch used by session rebase.
+    ///
+    /// The durable session prompts are intentionally excluded: changing them
+    /// requires a new session anchor rather than patching the current one.
     pub fn to_session_anchor_patch(&self) -> SessionAnchorPatch {
         SessionAnchorPatch {
             role: Some(self.role),
@@ -619,8 +618,6 @@ impl BranchConfig {
             provider: Some(None),
             model: Some(self.model.clone()),
             tools: Some(self.tools.clone()),
-            system_prompt: Some(self.system_prompt.clone()),
-            prompt: Some(self.prompt.clone()),
             temperature: Some(self.temperature),
             max_tokens: Some(self.max_tokens),
             additional_params: Some(self.additional_params.clone()),
@@ -629,7 +626,20 @@ impl BranchConfig {
     }
 
     pub fn apply_to_session_anchor(&self, anchor: &SessionAnchor) -> SessionAnchor {
-        anchor.apply_patch(&self.to_session_anchor_patch())
+        SessionAnchor {
+            role: self.role,
+            provider_profile: Some(self.provider_profile.clone()),
+            provider: None,
+            model: self.model.clone(),
+            tools: self.tools.clone(),
+            system_prompt: self.system_prompt.clone(),
+            prompt: self.prompt.clone(),
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            additional_params: self.additional_params.clone(),
+            enable_coco_shim: self.enable_coco_shim,
+            active_skill: anchor.active_skill.clone(),
+        }
     }
 }
 
@@ -1307,8 +1317,6 @@ mod tests {
             provider: Some(Some("anthropic".to_owned())),
             model: Some("claude-sonnet-4-20250514".to_owned()),
             tools: Some(vec![]),
-            system_prompt: Some("new system".to_owned()),
-            prompt: Some("new prompt".to_owned()),
             temperature: Some(None),
             max_tokens: Some(Some(256)),
             additional_params: Some(Some(json!({"service_tier": "priority"}))),
@@ -1320,8 +1328,8 @@ mod tests {
         assert_eq!(updated.provider.as_deref(), Some("anthropic"));
         assert_eq!(updated.model, "claude-sonnet-4-20250514");
         assert!(updated.tools.is_empty());
-        assert_eq!(updated.system_prompt, "new system");
-        assert_eq!(updated.prompt, "new prompt");
+        assert_eq!(updated.system_prompt, "system");
+        assert_eq!(updated.prompt, "prompt");
         assert_eq!(updated.temperature, None);
         assert_eq!(updated.max_tokens, Some(256));
         assert!(updated.enable_coco_shim);

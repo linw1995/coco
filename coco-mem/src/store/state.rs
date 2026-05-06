@@ -16,8 +16,9 @@ use crate::error::{
 };
 use crate::{
     Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind, NewNode, Node,
-    PauseReason, ProviderProfile, Role, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
-    SkillRecord, SkillUpdatePatch, SkillVersionSpec, default_skill_groups,
+    PauseReason, ProviderProfile, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
+    SessionState, SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
+    default_skill_groups,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,6 +581,27 @@ impl StoreState {
         name: &str,
         patch: &SessionAnchorPatch,
     ) -> Result<RebasePlan> {
+        self.plan_rebase_session_with(name, |session_anchor| session_anchor.apply_patch(patch))
+    }
+
+    pub fn plan_rebase_session_system_prompt(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        system_prompt: &str,
+    ) -> Result<RebasePlan> {
+        self.plan_rebase_session_with(name, |session_anchor| {
+            let mut rebased = session_anchor.apply_patch(patch);
+            rebased.system_prompt = system_prompt.to_owned();
+            rebased
+        })
+    }
+
+    fn plan_rebase_session_with(
+        &self,
+        name: &str,
+        rebase_session_anchor: impl FnOnce(&SessionAnchor) -> SessionAnchor,
+    ) -> Result<RebasePlan> {
         let branch = name.to_owned();
         let expected_old_head = self.get_branch_head(name)?.to_owned();
         let chain_ids = self
@@ -602,6 +624,7 @@ impl StoreState {
             _ => unreachable!("session chain should start with anchor"),
         }
         .clone();
+        let rebased_session_anchor = rebase_session_anchor(&session_anchor);
 
         let mut temp = self.clone();
         let mut previous_new_id = None;
@@ -623,7 +646,7 @@ impl StoreState {
                 };
                 Kind::Anchor(Anchor::session(
                     anchor.merge_parents().to_vec(),
-                    session_anchor.apply_patch(patch),
+                    rebased_session_anchor.clone(),
                 ))
             } else {
                 node.kind.clone()
