@@ -27,14 +27,25 @@ def main() -> int:
 
     lock_path = state_dir / f"{task_id}.lock"
     state_path = state_dir / f"{task_id}.state.json"
+    pending_path = state_dir / f"{task_id}.pending"
     with lock_for_policy(lock_path, repeat) as acquired:
         if not acquired:
-            print(f"Skipping {task_id}: another cron invocation is updating task state.")
+            if repeat == "serial":
+                count = increment_pending(pending_path)
+                print(
+                    f"Queued {task_id}: another cron invocation is updating task state "
+                    f"({count} pending)."
+                )
+            else:
+                print(f"Skipping {task_id}: another cron invocation is updating task state.")
             return 0
-        wait_for_previous_job(task, state_path)
-        job = submit_prompt(task)
-        write_state(state_path, {"last_job_id": job["job_id"], "branch": task["branch"]})
-        print(json.dumps(job, indent=2, sort_keys=True))
+        while True:
+            wait_for_previous_job(task, state_path)
+            job = submit_prompt(task)
+            write_state(state_path, {"last_job_id": job["job_id"], "branch": task["branch"]})
+            print(json.dumps(job, indent=2, sort_keys=True))
+            if repeat != "serial" or not consume_pending(pending_path):
+                break
     return 0
 
 
@@ -66,7 +77,7 @@ class lock_for_policy:
         if self.repeat == "parallel":
             return True
         flags = fcntl.LOCK_EX
-        if self.repeat == "skip":
+        if self.repeat in {"serial", "skip"}:
             flags |= fcntl.LOCK_NB
         try:
             fcntl.flock(self.handle.fileno(), flags)
@@ -80,6 +91,63 @@ class lock_for_policy:
                 fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
             finally:
                 self.handle.close()
+
+
+def increment_pending(path: Path) -> int:
+    with pending_counter_lock(path):
+        count = read_pending_count(path) + 1
+        write_pending_count(path, count)
+        return count
+
+
+def consume_pending(path: Path) -> bool:
+    with pending_counter_lock(path):
+        count = read_pending_count(path)
+        if count <= 0:
+            return False
+        write_pending_count(path, count - 1)
+        return True
+
+
+class pending_counter_lock:
+    def __init__(self, path: Path) -> None:
+        self.lock_path = path.with_suffix(".pending.lock")
+        self.handle = None
+
+    def __enter__(self) -> None:
+        self.handle = self.lock_path.open("a+", encoding="utf-8")
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.handle is not None:
+            try:
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.handle.close()
+
+
+def read_pending_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return 0
+    try:
+        count = int(text)
+    except ValueError as error:
+        raise SystemExit(f"pending counter is invalid: {path}") from error
+    if count < 0:
+        raise SystemExit(f"pending counter is invalid: {path}")
+    return count
+
+
+def write_pending_count(path: Path, count: int) -> None:
+    if count <= 0:
+        path.unlink(missing_ok=True)
+        return
+    tmp = path.with_suffix(".pending.tmp")
+    tmp.write_text(f"{count}\n", encoding="utf-8")
+    tmp.replace(path)
 
 
 def wait_for_previous_job(task: dict[str, str], state_path: Path) -> None:

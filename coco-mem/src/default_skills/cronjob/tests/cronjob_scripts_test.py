@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
@@ -278,6 +279,56 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([call["kind"] for call in calls], ["status", "submit"])
         self.assertEqual(state["last_job_id"], "job-new")
+
+    def test_runner_serial_policy_queues_when_state_is_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fake_coco = write_fake_coco(workspace, status="finished")
+            task_file = write_task_file(workspace, fake_coco, repeat="serial")
+            state_dir = workspace / "state"
+            state_dir.mkdir(parents=True)
+            lock_file = state_dir / "daily-review.lock"
+
+            with lock_file.open("a+", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                result = subprocess.run(
+                    [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=5,
+                )
+                calls = read_fake_coco_calls(workspace)
+                pending_count = (state_dir / "daily-review.pending").read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Queued daily-review", result.stdout)
+        self.assertEqual(calls, [])
+        self.assertEqual(pending_count, "1\n")
+
+    def test_runner_serial_policy_drains_queued_invocations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fake_coco = write_fake_coco(workspace, status="finished")
+            task_file = write_task_file(workspace, fake_coco, repeat="serial")
+            pending_file = workspace / "state" / "daily-review.pending"
+            pending_file.parent.mkdir(parents=True)
+            pending_file.write_text("1\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            calls = read_fake_coco_calls(workspace)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["kind"] for call in calls], ["submit", "status", "submit"])
+        self.assertFalse(pending_file.exists())
 
     def test_runner_fails_closed_when_previous_job_status_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
