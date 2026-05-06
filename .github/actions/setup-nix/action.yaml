@@ -17,7 +17,7 @@ runs:
         gc-max-store-size-linux: 15G
 
     - name: Cache Cargo dependencies
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
