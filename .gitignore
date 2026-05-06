@@ -4,6 +4,7 @@ coco-console/pkg
 
 # Ignore scripts by default
 *.sh
+!docker/coco-docker-entrypoint.sh
 !scripts/run-cov.sh
 
 # Agent artifacts

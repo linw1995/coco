@@ -74,33 +74,11 @@ rec {
           name = "coco-docker-entrypoint";
           runtimeInputs = [
             pkgs.coreutils
+            pkgs.gnugrep
             pkgs.supercronic
+            pkgs.util-linux
           ];
-          text = ''
-            if [ -n "''${TZ:-}" ] && [ -n "''${TZDIR:-}" ] && [ -f "''${TZDIR}/''${TZ}" ]; then
-              ln -snf "''${TZDIR}/''${TZ}" /etc/localtime 2>/dev/null || true
-              printf '%s\n' "''${TZ}" >/etc/timezone 2>/dev/null || true
-            fi
-
-            if [ "''${COCO_START_CRON:-1}" = "1" ]; then
-              cronjob_install_dir="''${COCO_SKILL_PERSIST_ROOT:-/data/skills}/orchestrator/cronjob/data/install"
-              cronjob_crontab_file="''${COCO_CRONTAB_FILE:-''${cronjob_install_dir}/crontab}"
-              mkdir -p "$(dirname "''${cronjob_crontab_file}")"
-              if [ ! -f "''${cronjob_crontab_file}" ]; then
-                printf '# CoCo cronjobs\n' >"''${cronjob_crontab_file}"
-              fi
-              export COCO_CRONTAB_FILE="''${cronjob_crontab_file}"
-              if [ -f "''${cronjob_install_dir}/cronjob_restore.py" ] && [ -f "''${cronjob_install_dir}/managed-crontab" ]; then
-                uv run --script "''${cronjob_install_dir}/cronjob_restore.py" \
-                  --snapshot "''${cronjob_install_dir}/managed-crontab" \
-                  --crontab-file "''${cronjob_crontab_file}" \
-                  || printf 'warning: failed to restore managed CoCo cronjobs\n' >&2
-              fi
-              supercronic -inotify "''${cronjob_crontab_file}" &
-            fi
-
-            exec "$@"
-          '';
+          text = builtins.readFile ./docker/coco-docker-entrypoint.sh;
         };
       in {
         packages = rec {
