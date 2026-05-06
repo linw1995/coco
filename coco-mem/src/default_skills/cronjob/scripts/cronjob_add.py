@@ -32,26 +32,8 @@ def main() -> int:
     task_dir = install_dir / "tasks"
     state_dir = resolve_state_dir(args.state_dir)
     log_dir = resolve_log_dir(args.log_dir)
-    install_dir.mkdir(parents=True, exist_ok=True)
-    task_dir.mkdir(parents=True, exist_ok=True)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    runner_path = install_script(args.runner_source, install_dir, "cronjob_run.py")
-    restore_path = install_script(None, install_dir, "cronjob_restore.py")
     task_path = task_dir / f"{task_id}.json"
-    write_task_config(
-        task_path,
-        {
-            "id": task_id,
-            "branch": branch,
-            "prompt": prompt,
-            "repeat": args.repeat,
-            "coco_bin": args.coco_bin,
-            "state_dir": str(state_dir),
-            "log_dir": str(log_dir),
-        },
-    )
+    runner_path = install_dir / "cronjob_run.py"
 
     block = render_crontab_block(
         task_id=task_id,
@@ -66,6 +48,35 @@ def main() -> int:
     if args.dry_run:
         print(block, end="")
         return 0
+
+    install_dir.mkdir(parents=True, exist_ok=True)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    runner_path = install_script(args.runner_source, install_dir, "cronjob_run.py")
+    restore_path = install_script(None, install_dir, "cronjob_restore.py")
+    write_task_config(
+        task_path,
+        {
+            "id": task_id,
+            "branch": branch,
+            "prompt": prompt,
+            "repeat": args.repeat,
+            "coco_bin": args.coco_bin,
+            "state_dir": str(state_dir),
+            "log_dir": str(log_dir),
+        },
+    )
+    block = render_crontab_block(
+        task_id=task_id,
+        cronexpr=args.cronexpr,
+        timezone=args.timezone,
+        uv_bin=args.uv_bin,
+        runner_path=runner_path,
+        task_path=task_path,
+        log_path=log_dir / f"{task_id}.log",
+    )
 
     current = read_crontab(args.crontab_bin)
     updated, action = upsert_managed_block(current, task_id, block)
@@ -307,6 +318,8 @@ def render_crontab_block(
     if timezone:
         lines.append(f"CRON_TZ={timezone}")
     lines.append(f"{cronexpr} {command} {redirect}")
+    if timezone:
+        lines.append("CRON_TZ=")
     lines.append(end_marker(task_id))
     return "\n".join(lines) + "\n"
 

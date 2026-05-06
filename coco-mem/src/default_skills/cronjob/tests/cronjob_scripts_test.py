@@ -130,6 +130,71 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertEqual(task["state_dir"], str(persist_dir / "state"))
         self.assertEqual(task["log_dir"], str(persist_dir / "logs"))
 
+    def test_add_dry_run_does_not_mutate_local_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fake_crontab = write_fake_crontab(workspace)
+            crontab_file = workspace / "crontab.txt"
+
+            result = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "15 * * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Preview prompt",
+                "--crontab-bin",
+                str(fake_crontab),
+                "--dry-run",
+                env={"FAKE_CRONTAB_FILE": str(crontab_file)},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("# BEGIN coco-cronjob id=daily-review", result.stdout)
+        self.assertFalse((workspace / "install").exists())
+        self.assertFalse((workspace / "state").exists())
+        self.assertFalse((workspace / "logs").exists())
+        self.assertFalse(crontab_file.exists())
+
+    def test_add_resets_cron_tz_inside_managed_block(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            result = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "15 * * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Preview prompt",
+                "--timezone",
+                "UTC",
+                "--dry-run",
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "\n".join(
+                [
+                    "# BEGIN coco-cronjob id=daily-review",
+                    "CRON_TZ=UTC",
+                    "15 * * * *",
+                ]
+            ),
+            result.stdout,
+        )
+        self.assertIn("\nCRON_TZ=\n# END coco-cronjob id=daily-review\n", result.stdout)
+
     def test_restore_preserves_existing_user_crontab(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
