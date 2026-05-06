@@ -85,6 +85,12 @@ rec {
             if [ "''${COCO_START_CRON:-1}" = "1" ]; then
               mkdir -p /var/cron /var/cron/tabs /var/run /var/spool/cron /var/spool/cron/crontabs
               chmod 700 /var/cron/tabs /var/spool/cron/crontabs 2>/dev/null || true
+              cronjob_install_dir="''${COCO_SKILL_PERSIST_ROOT:-/data/skills}/orchestrator/cronjob/data/install"
+              if [ -f "''${cronjob_install_dir}/cronjob_restore.py" ] && [ -f "''${cronjob_install_dir}/managed-crontab" ]; then
+                uv run --script "''${cronjob_install_dir}/cronjob_restore.py" \
+                  --snapshot "''${cronjob_install_dir}/managed-crontab" \
+                  || printf 'warning: failed to restore managed CoCo cronjobs\n' >&2
+              fi
               crond || printf 'warning: failed to start crond; cronjob skill can still edit crontab but schedules will not run\n' >&2
             fi
 

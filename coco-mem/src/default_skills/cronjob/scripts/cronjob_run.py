@@ -91,6 +91,10 @@ def wait_for_previous_job(task: dict[str, str], state_path: Path) -> None:
         return
     while True:
         status = prompt_status(task["coco_bin"], job_id)
+        if status is None:
+            raise SystemExit(
+                f"failed to resolve previous job {job_id} status for task {task['id']}"
+            )
         if status not in ACTIVE_STATUSES:
             return
         if task["repeat"] == "skip":

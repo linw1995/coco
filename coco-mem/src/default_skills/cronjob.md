@@ -38,6 +38,11 @@ Rules:
     or running.
 - The add script is idempotent by task id. Re-running it updates the managed
   crontab block and task config instead of adding a duplicate entry.
+- By default, installed runner scripts, task config, task state, logs, and the
+  managed crontab snapshot are stored under `$COCO_SKILL_PERSIST_DIR`. The
+  Docker image restores managed cron entries from this snapshot before starting
+  `crond`, so mounting `/data` is enough to preserve schedules across container
+  rebuilds.
 - The runner submits work with `coco prompt --async --json --branch <branch>
   <prompt>` and records the latest prompt job id in the task state file.
 - Use `--timezone <zone>` only when the host cron implementation supports

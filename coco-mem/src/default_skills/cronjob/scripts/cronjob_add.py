@@ -17,6 +17,7 @@ from pathlib import Path
 
 
 MANAGED_PREFIX = "coco-cronjob"
+MANAGED_CRONTAB_FILE = "managed-crontab"
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
@@ -36,7 +37,8 @@ def main() -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    runner_path = install_runner(args.runner_source, install_dir)
+    runner_path = install_script(args.runner_source, install_dir, "cronjob_run.py")
+    restore_path = install_script(None, install_dir, "cronjob_restore.py")
     task_path = task_dir / f"{task_id}.json"
     write_task_config(
         task_path,
@@ -69,6 +71,7 @@ def main() -> int:
     updated, action = upsert_managed_block(current, task_id, block)
     if updated != current:
         write_crontab(args.crontab_bin, updated)
+    write_managed_crontab_snapshot(install_dir / MANAGED_CRONTAB_FILE, updated)
     print(
         json.dumps(
             {
@@ -79,6 +82,8 @@ def main() -> int:
                 "repeat": args.repeat,
                 "task_file": str(task_path),
                 "runner": str(runner_path),
+                "restore": str(restore_path),
+                "managed_crontab": str(install_dir / MANAGED_CRONTAB_FILE),
             },
             indent=2,
             sort_keys=True,
@@ -221,6 +226,9 @@ def parse_minute(value: str) -> int:
 def resolve_install_dir(value: Path | None) -> Path:
     if value is not None:
         return value.expanduser()
+    persist_dir = resolve_skill_persist_dir()
+    if persist_dir is not None:
+        return persist_dir / "install"
     data_home = Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser()
     return data_home / "coco" / "cronjob"
 
@@ -228,6 +236,9 @@ def resolve_install_dir(value: Path | None) -> Path:
 def resolve_state_dir(value: Path | None) -> Path:
     if value is not None:
         return value.expanduser()
+    persist_dir = resolve_skill_persist_dir()
+    if persist_dir is not None:
+        return persist_dir / "state"
     state_home = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
     return state_home / "coco" / "cronjob"
 
@@ -235,20 +246,30 @@ def resolve_state_dir(value: Path | None) -> Path:
 def resolve_log_dir(value: Path | None) -> Path:
     if value is not None:
         return value.expanduser()
+    persist_dir = resolve_skill_persist_dir()
+    if persist_dir is not None:
+        return persist_dir / "logs"
     state_home = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
     return state_home / "coco" / "logs" / "cronjob"
 
 
-def install_runner(source: Path | None, install_dir: Path) -> Path:
+def resolve_skill_persist_dir() -> Path | None:
+    value = os.environ.get("COCO_SKILL_PERSIST_DIR")
+    if not value:
+        return None
+    return Path(value).expanduser()
+
+
+def install_script(source: Path | None, install_dir: Path, script_name: str) -> Path:
     source_path = source
     if source_path is None:
         skill_dir = os.environ.get("COCO_SKILL_DIR")
         if not skill_dir:
             raise SystemExit("COCO_SKILL_DIR is required unless --runner-source is provided")
-        source_path = Path(skill_dir) / "scripts" / "cronjob_run.py"
+        source_path = Path(skill_dir) / "scripts" / script_name
     if not source_path.is_file():
-        raise SystemExit(f"runner source does not exist: {source_path}")
-    target = install_dir / "cronjob_run.py"
+        raise SystemExit(f"script source does not exist: {source_path}")
+    target = install_dir / script_name
     shutil.copyfile(source_path, target)
     target.chmod(0o755)
     return target
@@ -321,6 +342,39 @@ def write_crontab(crontab_bin: str, content: str) -> None:
     )
     if result.returncode != 0:
         raise SystemExit(f"failed to install crontab: {result.stderr.strip()}")
+
+
+def write_managed_crontab_snapshot(path: Path, content: str) -> None:
+    snapshot = extract_managed_blocks(content)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(snapshot, encoding="utf-8")
+    tmp.replace(path)
+
+
+def extract_managed_blocks(content: str) -> str:
+    lines = content.splitlines()
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.startswith(f"# BEGIN {MANAGED_PREFIX} id="):
+            index += 1
+            continue
+
+        block = [line]
+        index += 1
+        while index < len(lines):
+            block.append(lines[index])
+            if lines[index].startswith(f"# END {MANAGED_PREFIX} id="):
+                break
+            index += 1
+        else:
+            raise SystemExit(f"managed crontab block {line!r} is missing its end marker")
+
+        blocks.append("\n".join(block))
+        index += 1
+
+    return "\n\n".join(blocks).rstrip("\n") + ("\n" if blocks else "")
 
 
 def upsert_managed_block(current: str, task_id: str, block: str) -> tuple[str, str]:

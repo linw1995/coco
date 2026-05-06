@@ -38,9 +38,12 @@ docker run --rm -it \
 ```
 
 The image includes `crontab` and starts `crond` before the default
-`coco daemon serve` command. Set `TZ` to the host timezone so cron schedules,
-logs, and CoCo agree on wall-clock time. You can also mount the host localtime
-file when your host exposes it:
+`coco daemon serve` command. Cronjob skill state, logs, runner scripts, and
+managed crontab snapshots are persisted under `/data/skills`; on container
+startup, CoCo restores only its managed cron entries from that snapshot while
+preserving other crontab entries. Set `TZ` to the host timezone so cron
+schedules, logs, and CoCo agree on wall-clock time. You can also mount the host
+localtime file when your host exposes it:
 
 ```bash
 docker run --rm -it \

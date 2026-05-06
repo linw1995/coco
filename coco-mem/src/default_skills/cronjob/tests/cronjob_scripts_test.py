@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ADD_SCRIPT = ROOT / "scripts" / "cronjob_add.py"
 RUN_SCRIPT = ROOT / "scripts" / "cronjob_run.py"
+RESTORE_SCRIPT = ROOT / "scripts" / "cronjob_restore.py"
 
 
 class CronjobScriptTests(unittest.TestCase):
@@ -42,6 +43,7 @@ class CronjobScriptTests(unittest.TestCase):
             workspace = Path(directory)
             fake_crontab = write_fake_crontab(workspace)
             crontab_file = workspace / "crontab.txt"
+            crontab_file.write_text("5 * * * * echo user-owned\n", encoding="utf-8")
 
             first = run_add(
                 workspace,
@@ -79,14 +81,93 @@ class CronjobScriptTests(unittest.TestCase):
             crontab = crontab_file.read_text(encoding="utf-8")
             task_file = workspace / "install" / "tasks" / "daily-review.json"
             task = json.loads(task_file.read_text(encoding="utf-8"))
+            managed_crontab = (workspace / "install" / "managed-crontab").read_text(
+                encoding="utf-8"
+            )
 
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(crontab.count("# BEGIN coco-cronjob id=daily-review"), 1)
+        self.assertIn("5 * * * * echo user-owned", crontab)
         self.assertIn("15 * * * *", crontab)
+        self.assertNotIn("echo user-owned", managed_crontab)
+        self.assertIn("# BEGIN coco-cronjob id=daily-review", managed_crontab)
         self.assertEqual(task["branch"], "release")
         self.assertEqual(task["prompt"], "Updated prompt")
         self.assertEqual(task["repeat"], "serial")
+
+    def test_add_defaults_to_skill_persistent_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            persist_dir = workspace / "persist"
+            fake_crontab = write_fake_crontab(workspace)
+            crontab_file = workspace / "crontab.txt"
+
+            result = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "15 * * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Persisted prompt",
+                "--crontab-bin",
+                str(fake_crontab),
+                env={
+                    "COCO_SKILL_PERSIST_DIR": str(persist_dir),
+                    "FAKE_CRONTAB_FILE": str(crontab_file),
+                },
+                explicit_dirs=False,
+            )
+            task_file = persist_dir / "install" / "tasks" / "daily-review.json"
+            task = json.loads(task_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(task["state_dir"], str(persist_dir / "state"))
+        self.assertEqual(task["log_dir"], str(persist_dir / "logs"))
+
+    def test_restore_preserves_existing_user_crontab(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fake_crontab = write_fake_crontab(workspace)
+            crontab_file = workspace / "crontab.txt"
+            crontab_file.write_text("5 * * * * echo user-owned\n", encoding="utf-8")
+            snapshot = workspace / "managed-crontab"
+            snapshot.write_text(
+                textwrap.dedent(
+                    """\
+                    # BEGIN coco-cronjob id=daily-review
+                    15 * * * * 'uv' 'run' '--script' '/data/cronjob_run.py' '--task-file' '/data/daily-review.json' >> '/data/daily-review.log' 2>&1
+                    # END coco-cronjob id=daily-review
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(RESTORE_SCRIPT),
+                    "--snapshot",
+                    str(snapshot),
+                    "--crontab-bin",
+                    str(fake_crontab),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "FAKE_CRONTAB_FILE": str(crontab_file)},
+            )
+            crontab = crontab_file.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("5 * * * * echo user-owned", crontab)
+        self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
 
     def test_runner_skip_policy_does_not_submit_while_previous_job_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -133,26 +214,52 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertEqual([call["kind"] for call in calls], ["status", "submit"])
         self.assertEqual(state["last_job_id"], "job-new")
 
+    def test_runner_fails_closed_when_previous_job_status_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fake_coco = write_fake_coco(workspace, status=None)
+            task_file = write_task_file(workspace, fake_coco, repeat="skip")
+            state_file = workspace / "state" / "daily-review.state.json"
+            state_file.parent.mkdir(parents=True)
+            state_file.write_text('{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            calls = read_fake_coco_calls(workspace)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed to resolve previous job job-old status", result.stderr)
+        self.assertEqual([call["kind"] for call in calls], ["status"])
+
 
 def run_add(
     workspace: Path,
     *args: str,
     env: dict[str, str] | None = None,
+    explicit_dirs: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     full_env = os.environ.copy()
     full_env["COCO_SKILL_DIR"] = str(ROOT)
     if env:
         full_env.update(env)
+    directory_args = [
+        "--install-dir",
+        str(workspace / "install"),
+        "--state-dir",
+        str(workspace / "state"),
+        "--log-dir",
+        str(workspace / "logs"),
+    ] if explicit_dirs else []
     return subprocess.run(
         [
             sys.executable,
             str(ADD_SCRIPT),
-            "--install-dir",
-            str(workspace / "install"),
-            "--state-dir",
-            str(workspace / "state"),
-            "--log-dir",
-            str(workspace / "logs"),
+            *directory_args,
             *args,
         ],
         check=False,
@@ -192,9 +299,15 @@ def write_fake_crontab(workspace: Path) -> Path:
     return path
 
 
-def write_fake_coco(workspace: Path, *, status: str) -> Path:
+def write_fake_coco(workspace: Path, *, status: str | None) -> Path:
     path = workspace / "fake-coco.py"
     calls_file = workspace / "coco-calls.jsonl"
+    status_response = (
+        f"print(json.dumps({{'job': {{'status': {status!r}}}}}))\n"
+        "                raise SystemExit(0)"
+        if status is not None
+        else "print('status unavailable', file=sys.stderr)\n                raise SystemExit(1)"
+    )
     path.write_text(
         textwrap.dedent(
             f"""\
@@ -208,8 +321,7 @@ def write_fake_coco(workspace: Path, *, status: str) -> Path:
             if args[:3] == ["prompt", "status", "--json"]:
                 with calls.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({{"kind": "status", "args": args}}) + "\\n")
-                print(json.dumps({{"job": {{"status": {status!r}}}}}))
-                raise SystemExit(0)
+                {status_response}
             if args[:4] == ["prompt", "--async", "--json", "--branch"]:
                 with calls.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({{"kind": "submit", "args": args}}) + "\\n")
