@@ -131,6 +131,34 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertEqual(task["state_dir"], str(persist_dir / "state"))
         self.assertEqual(task["log_dir"], str(persist_dir / "logs"))
 
+    def test_add_can_manage_crontab_file_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            crontab_file = workspace / "supercronic" / "crontab"
+            crontab_file.parent.mkdir(parents=True)
+            crontab_file.write_text("5 * * * * echo user-owned\n", encoding="utf-8")
+
+            result = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "15 * * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Persisted prompt",
+                "--crontab-file",
+                str(crontab_file),
+            )
+            crontab = crontab_file.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("5 * * * * echo user-owned", crontab)
+        self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
+
     def test_add_dry_run_does_not_mutate_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -228,6 +256,44 @@ class CronjobScriptTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 env={**os.environ, "FAKE_CRONTAB_FILE": str(crontab_file)},
+            )
+            crontab = crontab_file.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("5 * * * * echo user-owned", crontab)
+        self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
+
+    def test_restore_can_manage_crontab_file_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            crontab_file = workspace / "supercronic" / "crontab"
+            crontab_file.parent.mkdir(parents=True)
+            crontab_file.write_text("5 * * * * echo user-owned\n", encoding="utf-8")
+            snapshot = workspace / "managed-crontab"
+            snapshot.write_text(
+                textwrap.dedent(
+                    """\
+                    # BEGIN coco-cronjob id=daily-review
+                    15 * * * * 'uv' 'run' '--script' '/data/cronjob_run.py' '--task-file' '/data/daily-review.json' >> '/data/daily-review.log' 2>&1
+                    # END coco-cronjob id=daily-review
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(RESTORE_SCRIPT),
+                    "--snapshot",
+                    str(snapshot),
+                    "--crontab-file",
+                    str(crontab_file),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
             crontab = crontab_file.read_text(encoding="utf-8")
 

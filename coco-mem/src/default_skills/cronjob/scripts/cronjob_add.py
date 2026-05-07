@@ -78,10 +78,11 @@ def main() -> int:
         log_path=log_dir / f"{task_id}.log",
     )
 
-    current = read_crontab(args.crontab_bin)
+    crontab_file = resolve_crontab_file(args.crontab_file)
+    current = read_crontab(args.crontab_bin, crontab_file)
     updated, action = upsert_managed_block(current, task_id, block)
     if updated != current:
-        write_crontab(args.crontab_bin, updated)
+        write_crontab(args.crontab_bin, crontab_file, updated)
     write_managed_crontab_snapshot(install_dir / MANAGED_CRONTAB_FILE, updated)
     print(
         json.dumps(
@@ -95,6 +96,7 @@ def main() -> int:
                 "runner": str(runner_path),
                 "restore": str(restore_path),
                 "managed_crontab": str(install_dir / MANAGED_CRONTAB_FILE),
+                "crontab_file": str(crontab_file) if crontab_file is not None else None,
             },
             indent=2,
             sort_keys=True,
@@ -124,6 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coco-bin", default="coco", help="coco command path.")
     parser.add_argument("--uv-bin", default="uv", help="uv command path.")
     parser.add_argument("--crontab-bin", default="crontab", help="crontab command path.")
+    parser.add_argument("--crontab-file", type=Path, help="Manage this crontab file directly.")
     parser.add_argument("--install-dir", type=Path, help="Persistent runner install directory.")
     parser.add_argument("--state-dir", type=Path, help="Persistent task state directory.")
     parser.add_argument("--log-dir", type=Path, help="Cronjob log directory.")
@@ -271,6 +274,15 @@ def resolve_skill_persist_dir() -> Path | None:
     return Path(value).expanduser()
 
 
+def resolve_crontab_file(value: Path | None) -> Path | None:
+    if value is not None:
+        return value.expanduser()
+    env_value = os.environ.get("COCO_CRONTAB_FILE")
+    if not env_value:
+        return None
+    return Path(env_value).expanduser()
+
+
 def install_script(source: Path | None, install_dir: Path, script_name: str) -> Path:
     source_path = source
     if source_path is None:
@@ -328,7 +340,12 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def read_crontab(crontab_bin: str) -> str:
+def read_crontab(crontab_bin: str, crontab_file: Path | None) -> str:
+    if crontab_file is not None:
+        if not crontab_file.exists():
+            return ""
+        return crontab_file.read_text(encoding="utf-8")
+
     result = subprocess.run(
         [crontab_bin, "-l"],
         check=False,
@@ -344,7 +361,14 @@ def read_crontab(crontab_bin: str) -> str:
     raise SystemExit(f"failed to read crontab: {result.stderr.strip()}")
 
 
-def write_crontab(crontab_bin: str, content: str) -> None:
+def write_crontab(crontab_bin: str, crontab_file: Path | None, content: str) -> None:
+    if crontab_file is not None:
+        crontab_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = crontab_file.with_suffix(crontab_file.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(crontab_file)
+        return
+
     result = subprocess.run(
         [crontab_bin, "-"],
         input=content,

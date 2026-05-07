@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 from pathlib import Path
 
@@ -23,10 +24,11 @@ def main() -> int:
     if not snapshot.strip():
         return 0
 
-    current = read_crontab(args.crontab_bin)
+    crontab_file = resolve_crontab_file(args.crontab_file)
+    current = read_crontab(args.crontab_bin, crontab_file)
     updated = restore_managed_blocks(current, snapshot)
     if updated != current:
-        write_crontab(args.crontab_bin, updated)
+        write_crontab(args.crontab_bin, crontab_file, updated)
     return 0
 
 
@@ -34,10 +36,25 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--crontab-bin", default="crontab")
+    parser.add_argument("--crontab-file", type=Path, help="Manage this crontab file directly.")
     return parser.parse_args()
 
 
-def read_crontab(crontab_bin: str) -> str:
+def resolve_crontab_file(value: Path | None) -> Path | None:
+    if value is not None:
+        return value.expanduser()
+    env_value = os.environ.get("COCO_CRONTAB_FILE")
+    if not env_value:
+        return None
+    return Path(env_value).expanduser()
+
+
+def read_crontab(crontab_bin: str, crontab_file: Path | None) -> str:
+    if crontab_file is not None:
+        if not crontab_file.exists():
+            return ""
+        return crontab_file.read_text(encoding="utf-8")
+
     result = subprocess.run(
         [crontab_bin, "-l"],
         check=False,
@@ -53,7 +70,14 @@ def read_crontab(crontab_bin: str) -> str:
     raise SystemExit(f"failed to read crontab: {result.stderr.strip()}")
 
 
-def write_crontab(crontab_bin: str, content: str) -> None:
+def write_crontab(crontab_bin: str, crontab_file: Path | None, content: str) -> None:
+    if crontab_file is not None:
+        crontab_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = crontab_file.with_suffix(crontab_file.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(crontab_file)
+        return
+
     result = subprocess.run(
         [crontab_bin, "-"],
         input=content,
