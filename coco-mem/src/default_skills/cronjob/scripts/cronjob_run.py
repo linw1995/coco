@@ -150,6 +150,23 @@ def write_pending_count(path: Path, count: int) -> None:
     tmp.replace(path)
 
 
+class state_file_lock:
+    def __init__(self, path: Path) -> None:
+        self.lock_path = path.with_suffix(path.suffix + ".lock")
+        self.handle = None
+
+    def __enter__(self) -> None:
+        self.handle = self.lock_path.open("a+", encoding="utf-8")
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.handle is not None:
+            try:
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.handle.close()
+
+
 def wait_for_previous_job(task: dict[str, str], state_path: Path) -> None:
     if task["repeat"] == "parallel" or not state_path.exists():
         return
@@ -218,9 +235,10 @@ def submit_prompt(task: dict[str, str]) -> dict[str, str]:
 
 
 def write_state(path: Path, state: dict[str, str]) -> None:
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    with state_file_lock(path):
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
 
 
 if __name__ == "__main__":

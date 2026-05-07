@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -422,6 +423,37 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertEqual([call["kind"] for call in calls], ["submit", "status", "submit"])
         self.assertFalse(pending_file.exists())
 
+    def test_runner_parallel_policy_serializes_state_writes_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fake_coco = write_fake_coco(workspace, status="finished")
+            task_file = write_task_file(workspace, fake_coco, repeat="parallel")
+            state_dir = workspace / "state"
+            state_dir.mkdir(parents=True)
+            state_lock = state_dir / "daily-review.state.json.lock"
+
+            with state_lock.open("a+", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                process = subprocess.Popen(
+                    [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    wait_for_fake_coco_call(workspace, expected_count=1)
+                    self.assertIsNone(process.poll())
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                stdout, stderr = process.communicate(timeout=5)
+            state = json.loads(
+                (state_dir / "daily-review.state.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn('"job_id": "job-new"', stdout)
+        self.assertEqual(state["last_job_id"], "job-new")
+
     def test_runner_fails_closed_when_previous_job_status_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -568,6 +600,15 @@ def read_fake_coco_calls(workspace: Path) -> list[dict[str, object]]:
         for line in calls_file.read_text(encoding="utf-8").splitlines()
         if line
     ]
+
+
+def wait_for_fake_coco_call(workspace: Path, *, expected_count: int) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if len(read_fake_coco_calls(workspace)) >= expected_count:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {expected_count} fake coco calls")
 
 
 if __name__ == "__main__":
