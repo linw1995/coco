@@ -2421,21 +2421,20 @@ fn tool_result_message(
     }
 }
 
-fn reject_mixed_handoff_use_skill_calls(
-    tool_calls: &[CompletionToolCall],
-) -> std::result::Result<(), BackendError> {
+const MIXED_HANDOFF_USE_SKILL_ERROR: &str =
+    "use_skill with handoff must be the only tool call in the turn";
+
+fn mixed_handoff_use_skill_error(tool_calls: &[CompletionToolCall]) -> Option<&'static str> {
     let has_handoff_use_skill = tool_calls.iter().any(|tool_call| {
         tool_call.function.name == "use_skill"
             && tool_call.function.arguments.get("handoff").is_some()
     });
 
     if has_handoff_use_skill && tool_calls.len() != 1 {
-        return Err(BackendError::failed(
-            "use_skill with handoff must be the only tool call in the turn",
-        ));
+        return Some(MIXED_HANDOFF_USE_SKILL_ERROR);
     }
 
-    Ok(())
+    None
 }
 
 fn rig_tool_call_content(
@@ -2933,12 +2932,41 @@ impl CompletionRunner {
         })
     }
 
+    fn tool_call_error_result(
+        &mut self,
+        next_execution: &ExecutionMetadata,
+        tool_call: CompletionToolCall,
+        provider_output: &'static str,
+    ) -> std::result::Result<ToolCallExecution, BackendError> {
+        let call_id = tool_call.call_id.clone();
+        let event = ToolExecutionOutcome::tool_result(provider_output)
+            .into_backend_event(tool_call.id.clone(), call_id.clone());
+        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
+            self.head = Some(append_backend_event(
+                trace_node_appender,
+                next_execution,
+                event.clone(),
+            )?);
+        }
+
+        Ok(ToolCallExecution {
+            event,
+            tool_result: rig_tool_result_content(
+                tool_call.id,
+                call_id,
+                rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
+                    provider_output,
+                )),
+            ),
+        })
+    }
+
     async fn advance_with_tool_calls(
         &mut self,
         state: StepState,
         turn: BackendTurn,
     ) -> std::result::Result<RunControl, BackendError> {
-        reject_mixed_handoff_use_skill_calls(&turn.tool_calls)?;
+        let mixed_handoff_error = mixed_handoff_use_skill_error(&turn.tool_calls);
         self.history.push(self.prompt.clone());
         self.history.push(turn.message);
 
@@ -2946,7 +2974,11 @@ impl CompletionRunner {
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
         for tool_call in turn.tool_calls {
-            let execution = self.execute_tool_call(&next_execution, tool_call).await?;
+            let execution = if let Some(provider_output) = mixed_handoff_error {
+                self.tool_call_error_result(&next_execution, tool_call, provider_output)?
+            } else {
+                self.execute_tool_call(&next_execution, tool_call).await?
+            };
             next_events.push(execution.event);
             tool_results.push(execution.tool_result);
         }
@@ -3249,6 +3281,22 @@ mod tests {
                             .collect(),
                     )
                 })
+                .collect();
+
+            Self {
+                turns: Arc::new(Mutex::new(turns)),
+                runs: Arc::new(Mutex::new(HashMap::new())),
+                barrier: None,
+                calls: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn with_turns(
+            entries: Vec<(&str, Vec<std::result::Result<BackendTurn, BackendError>>)>,
+        ) -> Self {
+            let turns = entries
+                .into_iter()
+                .map(|(branch, responses)| (branch.to_owned(), responses.into()))
                 .collect();
 
             Self {
@@ -3631,8 +3679,13 @@ mod tests {
         crate::builtin_tool_definition("exec_command").expect("builtin tool should exist")
     }
 
-    fn test_tool_call(name: &str, arguments: serde_json::Value) -> CompletionToolCall {
-        match rig_tool_call_content("tool-call-1", None, name, arguments) {
+    fn test_tool_call(
+        id: &str,
+        call_id: Option<String>,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> CompletionToolCall {
+        match rig_tool_call_content(id, call_id, name, arguments) {
             rig::message::AssistantContent::ToolCall(tool_call) => tool_call,
             _ => panic!("expected tool call content"),
         }
@@ -3675,28 +3728,103 @@ mod tests {
     }
 
     #[test]
-    fn handoff_use_skill_must_be_the_only_tool_call() {
+    fn mixed_handoff_use_skill_reports_recoverable_tool_error() {
         let use_skill = test_tool_call(
+            "tool-call-1",
+            None,
             "use_skill",
             serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
         );
-        let exec_command = test_tool_call("exec_command", serde_json::json!({"cmd": "pwd"}));
-
-        let error = reject_mixed_handoff_use_skill_calls(&[use_skill, exec_command]).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("use_skill with handoff must be the only tool call")
+        let exec_command = test_tool_call(
+            "tool-call-2",
+            None,
+            "exec_command",
+            serde_json::json!({"cmd": "pwd"}),
         );
+
+        let error = mixed_handoff_use_skill_error(&[use_skill, exec_command]);
+
+        assert_eq!(error, Some(MIXED_HANDOFF_USE_SKILL_ERROR));
     }
 
     #[test]
     fn non_handoff_use_skill_can_share_tool_turn() {
-        let use_skill = test_tool_call("use_skill", serde_json::json!({"name": "fast-rust"}));
-        let exec_command = test_tool_call("exec_command", serde_json::json!({"cmd": "pwd"}));
+        let use_skill = test_tool_call(
+            "tool-call-1",
+            None,
+            "use_skill",
+            serde_json::json!({"name": "fast-rust"}),
+        );
+        let exec_command = test_tool_call(
+            "tool-call-2",
+            None,
+            "exec_command",
+            serde_json::json!({"cmd": "pwd"}),
+        );
 
-        reject_mixed_handoff_use_skill_calls(&[use_skill, exec_command]).unwrap();
+        assert_eq!(
+            mixed_handoff_use_skill_error(&[use_skill, exec_command]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_handoff_use_skill_returns_tool_results_for_recovery() {
+        let use_skill = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "use_skill",
+            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
+        );
+        let exec_command = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "exec_command",
+            serde_json::json!({"cmd": "pwd"}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![use_skill, exec_command])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![Ok(turn), Ok(BackendTurn::finished("recovered"))],
+        )]);
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), backend);
+        service
+            .create_session(SessionConfig {
+                tools: vec![
+                    exec_command_tool(),
+                    crate::builtin_tool_definition("use_skill").unwrap(),
+                ],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let result = service
+            .prompt(prompt_request("main", "delegate with another tool"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "recovered");
+        let ancestry = store.ancestry("main").unwrap();
+        let mixed_tool_results = ancestry
+            .iter()
+            .filter_map(|node| match &node.kind {
+                Kind::ToolResult(ToolResult { id, output }) => Some((id.as_str(), output.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mixed_tool_results,
+            vec![
+                ("tool-call-2", MIXED_HANDOFF_USE_SKILL_ERROR),
+                ("tool-call-1", MIXED_HANDOFF_USE_SKILL_ERROR),
+            ]
+        );
     }
 
     #[test]
