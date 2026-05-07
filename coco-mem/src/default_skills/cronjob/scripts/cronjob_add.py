@@ -19,6 +19,7 @@ from pathlib import Path
 MANAGED_PREFIX = "coco-cronjob"
 MANAGED_CRONTAB_FILE = "managed-crontab"
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+TIMEZONE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+./:-]{0,127}$")
 
 
 def main() -> int:
@@ -27,6 +28,7 @@ def main() -> int:
     branch = args.target or args.branch
     prompt = resolve_prompt(args)
     validate_cronexpr(args.cronexpr)
+    timezone = normalize_timezone(args.timezone)
 
     install_dir = resolve_install_dir(args.install_dir)
     task_dir = install_dir / "tasks"
@@ -38,7 +40,7 @@ def main() -> int:
     block = render_crontab_block(
         task_id=task_id,
         cronexpr=args.cronexpr,
-        timezone=args.timezone,
+        timezone=timezone,
         uv_bin=args.uv_bin,
         runner_path=runner_path,
         task_path=task_path,
@@ -71,7 +73,7 @@ def main() -> int:
     block = render_crontab_block(
         task_id=task_id,
         cronexpr=args.cronexpr,
-        timezone=args.timezone,
+        timezone=timezone,
         uv_bin=args.uv_bin,
         runner_path=runner_path,
         task_path=task_path,
@@ -147,6 +149,18 @@ def normalize_task_id(value: str) -> str:
             "letters, digits, dot, underscore, or dash"
         )
     return task_id
+
+
+def normalize_timezone(value: str | None) -> str | None:
+    if value is None:
+        return None
+    timezone = value.strip()
+    if not TIMEZONE_PATTERN.fullmatch(timezone):
+        raise SystemExit(
+            "timezone must start with an alphanumeric character and contain only "
+            "letters, digits, underscore, plus, dot, slash, colon, or dash"
+        )
+    return timezone
 
 
 def resolve_prompt(args: argparse.Namespace) -> str:

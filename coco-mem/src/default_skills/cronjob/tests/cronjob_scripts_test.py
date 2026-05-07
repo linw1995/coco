@@ -224,6 +224,32 @@ class CronjobScriptTests(unittest.TestCase):
         )
         self.assertIn("\nCRON_TZ=\n# END coco-cronjob id=daily-review\n", result.stdout)
 
+    def test_add_rejects_cron_tz_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            result = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "15 * * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Preview prompt",
+                "--timezone",
+                "UTC\n* * * * echo injected",
+                "--dry-run",
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("timezone", result.stderr)
+        self.assertNotIn("echo injected", result.stdout)
+        self.assertFalse((workspace / "install").exists())
+
     def test_restore_preserves_existing_user_crontab(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
