@@ -76,22 +76,40 @@ EOF
 
 #### Getting ChatGPT Secrets
 
-The recommended Docker flow is to run the ChatGPT OAuth device flow once and
-persist its cache under `/data/.config`.
+The recommended Docker flow is to create the session config first, then run one
+prompt to start the ChatGPT OAuth device flow. `session create` only records the
+session anchor; the verification URL and device code appear on the first
+provider request.
 
 ```bash
 docker run --rm -it \
   -v "$PWD/.coco-data:/data" \
   -v "$PWD:/workspace" \
+  -e COCO_START_CRON=0 \
+  -e COCO_UID="$(id -u)" \
+  -e COCO_GID="$(id -g)" \
   coco:latest \
   coco session create \
     --provider-profile gpt-subscription \
     --system-prompt "You are a pragmatic coding assistant."
 ```
 
-When prompted, open the displayed verification URL, enter the device code, and
-finish signing in with the ChatGPT account that has the subscription. The OAuth
-cache is written to:
+Then trigger a single ChatGPT request:
+
+```bash
+docker run --rm -it \
+  -v "$PWD/.coco-data:/data" \
+  -v "$PWD:/workspace" \
+  -e COCO_START_CRON=0 \
+  -e COCO_UID="$(id -u)" \
+  -e COCO_GID="$(id -g)" \
+  coco:latest \
+  coco prompt --branch main "Reply with OK after authentication succeeds."
+```
+
+When the prompt command displays the verification URL, open it, enter the device
+code, and finish signing in with the ChatGPT account that has the subscription.
+The OAuth cache is written to:
 
 ```text
 .coco-data/.config/chatgpt/auth.json
