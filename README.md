@@ -34,8 +34,14 @@ docker run --rm -it \
   -v "$PWD/.coco-data:/data" \
   -v "$PWD:/workspace" \
   -e TZ="${TZ:-UTC}" \
+  -e COCO_UID="$(id -u)" \
+  -e COCO_GID="$(id -g)" \
   coco:latest
 ```
+
+Set `COCO_UID` and `COCO_GID` when bind-mounting host directories. The
+entrypoint starts as root, prepares the runtime user/group, fixes ownership for
+`/data`, and then runs both `supercronic` and CoCo as that uid/gid.
 
 The image starts `supercronic` before the default `coco daemon serve` command.
 Cronjob skill state, logs, runner scripts, managed snapshots, and the active
@@ -52,11 +58,16 @@ docker run --rm -it \
   -v "$PWD:/workspace" \
   -v /etc/localtime:/etc/localtime:ro \
   -e TZ="${TZ:-UTC}" \
+  -e COCO_UID="$(id -u)" \
+  -e COCO_GID="$(id -g)" \
   coco:latest
 ```
 
 Set `COCO_START_CRON=0` when you only need one-shot CLI commands and do not
-want the container entrypoint to start `supercronic`.
+want the container entrypoint to start `supercronic`. Prefer `COCO_UID` and
+`COCO_GID` over forcing Docker's `--user`; if the container starts non-root, the
+entrypoint cannot create passwd/group entries or repair mounted directory
+ownership before CoCo starts.
 
 ### ChatGPT Subscription
 
