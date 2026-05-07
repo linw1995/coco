@@ -3044,33 +3044,38 @@ fn resolve_provider_api_key(
 fn resolve_chatgpt_auth(
     secrets: &BTreeMap<String, String>,
 ) -> std::result::Result<rig::providers::chatgpt::ChatGPTAuth, BackendError> {
-    if let Some(env) = secrets.get("access_token") {
-        let access_token = std::env::var(env).map_err(|_| {
-            BackendError::failed(format!(
-                "missing access token for provider chatgpt in environment variable {env}"
-            ))
-        })?;
+    if let Some(env) = secrets.get("access_token")
+        && let Some(access_token) = resolve_secret_env(
+            env,
+            format!("missing access token for provider chatgpt in environment variable {env}"),
+        )?
+    {
         return Ok(rig::providers::chatgpt::ChatGPTAuth::AccessToken {
             access_token,
-            account_id: resolve_optional_secret(secrets, "account_id")?
-                .or_else(|| std::env::var("CHATGPT_ACCOUNT_ID").ok()),
+            account_id: resolve_chatgpt_account_id(secrets)?,
         });
     }
 
-    if std::env::var_os("COCO_API_KEY").is_some() {
+    if resolve_env_value("COCO_API_KEY").is_some() {
         return Err(BackendError::failed(
             "COCO_API_KEY must not be set when provider is chatgpt",
         ));
     }
 
-    match std::env::var("CHATGPT_ACCESS_TOKEN").ok() {
+    match resolve_env_value("CHATGPT_ACCESS_TOKEN") {
         Some(access_token) => Ok(rig::providers::chatgpt::ChatGPTAuth::AccessToken {
             access_token,
-            account_id: resolve_optional_secret(secrets, "account_id")?
-                .or_else(|| std::env::var("CHATGPT_ACCOUNT_ID").ok()),
+            account_id: resolve_chatgpt_account_id(secrets)?,
         }),
         None => Ok(rig::providers::chatgpt::ChatGPTAuth::OAuth),
     }
+}
+
+fn resolve_chatgpt_account_id(
+    secrets: &BTreeMap<String, String>,
+) -> std::result::Result<Option<String>, BackendError> {
+    Ok(resolve_optional_secret(secrets, "account_id")?
+        .or_else(|| resolve_env_value("CHATGPT_ACCOUNT_ID")))
 }
 
 fn resolve_optional_secret(
@@ -3080,14 +3085,28 @@ fn resolve_optional_secret(
     secrets
         .get(key)
         .map(|env| {
-            std::env::var(env).map(Some).map_err(|_| {
-                BackendError::failed(format!(
-                    "missing secret {key} in environment variable {env}"
-                ))
-            })
+            resolve_secret_env(
+                env,
+                format!("missing secret {key} in environment variable {env}"),
+            )
         })
         .transpose()
         .map(Option::flatten)
+}
+
+fn resolve_secret_env(
+    name: &str,
+    missing_message: String,
+) -> std::result::Result<Option<String>, BackendError> {
+    std::env::var(name)
+        .map(|value| (!value.trim().is_empty()).then_some(value))
+        .map_err(|_| BackendError::failed(missing_message))
+}
+
+fn resolve_env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn resolve_base_url(provider: Provider, custom_base_url: Option<&str>) -> Option<String> {
@@ -3729,6 +3748,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_chatgpt_auth_defaults_to_oauth_with_empty_default_token() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", None),
+                ("CHATGPT_ACCESS_TOKEN", Some(OsStr::new(""))),
+                ("CHATGPT_ACCOUNT_ID", Some(OsStr::new(""))),
+            ],
+            || async {
+                assert!(matches!(
+                    resolve_chatgpt_auth(&BTreeMap::new()).unwrap(),
+                    rig::providers::chatgpt::ChatGPTAuth::OAuth
+                ));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn resolve_chatgpt_auth_rejects_coco_api_key() {
         with_process_env_async(
             &[
@@ -3741,6 +3778,53 @@ mod tests {
                 assert_eq!(
                     error.to_string(),
                     "COCO_API_KEY must not be set when provider is chatgpt"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_chatgpt_auth_uses_oauth_when_custom_env_access_token_is_empty() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", None),
+                ("COCO_CHATGPT_ACCESS_TOKEN", Some(OsStr::new(""))),
+                ("COCO_CHATGPT_ACCOUNT_ID", Some(OsStr::new(""))),
+                ("CHATGPT_ACCESS_TOKEN", None),
+                ("CHATGPT_ACCOUNT_ID", None),
+            ],
+            || async {
+                assert!(matches!(
+                    resolve_chatgpt_auth(&secrets(&[
+                        ("access_token", "COCO_CHATGPT_ACCESS_TOKEN"),
+                        ("account_id", "COCO_CHATGPT_ACCOUNT_ID"),
+                    ]))
+                    .unwrap(),
+                    rig::providers::chatgpt::ChatGPTAuth::OAuth
+                ));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_chatgpt_auth_reports_missing_custom_env_access_token() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", None),
+                ("COCO_CHATGPT_ACCESS_TOKEN", None),
+                ("CHATGPT_ACCESS_TOKEN", None),
+            ],
+            || async {
+                let error = resolve_chatgpt_auth(&secrets(&[(
+                    "access_token",
+                    "COCO_CHATGPT_ACCESS_TOKEN",
+                )]))
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "missing access token for provider chatgpt in environment variable COCO_CHATGPT_ACCESS_TOKEN"
                 );
             },
         )
