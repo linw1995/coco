@@ -2448,6 +2448,12 @@ fn rig_tool_result_content(
     }
 }
 
+const HANDOFF_SIBLING_TOOL_SKIPPED: &str = "Skipped this tool call because a previous use_skill handoff must return to the parent model before later sibling tool calls can run.";
+
+fn is_handoff_use_skill_tool_call(tool_call: &CompletionToolCall) -> bool {
+    tool_call.function.name == "use_skill" && tool_call.function.arguments.get("handoff").is_some()
+}
+
 fn provider_metadata(call_id: Option<String>) -> Option<ProviderMetadata> {
     Some(ProviderMetadata::new(call_id))
 }
@@ -2916,6 +2922,34 @@ impl CompletionRunner {
         })
     }
 
+    fn skipped_tool_call_after_handoff(
+        &mut self,
+        next_execution: &ExecutionMetadata,
+        tool_call: CompletionToolCall,
+    ) -> std::result::Result<ToolCallExecution, BackendError> {
+        let call_id = tool_call.call_id.clone();
+        let event = ToolExecutionOutcome::tool_result(HANDOFF_SIBLING_TOOL_SKIPPED)
+            .into_backend_event(tool_call.id.clone(), call_id.clone());
+        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
+            self.head = Some(append_backend_event(
+                trace_node_appender,
+                next_execution,
+                event.clone(),
+            )?);
+        }
+
+        Ok(ToolCallExecution {
+            event,
+            tool_result: rig_tool_result_content(
+                tool_call.id,
+                call_id,
+                rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
+                    HANDOFF_SIBLING_TOOL_SKIPPED,
+                )),
+            ),
+        })
+    }
+
     async fn advance_with_tool_calls(
         &mut self,
         state: StepState,
@@ -2927,8 +2961,18 @@ impl CompletionRunner {
         let next_execution = ExecutionMetadata::new(Self::next_execution_id());
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
+        let mut handoff_return_required = false;
         for tool_call in turn.tool_calls {
-            let execution = self.execute_tool_call(&next_execution, tool_call).await?;
+            let execution = if handoff_return_required {
+                self.skipped_tool_call_after_handoff(&next_execution, tool_call)?
+            } else {
+                let is_handoff_use_skill = is_handoff_use_skill_tool_call(&tool_call);
+                let execution = self.execute_tool_call(&next_execution, tool_call).await?;
+                if is_handoff_use_skill {
+                    handoff_return_required = true;
+                }
+                execution
+            };
             next_events.push(execution.event);
             tool_results.push(execution.tool_result);
         }
@@ -3241,6 +3285,22 @@ mod tests {
             }
         }
 
+        fn with_turns(
+            entries: Vec<(&str, Vec<std::result::Result<BackendTurn, BackendError>>)>,
+        ) -> Self {
+            let turns = entries
+                .into_iter()
+                .map(|(branch, responses)| (branch.to_owned(), responses.into()))
+                .collect();
+
+            Self {
+                turns: Arc::new(Mutex::new(turns)),
+                runs: Arc::new(Mutex::new(HashMap::new())),
+                barrier: None,
+                calls: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
         fn with_completions(
             entries: &[(&str, &[std::result::Result<BackendRun, BackendError>])],
         ) -> Self {
@@ -3341,6 +3401,32 @@ mod tests {
 
             tokio::time::sleep(Duration::from_millis(5)).await;
             next
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeSkillExecutor;
+
+    #[async_trait]
+    impl SkillToolExecutor for FakeSkillExecutor {
+        async fn search_skill_tool(
+            &self,
+            _request: SearchSkillToolRequest,
+        ) -> std::result::Result<String, ExecutorError> {
+            Ok(r#"{"skills":[]}"#.to_owned())
+        }
+
+        async fn execute_skill_tool(
+            &self,
+            request: UseSkillToolRequest,
+        ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
+            let response_node_id = request.parent_tool_use_id.clone();
+            Ok(SkillToolExecutionResult {
+                result: SkillToolRunResult {
+                    text: format!("Executed {}", request.skill_name),
+                },
+                response_node_id,
+            })
         }
     }
 
@@ -3658,6 +3744,64 @@ mod tests {
             Some("catgirl-role".to_owned())
         );
         assert_eq!(current_skill_name_from_prompt("regular prompt"), None);
+    }
+
+    #[tokio::test]
+    async fn handoff_use_skill_skips_later_sibling_tool_calls() {
+        let use_skill = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "use_skill",
+            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
+        );
+        let exec_command = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "exec_command",
+            serde_json::json!({"cmd": "printf sibling-executed"}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![use_skill, exec_command])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
+        )]);
+        let store = MemoryStore::new();
+        let service = LlmService::builder(store.clone(), backend)
+            .with_skill_tool_executor(Arc::new(FakeSkillExecutor))
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![
+                    crate::builtin_tool_definition("use_skill").unwrap(),
+                    exec_command_tool(),
+                ],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let result = service
+            .prompt(prompt_request("main", "delegate and continue"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "done");
+        let ancestry = store.ancestry("main").unwrap();
+        let tool_results = ancestry
+            .iter()
+            .filter_map(|node| match &node.kind {
+                Kind::ToolResult(ToolResult { id, output }) => Some((id.as_str(), output.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_results,
+            vec![("tool-call-2", HANDOFF_SIBLING_TOOL_SKIPPED)]
+        );
     }
 
     fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<BackendMetadata> {
