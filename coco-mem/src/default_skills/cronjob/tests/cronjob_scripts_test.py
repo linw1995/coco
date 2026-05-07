@@ -40,6 +40,27 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("minute step must be at least 15", result.stderr)
 
+    def test_add_rejects_cross_hour_cronexpr_under_fifteen_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            result = run_add(
+                workspace,
+                "--id",
+                "too-fast-across-hours",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "0,59 * * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Run too often across hours",
+                "--dry-run",
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("minute granularity must be at least 15 minutes", result.stderr)
+
     def test_add_rejects_invalid_cronexpr_fields(self) -> None:
         cases = [
             ("15 foo * * *", "hour values must be integers"),
@@ -81,6 +102,7 @@ class CronjobScriptTests(unittest.TestCase):
         cases = [
             "15 9 * jan,mar mon-fri",
             "0,30 */2 1-15/2 1-12/3 0,6",
+            "0,59 0 * * *",
             "45 23 31 dec sun",
         ]
         for cronexpr in cases:

@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -207,58 +208,151 @@ def validate_cronexpr(value: str) -> None:
     if len(fields) != 5:
         raise SystemExit("cronexpr must contain exactly five fields")
     minutes = expand_minute_field(fields[0])
-    validate_cron_field(fields[1], "hour", minimum=0, maximum=23)
-    validate_cron_field(fields[2], "day-of-month", minimum=1, maximum=31)
-    validate_cron_field(fields[3], "month", minimum=1, maximum=12, names=MONTH_NAMES)
-    validate_cron_field(fields[4], "day-of-week", minimum=0, maximum=7, names=WEEKDAY_NAMES)
+    hours = expand_cron_field(fields[1], "hour", minimum=0, maximum=23)
+    days_of_month = expand_cron_field(fields[2], "day-of-month", minimum=1, maximum=31)
+    months = expand_cron_field(fields[3], "month", minimum=1, maximum=12, names=MONTH_NAMES)
+    days_of_week = expand_cron_field(
+        fields[4],
+        "day-of-week",
+        minimum=0,
+        maximum=7,
+        names=WEEKDAY_NAMES,
+    )
     if not minutes:
         raise SystemExit("minute field must select at least one minute")
+    validate_minimum_cadence(
+        minutes=minutes,
+        hours=hours,
+        days_of_month=days_of_month,
+        months=months,
+        days_of_week=days_of_week,
+        day_of_month_field=fields[2],
+        day_of_week_field=fields[4],
+    )
+
+
+def validate_minimum_cadence(
+    *,
+    minutes: set[int],
+    hours: set[int],
+    days_of_month: set[int],
+    months: set[int],
+    days_of_week: set[int],
+    day_of_month_field: str,
+    day_of_week_field: str,
+) -> None:
     ordered = sorted(minutes)
-    gaps = [
-        right - left
-        for left, right in zip(ordered, ordered[1:])
-    ]
-    if len(ordered) > 1:
-        gaps.append((ordered[0] + 60) - ordered[-1])
-    if gaps and min(gaps) < 15:
+    if any(right - left < 15 for left, right in zip(ordered, ordered[1:])):
         raise SystemExit("cronexpr minute granularity must be at least 15 minutes")
 
+    previous = None
+    for occurrence in iter_cron_occurrences(
+        minutes=minutes,
+        hours=hours,
+        days_of_month=days_of_month,
+        months=months,
+        days_of_week=days_of_week,
+        day_of_month_field=day_of_month_field,
+        day_of_week_field=day_of_week_field,
+    ):
+        if previous is not None and occurrence - previous < timedelta(minutes=15):
+            raise SystemExit("cronexpr minute granularity must be at least 15 minutes")
+        previous = occurrence
 
-def validate_cron_field(
+
+def iter_cron_occurrences(
+    *,
+    minutes: set[int],
+    hours: set[int],
+    days_of_month: set[int],
+    months: set[int],
+    days_of_week: set[int],
+    day_of_month_field: str,
+    day_of_week_field: str,
+):
+    start = datetime(2024, 1, 1)
+    for offset in range(366 * 5):
+        day = start + timedelta(days=offset)
+        if day.month not in months:
+            continue
+        if not cron_day_matches(
+            day,
+            days_of_month=days_of_month,
+            days_of_week=days_of_week,
+            day_of_month_field=day_of_month_field,
+            day_of_week_field=day_of_week_field,
+        ):
+            continue
+        for hour in sorted(hours):
+            for minute in sorted(minutes):
+                yield day.replace(hour=hour, minute=minute)
+
+
+def cron_day_matches(
+    day: datetime,
+    *,
+    days_of_month: set[int],
+    days_of_week: set[int],
+    day_of_month_field: str,
+    day_of_week_field: str,
+) -> bool:
+    matches_day_of_month = day.day in days_of_month
+    cron_weekday = (day.weekday() + 1) % 7
+    matches_day_of_week = cron_weekday in days_of_week or (
+        cron_weekday == 0 and 7 in days_of_week
+    )
+    day_of_month_wildcard = day_of_month_field == "*"
+    day_of_week_wildcard = day_of_week_field == "*"
+    if day_of_month_wildcard and day_of_week_wildcard:
+        return True
+    if day_of_month_wildcard:
+        return matches_day_of_week
+    if day_of_week_wildcard:
+        return matches_day_of_month
+    return matches_day_of_month or matches_day_of_week
+
+
+def expand_cron_field(
     field: str,
     name: str,
     *,
     minimum: int,
     maximum: int,
     names: dict[str, int] | None = None,
-) -> None:
+) -> set[int]:
+    values: set[int] = set()
     for part in field.split(","):
         if not part:
             raise SystemExit(f"empty {name} field segment")
-        validate_cron_part(part, name, minimum=minimum, maximum=maximum, names=names)
+        values.update(
+            expand_cron_part(part, name, minimum=minimum, maximum=maximum, names=names)
+        )
+    return values
 
 
-def validate_cron_part(
+def expand_cron_part(
     part: str,
     name: str,
     *,
     minimum: int,
     maximum: int,
     names: dict[str, int] | None,
-) -> None:
+) -> set[int]:
     base, step = split_step(part, name)
     if base == "*":
-        return
+        start, end = minimum, maximum
     if "-" in base:
         left, right = base.split("-", 1)
         start = parse_cron_value(left, name, minimum=minimum, maximum=maximum, names=names)
         end = parse_cron_value(right, name, minimum=minimum, maximum=maximum, names=names)
         if start > end:
             raise SystemExit(f"{name} ranges must be ascending")
-        return
-    parse_cron_value(base, name, minimum=minimum, maximum=maximum, names=names)
-    if step is not None:
-        raise SystemExit(f"single {name} values cannot use a step")
+    elif base != "*":
+        value = parse_cron_value(base, name, minimum=minimum, maximum=maximum, names=names)
+        if step is not None:
+            raise SystemExit(f"single {name} values cannot use a step")
+        return {value}
+    return set(range(start, end + 1, step or 1))
 
 
 def expand_minute_field(field: str) -> set[int]:
