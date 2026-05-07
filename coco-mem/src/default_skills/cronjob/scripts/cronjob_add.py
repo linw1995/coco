@@ -20,6 +20,29 @@ MANAGED_PREFIX = "coco-cronjob"
 MANAGED_CRONTAB_FILE = "managed-crontab"
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 TIMEZONE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+./:-]{0,127}$")
+MONTH_NAMES = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+WEEKDAY_NAMES = {
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
+}
 
 
 def main() -> int:
@@ -184,6 +207,10 @@ def validate_cronexpr(value: str) -> None:
     if len(fields) != 5:
         raise SystemExit("cronexpr must contain exactly five fields")
     minutes = expand_minute_field(fields[0])
+    validate_cron_field(fields[1], "hour", minimum=0, maximum=23)
+    validate_cron_field(fields[2], "day-of-month", minimum=1, maximum=31)
+    validate_cron_field(fields[3], "month", minimum=1, maximum=12, names=MONTH_NAMES)
+    validate_cron_field(fields[4], "day-of-week", minimum=0, maximum=7, names=WEEKDAY_NAMES)
     if not minutes:
         raise SystemExit("minute field must select at least one minute")
     ordered = sorted(minutes)
@@ -197,6 +224,43 @@ def validate_cronexpr(value: str) -> None:
         raise SystemExit("cronexpr minute granularity must be at least 15 minutes")
 
 
+def validate_cron_field(
+    field: str,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+    names: dict[str, int] | None = None,
+) -> None:
+    for part in field.split(","):
+        if not part:
+            raise SystemExit(f"empty {name} field segment")
+        validate_cron_part(part, name, minimum=minimum, maximum=maximum, names=names)
+
+
+def validate_cron_part(
+    part: str,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+    names: dict[str, int] | None,
+) -> None:
+    base, step = split_step(part, name)
+    if base == "*":
+        return
+    if "-" in base:
+        left, right = base.split("-", 1)
+        start = parse_cron_value(left, name, minimum=minimum, maximum=maximum, names=names)
+        end = parse_cron_value(right, name, minimum=minimum, maximum=maximum, names=names)
+        if start > end:
+            raise SystemExit(f"{name} ranges must be ascending")
+        return
+    parse_cron_value(base, name, minimum=minimum, maximum=maximum, names=names)
+    if step is not None:
+        raise SystemExit(f"single {name} values cannot use a step")
+
+
 def expand_minute_field(field: str) -> set[int]:
     minutes: set[int] = set()
     for part in field.split(","):
@@ -207,16 +271,17 @@ def expand_minute_field(field: str) -> set[int]:
 
 
 def expand_minute_part(part: str) -> set[int]:
-    base, step = split_step(part)
+    base, step = split_step(part, "minute")
     if base == "*":
         start, end = 0, 59
     elif "-" in base:
         left, right = base.split("-", 1)
-        start, end = parse_minute(left), parse_minute(right)
+        start = parse_cron_value(left, "minute", minimum=0, maximum=59)
+        end = parse_cron_value(right, "minute", minimum=0, maximum=59)
         if start > end:
             raise SystemExit("minute ranges must be ascending")
     else:
-        minute = parse_minute(base)
+        minute = parse_cron_value(base, "minute", minimum=0, maximum=59)
         if step is not None:
             raise SystemExit("single minute values cannot use a step")
         return {minute}
@@ -226,29 +291,40 @@ def expand_minute_part(part: str) -> set[int]:
     return set(range(start, end + 1, step))
 
 
-def split_step(part: str) -> tuple[str, int | None]:
+def split_step(part: str, name: str) -> tuple[str, int | None]:
     if "/" not in part:
         return part, None
     base, step_text = part.split("/", 1)
     if not base or not step_text:
-        raise SystemExit("minute step syntax must be <range>/<step>")
+        raise SystemExit(f"{name} step syntax must be <range>/<step>")
     try:
         step = int(step_text)
     except ValueError as error:
-        raise SystemExit("minute step must be an integer") from error
+        raise SystemExit(f"{name} step must be an integer") from error
     if step <= 0:
-        raise SystemExit("minute step must be positive")
+        raise SystemExit(f"{name} step must be positive")
     return base, step
 
 
-def parse_minute(value: str) -> int:
+def parse_cron_value(
+    value: str,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+    names: dict[str, int] | None = None,
+) -> int:
+    if names is not None:
+        resolved = names.get(value.lower())
+        if resolved is not None:
+            return resolved
     try:
-        minute = int(value)
+        parsed = int(value)
     except ValueError as error:
-        raise SystemExit("minute values must be integers") from error
-    if minute < 0 or minute > 59:
-        raise SystemExit("minute values must be between 0 and 59")
-    return minute
+        raise SystemExit(f"{name} values must be integers") from error
+    if parsed < minimum or parsed > maximum:
+        raise SystemExit(f"{name} values must be between {minimum} and {maximum}")
+    return parsed
 
 
 def resolve_install_dir(value: Path | None) -> Path:

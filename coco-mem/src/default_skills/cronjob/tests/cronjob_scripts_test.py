@@ -40,6 +40,49 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("minute step must be at least 15", result.stderr)
 
+    def test_add_rejects_invalid_cronexpr_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            result = run_add(
+                workspace,
+                "--id",
+                "invalid-hour",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "15 foo * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Run with invalid cron field",
+                "--dry-run",
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hour values must be integers", result.stderr)
+        self.assertFalse((workspace / "install").exists())
+
+    def test_add_accepts_named_cronexpr_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            result = run_add(
+                workspace,
+                "--id",
+                "weekday-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "15 9 * jan,mar mon-fri",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Run with named cron fields",
+                "--dry-run",
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("15 9 * jan,mar mon-fri", result.stdout)
+
     def test_add_is_idempotent_by_managed_task_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
