@@ -2448,7 +2448,7 @@ fn rig_tool_result_content(
     }
 }
 
-const HANDOFF_SIBLING_TOOL_SKIPPED: &str = "Skipped this tool call because a previous use_skill handoff must return to the parent model before later sibling tool calls can run.";
+const HANDOFF_SIBLING_TOOL_SKIPPED: &str = "Skipped this tool call because this assistant turn contains a use_skill handoff, which must return to the parent model before sibling tool calls can run.";
 
 fn is_handoff_use_skill_tool_call(tool_call: &CompletionToolCall) -> bool {
     tool_call.function.name == "use_skill" && tool_call.function.arguments.get("handoff").is_some()
@@ -2922,7 +2922,7 @@ impl CompletionRunner {
         })
     }
 
-    fn skipped_tool_call_after_handoff(
+    fn skipped_tool_call_for_handoff_sibling(
         &mut self,
         next_execution: &ExecutionMetadata,
         tool_call: CompletionToolCall,
@@ -2961,17 +2961,17 @@ impl CompletionRunner {
         let next_execution = ExecutionMetadata::new(Self::next_execution_id());
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
-        let mut handoff_return_required = false;
+        let handoff_tool_call_id = turn
+            .tool_calls
+            .iter()
+            .find(|tool_call| is_handoff_use_skill_tool_call(tool_call))
+            .map(|tool_call| tool_call.id.clone());
         for tool_call in turn.tool_calls {
-            let execution = if handoff_return_required {
-                self.skipped_tool_call_after_handoff(&next_execution, tool_call)?
-            } else {
-                let is_handoff_use_skill = is_handoff_use_skill_tool_call(&tool_call);
-                let execution = self.execute_tool_call(&next_execution, tool_call).await?;
-                if is_handoff_use_skill {
-                    handoff_return_required = true;
+            let execution = match handoff_tool_call_id.as_deref() {
+                Some(handoff_id) if tool_call.id != handoff_id => {
+                    self.skipped_tool_call_for_handoff_sibling(&next_execution, tool_call)?
                 }
-                execution
+                _ => self.execute_tool_call(&next_execution, tool_call).await?,
             };
             next_events.push(execution.event);
             tool_results.push(execution.tool_result);
@@ -3801,6 +3801,64 @@ mod tests {
         assert_eq!(
             tool_results,
             vec![("tool-call-2", HANDOFF_SIBLING_TOOL_SKIPPED)]
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_use_skill_skips_earlier_sibling_tool_calls() {
+        let exec_command = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "exec_command",
+            serde_json::json!({"cmd": "printf sibling-executed"}),
+        );
+        let use_skill = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "use_skill",
+            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![exec_command, use_skill])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
+        )]);
+        let store = MemoryStore::new();
+        let service = LlmService::builder(store.clone(), backend)
+            .with_skill_tool_executor(Arc::new(FakeSkillExecutor))
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![
+                    exec_command_tool(),
+                    crate::builtin_tool_definition("use_skill").unwrap(),
+                ],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let result = service
+            .prompt(prompt_request("main", "run a command then delegate"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "done");
+        let ancestry = store.ancestry("main").unwrap();
+        let tool_results = ancestry
+            .iter()
+            .filter_map(|node| match &node.kind {
+                Kind::ToolResult(ToolResult { id, output }) => Some((id.as_str(), output.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_results,
+            vec![("tool-call-1", HANDOFF_SIBLING_TOOL_SKIPPED)]
         );
     }
 
