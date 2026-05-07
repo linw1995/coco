@@ -88,7 +88,7 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
         }),
         "use_skill" => Some(Tool {
             name: "use_skill".to_owned(),
-            description: "Run an installed skill on an isolated child branch.".to_owned(),
+            description: "Run an installed skill on an isolated child branch. When you provide `handoff`, call `use_skill` alone in that assistant turn so the bounded handoff is clear and the parent can inspect the skill result before deciding any next tool call.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
