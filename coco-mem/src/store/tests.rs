@@ -1753,17 +1753,23 @@ where
     let new_skill = store
         .get_skill(SessionRole::Orchestrator, "new-skill")
         .unwrap();
+    let cronjob = store
+        .get_skill(SessionRole::Orchestrator, "cronjob")
+        .unwrap();
     let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
     let telegram = store.get_skill(SessionRole::Runner, "telegram").unwrap();
 
     assert_eq!(orchestrator.current_version, 1);
     assert_eq!(new_skill.current_version, 1);
+    assert_eq!(cronjob.current_version, 1);
     assert_eq!(telegram.current_version, 1);
     assert_eq!(runner.current_version, 1);
     assert!(orchestrator.current().unwrap().enable_coco_shim);
     assert!(new_skill.current().unwrap().enable_coco_shim);
+    assert!(cronjob.current().unwrap().enable_coco_shim);
     assert!(telegram.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
+    assert_eq!(cronjob.current().unwrap().scripts.len(), 3);
     assert_eq!(telegram.current().unwrap().scripts.len(), 2);
     assert!(
         orchestrator
@@ -1780,6 +1786,13 @@ where
             .contains("--tool exec_command --tool write_stdin --tool search_skill")
     );
     assert!(new_skill.current().unwrap().body.contains("coco skill add"));
+    assert!(
+        cronjob
+            .current()
+            .unwrap()
+            .body
+            .contains("uv run --script \"$COCO_SKILL_DIR/scripts/cronjob_add.py\"")
+    );
     assert!(
         telegram
             .current()
@@ -2663,6 +2676,11 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
     );
     assert!(
         reopened
+            .get_skill(SessionRole::Orchestrator, "cronjob")
+            .is_ok()
+    );
+    assert!(
+        reopened
             .get_skill(SessionRole::Runner, "coco-runner")
             .is_ok()
     );
@@ -2673,6 +2691,10 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
     );
     assert!(
         path.join("skill-history/orchestrator/new-skill.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/orchestrator/cronjob.jsonl")
             .is_file()
     );
     assert!(

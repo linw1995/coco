@@ -33,8 +33,30 @@ docker run --rm -it \
   -p 17667:17667 \
   -v "$PWD/.coco-data:/data" \
   -v "$PWD:/workspace" \
+  -e TZ="${TZ:-UTC}" \
   coco:latest
 ```
+
+The image starts `supercronic` before the default `coco daemon serve` command.
+Cronjob skill state, logs, runner scripts, managed snapshots, and the active
+crontab file are persisted under `/data/skills`; the container does not rely on
+system crontab spool state. Set `TZ` to the host timezone so cron schedules,
+logs, and CoCo agree on wall-clock time. You can also mount the host localtime
+file when your host exposes it:
+
+```bash
+docker run --rm -it \
+  --name coco \
+  -p 17667:17667 \
+  -v "$PWD/.coco-data:/data" \
+  -v "$PWD:/workspace" \
+  -v /etc/localtime:/etc/localtime:ro \
+  -e TZ="${TZ:-UTC}" \
+  coco:latest
+```
+
+Set `COCO_START_CRON=0` when you only need one-shot CLI commands and do not
+want the container entrypoint to start `supercronic`.
 
 ### ChatGPT Subscription
 
