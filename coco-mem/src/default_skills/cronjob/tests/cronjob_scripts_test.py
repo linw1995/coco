@@ -41,47 +41,69 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertIn("minute step must be at least 15", result.stderr)
 
     def test_add_rejects_invalid_cronexpr_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            result = run_add(
-                workspace,
-                "--id",
-                "invalid-hour",
-                "--branch",
-                "main",
-                "--cronexpr",
-                "15 foo * * *",
-                "--repeat",
-                "skip",
-                "--prompt",
-                "Run with invalid cron field",
-                "--dry-run",
-            )
+        cases = [
+            ("15 foo * * *", "hour values must be integers"),
+            ("15 24 * * *", "hour values must be between 0 and 23"),
+            ("15 9 0 * *", "day-of-month values must be between 1 and 31"),
+            ("15 9 32 * *", "day-of-month values must be between 1 and 31"),
+            ("15 9 * nope *", "month values must be integers"),
+            ("15 9 * 13 *", "month values must be between 1 and 12"),
+            ("15 9 * dec-jan *", "month ranges must be ascending"),
+            ("15 9 * */x *", "month step must be an integer"),
+            ("15 9 * * funday", "day-of-week values must be integers"),
+            ("15 9 * * 8", "day-of-week values must be between 0 and 7"),
+            ("15 9 * * mon/2", "single day-of-week values cannot use a step"),
+        ]
+        for cronexpr, expected_error in cases:
+            with self.subTest(cronexpr=cronexpr):
+                with tempfile.TemporaryDirectory() as directory:
+                    workspace = Path(directory)
+                    result = run_add(
+                        workspace,
+                        "--id",
+                        "invalid-schedule",
+                        "--branch",
+                        "main",
+                        "--cronexpr",
+                        cronexpr,
+                        "--repeat",
+                        "skip",
+                        "--prompt",
+                        "Run with invalid cron field",
+                        "--dry-run",
+                    )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("hour values must be integers", result.stderr)
-        self.assertFalse((workspace / "install").exists())
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected_error, result.stderr)
+                    self.assertFalse((workspace / "install").exists())
 
-    def test_add_accepts_named_cronexpr_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            result = run_add(
-                workspace,
-                "--id",
-                "weekday-review",
-                "--branch",
-                "main",
-                "--cronexpr",
-                "15 9 * jan,mar mon-fri",
-                "--repeat",
-                "skip",
-                "--prompt",
-                "Run with named cron fields",
-                "--dry-run",
-            )
+    def test_add_accepts_valid_cronexpr_field_syntax(self) -> None:
+        cases = [
+            "15 9 * jan,mar mon-fri",
+            "0,30 */2 1-15/2 1-12/3 0,6",
+            "45 23 31 dec sun",
+        ]
+        for cronexpr in cases:
+            with self.subTest(cronexpr=cronexpr):
+                with tempfile.TemporaryDirectory() as directory:
+                    workspace = Path(directory)
+                    result = run_add(
+                        workspace,
+                        "--id",
+                        "weekday-review",
+                        "--branch",
+                        "main",
+                        "--cronexpr",
+                        cronexpr,
+                        "--repeat",
+                        "skip",
+                        "--prompt",
+                        "Run with valid cron fields",
+                        "--dry-run",
+                    )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("15 9 * jan,mar mon-fri", result.stdout)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(cronexpr, result.stdout)
 
     def test_add_is_idempotent_by_managed_task_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
