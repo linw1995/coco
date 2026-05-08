@@ -247,6 +247,36 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertIn("5 * * * * echo user-owned", crontab)
         self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
 
+    def test_add_direct_crontab_file_uses_non_empty_cron_tz_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            crontab_file = workspace / "supercronic" / "crontab"
+
+            result = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "15 * * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Persisted prompt",
+                "--timezone",
+                "Asia/Shanghai",
+                "--crontab-file",
+                str(crontab_file),
+                env={"TZ": "UTC"},
+            )
+            crontab = crontab_file.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CRON_TZ=Asia/Shanghai", crontab)
+        self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=daily-review\n", crontab)
+        self.assertNotIn("\nCRON_TZ=\n", crontab)
+
     def test_add_dry_run_does_not_mutate_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -388,7 +418,9 @@ class CronjobScriptTests(unittest.TestCase):
                 textwrap.dedent(
                     """\
                     # BEGIN coco-cronjob id=daily-review
+                    CRON_TZ=Asia/Shanghai
                     15 * * * * 'uv' 'run' '--script' '/data/cronjob_run.py' '--task-file' '/data/daily-review.json' >> '/data/daily-review.log' 2>&1
+                    CRON_TZ=
                     # END coco-cronjob id=daily-review
                     """
                 ),
@@ -408,12 +440,16 @@ class CronjobScriptTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env={**os.environ, "TZ": "UTC"},
             )
             crontab = crontab_file.read_text(encoding="utf-8")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("5 * * * * echo user-owned", crontab)
         self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
+        self.assertIn("CRON_TZ=Asia/Shanghai", crontab)
+        self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=daily-review\n", crontab)
+        self.assertNotIn("\nCRON_TZ=\n", crontab)
 
     def test_runner_skip_policy_does_not_submit_while_previous_job_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

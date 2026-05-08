@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 from pathlib import Path
 
 
 MANAGED_PREFIX = "coco-cronjob"
+TIMEZONE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+./:-]{0,127}$")
 
 
 def main() -> int:
@@ -25,7 +27,12 @@ def main() -> int:
         return 0
 
     crontab_file = resolve_crontab_file(args.crontab_file)
+    timezone_reset = resolve_timezone_reset(crontab_file)
+    if crontab_file is not None:
+        snapshot = normalize_direct_crontab(snapshot, timezone_reset)
     current = read_crontab(args.crontab_bin, crontab_file)
+    if crontab_file is not None:
+        current = normalize_direct_crontab(current, timezone_reset)
     updated = restore_managed_blocks(current, snapshot)
     if updated != current:
         write_crontab(args.crontab_bin, crontab_file, updated)
@@ -47,6 +54,24 @@ def resolve_crontab_file(value: Path | None) -> Path | None:
     if not env_value:
         return None
     return Path(env_value).expanduser()
+
+
+def resolve_timezone_reset(crontab_file: Path | None) -> str:
+    if crontab_file is None:
+        return ""
+    timezone = normalize_timezone(os.environ.get("TZ"))
+    return timezone or "UTC"
+
+
+def normalize_timezone(value: str | None) -> str | None:
+    if value is None:
+        return None
+    timezone = value.strip()
+    if not timezone:
+        return None
+    if not TIMEZONE_PATTERN.fullmatch(timezone):
+        raise SystemExit("timezone must be a single CRON_TZ token")
+    return timezone
 
 
 def read_crontab(crontab_bin: str, crontab_file: Path | None) -> str:
@@ -88,6 +113,13 @@ def write_crontab(crontab_bin: str, crontab_file: Path | None, content: str) -> 
     )
     if result.returncode != 0:
         raise SystemExit(f"failed to install crontab: {result.stderr.strip()}")
+
+
+def normalize_direct_crontab(content: str, timezone_reset: str) -> str:
+    return "\n".join(
+        f"CRON_TZ={timezone_reset}" if line == "CRON_TZ=" else line
+        for line in content.split("\n")
+    )
 
 
 def restore_managed_blocks(current: str, snapshot: str) -> str:
