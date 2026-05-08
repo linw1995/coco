@@ -275,6 +275,46 @@ async fn core_service_routes_message_to_engine() {
 }
 
 #[tokio::test]
+async fn core_service_telegram_prompt_requires_completing_request_before_reply() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let service = CoreService::new(
+        FixedBranchResolver::new("main"),
+        ConversationEngine::new(llm),
+    );
+
+    service
+        .handle_message(InboundMessage::telegram_with_message_id(
+            "chat-1",
+            "user-1",
+            "message-1",
+            "Create a runner skill and inspect the upstream history.",
+        ))
+        .await
+        .unwrap();
+
+    let ancestry = store.ancestry("main").unwrap();
+    let prompt = match &ancestry[1].kind {
+        Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
+        _ => panic!("expected prompt anchor"),
+    };
+    assert!(prompt.contains("Treat the incoming message as the user's actual request"));
+    assert!(prompt.contains("Complete the requested work using any needed tools or skills"));
+    assert!(prompt.contains("do not delegate the user task itself"));
+    assert!(prompt.contains("you may send one progress update through the `telegram` skill"));
+    assert!(prompt.contains("then continue working"));
+    assert!(prompt.contains("for the final user-facing reply only after"));
+    assert!(prompt.contains("the final reply is that first message"));
+    assert!(prompt.contains("Do not use the `telegram` skill merely to acknowledge"));
+    assert!(prompt.contains("Do not finish after an acknowledgement-only Telegram reply"));
+    assert!(prompt.contains("include a concise multi-task summary"));
+    assert!(prompt.contains("chat_id: chat-1"));
+    assert!(prompt.contains("reply_to_message_id: message-1"));
+}
+
+#[tokio::test]
 async fn core_service_returns_missing_session() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[]);
