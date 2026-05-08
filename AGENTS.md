@@ -35,3 +35,18 @@
 - Do not use `String` as a cross-module or public-facing error channel; define
   a typed SNAFU error instead and convert to text only at the outer
   presentation boundary.
+
+## Documentation
+
+- Keep the root `README.md` short. It should introduce the project and point to
+  detailed documents under `docs/`.
+- Put long-form setup, deployment, and operations guidance in `docs/`. Keep
+  `docs/README.md` as the documentation index.
+- Keep docs English-first. If Chinese docs are needed, prefer a clearly
+  separated section or a dedicated `docs/zh/` page instead of mixing
+  translations into English paragraphs.
+- When Docker image behavior, environment variables, ports, mounted paths,
+  cron behavior, or authentication flow changes, update `docker-compose.yaml`,
+  `.env.example`, and `docs/docker-compose.md` together.
+- Do not document real tokens, account ids, chat ids, or machine-local private
+  paths. Use placeholders in examples.

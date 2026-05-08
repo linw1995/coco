@@ -15,3 +15,5 @@ coco-console/pkg
 skills-lock.json
 config.toml
 logs
+.env
+!.env.example
