@@ -30,12 +30,14 @@ def main() -> int:
     timezone_reset = resolve_timezone_reset(crontab_file)
     if crontab_file is not None:
         snapshot = normalize_direct_crontab(snapshot, timezone_reset)
-    original = read_crontab(args.crontab_bin, crontab_file)
-    current = original
-    if crontab_file is not None:
-        current = normalize_direct_crontab(current, timezone_reset)
-    updated = restore_managed_blocks(current, snapshot)
-    if updated != original:
+    raw_crontab = read_crontab(args.crontab_bin, crontab_file)
+    normalized_crontab = (
+        normalize_direct_crontab(raw_crontab, timezone_reset)
+        if crontab_file is not None
+        else raw_crontab
+    )
+    updated = restore_managed_blocks(normalized_crontab, snapshot)
+    if updated != raw_crontab:
         write_crontab(args.crontab_bin, crontab_file, updated)
     return 0
 

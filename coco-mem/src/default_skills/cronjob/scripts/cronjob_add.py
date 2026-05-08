@@ -108,12 +108,14 @@ def main() -> int:
         log_path=log_dir / f"{task_id}.log",
     )
 
-    original = read_crontab(args.crontab_bin, crontab_file)
-    current = original
-    if crontab_file is not None:
-        current = normalize_direct_crontab(current, timezone_reset)
-    updated, action = upsert_managed_block(current, task_id, block)
-    if updated != original:
+    raw_crontab = read_crontab(args.crontab_bin, crontab_file)
+    normalized_crontab = (
+        normalize_direct_crontab(raw_crontab, timezone_reset)
+        if crontab_file is not None
+        else raw_crontab
+    )
+    updated, action = upsert_managed_block(normalized_crontab, task_id, block)
+    if updated != raw_crontab:
         write_crontab(args.crontab_bin, crontab_file, updated)
     write_managed_crontab_snapshot(install_dir / MANAGED_CRONTAB_FILE, updated)
     print(
