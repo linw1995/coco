@@ -116,10 +116,31 @@ def write_crontab(crontab_bin: str, crontab_file: Path | None, content: str) -> 
 
 
 def normalize_direct_crontab(content: str, timezone_reset: str) -> str:
-    return "\n".join(
-        f"CRON_TZ={timezone_reset}" if line == "CRON_TZ=" else line
-        for line in content.split("\n")
-    )
+    lines = content.splitlines()
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.startswith(f"# BEGIN {MANAGED_PREFIX} id="):
+            output.append(line)
+            index += 1
+            continue
+
+        output.append(line)
+        index += 1
+        while index < len(lines):
+            managed_line = lines[index]
+            output.append(
+                f"CRON_TZ={timezone_reset}" if managed_line == "CRON_TZ=" else managed_line
+            )
+            if managed_line.startswith(f"# END {MANAGED_PREFIX} id="):
+                break
+            index += 1
+        else:
+            raise SystemExit("managed crontab block is missing its end marker")
+        index += 1
+
+    return "\n".join(output).rstrip("\n") + ("\n" if output else "")
 
 
 def restore_managed_blocks(current: str, snapshot: str) -> str:

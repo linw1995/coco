@@ -180,10 +180,12 @@ def normalize_task_id(value: str) -> str:
     return task_id
 
 
-def normalize_timezone(value: str | None) -> str | None:
+def normalize_timezone(value: str | None, *, allow_blank: bool = False) -> str | None:
     if value is None:
         return None
     timezone = value.strip()
+    if allow_blank and not timezone:
+        return None
     if not TIMEZONE_PATTERN.fullmatch(timezone):
         raise SystemExit(
             "timezone must start with an alphanumeric character and contain only "
@@ -475,7 +477,7 @@ def resolve_crontab_file(value: Path | None) -> Path | None:
 def resolve_timezone_reset(crontab_file: Path | None) -> str:
     if crontab_file is None:
         return ""
-    timezone = normalize_timezone(os.environ.get("TZ"))
+    timezone = normalize_timezone(os.environ.get("TZ"), allow_blank=True)
     return timezone or "UTC"
 
 
@@ -579,10 +581,31 @@ def write_crontab(crontab_bin: str, crontab_file: Path | None, content: str) -> 
 
 
 def normalize_direct_crontab(content: str, timezone_reset: str) -> str:
-    return "\n".join(
-        f"CRON_TZ={timezone_reset}" if line == "CRON_TZ=" else line
-        for line in content.split("\n")
-    )
+    lines = content.splitlines()
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.startswith(f"# BEGIN {MANAGED_PREFIX} id="):
+            output.append(line)
+            index += 1
+            continue
+
+        output.append(line)
+        index += 1
+        while index < len(lines):
+            managed_line = lines[index]
+            output.append(
+                f"CRON_TZ={timezone_reset}" if managed_line == "CRON_TZ=" else managed_line
+            )
+            if managed_line.startswith(f"# END {MANAGED_PREFIX} id="):
+                break
+            index += 1
+        else:
+            raise SystemExit(f"managed crontab block {line!r} is missing its end marker")
+        index += 1
+
+    return "\n".join(output).rstrip("\n") + ("\n" if output else "")
 
 
 def write_managed_crontab_snapshot(path: Path, content: str) -> None:

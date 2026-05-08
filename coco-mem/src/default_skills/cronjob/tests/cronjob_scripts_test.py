@@ -251,6 +251,22 @@ class CronjobScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             crontab_file = workspace / "supercronic" / "crontab"
+            crontab_file.parent.mkdir(parents=True)
+            crontab_file.write_text(
+                "\n".join(
+                    [
+                        "CRON_TZ=",
+                        "5 * * * * echo user-owned",
+                        "# BEGIN coco-cronjob id=legacy",
+                        "CRON_TZ=Asia/Tokyo",
+                        "15 * * * * echo legacy",
+                        "CRON_TZ=",
+                        "# END coco-cronjob id=legacy",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
             result = run_add(
                 workspace,
@@ -268,14 +284,17 @@ class CronjobScriptTests(unittest.TestCase):
                 "Asia/Shanghai",
                 "--crontab-file",
                 str(crontab_file),
-                env={"TZ": "UTC"},
+                env={"TZ": ""},
             )
             crontab = crontab_file.read_text(encoding="utf-8")
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("\n5 * * * * echo user-owned\n", crontab)
+        self.assertTrue(crontab.startswith("CRON_TZ=\n"))
+        self.assertIn("CRON_TZ=Asia/Tokyo", crontab)
         self.assertIn("CRON_TZ=Asia/Shanghai", crontab)
         self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=daily-review\n", crontab)
-        self.assertNotIn("\nCRON_TZ=\n", crontab)
+        self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=legacy\n", crontab)
 
     def test_add_dry_run_does_not_mutate_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -412,7 +431,9 @@ class CronjobScriptTests(unittest.TestCase):
             workspace = Path(directory)
             crontab_file = workspace / "supercronic" / "crontab"
             crontab_file.parent.mkdir(parents=True)
-            crontab_file.write_text("5 * * * * echo user-owned\n", encoding="utf-8")
+            crontab_file.write_text(
+                "CRON_TZ=\n5 * * * * echo user-owned\n", encoding="utf-8"
+            )
             snapshot = workspace / "managed-crontab"
             snapshot.write_text(
                 textwrap.dedent(
@@ -446,10 +467,10 @@ class CronjobScriptTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("5 * * * * echo user-owned", crontab)
+        self.assertTrue(crontab.startswith("CRON_TZ=\n"))
         self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
         self.assertIn("CRON_TZ=Asia/Shanghai", crontab)
         self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=daily-review\n", crontab)
-        self.assertNotIn("\nCRON_TZ=\n", crontab)
 
     def test_runner_skip_policy_does_not_submit_while_previous_job_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
