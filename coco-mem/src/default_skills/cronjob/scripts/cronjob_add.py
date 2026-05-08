@@ -111,6 +111,7 @@ def main() -> int:
     active_crontab = read_crontab(args.crontab_bin, crontab_file)
     current = active_crontab
     if crontab_file is not None:
+        # Direct crontab files are skill-owned; keep the active file in managed-block format.
         current = normalize_direct_crontab(extract_managed_blocks(current), timezone_reset)
         block = normalize_direct_crontab(block, timezone_reset)
     final_crontab, action = upsert_managed_block(current, task_id, block)

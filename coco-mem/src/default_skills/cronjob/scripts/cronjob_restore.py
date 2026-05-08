@@ -28,6 +28,7 @@ def main() -> int:
     timezone_reset = resolve_timezone_reset(crontab_file)
     active_crontab = read_crontab(args.crontab_bin, crontab_file)
     if crontab_file is not None:
+        # Direct crontab files are skill-owned; restore the managed snapshot as-is.
         final_crontab = normalize_direct_crontab(snapshot, timezone_reset)
     else:
         final_crontab = restore_managed_blocks(active_crontab, snapshot)
