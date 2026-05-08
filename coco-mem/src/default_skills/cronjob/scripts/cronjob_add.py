@@ -53,6 +53,8 @@ def main() -> int:
     prompt = resolve_prompt(args)
     validate_cronexpr(args.cronexpr)
     timezone = normalize_timezone(args.timezone)
+    crontab_file = resolve_crontab_file(args.crontab_file)
+    timezone_reset = resolve_timezone_reset(crontab_file)
 
     install_dir = resolve_install_dir(args.install_dir)
     task_dir = install_dir / "tasks"
@@ -65,6 +67,7 @@ def main() -> int:
         task_id=task_id,
         cronexpr=args.cronexpr,
         timezone=timezone,
+        timezone_reset=timezone_reset,
         uv_bin=args.uv_bin,
         runner_path=runner_path,
         task_path=task_path,
@@ -98,18 +101,25 @@ def main() -> int:
         task_id=task_id,
         cronexpr=args.cronexpr,
         timezone=timezone,
+        timezone_reset=timezone_reset,
         uv_bin=args.uv_bin,
         runner_path=runner_path,
         task_path=task_path,
         log_path=log_dir / f"{task_id}.log",
     )
 
-    crontab_file = resolve_crontab_file(args.crontab_file)
-    current = read_crontab(args.crontab_bin, crontab_file)
-    updated, action = upsert_managed_block(current, task_id, block)
-    if updated != current:
-        write_crontab(args.crontab_bin, crontab_file, updated)
-    write_managed_crontab_snapshot(install_dir / MANAGED_CRONTAB_FILE, updated)
+    active_crontab = read_crontab(args.crontab_bin, crontab_file)
+    current = active_crontab
+    if crontab_file is not None:
+        # Direct crontab files are active schedule files for this skill, not shared user
+        # crontabs. The skill owns the file completely, so keep it in a fixed managed-block
+        # format and discard any non-managed content that may have been written manually.
+        current = normalize_direct_crontab(extract_managed_blocks(current), timezone_reset)
+        block = normalize_direct_crontab(block, timezone_reset)
+    final_crontab, action = upsert_managed_block(current, task_id, block)
+    if final_crontab != active_crontab:
+        write_crontab(args.crontab_bin, crontab_file, final_crontab)
+    write_managed_crontab_snapshot(install_dir / MANAGED_CRONTAB_FILE, final_crontab)
     print(
         json.dumps(
             {
@@ -175,10 +185,12 @@ def normalize_task_id(value: str) -> str:
     return task_id
 
 
-def normalize_timezone(value: str | None) -> str | None:
+def normalize_timezone(value: str | None, *, allow_blank: bool = False) -> str | None:
     if value is None:
         return None
     timezone = value.strip()
+    if allow_blank and not timezone:
+        return None
     if not TIMEZONE_PATTERN.fullmatch(timezone):
         raise SystemExit(
             "timezone must start with an alphanumeric character and contain only "
@@ -467,6 +479,22 @@ def resolve_crontab_file(value: Path | None) -> Path | None:
     return Path(env_value).expanduser()
 
 
+def resolve_timezone_reset(crontab_file: Path | None) -> str:
+    if crontab_file is None:
+        return ""
+    timezone = normalize_timezone_reset(os.environ.get("TZ"))
+    return timezone or "UTC"
+
+
+def normalize_timezone_reset(value: str | None) -> str | None:
+    if value is None:
+        return None
+    timezone = value.strip()
+    if not timezone or not TIMEZONE_PATTERN.fullmatch(timezone):
+        return None
+    return timezone
+
+
 def install_script(source: Path | None, install_dir: Path, script_name: str) -> Path:
     source_path = source
     if source_path is None:
@@ -493,6 +521,7 @@ def render_crontab_block(
     task_id: str,
     cronexpr: str,
     timezone: str | None,
+    timezone_reset: str,
     uv_bin: str,
     runner_path: Path,
     task_path: Path,
@@ -515,7 +544,7 @@ def render_crontab_block(
         lines.append(f"CRON_TZ={timezone}")
     lines.append(f"{cronexpr} {command} {redirect}")
     if timezone:
-        lines.append("CRON_TZ=")
+        lines.append(f"CRON_TZ={timezone_reset}")
     lines.append(end_marker(task_id))
     return "\n".join(lines) + "\n"
 
@@ -563,6 +592,13 @@ def write_crontab(crontab_bin: str, crontab_file: Path | None, content: str) -> 
     )
     if result.returncode != 0:
         raise SystemExit(f"failed to install crontab: {result.stderr.strip()}")
+
+
+def normalize_direct_crontab(content: str, timezone_reset: str) -> str:
+    return "\n".join(
+        f"CRON_TZ={timezone_reset}" if line == "CRON_TZ=" else line
+        for line in content.splitlines()
+    ).rstrip("\n") + ("\n" if content.strip() else "")
 
 
 def write_managed_crontab_snapshot(path: Path, content: str) -> None:
