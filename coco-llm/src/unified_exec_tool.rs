@@ -652,6 +652,7 @@ fn format_exec_result(
 struct ExecutionSpec {
     program: PathBuf,
     args: Vec<OsString>,
+    nono: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -695,10 +696,20 @@ fn shell_execution_args(command: &str) -> Vec<OsString> {
     vec![OsString::from("-c"), OsString::from(command.to_owned())]
 }
 
+fn command_fingerprint(command: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in command.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn shell_execution_spec(request: &ExecCommandRequest) -> ExecutionSpec {
     ExecutionSpec {
         program: PathBuf::from(&request.shell),
         args: shell_execution_args(&request.cmd),
+        nono: None,
     }
 }
 
@@ -1050,8 +1061,9 @@ fn nono_execution_spec(
     args.extend([OsString::from("--"), request.shell.clone()]);
     args.extend(shell_execution_args(&request.cmd));
     ExecutionSpec {
-        program: nono,
+        program: nono.clone(),
         args,
+        nono: Some(nono),
     }
 }
 
@@ -1517,8 +1529,16 @@ async fn execute_command(
         .as_ref()
         .map(|command| join_path_entries(command.path_entries.clone()));
     let execution = resolve_execution_spec(&request, path_env.as_deref(), &extra_allow_paths)?;
+    let nono = execution
+        .nono
+        .as_ref()
+        .map(|nono| nono.display().to_string())
+        .unwrap_or_default();
     tracing::info!(
-        program = %execution.program.display(),
+        cmd_hash = %command_fingerprint(&request.cmd),
+        cmd_len = request.cmd.len(),
+        shell = %request.shell.to_string_lossy(),
+        nono = %nono,
         arg_count = execution.args.len(),
         workdir = %request.workdir.display(),
         yield_time_ms = request.yield_time_ms,
@@ -2197,6 +2217,16 @@ mod tests {
     }
 
     #[test]
+    fn command_fingerprint_does_not_include_raw_command_text() {
+        let command = "curl -H 'Authorization: Bearer secret' https://example.com";
+        let fingerprint = command_fingerprint(command);
+
+        assert_eq!(fingerprint.len(), 16);
+        assert!(!fingerprint.contains("secret"));
+        assert_ne!(fingerprint, command);
+    }
+
+    #[test]
     fn resolve_execution_spec_uses_nono_when_available_in_nono_mode() {
         let temp_root = tempfile::tempdir().unwrap();
         let request = ExecCommandRequest {
@@ -2236,6 +2266,7 @@ mod tests {
         let spec = nono_execution_spec(nono.clone(), &request, std::slice::from_ref(&runtime_dir));
 
         assert_eq!(spec.program, nono);
+        assert_eq!(spec.nono, Some(PathBuf::from("/bin/nono")));
         let mut expected_args = vec![
             OsString::from("run"),
             OsString::from("--silent"),
