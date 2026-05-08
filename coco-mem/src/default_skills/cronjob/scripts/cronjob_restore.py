@@ -23,21 +23,15 @@ def main() -> int:
         return 0
 
     snapshot = snapshot_path.read_text(encoding="utf-8")
-    if not snapshot.strip():
-        return 0
 
     crontab_file = resolve_crontab_file(args.crontab_file)
     timezone_reset = resolve_timezone_reset(crontab_file)
+    active_crontab = read_crontab(args.crontab_bin, crontab_file)
     if crontab_file is not None:
-        snapshot = normalize_direct_crontab(snapshot, timezone_reset)
-    raw_crontab = read_crontab(args.crontab_bin, crontab_file)
-    normalized_crontab = (
-        normalize_direct_crontab(raw_crontab, timezone_reset)
-        if crontab_file is not None
-        else raw_crontab
-    )
-    final_crontab = restore_managed_blocks(normalized_crontab, snapshot)
-    if final_crontab != raw_crontab:
+        final_crontab = normalize_direct_crontab(snapshot, timezone_reset)
+    else:
+        final_crontab = restore_managed_blocks(active_crontab, snapshot)
+    if final_crontab != active_crontab:
         write_crontab(args.crontab_bin, crontab_file, final_crontab)
     return 0
 
@@ -119,31 +113,10 @@ def write_crontab(crontab_bin: str, crontab_file: Path | None, content: str) -> 
 
 
 def normalize_direct_crontab(content: str, timezone_reset: str) -> str:
-    lines = content.splitlines()
-    output: list[str] = []
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if not line.startswith(f"# BEGIN {MANAGED_PREFIX} id="):
-            output.append(line)
-            index += 1
-            continue
-
-        output.append(line)
-        index += 1
-        while index < len(lines):
-            managed_line = lines[index]
-            output.append(
-                f"CRON_TZ={timezone_reset}" if managed_line == "CRON_TZ=" else managed_line
-            )
-            if managed_line.startswith(f"# END {MANAGED_PREFIX} id="):
-                break
-            index += 1
-        else:
-            raise SystemExit("managed crontab block is missing its end marker")
-        index += 1
-
-    return "\n".join(output).rstrip("\n") + ("\n" if output else "")
+    return "\n".join(
+        f"CRON_TZ={timezone_reset}" if line == "CRON_TZ=" else line
+        for line in content.splitlines()
+    ).rstrip("\n") + ("\n" if content.strip() else "")
 
 
 def restore_managed_blocks(current: str, snapshot: str) -> str:

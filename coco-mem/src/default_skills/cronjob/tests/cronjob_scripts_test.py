@@ -244,7 +244,7 @@ class CronjobScriptTests(unittest.TestCase):
             crontab = crontab_file.read_text(encoding="utf-8")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("5 * * * * echo user-owned", crontab)
+        self.assertNotIn("5 * * * * echo user-owned", crontab)
         self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
 
     def test_add_direct_crontab_file_uses_non_empty_cron_tz_reset(self) -> None:
@@ -289,8 +289,8 @@ class CronjobScriptTests(unittest.TestCase):
             crontab = crontab_file.read_text(encoding="utf-8")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("\n5 * * * * echo user-owned\n", crontab)
-        self.assertTrue(crontab.startswith("CRON_TZ=\n"))
+        self.assertNotIn("5 * * * * echo user-owned", crontab)
+        self.assertNotIn("CRON_TZ=\n", crontab)
         self.assertIn("CRON_TZ=Asia/Tokyo", crontab)
         self.assertIn("CRON_TZ=Asia/Shanghai", crontab)
         self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=daily-review\n", crontab)
@@ -498,8 +498,8 @@ class CronjobScriptTests(unittest.TestCase):
             crontab = crontab_file.read_text(encoding="utf-8")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("5 * * * * echo user-owned", crontab)
-        self.assertTrue(crontab.startswith("CRON_TZ=\n"))
+        self.assertNotIn("5 * * * * echo user-owned", crontab)
+        self.assertFalse(crontab.startswith("CRON_TZ=\n"))
         self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
         self.assertIn("CRON_TZ=Asia/Shanghai", crontab)
         self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=daily-review\n", crontab)
