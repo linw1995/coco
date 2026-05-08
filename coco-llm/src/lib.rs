@@ -2448,19 +2448,6 @@ fn rig_tool_result_content(
     }
 }
 
-const HANDOFF_SIBLING_TOOL_SKIPPED: &str = "Skipped this tool call because this assistant turn contains a use_skill handoff, which must return to the parent model before sibling tool calls can run.";
-
-fn is_handoff_use_skill_tool_call(tool_call: &CompletionToolCall) -> bool {
-    tool_call.function.name == "use_skill"
-        && tool_call
-            .function
-            .arguments
-            .get("handoff")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|handoff| !handoff.is_empty())
-}
-
 fn provider_metadata(call_id: Option<String>) -> Option<ProviderMetadata> {
     Some(ProviderMetadata::new(call_id))
 }
@@ -2929,35 +2916,6 @@ impl CompletionRunner {
         })
     }
 
-    fn skipped_tool_call_for_handoff_sibling(
-        &mut self,
-        next_execution: &ExecutionMetadata,
-        tool_call: CompletionToolCall,
-    ) -> std::result::Result<ToolCallExecution, BackendError> {
-        self.tool_use_node_ids.remove(&tool_call.id);
-        let call_id = tool_call.call_id.clone();
-        let event = ToolExecutionOutcome::tool_result(HANDOFF_SIBLING_TOOL_SKIPPED)
-            .into_backend_event(tool_call.id.clone(), call_id.clone());
-        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
-            self.head = Some(append_backend_event(
-                trace_node_appender,
-                next_execution,
-                event.clone(),
-            )?);
-        }
-
-        Ok(ToolCallExecution {
-            event,
-            tool_result: rig_tool_result_content(
-                tool_call.id,
-                call_id,
-                rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
-                    HANDOFF_SIBLING_TOOL_SKIPPED,
-                )),
-            ),
-        })
-    }
-
     async fn advance_with_tool_calls(
         &mut self,
         state: StepState,
@@ -2969,18 +2927,8 @@ impl CompletionRunner {
         let next_execution = ExecutionMetadata::new(Self::next_execution_id());
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
-        let handoff_tool_call_id = turn
-            .tool_calls
-            .iter()
-            .find(|tool_call| is_handoff_use_skill_tool_call(tool_call))
-            .map(|tool_call| tool_call.id.clone());
         for tool_call in turn.tool_calls {
-            let execution = match handoff_tool_call_id.as_deref() {
-                Some(handoff_id) if tool_call.id != handoff_id => {
-                    self.skipped_tool_call_for_handoff_sibling(&next_execution, tool_call)?
-                }
-                _ => self.execute_tool_call(&next_execution, tool_call).await?,
-            };
+            let execution = self.execute_tool_call(&next_execution, tool_call).await?;
             next_events.push(execution.event);
             tool_results.push(execution.tool_result);
         }
@@ -3755,128 +3703,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handoff_use_skill_skips_later_sibling_tool_calls() {
+    async fn handoff_use_skill_waits_for_sibling_results_before_continuing() {
         let use_skill = rig_tool_call_content(
             "tool-call-1",
             Some("call-1".to_owned()),
             "use_skill",
             serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
-        );
-        let exec_command = rig_tool_call_content(
-            "tool-call-2",
-            Some("call-2".to_owned()),
-            "exec_command",
-            serde_json::json!({"cmd": "printf sibling-executed"}),
-        );
-        let turn = BackendTurn::from_assistant_choice(
-            Some("assistant-1".to_owned()),
-            rig::OneOrMany::many(vec![use_skill, exec_command])
-                .expect("assistant choice should be non-empty"),
-        );
-        let backend = FakeBackend::with_turns(vec![(
-            "main",
-            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
-        )]);
-        let store = MemoryStore::new();
-        let service = LlmService::builder(store.clone(), backend)
-            .with_skill_tool_executor(Arc::new(FakeSkillExecutor))
-            .build();
-        service
-            .create_session(SessionConfig {
-                tools: vec![
-                    crate::builtin_tool_definition("use_skill").unwrap(),
-                    exec_command_tool(),
-                ],
-                ..session_config("main")
-            })
-            .await
-            .unwrap();
-
-        let result = service
-            .prompt(prompt_request("main", "delegate and continue"))
-            .await
-            .unwrap();
-
-        assert_eq!(result.text, "done");
-        let ancestry = store.ancestry("main").unwrap();
-        let tool_results = ancestry
-            .iter()
-            .filter_map(|node| match &node.kind {
-                Kind::ToolResult(ToolResult { id, output }) => Some((id.as_str(), output.as_str())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            tool_results,
-            vec![("tool-call-2", HANDOFF_SIBLING_TOOL_SKIPPED)]
-        );
-    }
-
-    #[tokio::test]
-    async fn handoff_use_skill_skips_earlier_sibling_tool_calls() {
-        let exec_command = rig_tool_call_content(
-            "tool-call-1",
-            Some("call-1".to_owned()),
-            "exec_command",
-            serde_json::json!({"cmd": "printf sibling-executed"}),
-        );
-        let use_skill = rig_tool_call_content(
-            "tool-call-2",
-            Some("call-2".to_owned()),
-            "use_skill",
-            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
-        );
-        let turn = BackendTurn::from_assistant_choice(
-            Some("assistant-1".to_owned()),
-            rig::OneOrMany::many(vec![exec_command, use_skill])
-                .expect("assistant choice should be non-empty"),
-        );
-        let backend = FakeBackend::with_turns(vec![(
-            "main",
-            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
-        )]);
-        let store = MemoryStore::new();
-        let service = LlmService::builder(store.clone(), backend)
-            .with_skill_tool_executor(Arc::new(FakeSkillExecutor))
-            .build();
-        service
-            .create_session(SessionConfig {
-                tools: vec![
-                    exec_command_tool(),
-                    crate::builtin_tool_definition("use_skill").unwrap(),
-                ],
-                ..session_config("main")
-            })
-            .await
-            .unwrap();
-
-        let result = service
-            .prompt(prompt_request("main", "run a command then delegate"))
-            .await
-            .unwrap();
-
-        assert_eq!(result.text, "done");
-        let ancestry = store.ancestry("main").unwrap();
-        let tool_results = ancestry
-            .iter()
-            .filter_map(|node| match &node.kind {
-                Kind::ToolResult(ToolResult { id, output }) => Some((id.as_str(), output.as_str())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            tool_results,
-            vec![("tool-call-1", HANDOFF_SIBLING_TOOL_SKIPPED)]
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_handoff_use_skill_does_not_skip_sibling_tool_calls() {
-        let use_skill = rig_tool_call_content(
-            "tool-call-1",
-            Some("call-1".to_owned()),
-            "use_skill",
-            serde_json::json!({"name": "fast-rust", "handoff": "   "}),
         );
         let search_skill = rig_tool_call_content(
             "tool-call-2",
@@ -3909,22 +3741,32 @@ mod tests {
             .unwrap();
 
         let result = service
-            .prompt(prompt_request("main", "delegate with malformed handoff"))
+            .prompt(prompt_request("main", "delegate and continue"))
             .await
             .unwrap();
 
         assert_eq!(result.text, "done");
-        let ancestry = store.ancestry("main").unwrap();
-        let tool_results = ancestry
-            .iter()
-            .filter_map(|node| match &node.kind {
-                Kind::ToolResult(ToolResult { id, output }) => Some((id.as_str(), output.as_str())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(tool_results.iter().any(|(id, output)| *id == "tool-call-1"
-            && output.contains("use_skill field `handoff` must be a non-empty string")));
-        assert!(tool_results.contains(&("tool-call-2", r#"{"skills":[]}"#)));
+        let session = service.resolve_session("main").unwrap();
+        assert!(matches!(
+            &session.provider_history[3],
+            rig::completion::message::Message::User { content }
+                if {
+                    let tool_results = content.iter().collect::<Vec<_>>();
+                    tool_results.len() == 2
+                        && matches!(
+                            tool_results[0],
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.id == "tool-call-1"
+                                    && tool_result.call_id.as_deref() == Some("call-1")
+                        )
+                        && matches!(
+                            tool_results[1],
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.id == "tool-call-2"
+                                    && tool_result.call_id.as_deref() == Some("call-2")
+                        )
+                }
+        ));
     }
 
     fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<BackendMetadata> {
