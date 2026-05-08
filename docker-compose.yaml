@@ -1,0 +1,19 @@
+services:
+  coco:
+    image: ${COCO_IMAGE:-ghcr.io/linw1995/coco:latest}
+    container_name: ${COCO_CONTAINER_NAME:-coco}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      COCO_UID: ${COCO_UID:?COCO_UID is required}
+      COCO_GID: ${COCO_GID:?COCO_GID is required}
+    ports:
+      - "${COCO_PORT:-17667}:17667"
+    volumes:
+      - type: bind
+        source: ${COCO_DATA_DIR:-.coco-data}
+        target: /data
+      - type: bind
+        source: ${COCO_WORKSPACE_DIR:-.coco-workspace}
+        target: /workspace
