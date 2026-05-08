@@ -201,6 +201,7 @@ pub struct SkillScript {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillRuntimeContext {
     pub name: String,
+    pub handoff: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

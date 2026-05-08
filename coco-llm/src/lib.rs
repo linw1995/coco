@@ -318,8 +318,8 @@ pub(crate) enum ToolExecutionOutcome {
     },
     SkillResult {
         skill_name: String,
-        provider_output: String,
         merge_parent: String,
+        provider_output: String,
     },
 }
 
@@ -332,22 +332,20 @@ impl ToolExecutionOutcome {
 
     pub fn skill_result(
         skill_name: impl Into<String>,
-        provider_output: impl Into<String>,
         merge_parent: impl Into<String>,
+        provider_output: impl Into<String>,
     ) -> Self {
         Self::SkillResult {
             skill_name: skill_name.into(),
-            provider_output: provider_output.into(),
             merge_parent: merge_parent.into(),
+            provider_output: provider_output.into(),
         }
     }
 
     pub fn provider_output(&self) -> &str {
         match self {
-            Self::ToolResult {
-                provider_output, ..
-            }
-            | Self::SkillResult {
+            Self::ToolResult { provider_output } => provider_output,
+            Self::SkillResult {
                 provider_output, ..
             } => provider_output,
         }
@@ -361,8 +359,8 @@ impl ToolExecutionOutcome {
             }),
             Self::SkillResult {
                 skill_name,
-                provider_output,
                 merge_parent,
+                provider_output,
             } => BackendEventPayload::SkillResult(SkillResultEvent {
                 tool_id,
                 skill_name,
@@ -2078,10 +2076,16 @@ fn is_provider_context_start(node: &coco_mem::Node) -> bool {
     matches!(
         &node.kind,
         Kind::Anchor(anchor)
-            if anchor
-                .as_session()
-                .is_some_and(|session| !is_skill_execution_prompt(&session.prompt))
+            if anchor.as_session().is_some_and(is_context_start_session)
     )
+}
+
+fn is_context_start_session(session: &SessionAnchor) -> bool {
+    !is_skill_execution_prompt(&session.prompt)
+        || session
+            .active_skill
+            .as_ref()
+            .is_some_and(|active_skill| active_skill.handoff.is_some())
 }
 
 fn is_use_skill_tool_use(node: &coco_mem::Node) -> bool {
@@ -2727,6 +2731,11 @@ struct StepState {
     step_events: Vec<BackendEvent>,
 }
 
+struct ToolCallExecution {
+    event: BackendEvent,
+    tool_result: rig::completion::message::UserContent,
+}
+
 enum RunControl {
     Continue,
     Completed(BackendRun),
@@ -2864,8 +2873,7 @@ impl CompletionRunner {
         &mut self,
         next_execution: &ExecutionMetadata,
         tool_call: CompletionToolCall,
-    ) -> std::result::Result<(BackendEvent, rig::completion::message::UserContent), BackendError>
-    {
+    ) -> std::result::Result<ToolCallExecution, BackendError> {
         let tool_use_node_id = self.tool_use_node_ids.remove(&tool_call.id);
         if tool_call.function.name == "use_skill" && tool_use_node_id.is_none() {
             return Err(BackendError::failed(format!(
@@ -2896,23 +2904,23 @@ impl CompletionRunner {
             )?);
         }
 
-        Ok((
+        Ok(ToolCallExecution {
             event,
-            rig_tool_result_content(
+            tool_result: rig_tool_result_content(
                 tool_call.id,
                 call_id,
                 rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
                     provider_output,
                 )),
             ),
-        ))
+        })
     }
 
     async fn advance_with_tool_calls(
         &mut self,
         state: StepState,
         turn: BackendTurn,
-    ) -> std::result::Result<(), BackendError> {
+    ) -> std::result::Result<RunControl, BackendError> {
         self.history.push(self.prompt.clone());
         self.history.push(turn.message);
 
@@ -2920,9 +2928,9 @@ impl CompletionRunner {
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
         for tool_call in turn.tool_calls {
-            let (event, tool_result) = self.execute_tool_call(&next_execution, tool_call).await?;
-            next_events.push(event);
-            tool_results.push(tool_result);
+            let execution = self.execute_tool_call(&next_execution, tool_call).await?;
+            next_events.push(execution.event);
+            tool_results.push(execution.tool_result);
         }
 
         self.steps.push(BackendStep {
@@ -2936,7 +2944,7 @@ impl CompletionRunner {
             events: next_events,
         });
         self.prompt = tool_result_message(tool_results);
-        Ok(())
+        Ok(RunControl::Continue)
     }
 
     async fn finish_step(
@@ -2950,8 +2958,7 @@ impl CompletionRunner {
                 .map(RunControl::Completed);
         }
 
-        self.advance_with_tool_calls(state, turn).await?;
-        Ok(RunControl::Continue)
+        self.advance_with_tool_calls(state, turn).await
     }
 
     fn max_turn_failure(&mut self) -> BackendRun {
@@ -3234,6 +3241,22 @@ mod tests {
             }
         }
 
+        fn with_turns(
+            entries: Vec<(&str, Vec<std::result::Result<BackendTurn, BackendError>>)>,
+        ) -> Self {
+            let turns = entries
+                .into_iter()
+                .map(|(branch, responses)| (branch.to_owned(), responses.into()))
+                .collect();
+
+            Self {
+                turns: Arc::new(Mutex::new(turns)),
+                runs: Arc::new(Mutex::new(HashMap::new())),
+                barrier: None,
+                calls: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
         fn with_completions(
             entries: &[(&str, &[std::result::Result<BackendRun, BackendError>])],
         ) -> Self {
@@ -3334,6 +3357,32 @@ mod tests {
 
             tokio::time::sleep(Duration::from_millis(5)).await;
             next
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeSkillExecutor;
+
+    #[async_trait]
+    impl SkillToolExecutor for FakeSkillExecutor {
+        async fn search_skill_tool(
+            &self,
+            _request: SearchSkillToolRequest,
+        ) -> std::result::Result<String, ExecutorError> {
+            Ok(r#"{"skills":[]}"#.to_owned())
+        }
+
+        async fn execute_skill_tool(
+            &self,
+            request: UseSkillToolRequest,
+        ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
+            let response_node_id = request.parent_tool_use_id.clone();
+            Ok(SkillToolExecutionResult {
+                result: SkillToolRunResult {
+                    text: format!("Executed {}", request.skill_name),
+                },
+                response_node_id,
+            })
         }
     }
 
@@ -3651,6 +3700,73 @@ mod tests {
             Some("catgirl-role".to_owned())
         );
         assert_eq!(current_skill_name_from_prompt("regular prompt"), None);
+    }
+
+    #[tokio::test]
+    async fn handoff_use_skill_waits_for_sibling_results_before_continuing() {
+        let use_skill = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "use_skill",
+            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
+        );
+        let search_skill = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "search_skill",
+            serde_json::json!({"query": "rust"}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![use_skill, search_skill])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
+        )]);
+        let store = MemoryStore::new();
+        let service = LlmService::builder(store.clone(), backend)
+            .with_skill_tool_executor(Arc::new(FakeSkillExecutor))
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![
+                    crate::builtin_tool_definition("use_skill").unwrap(),
+                    crate::builtin_tool_definition("search_skill").unwrap(),
+                ],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let result = service
+            .prompt(prompt_request("main", "delegate and continue"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "done");
+        let session = service.resolve_session("main").unwrap();
+        assert!(matches!(
+            &session.provider_history[3],
+            rig::completion::message::Message::User { content }
+                if {
+                    let tool_results = content.iter().collect::<Vec<_>>();
+                    tool_results.len() == 2
+                        && matches!(
+                            tool_results[0],
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.id == "tool-call-1"
+                                    && tool_result.call_id.as_deref() == Some("call-1")
+                        )
+                        && matches!(
+                            tool_results[1],
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.id == "tool-call-2"
+                                    && tool_result.call_id.as_deref() == Some("call-2")
+                        )
+                }
+        ));
     }
 
     fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<BackendMetadata> {
@@ -4068,7 +4184,9 @@ mod tests {
         );
     }
 
-    async fn skill_child_context_fixture() -> (LlmService<FakeBackend, MemoryStore>, String) {
+    async fn skill_child_context_fixture(
+        handoff: Option<String>,
+    ) -> (LlmService<FakeBackend, MemoryStore>, String) {
         let store = MemoryStore::new();
         let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
         let base_session = service
@@ -4121,7 +4239,10 @@ mod tests {
                         max_tokens: child_config.max_tokens,
                         additional_params: child_config.additional_params,
                         enable_coco_shim: child_config.enable_coco_shim,
-                        active_skill: None,
+                        active_skill: Some(coco_mem::SkillRuntimeContext {
+                            name: "fast-rust".to_owned(),
+                            handoff,
+                        }),
                     },
                 )),
             })
@@ -4133,7 +4254,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_reconstruction_orders_skill_prompt_after_inherited_history() {
-        let (service, child_prompt) = skill_child_context_fixture().await;
+        let (service, child_prompt) = skill_child_context_fixture(None).await;
         let session = service.resolve_session("child").unwrap();
 
         assert_eq!(
@@ -4148,7 +4269,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_reconstruction_skips_use_skill_that_created_skill_session() {
-        let (service, _) = skill_child_context_fixture().await;
+        let (service, _) = skill_child_context_fixture(None).await;
         let session = service.resolve_session("child").unwrap();
 
         assert_eq!(
@@ -4167,6 +4288,18 @@ mod tests {
                 })
                 .count(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn context_reconstruction_can_hide_parent_history_for_handoff_skill_child() {
+        let (service, child_prompt) =
+            skill_child_context_fixture(Some("Review the bounded diff.".to_owned())).await;
+        let session = service.resolve_session("child").unwrap();
+
+        assert_eq!(
+            text_messages_from_provider_history(&session.provider_history),
+            vec![(Role::User, child_prompt)]
         );
     }
 

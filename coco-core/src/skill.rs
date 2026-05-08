@@ -174,6 +174,7 @@ where
             scripts: skill.scripts,
             session_role: skill.session_role,
             enable_coco_shim: skill.enable_coco_shim,
+            handoff: request.handoff,
         };
 
         let runtime = materialize_skill_runtime(&skill_request)?;
@@ -382,6 +383,7 @@ where
             scripts: skill.scripts,
             session_role: skill.session_role,
             enable_coco_shim: skill.enable_coco_shim,
+            handoff: None,
         };
         let runtime = materialize_skill_runtime(&request)?;
         self.execute_resolved_skill(request, runtime)
@@ -485,6 +487,7 @@ where
                     enable_coco_shim: request.enable_coco_shim,
                     active_skill: Some(SkillRuntimeContext {
                         name: request.skill_name.clone(),
+                        handoff: request.handoff.clone(),
                     }),
                 },
             )),
@@ -552,6 +555,13 @@ fn temporary_skill_branch_name(base_branch: &str, skill_name: &str) -> String {
 
 fn skill_execution_prompt(request: &SkillToolRequest) -> String {
     let script_instructions = skill_script_instructions(request);
+    let context_instruction = if let Some(handoff) = &request.handoff {
+        format!(
+            "The parent conversation history is intentionally hidden. Use this explicit handoff content as the bounded task:\n{handoff}"
+        )
+    } else {
+        "The parent conversation history is available. Use it only when it is directly relevant to the skill task.".to_owned()
+    };
     formatdoc!(
         "
         You are executing the skill `{}` on an isolated child branch forked from `{}`.
@@ -565,6 +575,12 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         {}
 
         Skill session role:
+        {}
+
+        Context inheritance:
+        {}
+
+        Handoff behavior:
         {}
 
         Skill persistent paths:
@@ -582,10 +598,20 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
         request.skill_description,
         request.skill_path,
         request.session_role.as_str(),
+        context_instruction,
+        skill_handoff_completion_instruction(request),
         COCO_SKILL_PERSIST_DIR_ENV,
         script_instructions,
         request.skill_body,
     )
+}
+
+fn skill_handoff_completion_instruction(request: &SkillToolRequest) -> &'static str {
+    if request.handoff.is_some() {
+        "Return the final result for the caller as a normal tool result. The parent model will inspect it before it continues."
+    } else {
+        "Return a normal tool result for the parent model to inspect before it continues."
+    }
 }
 
 fn skill_persistent_directory(request: &SkillToolRequest) -> PathBuf {
@@ -840,6 +866,7 @@ mod tests {
             }],
             session_role: SessionRole::Runner,
             enable_coco_shim: true,
+            handoff: Some("Find matching skills.".to_owned()),
         });
 
         assert!(prompt.contains("skill `find-skills`"));
@@ -879,6 +906,7 @@ mod tests {
             scripts: Vec::new(),
             session_role: SessionRole::Runner,
             enable_coco_shim: false,
+            handoff: None,
         });
 
         assert!(directory.ends_with(Path::new("runner").join("%2E%2E").join("data")));
