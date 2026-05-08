@@ -284,7 +284,7 @@ class CronjobScriptTests(unittest.TestCase):
                 "Asia/Shanghai",
                 "--crontab-file",
                 str(crontab_file),
-                env={"TZ": ""},
+                env={"TZ": ":/etc/localtime"},
             )
             crontab = crontab_file.read_text(encoding="utf-8")
 
@@ -327,6 +327,34 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=daily-review\n", crontab)
         self.assertNotIn("\nCRON_TZ=\n# END coco-cronjob id=daily-review\n", crontab)
+
+    def test_restore_direct_crontab_file_ignores_invalid_env_tz_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            crontab_file = workspace / "supercronic" / "crontab"
+            snapshot = workspace / "managed-crontab"
+            block = render_restore_block(timezone_reset="")
+            snapshot.write_text(block, encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(RESTORE_SCRIPT),
+                    "--snapshot",
+                    str(snapshot),
+                    "--crontab-file",
+                    str(crontab_file),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "TZ": "/etc/localtime"},
+            )
+            crontab = crontab_file.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=daily-review\n", crontab)
 
     def test_add_dry_run_does_not_mutate_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

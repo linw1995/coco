@@ -56,8 +56,17 @@ def resolve_crontab_file(value: Path | None) -> Path | None:
 def resolve_timezone_reset(crontab_file: Path | None) -> str:
     if crontab_file is None:
         return ""
-    timezone = normalize_timezone(os.environ.get("TZ"))
+    timezone = normalize_timezone_reset(os.environ.get("TZ"))
     return timezone or "UTC"
+
+
+def normalize_timezone_reset(value: str | None) -> str | None:
+    if value is None:
+        return None
+    timezone = value.strip()
+    if not timezone or not TIMEZONE_PATTERN.fullmatch(timezone):
+        return None
+    return timezone
 
 
 def normalize_timezone(value: str | None) -> str | None:
