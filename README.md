@@ -29,6 +29,11 @@ nix build .#coco-image
 docker load < result
 ```
 
+Use `.#coco-image-linux-amd64` or `.#coco-image-linux-arm64` when you need a
+specific Linux image architecture. See
+[Docker Compose Deployment](docs/docker-compose.md#local-image-builds) for
+published image and local build notes.
+
 After loading the local image, set `COCO_IMAGE=coco:latest` in `.env`.
 
 ## Documentation

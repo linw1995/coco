@@ -192,13 +192,38 @@ docker compose pull
 docker compose up -d
 ```
 
-Use a locally built image:
+## Local Image Builds
+
+The published GHCR image is a multi-arch image built by CD for `linux/amd64`
+and `linux/arm64`. For normal deployments, use:
+
+```dotenv
+COCO_IMAGE=ghcr.io/linw1995/coco:latest
+```
+
+Manual local builds are mainly for development or debugging:
 
 ```bash
 nix build .#coco-image
 docker load < result
 docker compose up -d
 ```
+
+`coco-image` always builds a Linux container image. Linux hosts use their own
+system by default. Darwin hosts map to the matching Linux image target, so
+`aarch64-darwin` selects `aarch64-linux` and `x86_64-darwin` selects
+`x86_64-linux`.
+
+Use explicit image outputs when you need a specific architecture:
+
+```bash
+nix build .#coco-image-linux-amd64
+nix build .#coco-image-linux-arm64
+```
+
+Run manual image builds on Linux, or on a host whose Nix setup can build the
+selected Linux target. For example, a macOS host needs a Linux builder before it
+can build `.#coco-image-linux-arm64` locally.
 
 ## Cronjob Skill
 
