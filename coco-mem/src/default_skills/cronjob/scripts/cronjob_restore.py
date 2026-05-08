@@ -36,9 +36,9 @@ def main() -> int:
         if crontab_file is not None
         else raw_crontab
     )
-    updated = restore_managed_blocks(normalized_crontab, snapshot)
-    if updated != raw_crontab:
-        write_crontab(args.crontab_bin, crontab_file, updated)
+    final_crontab = restore_managed_blocks(normalized_crontab, snapshot)
+    if final_crontab != raw_crontab:
+        write_crontab(args.crontab_bin, crontab_file, final_crontab)
     return 0
 
 

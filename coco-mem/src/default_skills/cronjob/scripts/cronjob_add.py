@@ -114,10 +114,10 @@ def main() -> int:
         if crontab_file is not None
         else raw_crontab
     )
-    updated, action = upsert_managed_block(normalized_crontab, task_id, block)
-    if updated != raw_crontab:
-        write_crontab(args.crontab_bin, crontab_file, updated)
-    write_managed_crontab_snapshot(install_dir / MANAGED_CRONTAB_FILE, updated)
+    final_crontab, action = upsert_managed_block(normalized_crontab, task_id, block)
+    if final_crontab != raw_crontab:
+        write_crontab(args.crontab_bin, crontab_file, final_crontab)
+    write_managed_crontab_snapshot(install_dir / MANAGED_CRONTAB_FILE, final_crontab)
     print(
         json.dumps(
             {
