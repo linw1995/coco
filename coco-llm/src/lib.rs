@@ -386,6 +386,9 @@ struct TraceNodeAppenderHandle {
 }
 
 trait TraceNodeAppender: Send + Sync {
+    /// Returns the current trace tail.
+    fn head_id(&self) -> std::result::Result<String, BackendError>;
+
     /// Appends a store node to the current trace tail.
     fn append(
         &self,
@@ -408,6 +411,10 @@ impl TraceNodeAppenderHandle {
     ) -> std::result::Result<String, BackendError> {
         self.inner.append(role, metadata, kind)
     }
+
+    fn head_id(&self) -> std::result::Result<String, BackendError> {
+        self.inner.head_id()
+    }
 }
 
 impl std::fmt::Debug for TraceNodeAppenderHandle {
@@ -420,6 +427,14 @@ impl<S> TraceNodeAppender for StoreNodeAppender<S>
 where
     S: NodeStore + Send + Sync,
 {
+    fn head_id(&self) -> std::result::Result<String, BackendError> {
+        Ok(self
+            .head_id
+            .lock()
+            .expect("trace node appender lock poisoned")
+            .clone())
+    }
+
     fn append(
         &self,
         role: Role,
@@ -1602,9 +1617,8 @@ where
         events: &[BackendEvent],
     ) -> std::result::Result<String, StoreError> {
         let mut parent_id = parent_id;
-        for event in events {
-            let (role, metadata, kind) =
-                persisted_node_from_backend_event(event.clone(), execution);
+        for (role, metadata, kind) in persisted_nodes_from_backend_events(events, execution) {
+            let kind = normalize_kind_for_primary_parent(kind, &parent_id);
             parent_id = self.store.append(NewNode {
                 parent: parent_id,
                 role,
@@ -2501,13 +2515,130 @@ fn persisted_node_from_backend_event(
     }
 }
 
+fn execution_backend_metadata(execution: &ExecutionMetadata) -> Option<BackendMetadata> {
+    BackendMetadata::builder().execution(execution).build()
+}
+
+fn provider_call_id(metadata: Option<&ProviderMetadata>) -> Option<String> {
+    metadata.and_then(|metadata| metadata.call_id.clone())
+}
+
+fn persisted_nodes_from_backend_events(
+    events: &[BackendEvent],
+    execution: &ExecutionMetadata,
+) -> Vec<(Role, Option<BackendMetadata>, Kind)> {
+    fn flush_tool_uses(
+        nodes: &mut Vec<(Role, Option<BackendMetadata>, Kind)>,
+        execution: &ExecutionMetadata,
+        tool_uses: &mut Vec<ToolUse>,
+    ) {
+        if tool_uses.is_empty() {
+            return;
+        }
+        let kind = if tool_uses.len() == 1 {
+            Kind::tool_use(tool_uses.pop().expect("tool uses buffer is non-empty"))
+        } else {
+            Kind::tool_uses(std::mem::take(tool_uses))
+        };
+        nodes.push((Role::LLM, execution_backend_metadata(execution), kind));
+    }
+
+    fn flush_tool_results(
+        nodes: &mut Vec<(Role, Option<BackendMetadata>, Kind)>,
+        execution: &ExecutionMetadata,
+        tool_results: &mut Vec<ToolResult>,
+    ) {
+        if tool_results.is_empty() {
+            return;
+        }
+        let kind = if tool_results.len() == 1 {
+            Kind::tool_result(
+                tool_results
+                    .pop()
+                    .expect("tool results buffer is non-empty"),
+            )
+        } else {
+            Kind::tool_results(std::mem::take(tool_results))
+        };
+        nodes.push((Role::User, execution_backend_metadata(execution), kind));
+    }
+
+    let mut nodes = Vec::new();
+    let mut tool_uses = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for event in events {
+        match event.event.clone() {
+            BackendEventPayload::ToolUse(mut tool_use) => {
+                flush_tool_results(&mut nodes, execution, &mut tool_results);
+                if tool_use.call_id.is_none() {
+                    tool_use.call_id = provider_call_id(event.metadata.as_ref());
+                }
+                tool_uses.push(tool_use);
+            }
+            BackendEventPayload::ToolResult(mut tool_result) => {
+                flush_tool_uses(&mut nodes, execution, &mut tool_uses);
+                if tool_result.call_id.is_none() {
+                    tool_result.call_id = provider_call_id(event.metadata.as_ref());
+                }
+                tool_results.push(tool_result);
+            }
+            BackendEventPayload::AssistantText(_) | BackendEventPayload::SkillResult(_) => {
+                flush_tool_uses(&mut nodes, execution, &mut tool_uses);
+                flush_tool_results(&mut nodes, execution, &mut tool_results);
+                nodes.push(persisted_node_from_backend_event(event.clone(), execution));
+            }
+        }
+    }
+
+    flush_tool_uses(&mut nodes, execution, &mut tool_uses);
+    flush_tool_results(&mut nodes, execution, &mut tool_results);
+
+    nodes
+}
+
+fn normalize_kind_for_primary_parent(kind: Kind, primary_parent: &str) -> Kind {
+    let Kind::Anchor(mut anchor) = kind else {
+        return kind;
+    };
+    if !matches!(anchor.payload, AnchorPayload::SkillResult(_)) {
+        return Kind::Anchor(anchor);
+    }
+
+    anchor
+        .merge_parents
+        .retain(|merge_parent| merge_parent.node_id() != primary_parent);
+    Kind::Anchor(anchor)
+}
+
 fn append_backend_event(
     trace_node_appender: &TraceNodeAppenderHandle,
     execution: &ExecutionMetadata,
     event: BackendEvent,
 ) -> std::result::Result<String, BackendError> {
     let (role, metadata, kind) = persisted_node_from_backend_event(event, execution);
-    trace_node_appender.append(role, metadata, kind)
+    let primary_parent = trace_node_appender.head_id()?;
+    trace_node_appender.append(
+        role,
+        metadata,
+        normalize_kind_for_primary_parent(kind, &primary_parent),
+    )
+}
+
+fn append_backend_event_nodes(
+    trace_node_appender: &TraceNodeAppenderHandle,
+    execution: &ExecutionMetadata,
+    events: &[BackendEvent],
+) -> std::result::Result<Vec<(String, Kind)>, BackendError> {
+    let mut appended = Vec::new();
+    for (role, metadata, kind) in persisted_nodes_from_backend_events(events, execution) {
+        let primary_parent = trace_node_appender.head_id()?;
+        let kind = normalize_kind_for_primary_parent(kind, &primary_parent);
+        let node_id = trace_node_appender.append(role, metadata, kind.clone())?;
+        appended.push((node_id, kind));
+    }
+
+    Ok(appended)
 }
 
 fn append_backend_events(
@@ -2515,16 +2646,10 @@ fn append_backend_events(
     execution: &ExecutionMetadata,
     events: &[BackendEvent],
 ) -> std::result::Result<String, BackendError> {
-    let mut events = events.iter();
-    let first = events
-        .next()
-        .expect("append_backend_events requires at least one event");
-    let mut head_id = append_backend_event(trace_node_appender, execution, first.clone())?;
-    for event in events {
-        head_id = append_backend_event(trace_node_appender, execution, event.clone())?;
-    }
-
-    Ok(head_id)
+    append_backend_event_nodes(trace_node_appender, execution, events)?
+        .last()
+        .map(|(node_id, _)| node_id.clone())
+        .ok_or_else(|| BackendError::failed("append_backend_events requires at least one event"))
 }
 
 fn rig_messages_from_nodes(nodes: &[coco_mem::Node]) -> Vec<rig::completion::message::Message> {
@@ -2858,16 +2983,17 @@ impl CompletionRunner {
             && !turn.trace_persisted
             && !turn.events.is_empty()
         {
-            let mut head_id = None;
-            for event in &turn.events {
-                let node_id = append_backend_event(trace_node_appender, execution, event.clone())?;
-                if let BackendEventPayload::ToolUse(tool_use) = &event.event {
-                    self.tool_use_node_ids
-                        .insert(tool_use.id.clone(), node_id.clone());
+            let appended =
+                append_backend_event_nodes(trace_node_appender, execution, &turn.events)?;
+            for (node_id, kind) in &appended {
+                if let Kind::ToolUse(tool_uses) = kind {
+                    for tool_use in tool_uses.iter() {
+                        self.tool_use_node_ids
+                            .insert(tool_use.id.clone(), node_id.clone());
+                    }
                 }
-                head_id = Some(node_id);
             }
-            self.head = head_id;
+            self.head = appended.last().map(|(node_id, _)| node_id.clone());
         }
         step_events.extend(turn.events.clone());
         Ok(())
@@ -2916,7 +3042,6 @@ impl CompletionRunner {
 
     async fn execute_tool_call(
         &mut self,
-        next_execution: &ExecutionMetadata,
         tool_call: CompletionToolCall,
     ) -> std::result::Result<ToolCallExecution, BackendError> {
         let tool_use_node_id = self.tool_use_node_ids.remove(&tool_call.id);
@@ -2941,14 +3066,6 @@ impl CompletionRunner {
         let provider_output = outcome.provider_output().to_owned();
         let call_id = tool_call.call_id.clone();
         let event = outcome.into_backend_event(tool_call.id.clone(), call_id.clone());
-        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
-            self.head = Some(append_backend_event(
-                trace_node_appender,
-                next_execution,
-                event.clone(),
-            )?);
-        }
-
         Ok(ToolCallExecution {
             event,
             tool_result: rig_tool_result_content(
@@ -2973,9 +3090,14 @@ impl CompletionRunner {
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
         for tool_call in turn.tool_calls {
-            let execution = self.execute_tool_call(&next_execution, tool_call).await?;
+            let execution = self.execute_tool_call(tool_call).await?;
             next_events.push(execution.event);
             tool_results.push(execution.tool_result);
+        }
+        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
+            let appended =
+                append_backend_event_nodes(trace_node_appender, &next_execution, &next_events)?;
+            self.head = appended.last().map(|(node_id, _)| node_id.clone());
         }
 
         self.steps.push(BackendStep {
@@ -5226,6 +5348,111 @@ mod tests {
             tool_use.metadata.as_ref().unwrap().execution_id.as_deref(),
             Some("execution-step-1")
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_persists_sibling_tool_calls_as_single_nodes() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_completions(&[(
+            "main",
+            &[Ok(BackendRun::succeeded_with_steps(
+                "done",
+                vec![
+                    BackendStep {
+                        execution: ExecutionMetadata::new("execution-step-1".to_owned()),
+                        events: vec![
+                            backend_event(
+                                BackendEventPayload::ToolUse(ToolUse {
+                                    id: "tool-call-1".to_owned(),
+                                    call_id: None,
+                                    name: "exec_command".to_owned(),
+                                    input: serde_json::json!({"cmd": "pwd"}),
+                                }),
+                                Some("execution-step-1"),
+                                Some("call-1"),
+                            ),
+                            backend_event(
+                                BackendEventPayload::ToolUse(ToolUse {
+                                    id: "tool-call-2".to_owned(),
+                                    call_id: None,
+                                    name: "exec_command".to_owned(),
+                                    input: serde_json::json!({"cmd": "ls"}),
+                                }),
+                                Some("execution-step-1"),
+                                Some("call-2"),
+                            ),
+                        ],
+                    },
+                    BackendStep {
+                        execution: ExecutionMetadata::new("execution-step-2".to_owned()),
+                        events: vec![
+                            backend_event(
+                                BackendEventPayload::ToolResult(ToolResult {
+                                    id: "tool-call-1".to_owned(),
+                                    call_id: None,
+                                    output: "/tmp".to_owned(),
+                                }),
+                                Some("execution-step-2"),
+                                Some("call-1"),
+                            ),
+                            backend_event(
+                                BackendEventPayload::ToolResult(ToolResult {
+                                    id: "tool-call-2".to_owned(),
+                                    call_id: None,
+                                    output: "Cargo.toml".to_owned(),
+                                }),
+                                Some("execution-step-2"),
+                                Some("call-2"),
+                            ),
+                            BackendEventPayload::AssistantText("done".to_owned()).into(),
+                        ],
+                    },
+                ],
+            ))],
+        )]);
+        let service = LlmService::new(store.clone(), backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        service
+            .prompt(prompt_request("main", "inspect files"))
+            .await
+            .unwrap();
+
+        let ancestry = store.ancestry("main").unwrap();
+        let assistant = &ancestry[0];
+        let tool_result = &ancestry[1];
+        let tool_use = &ancestry[2];
+
+        assert_eq!(assistant.parent, tool_result.id);
+        assert_eq!(tool_result.parent, tool_use.id);
+        assert_eq!(tool_use.parent, ancestry[3].id);
+
+        let tool_uses = tool_use
+            .kind
+            .as_tool_uses()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(tool_uses.len(), 2);
+        assert_eq!(tool_uses[0].id, "tool-call-1");
+        assert_eq!(tool_uses[0].call_id.as_deref(), Some("call-1"));
+        assert_eq!(tool_uses[1].id, "tool-call-2");
+        assert_eq!(tool_uses[1].call_id.as_deref(), Some("call-2"));
+
+        let tool_results = tool_result
+            .kind
+            .as_tool_results()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 2);
+        assert_eq!(tool_results[0].id, "tool-call-1");
+        assert_eq!(tool_results[0].call_id.as_deref(), Some("call-1"));
+        assert_eq!(tool_results[1].id, "tool-call-2");
+        assert_eq!(tool_results[1].call_id.as_deref(), Some("call-2"));
     }
 
     #[tokio::test]
