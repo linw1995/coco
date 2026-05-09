@@ -264,7 +264,6 @@ fn console_store_notifies_after_successful_writes() {
             metadata: None,
             kind: Kind::tool_use(coco_mem::ToolUse {
                 id: "tool-1".to_owned(),
-                call_id: None,
                 name: "noop".to_owned(),
                 input: json!({}),
             }),

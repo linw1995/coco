@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
-    MergeParent, NewNode, NodeStore, PauseReason, PromptAnchor, ProviderMetadata, Role,
-    RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
+    Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, ManyOrOneItem,
+    MemoryStore, MergeParent, NewNode, NodeStore, PauseReason, PromptAnchor, ProviderMetadata,
+    Role, RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
     StoreError, Tool, ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
@@ -355,7 +355,6 @@ impl ToolExecutionOutcome {
         let event = match self {
             Self::ToolResult { provider_output } => BackendEventPayload::ToolResult(ToolResult {
                 id: tool_id,
-                call_id: call_id.clone(),
                 output: provider_output,
             }),
             Self::SkillResult {
@@ -2482,24 +2481,16 @@ fn persisted_node_from_backend_event(
 
     match envelope.event {
         BackendEventPayload::AssistantText(text) => (Role::LLM, metadata, Kind::Text(text)),
-        BackendEventPayload::ToolUse(mut tool_use) => {
-            if tool_use.call_id.is_none() {
-                tool_use.call_id = envelope
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.call_id.clone());
-            }
-            (Role::LLM, metadata, Kind::tool_use(tool_use))
-        }
-        BackendEventPayload::ToolResult(mut tool_result) => {
-            if tool_result.call_id.is_none() {
-                tool_result.call_id = envelope
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.call_id.clone());
-            }
-            (Role::User, metadata, Kind::tool_result(tool_result))
-        }
+        BackendEventPayload::ToolUse(tool_use) => (
+            Role::LLM,
+            metadata,
+            Kind::tool_use_with_metadata(tool_use, envelope.metadata),
+        ),
+        BackendEventPayload::ToolResult(tool_result) => (
+            Role::User,
+            metadata,
+            Kind::tool_result_with_metadata(tool_result, envelope.metadata),
+        ),
         BackendEventPayload::SkillResult(skill_result) => (
             Role::System,
             metadata,
@@ -2519,10 +2510,6 @@ fn execution_backend_metadata(execution: &ExecutionMetadata) -> Option<BackendMe
     BackendMetadata::builder().execution(execution).build()
 }
 
-fn provider_call_id(metadata: Option<&ProviderMetadata>) -> Option<String> {
-    metadata.and_then(|metadata| metadata.call_id.clone())
-}
-
 fn persisted_nodes_from_backend_events(
     events: &[BackendEvent],
     execution: &ExecutionMetadata,
@@ -2530,36 +2517,24 @@ fn persisted_nodes_from_backend_events(
     fn flush_tool_uses(
         nodes: &mut Vec<(Role, Option<BackendMetadata>, Kind)>,
         execution: &ExecutionMetadata,
-        tool_uses: &mut Vec<ToolUse>,
+        tool_uses: &mut Vec<ManyOrOneItem<ToolUse>>,
     ) {
         if tool_uses.is_empty() {
             return;
         }
-        let kind = if tool_uses.len() == 1 {
-            Kind::tool_use(tool_uses.pop().expect("tool uses buffer is non-empty"))
-        } else {
-            Kind::tool_uses(std::mem::take(tool_uses))
-        };
+        let kind = Kind::tool_use_items(std::mem::take(tool_uses));
         nodes.push((Role::LLM, execution_backend_metadata(execution), kind));
     }
 
     fn flush_tool_results(
         nodes: &mut Vec<(Role, Option<BackendMetadata>, Kind)>,
         execution: &ExecutionMetadata,
-        tool_results: &mut Vec<ToolResult>,
+        tool_results: &mut Vec<ManyOrOneItem<ToolResult>>,
     ) {
         if tool_results.is_empty() {
             return;
         }
-        let kind = if tool_results.len() == 1 {
-            Kind::tool_result(
-                tool_results
-                    .pop()
-                    .expect("tool results buffer is non-empty"),
-            )
-        } else {
-            Kind::tool_results(std::mem::take(tool_results))
-        };
+        let kind = Kind::tool_result_items(std::mem::take(tool_results));
         nodes.push((Role::User, execution_backend_metadata(execution), kind));
     }
 
@@ -2569,19 +2544,19 @@ fn persisted_nodes_from_backend_events(
 
     for event in events {
         match event.event.clone() {
-            BackendEventPayload::ToolUse(mut tool_use) => {
+            BackendEventPayload::ToolUse(tool_use) => {
                 flush_tool_results(&mut nodes, execution, &mut tool_results);
-                if tool_use.call_id.is_none() {
-                    tool_use.call_id = provider_call_id(event.metadata.as_ref());
-                }
-                tool_uses.push(tool_use);
+                tool_uses.push(ManyOrOneItem::with_metadata(
+                    tool_use,
+                    event.metadata.clone(),
+                ));
             }
-            BackendEventPayload::ToolResult(mut tool_result) => {
+            BackendEventPayload::ToolResult(tool_result) => {
                 flush_tool_uses(&mut nodes, execution, &mut tool_uses);
-                if tool_result.call_id.is_none() {
-                    tool_result.call_id = provider_call_id(event.metadata.as_ref());
-                }
-                tool_results.push(tool_result);
+                tool_results.push(ManyOrOneItem::with_metadata(
+                    tool_result,
+                    event.metadata.clone(),
+                ));
             }
             BackendEventPayload::AssistantText(_) | BackendEventPayload::SkillResult(_) => {
                 flush_tool_uses(&mut nodes, execution, &mut tool_uses);
@@ -2680,8 +2655,8 @@ impl ProviderHistoryBuilder {
                 AnchorPayload::Prompt(prompt) => self.push_user_text(&prompt.prompt),
                 AnchorPayload::SkillResult(result) => self.push_tool_result(
                     node.metadata.as_ref(),
-                    &result.tool_id,
                     None,
+                    &result.tool_id,
                     &result.output,
                 ),
             },
@@ -2691,17 +2666,21 @@ impl ProviderHistoryBuilder {
                 Role::System => {}
             },
             Kind::ToolUse(tool_uses) => {
-                for tool_use in tool_uses.iter() {
-                    self.push_tool_use(node.metadata.as_ref(), tool_use);
+                for tool_use in tool_uses.items() {
+                    self.push_tool_use(
+                        node.metadata.as_ref(),
+                        tool_use.metadata(),
+                        tool_use.payload(),
+                    );
                 }
             }
             Kind::ToolResult(tool_results) => {
-                for tool_result in tool_results.iter() {
+                for tool_result in tool_results.items() {
                     self.push_tool_result(
                         node.metadata.as_ref(),
-                        &tool_result.id,
-                        tool_result.call_id.as_deref(),
-                        &tool_result.output,
+                        tool_result.metadata(),
+                        &tool_result.payload().id,
+                        &tool_result.payload().output,
                     );
                 }
             }
@@ -2739,17 +2718,21 @@ impl ProviderHistoryBuilder {
             .push(rig::message::AssistantContent::text(text.to_owned()));
     }
 
-    fn push_tool_use(&mut self, metadata: Option<&BackendMetadata>, tool_use: &ToolUse) {
+    fn push_tool_use(
+        &mut self,
+        node_metadata: Option<&BackendMetadata>,
+        item_metadata: Option<&ProviderMetadata>,
+        tool_use: &ToolUse,
+    ) {
         self.flush_tool_results();
-        let execution_id = metadata.and_then(|metadata| metadata.execution_id.clone());
+        let execution_id = node_metadata.and_then(|metadata| metadata.execution_id.clone());
         if !self.assistant_contents.is_empty() && self.assistant_execution_id != execution_id {
             self.flush_assistant_contents();
         }
         self.assistant_execution_id = execution_id;
-        let call_id = tool_use
-            .call_id
-            .clone()
-            .or_else(|| metadata.and_then(|metadata| metadata.call_id.clone()));
+        let call_id = item_metadata
+            .and_then(|metadata| metadata.call_id.clone())
+            .or_else(|| node_metadata.and_then(|metadata| metadata.call_id.clone()));
         self.assistant_contents.push(rig_tool_call_content(
             tool_use.id.clone(),
             call_id,
@@ -2760,13 +2743,13 @@ impl ProviderHistoryBuilder {
 
     fn push_tool_result(
         &mut self,
-        metadata: Option<&BackendMetadata>,
+        node_metadata: Option<&BackendMetadata>,
+        item_metadata: Option<&ProviderMetadata>,
         id: &str,
-        call_id: Option<&str>,
         output: &str,
     ) {
         self.flush_assistant_contents();
-        let execution_id = metadata.and_then(|metadata| metadata.execution_id.clone());
+        let execution_id = node_metadata.and_then(|metadata| metadata.execution_id.clone());
         if !self.tool_results.is_empty() && self.tool_result_execution_id != execution_id {
             self.flush_tool_results();
         }
@@ -2774,9 +2757,9 @@ impl ProviderHistoryBuilder {
         let content = rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
             output.to_owned(),
         ));
-        let call_id = call_id
-            .map(str::to_owned)
-            .or_else(|| metadata.and_then(|metadata| metadata.call_id.clone()));
+        let call_id = item_metadata
+            .and_then(|metadata| metadata.call_id.clone())
+            .or_else(|| node_metadata.and_then(|metadata| metadata.call_id.clone()));
         self.tool_results
             .push(rig_tool_result_content(id.to_owned(), call_id, content));
     }
@@ -2839,7 +2822,6 @@ fn backend_events_from_choice(
                 events.push(
                     BackendEvent::new(BackendEventPayload::ToolUse(ToolUse {
                         id: tool_call.id.clone(),
-                        call_id: tool_call.call_id.clone(),
                         name: tool_call.function.name.clone(),
                         input: tool_call.function.arguments.clone(),
                     }))
@@ -3602,7 +3584,6 @@ mod tests {
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    call_id: None,
                     name: "use_skill".to_owned(),
                     input: serde_json::json!({"name": "find-skills"}),
                 }),
@@ -3678,7 +3659,6 @@ mod tests {
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    call_id: None,
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "printf 'hello' > trace.txt"}),
                 }),
@@ -3697,7 +3677,6 @@ mod tests {
                 backend_event(
                     BackendEventPayload::ToolResult(ToolResult {
                         id: "tool-call-1".to_owned(),
-                        call_id: None,
                         output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
                     }),
                     Some("execution-step-2"),
@@ -3746,7 +3725,6 @@ mod tests {
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    call_id: None,
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "printf done"}),
                 }),
@@ -3762,7 +3740,6 @@ mod tests {
             let step_two_events = vec![backend_event(
                 BackendEventPayload::ToolResult(ToolResult {
                     id: "tool-call-1".to_owned(),
-                    call_id: None,
                     output: "stdout: done".to_owned(),
                 }),
                 Some("execution-step-2"),
@@ -4420,7 +4397,6 @@ mod tests {
                 metadata: None,
                 kind: Kind::tool_use(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    call_id: None,
                     name: "use_skill".to_owned(),
                     input: serde_json::json!({"name": "fast-rust"}),
                 }),
@@ -5290,7 +5266,6 @@ mod tests {
                         events: vec![backend_event(
                             BackendEventPayload::ToolUse(ToolUse {
                                 id: "tool-call-1".to_owned(),
-                                call_id: None,
                                 name: "exec_command".to_owned(),
                                 input: serde_json::json!({"cmd": "rg --files"}),
                             }),
@@ -5304,7 +5279,6 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolResult(ToolResult {
                                     id: "tool-call-1".to_owned(),
-                                    call_id: None,
                                     output: "Cargo.toml".to_owned(),
                                 }),
                                 Some("execution-step-2"),
@@ -5383,7 +5357,6 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolUse(ToolUse {
                                     id: "tool-call-1".to_owned(),
-                                    call_id: None,
                                     name: "exec_command".to_owned(),
                                     input: serde_json::json!({"cmd": "pwd"}),
                                 }),
@@ -5393,7 +5366,6 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolUse(ToolUse {
                                     id: "tool-call-2".to_owned(),
-                                    call_id: None,
                                     name: "exec_command".to_owned(),
                                     input: serde_json::json!({"cmd": "ls"}),
                                 }),
@@ -5408,7 +5380,6 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolResult(ToolResult {
                                     id: "tool-call-1".to_owned(),
-                                    call_id: None,
                                     output: "/tmp".to_owned(),
                                 }),
                                 Some("execution-step-2"),
@@ -5417,7 +5388,6 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolResult(ToolResult {
                                     id: "tool-call-2".to_owned(),
-                                    call_id: None,
                                     output: "Cargo.toml".to_owned(),
                                 }),
                                 Some("execution-step-2"),
@@ -5453,25 +5423,47 @@ mod tests {
             .kind
             .as_tool_uses()
             .unwrap()
+            .items()
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(tool_uses.len(), 2);
-        assert_eq!(tool_uses[0].id, "tool-call-1");
-        assert_eq!(tool_uses[0].call_id.as_deref(), Some("call-1"));
-        assert_eq!(tool_uses[1].id, "tool-call-2");
-        assert_eq!(tool_uses[1].call_id.as_deref(), Some("call-2"));
+        assert_eq!(tool_uses[0].payload().id, "tool-call-1");
+        assert_eq!(
+            tool_uses[0]
+                .metadata()
+                .and_then(|metadata| metadata.call_id.as_deref()),
+            Some("call-1")
+        );
+        assert_eq!(tool_uses[1].payload().id, "tool-call-2");
+        assert_eq!(
+            tool_uses[1]
+                .metadata()
+                .and_then(|metadata| metadata.call_id.as_deref()),
+            Some("call-2")
+        );
 
         let tool_results = tool_result
             .kind
             .as_tool_results()
             .unwrap()
+            .items()
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(tool_results.len(), 2);
-        assert_eq!(tool_results[0].id, "tool-call-1");
-        assert_eq!(tool_results[0].call_id.as_deref(), Some("call-1"));
-        assert_eq!(tool_results[1].id, "tool-call-2");
-        assert_eq!(tool_results[1].call_id.as_deref(), Some("call-2"));
+        assert_eq!(tool_results[0].payload().id, "tool-call-1");
+        assert_eq!(
+            tool_results[0]
+                .metadata()
+                .and_then(|metadata| metadata.call_id.as_deref()),
+            Some("call-1")
+        );
+        assert_eq!(tool_results[1].payload().id, "tool-call-2");
+        assert_eq!(
+            tool_results[1]
+                .metadata()
+                .and_then(|metadata| metadata.call_id.as_deref()),
+            Some("call-2")
+        );
     }
 
     #[tokio::test]
@@ -5526,11 +5518,14 @@ mod tests {
                 .kind
                 .as_tool_results()
                 .is_some_and(|tool_results| {
-                    let results = tool_results.iter().collect::<Vec<_>>();
+                    let results = tool_results.items().iter().collect::<Vec<_>>();
                     results.len() == 1
-                        && results[0].id == "tool-call-1"
-                        && results[0].call_id.as_deref() == Some("call-1")
-                        && results[0].output == r#"{"skills":[]}"#
+                        && results[0].payload().id == "tool-call-1"
+                        && results[0]
+                            .metadata()
+                            .and_then(|metadata| metadata.call_id.as_deref())
+                            == Some("call-1")
+                        && results[0].payload().output == r#"{"skills":[]}"#
                 })
         );
 
@@ -5695,7 +5690,6 @@ mod tests {
                         events: vec![backend_event(
                             BackendEventPayload::ToolUse(ToolUse {
                                 id: "tool-call-1".to_owned(),
-                                call_id: None,
                                 name: "exec_command".to_owned(),
                                 input: serde_json::json!({"cmd": "rg --files"}),
                             }),
@@ -5709,7 +5703,6 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolResult(ToolResult {
                                     id: "tool-call-1".to_owned(),
-                                    call_id: None,
                                     output: "Cargo.toml".to_owned(),
                                 }),
                                 Some("execution-step-2"),
@@ -5774,7 +5767,6 @@ mod tests {
                 metadata(Some("execution-1"), Some("call-1")),
                 Kind::tool_use(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    call_id: None,
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "ls"}),
                 }),
@@ -5784,7 +5776,6 @@ mod tests {
                 metadata(Some("execution-1"), Some("call-2")),
                 Kind::tool_use(ToolUse {
                     id: "tool-call-2".to_owned(),
-                    call_id: None,
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
                 }),
@@ -5794,7 +5785,6 @@ mod tests {
                 metadata(Some("execution-1"), Some("call-1")),
                 Kind::tool_result(ToolResult {
                     id: "tool-call-1".to_owned(),
-                    call_id: None,
                     output: "Cargo.toml".to_owned(),
                 }),
             ),
@@ -5803,7 +5793,6 @@ mod tests {
                 metadata(Some("execution-1"), Some("call-2")),
                 Kind::tool_result(ToolResult {
                     id: "tool-call-2".to_owned(),
-                    call_id: None,
                     output: "/tmp".to_owned(),
                 }),
             ),
@@ -5886,7 +5875,6 @@ mod tests {
                 metadata(Some("execution-1"), Some("call-legacy")),
                 Kind::tool_use(ToolUse {
                     id: "tool-call-legacy".to_owned(),
-                    call_id: None,
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
                 }),
@@ -5896,7 +5884,6 @@ mod tests {
                 metadata(Some("execution-1"), Some("call-legacy")),
                 Kind::tool_result(ToolResult {
                     id: "tool-call-legacy".to_owned(),
-                    call_id: None,
                     output: "/tmp".to_owned(),
                 }),
             ),
@@ -5925,26 +5912,30 @@ mod tests {
     }
 
     #[test]
-    fn rig_messages_from_nodes_uses_payload_call_id_without_metadata_call_id() {
+    fn rig_messages_from_nodes_uses_many_or_one_item_call_id_without_node_call_id() {
         let messages = rig_messages_from_nodes(&[
             context_node(
                 Role::LLM,
                 metadata(Some("execution-1"), None),
-                Kind::tool_use(ToolUse {
-                    id: "tool-call-payload".to_owned(),
-                    call_id: Some("call-payload".to_owned()),
-                    name: "exec_command".to_owned(),
-                    input: serde_json::json!({"cmd": "pwd"}),
-                }),
+                Kind::tool_use_with_metadata(
+                    ToolUse {
+                        id: "tool-call-payload".to_owned(),
+                        name: "exec_command".to_owned(),
+                        input: serde_json::json!({"cmd": "pwd"}),
+                    },
+                    Some(ProviderMetadata::new(Some("call-payload".to_owned()))),
+                ),
             ),
             context_node(
                 Role::User,
                 metadata(Some("execution-1"), None),
-                Kind::tool_result(ToolResult {
-                    id: "tool-call-payload".to_owned(),
-                    call_id: Some("call-payload".to_owned()),
-                    output: "/tmp".to_owned(),
-                }),
+                Kind::tool_result_with_metadata(
+                    ToolResult {
+                        id: "tool-call-payload".to_owned(),
+                        output: "/tmp".to_owned(),
+                    },
+                    Some(ProviderMetadata::new(Some("call-payload".to_owned()))),
+                ),
             ),
         ]);
 
@@ -5976,7 +5967,6 @@ mod tests {
                 metadata(Some("execution-1"), None),
                 Kind::tool_use(ToolUse {
                     id: "tool-call-legacy".to_owned(),
-                    call_id: None,
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
                 }),
@@ -5986,7 +5976,6 @@ mod tests {
                 metadata(Some("execution-1"), None),
                 Kind::tool_result(ToolResult {
                     id: "tool-call-legacy".to_owned(),
-                    call_id: None,
                     output: "/tmp".to_owned(),
                 }),
             ),
@@ -6064,7 +6053,6 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolUse(ToolUse {
                                     id: "tool-call-1".to_owned(),
-                                    call_id: None,
                                     name: "exec_command".to_owned(),
                                     input: serde_json::json!({"cmd": "ls"}),
                                 }),
@@ -6074,7 +6062,6 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolResult(ToolResult {
                                     id: "tool-call-1".to_owned(),
-                                    call_id: None,
                                     output: "Cargo.toml".to_owned(),
                                 }),
                                 Some("execution-step-1"),
@@ -6167,7 +6154,6 @@ mod tests {
                         events: vec![backend_event(
                             BackendEventPayload::ToolUse(ToolUse {
                                 id: "tool-call-1".to_owned(),
-                                call_id: None,
                                 name: "exec_command".to_owned(),
                                 input: serde_json::json!({"cmd": "printf 'hello' > trace.txt"}),
                             }),
@@ -6181,7 +6167,6 @@ mod tests {
                             backend_event(
                                 BackendEventPayload::ToolResult(ToolResult {
                                     id: "tool-call-1".to_owned(),
-                                    call_id: None,
                                     output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
                                 }),
                                 Some("execution-step-2"),

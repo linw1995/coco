@@ -43,8 +43,16 @@ pub enum Kind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ManyOrOne<T> {
-    One(T),
-    Many(Vec<T>),
+    One(ManyOrOneItem<T>),
+    Many(Vec<ManyOrOneItem<T>>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManyOrOneItem<T> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ProviderMetadata>,
+    #[serde(flatten)]
+    pub payload: T,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -496,8 +504,6 @@ pub struct BackendMetadataBuilder {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolUse {
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
     pub name: String,
     pub input: Value,
 }
@@ -505,8 +511,6 @@ pub struct ToolUse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolResult {
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
     pub output: String,
 }
 
@@ -519,32 +523,66 @@ pub struct Tool {
 
 impl<T> ManyOrOne<T> {
     pub fn one(value: T) -> Self {
-        Self::One(value)
+        Self::One(ManyOrOneItem::new(value))
+    }
+
+    pub fn one_with_metadata(value: T, metadata: Option<ProviderMetadata>) -> Self {
+        Self::One(ManyOrOneItem::with_metadata(value, metadata))
     }
 
     pub fn many(values: Vec<T>) -> Self {
-        Self::Many(values)
+        Self::from_items(values.into_iter().map(ManyOrOneItem::new).collect())
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, T> {
-        match self {
-            Self::One(value) => std::slice::from_ref(value).iter(),
-            Self::Many(values) => values.iter(),
+    pub fn from_items(mut items: Vec<ManyOrOneItem<T>>) -> Self {
+        if items.len() == 1 {
+            Self::One(items.pop().expect("items length is one"))
+        } else {
+            Self::Many(items)
         }
+    }
+
+    pub fn items(&self) -> &[ManyOrOneItem<T>] {
+        match self {
+            Self::One(item) => std::slice::from_ref(item),
+            Self::Many(items) => items,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.items().iter().map(ManyOrOneItem::payload)
     }
 
     pub fn first(&self) -> Option<&T> {
-        match self {
-            Self::One(value) => Some(value),
-            Self::Many(values) => values.first(),
-        }
+        self.items().first().map(ManyOrOneItem::payload)
     }
 
     pub fn as_one(&self) -> Option<&T> {
         match self {
-            Self::One(value) => Some(value),
+            Self::One(item) => Some(item.payload()),
             Self::Many(_) => None,
         }
+    }
+}
+
+impl<T> ManyOrOneItem<T> {
+    pub fn new(payload: T) -> Self {
+        Self {
+            metadata: None,
+            payload,
+        }
+    }
+
+    pub fn with_metadata(payload: T, metadata: Option<ProviderMetadata>) -> Self {
+        Self { metadata, payload }
+    }
+
+    pub fn payload(&self) -> &T {
+        &self.payload
+    }
+
+    pub fn metadata(&self) -> Option<&ProviderMetadata> {
+        self.metadata.as_ref()
     }
 }
 
@@ -906,16 +944,35 @@ impl Kind {
         Self::ToolUse(ManyOrOne::one(tool_use))
     }
 
+    pub fn tool_use_with_metadata(tool_use: ToolUse, metadata: Option<ProviderMetadata>) -> Self {
+        Self::ToolUse(ManyOrOne::one_with_metadata(tool_use, metadata))
+    }
+
     pub fn tool_uses(tool_uses: Vec<ToolUse>) -> Self {
         Self::ToolUse(ManyOrOne::many(tool_uses))
+    }
+
+    pub fn tool_use_items(tool_uses: Vec<ManyOrOneItem<ToolUse>>) -> Self {
+        Self::ToolUse(ManyOrOne::from_items(tool_uses))
     }
 
     pub fn tool_result(tool_result: ToolResult) -> Self {
         Self::ToolResult(ManyOrOne::one(tool_result))
     }
 
+    pub fn tool_result_with_metadata(
+        tool_result: ToolResult,
+        metadata: Option<ProviderMetadata>,
+    ) -> Self {
+        Self::ToolResult(ManyOrOne::one_with_metadata(tool_result, metadata))
+    }
+
     pub fn tool_results(tool_results: Vec<ToolResult>) -> Self {
         Self::ToolResult(ManyOrOne::many(tool_results))
+    }
+
+    pub fn tool_result_items(tool_results: Vec<ManyOrOneItem<ToolResult>>) -> Self {
+        Self::ToolResult(ManyOrOne::from_items(tool_results))
     }
 
     pub fn as_tool_uses(&self) -> Option<&ManyOrOne<ToolUse>> {
@@ -1243,7 +1300,6 @@ mod tests {
                 .build(),
             Kind::tool_result(ToolResult {
                 id: "call-1".to_owned(),
-                call_id: None,
                 output: "ok".to_owned(),
             }),
             fixed_timestamp(),
@@ -1270,6 +1326,7 @@ mod tests {
         let many: Kind = serde_json::from_value(serde_json::json!({
             "ToolUse": [
                 {
+                    "metadata": { "call_id": "call-1" },
                     "id": "tool-call-1",
                     "name": "exec_command",
                     "input": { "cmd": "pwd" }
@@ -1285,6 +1342,12 @@ mod tests {
 
         assert_eq!(one.as_tool_uses().unwrap().iter().count(), 1);
         assert_eq!(many.as_tool_uses().unwrap().iter().count(), 2);
+        assert_eq!(
+            many.as_tool_uses().unwrap().items()[0]
+                .metadata()
+                .and_then(|metadata| metadata.call_id.as_deref()),
+            Some("call-1")
+        );
     }
 
     #[test]
