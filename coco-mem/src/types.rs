@@ -34,10 +34,17 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Kind {
     Anchor(Anchor),
-    ToolUse(ToolUse),
-    ToolResult(ToolResult),
+    ToolUse(ManyOrOne<ToolUse>),
+    ToolResult(ManyOrOne<ToolResult>),
     Text(String),
     Failure(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ManyOrOne<T> {
+    One(T),
+    Many(Vec<T>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -506,6 +513,43 @@ pub struct Tool {
     pub input_schema: Value,
 }
 
+impl<T> ManyOrOne<T> {
+    pub fn one(value: T) -> Self {
+        Self::One(value)
+    }
+
+    pub fn many(values: Vec<T>) -> Self {
+        Self::Many(values)
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        match self {
+            Self::One(value) => std::slice::from_ref(value).iter(),
+            Self::Many(values) => values.iter(),
+        }
+    }
+
+    pub fn first(&self) -> Option<&T> {
+        match self {
+            Self::One(value) => Some(value),
+            Self::Many(values) => values.first(),
+        }
+    }
+
+    pub fn as_one(&self) -> Option<&T> {
+        match self {
+            Self::One(value) => Some(value),
+            Self::Many(_) => None,
+        }
+    }
+}
+
+impl<T> From<T> for ManyOrOne<T> {
+    fn from(value: T) -> Self {
+        Self::one(value)
+    }
+}
+
 impl MergeParent {
     pub fn merge(node_id: impl Into<String>) -> Self {
         Self::Merge {
@@ -853,6 +897,38 @@ impl Node {
     }
 }
 
+impl Kind {
+    pub fn tool_use(tool_use: ToolUse) -> Self {
+        Self::ToolUse(ManyOrOne::one(tool_use))
+    }
+
+    pub fn tool_uses(tool_uses: Vec<ToolUse>) -> Self {
+        Self::ToolUse(ManyOrOne::many(tool_uses))
+    }
+
+    pub fn tool_result(tool_result: ToolResult) -> Self {
+        Self::ToolResult(ManyOrOne::one(tool_result))
+    }
+
+    pub fn tool_results(tool_results: Vec<ToolResult>) -> Self {
+        Self::ToolResult(ManyOrOne::many(tool_results))
+    }
+
+    pub fn as_tool_uses(&self) -> Option<&ManyOrOne<ToolUse>> {
+        match self {
+            Self::ToolUse(tool_uses) => Some(tool_uses),
+            Self::Anchor(_) | Self::ToolResult(_) | Self::Text(_) | Self::Failure(_) => None,
+        }
+    }
+
+    pub fn as_tool_results(&self) -> Option<&ManyOrOne<ToolResult>> {
+        match self {
+            Self::ToolResult(tool_results) => Some(tool_results),
+            Self::Anchor(_) | Self::ToolUse(_) | Self::Text(_) | Self::Failure(_) => None,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct NodeHashPayload<'a> {
     parent: &'a str,
@@ -1161,7 +1237,7 @@ mod tests {
             BackendMetadata::builder()
                 .provider(&ProviderMetadata::new(Some("call-1".to_owned())))
                 .build(),
-            Kind::ToolResult(ToolResult {
+            Kind::tool_result(ToolResult {
                 id: "call-1".to_owned(),
                 output: "ok".to_owned(),
             }),
@@ -1174,6 +1250,36 @@ mod tests {
         assert_eq!(decoded.id, node.id);
         assert_eq!(decoded.parent, node.parent);
         assert_eq!(decoded.created_at, node.created_at);
+    }
+
+    #[test]
+    fn tool_use_payload_accepts_one_or_many_items() {
+        let one: Kind = serde_json::from_value(serde_json::json!({
+            "ToolUse": {
+                "id": "tool-call-1",
+                "name": "exec_command",
+                "input": { "cmd": "pwd" }
+            }
+        }))
+        .unwrap();
+        let many: Kind = serde_json::from_value(serde_json::json!({
+            "ToolUse": [
+                {
+                    "id": "tool-call-1",
+                    "name": "exec_command",
+                    "input": { "cmd": "pwd" }
+                },
+                {
+                    "id": "tool-call-2",
+                    "name": "exec_command",
+                    "input": { "cmd": "ls" }
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(one.as_tool_uses().unwrap().iter().count(), 1);
+        assert_eq!(many.as_tool_uses().unwrap().iter().count(), 2);
     }
 
     #[test]

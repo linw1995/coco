@@ -737,7 +737,7 @@ fn append_tool_use_node(store: &impl NodeStore, parent: &str, id: &str, name: &s
             metadata: BackendMetadata::builder()
                 .provider(&ProviderMetadata::new(Some(id.to_owned())))
                 .build(),
-            kind: Kind::ToolUse(ToolUse {
+            kind: Kind::tool_use(ToolUse {
                 id: id.to_owned(),
                 name: name.to_owned(),
                 input: json!({
@@ -756,7 +756,7 @@ fn append_tool_result_node(store: &impl NodeStore, parent: &str, id: &str, outpu
             metadata: BackendMetadata::builder()
                 .provider(&ProviderMetadata::new(Some(id.to_owned())))
                 .build(),
-            kind: Kind::ToolResult(ToolResult {
+            kind: Kind::tool_result(ToolResult {
                 id: id.to_owned(),
                 output: output.to_owned(),
             }),
@@ -1072,11 +1072,11 @@ async fn prompt_wires_skill_executor_for_use_skill() {
     let tool_use = ancestry
         .iter()
         .find(|node| {
-            matches!(
-                &node.kind,
-                Kind::ToolUse(ToolUse { id, name, .. })
-                    if id == "tool-call-1" && name == "use_skill"
-            )
+            node.kind.as_tool_uses().is_some_and(|tool_uses| {
+                tool_uses
+                    .iter()
+                    .any(|tool_use| tool_use.id == "tool-call-1" && tool_use.name == "use_skill")
+            })
         })
         .expect("expected use_skill tool use on main");
     let skill_result = ancestry
@@ -1235,11 +1235,11 @@ async fn prompt_keeps_failed_use_skill_child_visible_under_tool_use() {
     let tool_use = ancestry
         .iter()
         .find(|node| {
-            matches!(
-                &node.kind,
-                Kind::ToolUse(ToolUse { id, name, .. })
-                    if id == "tool-call-1" && name == "use_skill"
-            )
+            node.kind.as_tool_uses().is_some_and(|tool_uses| {
+                tool_uses
+                    .iter()
+                    .any(|tool_use| tool_use.id == "tool-call-1" && tool_use.name == "use_skill")
+            })
         })
         .expect("expected use_skill tool use on main");
     let children = store.list_children(&tool_use.id).unwrap();
@@ -1253,7 +1253,7 @@ async fn prompt_keeps_failed_use_skill_child_visible_under_tool_use() {
     let tool_result = children
         .iter()
         .find_map(|node| match &node.kind {
-            Kind::ToolResult(result) if result.id == "tool-call-1" => Some(result),
+            Kind::ToolResult(results) => results.iter().find(|result| result.id == "tool-call-1"),
             _ => None,
         })
         .expect("expected use_skill failure as parent tool result");

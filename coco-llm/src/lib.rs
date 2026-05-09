@@ -2089,7 +2089,11 @@ fn is_context_start_session(session: &SessionAnchor) -> bool {
 }
 
 fn is_use_skill_tool_use(node: &coco_mem::Node) -> bool {
-    matches!(&node.kind, Kind::ToolUse(ToolUse { name, .. }) if name == "use_skill")
+    node.kind.as_tool_uses().is_some_and(|tool_uses| {
+        tool_uses
+            .iter()
+            .any(|tool_use| tool_use.name == "use_skill")
+    })
 }
 
 fn is_skill_execution_anchor(node: &coco_mem::Node) -> bool {
@@ -2463,9 +2467,9 @@ fn persisted_node_from_backend_event(
 
     match envelope.event {
         BackendEventPayload::AssistantText(text) => (Role::LLM, metadata, Kind::Text(text)),
-        BackendEventPayload::ToolUse(tool_use) => (Role::LLM, metadata, Kind::ToolUse(tool_use)),
+        BackendEventPayload::ToolUse(tool_use) => (Role::LLM, metadata, Kind::tool_use(tool_use)),
         BackendEventPayload::ToolResult(tool_result) => {
-            (Role::User, metadata, Kind::ToolResult(tool_result))
+            (Role::User, metadata, Kind::tool_result(tool_result))
         }
         BackendEventPayload::SkillResult(skill_result) => (
             Role::System,
@@ -2543,9 +2547,19 @@ impl ProviderHistoryBuilder {
                 Role::LLM => self.push_assistant_text(node.metadata.as_ref(), text),
                 Role::System => {}
             },
-            Kind::ToolUse(tool_use) => self.push_tool_use(node.metadata.as_ref(), tool_use),
-            Kind::ToolResult(tool_result) => {
-                self.push_tool_result(node.metadata.as_ref(), &tool_result.id, &tool_result.output)
+            Kind::ToolUse(tool_uses) => {
+                for tool_use in tool_uses.iter() {
+                    self.push_tool_use(node.metadata.as_ref(), tool_use);
+                }
+            }
+            Kind::ToolResult(tool_results) => {
+                for tool_result in tool_results.iter() {
+                    self.push_tool_result(
+                        node.metadata.as_ref(),
+                        &tool_result.id,
+                        &tool_result.output,
+                    );
+                }
             }
             Kind::Failure(_) => {}
         }
@@ -3793,6 +3807,22 @@ mod tests {
         store.get_node(&id).expect("test node should exist")
     }
 
+    fn kind_has_tool_use(kind: &Kind, expected_id: &str, expected_name: &str) -> bool {
+        kind.as_tool_uses().is_some_and(|tool_uses| {
+            tool_uses
+                .iter()
+                .any(|tool_use| tool_use.id == expected_id && tool_use.name == expected_name)
+        })
+    }
+
+    fn kind_has_tool_result(kind: &Kind, expected_id: &str, expected_output: &str) -> bool {
+        kind.as_tool_results().is_some_and(|tool_results| {
+            tool_results.iter().any(|tool_result| {
+                tool_result.id == expected_id && tool_result.output == expected_output
+            })
+        })
+    }
+
     fn execution(execution_id: &str) -> ExecutionMetadata {
         ExecutionMetadata::new(execution_id.to_owned())
     }
@@ -4211,7 +4241,7 @@ mod tests {
                 parent: prompt_id,
                 role: Role::LLM,
                 metadata: None,
-                kind: Kind::ToolUse(ToolUse {
+                kind: Kind::tool_use(ToolUse {
                     id: "tool-call-1".to_owned(),
                     name: "use_skill".to_owned(),
                     input: serde_json::json!({"name": "fast-rust"}),
@@ -5130,10 +5160,10 @@ mod tests {
         );
 
         assert_eq!(tool_result.role, Role::User);
-        assert!(matches!(
+        assert!(kind_has_tool_result(
             &tool_result.kind,
-            Kind::ToolResult(ToolResult { id, output, .. })
-                if id == "tool-call-1" && output == "Cargo.toml"
+            "tool-call-1",
+            "Cargo.toml"
         ));
         assert_eq!(
             tool_result
@@ -5146,13 +5176,13 @@ mod tests {
         );
 
         assert_eq!(tool_use.role, Role::LLM);
-        assert!(matches!(
-            &tool_use.kind,
-            Kind::ToolUse(ToolUse { id, name, input, .. })
-                if id == "tool-call-1"
-                    && name == "exec_command"
-                    && input == &serde_json::json!({"cmd": "rg --files"})
-        ));
+        assert!(tool_use.kind.as_tool_uses().is_some_and(|tool_uses| {
+            tool_uses.iter().any(|tool_use| {
+                tool_use.id == "tool-call-1"
+                    && tool_use.name == "exec_command"
+                    && tool_use.input == serde_json::json!({"cmd": "rg --files"})
+            })
+        }));
         assert_eq!(
             tool_use.metadata.as_ref().unwrap().execution_id.as_deref(),
             Some("execution-step-1")
@@ -5203,9 +5233,10 @@ mod tests {
         assert_eq!(assistant.id, result.response_node_id);
         assert!(tool_use.created_at < skill_result.created_at);
         assert!(skill_result.created_at < assistant.created_at);
-        assert!(matches!(
+        assert!(kind_has_tool_use(
             &tool_use.kind,
-            Kind::ToolUse(ToolUse { id, name, .. }) if id == "tool-call-1" && name == "use_skill"
+            "tool-call-1",
+            "use_skill"
         ));
         let Kind::Anchor(anchor) = &skill_result.kind else {
             panic!("expected skill result anchor");
@@ -5384,7 +5415,7 @@ mod tests {
             context_node(
                 Role::LLM,
                 metadata(Some("execution-1"), Some("call-1")),
-                Kind::ToolUse(ToolUse {
+                Kind::tool_use(ToolUse {
                     id: "tool-call-1".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "ls"}),
@@ -5393,7 +5424,7 @@ mod tests {
             context_node(
                 Role::LLM,
                 metadata(Some("execution-1"), Some("call-2")),
-                Kind::ToolUse(ToolUse {
+                Kind::tool_use(ToolUse {
                     id: "tool-call-2".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
@@ -5402,7 +5433,7 @@ mod tests {
             context_node(
                 Role::User,
                 metadata(Some("execution-1"), Some("call-1")),
-                Kind::ToolResult(ToolResult {
+                Kind::tool_result(ToolResult {
                     id: "tool-call-1".to_owned(),
                     output: "Cargo.toml".to_owned(),
                 }),
@@ -5410,7 +5441,7 @@ mod tests {
             context_node(
                 Role::User,
                 metadata(Some("execution-1"), Some("call-2")),
-                Kind::ToolResult(ToolResult {
+                Kind::tool_result(ToolResult {
                     id: "tool-call-2".to_owned(),
                     output: "/tmp".to_owned(),
                 }),
@@ -5492,7 +5523,7 @@ mod tests {
             context_node(
                 Role::LLM,
                 metadata(Some("execution-1"), Some("call-legacy")),
-                Kind::ToolUse(ToolUse {
+                Kind::tool_use(ToolUse {
                     id: "tool-call-legacy".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
@@ -5501,7 +5532,7 @@ mod tests {
             context_node(
                 Role::User,
                 metadata(Some("execution-1"), Some("call-legacy")),
-                Kind::ToolResult(ToolResult {
+                Kind::tool_result(ToolResult {
                     id: "tool-call-legacy".to_owned(),
                     output: "/tmp".to_owned(),
                 }),
@@ -5536,7 +5567,7 @@ mod tests {
             context_node(
                 Role::LLM,
                 metadata(Some("execution-1"), None),
-                Kind::ToolUse(ToolUse {
+                Kind::tool_use(ToolUse {
                     id: "tool-call-legacy".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
@@ -5545,7 +5576,7 @@ mod tests {
             context_node(
                 Role::User,
                 metadata(Some("execution-1"), None),
-                Kind::ToolResult(ToolResult {
+                Kind::tool_result(ToolResult {
                     id: "tool-call-legacy".to_owned(),
                     output: "/tmp".to_owned(),
                 }),
@@ -5779,18 +5810,17 @@ mod tests {
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "trying again"));
 
         let tool_result = store.get_node(&assistant.parent).unwrap();
-        assert!(matches!(
+        assert!(kind_has_tool_result(
             &tool_result.kind,
-            Kind::ToolResult(ToolResult { id, output, .. })
-                if id == "tool-call-1"
-                    && output == "exit_status: 0\nstdout:\n\nstderr:\n"
+            "tool-call-1",
+            "exit_status: 0\nstdout:\n\nstderr:\n"
         ));
 
         let tool_use = store.get_node(&tool_result.parent).unwrap();
-        assert!(matches!(
+        assert!(kind_has_tool_use(
             &tool_use.kind,
-            Kind::ToolUse(ToolUse { id, name, .. })
-                if id == "tool-call-1" && name == "exec_command"
+            "tool-call-1",
+            "exec_command"
         ));
         assert_eq!(tool_use.parent, context.retry_from_node_id);
 

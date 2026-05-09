@@ -262,7 +262,7 @@ fn console_store_notifies_after_successful_writes() {
             parent: root,
             role: Role::User,
             metadata: None,
-            kind: Kind::ToolUse(coco_mem::ToolUse {
+            kind: Kind::tool_use(coco_mem::ToolUse {
                 id: "tool-1".to_owned(),
                 name: "noop".to_owned(),
                 input: json!({}),

@@ -250,7 +250,11 @@ fn collect_visible_anchor_child_subtrees(
 }
 
 fn is_use_skill_tool_use(node: &Node) -> bool {
-    matches!(&node.kind, Kind::ToolUse(tool_use) if tool_use.name == "use_skill")
+    node.kind.as_tool_uses().is_some_and(|tool_uses| {
+        tool_uses
+            .iter()
+            .any(|tool_use| tool_use.name == "use_skill")
+    })
 }
 
 fn resolve_visible_parent(visible_node_ids: &BTreeSet<String>, start_id: &str) -> Option<String> {
@@ -306,8 +310,14 @@ fn render_node_content(node: &Node) -> String {
             AnchorPayload::Prompt(prompt) => prompt.prompt.clone(),
             AnchorPayload::SkillResult(skill_result) => skill_result.output.clone(),
         },
-        Kind::ToolUse(tool_use) => tool_use.input.to_string(),
-        Kind::ToolResult(tool_result) => tool_result.output.clone(),
+        Kind::ToolUse(tool_uses) => tool_uses
+            .first()
+            .map(|tool_use| tool_use.input.to_string())
+            .unwrap_or_default(),
+        Kind::ToolResult(tool_results) => tool_results
+            .first()
+            .map(|tool_result| tool_result.output.clone())
+            .unwrap_or_default(),
         Kind::Text(text) => text.clone(),
         Kind::Failure(message) => message.clone(),
     }
