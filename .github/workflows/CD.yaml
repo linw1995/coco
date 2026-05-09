@@ -15,6 +15,7 @@ permissions:
 jobs:
   publish-image-arch:
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -39,8 +40,38 @@ jobs:
             extra-platforms = ${{ matrix.extra-platforms }}
         run: nix build --out-link image "${{ matrix.nix-output }}" --print-build-logs
 
-      - name: Load Docker image
-        run: docker load --input image
+      - name: Prepare Docker image artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          cp --dereference image "dist/coco-${{ matrix.arch }}.tar.gz"
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: "coco-image-${{ matrix.arch }}"
+          path: "dist/coco-${{ matrix.arch }}.tar.gz"
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-image:
+    needs:
+      - publish-image-arch
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+
+      - name: Download Docker image artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          pattern: "coco-image-*"
+          merge-multiple: true
 
       - name: Login to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
@@ -49,44 +80,58 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          arch_tag="sha-${GITHUB_SHA::12}-${{ matrix.arch }}"
-
-          docker tag coco:latest "${image}:${arch_tag}"
-          docker push "${image}:${arch_tag}"
-
-  publish-image-manifest:
-    needs:
-      - publish-image-arch
-    runs-on: ubuntu-latest
-    steps:
-      - name: Login to GitHub Container Registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
-
-      - name: Publish Docker image manifests
-        shell: bash
-        run: |
-          set -euo pipefail
+          shopt -s nullglob
 
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           sha_tag="sha-${GITHUB_SHA::12}"
-          amd64_tag="${image}:${sha_tag}-amd64"
-          arm64_tag="${image}:${sha_tag}-arm64"
+          image_files=(artifacts/coco-*.tar.gz)
 
-          publish_manifest() {
+          if ((${#image_files[@]} == 0)); then
+            echo "::error::No Docker image artifacts were built."
+            exit 1
+          fi
+
+          local_images=()
+
+          for image_file in "${image_files[@]}"; do
+            case "$(basename "${image_file}")" in
+              coco-amd64.tar.gz)
+                local_tag="coco:amd64"
+                ;;
+              coco-arm64.tar.gz)
+                local_tag="coco:arm64"
+                ;;
+              *)
+                echo "::error::Unexpected Docker image artifact: ${image_file}"
+                exit 1
+                ;;
+            esac
+
+            docker load --input "${image_file}"
+            image_id="$(docker image inspect coco:latest --format '{{ .Id }}')"
+            docker tag "${image_id}" "${local_tag}"
+            docker rmi coco:latest
+            local_images+=("${local_tag}")
+          done
+
+          docker save --output coco-images.tar "${local_images[@]}"
+
+          crane_args=()
+          if ((${#local_images[@]} > 1)); then
+            crane_args+=(--index)
+          fi
+
+          publish_image() {
             local tag="$1"
-            docker manifest rm "${image}:${tag}" >/dev/null 2>&1 || true
-            docker manifest create "${image}:${tag}" "${amd64_tag}" "${arm64_tag}"
-            docker manifest push --purge "${image}:${tag}"
+            nix run nixpkgs#crane -- push "${crane_args[@]}" coco-images.tar "${image}:${tag}"
           }
 
-          publish_manifest "${sha_tag}"
+          publish_image "${sha_tag}"
 
           if [[ "${GITHUB_REF_TYPE}" == "branch" && "${GITHUB_REF_NAME}" == "main" ]]; then
-            publish_manifest "latest"
+            publish_image "latest"
           fi
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            publish_manifest "${GITHUB_REF_NAME}"
+            publish_image "${GITHUB_REF_NAME}"
           fi
