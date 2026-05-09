@@ -496,6 +496,8 @@ pub struct BackendMetadataBuilder {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolUse {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     pub name: String,
     pub input: Value,
 }
@@ -503,6 +505,8 @@ pub struct ToolUse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolResult {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     pub output: String,
 }
 
@@ -1239,6 +1243,7 @@ mod tests {
                 .build(),
             Kind::tool_result(ToolResult {
                 id: "call-1".to_owned(),
+                call_id: None,
                 output: "ok".to_owned(),
             }),
             fixed_timestamp(),

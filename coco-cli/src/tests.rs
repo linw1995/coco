@@ -185,6 +185,7 @@ impl CompletionBackend for UseSkillBackend {
                         events: vec![
                             BackendEvent::new(BackendEventPayload::ToolUse(ToolUse {
                                 id: tool_call.id.clone(),
+                                call_id: None,
                                 name: tool_call.function.name.clone(),
                                 input: tool_call.function.arguments.clone(),
                             }))
@@ -235,6 +236,7 @@ impl CompletionBackend for UseSkillFailureBackend {
                         events: vec![
                             BackendEvent::new(BackendEventPayload::ToolUse(ToolUse {
                                 id: tool_call.id.clone(),
+                                call_id: None,
                                 name: tool_call.function.name.clone(),
                                 input: tool_call.function.arguments.clone(),
                             }))
@@ -739,6 +741,7 @@ fn append_tool_use_node(store: &impl NodeStore, parent: &str, id: &str, name: &s
                 .build(),
             kind: Kind::tool_use(ToolUse {
                 id: id.to_owned(),
+                call_id: None,
                 name: name.to_owned(),
                 input: json!({
                     "cmd": "echo hello",
@@ -758,6 +761,7 @@ fn append_tool_result_node(store: &impl NodeStore, parent: &str, id: &str, outpu
                 .build(),
             kind: Kind::tool_result(ToolResult {
                 id: id.to_owned(),
+                call_id: None,
                 output: output.to_owned(),
             }),
         })

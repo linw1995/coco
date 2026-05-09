@@ -41,6 +41,7 @@ where
                 .build(),
             kind: Kind::tool_use(ToolUse {
                 id: "tool-call-1".to_owned(),
+                call_id: None,
                 name: "use_skill".to_owned(),
                 input: serde_json::json!({ "name": skill_name }),
             }),
@@ -729,6 +730,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
                 .build(),
             kind: Kind::tool_use(ToolUse {
                 id: "tool-call-1".to_owned(),
+                call_id: None,
                 name: "exec_command".to_owned(),
                 input: serde_json::json!({"cmd": "printf 'hello' > trace.txt"}),
             }),
@@ -747,6 +749,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
                 .build(),
             kind: Kind::tool_result(ToolResult {
                 id: "tool-call-1".to_owned(),
+                call_id: None,
                 output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
             }),
         })
