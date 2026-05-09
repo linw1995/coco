@@ -13,17 +13,63 @@ permissions:
   packages: write
 
 jobs:
-  publish-image:
-    runs-on: ubuntu-latest
+  publish-image-arch:
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            nix-output: .#coco-image-linux-amd64
+            extra-platforms: x86_64-linux
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            nix-output: .#coco-image-linux-arm64
+            extra-platforms: aarch64-linux
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
 
       - name: Build Docker image
-        run: nix build --out-link image .#coco-image --print-build-logs
+        env:
+          NIX_CONFIG: |
+            extra-platforms = ${{ matrix.extra-platforms }}
+        run: nix build --out-link image "${{ matrix.nix-output }}" --print-build-logs
 
-      - name: Load Docker image
-        run: docker load --input image
+      - name: Prepare Docker image artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          cp --dereference image "dist/coco-${{ matrix.arch }}.tar.gz"
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: "coco-image-${{ matrix.arch }}"
+          path: "dist/coco-${{ matrix.arch }}.tar.gz"
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-image:
+    needs:
+      - publish-image-arch
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+
+      - name: Download Docker image artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          pattern: "coco-image-*"
+          merge-multiple: true
 
       - name: Login to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
@@ -32,19 +78,74 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
 
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           sha_tag="sha-${GITHUB_SHA::12}"
+          image_files=(artifacts/coco-*.tar.gz)
 
-          docker tag coco:latest "${image}:${sha_tag}"
-          docker push "${image}:${sha_tag}"
+          if ((${#image_files[@]} == 0)); then
+            echo "::error::No Docker image artifacts were built."
+            exit 1
+          fi
+
+          temp_refs=()
+          manifest_refs=()
+
+          cleanup_temp_refs() {
+            for temp_ref in "${temp_refs[@]}"; do
+              nix run nixpkgs#crane -- delete "${temp_ref}" >/dev/null 2>&1 || true
+            done
+          }
+
+          trap cleanup_temp_refs EXIT
+
+          for image_file in "${image_files[@]}"; do
+            case "$(basename "${image_file}")" in
+              coco-amd64.tar.gz)
+                arch="amd64"
+                ;;
+              coco-arm64.tar.gz)
+                arch="arm64"
+                ;;
+              *)
+                echo "::error::Unexpected Docker image artifact: ${image_file}"
+                exit 1
+                ;;
+            esac
+
+            temp_ref="${image}:tmp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${arch}"
+            docker_tar="${image_file%.gz}"
+            gzip -dc "${image_file}" > "${docker_tar}"
+            nix run nixpkgs#crane -- push "${docker_tar}" "${temp_ref}"
+
+            digest="$(nix run nixpkgs#crane -- digest "${temp_ref}")"
+            temp_refs+=("${temp_ref}")
+            manifest_refs+=("${image}@${digest}")
+          done
+
+          publish_image() {
+            local tag="$1"
+
+            if ((${#manifest_refs[@]} == 1)); then
+              nix run nixpkgs#crane -- copy "${manifest_refs[0]}" "${image}:${tag}"
+              return
+            fi
+
+            manifest_args=()
+            for manifest_ref in "${manifest_refs[@]}"; do
+              manifest_args+=("--manifest" "${manifest_ref}")
+            done
+
+            nix run nixpkgs#crane -- index append "${manifest_args[@]}" --tag "${image}:${tag}"
+          }
+
+          publish_image "${sha_tag}"
 
           if [[ "${GITHUB_REF_TYPE}" == "branch" && "${GITHUB_REF_NAME}" == "main" ]]; then
-            docker tag coco:latest "${image}:latest"
-            docker push "${image}:latest"
+            publish_image "latest"
           fi
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            docker tag coco:latest "${image}:${GITHUB_REF_NAME}"
-            docker push "${image}:${GITHUB_REF_NAME}"
+            publish_image "${GITHUB_REF_NAME}"
           fi

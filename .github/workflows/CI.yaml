@@ -55,5 +55,8 @@ jobs:
       - name: Build binary
         run: nix build --profile default .#coco-cli --print-build-logs
 
+      - name: Check flake
+        run: nix flake check --no-build
+
       - name: Build Docker image
         run: nix build --out-link image .#coco-image --print-build-logs

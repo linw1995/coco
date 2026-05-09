@@ -25,7 +25,8 @@ rec {
             inputs.fenix.overlays.default
           ];
         };
-        lib = pkgs.lib;
+        hostLib = pkgs.lib;
+        hostSystem = system;
         rustToolchainFor = p:
           with p.fenix;
             combine [
@@ -33,57 +34,64 @@ rec {
               stable.rustc
               targets.wasm32-unknown-unknown.stable.rust-std
             ];
-        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchainFor;
-        fhsDynamicLinker = lib.attrByPath [system] null {
-          x86_64-linux = "/lib64/ld-linux-x86-64.so.2";
-          aarch64-linux = "/lib/ld-linux-aarch64.so.1";
-          i686-linux = "/lib/ld-linux.so.2";
+        dockerImageSystem = hostLib.attrByPath [hostSystem] hostSystem {
+          aarch64-darwin = "aarch64-linux";
+          x86_64-darwin = "x86_64-linux";
         };
-        fhsDynamicLinkerSymlink = lib.attrByPath [system] null {
-          x86_64-linux = {
-            link = "/lib64/ld-linux-x86-64.so.2";
-            target = "/lib/ld-linux-x86-64.so.2";
+        mkPackageSet = targetSystem: let
+          packagePkgs = import nixpkgs {
+            system = targetSystem;
+            overlays = [
+              inputs.fenix.overlays.default
+            ];
           };
-        };
-        src = lib.fileset.toSource {
-          root = ./.;
-          fileset = lib.fileset.unions [
-            (craneLib.fileset.commonCargoSources ./.)
-            (lib.fileset.maybeMissing ./coco-console/src/native/style.css)
-            (lib.fileset.maybeMissing ./coco-mem/src/default_skills)
-          ];
-        };
-        cargoArgs = {
-          pname = "coco-cli";
-          inherit version src;
-          strictDeps = true;
-
-          cargoExtraArgs = "--package coco-cli";
-
-          outputHashes = {
-            "git+https://github.com/0xPlaygrounds/rig?branch=main#6dc36d803adaf4f89de774577b9c4f7ac9057644" = "sha256-tnSi5EOq9BCEXlJxj2bFzlynG33qB+UuPDufW92kAj8=";
+          lib = packagePkgs.lib;
+          craneLib = (crane.mkLib packagePkgs).overrideToolchain rustToolchainFor;
+          fhsDynamicLinker = lib.attrByPath [targetSystem] null {
+            x86_64-linux = "/lib64/ld-linux-x86-64.so.2";
+            aarch64-linux = "/lib/ld-linux-aarch64.so.1";
+            i686-linux = "/lib/ld-linux.so.2";
           };
+          fhsDynamicLinkerSymlink = lib.attrByPath [targetSystem] null {
+            x86_64-linux = {
+              link = "/lib64/ld-linux-x86-64.so.2";
+              target = "/lib/ld-linux-x86-64.so.2";
+            };
+          };
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              (lib.fileset.maybeMissing ./coco-console/src/native/style.css)
+              (lib.fileset.maybeMissing ./coco-mem/src/default_skills)
+            ];
+          };
+          cargoArgs = {
+            pname = "coco-cli";
+            inherit version src;
+            strictDeps = true;
 
-          nativeBuildInputs = [
-            pkgs.wasm-bindgen-cli
-          ];
-        };
-        cargoArtifacts = craneLib.buildDepsOnly cargoArgs;
-        version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-        cocoDockerEntrypoint = pkgs.writeShellApplication {
-          name = "coco-docker-entrypoint";
-          runtimeInputs = [
-            pkgs.coreutils
-            pkgs.gnugrep
-            pkgs.supercronic
-            pkgs.util-linux
-          ];
-          text = builtins.readFile ./docker/coco-docker-entrypoint.sh;
-        };
-      in {
-        packages = rec {
-          default = coco-cli;
+            cargoExtraArgs = "--package coco-cli";
 
+            outputHashes = {
+              "git+https://github.com/0xPlaygrounds/rig?branch=main#6dc36d803adaf4f89de774577b9c4f7ac9057644" = "sha256-tnSi5EOq9BCEXlJxj2bFzlynG33qB+UuPDufW92kAj8=";
+            };
+
+            nativeBuildInputs = with packagePkgs; [
+              wasm-bindgen-cli
+            ];
+          };
+          cargoArtifacts = craneLib.buildDepsOnly cargoArgs;
+          cocoDockerEntrypoint = packagePkgs.writeShellApplication {
+            name = "coco-docker-entrypoint";
+            runtimeInputs = with packagePkgs; [
+              coreutils
+              gnugrep
+              supercronic
+              util-linux
+            ];
+            text = builtins.readFile ./docker/coco-docker-entrypoint.sh;
+          };
           coco-cli = craneLib.buildPackage (cargoArgs
             // {
               inherit cargoArtifacts;
@@ -93,38 +101,37 @@ rec {
                 mainProgram = "coco-cli";
               };
             });
-
-          coco-image = pkgs.dockerTools.buildLayeredImage {
+          coco-image = with packagePkgs; dockerTools.buildLayeredImage {
             name = "coco";
             tag = "latest";
             contents =
               [
                 coco-cli
                 cocoDockerEntrypoint
-                pkgs.bash
-                pkgs.coreutils
-                pkgs.nono
-                pkgs.supercronic
-                pkgs.uv
+                bash
+                coreutils
+                nono
+                supercronic
+                uv
               ]
               ++ [
-                pkgs.diffutils
-                pkgs.findutils
-                pkgs.gawk
-                pkgs.gnugrep
-                pkgs.gnused
-                pkgs.jq
-                pkgs.less
-                pkgs.procps
-                pkgs.ripgrep
-                pkgs.which
+                diffutils
+                findutils
+                gawk
+                gnugrep
+                gnused
+                jq
+                less
+                procps
+                ripgrep
+                which
               ]
               ++ [
-                pkgs.cacert
-                pkgs.tzdata
+                cacert
+                tzdata
               ]
               ++ lib.optionals (fhsDynamicLinker != null) [
-                pkgs.glibc
+                glibc
               ];
             extraCommands =
               ''
@@ -143,8 +150,8 @@ rec {
             config = {
               Env = [
                 "PATH=/bin"
-                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-                "TZDIR=${pkgs.tzdata}/share/zoneinfo"
+                "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
+                "TZDIR=${tzdata}/share/zoneinfo"
                 "TZ=UTC"
                 "HOME=/data"
                 "XDG_CACHE_HOME=/data/.cache"
@@ -179,6 +186,21 @@ rec {
               ];
             };
           };
+        in {
+          inherit coco-cli coco-image;
+        };
+        hostPackages = mkPackageSet hostSystem;
+        defaultDockerImagePackages = mkPackageSet dockerImageSystem;
+        amd64LinuxPackages = mkPackageSet "x86_64-linux";
+        arm64LinuxPackages = mkPackageSet "aarch64-linux";
+        version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      in {
+        packages = rec {
+          default = coco-cli;
+          coco-cli = hostPackages.coco-cli;
+          coco-image = defaultDockerImagePackages.coco-image;
+          coco-image-linux-amd64 = amd64LinuxPackages.coco-image;
+          coco-image-linux-arm64 = arm64LinuxPackages.coco-image;
         };
 
         devShells = {
