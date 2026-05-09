@@ -3078,6 +3078,23 @@ impl CompletionRunner {
         })
     }
 
+    fn persist_tool_result_events(
+        &mut self,
+        execution: &ExecutionMetadata,
+        events: &[BackendEvent],
+    ) -> std::result::Result<(), BackendError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() else {
+            return Ok(());
+        };
+
+        let appended = append_backend_event_nodes(trace_node_appender, execution, events)?;
+        self.head = appended.last().map(|(node_id, _)| node_id.clone());
+        Ok(())
+    }
+
     async fn advance_with_tool_calls(
         &mut self,
         state: StepState,
@@ -3090,15 +3107,17 @@ impl CompletionRunner {
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
         for tool_call in turn.tool_calls {
-            let execution = self.execute_tool_call(tool_call).await?;
+            let execution = match self.execute_tool_call(tool_call).await {
+                Ok(execution) => execution,
+                Err(source) => {
+                    self.persist_tool_result_events(&next_execution, &next_events)?;
+                    return Err(source);
+                }
+            };
             next_events.push(execution.event);
             tool_results.push(execution.tool_result);
         }
-        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
-            let appended =
-                append_backend_event_nodes(trace_node_appender, &next_execution, &next_events)?;
-            self.head = appended.last().map(|(node_id, _)| node_id.clone());
-        }
+        self.persist_tool_result_events(&next_execution, &next_events)?;
 
         self.steps.push(BackendStep {
             execution: state.execution,
@@ -5453,6 +5472,76 @@ mod tests {
         assert_eq!(tool_results[0].call_id.as_deref(), Some("call-1"));
         assert_eq!(tool_results[1].id, "tool-call-2");
         assert_eq!(tool_results[1].call_id.as_deref(), Some("call-2"));
+    }
+
+    #[tokio::test]
+    async fn prompt_persists_completed_sibling_tool_results_before_later_tool_failure() {
+        let search_skill = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "search_skill",
+            serde_json::json!({"query": "rust"}),
+        );
+        let missing_tool = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "missing_tool",
+            serde_json::json!({}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![search_skill, missing_tool])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![("main", vec![Ok(turn)])]);
+        let store = MemoryStore::new();
+        let service = LlmService::builder(store.clone(), backend)
+            .with_skill_tool_executor(Arc::new(FakeSkillExecutor))
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let err = service
+            .prompt(prompt_request("main", "search then fail"))
+            .await
+            .unwrap_err();
+        let context = match err {
+            Error::Backend { context, .. } => context,
+            other => panic!("expected backend error, got {other:?}"),
+        };
+
+        assert_eq!(
+            store.get_branch_head("main").unwrap(),
+            context.retry_from_node_id
+        );
+        let failure = store.get_node(&context.error_node_id).unwrap();
+        let tool_result = store.get_node(&failure.parent).unwrap();
+        assert!(
+            tool_result
+                .kind
+                .as_tool_results()
+                .is_some_and(|tool_results| {
+                    let results = tool_results.iter().collect::<Vec<_>>();
+                    results.len() == 1
+                        && results[0].id == "tool-call-1"
+                        && results[0].call_id.as_deref() == Some("call-1")
+                        && results[0].output == r#"{"skills":[]}"#
+                })
+        );
+
+        let tool_use = store.get_node(&tool_result.parent).unwrap();
+        assert!(tool_use.kind.as_tool_uses().is_some_and(|tool_uses| {
+            let uses = tool_uses.iter().collect::<Vec<_>>();
+            uses.len() == 2
+                && uses[0].id == "tool-call-1"
+                && uses[1].id == "tool-call-2"
+                && uses[1].name == "missing_tool"
+        }));
     }
 
     #[tokio::test]
