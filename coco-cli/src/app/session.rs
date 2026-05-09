@@ -1164,6 +1164,7 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
         .node
         .metadata
         .as_ref()
+        .and_then(|metadata| metadata.first())
         .and_then(|metadata| metadata.execution_id.as_deref())
     {
         lines.push(format!("execution_id: {execution_id}"));

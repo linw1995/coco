@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, ManyOrOneItem,
-    MemoryStore, MergeParent, NewNode, NodeStore, PauseReason, PromptAnchor, ProviderMetadata,
+    Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
+    MergeParent, NewNode, NodeMetadata, NodeStore, PauseReason, PromptAnchor, ProviderMetadata,
     Role, RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
     StoreError, Tool, ToolResult, ToolUse,
 };
@@ -392,7 +392,7 @@ trait TraceNodeAppender: Send + Sync {
     fn append(
         &self,
         role: Role,
-        metadata: Option<BackendMetadata>,
+        metadata: Option<NodeMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError>;
 }
@@ -405,7 +405,7 @@ impl TraceNodeAppenderHandle {
     fn append(
         &self,
         role: Role,
-        metadata: Option<BackendMetadata>,
+        metadata: Option<NodeMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError> {
         self.inner.append(role, metadata, kind)
@@ -437,7 +437,7 @@ where
     fn append(
         &self,
         role: Role,
-        metadata: Option<BackendMetadata>,
+        metadata: Option<NodeMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError> {
         let mut head_id = self
@@ -2473,7 +2473,7 @@ fn provider_metadata(call_id: Option<String>) -> Option<ProviderMetadata> {
 fn persisted_node_from_backend_event(
     envelope: BackendEvent,
     execution: &ExecutionMetadata,
-) -> (Role, Option<BackendMetadata>, Kind) {
+) -> (Role, Option<NodeMetadata>, Kind) {
     let metadata = BackendMetadata::builder()
         .execution(execution)
         .maybe_provider(envelope.metadata.as_ref())
@@ -2481,16 +2481,10 @@ fn persisted_node_from_backend_event(
 
     match envelope.event {
         BackendEventPayload::AssistantText(text) => (Role::LLM, metadata, Kind::Text(text)),
-        BackendEventPayload::ToolUse(tool_use) => (
-            Role::LLM,
-            metadata,
-            Kind::tool_use_with_metadata(tool_use, envelope.metadata),
-        ),
-        BackendEventPayload::ToolResult(tool_result) => (
-            Role::User,
-            metadata,
-            Kind::tool_result_with_metadata(tool_result, envelope.metadata),
-        ),
+        BackendEventPayload::ToolUse(tool_use) => (Role::LLM, metadata, Kind::tool_use(tool_use)),
+        BackendEventPayload::ToolResult(tool_result) => {
+            (Role::User, metadata, Kind::tool_result(tool_result))
+        }
         BackendEventPayload::SkillResult(skill_result) => (
             Role::System,
             metadata,
@@ -2506,68 +2500,75 @@ fn persisted_node_from_backend_event(
     }
 }
 
-fn execution_backend_metadata(execution: &ExecutionMetadata) -> Option<BackendMetadata> {
-    BackendMetadata::builder().execution(execution).build()
+fn backend_metadata_item(
+    execution: &ExecutionMetadata,
+    provider: Option<&ProviderMetadata>,
+) -> BackendMetadata {
+    BackendMetadata {
+        execution_id: Some(execution.execution_id.clone()),
+        call_id: provider.and_then(|provider| provider.call_id.clone()),
+    }
 }
 
 fn persisted_nodes_from_backend_events(
     events: &[BackendEvent],
     execution: &ExecutionMetadata,
-) -> Vec<(Role, Option<BackendMetadata>, Kind)> {
+) -> Vec<(Role, Option<NodeMetadata>, Kind)> {
     fn flush_tool_uses(
-        nodes: &mut Vec<(Role, Option<BackendMetadata>, Kind)>,
-        execution: &ExecutionMetadata,
-        tool_uses: &mut Vec<ManyOrOneItem<ToolUse>>,
+        nodes: &mut Vec<(Role, Option<NodeMetadata>, Kind)>,
+        tool_uses: &mut Vec<ToolUse>,
+        tool_metadata: &mut Vec<BackendMetadata>,
     ) {
         if tool_uses.is_empty() {
             return;
         }
         let kind = Kind::tool_use_items(std::mem::take(tool_uses));
-        nodes.push((Role::LLM, execution_backend_metadata(execution), kind));
+        let metadata = Some(NodeMetadata::from_items(std::mem::take(tool_metadata)));
+        nodes.push((Role::LLM, metadata, kind));
     }
 
     fn flush_tool_results(
-        nodes: &mut Vec<(Role, Option<BackendMetadata>, Kind)>,
-        execution: &ExecutionMetadata,
-        tool_results: &mut Vec<ManyOrOneItem<ToolResult>>,
+        nodes: &mut Vec<(Role, Option<NodeMetadata>, Kind)>,
+        tool_results: &mut Vec<ToolResult>,
+        tool_metadata: &mut Vec<BackendMetadata>,
     ) {
         if tool_results.is_empty() {
             return;
         }
         let kind = Kind::tool_result_items(std::mem::take(tool_results));
-        nodes.push((Role::User, execution_backend_metadata(execution), kind));
+        let metadata = Some(NodeMetadata::from_items(std::mem::take(tool_metadata)));
+        nodes.push((Role::User, metadata, kind));
     }
 
     let mut nodes = Vec::new();
     let mut tool_uses = Vec::new();
     let mut tool_results = Vec::new();
+    let mut tool_use_metadata = Vec::new();
+    let mut tool_result_metadata = Vec::new();
 
     for event in events {
         match event.event.clone() {
             BackendEventPayload::ToolUse(tool_use) => {
-                flush_tool_results(&mut nodes, execution, &mut tool_results);
-                tool_uses.push(ManyOrOneItem::with_metadata(
-                    tool_use,
-                    event.metadata.clone(),
-                ));
+                flush_tool_results(&mut nodes, &mut tool_results, &mut tool_result_metadata);
+                tool_use_metadata.push(backend_metadata_item(execution, event.metadata.as_ref()));
+                tool_uses.push(tool_use);
             }
             BackendEventPayload::ToolResult(tool_result) => {
-                flush_tool_uses(&mut nodes, execution, &mut tool_uses);
-                tool_results.push(ManyOrOneItem::with_metadata(
-                    tool_result,
-                    event.metadata.clone(),
-                ));
+                flush_tool_uses(&mut nodes, &mut tool_uses, &mut tool_use_metadata);
+                tool_result_metadata
+                    .push(backend_metadata_item(execution, event.metadata.as_ref()));
+                tool_results.push(tool_result);
             }
             BackendEventPayload::AssistantText(_) | BackendEventPayload::SkillResult(_) => {
-                flush_tool_uses(&mut nodes, execution, &mut tool_uses);
-                flush_tool_results(&mut nodes, execution, &mut tool_results);
+                flush_tool_uses(&mut nodes, &mut tool_uses, &mut tool_use_metadata);
+                flush_tool_results(&mut nodes, &mut tool_results, &mut tool_result_metadata);
                 nodes.push(persisted_node_from_backend_event(event.clone(), execution));
             }
         }
     }
 
-    flush_tool_uses(&mut nodes, execution, &mut tool_uses);
-    flush_tool_results(&mut nodes, execution, &mut tool_results);
+    flush_tool_uses(&mut nodes, &mut tool_uses, &mut tool_use_metadata);
+    flush_tool_results(&mut nodes, &mut tool_results, &mut tool_result_metadata);
 
     nodes
 }
@@ -2646,6 +2647,14 @@ struct ProviderHistoryBuilder {
     tool_result_execution_id: Option<String>,
 }
 
+fn node_metadata_first(metadata: Option<&NodeMetadata>) -> Option<&BackendMetadata> {
+    metadata.and_then(NodeMetadata::first)
+}
+
+fn node_metadata_at(metadata: Option<&NodeMetadata>, index: usize) -> Option<&BackendMetadata> {
+    metadata.and_then(|metadata| metadata.as_one().or_else(|| metadata.items().get(index)))
+}
+
 impl ProviderHistoryBuilder {
     fn apply_node(&mut self, node: &coco_mem::Node) {
         match &node.kind {
@@ -2654,33 +2663,29 @@ impl ProviderHistoryBuilder {
                 AnchorPayload::SessionPatch(_) => {}
                 AnchorPayload::Prompt(prompt) => self.push_user_text(&prompt.prompt),
                 AnchorPayload::SkillResult(result) => self.push_tool_result(
-                    node.metadata.as_ref(),
-                    None,
+                    node_metadata_first(node.metadata.as_ref()),
                     &result.tool_id,
                     &result.output,
                 ),
             },
             Kind::Text(text) => match node.role {
                 Role::User => self.push_user_text(text),
-                Role::LLM => self.push_assistant_text(node.metadata.as_ref(), text),
+                Role::LLM => {
+                    self.push_assistant_text(node_metadata_first(node.metadata.as_ref()), text)
+                }
                 Role::System => {}
             },
             Kind::ToolUse(tool_uses) => {
-                for tool_use in tool_uses.items() {
-                    self.push_tool_use(
-                        node.metadata.as_ref(),
-                        tool_use.metadata(),
-                        tool_use.payload(),
-                    );
+                for (index, tool_use) in tool_uses.items().iter().enumerate() {
+                    self.push_tool_use(node_metadata_at(node.metadata.as_ref(), index), tool_use);
                 }
             }
             Kind::ToolResult(tool_results) => {
-                for tool_result in tool_results.items() {
+                for (index, tool_result) in tool_results.items().iter().enumerate() {
                     self.push_tool_result(
-                        node.metadata.as_ref(),
-                        tool_result.metadata(),
-                        &tool_result.payload().id,
-                        &tool_result.payload().output,
+                        node_metadata_at(node.metadata.as_ref(), index),
+                        &tool_result.id,
+                        &tool_result.output,
                     );
                 }
             }
@@ -2718,21 +2723,14 @@ impl ProviderHistoryBuilder {
             .push(rig::message::AssistantContent::text(text.to_owned()));
     }
 
-    fn push_tool_use(
-        &mut self,
-        node_metadata: Option<&BackendMetadata>,
-        item_metadata: Option<&ProviderMetadata>,
-        tool_use: &ToolUse,
-    ) {
+    fn push_tool_use(&mut self, node_metadata: Option<&BackendMetadata>, tool_use: &ToolUse) {
         self.flush_tool_results();
         let execution_id = node_metadata.and_then(|metadata| metadata.execution_id.clone());
         if !self.assistant_contents.is_empty() && self.assistant_execution_id != execution_id {
             self.flush_assistant_contents();
         }
         self.assistant_execution_id = execution_id;
-        let call_id = item_metadata
-            .and_then(|metadata| metadata.call_id.clone())
-            .or_else(|| node_metadata.and_then(|metadata| metadata.call_id.clone()));
+        let call_id = node_metadata.and_then(|metadata| metadata.call_id.clone());
         self.assistant_contents.push(rig_tool_call_content(
             tool_use.id.clone(),
             call_id,
@@ -2744,7 +2742,6 @@ impl ProviderHistoryBuilder {
     fn push_tool_result(
         &mut self,
         node_metadata: Option<&BackendMetadata>,
-        item_metadata: Option<&ProviderMetadata>,
         id: &str,
         output: &str,
     ) {
@@ -2757,9 +2754,7 @@ impl ProviderHistoryBuilder {
         let content = rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
             output.to_owned(),
         ));
-        let call_id = item_metadata
-            .and_then(|metadata| metadata.call_id.clone())
-            .or_else(|| node_metadata.and_then(|metadata| metadata.call_id.clone()));
+        let call_id = node_metadata.and_then(|metadata| metadata.call_id.clone());
         self.tool_results
             .push(rig_tool_result_content(id.to_owned(), call_id, content));
     }
@@ -3937,7 +3932,7 @@ mod tests {
         ));
     }
 
-    fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<BackendMetadata> {
+    fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<NodeMetadata> {
         let execution =
             execution_id.map(|execution_id| ExecutionMetadata::new(execution_id.to_owned()));
         let provider = call_id.map(|call_id| ProviderMetadata::new(Some(call_id.to_owned())));
@@ -3948,7 +3943,7 @@ mod tests {
             .build()
     }
 
-    fn context_node(role: Role, metadata: Option<BackendMetadata>, kind: Kind) -> coco_mem::Node {
+    fn context_node(role: Role, metadata: Option<NodeMetadata>, kind: Kind) -> coco_mem::Node {
         let store = MemoryStore::new();
         let id = store
             .append(NewNode {
@@ -3959,6 +3954,20 @@ mod tests {
             })
             .expect("test node should be appended");
         store.get_node(&id).expect("test node should exist")
+    }
+
+    fn node_execution_id(node: &coco_mem::Node) -> Option<&str> {
+        node.metadata
+            .as_ref()
+            .and_then(NodeMetadata::first)
+            .and_then(|metadata| metadata.execution_id.as_deref())
+    }
+
+    fn node_call_id_at(node: &coco_mem::Node, index: usize) -> Option<&str> {
+        node.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.items().get(index))
+            .and_then(|metadata| metadata.call_id.as_deref())
     }
 
     fn kind_has_tool_use(kind: &Kind, expected_id: &str, expected_name: &str) -> bool {
@@ -4262,7 +4271,7 @@ mod tests {
         assert_eq!(assistant.role, Role::LLM);
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "hello"));
         assert_eq!(
-            assistant.metadata.as_ref().unwrap().execution_id.as_deref(),
+            node_execution_id(assistant),
             Some(result.execution_id.as_str())
         );
 
@@ -4520,16 +4529,7 @@ mod tests {
         let failure = store.get_node(&error_node_id).unwrap();
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
-        assert_eq!(
-            failure
-                .metadata
-                .as_ref()
-                .unwrap()
-                .execution_id
-                .as_ref()
-                .unwrap(),
-            &execution_id
-        );
+        assert_eq!(node_execution_id(&failure), Some(execution_id.as_str()));
         assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
 
         let session = service.resolve_session("main").unwrap();
@@ -5309,7 +5309,7 @@ mod tests {
         assert_eq!(assistant.role, Role::LLM);
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
         assert_eq!(
-            assistant.metadata.as_ref().unwrap().execution_id.as_deref(),
+            node_execution_id(assistant),
             Some(result.execution_id.as_str())
         );
 
@@ -5319,15 +5319,7 @@ mod tests {
             "tool-call-1",
             "Cargo.toml"
         ));
-        assert_eq!(
-            tool_result
-                .metadata
-                .as_ref()
-                .unwrap()
-                .execution_id
-                .as_deref(),
-            Some("execution-step-2")
-        );
+        assert_eq!(node_execution_id(tool_result), Some("execution-step-2"));
 
         assert_eq!(tool_use.role, Role::LLM);
         assert!(tool_use.kind.as_tool_uses().is_some_and(|tool_uses| {
@@ -5337,10 +5329,7 @@ mod tests {
                     && tool_use.input == serde_json::json!({"cmd": "rg --files"})
             })
         }));
-        assert_eq!(
-            tool_use.metadata.as_ref().unwrap().execution_id.as_deref(),
-            Some("execution-step-1")
-        );
+        assert_eq!(node_execution_id(tool_use), Some("execution-step-1"));
     }
 
     #[tokio::test]
@@ -5427,20 +5416,10 @@ mod tests {
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(tool_uses.len(), 2);
-        assert_eq!(tool_uses[0].payload().id, "tool-call-1");
-        assert_eq!(
-            tool_uses[0]
-                .metadata()
-                .and_then(|metadata| metadata.call_id.as_deref()),
-            Some("call-1")
-        );
-        assert_eq!(tool_uses[1].payload().id, "tool-call-2");
-        assert_eq!(
-            tool_uses[1]
-                .metadata()
-                .and_then(|metadata| metadata.call_id.as_deref()),
-            Some("call-2")
-        );
+        assert_eq!(tool_uses[0].id, "tool-call-1");
+        assert_eq!(node_call_id_at(tool_use, 0), Some("call-1"));
+        assert_eq!(tool_uses[1].id, "tool-call-2");
+        assert_eq!(node_call_id_at(tool_use, 1), Some("call-2"));
 
         let tool_results = tool_result
             .kind
@@ -5450,20 +5429,10 @@ mod tests {
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(tool_results.len(), 2);
-        assert_eq!(tool_results[0].payload().id, "tool-call-1");
-        assert_eq!(
-            tool_results[0]
-                .metadata()
-                .and_then(|metadata| metadata.call_id.as_deref()),
-            Some("call-1")
-        );
-        assert_eq!(tool_results[1].payload().id, "tool-call-2");
-        assert_eq!(
-            tool_results[1]
-                .metadata()
-                .and_then(|metadata| metadata.call_id.as_deref()),
-            Some("call-2")
-        );
+        assert_eq!(tool_results[0].id, "tool-call-1");
+        assert_eq!(node_call_id_at(tool_result, 0), Some("call-1"));
+        assert_eq!(tool_results[1].id, "tool-call-2");
+        assert_eq!(node_call_id_at(tool_result, 1), Some("call-2"));
     }
 
     #[tokio::test]
@@ -5520,12 +5489,9 @@ mod tests {
                 .is_some_and(|tool_results| {
                     let results = tool_results.items().iter().collect::<Vec<_>>();
                     results.len() == 1
-                        && results[0].payload().id == "tool-call-1"
-                        && results[0]
-                            .metadata()
-                            .and_then(|metadata| metadata.call_id.as_deref())
-                            == Some("call-1")
-                        && results[0].payload().output == r#"{"skills":[]}"#
+                        && results[0].id == "tool-call-1"
+                        && node_call_id_at(&tool_result, 0) == Some("call-1")
+                        && results[0].output == r#"{"skills":[]}"#
                 })
         );
 
@@ -5912,50 +5878,93 @@ mod tests {
     }
 
     #[test]
-    fn rig_messages_from_nodes_uses_many_or_one_item_call_id_without_node_call_id() {
+    fn rig_messages_from_nodes_uses_many_node_metadata_call_ids() {
         let messages = rig_messages_from_nodes(&[
             context_node(
                 Role::LLM,
-                metadata(Some("execution-1"), None),
-                Kind::tool_use_with_metadata(
+                Some(NodeMetadata::many(vec![
+                    BackendMetadata {
+                        execution_id: Some("execution-1".to_owned()),
+                        call_id: Some("call-payload".to_owned()),
+                    },
+                    BackendMetadata {
+                        execution_id: Some("execution-1".to_owned()),
+                        call_id: Some("call-next".to_owned()),
+                    },
+                ])),
+                Kind::tool_uses(vec![
                     ToolUse {
                         id: "tool-call-payload".to_owned(),
                         name: "exec_command".to_owned(),
                         input: serde_json::json!({"cmd": "pwd"}),
                     },
-                    Some(ProviderMetadata::new(Some("call-payload".to_owned()))),
-                ),
+                    ToolUse {
+                        id: "tool-call-next".to_owned(),
+                        name: "exec_command".to_owned(),
+                        input: serde_json::json!({"cmd": "ls"}),
+                    },
+                ]),
             ),
             context_node(
                 Role::User,
-                metadata(Some("execution-1"), None),
-                Kind::tool_result_with_metadata(
+                Some(NodeMetadata::many(vec![
+                    BackendMetadata {
+                        execution_id: Some("execution-1".to_owned()),
+                        call_id: Some("call-payload".to_owned()),
+                    },
+                    BackendMetadata {
+                        execution_id: Some("execution-1".to_owned()),
+                        call_id: Some("call-next".to_owned()),
+                    },
+                ])),
+                Kind::tool_results(vec![
                     ToolResult {
                         id: "tool-call-payload".to_owned(),
                         output: "/tmp".to_owned(),
                     },
-                    Some(ProviderMetadata::new(Some("call-payload".to_owned()))),
-                ),
+                    ToolResult {
+                        id: "tool-call-next".to_owned(),
+                        output: "Cargo.toml".to_owned(),
+                    },
+                ]),
             ),
         ]);
 
         assert!(matches!(
             &messages[0],
             rig::completion::message::Message::Assistant { content, .. }
-                if matches!(
-                    content.first_ref(),
-                    rig::completion::message::AssistantContent::ToolCall(tool_call)
-                        if tool_call.call_id.as_deref() == Some("call-payload")
-                )
+                if {
+                    let items = content.iter().collect::<Vec<_>>();
+                    items.len() == 2
+                        && matches!(
+                            items[0],
+                            rig::completion::message::AssistantContent::ToolCall(tool_call)
+                                if tool_call.call_id.as_deref() == Some("call-payload")
+                        )
+                        && matches!(
+                            items[1],
+                            rig::completion::message::AssistantContent::ToolCall(tool_call)
+                                if tool_call.call_id.as_deref() == Some("call-next")
+                        )
+                }
         ));
         assert!(matches!(
             &messages[1],
             rig::completion::message::Message::User { content }
-                if matches!(
-                    content.first_ref(),
-                    rig::completion::message::UserContent::ToolResult(tool_result)
-                        if tool_result.call_id.as_deref() == Some("call-payload")
-                )
+                if {
+                    let items = content.iter().collect::<Vec<_>>();
+                    items.len() == 2
+                        && matches!(
+                            items[0],
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.call_id.as_deref() == Some("call-payload")
+                        )
+                        && matches!(
+                            items[1],
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.call_id.as_deref() == Some("call-next")
+                        )
+                }
         ));
     }
 
@@ -6092,23 +6101,9 @@ mod tests {
         let tool_result = &ancestry[1];
         let tool_use = &ancestry[2];
 
-        assert_eq!(
-            assistant.metadata.as_ref().unwrap().execution_id.as_deref(),
-            Some("execution-step-2")
-        );
-        assert_eq!(
-            tool_result
-                .metadata
-                .as_ref()
-                .unwrap()
-                .execution_id
-                .as_deref(),
-            Some("execution-step-1")
-        );
-        assert_eq!(
-            tool_use.metadata.as_ref().unwrap().execution_id.as_deref(),
-            Some("execution-step-1")
-        );
+        assert_eq!(node_execution_id(assistant), Some("execution-step-2"));
+        assert_eq!(node_execution_id(tool_result), Some("execution-step-1"));
+        assert_eq!(node_execution_id(tool_use), Some("execution-step-1"));
         assert_eq!(result.execution_id, "execution-step-2");
 
         let session = service.resolve_session("main").unwrap();

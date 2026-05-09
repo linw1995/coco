@@ -12,7 +12,7 @@ pub struct Node {
     pub parent: String,
     pub created_at: Timestamp,
     pub role: Role,
-    pub metadata: Option<BackendMetadata>,
+    pub metadata: Option<NodeMetadata>,
     pub kind: Kind,
 }
 
@@ -20,7 +20,7 @@ pub struct Node {
 pub struct NewNode {
     pub parent: String,
     pub role: Role,
-    pub metadata: Option<BackendMetadata>,
+    pub metadata: Option<NodeMetadata>,
     pub kind: Kind,
 }
 
@@ -43,16 +43,8 @@ pub enum Kind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ManyOrOne<T> {
-    One(ManyOrOneItem<T>),
-    Many(Vec<ManyOrOneItem<T>>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ManyOrOneItem<T> {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<ProviderMetadata>,
-    #[serde(flatten)]
-    pub payload: T,
+    One(T),
+    Many(Vec<T>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -495,6 +487,8 @@ pub struct BackendMetadata {
     pub call_id: Option<String>,
 }
 
+pub type NodeMetadata = ManyOrOne<BackendMetadata>;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendMetadataBuilder {
     execution_id: Option<String>,
@@ -523,18 +517,14 @@ pub struct Tool {
 
 impl<T> ManyOrOne<T> {
     pub fn one(value: T) -> Self {
-        Self::One(ManyOrOneItem::new(value))
-    }
-
-    pub fn one_with_metadata(value: T, metadata: Option<ProviderMetadata>) -> Self {
-        Self::One(ManyOrOneItem::with_metadata(value, metadata))
+        Self::One(value)
     }
 
     pub fn many(values: Vec<T>) -> Self {
-        Self::from_items(values.into_iter().map(ManyOrOneItem::new).collect())
+        Self::from_items(values)
     }
 
-    pub fn from_items(mut items: Vec<ManyOrOneItem<T>>) -> Self {
+    pub fn from_items(mut items: Vec<T>) -> Self {
         if items.len() == 1 {
             Self::One(items.pop().expect("items length is one"))
         } else {
@@ -542,7 +532,7 @@ impl<T> ManyOrOne<T> {
         }
     }
 
-    pub fn items(&self) -> &[ManyOrOneItem<T>] {
+    pub fn items(&self) -> &[T] {
         match self {
             Self::One(item) => std::slice::from_ref(item),
             Self::Many(items) => items,
@@ -550,39 +540,18 @@ impl<T> ManyOrOne<T> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.items().iter().map(ManyOrOneItem::payload)
+        self.items().iter()
     }
 
     pub fn first(&self) -> Option<&T> {
-        self.items().first().map(ManyOrOneItem::payload)
+        self.items().first()
     }
 
     pub fn as_one(&self) -> Option<&T> {
         match self {
-            Self::One(item) => Some(item.payload()),
+            Self::One(item) => Some(item),
             Self::Many(_) => None,
         }
-    }
-}
-
-impl<T> ManyOrOneItem<T> {
-    pub fn new(payload: T) -> Self {
-        Self {
-            metadata: None,
-            payload,
-        }
-    }
-
-    pub fn with_metadata(payload: T, metadata: Option<ProviderMetadata>) -> Self {
-        Self { metadata, payload }
-    }
-
-    pub fn payload(&self) -> &T {
-        &self.payload
-    }
-
-    pub fn metadata(&self) -> Option<&ProviderMetadata> {
-        self.metadata.as_ref()
     }
 }
 
@@ -812,7 +781,7 @@ impl BackendMetadata {
     pub fn from_parts(
         execution: Option<&ExecutionMetadata>,
         provider: Option<&ProviderMetadata>,
-    ) -> Option<Self> {
+    ) -> Option<NodeMetadata> {
         Self::builder()
             .maybe_execution(execution)
             .maybe_provider(provider)
@@ -845,7 +814,18 @@ impl BackendMetadataBuilder {
         }
     }
 
-    pub fn build(self) -> Option<BackendMetadata> {
+    pub fn build(self) -> Option<NodeMetadata> {
+        if self.execution_id.is_none() && self.call_id.is_none() {
+            return None;
+        }
+
+        Some(NodeMetadata::one(BackendMetadata {
+            execution_id: self.execution_id,
+            call_id: self.call_id,
+        }))
+    }
+
+    pub fn build_item(self) -> Option<BackendMetadata> {
         if self.execution_id.is_none() && self.call_id.is_none() {
             return None;
         }
@@ -918,7 +898,7 @@ impl Node {
     pub fn new(
         parent: String,
         role: Role,
-        metadata: Option<BackendMetadata>,
+        metadata: Option<NodeMetadata>,
         kind: Kind,
         created_at: Timestamp,
     ) -> Self {
@@ -944,15 +924,11 @@ impl Kind {
         Self::ToolUse(ManyOrOne::one(tool_use))
     }
 
-    pub fn tool_use_with_metadata(tool_use: ToolUse, metadata: Option<ProviderMetadata>) -> Self {
-        Self::ToolUse(ManyOrOne::one_with_metadata(tool_use, metadata))
-    }
-
     pub fn tool_uses(tool_uses: Vec<ToolUse>) -> Self {
         Self::ToolUse(ManyOrOne::many(tool_uses))
     }
 
-    pub fn tool_use_items(tool_uses: Vec<ManyOrOneItem<ToolUse>>) -> Self {
+    pub fn tool_use_items(tool_uses: Vec<ToolUse>) -> Self {
         Self::ToolUse(ManyOrOne::from_items(tool_uses))
     }
 
@@ -960,18 +936,11 @@ impl Kind {
         Self::ToolResult(ManyOrOne::one(tool_result))
     }
 
-    pub fn tool_result_with_metadata(
-        tool_result: ToolResult,
-        metadata: Option<ProviderMetadata>,
-    ) -> Self {
-        Self::ToolResult(ManyOrOne::one_with_metadata(tool_result, metadata))
-    }
-
     pub fn tool_results(tool_results: Vec<ToolResult>) -> Self {
         Self::ToolResult(ManyOrOne::many(tool_results))
     }
 
-    pub fn tool_result_items(tool_results: Vec<ManyOrOneItem<ToolResult>>) -> Self {
+    pub fn tool_result_items(tool_results: Vec<ToolResult>) -> Self {
         Self::ToolResult(ManyOrOne::from_items(tool_results))
     }
 
@@ -994,7 +963,7 @@ impl Kind {
 struct NodeHashPayload<'a> {
     parent: &'a str,
     role: &'a Role,
-    metadata: Option<&'a BackendMetadata>,
+    metadata: Option<&'a NodeMetadata>,
     kind: &'a Kind,
     created_at: &'a Timestamp,
 }
@@ -1002,7 +971,7 @@ struct NodeHashPayload<'a> {
 fn compute_node_id(
     parent: &str,
     role: &Role,
-    metadata: Option<&BackendMetadata>,
+    metadata: Option<&NodeMetadata>,
     kind: &Kind,
     created_at: &Timestamp,
 ) -> String {
@@ -1038,8 +1007,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         Anchor, BackendMetadata, BranchConfig, ExecutionMetadata, Kind, MergeParent, NewNode, Node,
-        PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch,
-        SessionRole, SessionState, SkillResultAnchor, Tool, ToolResult,
+        NodeMetadata, PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
+        SessionAnchorPatch, SessionRole, SessionState, SkillResultAnchor, Tool, ToolResult,
+        ToolUse,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -1326,7 +1296,6 @@ mod tests {
         let many: Kind = serde_json::from_value(serde_json::json!({
             "ToolUse": [
                 {
-                    "metadata": { "call_id": "call-1" },
                     "id": "tool-call-1",
                     "name": "exec_command",
                     "input": { "cmd": "pwd" }
@@ -1342,12 +1311,47 @@ mod tests {
 
         assert_eq!(one.as_tool_uses().unwrap().iter().count(), 1);
         assert_eq!(many.as_tool_uses().unwrap().iter().count(), 2);
-        assert_eq!(
-            many.as_tool_uses().unwrap().items()[0]
-                .metadata()
-                .and_then(|metadata| metadata.call_id.as_deref()),
-            Some("call-1")
+        assert_eq!(many.as_tool_uses().unwrap().items()[0].id, "tool-call-1");
+    }
+
+    #[test]
+    fn many_tool_node_metadata_round_trip_preserves_call_ids() {
+        let node = Node::new(
+            "parent".to_owned(),
+            Role::LLM,
+            Some(NodeMetadata::many(vec![
+                BackendMetadata {
+                    execution_id: Some("execution-1".to_owned()),
+                    call_id: Some("call-1".to_owned()),
+                },
+                BackendMetadata {
+                    execution_id: Some("execution-1".to_owned()),
+                    call_id: Some("call-2".to_owned()),
+                },
+            ])),
+            Kind::tool_uses(vec![
+                ToolUse {
+                    id: "tool-call-1".to_owned(),
+                    name: "exec_command".to_owned(),
+                    input: json!({"cmd": "pwd"}),
+                },
+                ToolUse {
+                    id: "tool-call-2".to_owned(),
+                    name: "exec_command".to_owned(),
+                    input: json!({"cmd": "ls"}),
+                },
+            ]),
+            fixed_timestamp(),
         );
+
+        let encoded = serde_json::to_string(&node).unwrap();
+        let decoded: Node = serde_json::from_str(&encoded).unwrap();
+        let metadata = decoded.metadata.expect("expected node metadata");
+        let items = metadata.items();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].call_id.as_deref(), Some("call-1"));
+        assert_eq!(items[1].call_id.as_deref(), Some("call-2"));
     }
 
     #[test]
@@ -1501,7 +1505,12 @@ mod tests {
 
         let encoded = serde_json::to_string(&node).unwrap();
         let decoded: Node = serde_json::from_str(&encoded).unwrap();
-        let metadata = decoded.metadata.expect("expected node metadata");
+        let metadata = decoded
+            .metadata
+            .expect("expected node metadata")
+            .as_one()
+            .expect("expected single node metadata")
+            .clone();
 
         assert_eq!(metadata.execution_id.as_deref(), Some("execution-1"));
         assert_eq!(metadata.call_id.as_deref(), Some("call-1"));
