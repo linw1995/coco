@@ -115,7 +115,9 @@ jobs:
             esac
 
             temp_ref="${image}:tmp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${arch}"
-            nix run nixpkgs#crane -- push "${image_file}" "${temp_ref}"
+            docker_tar="${image_file%.gz}"
+            gzip -dc "${image_file}" > "${docker_tar}"
+            nix run nixpkgs#crane -- push "${docker_tar}" "${temp_ref}"
 
             digest="$(nix run nixpkgs#crane -- digest "${temp_ref}")"
             temp_refs+=("${temp_ref}")
