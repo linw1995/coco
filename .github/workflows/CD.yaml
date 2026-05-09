@@ -14,24 +14,22 @@ permissions:
 
 jobs:
   publish-image-arch:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
+            runner: ubuntu-latest
             nix-output: .#coco-image-linux-amd64
             extra-platforms: x86_64-linux
           - arch: arm64
+            runner: ubuntu-24.04-arm
             nix-output: .#coco-image-linux-arm64
             extra-platforms: aarch64-linux
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-qemu-action@v3
-        if: matrix.arch == 'arm64'
-        with:
-          platforms: arm64
       - uses: ./.github/actions/setup-nix
 
       - name: Build Docker image
