@@ -77,18 +77,18 @@ rec {
               "git+https://github.com/0xPlaygrounds/rig?branch=main#6dc36d803adaf4f89de774577b9c4f7ac9057644" = "sha256-tnSi5EOq9BCEXlJxj2bFzlynG33qB+UuPDufW92kAj8=";
             };
 
-            nativeBuildInputs = [
-              packagePkgs.wasm-bindgen-cli
+            nativeBuildInputs = with packagePkgs; [
+              wasm-bindgen-cli
             ];
           };
           cargoArtifacts = craneLib.buildDepsOnly cargoArgs;
           cocoDockerEntrypoint = packagePkgs.writeShellApplication {
             name = "coco-docker-entrypoint";
-            runtimeInputs = [
-              packagePkgs.coreutils
-              packagePkgs.gnugrep
-              packagePkgs.supercronic
-              packagePkgs.util-linux
+            runtimeInputs = with packagePkgs; [
+              coreutils
+              gnugrep
+              supercronic
+              util-linux
             ];
             text = builtins.readFile ./docker/coco-docker-entrypoint.sh;
           };
@@ -101,37 +101,37 @@ rec {
                 mainProgram = "coco-cli";
               };
             });
-          coco-image = packagePkgs.dockerTools.buildLayeredImage {
+          coco-image = with packagePkgs; dockerTools.buildLayeredImage {
             name = "coco";
             tag = "latest";
             contents =
               [
                 coco-cli
                 cocoDockerEntrypoint
-                packagePkgs.bash
-                packagePkgs.coreutils
-                packagePkgs.nono
-                packagePkgs.supercronic
-                packagePkgs.uv
+                bash
+                coreutils
+                nono
+                supercronic
+                uv
               ]
               ++ [
-                packagePkgs.diffutils
-                packagePkgs.findutils
-                packagePkgs.gawk
-                packagePkgs.gnugrep
-                packagePkgs.gnused
-                packagePkgs.jq
-                packagePkgs.less
-                packagePkgs.procps
-                packagePkgs.ripgrep
-                packagePkgs.which
+                diffutils
+                findutils
+                gawk
+                gnugrep
+                gnused
+                jq
+                less
+                procps
+                ripgrep
+                which
               ]
               ++ [
-                packagePkgs.cacert
-                packagePkgs.tzdata
+                cacert
+                tzdata
               ]
               ++ lib.optionals (fhsDynamicLinker != null) [
-                packagePkgs.glibc
+                glibc
               ];
             extraCommands =
               ''
@@ -150,8 +150,8 @@ rec {
             config = {
               Env = [
                 "PATH=/bin"
-                "SSL_CERT_FILE=${packagePkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-                "TZDIR=${packagePkgs.tzdata}/share/zoneinfo"
+                "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
+                "TZDIR=${tzdata}/share/zoneinfo"
                 "TZ=UTC"
                 "HOME=/data"
                 "XDG_CACHE_HOME=/data/.cache"
