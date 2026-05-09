@@ -20,6 +20,7 @@ use coco_mem::{
     Role, RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
     StoreError, Tool, ToolResult, ToolUse,
 };
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::IntoError;
@@ -2878,6 +2879,11 @@ struct StepState {
     step_events: Vec<BackendEvent>,
 }
 
+struct ToolCallInvocation {
+    tool_call: CompletionToolCall,
+    tool_use_node_id: Option<String>,
+}
+
 struct ToolCallExecution {
     event: BackendEvent,
     tool_result: rig::completion::message::UserContent,
@@ -3017,10 +3023,10 @@ impl CompletionRunner {
         )
     }
 
-    async fn execute_tool_call(
+    fn prepare_tool_call_invocation(
         &mut self,
         tool_call: CompletionToolCall,
-    ) -> std::result::Result<ToolCallExecution, BackendError> {
+    ) -> std::result::Result<ToolCallInvocation, BackendError> {
         let tool_use_node_id = self.tool_use_node_ids.remove(&tool_call.id);
         if tool_call.function.name == "use_skill" && tool_use_node_id.is_none() {
             return Err(BackendError::failed(format!(
@@ -3028,6 +3034,18 @@ impl CompletionRunner {
                 tool_call.id
             )));
         }
+
+        Ok(ToolCallInvocation {
+            tool_call,
+            tool_use_node_id,
+        })
+    }
+
+    async fn execute_tool_call(
+        &self,
+        invocation: ToolCallInvocation,
+    ) -> std::result::Result<ToolCallExecution, BackendError> {
+        let tool_call = invocation.tool_call;
         let args = serde_json::to_string(&tool_call.function.arguments)
             .map_err(|source| BackendError::failed(source.to_string()))?;
         let outcome = self
@@ -3036,7 +3054,7 @@ impl CompletionRunner {
                 &tool_call.function.name,
                 args,
                 ToolInvocationContext {
-                    persisted_tool_use_node_id: tool_use_node_id,
+                    persisted_tool_use_node_id: invocation.tool_use_node_id,
                 },
             )
             .await?;
@@ -3083,16 +3101,33 @@ impl CompletionRunner {
         let next_execution = ExecutionMetadata::new(Self::next_execution_id());
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
-        for tool_call in turn.tool_calls {
-            let execution = match self.execute_tool_call(tool_call).await {
-                Ok(execution) => execution,
-                Err(source) => {
-                    self.persist_tool_result_events(&next_execution, &next_events)?;
-                    return Err(source);
+        let invocations = turn
+            .tool_calls
+            .into_iter()
+            .map(|tool_call| self.prepare_tool_call_invocation(tool_call))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let executions = join_all(
+            invocations
+                .into_iter()
+                .map(|invocation| self.execute_tool_call(invocation)),
+        )
+        .await;
+
+        let mut error = None;
+        for execution in executions {
+            match execution {
+                Ok(execution) => {
+                    next_events.push(execution.event);
+                    tool_results.push(execution.tool_result);
                 }
-            };
-            next_events.push(execution.event);
-            tool_results.push(execution.tool_result);
+                Err(source) => {
+                    error.get_or_insert(source);
+                }
+            }
+        }
+        if let Some(source) = error {
+            self.persist_tool_result_events(&next_execution, &next_events)?;
+            return Err(source);
         }
         self.persist_tool_result_events(&next_execution, &next_events)?;
 
@@ -3549,6 +3584,35 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BarrierSkillExecutor {
+        barrier: Arc<Barrier>,
+    }
+
+    #[async_trait]
+    impl SkillToolExecutor for BarrierSkillExecutor {
+        async fn search_skill_tool(
+            &self,
+            _request: SearchSkillToolRequest,
+        ) -> std::result::Result<String, ExecutorError> {
+            Ok(r#"{"skills":[]}"#.to_owned())
+        }
+
+        async fn execute_skill_tool(
+            &self,
+            request: UseSkillToolRequest,
+        ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
+            self.barrier.wait().await;
+            let response_node_id = request.parent_tool_use_id.clone();
+            Ok(SkillToolExecutionResult {
+                result: SkillToolRunResult {
+                    text: format!("Executed {}", request.skill_name),
+                },
+                response_node_id,
+            })
+        }
+    }
+
     #[derive(Clone)]
     struct StreamingBackend {
         calls: RecordedCalls,
@@ -3930,6 +3994,54 @@ mod tests {
                         )
                 }
         ));
+    }
+
+    #[tokio::test]
+    async fn sibling_tool_calls_execute_in_parallel() {
+        let first = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "use_skill",
+            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
+        );
+        let second = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "use_skill",
+            serde_json::json!({"name": "rust-patterns", "handoff": "Review the API."}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![first, second])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
+        )]);
+        let store = MemoryStore::new();
+        let service = LlmService::builder(store.clone(), backend)
+            .with_skill_tool_executor(Arc::new(BarrierSkillExecutor {
+                barrier: Arc::new(Barrier::new(2)),
+            }))
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![crate::builtin_tool_definition("use_skill").unwrap()],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            service.prompt(prompt_request("main", "delegate twice")),
+        )
+        .await
+        .expect("sibling tool calls should not block each other")
+        .unwrap();
+
+        assert_eq!(result.text, "done");
     }
 
     fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<NodeMetadata> {
