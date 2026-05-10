@@ -8,7 +8,7 @@ use clap::Parser;
 use coco_llm::coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, JobStore, Kind, MergeParent, NewNode,
     NodeStore, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionStore,
-    SkillResultAnchor, ToolResult, ToolUse,
+    SkillInvocationMode, SkillResultAnchor, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEvent, BackendEventPayload, BackendTurn, CompletionBackend,
@@ -3383,6 +3383,31 @@ fn skill_add_parses_script_inputs() {
     );
 }
 
+#[test]
+fn skill_run_parses_handoff_and_json_flags() {
+    let cli = Cli::try_parse_from([
+        "coco-cli",
+        "skill",
+        "run",
+        "fast-rust",
+        "--handoff",
+        "Review the diff.",
+        "--json",
+    ])
+    .unwrap();
+
+    let Command::Skill(command) = cli.command else {
+        panic!("expected skill command");
+    };
+    let crate::cli::SkillSubcommand::Run(command) = command.command else {
+        panic!("expected skill run command");
+    };
+
+    assert_eq!(command.name, "fast-rust");
+    assert_eq!(command.handoff.as_deref(), Some("Review the diff."));
+    assert!(command.json);
+}
+
 #[tokio::test]
 async fn skill_add_defaults_to_text_and_supports_json() {
     let (_tempdir, store_path) = temp_store_path();
@@ -4722,6 +4747,77 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
     assert_eq!(
         prompt_anchor.merge_parents(),
         [MergeParent::shadow(parent_tool_use)].as_slice()
+    );
+}
+
+#[tokio::test]
+async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_head = store.get_branch_head("main").unwrap();
+    let parent_tool_use =
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
+    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
+
+    let response = run_forwarded_with_services(
+        ForwardedRuntimeInputs {
+            args: &[
+                "skill".to_owned(),
+                "run".to_owned(),
+                "fast-rust".to_owned(),
+                "--handoff".to_owned(),
+                "Review the diff.".to_owned(),
+                "--json".to_owned(),
+            ],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Orchestrator),
+            store_path_env: None,
+            parent_tool_use_id_env: Some(&parent_tool_use),
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
+            shared_engine: None,
+        },
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 0);
+    assert!(response.stderr.is_empty());
+    let output: Value = serde_json::from_str(&response.stdout).unwrap();
+    assert_eq!(output["parent_tool_use_id"], parent_tool_use);
+    assert_eq!(output["skill_name"], "fast-rust");
+
+    let children = store.list_children(&parent_tool_use).unwrap();
+    let invocation = children
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor.as_skill_invocation(),
+            _ => None,
+        })
+        .expect("expected skill invocation child");
+    assert_eq!(invocation.skill_name, "fast-rust");
+    assert_eq!(
+        invocation.mode,
+        SkillInvocationMode::Handoff {
+            prompt: "Review the diff.".to_owned(),
+        }
     );
 }
 

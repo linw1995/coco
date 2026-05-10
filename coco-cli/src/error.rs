@@ -95,6 +95,17 @@ pub enum Error {
     #[snafu(display("Invalid skill script path {path:?}: {message}"))]
     InvalidSkillScriptPath { path: PathBuf, message: String },
 
+    #[snafu(display(
+        "skill run requires a parent tool use context; run it through exec_command or pass --parent-tool-use-id"
+    ))]
+    MissingSkillInvocationParent,
+
+    #[snafu(display("skill invocation parent {parent_tool_use_id:?} is not a tool use node"))]
+    InvalidSkillInvocationParent { parent_tool_use_id: String },
+
+    #[snafu(display("skill run --handoff must not be empty"))]
+    InvalidSkillRunHandoff,
+
     #[snafu(display("Failed to resolve current executable: {source}"))]
     ResolveCurrentExe { source: io::Error },
 

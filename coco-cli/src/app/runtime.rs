@@ -15,7 +15,7 @@ use crate::{
     cli::{
         Command, PresetCommand, PromptBranchStatusCommand, PromptCommand, PromptRunCommand,
         PromptStatusCommand, PromptSubcommand, SessionBranchCommand, SessionCommand,
-        SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand,
+        SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand, SkillSubcommand,
     },
 };
 
@@ -385,7 +385,9 @@ fn apply_forwarded_defaults(
     if scope == ForwardedRuntimeScope::Orchestrator
         && let Some(parent_tool_use_id) = parent_tool_use_id_env
     {
-        apply_forwarded_shadow_parent(cli, parent_tool_use_id.to_owned());
+        let parent_tool_use_id = parent_tool_use_id.to_owned();
+        apply_forwarded_shadow_parent(cli, parent_tool_use_id.clone());
+        apply_forwarded_skill_parent(cli, parent_tool_use_id);
     }
 
     if has_explicit_flag(args, "branch") {
@@ -435,5 +437,14 @@ fn apply_forwarded_shadow_parent(cli: &mut Cli, shadow_parent: String) {
                 .push(MergeParent::shadow(shadow_parent)),
             Some(PromptSubcommand::Status(_)) | Some(PromptSubcommand::BranchStatus(_)) => {}
         }
+    }
+}
+
+fn apply_forwarded_skill_parent(cli: &mut Cli, parent_tool_use_id: String) {
+    if let Command::Skill(command) = &mut cli.command
+        && let SkillSubcommand::Run(command) = &mut command.command
+        && command.parent_tool_use_id.is_none()
+    {
+        command.parent_tool_use_id = Some(parent_tool_use_id);
     }
 }

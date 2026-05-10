@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use coco_mem::{
-    SessionRole, SkillRecord, SkillScript, SkillStore, SkillUpdatePatch, SkillVersion,
+    Anchor, Kind, NewNode, NodeStore, Role, SessionRole, SkillInvocationAnchor,
+    SkillInvocationMode, SkillRecord, SkillScript, SkillStore, SkillUpdatePatch, SkillVersion,
     SkillVersionSpec,
 };
 use serde::Serialize;
@@ -17,7 +18,9 @@ use crate::{
         SkillSubcommand, SkillUpdateCommand,
     },
     error::{
-        InvalidSkillScriptPathSnafu, ReadSkillFileSnafu, ReadSkillScriptDirectorySnafu, StoreSnafu,
+        InvalidSkillInvocationParentSnafu, InvalidSkillRunHandoffSnafu,
+        InvalidSkillScriptPathSnafu, MissingSkillInvocationParentSnafu, ReadSkillFileSnafu,
+        ReadSkillScriptDirectorySnafu, StoreSnafu,
     },
 };
 
@@ -41,6 +44,14 @@ struct SkillShowView {
 }
 
 #[derive(Debug, Serialize)]
+struct SkillRunView {
+    invocation_node_id: String,
+    parent_tool_use_id: String,
+    skill_name: String,
+    mode: SkillInvocationMode,
+}
+
+#[derive(Debug, Serialize)]
 struct SkillVersionView {
     version: u64,
     created_at: String,
@@ -52,7 +63,7 @@ struct SkillVersionView {
 
 pub(super) async fn run_skill_command(
     command: SkillCommand,
-    store: &impl SkillStore,
+    store: &(impl SkillStore + NodeStore),
 ) -> Result<Option<String>> {
     match command.command {
         SkillSubcommand::Add(command) => {
@@ -98,6 +109,15 @@ pub(super) async fn run_skill_command(
                 render_json(skill)
             } else {
                 render_skill_show_text(&skill)
+            }))
+        }
+        SkillSubcommand::Run(command) => {
+            let json = command.json;
+            let invocation = run_skill_run(command, store)?;
+            Ok(Some(if json {
+                render_json(invocation)
+            } else {
+                render_skill_run_text(&invocation)
             }))
         }
     }
@@ -200,6 +220,54 @@ fn run_skill_show(command: SkillShowCommand, store: &impl SkillStore) -> Result<
         name: record.name,
         current_version: record.current_version,
         versions,
+    })
+}
+
+fn run_skill_run(
+    command: crate::cli::SkillRunCommand,
+    store: &impl NodeStore,
+) -> Result<SkillRunView> {
+    let parent_tool_use_id = command
+        .parent_tool_use_id
+        .or_else(|| std::env::var(coco_llm::COCO_PARENT_TOOL_USE_ID_ENV).ok())
+        .context(MissingSkillInvocationParentSnafu)?;
+    let parent = store.get_node(&parent_tool_use_id).context(StoreSnafu)?;
+    ensure!(
+        parent.kind.as_tool_uses().is_some(),
+        InvalidSkillInvocationParentSnafu {
+            parent_tool_use_id: parent_tool_use_id.clone(),
+        }
+    );
+
+    let mode = match command.handoff {
+        Some(handoff) => {
+            let prompt = handoff.trim().to_owned();
+            ensure!(!prompt.is_empty(), InvalidSkillRunHandoffSnafu);
+            SkillInvocationMode::Handoff { prompt }
+        }
+        None => SkillInvocationMode::InheritContext,
+    };
+    let skill_name = command.name;
+    let invocation_node_id = store
+        .append(NewNode {
+            parent: parent_tool_use_id.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_invocation(
+                vec![],
+                SkillInvocationAnchor {
+                    skill_name: skill_name.clone(),
+                    mode: mode.clone(),
+                },
+            )),
+        })
+        .context(StoreSnafu)?;
+
+    Ok(SkillRunView {
+        invocation_node_id,
+        parent_tool_use_id,
+        skill_name,
+        mode,
     })
 }
 
@@ -404,6 +472,17 @@ fn render_skill_summary_text(skill: &SkillSummaryView) -> String {
         skill.scripts.join(","),
         skill.enable_coco_shim,
         skill.description
+    )
+}
+
+fn render_skill_run_text(invocation: &SkillRunView) -> String {
+    format!(
+        "invocation_node_id: {}\nparent_tool_use_id: {}\nskill_name: {}\nmode:\n{}",
+        invocation.invocation_node_id,
+        invocation.parent_tool_use_id,
+        invocation.skill_name,
+        serde_json::to_string_pretty(&invocation.mode)
+            .expect("skill invocation mode should serialize")
     )
 }
 
