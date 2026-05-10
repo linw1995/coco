@@ -1101,6 +1101,7 @@ fn graph_kind_name(node: &Node) -> &'static str {
             AnchorPayload::Session(_) => "session",
             AnchorPayload::SessionPatch(_) => "session_patch",
             AnchorPayload::Prompt(_) => "prompt",
+            AnchorPayload::SkillInvocation(_) => "skill_invocation",
             AnchorPayload::SkillResult(_) => "skill_result",
         },
         Kind::ToolUse(_) => "tool_use",
@@ -1124,6 +1125,7 @@ fn summarize_node(node: &Node) -> String {
                 serde_json::to_string(patch).expect("session patch should serialize")
             }
             AnchorPayload::Prompt(prompt) => prompt.prompt.clone(),
+            AnchorPayload::SkillInvocation(invocation) => invocation.skill_name.clone(),
             AnchorPayload::SkillResult(skill_result) => skill_result.output.clone(),
         },
         Kind::ToolUse(tool_uses) => tool_uses
@@ -1242,6 +1244,14 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
                 AnchorPayload::Prompt(prompt) => {
                     lines.push("prompt:".to_owned());
                     lines.push(prompt.prompt.clone());
+                }
+                AnchorPayload::SkillInvocation(invocation) => {
+                    lines.push(format!("skill_name: {}", invocation.skill_name));
+                    lines.push("mode:".to_owned());
+                    lines.push(
+                        serde_json::to_string_pretty(&invocation.mode)
+                            .expect("skill invocation mode should serialize"),
+                    );
                 }
                 AnchorPayload::SkillResult(skill_result) => {
                     lines.push(format!("tool_id: {}", skill_result.tool_id));

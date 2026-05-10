@@ -2037,6 +2037,17 @@ where
                     context.nodes.push(node.clone());
                     context.active_anchor_id = node.id.clone();
                 }
+                AnchorPayload::SkillInvocation(_) => {
+                    let Some(context) = state.as_mut() else {
+                        return MissingAnchorSnafu {
+                            branch: reference.to_owned(),
+                        }
+                        .fail();
+                    };
+
+                    context.nodes.push(node.clone());
+                    context.active_anchor_id = node.id.clone();
+                }
                 AnchorPayload::SkillResult(_) => {
                     let Some(context) = state.as_mut() else {
                         return MissingAnchorSnafu {
@@ -2675,6 +2686,7 @@ impl ProviderHistoryBuilder {
                 AnchorPayload::Session(session) => self.push_session_prompt(&session.prompt),
                 AnchorPayload::SessionPatch(_) => {}
                 AnchorPayload::Prompt(prompt) => self.push_user_text(&prompt.prompt),
+                AnchorPayload::SkillInvocation(_) => {}
                 AnchorPayload::SkillResult(result) => self.push_tool_result(
                     node_metadata_first(node.metadata.as_ref()),
                     &result.tool_id,
