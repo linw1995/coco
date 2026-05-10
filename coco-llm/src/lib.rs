@@ -2084,6 +2084,9 @@ fn should_skip_inherited_use_skill_tool_use(
     node: &coco_mem::Node,
     next: Option<&coco_mem::Node>,
 ) -> bool {
+    // use_skill inheritance is node-scoped. When a grouped sibling ToolUse node
+    // creates a skill execution anchor, the child skill branch should not inherit
+    // any sibling from that fan-out node as parent provider context.
     is_use_skill_tool_use(node) && next.is_some_and(is_skill_execution_anchor)
 }
 
