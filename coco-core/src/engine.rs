@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, Node, NodeStore,
-    RuntimeStore, SessionStore,
+    RuntimeStore, SessionStore, SkillStore,
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
@@ -80,6 +80,7 @@ where
         + SessionStore
         + JobStore
         + RuntimeStore
+        + SkillStore
         + Clone
         + Send
         + Sync

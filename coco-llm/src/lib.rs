@@ -4,7 +4,7 @@ mod skill_tool;
 mod tool_definition;
 mod unified_exec_tool;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(test)]
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
     MergeParent, NewNode, NodeMetadata, NodeStore, PauseReason, PromptAnchor, ProviderMetadata,
-    Role, RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
-    StoreError, Tool, ToolResult, ToolUse,
+    Role, RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord,
+    SkillResultAnchor, SkillStore, StoreError, Tool, ToolResult, ToolUse,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -274,6 +274,12 @@ pub struct SessionModelConfig {
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
     pub enable_coco_shim: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSkillSummary {
+    pub name: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1179,7 +1185,15 @@ where
 impl<B, S> LlmService<B, S>
 where
     B: CompletionBackend,
-    S: NodeStore + BranchStore + SessionStore + RuntimeStore + Clone + Send + Sync + 'static,
+    S: NodeStore
+        + BranchStore
+        + SessionStore
+        + RuntimeStore
+        + SkillStore
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     pub async fn prompt(&self, request: PromptRequest) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
@@ -1417,7 +1431,7 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + RuntimeStore,
+    S: NodeStore + RuntimeStore + SkillStore,
 {
     fn resolve_session_from_reference(
         &self,
@@ -1826,7 +1840,7 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + RuntimeStore,
+    S: NodeStore + RuntimeStore + SkillStore,
 {
     #[cfg(test)]
     fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
@@ -1853,9 +1867,70 @@ fn normalize_merge_parents(
     normalized
 }
 
+fn accessible_skill_roles(session_role: SessionRole) -> &'static [SessionRole] {
+    match session_role {
+        SessionRole::Orchestrator => &[SessionRole::Orchestrator, SessionRole::Runner],
+        SessionRole::Runner => &[SessionRole::Runner],
+    }
+}
+
+fn skill_summaries_from_records(records: &[SkillRecord]) -> Vec<SessionSkillSummary> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let current = record.current()?;
+            Some(SessionSkillSummary {
+                name: record.name.clone(),
+                description: current.description.clone(),
+            })
+        })
+        .collect()
+}
+
+fn session_skill_summaries(
+    store: &impl SkillStore,
+    session_role: SessionRole,
+) -> Result<Vec<SessionSkillSummary>> {
+    let mut seen_names = HashSet::new();
+    let mut skills = Vec::new();
+    for role in accessible_skill_roles(session_role) {
+        let records = store.list_skills(*role).context(MemorySnafu)?;
+        for skill in skill_summaries_from_records(&records) {
+            if seen_names.insert(skill.name.clone()) {
+                skills.push(skill);
+            }
+        }
+    }
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(skills)
+}
+
+fn append_skills_to_system_prompt(system_prompt: &str, skills: &[SessionSkillSummary]) -> String {
+    if skills.is_empty() {
+        return system_prompt.to_owned();
+    }
+
+    let mut prompt = system_prompt.trim_end().to_owned();
+    if !prompt.is_empty() {
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("## Available Skills\n");
+    prompt.push_str(
+        "Use `search_skill` to discover installed skills. To run a skill, call `coco skill run <name>` through `exec_command`; pass `--handoff <text>` for a bounded handoff, or omit it to inherit context.\n",
+    );
+    for skill in skills {
+        prompt.push_str("- `");
+        prompt.push_str(&skill.name);
+        prompt.push_str("`: ");
+        prompt.push_str(&skill.description.replace('\n', " "));
+        prompt.push('\n');
+    }
+    prompt
+}
+
 impl<B, S> LlmService<B, S>
 where
-    S: RuntimeStore,
+    S: RuntimeStore + SkillStore,
 {
     fn session_from_context(
         &self,
@@ -1883,6 +1958,8 @@ where
             .unwrap_or_default();
         let base_url = provider_config.and_then(|config| config.base_url.clone());
 
+        let available_skills = session_skill_summaries(self.store(), context.session_anchor.role)?;
+
         Ok(ResolvedSession {
             branch: branch.to_owned(),
             anchor_id: context.active_anchor_id,
@@ -1893,7 +1970,10 @@ where
                 model,
                 secrets,
                 base_url,
-                system_prompt: context.session_anchor.system_prompt.clone(),
+                system_prompt: append_skills_to_system_prompt(
+                    &context.session_anchor.system_prompt,
+                    &available_skills,
+                ),
                 tools: context.session_anchor.tools.clone(),
                 temperature: context.session_anchor.temperature,
                 max_tokens: context.session_anchor.max_tokens,
@@ -3927,6 +4007,56 @@ mod tests {
         assert_eq!(current_skill_name_from_prompt("regular prompt"), None);
     }
 
+    #[test]
+    fn append_skills_to_system_prompt_lists_available_skills() {
+        let prompt = append_skills_to_system_prompt(
+            "You are helpful.",
+            &[
+                SessionSkillSummary {
+                    name: "fast-rust".to_owned(),
+                    description: "Write fast Rust.".to_owned(),
+                },
+                SessionSkillSummary {
+                    name: "openai-docs".to_owned(),
+                    description: "Read OpenAI docs.\nUse official sources.".to_owned(),
+                },
+            ],
+        );
+
+        assert!(prompt.starts_with("You are helpful.\n\n## Available Skills"));
+        assert!(prompt.contains("`coco skill run <name>` through `exec_command`"));
+        assert!(prompt.contains("- `fast-rust`: Write fast Rust."));
+        assert!(prompt.contains("- `openai-docs`: Read OpenAI docs. Use official sources."));
+    }
+
+    #[tokio::test]
+    async fn resolve_session_appends_available_skills_to_system_prompt() {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store, FakeBackend::with_responses(&[]));
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let session = service.resolve_session("main").unwrap();
+
+        assert!(session.config.system_prompt.starts_with("You are helpful."));
+        assert!(session.config.system_prompt.contains("## Available Skills"));
+        assert!(
+            session
+                .config
+                .system_prompt
+                .contains("- `coco-orchestrator`:")
+        );
+        assert!(session.config.system_prompt.contains("- `coco-runner`:"));
+        assert!(
+            session
+                .config
+                .system_prompt
+                .contains("`coco skill run <name>` through `exec_command`")
+        );
+    }
+
     #[tokio::test]
     async fn sibling_tool_results_persist_as_each_call_finishes() {
         let first = rig_tool_call_content(
@@ -4892,7 +5022,8 @@ mod tests {
         let session = service.resolve_session("main").unwrap();
         assert_eq!(result.text, "merge answer");
         assert_eq!(session.config.model, "gpt-4.1-mini");
-        assert_eq!(session.config.system_prompt, "You are helpful.");
+        assert!(session.config.system_prompt.starts_with("You are helpful."));
+        assert!(session.config.system_prompt.contains("## Available Skills"));
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -5460,7 +5591,7 @@ mod tests {
         let session = service.resolve_session("main").unwrap();
         assert_eq!(session.config.provider, Provider::Anthropic);
         assert_eq!(session.config.model, "claude-sonnet-4-20250514");
-        assert_eq!(session.config.system_prompt, "You are helpful.");
+        assert!(session.config.system_prompt.starts_with("You are helpful."));
         assert_eq!(session.config.temperature, None);
         assert_eq!(session.config.max_tokens, Some(128));
         assert_eq!(
@@ -5470,7 +5601,8 @@ mod tests {
 
         let calls = calls.lock().await;
         let last = calls.last().expect("expected backend call");
-        assert_eq!(last.0.config.system_prompt, "You are helpful.");
+        assert!(last.0.config.system_prompt.starts_with("You are helpful."));
+        assert!(last.0.config.system_prompt.contains("## Available Skills"));
         assert_eq!(last.1.provider, Provider::Anthropic);
         assert_eq!(last.1.model, "claude-sonnet-4-20250514");
         assert_eq!(last.1.temperature, None);
@@ -5515,7 +5647,8 @@ mod tests {
         assert_eq!(result.text, "updated");
         let calls = calls.lock().await;
         let last = calls.last().expect("expected backend call");
-        assert_eq!(last.0.config.system_prompt, "You are strict.");
+        assert!(last.0.config.system_prompt.starts_with("You are strict."));
+        assert!(last.0.config.system_prompt.contains("## Available Skills"));
     }
 
     #[tokio::test]
