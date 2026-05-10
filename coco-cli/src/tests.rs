@@ -175,6 +175,8 @@ fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str
                 role: None,
                 tools: vec![],
                 clear_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
                 merge_parents: vec![],
             },
         }),
@@ -198,6 +200,8 @@ fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
                 role: None,
                 tools: vec![],
                 clear_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
                 merge_parents: vec![],
             },
         }),
@@ -221,6 +225,8 @@ fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
                 role: None,
                 tools: vec![],
                 clear_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
                 merge_parents: vec![],
             },
         }),
@@ -249,6 +255,8 @@ fn prompt_branch_status_cli(
                 role: None,
                 tools: vec![],
                 clear_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
                 merge_parents: vec![],
             },
         }),
@@ -270,6 +278,8 @@ fn session_create_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
                 max_tokens: Some(64),
                 additional_params: None,
                 tools: vec![],
+                enable_coco_shim: false,
+                disable_coco_shim: false,
             }),
         }),
     }
@@ -888,6 +898,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
             "runner",
             "--tool",
             "exec_command",
+            "--enable-coco-shim",
             "run date",
         ])
         .unwrap(),
@@ -915,6 +926,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
     let tools = patch.tools.as_ref().expect("expected tools patch");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "exec_command");
+    assert_eq!(patch.enable_coco_shim, Some(true));
     assert_eq!(ancestry[2].parent, original_main_head);
     assert_eq!(ancestry[3].id, original_main_head);
 }
@@ -1619,6 +1631,8 @@ async fn session_create_persists_additional_params() {
                                 .to_owned(),
                         ),
                         tools: vec![],
+                        enable_coco_shim: false,
+                        disable_coco_shim: false,
                     }),
                 }),
             };
@@ -5043,6 +5057,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
     assert_eq!(session.system_prompt, "You are CoCo. An AI copilot");
     assert_eq!(session.prompt, "");
     assert_eq!(session.max_tokens, Some(32_000));
+    assert!(session.enable_coco_shim);
     assert_eq!(
         session
             .tools
@@ -5162,6 +5177,8 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
                     max_tokens: Some(64),
                     additional_params: None,
                     tools: vec![],
+                    enable_coco_shim: false,
+                    disable_coco_shim: false,
                 })
                 .unwrap()
             },
@@ -5194,6 +5211,8 @@ fn resolve_session_config_accepts_chatgpt_provider() {
                     max_tokens: Some(64),
                     additional_params: None,
                     tools: vec![],
+                    enable_coco_shim: false,
+                    disable_coco_shim: false,
                 })
                 .unwrap()
             },
@@ -5226,6 +5245,8 @@ fn resolve_session_config_reads_tools_from_env() {
                     max_tokens: Some(64),
                     additional_params: None,
                     tools: vec![],
+                    enable_coco_shim: true,
+                    disable_coco_shim: false,
                 })
                 .unwrap()
             },
@@ -5239,6 +5260,7 @@ fn resolve_session_config_reads_tools_from_env() {
             .collect::<Vec<_>>(),
         vec!["exec_command", "write_stdin", "search_skill"]
     );
+    assert!(config.enable_coco_shim);
 }
 
 #[test]
@@ -5262,6 +5284,8 @@ fn resolve_session_config_parses_additional_params_json_object() {
                         "{\"service_tier\":\"priority\",\"reasoning_effort\":\"low\"}".to_owned(),
                     ),
                     tools: vec![],
+                    enable_coco_shim: false,
+                    disable_coco_shim: false,
                 })
                 .unwrap()
             },
@@ -5295,6 +5319,8 @@ fn resolve_session_config_rejects_non_object_additional_params() {
                     max_tokens: Some(64),
                     additional_params: Some("[1,2,3]".to_owned()),
                     tools: vec![],
+                    enable_coco_shim: false,
+                    disable_coco_shim: false,
                 })
                 .unwrap_err()
             },

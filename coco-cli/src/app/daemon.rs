@@ -132,6 +132,8 @@ fn default_session_create_command() -> SessionCreateCommand {
             CliTool::WriteStdin,
             CliTool::SearchSkill,
         ],
+        enable_coco_shim: true,
+        disable_coco_shim: false,
     }
 }
 

@@ -47,5 +47,6 @@ INVOCATION=$(coco session show --json "$ANCHOR" | jq -r '.node.parent')
 BASE=$(coco session show --json "$INVOCATION" | jq -r '.node.parent')
 coco session fork --branch "$RUNNER_BRANCH" --from-ref "$BASE"
 coco prompt --branch "$RUNNER_BRANCH" --role runner \
-  --tool exec_command --tool write_stdin --tool search_skill "<task>"
+  --tool exec_command --tool write_stdin --tool search_skill \
+  --enable-coco-shim "<task>"
 ```

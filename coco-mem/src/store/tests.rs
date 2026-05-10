@@ -1785,6 +1785,13 @@ where
             .body
             .contains("--tool exec_command --tool write_stdin --tool search_skill")
     );
+    assert!(
+        orchestrator
+            .current()
+            .unwrap()
+            .body
+            .contains("--enable-coco-shim")
+    );
     assert!(new_skill.current().unwrap().body.contains("coco skill add"));
     assert!(
         cronjob

@@ -118,6 +118,8 @@ impl RunnerCli {
                     role: None,
                     tools: vec![],
                     clear_tools: false,
+                    enable_coco_shim: false,
+                    disable_coco_shim: false,
                     merge_parents: vec![],
                 },
             }),

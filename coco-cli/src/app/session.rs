@@ -348,6 +348,8 @@ pub fn resolve_session_config(
     };
     let additional_params = parse_session_additional_params(command.additional_params)?;
 
+    let enable_coco_shim = command.enable_coco_shim && !command.disable_coco_shim;
+
     Ok(SessionConfig {
         branch: command.branch,
         merge_parents: vec![],
@@ -361,7 +363,7 @@ pub fn resolve_session_config(
         temperature: command.temperature,
         max_tokens: command.max_tokens,
         additional_params,
-        enable_coco_shim: false,
+        enable_coco_shim,
     })
 }
 
