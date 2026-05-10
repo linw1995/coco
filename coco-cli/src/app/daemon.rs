@@ -131,7 +131,6 @@ fn default_session_create_command() -> SessionCreateCommand {
             CliTool::ExecCommand,
             CliTool::WriteStdin,
             CliTool::SearchSkill,
-            CliTool::UseSkill,
         ],
     }
 }

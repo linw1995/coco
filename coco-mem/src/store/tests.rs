@@ -1776,7 +1776,7 @@ where
             .current()
             .unwrap()
             .body
-            .contains("fork from the node before the `use_skill` ToolUse")
+            .contains("fork from the node before the `SkillInvocation`")
     );
     assert!(
         orchestrator

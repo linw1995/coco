@@ -70,7 +70,7 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
         }),
         "search_skill" => Some(Tool {
             name: "search_skill".to_owned(),
-            description: "Search installed skills.".to_owned(),
+            description: "Search installed skills. To run a returned skill, call `coco skill run <name>` through `exec_command`; pass `--handoff <text>` for a bounded handoff, or omit it to inherit context.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

@@ -5365,7 +5365,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["exec_command", "write_stdin", "search_skill", "use_skill"]
+        vec!["exec_command", "write_stdin", "search_skill"]
     );
 
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())

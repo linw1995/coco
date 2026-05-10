@@ -125,7 +125,7 @@ fn channel_prompt(message: &InboundMessage, text: &str) -> String {
         - Complete the requested work using any needed tools or skills before sending the final Telegram reply.
         - Use the `telegram` skill only for Telegram delivery; do not delegate the user task itself to the `telegram` skill.
         - If the work is long-running, you may send one progress update through the `telegram` skill, then continue working.
-        - Call the `telegram` skill through `use_skill` for the final user-facing reply only after the reply content is ready to send.
+        - Call `coco skill run telegram --handoff <reply task>` through `exec_command` for the final user-facing reply only after the reply content is ready to send.
         - Use the target chat_id and reply_to_message_id above for the first Telegram message; if you send no progress update, the final reply is that first message.
         - Do not use the `telegram` skill merely to acknowledge the request unless the incoming message only asks for acknowledgement.
         - Do not finish after an acknowledgement-only Telegram reply unless the incoming message only asked for acknowledgement.
