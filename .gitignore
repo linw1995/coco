@@ -7,13 +7,19 @@ coco-console/pkg
 !docker/coco-docker-entrypoint.sh
 !scripts/run-cov.sh
 
+# CoCo
+config.toml
+logs
+.env
+!.env.example
+
 # Agent artifacts
 .agents/
 .coco-workspace/
 .coco-store/
 .codex
 skills-lock.json
-config.toml
-logs
-.env
-!.env.example
+.ml-cache/
+.codex
+.mainline/local.toml
+.cursor
