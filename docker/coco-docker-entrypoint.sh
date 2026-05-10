@@ -24,8 +24,15 @@ validate_runtime_id_pair() {
 
 setup_timezone() {
   if [ -n "${TZ:-}" ] && [ -n "${TZDIR:-}" ] && [ -f "${TZDIR}/${TZ}" ]; then
-    ln -snf "${TZDIR}/${TZ}" /etc/localtime 2>/dev/null || true
-    printf '%s\n' "${TZ}" >/etc/timezone 2>/dev/null || true
+    if ! { ln -snf "${TZDIR}/${TZ}" /etc/localtime; } 2>/dev/null; then
+      printf 'warning: failed to link /etc/localtime to %s/%s\n' \
+        "${TZDIR}" \
+        "${TZ}" \
+        >&2
+    fi
+    if ! { printf '%s\n' "${TZ}" >/etc/timezone; } 2>/dev/null; then
+      printf 'warning: failed to write /etc/timezone for %s\n' "${TZ}" >&2
+    fi
   fi
 }
 
@@ -85,9 +92,9 @@ start_cron() {
 }
 
 validate_runtime_id_pair
-setup_timezone
 
 if [ "${current_uid}" = "0" ]; then
+  setup_timezone
   ensure_runtime_identity
   chown_runtime_paths
   if [ "${runtime_uid}:${runtime_gid}" != "0:0" ]; then
