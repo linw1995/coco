@@ -2646,9 +2646,15 @@ struct ProviderHistoryBuilder {
     messages: Vec<rig::completion::message::Message>,
     assistant_contents: Vec<rig::completion::message::AssistantContent>,
     assistant_execution_id: Option<String>,
-    last_tool_call_order: HashMap<String, usize>,
+    last_tool_calls: HashMap<String, PendingToolCall>,
     tool_results: Vec<rig::completion::message::UserContent>,
     tool_result_execution_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    order: usize,
+    call_id: Option<String>,
 }
 
 fn node_metadata_first(metadata: Option<&NodeMetadata>) -> Option<&BackendMetadata> {
@@ -2735,8 +2741,6 @@ impl ProviderHistoryBuilder {
         }
         self.assistant_execution_id = execution_id;
         let call_id = node_metadata.and_then(|metadata| metadata.call_id.clone());
-        let order = self.last_tool_call_order.len();
-        self.last_tool_call_order.insert(tool_use.id.clone(), order);
         self.assistant_contents.push(rig_tool_call_content(
             tool_use.id.clone(),
             call_id,
@@ -2776,13 +2780,19 @@ impl ProviderHistoryBuilder {
             return;
         }
 
-        let mut tool_call_order = HashMap::new();
+        let mut tool_calls = HashMap::new();
         for content in &self.assistant_contents {
             if let rig::completion::message::AssistantContent::ToolCall(tool_call) = content {
-                tool_call_order.insert(tool_call.id.clone(), tool_call_order.len());
+                tool_calls.insert(
+                    tool_call.id.clone(),
+                    PendingToolCall {
+                        order: tool_calls.len(),
+                        call_id: tool_call.call_id.clone(),
+                    },
+                );
             }
         }
-        self.last_tool_call_order = tool_call_order;
+        self.last_tool_calls = tool_calls;
         self.messages
             .push(rig::completion::message::Message::Assistant {
                 id: None,
@@ -2793,15 +2803,48 @@ impl ProviderHistoryBuilder {
     }
 
     fn flush_tool_results(&mut self) {
-        if self.tool_results.is_empty() {
+        if self.tool_results.is_empty() && self.last_tool_calls.is_empty() {
             return;
+        }
+
+        let completed_tool_ids = self
+            .tool_results
+            .iter()
+            .filter_map(|content| match content {
+                rig::completion::message::UserContent::ToolResult(tool_result) => {
+                    Some(tool_result.id.as_str())
+                }
+                rig::completion::message::UserContent::Text(_)
+                | rig::completion::message::UserContent::Image(_)
+                | rig::completion::message::UserContent::Audio(_)
+                | rig::completion::message::UserContent::Video(_)
+                | rig::completion::message::UserContent::Document(_) => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut missing_tool_calls = self
+            .last_tool_calls
+            .iter()
+            .filter(|(id, _)| !completed_tool_ids.contains(id.as_str()))
+            .collect::<Vec<_>>();
+        missing_tool_calls.sort_by_key(|(_, tool_call)| tool_call.order);
+        for (id, tool_call) in missing_tool_calls {
+            let content = rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
+                format!(
+                    "Tool call {id:?} did not produce a result before recovery; treating it as failed."
+                ),
+            ));
+            self.tool_results.push(rig_tool_result_content(
+                id.clone(),
+                tool_call.call_id.clone(),
+                content,
+            ));
         }
 
         self.tool_results.sort_by_key(|content| match content {
             rig::completion::message::UserContent::ToolResult(tool_result) => self
-                .last_tool_call_order
+                .last_tool_calls
                 .get(&tool_result.id)
-                .copied()
+                .map(|tool_call| tool_call.order)
                 .unwrap_or(usize::MAX),
             rig::completion::message::UserContent::Text(_)
             | rig::completion::message::UserContent::Image(_)
@@ -2814,6 +2857,7 @@ impl ProviderHistoryBuilder {
                 .expect("tool result buffer is non-empty"),
         });
         self.tool_result_execution_id = None;
+        self.last_tool_calls.clear();
     }
 }
 
@@ -4299,6 +4343,113 @@ mod tests {
                         tool_result.content.first_ref(),
                         rig::completion::message::ToolResultContent::Text(text)
                             if text.text == r#"{"query":"fast"}"#
+                    )
+        ));
+    }
+
+    #[tokio::test]
+    async fn reopened_store_recovers_missing_sibling_tool_result_as_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store_path = temp_dir.path().join("store");
+        {
+            let store = FsStore::open(&store_path).unwrap();
+            let service = LlmService::new(store.clone(), FakeBackend::with_turns(vec![]));
+            service
+                .create_session(SessionConfig {
+                    tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                    ..session_config("main")
+                })
+                .await
+                .unwrap();
+            let session_head = store.get_branch_head("main").unwrap();
+            let tool_use_id = store
+                .append(NewNode {
+                    parent: session_head.clone(),
+                    role: Role::LLM,
+                    metadata: Some(NodeMetadata::many(vec![
+                        BackendMetadata {
+                            execution_id: Some("execution-1".to_owned()),
+                            call_id: Some("call-1".to_owned()),
+                        },
+                        BackendMetadata {
+                            execution_id: Some("execution-1".to_owned()),
+                            call_id: Some("call-2".to_owned()),
+                        },
+                    ])),
+                    kind: Kind::tool_uses(vec![
+                        ToolUse {
+                            id: "tool-call-1".to_owned(),
+                            name: "search_skill".to_owned(),
+                            input: serde_json::json!({"query": "missing"}),
+                        },
+                        ToolUse {
+                            id: "tool-call-2".to_owned(),
+                            name: "search_skill".to_owned(),
+                            input: serde_json::json!({"query": "present"}),
+                        },
+                    ]),
+                })
+                .unwrap();
+            let tool_result_id = store
+                .append(NewNode {
+                    parent: tool_use_id,
+                    role: Role::User,
+                    metadata: metadata(Some("execution-1"), Some("call-2")),
+                    kind: Kind::tool_result(ToolResult {
+                        id: "tool-call-2".to_owned(),
+                        output: r#"{"query":"present"}"#.to_owned(),
+                    }),
+                })
+                .unwrap();
+            store
+                .set_branch_head("main", &session_head, &tool_result_id)
+                .unwrap();
+        }
+
+        let reopened = FsStore::open(&store_path).unwrap();
+        let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
+        let session = service.resolve_session("main").unwrap();
+        let tool_result_message = session
+            .provider_history
+            .iter()
+            .find_map(|message| match message {
+                rig::completion::message::Message::User { content }
+                    if content.iter().any(|content| {
+                        matches!(
+                            content,
+                            rig::completion::message::UserContent::ToolResult(_)
+                        )
+                    }) =>
+                {
+                    Some(content.iter().collect::<Vec<_>>())
+                }
+                rig::completion::message::Message::User { .. }
+                | rig::completion::message::Message::Assistant { .. }
+                | rig::completion::message::Message::System { .. } => None,
+            })
+            .expect("expected recovered tool result message");
+
+        assert_eq!(tool_result_message.len(), 2);
+        assert!(matches!(
+            tool_result_message[0],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-1"
+                    && tool_result.call_id.as_deref() == Some("call-1")
+                    && matches!(
+                        tool_result.content.first_ref(),
+                        rig::completion::message::ToolResultContent::Text(text)
+                            if text.text.contains("did not produce a result before recovery")
+                    )
+        ));
+        assert!(matches!(
+            tool_result_message[1],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-2"
+                    && tool_result.call_id.as_deref() == Some("call-2")
+                    && matches!(
+                        tool_result.content.first_ref(),
+                        rig::completion::message::ToolResultContent::Text(text)
+                            if text.text == r#"{"query":"present"}"#
                     )
         ));
     }
