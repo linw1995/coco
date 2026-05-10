@@ -13,7 +13,7 @@ runs:
       uses: nix-community/cache-nix-action@v6
       with:
         # Cache crane's nix build dependency artifacts by Cargo.lock and flake inputs.
-        primary-key: nix-store-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'flake.nix', 'flake.lock') }}
+        primary-key: nix-store-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'flake.nix', 'flake.lock') }}
         gc-max-store-size-linux: 15G
 
     - name: Cache Cargo dependencies
@@ -23,9 +23,9 @@ runs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+        key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
         restore-keys: |
-          cargo-${{ runner.os }}-${{ github.job }}-
+          cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
 
     - name: Setup nix develop env
       shell: bash
