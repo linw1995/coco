@@ -2646,6 +2646,7 @@ struct ProviderHistoryBuilder {
     messages: Vec<rig::completion::message::Message>,
     assistant_contents: Vec<rig::completion::message::AssistantContent>,
     assistant_execution_id: Option<String>,
+    last_tool_call_order: HashMap<String, usize>,
     tool_results: Vec<rig::completion::message::UserContent>,
     tool_result_execution_id: Option<String>,
 }
@@ -2734,6 +2735,8 @@ impl ProviderHistoryBuilder {
         }
         self.assistant_execution_id = execution_id;
         let call_id = node_metadata.and_then(|metadata| metadata.call_id.clone());
+        let order = self.last_tool_call_order.len();
+        self.last_tool_call_order.insert(tool_use.id.clone(), order);
         self.assistant_contents.push(rig_tool_call_content(
             tool_use.id.clone(),
             call_id,
@@ -2773,6 +2776,13 @@ impl ProviderHistoryBuilder {
             return;
         }
 
+        let mut tool_call_order = HashMap::new();
+        for content in &self.assistant_contents {
+            if let rig::completion::message::AssistantContent::ToolCall(tool_call) = content {
+                tool_call_order.insert(tool_call.id.clone(), tool_call_order.len());
+            }
+        }
+        self.last_tool_call_order = tool_call_order;
         self.messages
             .push(rig::completion::message::Message::Assistant {
                 id: None,
@@ -2787,6 +2797,18 @@ impl ProviderHistoryBuilder {
             return;
         }
 
+        self.tool_results.sort_by_key(|content| match content {
+            rig::completion::message::UserContent::ToolResult(tool_result) => self
+                .last_tool_call_order
+                .get(&tool_result.id)
+                .copied()
+                .unwrap_or(usize::MAX),
+            rig::completion::message::UserContent::Text(_)
+            | rig::completion::message::UserContent::Image(_)
+            | rig::completion::message::UserContent::Audio(_)
+            | rig::completion::message::UserContent::Video(_)
+            | rig::completion::message::UserContent::Document(_) => usize::MAX,
+        });
         self.messages.push(rig::completion::message::Message::User {
             content: rig::OneOrMany::many(std::mem::take(&mut self.tool_results))
                 .expect("tool result buffer is non-empty"),
@@ -3411,7 +3433,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::time::Duration;
 
-    use coco_mem::{BranchStore, MemoryStore, NodeStore, SessionStore};
+    use coco_mem::{BranchStore, FsStore, MemoryStore, NodeStore, SessionStore};
     use tokio::sync::{Barrier, Notify};
 
     type RecordedCalls = Arc<Mutex<Vec<(ResolvedSession, ResolvedCompletionRequest)>>>;
@@ -4180,6 +4202,105 @@ mod tests {
 
         let final_result_nodes = tool_result_nodes(&store, &initial_head);
         assert_eq!(final_result_nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reopened_store_reconstructs_staged_tool_results_as_grouped_turn() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store_path = temp_dir.path().join("store");
+        {
+            let first = rig_tool_call_content(
+                "tool-call-1",
+                Some("call-1".to_owned()),
+                "search_skill",
+                serde_json::json!({"query": "slow"}),
+            );
+            let second = rig_tool_call_content(
+                "tool-call-2",
+                Some("call-2".to_owned()),
+                "search_skill",
+                serde_json::json!({"query": "fast"}),
+            );
+            let turn = BackendTurn::from_assistant_choice(
+                Some("assistant-1".to_owned()),
+                rig::OneOrMany::many(vec![first, second])
+                    .expect("assistant choice should be non-empty"),
+            );
+            let backend = FakeBackend::with_turns(vec![(
+                "main",
+                vec![Ok(turn), Ok(BackendTurn::finished("done"))],
+            )]);
+            let store = FsStore::open(&store_path).unwrap();
+            let first_done = Arc::new(Notify::new());
+            let release_second = Arc::new(Notify::new());
+            let service = LlmService::builder(store, backend)
+                .with_skill_tool_executor(Arc::new(StagedSkillExecutor {
+                    first_done: first_done.clone(),
+                    release_second: release_second.clone(),
+                }))
+                .build();
+            service
+                .create_session(SessionConfig {
+                    tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                    ..session_config("main")
+                })
+                .await
+                .unwrap();
+
+            let prompt = tokio::spawn(async move {
+                service.prompt(prompt_request("main", "search twice")).await
+            });
+            first_done.notified().await;
+            release_second.notify_one();
+            assert_eq!(prompt.await.unwrap().unwrap().text, "done");
+        }
+
+        let reopened = FsStore::open(&store_path).unwrap();
+        let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
+        let session = service.resolve_session("main").unwrap();
+        let tool_result_message = session
+            .provider_history
+            .iter()
+            .find_map(|message| match message {
+                rig::completion::message::Message::User { content }
+                    if content.iter().any(|content| {
+                        matches!(
+                            content,
+                            rig::completion::message::UserContent::ToolResult(_)
+                        )
+                    }) =>
+                {
+                    Some(content.iter().collect::<Vec<_>>())
+                }
+                rig::completion::message::Message::User { .. }
+                | rig::completion::message::Message::Assistant { .. }
+                | rig::completion::message::Message::System { .. } => None,
+            })
+            .expect("expected grouped tool result message");
+
+        assert_eq!(tool_result_message.len(), 2);
+        assert!(matches!(
+            tool_result_message[0],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-1"
+                    && tool_result.call_id.as_deref() == Some("call-1")
+                    && matches!(
+                        tool_result.content.first_ref(),
+                        rig::completion::message::ToolResultContent::Text(text)
+                            if text.text == r#"{"query":"slow"}"#
+                    )
+        ));
+        assert!(matches!(
+            tool_result_message[1],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-2"
+                    && tool_result.call_id.as_deref() == Some("call-2")
+                    && matches!(
+                        tool_result.content.first_ref(),
+                        rig::completion::message::ToolResultContent::Text(text)
+                            if text.text == r#"{"query":"fast"}"#
+                    )
+        ));
     }
 
     fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<NodeMetadata> {
@@ -6021,18 +6142,18 @@ mod tests {
             ),
             context_node(
                 Role::User,
-                metadata(Some("execution-1"), Some("call-1")),
-                Kind::tool_result(ToolResult {
-                    id: "tool-call-1".to_owned(),
-                    output: "Cargo.toml".to_owned(),
-                }),
-            ),
-            context_node(
-                Role::User,
                 metadata(Some("execution-1"), Some("call-2")),
                 Kind::tool_result(ToolResult {
                     id: "tool-call-2".to_owned(),
                     output: "/tmp".to_owned(),
+                }),
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), Some("call-1")),
+                Kind::tool_result(ToolResult {
+                    id: "tool-call-1".to_owned(),
+                    output: "Cargo.toml".to_owned(),
                 }),
             ),
             context_node(
