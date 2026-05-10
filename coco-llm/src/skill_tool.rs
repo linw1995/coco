@@ -1,27 +1,16 @@
-use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use coco_mem::Tool;
 use serde_json::Value;
 use snafu::prelude::*;
 
-use crate::{
-    SearchSkillToolRequest, ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv,
-    UseSkillToolRequest,
-};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillToolKind {
-    Search,
-    Use,
-}
+use crate::{SearchSkillToolRequest, ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SkillToolRuntime {
     definition: Tool,
     workspace_root: PathBuf,
     context: ToolRuntimeEnv,
-    kind: SkillToolKind,
 }
 
 #[derive(Debug, Snafu)]
@@ -34,18 +23,6 @@ pub enum SkillToolError {
 
     #[snafu(display("skill tool `limit` must be a positive integer"))]
     InvalidLimit,
-
-    #[snafu(display("use_skill requires a string field `name`"))]
-    MissingSkillName,
-
-    #[snafu(display("use_skill field `handoff` must be a non-empty string when present"))]
-    InvalidHandoff,
-
-    #[snafu(display("use_skill requires a persisted tool_use node context"))]
-    MissingToolUseNode,
-
-    #[snafu(display("failed to serialize skill tool output: {source}"))]
-    SerializeOutput { source: serde_json::Error },
 }
 
 impl From<crate::ExecutorError> for rig::tool::ToolError {
@@ -69,7 +46,6 @@ pub(crate) fn search_runtime(
         definition,
         workspace_root,
         context,
-        kind: SkillToolKind::Search,
     }
 }
 
@@ -80,28 +56,6 @@ pub fn search_runtime_tool(
     context: ToolRuntimeEnv,
 ) -> Box<dyn rig::tool::ToolDyn> {
     Box::new(search_runtime(definition, workspace_root, context))
-}
-
-pub(crate) fn run_runtime(
-    definition: Tool,
-    workspace_root: PathBuf,
-    context: ToolRuntimeEnv,
-) -> SkillToolRuntime {
-    SkillToolRuntime {
-        definition,
-        workspace_root,
-        context,
-        kind: SkillToolKind::Use,
-    }
-}
-
-#[cfg(test)]
-pub fn run_runtime_tool(
-    definition: Tool,
-    workspace_root: PathBuf,
-    context: ToolRuntimeEnv,
-) -> Box<dyn rig::tool::ToolDyn> {
-    Box::new(run_runtime(definition, workspace_root, context))
 }
 
 fn parse_search_request(
@@ -130,58 +84,11 @@ fn parse_search_request(
     })
 }
 
-fn parse_use_request(
-    workspace_root: PathBuf,
-    session_branch: String,
-    session_role: coco_mem::SessionRole,
-    parent_tool_use_id: String,
-    args: Value,
-) -> std::result::Result<UseSkillToolRequest, SkillToolError> {
-    let object = args.as_object().context(InvalidInputTypeSnafu)?;
-    let skill_name = object
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .context(MissingSkillNameSnafu)?;
-    let handoff = object
-        .get("handoff")
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::trim)
-                .filter(|handoff| !handoff.is_empty())
-                .map(str::to_owned)
-                .context(InvalidHandoffSnafu)
-        })
-        .transpose()?;
-    Ok(UseSkillToolRequest {
-        workspace_root,
-        session_branch,
-        session_role,
-        parent_tool_use_id,
-        skill_name,
-        handoff,
-    })
-}
-
 impl SkillToolRuntime {
     pub fn tool_definition(&self) -> rig::completion::ToolDefinition {
-        let mut description = self.definition.description.clone();
-        if matches!(self.kind, SkillToolKind::Use)
-            && let Some(skill_name) = &self.context.current_skill_name
-        {
-            write!(
-                &mut description,
-                "\n\nCurrent skill status: already executing `{skill_name}`. Do not call `use_skill` for `{skill_name}` again; apply the loaded skill instructions directly."
-            )
-            .expect("writing to String should not fail");
-        }
-
         rig::completion::ToolDefinition {
             name: self.definition.name.clone(),
-            description,
+            description: self.definition.description.clone(),
             parameters: self.definition.input_schema.clone(),
         }
     }
@@ -189,46 +96,16 @@ impl SkillToolRuntime {
     pub async fn execute(
         &self,
         args: String,
-        invocation: ToolInvocationContext,
+        _invocation: ToolInvocationContext,
     ) -> std::result::Result<ToolExecutionOutcome, rig::tool::ToolError> {
         let workspace_root = self.workspace_root.clone();
         let context = self.context.clone();
-        let kind = self.kind;
 
         let args: Value = serde_json::from_str(&args).context(ParseArgsSnafu)?;
 
-        match kind {
-            SkillToolKind::Search => {
-                let request = parse_search_request(workspace_root, context.session_role, args)?;
-                let output = context.skill_executor.search_skill_tool(request).await?;
-                Ok(ToolExecutionOutcome::tool_result(output))
-            }
-            SkillToolKind::Use => {
-                let parent_tool_use_id = invocation
-                    .persisted_tool_use_node_id
-                    .context(MissingToolUseNodeSnafu)?;
-                let request = parse_use_request(
-                    workspace_root,
-                    context.session_branch.clone(),
-                    context.session_role,
-                    parent_tool_use_id,
-                    args,
-                )?;
-                let skill_name = request.skill_name.clone();
-                match context.skill_executor.execute_skill_tool(request).await {
-                    Ok(result) => {
-                        let output = serde_json::to_string_pretty(&result.result)
-                            .context(SerializeOutputSnafu)?;
-                        Ok(ToolExecutionOutcome::skill_result(
-                            skill_name,
-                            result.response_node_id,
-                            output,
-                        ))
-                    }
-                    Err(error) => Ok(ToolExecutionOutcome::tool_result(error.to_string())),
-                }
-            }
-        }
+        let request = parse_search_request(workspace_root, context.session_role, args)?;
+        let output = context.skill_executor.search_skill_tool(request).await?;
+        Ok(ToolExecutionOutcome::tool_result(output))
     }
 }
 
@@ -261,21 +138,16 @@ impl rig::tool::ToolDyn for SkillToolRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::{SkillToolExecutionResult, SkillToolExecutor, SkillToolRunResult};
+    use crate::SkillToolExecutor;
 
     fn search_tool_definition() -> Tool {
         crate::builtin_tool_definition("search_skill").expect("builtin tool should exist")
-    }
-
-    fn run_tool_definition() -> Tool {
-        crate::builtin_tool_definition("use_skill").expect("builtin tool should exist")
     }
 
     fn run_context(executor: Arc<dyn crate::SkillToolExecutor>) -> ToolRuntimeEnv {
@@ -294,7 +166,6 @@ mod tests {
     #[derive(Debug)]
     struct FakeExecutor {
         search_requests: Arc<Mutex<Vec<SearchSkillToolRequest>>>,
-        use_requests: Arc<Mutex<Vec<UseSkillToolRequest>>>,
     }
 
     #[async_trait]
@@ -315,19 +186,6 @@ mod tests {
 }"#
             .to_owned())
         }
-
-        async fn execute_skill_tool(
-            &self,
-            request: UseSkillToolRequest,
-        ) -> std::result::Result<SkillToolExecutionResult, crate::ExecutorError> {
-            self.use_requests.lock().await.push(request);
-            Ok(SkillToolExecutionResult {
-                result: SkillToolRunResult {
-                    text: "Executed skill result".to_owned(),
-                },
-                response_node_id: "child-response-node".to_owned(),
-            })
-        }
     }
 
     #[tokio::test]
@@ -335,7 +193,6 @@ mod tests {
         let search_requests = Arc::new(Mutex::new(Vec::new()));
         let executor = Arc::new(FakeExecutor {
             search_requests: search_requests.clone(),
-            use_requests: Arc::new(Mutex::new(Vec::new())),
         });
         let workspace_root = std::env::temp_dir().join("skill-tool-search");
         let runtime = search_runtime_tool(
@@ -364,132 +221,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn use_skill_runtime_executes_on_child_branch_via_executor() {
-        let use_requests = Arc::new(Mutex::new(Vec::new()));
-        let executor = Arc::new(FakeExecutor {
-            search_requests: Arc::new(Mutex::new(Vec::new())),
-            use_requests: use_requests.clone(),
-        });
-        let workspace_root = std::env::temp_dir().join("skill-tool-use");
-        let runtime = run_runtime(
-            run_tool_definition(),
-            workspace_root.clone(),
-            run_context(executor),
-        );
-
-        let outcome = runtime
-            .execute(
-                r#"{"name":"find-skills"}"#.to_owned(),
-                ToolInvocationContext {
-                    persisted_tool_use_node_id: Some("tool-use-node".to_owned()),
-                },
-            )
-            .await
-            .unwrap();
-        let requests = use_requests.lock().await;
-        let value: Value = serde_json::from_str(outcome.provider_output()).unwrap();
-
-        assert_eq!(value.as_object().expect("expected JSON object").len(), 1);
-        assert_eq!(value["text"], "Executed skill result");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].workspace_root, workspace_root);
-        assert_eq!(requests[0].session_branch, "main");
-        assert_eq!(
-            requests[0].session_role,
-            coco_mem::SessionRole::Orchestrator
-        );
-        assert_eq!(requests[0].parent_tool_use_id, "tool-use-node");
-        assert_eq!(requests[0].skill_name, "find-skills");
-        assert_eq!(requests[0].handoff, None);
-        assert!(matches!(
-            outcome,
-            ToolExecutionOutcome::SkillResult {
-                skill_name,
-                merge_parent,
-                ..
-            } if skill_name == "find-skills" && merge_parent == "child-response-node"
-        ));
-    }
-
-    #[tokio::test]
-    async fn use_skill_runtime_passes_string_handoff_as_skill_result() {
-        let use_requests = Arc::new(Mutex::new(Vec::new()));
-        let executor = Arc::new(FakeExecutor {
-            search_requests: Arc::new(Mutex::new(Vec::new())),
-            use_requests: use_requests.clone(),
-        });
-        let runtime = run_runtime(
-            run_tool_definition(),
-            Path::new("/tmp").to_path_buf(),
-            run_context(executor),
-        );
-
-        let outcome = runtime
-            .execute(
-                r#"{"name":"find-skills","handoff":"Summarize the docs decision."}"#.to_owned(),
-                ToolInvocationContext {
-                    persisted_tool_use_node_id: Some("tool-use-node".to_owned()),
-                },
-            )
-            .await
-            .unwrap();
-        let requests = use_requests.lock().await;
-        let value: Value = serde_json::from_str(outcome.provider_output()).unwrap();
-
-        assert_eq!(value["text"], "Executed skill result");
-        assert_eq!(
-            requests[0].handoff.as_deref(),
-            Some("Summarize the docs decision.")
-        );
-        assert!(matches!(
-            outcome,
-            ToolExecutionOutcome::SkillResult {
-                skill_name,
-                merge_parent,
-                ..
-            } if skill_name == "find-skills" && merge_parent == "child-response-node"
-        ));
-    }
-
-    #[test]
-    fn use_skill_definition_reports_current_skill_status() {
-        let executor = Arc::new(FakeExecutor {
-            search_requests: Arc::new(Mutex::new(Vec::new())),
-            use_requests: Arc::new(Mutex::new(Vec::new())),
-        });
-        let mut context = run_context(executor);
-        context.current_skill_name = Some("catgirl-role".to_owned());
-        let runtime = run_runtime(
-            run_tool_definition(),
-            Path::new("/tmp").to_path_buf(),
-            context,
-        );
-
-        let definition = runtime.tool_definition();
-
-        assert!(
-            definition
-                .description
-                .contains("Current skill status: already executing `catgirl-role`.")
-        );
-        assert!(
-            definition
-                .description
-                .contains("Do not call `use_skill` for `catgirl-role` again")
-        );
-    }
-
-    #[tokio::test]
     async fn invalid_json_is_rejected_before_delegation() {
         let search_requests = Arc::new(Mutex::new(Vec::new()));
-        let use_requests = Arc::new(Mutex::new(Vec::new()));
         let executor = Arc::new(FakeExecutor {
             search_requests: search_requests.clone(),
-            use_requests: use_requests.clone(),
         });
-        let runtime = run_runtime_tool(
-            run_tool_definition(),
-            Path::new("/tmp").to_path_buf(),
+        let runtime = search_runtime_tool(
+            search_tool_definition(),
+            std::env::temp_dir().join("skill-tool-invalid-json"),
             run_context(executor),
         );
 
@@ -497,51 +236,5 @@ mod tests {
 
         assert!(error.to_string().contains("must be valid JSON"));
         assert!(search_requests.lock().await.is_empty());
-        assert!(use_requests.lock().await.is_empty());
-    }
-
-    #[derive(Debug)]
-    struct FailingExecutor;
-
-    #[async_trait]
-    impl SkillToolExecutor for FailingExecutor {
-        async fn search_skill_tool(
-            &self,
-            _request: SearchSkillToolRequest,
-        ) -> std::result::Result<String, crate::ExecutorError> {
-            unreachable!("search_skill_tool should not be called")
-        }
-
-        async fn execute_skill_tool(
-            &self,
-            _request: UseSkillToolRequest,
-        ) -> std::result::Result<SkillToolExecutionResult, crate::ExecutorError> {
-            Err(crate::ExecutorError::OperationFailed {
-                message: "delegated failure".to_owned(),
-                source: None,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn use_skill_runtime_returns_executor_errors_as_tool_results() {
-        let workspace_root = std::env::temp_dir().join("skill-tool-use-failure");
-        let runtime = run_runtime(
-            run_tool_definition(),
-            workspace_root,
-            run_context(Arc::new(FailingExecutor)),
-        );
-
-        let outcome = runtime
-            .execute(
-                r#"{"name":"find-skills"}"#.to_owned(),
-                ToolInvocationContext {
-                    persisted_tool_use_node_id: Some("tool-use-node".to_owned()),
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.provider_output(), "delegated failure");
     }
 }

@@ -14,7 +14,7 @@ use coco_llm::{
     ActiveSkillRuntimeContext, COCO_SKILL_PERSIST_DIR_ENV, COCO_SKILL_PERSIST_ROOT_ENV,
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
     Error as LlmError, ExecutorError, LlmService, SearchSkillToolRequest, SkillToolExecutionResult,
-    SkillToolExecutor, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
+    SkillToolExecutor, SkillToolRequest, SkillToolRunResult,
 };
 use indoc::formatdoc;
 use serde::Serialize;
@@ -150,46 +150,6 @@ where
 
         let output = serde_json::to_string_pretty(&result).context(SerializeOutputSnafu)?;
         Ok(output)
-    }
-
-    async fn execute_skill_tool(
-        &self,
-        request: UseSkillToolRequest,
-    ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
-        let engine = self.upgrade_engine()?;
-        let skill = resolve_skill(
-            &request.workspace_root,
-            engine.service().store(),
-            request.session_role,
-            &request.skill_name,
-        )?;
-        let skill_request = SkillToolRequest {
-            workspace_root: request.workspace_root,
-            base_branch: request.session_branch,
-            parent_tool_use_id: request.parent_tool_use_id,
-            skill_name: skill.name.clone(),
-            skill_description: skill.description,
-            skill_path: skill.path.display().to_string(),
-            skill_body: skill.body,
-            scripts: skill.scripts,
-            session_role: skill.session_role,
-            enable_coco_shim: skill.enable_coco_shim,
-            handoff: request.handoff,
-        };
-
-        let runtime = materialize_skill_runtime(&skill_request)?;
-        engine
-            .execute_resolved_skill(skill_request, runtime, SkillExecutionParent::UseSkill)
-            .await
-            .map_err(executor_error_from_llm_error)
-    }
-}
-
-fn executor_error_from_llm_error(error: LlmError) -> ExecutorError {
-    let message = error.to_string();
-    ExecutorError::OperationFailed {
-        message,
-        source: Some(Box::new(error)),
     }
 }
 
@@ -358,39 +318,6 @@ where
         Ok(result)
     }
 
-    pub async fn execute_skill(
-        &self,
-        workspace_root: &Path,
-        base_branch: &str,
-        session_role: SessionRole,
-        parent_tool_use_id: &str,
-        skill_name: &str,
-    ) -> std::result::Result<SkillToolExecutionResult, EngineError> {
-        let skill = resolve_skill(
-            workspace_root,
-            self.service().store(),
-            session_role,
-            skill_name,
-        )?;
-        let request = SkillToolRequest {
-            workspace_root: workspace_root.to_path_buf(),
-            base_branch: base_branch.to_owned(),
-            parent_tool_use_id: parent_tool_use_id.to_owned(),
-            skill_name: skill.name.clone(),
-            skill_description: skill.description.clone(),
-            skill_path: skill.path.display().to_string(),
-            skill_body: skill.body,
-            scripts: skill.scripts,
-            session_role: skill.session_role,
-            enable_coco_shim: skill.enable_coco_shim,
-            handoff: None,
-        };
-        let runtime = materialize_skill_runtime(&request)?;
-        self.execute_resolved_skill(request, runtime, SkillExecutionParent::UseSkill)
-            .await
-            .map_err(EngineError::from)
-    }
-
     pub async fn execute_skill_invocation(
         &self,
         workspace_root: &Path,
@@ -420,7 +347,7 @@ where
             handoff,
         };
         let runtime = materialize_skill_runtime(&request)?;
-        self.execute_resolved_skill(request, runtime, SkillExecutionParent::SkillInvocation)
+        self.execute_resolved_skill(request, runtime)
             .await
             .map_err(EngineError::from)
     }
@@ -429,17 +356,11 @@ where
         &self,
         request: SkillToolRequest,
         runtime: MaterializedSkillRuntime,
-        parent: SkillExecutionParent,
     ) -> std::result::Result<SkillToolExecutionResult, LlmError> {
         let service = self.service();
         let store = service.store();
         let child_branch = temporary_skill_branch_name(&request.base_branch, &request.skill_name);
-        ensure_skill_execution_parent(
-            store,
-            &request.parent_tool_use_id,
-            parent,
-            &request.skill_name,
-        )?;
+        ensure_skill_invocation_node(store, &request.parent_tool_use_id, &request.skill_name)?;
         let child_session_anchor_id = append_skill_session_anchor(store, &request)?;
 
         store
@@ -466,63 +387,17 @@ where
                 response_node_id: result.response_node_id,
             }),
             (Err(workflow), Ok(())) => Err(workflow),
-            (Ok(_), Err(cleanup)) => Err(LlmError::UseSkillCleanup {
+            (Ok(_), Err(cleanup)) => Err(LlmError::SkillCleanup {
                 branch: child_branch,
                 source: Box::new(cleanup),
             }),
-            (Err(workflow), Err(cleanup)) => Err(LlmError::UseSkillWorkflowFailedCleanup {
+            (Err(workflow), Err(cleanup)) => Err(LlmError::SkillWorkflowFailedCleanup {
                 branch: child_branch,
                 workflow: Box::new(workflow),
                 cleanup: Box::new(cleanup),
             }),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SkillExecutionParent {
-    UseSkill,
-    SkillInvocation,
-}
-
-fn ensure_skill_execution_parent<S>(
-    store: &S,
-    reference: &str,
-    parent: SkillExecutionParent,
-    skill_name: &str,
-) -> std::result::Result<(), LlmError>
-where
-    S: NodeStore,
-{
-    match parent {
-        SkillExecutionParent::UseSkill => ensure_use_skill_node(store, reference),
-        SkillExecutionParent::SkillInvocation => {
-            ensure_skill_invocation_node(store, reference, skill_name)
-        }
-    }
-}
-
-fn ensure_use_skill_node<S>(store: &S, reference: &str) -> std::result::Result<(), LlmError>
-where
-    S: NodeStore,
-{
-    let node = store
-        .get_node(reference)
-        .map_err(|source| LlmError::Memory {
-            source: Box::new(source),
-        })?;
-
-    if node.kind.as_tool_uses().is_some_and(|tool_uses| {
-        tool_uses
-            .iter()
-            .any(|tool_use| tool_use.name == "use_skill")
-    }) {
-        return Ok(());
-    }
-
-    Err(LlmError::InvalidAnchor {
-        anchor_id: reference.to_owned(),
-    })
 }
 
 fn ensure_skill_invocation_node<S>(

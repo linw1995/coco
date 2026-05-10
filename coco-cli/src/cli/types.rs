@@ -38,8 +38,6 @@ pub enum CliTool {
     WriteStdin,
     #[value(name = "search_skill")]
     SearchSkill,
-    #[value(name = "use_skill")]
-    UseSkill,
 }
 
 impl CliTool {
@@ -48,7 +46,6 @@ impl CliTool {
             "exec_command" => Some(Self::ExecCommand),
             "write_stdin" => Some(Self::WriteStdin),
             "search_skill" => Some(Self::SearchSkill),
-            "use_skill" => Some(Self::UseSkill),
             _ => None,
         }
     }
@@ -58,7 +55,6 @@ impl CliTool {
             Self::ExecCommand => "exec_command",
             Self::WriteStdin => "write_stdin",
             Self::SearchSkill => "search_skill",
-            Self::UseSkill => "use_skill",
         }
     }
 }

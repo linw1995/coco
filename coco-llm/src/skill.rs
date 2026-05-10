@@ -40,16 +40,6 @@ pub struct SearchSkillToolRequest {
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UseSkillToolRequest {
-    pub workspace_root: PathBuf,
-    pub session_branch: String,
-    pub session_role: SessionRole,
-    pub parent_tool_use_id: String,
-    pub skill_name: String,
-    pub handoff: Option<String>,
-}
-
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum ExecutorError {
@@ -70,11 +60,6 @@ pub trait SkillToolExecutor: Send + Sync {
         &self,
         request: SearchSkillToolRequest,
     ) -> std::result::Result<String, ExecutorError>;
-
-    async fn execute_skill_tool(
-        &self,
-        request: UseSkillToolRequest,
-    ) -> std::result::Result<SkillToolExecutionResult, ExecutorError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

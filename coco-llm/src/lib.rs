@@ -29,7 +29,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use skill::{
     ExecutorError, SearchSkillToolRequest, SkillResultEvent, SkillToolExecutionResult,
-    SkillToolExecutor, SkillToolRequest, SkillToolRunResult, UseSkillToolRequest,
+    SkillToolExecutor, SkillToolRequest, SkillToolRunResult,
 };
 
 pub use coco_mem;
@@ -314,14 +314,7 @@ pub(crate) struct ToolInvocationContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolExecutionOutcome {
-    ToolResult {
-        provider_output: String,
-    },
-    SkillResult {
-        skill_name: String,
-        merge_parent: String,
-        provider_output: String,
-    },
+    ToolResult { provider_output: String },
 }
 
 impl ToolExecutionOutcome {
@@ -331,24 +324,9 @@ impl ToolExecutionOutcome {
         }
     }
 
-    pub fn skill_result(
-        skill_name: impl Into<String>,
-        merge_parent: impl Into<String>,
-        provider_output: impl Into<String>,
-    ) -> Self {
-        Self::SkillResult {
-            skill_name: skill_name.into(),
-            merge_parent: merge_parent.into(),
-            provider_output: provider_output.into(),
-        }
-    }
-
     pub fn provider_output(&self) -> &str {
         match self {
             Self::ToolResult { provider_output } => provider_output,
-            Self::SkillResult {
-                provider_output, ..
-            } => provider_output,
         }
     }
 
@@ -356,15 +334,6 @@ impl ToolExecutionOutcome {
         let event = match self {
             Self::ToolResult { provider_output } => BackendEventPayload::ToolResult(ToolResult {
                 id: tool_id,
-                output: provider_output,
-            }),
-            Self::SkillResult {
-                skill_name,
-                merge_parent,
-                provider_output,
-            } => BackendEventPayload::SkillResult(SkillResultEvent {
-                skill_name,
-                merge_parent,
                 output: provider_output,
             }),
         };
@@ -547,7 +516,6 @@ impl Default for UnifiedExecCliBridgeHandle {
         Self::unavailable()
     }
 }
-
 #[derive(Debug)]
 struct UnavailableSkillToolExecutor;
 
@@ -557,13 +525,6 @@ impl SkillToolExecutor for UnavailableSkillToolExecutor {
         &self,
         _request: SearchSkillToolRequest,
     ) -> std::result::Result<String, ExecutorError> {
-        Err(ExecutorError::Unavailable)
-    }
-
-    async fn execute_skill_tool(
-        &self,
-        _request: UseSkillToolRequest,
-    ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
         Err(ExecutorError::Unavailable)
     }
 }
@@ -587,13 +548,6 @@ impl SkillToolExecutorHandle {
         request: SearchSkillToolRequest,
     ) -> std::result::Result<String, ExecutorError> {
         self.inner.search_skill_tool(request).await
-    }
-
-    pub async fn execute_skill_tool(
-        &self,
-        request: UseSkillToolRequest,
-    ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
-        self.inner.execute_skill_tool(request).await
     }
 }
 
@@ -919,13 +873,13 @@ pub enum Error {
         context: Box<BackendFailureContext>,
     },
 
-    #[snafu(display("Failed to clean up temporary use_skill branch {branch:?}: {source}"))]
-    UseSkillCleanup { branch: String, source: Box<Error> },
+    #[snafu(display("Failed to clean up temporary skill branch {branch:?}: {source}"))]
+    SkillCleanup { branch: String, source: Box<Error> },
 
     #[snafu(display(
-        "use_skill workflow failed and cleanup of temporary branch {branch:?} also failed: workflow={workflow}; cleanup={cleanup}"
+        "skill workflow failed and cleanup of temporary branch {branch:?} also failed: workflow={workflow}; cleanup={cleanup}"
     ))]
-    UseSkillWorkflowFailedCleanup {
+    SkillWorkflowFailedCleanup {
         branch: String,
         workflow: Box<Error>,
         cleanup: Box<Error>,
@@ -1981,7 +1935,7 @@ where
         for index in 0..ordered.len() {
             let node = &ordered[index];
             let next = ordered.get(index + 1);
-            if should_skip_inherited_use_skill_tool_use(node, next) {
+            if should_skip_skill_invocation_tool_use(node, next) {
                 continue;
             }
             self.apply_node_to_context(reference, &mut state, node)?;
@@ -2090,14 +2044,13 @@ where
     }
 }
 
-fn should_skip_inherited_use_skill_tool_use(
+fn should_skip_skill_invocation_tool_use(
     node: &coco_mem::Node,
     next: Option<&coco_mem::Node>,
 ) -> bool {
-    // use_skill inheritance is node-scoped. When a grouped sibling ToolUse node
-    // creates a skill execution anchor, the child skill branch should not inherit
-    // any sibling from that fan-out node as parent provider context.
-    is_use_skill_tool_use(node) && next.is_some_and(is_skill_execution_anchor)
+    // Skill invocation is node-scoped. The child skill branch should not inherit
+    // the exec_command ToolUse that launched `coco skill run`.
+    node.kind.as_tool_uses().is_some() && next.is_some_and(is_skill_invocation_anchor)
 }
 
 fn is_provider_context_start(node: &coco_mem::Node) -> bool {
@@ -2116,26 +2069,11 @@ fn is_context_start_session(session: &SessionAnchor) -> bool {
             .is_some_and(|active_skill| active_skill.handoff.is_some())
 }
 
-fn is_use_skill_tool_use(node: &coco_mem::Node) -> bool {
-    node.kind.as_tool_uses().is_some_and(|tool_uses| {
-        tool_uses
-            .iter()
-            .any(|tool_use| tool_use.name == "use_skill")
-    })
-}
-
-fn is_skill_execution_anchor(node: &coco_mem::Node) -> bool {
-    match &node.kind {
-        Kind::Anchor(anchor) => {
-            anchor
-                .as_prompt()
-                .is_some_and(|prompt| is_skill_execution_prompt(&prompt.prompt))
-                || anchor
-                    .as_session()
-                    .is_some_and(|session| is_skill_execution_prompt(&session.prompt))
-        }
-        _ => false,
-    }
+fn is_skill_invocation_anchor(node: &coco_mem::Node) -> bool {
+    matches!(
+        &node.kind,
+        Kind::Anchor(anchor) if anchor.as_skill_invocation().is_some()
+    )
 }
 
 fn is_skill_execution_prompt(prompt: &str) -> bool {
@@ -2285,14 +2223,13 @@ enum RuntimeTool {
     ExecCommand(unified_exec_tool::UnifiedExecToolRuntime),
     WriteStdin(unified_exec_tool::UnifiedExecToolRuntime),
     SearchSkill(skill_tool::SkillToolRuntime),
-    UseSkill(skill_tool::SkillToolRuntime),
 }
 
 impl RuntimeTool {
     fn definition(&self) -> CompletionToolDefinition {
         match self {
             Self::ExecCommand(tool) | Self::WriteStdin(tool) => tool.tool_definition(),
-            Self::SearchSkill(tool) | Self::UseSkill(tool) => tool.tool_definition(),
+            Self::SearchSkill(tool) => tool.tool_definition(),
         }
     }
 
@@ -2305,7 +2242,7 @@ impl RuntimeTool {
             Self::ExecCommand(tool) | Self::WriteStdin(tool) => {
                 tool.execute(args, invocation).await
             }
-            Self::SearchSkill(tool) | Self::UseSkill(tool) => tool.execute(args, invocation).await,
+            Self::SearchSkill(tool) => tool.execute(args, invocation).await,
         }
     }
 }
@@ -2360,14 +2297,9 @@ fn build_runtime_tools(
                 workspace_root.clone(),
                 session.tool_runtime_env.clone(),
             )),
-            "use_skill" => RuntimeTool::UseSkill(skill_tool::run_runtime(
-                tool.clone(),
-                workspace_root.clone(),
-                session.tool_runtime_env.clone(),
-            )),
             other => {
                 return Err(BackendError::failed(format!(
-                    "unsupported tool {other:?}; only \"exec_command\", \"write_stdin\", \"search_skill\", and \"use_skill\" are implemented"
+                    "unsupported tool {other:?}; only \"exec_command\", \"write_stdin\", and \"search_skill\" are implemented"
                 )));
             }
         };
@@ -3108,12 +3040,6 @@ impl CompletionRunner {
         tool_call: CompletionToolCall,
     ) -> std::result::Result<ToolCallInvocation, BackendError> {
         let tool_use_node_id = self.tool_use_node_ids.remove(&tool_call.id);
-        if tool_call.function.name == "use_skill" && tool_use_node_id.is_none() {
-            return Err(BackendError::failed(format!(
-                "missing persisted tool_use node for {:?}",
-                tool_call.id
-            )));
-        }
 
         Ok(ToolCallInvocation {
             index,
@@ -3661,48 +3587,6 @@ mod tests {
         ) -> std::result::Result<String, ExecutorError> {
             Ok(r#"{"skills":[]}"#.to_owned())
         }
-
-        async fn execute_skill_tool(
-            &self,
-            request: UseSkillToolRequest,
-        ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
-            let response_node_id = request.parent_tool_use_id.clone();
-            Ok(SkillToolExecutionResult {
-                result: SkillToolRunResult {
-                    text: format!("Executed {}", request.skill_name),
-                },
-                response_node_id,
-            })
-        }
-    }
-
-    #[derive(Debug)]
-    struct BarrierSkillExecutor {
-        barrier: Arc<Barrier>,
-    }
-
-    #[async_trait]
-    impl SkillToolExecutor for BarrierSkillExecutor {
-        async fn search_skill_tool(
-            &self,
-            _request: SearchSkillToolRequest,
-        ) -> std::result::Result<String, ExecutorError> {
-            Ok(r#"{"skills":[]}"#.to_owned())
-        }
-
-        async fn execute_skill_tool(
-            &self,
-            request: UseSkillToolRequest,
-        ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
-            self.barrier.wait().await;
-            let response_node_id = request.parent_tool_use_id.clone();
-            Ok(SkillToolExecutionResult {
-                result: SkillToolRunResult {
-                    text: format!("Executed {}", request.skill_name),
-                },
-                response_node_id,
-            })
-        }
     }
 
     #[derive(Debug)]
@@ -3725,29 +3609,6 @@ mod tests {
                 self.first_done.notify_one();
             }
             Ok(output)
-        }
-
-        async fn execute_skill_tool(
-            &self,
-            request: UseSkillToolRequest,
-        ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
-            if request.skill_name == "rust-patterns" {
-                self.release_second.notified().await;
-            }
-
-            let response_node_id = request.parent_tool_use_id.clone();
-            let result = SkillToolExecutionResult {
-                result: SkillToolRunResult {
-                    text: format!("Executed {}", request.skill_name),
-                },
-                response_node_id,
-            };
-
-            if request.skill_name == "fast-rust" {
-                self.first_done.notify_one();
-            }
-
-            Ok(result)
         }
     }
 
@@ -3781,8 +3642,8 @@ mod tests {
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    name: "use_skill".to_owned(),
-                    input: serde_json::json!({"name": "find-skills"}),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "coco skill run find-skills"}),
                 }),
                 Some("execution-step-1"),
                 Some("tool-call-1"),
@@ -4064,121 +3925,6 @@ mod tests {
             Some("catgirl-role".to_owned())
         );
         assert_eq!(current_skill_name_from_prompt("regular prompt"), None);
-    }
-
-    #[tokio::test]
-    async fn handoff_use_skill_waits_for_sibling_results_before_continuing() {
-        let use_skill = rig_tool_call_content(
-            "tool-call-1",
-            Some("call-1".to_owned()),
-            "use_skill",
-            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
-        );
-        let search_skill = rig_tool_call_content(
-            "tool-call-2",
-            Some("call-2".to_owned()),
-            "search_skill",
-            serde_json::json!({"query": "rust"}),
-        );
-        let turn = BackendTurn::from_assistant_choice(
-            Some("assistant-1".to_owned()),
-            rig::OneOrMany::many(vec![use_skill, search_skill])
-                .expect("assistant choice should be non-empty"),
-        );
-        let backend = FakeBackend::with_turns(vec![(
-            "main",
-            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
-        )]);
-        let store = MemoryStore::new();
-        let service = LlmService::builder(store.clone(), backend)
-            .with_skill_tool_executor(Arc::new(FakeSkillExecutor))
-            .build();
-        service
-            .create_session(SessionConfig {
-                tools: vec![
-                    crate::builtin_tool_definition("use_skill").unwrap(),
-                    crate::builtin_tool_definition("search_skill").unwrap(),
-                ],
-                ..session_config("main")
-            })
-            .await
-            .unwrap();
-
-        let result = service
-            .prompt(prompt_request("main", "delegate and continue"))
-            .await
-            .unwrap();
-
-        assert_eq!(result.text, "done");
-        let session = service.resolve_session("main").unwrap();
-        assert!(matches!(
-            &session.provider_history[3],
-            rig::completion::message::Message::User { content }
-                if {
-                    let tool_results = content.iter().collect::<Vec<_>>();
-                    tool_results.len() == 2
-                        && matches!(
-                            tool_results[0],
-                            rig::completion::message::UserContent::ToolResult(tool_result)
-                                if tool_result.id == "tool-call-1"
-                                    && tool_result.call_id.as_deref() == Some("call-1")
-                        )
-                        && matches!(
-                            tool_results[1],
-                            rig::completion::message::UserContent::ToolResult(tool_result)
-                                if tool_result.id == "tool-call-2"
-                                    && tool_result.call_id.as_deref() == Some("call-2")
-                        )
-                }
-        ));
-    }
-
-    #[tokio::test]
-    async fn sibling_tool_calls_execute_in_parallel() {
-        let first = rig_tool_call_content(
-            "tool-call-1",
-            Some("call-1".to_owned()),
-            "use_skill",
-            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
-        );
-        let second = rig_tool_call_content(
-            "tool-call-2",
-            Some("call-2".to_owned()),
-            "use_skill",
-            serde_json::json!({"name": "rust-patterns", "handoff": "Review the API."}),
-        );
-        let turn = BackendTurn::from_assistant_choice(
-            Some("assistant-1".to_owned()),
-            rig::OneOrMany::many(vec![first, second])
-                .expect("assistant choice should be non-empty"),
-        );
-        let backend = FakeBackend::with_turns(vec![(
-            "main",
-            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
-        )]);
-        let store = MemoryStore::new();
-        let service = LlmService::builder(store.clone(), backend)
-            .with_skill_tool_executor(Arc::new(BarrierSkillExecutor {
-                barrier: Arc::new(Barrier::new(2)),
-            }))
-            .build();
-        service
-            .create_session(SessionConfig {
-                tools: vec![crate::builtin_tool_definition("use_skill").unwrap()],
-                ..session_config("main")
-            })
-            .await
-            .unwrap();
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            service.prompt(prompt_request("main", "delegate twice")),
-        )
-        .await
-        .expect("sibling tool calls should not block each other")
-        .unwrap();
-
-        assert_eq!(result.text, "done");
     }
 
     #[tokio::test]
@@ -4952,23 +4698,37 @@ mod tests {
                 )),
             })
             .unwrap();
-        let use_skill_id = store
+        let tool_use_id = store
             .append(NewNode {
                 parent: prompt_id,
                 role: Role::LLM,
                 metadata: None,
                 kind: Kind::tool_use(ToolUse {
                     id: "tool-call-1".to_owned(),
-                    name: "use_skill".to_owned(),
-                    input: serde_json::json!({"name": "fast-rust"}),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "coco skill run fast-rust"}),
                 }),
+            })
+            .unwrap();
+        let invocation_id = store
+            .append(NewNode {
+                parent: tool_use_id,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    vec![],
+                    coco_mem::SkillInvocationAnchor {
+                        skill_name: "fast-rust".to_owned(),
+                        mode: coco_mem::SkillInvocationMode::InheritContext,
+                    },
+                )),
             })
             .unwrap();
         let child_config = session_config("child");
         let child_prompt = "You are executing the skill `fast-rust` on an isolated child branch.";
         let child_anchor_id = store
             .append(NewNode {
-                parent: use_skill_id,
+                parent: invocation_id,
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(
@@ -5014,7 +4774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_reconstruction_skips_use_skill_that_created_skill_session() {
+    async fn context_reconstruction_skips_tool_use_that_created_skill_invocation() {
         let (service, _) = skill_child_context_fixture(None).await;
         let session = service.resolve_session("child").unwrap();
 
@@ -6105,7 +5865,7 @@ mod tests {
         assert!(kind_has_tool_use(
             &tool_use.kind,
             "tool-call-1",
-            "use_skill"
+            "exec_command"
         ));
         let Kind::Anchor(anchor) = &skill_result.kind else {
             panic!("expected skill result anchor");
