@@ -126,6 +126,9 @@ pub struct SkillRunCommand {
     #[arg(long, hide = true)]
     pub parent_tool_use_id: Option<String>,
 
+    #[arg(long, hide = true)]
+    pub branch: Option<String>,
+
     #[arg(long)]
     pub json: bool,
 }

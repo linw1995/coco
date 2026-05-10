@@ -197,7 +197,9 @@ where
             )
             .await
         }
-        Command::Skill(command) => run_skill_command(command, services.shared_store).await,
+        Command::Skill(command) => {
+            run_skill_command(command, services.shared_store, services.llm).await
+        }
         Command::Daemon(command) => {
             run_daemon_command(
                 command,
@@ -387,7 +389,7 @@ fn apply_forwarded_defaults(
     {
         let parent_tool_use_id = parent_tool_use_id.to_owned();
         apply_forwarded_shadow_parent(cli, parent_tool_use_id.clone());
-        apply_forwarded_skill_parent(cli, parent_tool_use_id);
+        apply_forwarded_skill_parent(cli, parent_tool_use_id, branch_env.map(str::to_owned));
     }
 
     if has_explicit_flag(args, "branch") {
@@ -440,11 +442,15 @@ fn apply_forwarded_shadow_parent(cli: &mut Cli, shadow_parent: String) {
     }
 }
 
-fn apply_forwarded_skill_parent(cli: &mut Cli, parent_tool_use_id: String) {
+fn apply_forwarded_skill_parent(cli: &mut Cli, parent_tool_use_id: String, branch: Option<String>) {
     if let Command::Skill(command) = &mut cli.command
         && let SkillSubcommand::Run(command) = &mut command.command
-        && command.parent_tool_use_id.is_none()
     {
-        command.parent_tool_use_id = Some(parent_tool_use_id);
+        if command.parent_tool_use_id.is_none() {
+            command.parent_tool_use_id = Some(parent_tool_use_id);
+        }
+        if command.branch.is_none() {
+            command.branch = branch;
+        }
     }
 }

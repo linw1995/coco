@@ -100,6 +100,12 @@ pub enum Error {
     ))]
     MissingSkillInvocationParent,
 
+    #[snafu(display("skill run requires a branch context; run it through exec_command"))]
+    MissingSkillRunBranch,
+
+    #[snafu(display("skill invocation parent {parent_tool_use_id:?} has no session ancestor"))]
+    MissingSkillInvocationSession { parent_tool_use_id: String },
+
     #[snafu(display("skill invocation parent {parent_tool_use_id:?} is not a tool use node"))]
     InvalidSkillInvocationParent { parent_tool_use_id: String },
 

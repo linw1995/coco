@@ -4768,10 +4768,22 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
     .await;
 
     let store = open_store(&store_path).unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "fast-rust",
+            SkillVersionSpec {
+                description: "Review Rust changes.".to_owned(),
+                body: "# Fast Rust".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
     let session_head = store.get_branch_head("main").unwrap();
     let parent_tool_use =
         append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
-    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
+    let llm = llm_with_test_provider_config(store.clone(), UseSkillBackend::default());
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
@@ -4803,15 +4815,19 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
     let output: Value = serde_json::from_str(&response.stdout).unwrap();
     assert_eq!(output["parent_tool_use_id"], parent_tool_use);
     assert_eq!(output["skill_name"], "fast-rust");
+    assert_eq!(output["text"], "delegated output");
 
     let children = store.list_children(&parent_tool_use).unwrap();
-    let invocation = children
+    let invocation_node = children
         .iter()
         .find_map(|node| match &node.kind {
-            Kind::Anchor(anchor) => anchor.as_skill_invocation(),
+            Kind::Anchor(anchor) => anchor
+                .as_skill_invocation()
+                .map(|invocation| (node, invocation)),
             _ => None,
         })
         .expect("expected skill invocation child");
+    let invocation = invocation_node.1;
     assert_eq!(invocation.skill_name, "fast-rust");
     assert_eq!(
         invocation.mode,
@@ -4819,6 +4835,45 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
             prompt: "Review the diff.".to_owned(),
         }
     );
+
+    let invocation_children = store.list_children(&invocation_node.0.id).unwrap();
+    let child_session_anchor = invocation_children
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor.as_session().map(|session| (node, session)),
+            _ => None,
+        })
+        .expect("expected child session anchor under skill invocation");
+    assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
+    assert_eq!(
+        child_session_anchor.1.active_skill.as_ref().unwrap().name,
+        "fast-rust"
+    );
+    assert_eq!(
+        child_session_anchor
+            .1
+            .active_skill
+            .as_ref()
+            .unwrap()
+            .handoff
+            .as_deref(),
+        Some("Review the diff.")
+    );
+
+    let skill_result = invocation_children
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor
+                .as_skill_result()
+                .filter(|result| result.skill_name == "fast-rust")
+                .map(|result| (anchor, result)),
+            _ => None,
+        })
+        .expect("expected skill result under skill invocation");
+    let response_node_id = output["response_node_id"].as_str().unwrap();
+    assert_eq!(skill_result.0.merge_parent_node_ids(), [response_node_id]);
+    let value: Value = serde_json::from_str(&skill_result.1.output).unwrap();
+    assert_eq!(value["text"], "delegated output");
 }
 
 #[tokio::test]
