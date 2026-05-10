@@ -211,8 +211,8 @@ fn collect_visible_graph_nodes(
                     .map(|parent| parent.node_id().to_owned()),
             );
         }
-        if is_use_skill_tool_use(&node) {
-            collect_visible_anchor_child_subtrees(store, &node.id, &mut pending)?;
+        if node.kind.as_tool_uses().is_some() {
+            collect_visible_skill_invocation_subtrees(store, &node.id, &mut pending)?;
         }
 
         visible_node_ids.insert(node.id.clone());
@@ -222,7 +222,7 @@ fn collect_visible_graph_nodes(
     Ok(())
 }
 
-fn collect_visible_anchor_child_subtrees(
+fn collect_visible_skill_invocation_subtrees(
     store: &impl NodeStore,
     parent_id: &str,
     pending: &mut Vec<String>,
@@ -231,7 +231,10 @@ fn collect_visible_anchor_child_subtrees(
         .list_children(parent_id)
         .context(StoreSnafu)?
         .into_iter()
-        .filter_map(|child| matches!(child.kind, Kind::Anchor(_)).then_some(child.id))
+        .filter_map(|child| match child.kind {
+            Kind::Anchor(anchor) if anchor.as_skill_invocation().is_some() => Some(child.id),
+            _ => None,
+        })
         .collect::<Vec<_>>();
     let mut visited = BTreeSet::new();
 
@@ -247,14 +250,6 @@ fn collect_visible_anchor_child_subtrees(
     }
 
     Ok(())
-}
-
-fn is_use_skill_tool_use(node: &Node) -> bool {
-    node.kind.as_tool_uses().is_some_and(|tool_uses| {
-        tool_uses
-            .iter()
-            .any(|tool_use| tool_use.name == "use_skill")
-    })
 }
 
 fn resolve_visible_parent(visible_node_ids: &BTreeSet<String>, start_id: &str) -> Option<String> {

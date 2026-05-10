@@ -8,7 +8,7 @@ use clap::Parser;
 use coco_llm::coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, JobStore, Kind, MergeParent, NewNode,
     NodeStore, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionStore,
-    SkillInvocationMode, SkillResultAnchor, ToolResult, ToolUse,
+    SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEvent, BackendEventPayload, BackendTurn, CompletionBackend,
@@ -803,6 +803,27 @@ fn append_skill_result_anchor(
                 SkillResultAnchor {
                     skill_name: skill_name.to_owned(),
                     output: output.to_owned(),
+                },
+            )),
+        })
+        .unwrap()
+}
+
+fn append_skill_invocation_anchor(
+    store: &impl NodeStore,
+    parent: &str,
+    skill_name: &str,
+) -> String {
+    store
+        .append(NewNode {
+            parent: parent.to_owned(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_invocation(
+                vec![],
+                SkillInvocationAnchor {
+                    skill_name: skill_name.to_owned(),
+                    mode: SkillInvocationMode::InheritContext,
                 },
             )),
         })
@@ -2924,16 +2945,24 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
 
     let store = open_store(&store_path).unwrap();
     let session_head = store.get_branch_head("main").unwrap();
-    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "use_skill");
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command");
     store
         .set_branch_head("main", &session_head, &tool_use_id)
         .unwrap();
+    let invocation_id = append_skill_invocation_anchor(&store, &tool_use_id, "fast-rust");
     let child_session_id = append_session_anchor(
         &store,
-        &tool_use_id,
+        &invocation_id,
         "You are executing the skill `fast-rust` on an isolated branch.",
     );
     let child_output_id = append_text_node(&store, &child_session_id, "Delegated result");
+    let skill_result_id = append_skill_result_anchor(
+        &store,
+        &invocation_id,
+        &child_output_id,
+        "fast-rust",
+        "Delegated result",
+    );
     let tool_result_id =
         append_tool_result_node(&store, &tool_use_id, "tool-1", "Delegated result");
     store
@@ -2951,8 +2980,13 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
 
     let short_id = |id: &str| id.chars().take(8).collect::<String>();
     assert!(graph_output.contains(&format!("* {} tool_result", short_id(&tool_result_id))));
+    assert!(graph_output.contains(&format!("| * {} skill_result", short_id(&skill_result_id))));
     assert!(graph_output.contains(&format!("| * {} text", short_id(&child_output_id))));
     assert!(graph_output.contains(&format!("| * {} session", short_id(&child_session_id))));
+    assert!(graph_output.contains(&format!(
+        "| * {} skill_invocation",
+        short_id(&invocation_id)
+    )));
     assert!(graph_output.contains(&format!("* {} tool_use", short_id(&tool_use_id))));
 }
 
