@@ -535,6 +535,7 @@ where
     let execution_id = response_node
         .metadata
         .as_ref()
+        .and_then(|metadata| metadata.first())
         .and_then(|metadata| metadata.execution_id.clone());
 
     match response_node.kind {

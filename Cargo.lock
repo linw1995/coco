@@ -421,6 +421,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "coco-mem",
+ "futures",
  "indoc",
  "nanoid 0.5.0",
  "portable-pty",

@@ -16,10 +16,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
-    MergeParent, NewNode, NodeStore, PauseReason, PromptAnchor, ProviderMetadata, Role,
-    RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
+    MergeParent, NewNode, NodeMetadata, NodeStore, PauseReason, PromptAnchor, ProviderMetadata,
+    Role, RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
     StoreError, Tool, ToolResult, ToolUse,
 };
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::IntoError;
@@ -385,11 +386,14 @@ struct TraceNodeAppenderHandle {
 }
 
 trait TraceNodeAppender: Send + Sync {
+    /// Returns the current trace tail.
+    fn head_id(&self) -> std::result::Result<String, BackendError>;
+
     /// Appends a store node to the current trace tail.
     fn append(
         &self,
         role: Role,
-        metadata: Option<BackendMetadata>,
+        metadata: Option<NodeMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError>;
 }
@@ -402,10 +406,14 @@ impl TraceNodeAppenderHandle {
     fn append(
         &self,
         role: Role,
-        metadata: Option<BackendMetadata>,
+        metadata: Option<NodeMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError> {
         self.inner.append(role, metadata, kind)
+    }
+
+    fn head_id(&self) -> std::result::Result<String, BackendError> {
+        self.inner.head_id()
     }
 }
 
@@ -419,10 +427,18 @@ impl<S> TraceNodeAppender for StoreNodeAppender<S>
 where
     S: NodeStore + Send + Sync,
 {
+    fn head_id(&self) -> std::result::Result<String, BackendError> {
+        Ok(self
+            .head_id
+            .lock()
+            .expect("trace node appender lock poisoned")
+            .clone())
+    }
+
     fn append(
         &self,
         role: Role,
-        metadata: Option<BackendMetadata>,
+        metadata: Option<NodeMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError> {
         let mut head_id = self
@@ -1601,9 +1617,8 @@ where
         events: &[BackendEvent],
     ) -> std::result::Result<String, StoreError> {
         let mut parent_id = parent_id;
-        for event in events {
-            let (role, metadata, kind) =
-                persisted_node_from_backend_event(event.clone(), execution);
+        for (role, metadata, kind) in persisted_nodes_from_backend_events(events, execution) {
+            let kind = normalize_kind_for_primary_parent(kind, &parent_id);
             parent_id = self.store.append(NewNode {
                 parent: parent_id,
                 role,
@@ -2069,6 +2084,9 @@ fn should_skip_inherited_use_skill_tool_use(
     node: &coco_mem::Node,
     next: Option<&coco_mem::Node>,
 ) -> bool {
+    // use_skill inheritance is node-scoped. When a grouped sibling ToolUse node
+    // creates a skill execution anchor, the child skill branch should not inherit
+    // any sibling from that fan-out node as parent provider context.
     is_use_skill_tool_use(node) && next.is_some_and(is_skill_execution_anchor)
 }
 
@@ -2089,7 +2107,11 @@ fn is_context_start_session(session: &SessionAnchor) -> bool {
 }
 
 fn is_use_skill_tool_use(node: &coco_mem::Node) -> bool {
-    matches!(&node.kind, Kind::ToolUse(ToolUse { name, .. }) if name == "use_skill")
+    node.kind.as_tool_uses().is_some_and(|tool_uses| {
+        tool_uses
+            .iter()
+            .any(|tool_use| tool_use.name == "use_skill")
+    })
 }
 
 fn is_skill_execution_anchor(node: &coco_mem::Node) -> bool {
@@ -2242,11 +2264,13 @@ where
 
 const DEFAULT_AGENT_MAX_TURNS: usize = 100;
 
+#[derive(Clone)]
 struct RuntimeToolSet {
     definitions: Vec<CompletionToolDefinition>,
     tools: HashMap<String, RuntimeTool>,
 }
 
+#[derive(Clone)]
 enum RuntimeTool {
     ExecCommand(unified_exec_tool::UnifiedExecToolRuntime),
     WriteStdin(unified_exec_tool::UnifiedExecToolRuntime),
@@ -2455,7 +2479,7 @@ fn provider_metadata(call_id: Option<String>) -> Option<ProviderMetadata> {
 fn persisted_node_from_backend_event(
     envelope: BackendEvent,
     execution: &ExecutionMetadata,
-) -> (Role, Option<BackendMetadata>, Kind) {
+) -> (Role, Option<NodeMetadata>, Kind) {
     let metadata = BackendMetadata::builder()
         .execution(execution)
         .maybe_provider(envelope.metadata.as_ref())
@@ -2463,9 +2487,9 @@ fn persisted_node_from_backend_event(
 
     match envelope.event {
         BackendEventPayload::AssistantText(text) => (Role::LLM, metadata, Kind::Text(text)),
-        BackendEventPayload::ToolUse(tool_use) => (Role::LLM, metadata, Kind::ToolUse(tool_use)),
+        BackendEventPayload::ToolUse(tool_use) => (Role::LLM, metadata, Kind::tool_use(tool_use)),
         BackendEventPayload::ToolResult(tool_result) => {
-            (Role::User, metadata, Kind::ToolResult(tool_result))
+            (Role::User, metadata, Kind::tool_result(tool_result))
         }
         BackendEventPayload::SkillResult(skill_result) => (
             Role::System,
@@ -2482,13 +2506,121 @@ fn persisted_node_from_backend_event(
     }
 }
 
+fn backend_metadata_item(
+    execution: &ExecutionMetadata,
+    provider: Option<&ProviderMetadata>,
+) -> BackendMetadata {
+    BackendMetadata {
+        execution_id: Some(execution.execution_id.clone()),
+        call_id: provider.and_then(|provider| provider.call_id.clone()),
+    }
+}
+
+fn persisted_nodes_from_backend_events(
+    events: &[BackendEvent],
+    execution: &ExecutionMetadata,
+) -> Vec<(Role, Option<NodeMetadata>, Kind)> {
+    fn flush_tool_uses(
+        nodes: &mut Vec<(Role, Option<NodeMetadata>, Kind)>,
+        tool_uses: &mut Vec<ToolUse>,
+        tool_metadata: &mut Vec<BackendMetadata>,
+    ) {
+        if tool_uses.is_empty() {
+            return;
+        }
+        let kind = Kind::tool_use_items(std::mem::take(tool_uses));
+        let metadata = Some(NodeMetadata::from_items(std::mem::take(tool_metadata)));
+        nodes.push((Role::LLM, metadata, kind));
+    }
+
+    fn flush_tool_results(
+        nodes: &mut Vec<(Role, Option<NodeMetadata>, Kind)>,
+        tool_results: &mut Vec<ToolResult>,
+        tool_metadata: &mut Vec<BackendMetadata>,
+    ) {
+        if tool_results.is_empty() {
+            return;
+        }
+        let kind = Kind::tool_result_items(std::mem::take(tool_results));
+        let metadata = Some(NodeMetadata::from_items(std::mem::take(tool_metadata)));
+        nodes.push((Role::User, metadata, kind));
+    }
+
+    let mut nodes = Vec::new();
+    let mut tool_uses = Vec::new();
+    let mut tool_results = Vec::new();
+    let mut tool_use_metadata = Vec::new();
+    let mut tool_result_metadata = Vec::new();
+
+    for event in events {
+        match event.event.clone() {
+            BackendEventPayload::ToolUse(tool_use) => {
+                flush_tool_results(&mut nodes, &mut tool_results, &mut tool_result_metadata);
+                tool_use_metadata.push(backend_metadata_item(execution, event.metadata.as_ref()));
+                tool_uses.push(tool_use);
+            }
+            BackendEventPayload::ToolResult(tool_result) => {
+                flush_tool_uses(&mut nodes, &mut tool_uses, &mut tool_use_metadata);
+                tool_result_metadata
+                    .push(backend_metadata_item(execution, event.metadata.as_ref()));
+                tool_results.push(tool_result);
+            }
+            BackendEventPayload::AssistantText(_) | BackendEventPayload::SkillResult(_) => {
+                flush_tool_uses(&mut nodes, &mut tool_uses, &mut tool_use_metadata);
+                flush_tool_results(&mut nodes, &mut tool_results, &mut tool_result_metadata);
+                nodes.push(persisted_node_from_backend_event(event.clone(), execution));
+            }
+        }
+    }
+
+    flush_tool_uses(&mut nodes, &mut tool_uses, &mut tool_use_metadata);
+    flush_tool_results(&mut nodes, &mut tool_results, &mut tool_result_metadata);
+
+    nodes
+}
+
+fn normalize_kind_for_primary_parent(kind: Kind, primary_parent: &str) -> Kind {
+    let Kind::Anchor(mut anchor) = kind else {
+        return kind;
+    };
+    if !matches!(anchor.payload, AnchorPayload::SkillResult(_)) {
+        return Kind::Anchor(anchor);
+    }
+
+    anchor
+        .merge_parents
+        .retain(|merge_parent| merge_parent.node_id() != primary_parent);
+    Kind::Anchor(anchor)
+}
+
 fn append_backend_event(
     trace_node_appender: &TraceNodeAppenderHandle,
     execution: &ExecutionMetadata,
     event: BackendEvent,
 ) -> std::result::Result<String, BackendError> {
     let (role, metadata, kind) = persisted_node_from_backend_event(event, execution);
-    trace_node_appender.append(role, metadata, kind)
+    let primary_parent = trace_node_appender.head_id()?;
+    trace_node_appender.append(
+        role,
+        metadata,
+        normalize_kind_for_primary_parent(kind, &primary_parent),
+    )
+}
+
+fn append_backend_event_nodes(
+    trace_node_appender: &TraceNodeAppenderHandle,
+    execution: &ExecutionMetadata,
+    events: &[BackendEvent],
+) -> std::result::Result<Vec<(String, Kind)>, BackendError> {
+    let mut appended = Vec::new();
+    for (role, metadata, kind) in persisted_nodes_from_backend_events(events, execution) {
+        let primary_parent = trace_node_appender.head_id()?;
+        let kind = normalize_kind_for_primary_parent(kind, &primary_parent);
+        let node_id = trace_node_appender.append(role, metadata, kind.clone())?;
+        appended.push((node_id, kind));
+    }
+
+    Ok(appended)
 }
 
 fn append_backend_events(
@@ -2496,16 +2628,10 @@ fn append_backend_events(
     execution: &ExecutionMetadata,
     events: &[BackendEvent],
 ) -> std::result::Result<String, BackendError> {
-    let mut events = events.iter();
-    let first = events
-        .next()
-        .expect("append_backend_events requires at least one event");
-    let mut head_id = append_backend_event(trace_node_appender, execution, first.clone())?;
-    for event in events {
-        head_id = append_backend_event(trace_node_appender, execution, event.clone())?;
-    }
-
-    Ok(head_id)
+    append_backend_event_nodes(trace_node_appender, execution, events)?
+        .last()
+        .map(|(node_id, _)| node_id.clone())
+        .ok_or_else(|| BackendError::failed("append_backend_events requires at least one event"))
 }
 
 fn rig_messages_from_nodes(nodes: &[coco_mem::Node]) -> Vec<rig::completion::message::Message> {
@@ -2523,8 +2649,23 @@ struct ProviderHistoryBuilder {
     messages: Vec<rig::completion::message::Message>,
     assistant_contents: Vec<rig::completion::message::AssistantContent>,
     assistant_execution_id: Option<String>,
+    last_tool_calls: HashMap<String, PendingToolCall>,
     tool_results: Vec<rig::completion::message::UserContent>,
     tool_result_execution_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    order: usize,
+    call_id: Option<String>,
+}
+
+fn node_metadata_first(metadata: Option<&NodeMetadata>) -> Option<&BackendMetadata> {
+    metadata.and_then(NodeMetadata::first)
+}
+
+fn node_metadata_at(metadata: Option<&NodeMetadata>, index: usize) -> Option<&BackendMetadata> {
+    metadata.and_then(|metadata| metadata.as_one().or_else(|| metadata.items().get(index)))
 }
 
 impl ProviderHistoryBuilder {
@@ -2534,18 +2675,32 @@ impl ProviderHistoryBuilder {
                 AnchorPayload::Session(session) => self.push_session_prompt(&session.prompt),
                 AnchorPayload::SessionPatch(_) => {}
                 AnchorPayload::Prompt(prompt) => self.push_user_text(&prompt.prompt),
-                AnchorPayload::SkillResult(result) => {
-                    self.push_tool_result(node.metadata.as_ref(), &result.tool_id, &result.output)
-                }
+                AnchorPayload::SkillResult(result) => self.push_tool_result(
+                    node_metadata_first(node.metadata.as_ref()),
+                    &result.tool_id,
+                    &result.output,
+                ),
             },
             Kind::Text(text) => match node.role {
                 Role::User => self.push_user_text(text),
-                Role::LLM => self.push_assistant_text(node.metadata.as_ref(), text),
+                Role::LLM => {
+                    self.push_assistant_text(node_metadata_first(node.metadata.as_ref()), text)
+                }
                 Role::System => {}
             },
-            Kind::ToolUse(tool_use) => self.push_tool_use(node.metadata.as_ref(), tool_use),
-            Kind::ToolResult(tool_result) => {
-                self.push_tool_result(node.metadata.as_ref(), &tool_result.id, &tool_result.output)
+            Kind::ToolUse(tool_uses) => {
+                for (index, tool_use) in tool_uses.items().iter().enumerate() {
+                    self.push_tool_use(node_metadata_at(node.metadata.as_ref(), index), tool_use);
+                }
+            }
+            Kind::ToolResult(tool_results) => {
+                for (index, tool_result) in tool_results.items().iter().enumerate() {
+                    self.push_tool_result(
+                        node_metadata_at(node.metadata.as_ref(), index),
+                        &tool_result.id,
+                        &tool_result.output,
+                    );
+                }
             }
             Kind::Failure(_) => {}
         }
@@ -2581,14 +2736,14 @@ impl ProviderHistoryBuilder {
             .push(rig::message::AssistantContent::text(text.to_owned()));
     }
 
-    fn push_tool_use(&mut self, metadata: Option<&BackendMetadata>, tool_use: &ToolUse) {
+    fn push_tool_use(&mut self, node_metadata: Option<&BackendMetadata>, tool_use: &ToolUse) {
         self.flush_tool_results();
-        let execution_id = metadata.and_then(|metadata| metadata.execution_id.clone());
+        let execution_id = node_metadata.and_then(|metadata| metadata.execution_id.clone());
         if !self.assistant_contents.is_empty() && self.assistant_execution_id != execution_id {
             self.flush_assistant_contents();
         }
         self.assistant_execution_id = execution_id;
-        let call_id = metadata.and_then(|metadata| metadata.call_id.clone());
+        let call_id = node_metadata.and_then(|metadata| metadata.call_id.clone());
         self.assistant_contents.push(rig_tool_call_content(
             tool_use.id.clone(),
             call_id,
@@ -2597,9 +2752,14 @@ impl ProviderHistoryBuilder {
         ));
     }
 
-    fn push_tool_result(&mut self, metadata: Option<&BackendMetadata>, id: &str, output: &str) {
+    fn push_tool_result(
+        &mut self,
+        node_metadata: Option<&BackendMetadata>,
+        id: &str,
+        output: &str,
+    ) {
         self.flush_assistant_contents();
-        let execution_id = metadata.and_then(|metadata| metadata.execution_id.clone());
+        let execution_id = node_metadata.and_then(|metadata| metadata.execution_id.clone());
         if !self.tool_results.is_empty() && self.tool_result_execution_id != execution_id {
             self.flush_tool_results();
         }
@@ -2607,7 +2767,7 @@ impl ProviderHistoryBuilder {
         let content = rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
             output.to_owned(),
         ));
-        let call_id = metadata.and_then(|metadata| metadata.call_id.clone());
+        let call_id = node_metadata.and_then(|metadata| metadata.call_id.clone());
         self.tool_results
             .push(rig_tool_result_content(id.to_owned(), call_id, content));
     }
@@ -2623,6 +2783,19 @@ impl ProviderHistoryBuilder {
             return;
         }
 
+        let mut tool_calls = HashMap::new();
+        for content in &self.assistant_contents {
+            if let rig::completion::message::AssistantContent::ToolCall(tool_call) = content {
+                tool_calls.insert(
+                    tool_call.id.clone(),
+                    PendingToolCall {
+                        order: tool_calls.len(),
+                        call_id: tool_call.call_id.clone(),
+                    },
+                );
+            }
+        }
+        self.last_tool_calls = tool_calls;
         self.messages
             .push(rig::completion::message::Message::Assistant {
                 id: None,
@@ -2633,15 +2806,61 @@ impl ProviderHistoryBuilder {
     }
 
     fn flush_tool_results(&mut self) {
-        if self.tool_results.is_empty() {
+        if self.tool_results.is_empty() && self.last_tool_calls.is_empty() {
             return;
         }
 
+        let completed_tool_ids = self
+            .tool_results
+            .iter()
+            .filter_map(|content| match content {
+                rig::completion::message::UserContent::ToolResult(tool_result) => {
+                    Some(tool_result.id.as_str())
+                }
+                rig::completion::message::UserContent::Text(_)
+                | rig::completion::message::UserContent::Image(_)
+                | rig::completion::message::UserContent::Audio(_)
+                | rig::completion::message::UserContent::Video(_)
+                | rig::completion::message::UserContent::Document(_) => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut missing_tool_calls = self
+            .last_tool_calls
+            .iter()
+            .filter(|(id, _)| !completed_tool_ids.contains(id.as_str()))
+            .collect::<Vec<_>>();
+        missing_tool_calls.sort_by_key(|(_, tool_call)| tool_call.order);
+        for (id, tool_call) in missing_tool_calls {
+            let content = rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
+                format!(
+                    "Tool call {id:?} did not produce a result before recovery; treating it as failed."
+                ),
+            ));
+            self.tool_results.push(rig_tool_result_content(
+                id.clone(),
+                tool_call.call_id.clone(),
+                content,
+            ));
+        }
+
+        self.tool_results.sort_by_key(|content| match content {
+            rig::completion::message::UserContent::ToolResult(tool_result) => self
+                .last_tool_calls
+                .get(&tool_result.id)
+                .map(|tool_call| tool_call.order)
+                .unwrap_or(usize::MAX),
+            rig::completion::message::UserContent::Text(_)
+            | rig::completion::message::UserContent::Image(_)
+            | rig::completion::message::UserContent::Audio(_)
+            | rig::completion::message::UserContent::Video(_)
+            | rig::completion::message::UserContent::Document(_) => usize::MAX,
+        });
         self.messages.push(rig::completion::message::Message::User {
             content: rig::OneOrMany::many(std::mem::take(&mut self.tool_results))
                 .expect("tool result buffer is non-empty"),
         });
         self.tool_result_execution_id = None;
+        self.last_tool_calls.clear();
     }
 }
 
@@ -2731,7 +2950,14 @@ struct StepState {
     step_events: Vec<BackendEvent>,
 }
 
+struct ToolCallInvocation {
+    index: usize,
+    tool_call: CompletionToolCall,
+    tool_use_node_id: Option<String>,
+}
+
 struct ToolCallExecution {
+    index: usize,
     event: BackendEvent,
     tool_result: rig::completion::message::UserContent,
 }
@@ -2813,16 +3039,17 @@ impl CompletionRunner {
             && !turn.trace_persisted
             && !turn.events.is_empty()
         {
-            let mut head_id = None;
-            for event in &turn.events {
-                let node_id = append_backend_event(trace_node_appender, execution, event.clone())?;
-                if let BackendEventPayload::ToolUse(tool_use) = &event.event {
-                    self.tool_use_node_ids
-                        .insert(tool_use.id.clone(), node_id.clone());
+            let appended =
+                append_backend_event_nodes(trace_node_appender, execution, &turn.events)?;
+            for (node_id, kind) in &appended {
+                if let Kind::ToolUse(tool_uses) = kind {
+                    for tool_use in tool_uses.iter() {
+                        self.tool_use_node_ids
+                            .insert(tool_use.id.clone(), node_id.clone());
+                    }
                 }
-                head_id = Some(node_id);
             }
-            self.head = head_id;
+            self.head = appended.last().map(|(node_id, _)| node_id.clone());
         }
         step_events.extend(turn.events.clone());
         Ok(())
@@ -2869,11 +3096,11 @@ impl CompletionRunner {
         )
     }
 
-    async fn execute_tool_call(
+    fn prepare_tool_call_invocation(
         &mut self,
-        next_execution: &ExecutionMetadata,
+        index: usize,
         tool_call: CompletionToolCall,
-    ) -> std::result::Result<ToolCallExecution, BackendError> {
+    ) -> std::result::Result<ToolCallInvocation, BackendError> {
         let tool_use_node_id = self.tool_use_node_ids.remove(&tool_call.id);
         if tool_call.function.name == "use_skill" && tool_use_node_id.is_none() {
             return Err(BackendError::failed(format!(
@@ -2881,30 +3108,36 @@ impl CompletionRunner {
                 tool_call.id
             )));
         }
+
+        Ok(ToolCallInvocation {
+            index,
+            tool_call,
+            tool_use_node_id,
+        })
+    }
+
+    async fn execute_tool_call(
+        runtime_tools: RuntimeToolSet,
+        invocation: ToolCallInvocation,
+    ) -> std::result::Result<ToolCallExecution, BackendError> {
+        let index = invocation.index;
+        let tool_call = invocation.tool_call;
         let args = serde_json::to_string(&tool_call.function.arguments)
             .map_err(|source| BackendError::failed(source.to_string()))?;
-        let outcome = self
-            .runtime_tools
+        let outcome = runtime_tools
             .execute(
                 &tool_call.function.name,
                 args,
                 ToolInvocationContext {
-                    persisted_tool_use_node_id: tool_use_node_id,
+                    persisted_tool_use_node_id: invocation.tool_use_node_id,
                 },
             )
             .await?;
         let provider_output = outcome.provider_output().to_owned();
         let call_id = tool_call.call_id.clone();
         let event = outcome.into_backend_event(tool_call.id.clone(), call_id.clone());
-        if let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() {
-            self.head = Some(append_backend_event(
-                trace_node_appender,
-                next_execution,
-                event.clone(),
-            )?);
-        }
-
         Ok(ToolCallExecution {
+            index,
             event,
             tool_result: rig_tool_result_content(
                 tool_call.id,
@@ -2914,6 +3147,23 @@ impl CompletionRunner {
                 )),
             ),
         })
+    }
+
+    fn persist_tool_result_events(
+        &mut self,
+        execution: &ExecutionMetadata,
+        events: &[BackendEvent],
+    ) -> std::result::Result<(), BackendError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let Some(trace_node_appender) = self.request.trace_node_appender.as_ref() else {
+            return Ok(());
+        };
+
+        let appended = append_backend_event_nodes(trace_node_appender, execution, events)?;
+        self.head = appended.last().map(|(node_id, _)| node_id.clone());
+        Ok(())
     }
 
     async fn advance_with_tool_calls(
@@ -2927,10 +3177,44 @@ impl CompletionRunner {
         let next_execution = ExecutionMetadata::new(Self::next_execution_id());
         let mut tool_results = Vec::with_capacity(turn.tool_calls.len());
         let mut next_events = Vec::with_capacity(turn.tool_calls.len());
-        for tool_call in turn.tool_calls {
-            let execution = self.execute_tool_call(&next_execution, tool_call).await?;
+        let invocations = turn
+            .tool_calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, tool_call)| self.prepare_tool_call_invocation(index, tool_call))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let runtime_tools = self.runtime_tools.clone();
+        let mut executions = invocations
+            .into_iter()
+            .map(|invocation| {
+                let runtime_tools = runtime_tools.clone();
+                async move { Self::execute_tool_call(runtime_tools, invocation).await }
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        let mut completed = Vec::new();
+        let mut error = None;
+        while let Some(execution) = executions.next().await {
+            match execution {
+                Ok(execution) => {
+                    self.persist_tool_result_events(
+                        &next_execution,
+                        std::slice::from_ref(&execution.event),
+                    )?;
+                    completed.push(execution);
+                }
+                Err(source) => {
+                    error.get_or_insert(source);
+                }
+            }
+        }
+        completed.sort_by_key(|execution| execution.index);
+        for execution in completed {
             next_events.push(execution.event);
             tool_results.push(execution.tool_result);
+        }
+        if let Some(source) = error {
+            return Err(source);
         }
 
         self.steps.push(BackendStep {
@@ -3196,8 +3480,8 @@ mod tests {
     use std::ffi::OsStr;
     use std::time::Duration;
 
-    use coco_mem::{BranchStore, MemoryStore, NodeStore, SessionStore};
-    use tokio::sync::Barrier;
+    use coco_mem::{BranchStore, FsStore, MemoryStore, NodeStore, SessionStore};
+    use tokio::sync::{Barrier, Notify};
 
     type RecordedCalls = Arc<Mutex<Vec<(ResolvedSession, ResolvedCompletionRequest)>>>;
     type FakeTurnQueue =
@@ -3383,6 +3667,81 @@ mod tests {
                 },
                 response_node_id,
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct BarrierSkillExecutor {
+        barrier: Arc<Barrier>,
+    }
+
+    #[async_trait]
+    impl SkillToolExecutor for BarrierSkillExecutor {
+        async fn search_skill_tool(
+            &self,
+            _request: SearchSkillToolRequest,
+        ) -> std::result::Result<String, ExecutorError> {
+            Ok(r#"{"skills":[]}"#.to_owned())
+        }
+
+        async fn execute_skill_tool(
+            &self,
+            request: UseSkillToolRequest,
+        ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
+            self.barrier.wait().await;
+            let response_node_id = request.parent_tool_use_id.clone();
+            Ok(SkillToolExecutionResult {
+                result: SkillToolRunResult {
+                    text: format!("Executed {}", request.skill_name),
+                },
+                response_node_id,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct StagedSkillExecutor {
+        first_done: Arc<Notify>,
+        release_second: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SkillToolExecutor for StagedSkillExecutor {
+        async fn search_skill_tool(
+            &self,
+            request: SearchSkillToolRequest,
+        ) -> std::result::Result<String, ExecutorError> {
+            if request.query == "slow" {
+                self.release_second.notified().await;
+            }
+            let output = format!(r#"{{"query":"{}"}}"#, request.query);
+            if request.query == "fast" {
+                self.first_done.notify_one();
+            }
+            Ok(output)
+        }
+
+        async fn execute_skill_tool(
+            &self,
+            request: UseSkillToolRequest,
+        ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
+            if request.skill_name == "rust-patterns" {
+                self.release_second.notified().await;
+            }
+
+            let response_node_id = request.parent_tool_use_id.clone();
+            let result = SkillToolExecutionResult {
+                result: SkillToolRunResult {
+                    text: format!("Executed {}", request.skill_name),
+                },
+                response_node_id,
+            };
+
+            if request.skill_name == "fast-rust" {
+                self.first_done.notify_one();
+            }
+
+            Ok(result)
         }
     }
 
@@ -3769,7 +4128,336 @@ mod tests {
         ));
     }
 
-    fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<BackendMetadata> {
+    #[tokio::test]
+    async fn sibling_tool_calls_execute_in_parallel() {
+        let first = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "use_skill",
+            serde_json::json!({"name": "fast-rust", "handoff": "Review the diff."}),
+        );
+        let second = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "use_skill",
+            serde_json::json!({"name": "rust-patterns", "handoff": "Review the API."}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![first, second])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
+        )]);
+        let store = MemoryStore::new();
+        let service = LlmService::builder(store.clone(), backend)
+            .with_skill_tool_executor(Arc::new(BarrierSkillExecutor {
+                barrier: Arc::new(Barrier::new(2)),
+            }))
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![crate::builtin_tool_definition("use_skill").unwrap()],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            service.prompt(prompt_request("main", "delegate twice")),
+        )
+        .await
+        .expect("sibling tool calls should not block each other")
+        .unwrap();
+
+        assert_eq!(result.text, "done");
+    }
+
+    #[tokio::test]
+    async fn sibling_tool_results_persist_as_each_call_finishes() {
+        let first = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "search_skill",
+            serde_json::json!({"query": "fast"}),
+        );
+        let second = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "search_skill",
+            serde_json::json!({"query": "slow"}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![first, second])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
+        )]);
+        let store = MemoryStore::new();
+        let first_done = Arc::new(Notify::new());
+        let release_second = Arc::new(Notify::new());
+        let service = LlmService::builder(store.clone(), backend)
+            .with_skill_tool_executor(Arc::new(StagedSkillExecutor {
+                first_done: first_done.clone(),
+                release_second: release_second.clone(),
+            }))
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+        let initial_head = store.get_branch_head("main").unwrap();
+
+        let prompt =
+            tokio::spawn(
+                async move { service.prompt(prompt_request("main", "search twice")).await },
+            );
+        first_done.notified().await;
+
+        let staged_nodes = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let nodes = tool_result_nodes(&store, &initial_head);
+                if !nodes.is_empty() {
+                    return nodes;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first completed sibling result should be persisted before the second finishes");
+
+        assert_eq!(staged_nodes.len(), 1);
+        assert!(kind_has_tool_result(
+            &staged_nodes[0].kind,
+            "tool-call-1",
+            r#"{"query":"fast"}"#
+        ));
+        assert_eq!(node_call_id_at(&staged_nodes[0], 0), Some("call-1"));
+
+        release_second.notify_one();
+        let result = prompt.await.unwrap().unwrap();
+        assert_eq!(result.text, "done");
+
+        let final_result_nodes = tool_result_nodes(&store, &initial_head);
+        assert_eq!(final_result_nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reopened_store_reconstructs_staged_tool_results_as_grouped_turn() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store_path = temp_dir.path().join("store");
+        {
+            let first = rig_tool_call_content(
+                "tool-call-1",
+                Some("call-1".to_owned()),
+                "search_skill",
+                serde_json::json!({"query": "slow"}),
+            );
+            let second = rig_tool_call_content(
+                "tool-call-2",
+                Some("call-2".to_owned()),
+                "search_skill",
+                serde_json::json!({"query": "fast"}),
+            );
+            let turn = BackendTurn::from_assistant_choice(
+                Some("assistant-1".to_owned()),
+                rig::OneOrMany::many(vec![first, second])
+                    .expect("assistant choice should be non-empty"),
+            );
+            let backend = FakeBackend::with_turns(vec![(
+                "main",
+                vec![Ok(turn), Ok(BackendTurn::finished("done"))],
+            )]);
+            let store = FsStore::open(&store_path).unwrap();
+            let first_done = Arc::new(Notify::new());
+            let release_second = Arc::new(Notify::new());
+            let service = LlmService::builder(store, backend)
+                .with_skill_tool_executor(Arc::new(StagedSkillExecutor {
+                    first_done: first_done.clone(),
+                    release_second: release_second.clone(),
+                }))
+                .build();
+            service
+                .create_session(SessionConfig {
+                    tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                    ..session_config("main")
+                })
+                .await
+                .unwrap();
+
+            let prompt = tokio::spawn(async move {
+                service.prompt(prompt_request("main", "search twice")).await
+            });
+            first_done.notified().await;
+            release_second.notify_one();
+            assert_eq!(prompt.await.unwrap().unwrap().text, "done");
+        }
+
+        let reopened = FsStore::open(&store_path).unwrap();
+        let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
+        let session = service.resolve_session("main").unwrap();
+        let tool_result_message = session
+            .provider_history
+            .iter()
+            .find_map(|message| match message {
+                rig::completion::message::Message::User { content }
+                    if content.iter().any(|content| {
+                        matches!(
+                            content,
+                            rig::completion::message::UserContent::ToolResult(_)
+                        )
+                    }) =>
+                {
+                    Some(content.iter().collect::<Vec<_>>())
+                }
+                rig::completion::message::Message::User { .. }
+                | rig::completion::message::Message::Assistant { .. }
+                | rig::completion::message::Message::System { .. } => None,
+            })
+            .expect("expected grouped tool result message");
+
+        assert_eq!(tool_result_message.len(), 2);
+        assert!(matches!(
+            tool_result_message[0],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-1"
+                    && tool_result.call_id.as_deref() == Some("call-1")
+                    && matches!(
+                        tool_result.content.first_ref(),
+                        rig::completion::message::ToolResultContent::Text(text)
+                            if text.text == r#"{"query":"slow"}"#
+                    )
+        ));
+        assert!(matches!(
+            tool_result_message[1],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-2"
+                    && tool_result.call_id.as_deref() == Some("call-2")
+                    && matches!(
+                        tool_result.content.first_ref(),
+                        rig::completion::message::ToolResultContent::Text(text)
+                            if text.text == r#"{"query":"fast"}"#
+                    )
+        ));
+    }
+
+    #[tokio::test]
+    async fn reopened_store_recovers_missing_sibling_tool_result_as_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store_path = temp_dir.path().join("store");
+        {
+            let store = FsStore::open(&store_path).unwrap();
+            let service = LlmService::new(store.clone(), FakeBackend::with_turns(vec![]));
+            service
+                .create_session(SessionConfig {
+                    tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                    ..session_config("main")
+                })
+                .await
+                .unwrap();
+            let session_head = store.get_branch_head("main").unwrap();
+            let tool_use_id = store
+                .append(NewNode {
+                    parent: session_head.clone(),
+                    role: Role::LLM,
+                    metadata: Some(NodeMetadata::many(vec![
+                        BackendMetadata {
+                            execution_id: Some("execution-1".to_owned()),
+                            call_id: Some("call-1".to_owned()),
+                        },
+                        BackendMetadata {
+                            execution_id: Some("execution-1".to_owned()),
+                            call_id: Some("call-2".to_owned()),
+                        },
+                    ])),
+                    kind: Kind::tool_uses(vec![
+                        ToolUse {
+                            id: "tool-call-1".to_owned(),
+                            name: "search_skill".to_owned(),
+                            input: serde_json::json!({"query": "missing"}),
+                        },
+                        ToolUse {
+                            id: "tool-call-2".to_owned(),
+                            name: "search_skill".to_owned(),
+                            input: serde_json::json!({"query": "present"}),
+                        },
+                    ]),
+                })
+                .unwrap();
+            let tool_result_id = store
+                .append(NewNode {
+                    parent: tool_use_id,
+                    role: Role::User,
+                    metadata: metadata(Some("execution-1"), Some("call-2")),
+                    kind: Kind::tool_result(ToolResult {
+                        id: "tool-call-2".to_owned(),
+                        output: r#"{"query":"present"}"#.to_owned(),
+                    }),
+                })
+                .unwrap();
+            store
+                .set_branch_head("main", &session_head, &tool_result_id)
+                .unwrap();
+        }
+
+        let reopened = FsStore::open(&store_path).unwrap();
+        let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
+        let session = service.resolve_session("main").unwrap();
+        let tool_result_message = session
+            .provider_history
+            .iter()
+            .find_map(|message| match message {
+                rig::completion::message::Message::User { content }
+                    if content.iter().any(|content| {
+                        matches!(
+                            content,
+                            rig::completion::message::UserContent::ToolResult(_)
+                        )
+                    }) =>
+                {
+                    Some(content.iter().collect::<Vec<_>>())
+                }
+                rig::completion::message::Message::User { .. }
+                | rig::completion::message::Message::Assistant { .. }
+                | rig::completion::message::Message::System { .. } => None,
+            })
+            .expect("expected recovered tool result message");
+
+        assert_eq!(tool_result_message.len(), 2);
+        assert!(matches!(
+            tool_result_message[0],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-1"
+                    && tool_result.call_id.as_deref() == Some("call-1")
+                    && matches!(
+                        tool_result.content.first_ref(),
+                        rig::completion::message::ToolResultContent::Text(text)
+                            if text.text.contains("did not produce a result before recovery")
+                    )
+        ));
+        assert!(matches!(
+            tool_result_message[1],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-2"
+                    && tool_result.call_id.as_deref() == Some("call-2")
+                    && matches!(
+                        tool_result.content.first_ref(),
+                        rig::completion::message::ToolResultContent::Text(text)
+                            if text.text == r#"{"query":"present"}"#
+                    )
+        ));
+    }
+
+    fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<NodeMetadata> {
         let execution =
             execution_id.map(|execution_id| ExecutionMetadata::new(execution_id.to_owned()));
         let provider = call_id.map(|call_id| ProviderMetadata::new(Some(call_id.to_owned())));
@@ -3780,7 +4468,7 @@ mod tests {
             .build()
     }
 
-    fn context_node(role: Role, metadata: Option<BackendMetadata>, kind: Kind) -> coco_mem::Node {
+    fn context_node(role: Role, metadata: Option<NodeMetadata>, kind: Kind) -> coco_mem::Node {
         let store = MemoryStore::new();
         let id = store
             .append(NewNode {
@@ -3791,6 +4479,59 @@ mod tests {
             })
             .expect("test node should be appended");
         store.get_node(&id).expect("test node should exist")
+    }
+
+    fn node_execution_id(node: &coco_mem::Node) -> Option<&str> {
+        node.metadata
+            .as_ref()
+            .and_then(NodeMetadata::first)
+            .and_then(|metadata| metadata.execution_id.as_deref())
+    }
+
+    fn node_call_id_at(node: &coco_mem::Node, index: usize) -> Option<&str> {
+        node.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.items().get(index))
+            .and_then(|metadata| metadata.call_id.as_deref())
+    }
+
+    fn collect_descendants(store: &MemoryStore, node_id: &str) -> Vec<coco_mem::Node> {
+        let mut descendants = Vec::new();
+        let mut stack = store
+            .list_children(node_id)
+            .expect("children should be listed");
+        while let Some(node) = stack.pop() {
+            stack.extend(
+                store
+                    .list_children(&node.id)
+                    .expect("children should be listed"),
+            );
+            descendants.push(node);
+        }
+        descendants
+    }
+
+    fn tool_result_nodes(store: &MemoryStore, root_id: &str) -> Vec<coco_mem::Node> {
+        collect_descendants(store, root_id)
+            .into_iter()
+            .filter(|node| matches!(node.kind, Kind::ToolResult(_)))
+            .collect()
+    }
+
+    fn kind_has_tool_use(kind: &Kind, expected_id: &str, expected_name: &str) -> bool {
+        kind.as_tool_uses().is_some_and(|tool_uses| {
+            tool_uses
+                .iter()
+                .any(|tool_use| tool_use.id == expected_id && tool_use.name == expected_name)
+        })
+    }
+
+    fn kind_has_tool_result(kind: &Kind, expected_id: &str, expected_output: &str) -> bool {
+        kind.as_tool_results().is_some_and(|tool_results| {
+            tool_results.iter().any(|tool_result| {
+                tool_result.id == expected_id && tool_result.output == expected_output
+            })
+        })
     }
 
     fn execution(execution_id: &str) -> ExecutionMetadata {
@@ -4078,7 +4819,7 @@ mod tests {
         assert_eq!(assistant.role, Role::LLM);
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "hello"));
         assert_eq!(
-            assistant.metadata.as_ref().unwrap().execution_id.as_deref(),
+            node_execution_id(assistant),
             Some(result.execution_id.as_str())
         );
 
@@ -4211,7 +4952,7 @@ mod tests {
                 parent: prompt_id,
                 role: Role::LLM,
                 metadata: None,
-                kind: Kind::ToolUse(ToolUse {
+                kind: Kind::tool_use(ToolUse {
                     id: "tool-call-1".to_owned(),
                     name: "use_skill".to_owned(),
                     input: serde_json::json!({"name": "fast-rust"}),
@@ -4336,16 +5077,7 @@ mod tests {
         let failure = store.get_node(&error_node_id).unwrap();
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
-        assert_eq!(
-            failure
-                .metadata
-                .as_ref()
-                .unwrap()
-                .execution_id
-                .as_ref()
-                .unwrap(),
-            &execution_id
-        );
+        assert_eq!(node_execution_id(&failure), Some(execution_id.as_str()));
         assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
 
         let session = service.resolve_session("main").unwrap();
@@ -5125,38 +5857,200 @@ mod tests {
         assert_eq!(assistant.role, Role::LLM);
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
         assert_eq!(
-            assistant.metadata.as_ref().unwrap().execution_id.as_deref(),
+            node_execution_id(assistant),
             Some(result.execution_id.as_str())
         );
 
         assert_eq!(tool_result.role, Role::User);
-        assert!(matches!(
+        assert!(kind_has_tool_result(
             &tool_result.kind,
-            Kind::ToolResult(ToolResult { id, output, .. })
-                if id == "tool-call-1" && output == "Cargo.toml"
+            "tool-call-1",
+            "Cargo.toml"
         ));
-        assert_eq!(
-            tool_result
-                .metadata
-                .as_ref()
-                .unwrap()
-                .execution_id
-                .as_deref(),
-            Some("execution-step-2")
-        );
+        assert_eq!(node_execution_id(tool_result), Some("execution-step-2"));
 
         assert_eq!(tool_use.role, Role::LLM);
-        assert!(matches!(
-            &tool_use.kind,
-            Kind::ToolUse(ToolUse { id, name, input, .. })
-                if id == "tool-call-1"
-                    && name == "exec_command"
-                    && input == &serde_json::json!({"cmd": "rg --files"})
-        ));
-        assert_eq!(
-            tool_use.metadata.as_ref().unwrap().execution_id.as_deref(),
-            Some("execution-step-1")
+        assert!(tool_use.kind.as_tool_uses().is_some_and(|tool_uses| {
+            tool_uses.iter().any(|tool_use| {
+                tool_use.id == "tool-call-1"
+                    && tool_use.name == "exec_command"
+                    && tool_use.input == serde_json::json!({"cmd": "rg --files"})
+            })
+        }));
+        assert_eq!(node_execution_id(tool_use), Some("execution-step-1"));
+    }
+
+    #[tokio::test]
+    async fn prompt_persists_sibling_tool_calls_as_single_nodes() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_completions(&[(
+            "main",
+            &[Ok(BackendRun::succeeded_with_steps(
+                "done",
+                vec![
+                    BackendStep {
+                        execution: ExecutionMetadata::new("execution-step-1".to_owned()),
+                        events: vec![
+                            backend_event(
+                                BackendEventPayload::ToolUse(ToolUse {
+                                    id: "tool-call-1".to_owned(),
+                                    name: "exec_command".to_owned(),
+                                    input: serde_json::json!({"cmd": "pwd"}),
+                                }),
+                                Some("execution-step-1"),
+                                Some("call-1"),
+                            ),
+                            backend_event(
+                                BackendEventPayload::ToolUse(ToolUse {
+                                    id: "tool-call-2".to_owned(),
+                                    name: "exec_command".to_owned(),
+                                    input: serde_json::json!({"cmd": "ls"}),
+                                }),
+                                Some("execution-step-1"),
+                                Some("call-2"),
+                            ),
+                        ],
+                    },
+                    BackendStep {
+                        execution: ExecutionMetadata::new("execution-step-2".to_owned()),
+                        events: vec![
+                            backend_event(
+                                BackendEventPayload::ToolResult(ToolResult {
+                                    id: "tool-call-1".to_owned(),
+                                    output: "/tmp".to_owned(),
+                                }),
+                                Some("execution-step-2"),
+                                Some("call-1"),
+                            ),
+                            backend_event(
+                                BackendEventPayload::ToolResult(ToolResult {
+                                    id: "tool-call-2".to_owned(),
+                                    output: "Cargo.toml".to_owned(),
+                                }),
+                                Some("execution-step-2"),
+                                Some("call-2"),
+                            ),
+                            BackendEventPayload::AssistantText("done".to_owned()).into(),
+                        ],
+                    },
+                ],
+            ))],
+        )]);
+        let service = LlmService::new(store.clone(), backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        service
+            .prompt(prompt_request("main", "inspect files"))
+            .await
+            .unwrap();
+
+        let ancestry = store.ancestry("main").unwrap();
+        let assistant = &ancestry[0];
+        let tool_result = &ancestry[1];
+        let tool_use = &ancestry[2];
+
+        assert_eq!(assistant.parent, tool_result.id);
+        assert_eq!(tool_result.parent, tool_use.id);
+        assert_eq!(tool_use.parent, ancestry[3].id);
+
+        let tool_uses = tool_use
+            .kind
+            .as_tool_uses()
+            .unwrap()
+            .items()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(tool_uses.len(), 2);
+        assert_eq!(tool_uses[0].id, "tool-call-1");
+        assert_eq!(node_call_id_at(tool_use, 0), Some("call-1"));
+        assert_eq!(tool_uses[1].id, "tool-call-2");
+        assert_eq!(node_call_id_at(tool_use, 1), Some("call-2"));
+
+        let tool_results = tool_result
+            .kind
+            .as_tool_results()
+            .unwrap()
+            .items()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 2);
+        assert_eq!(tool_results[0].id, "tool-call-1");
+        assert_eq!(node_call_id_at(tool_result, 0), Some("call-1"));
+        assert_eq!(tool_results[1].id, "tool-call-2");
+        assert_eq!(node_call_id_at(tool_result, 1), Some("call-2"));
+    }
+
+    #[tokio::test]
+    async fn prompt_persists_completed_sibling_tool_results_before_later_tool_failure() {
+        let search_skill = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "search_skill",
+            serde_json::json!({"query": "rust"}),
         );
+        let missing_tool = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "missing_tool",
+            serde_json::json!({}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![search_skill, missing_tool])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![("main", vec![Ok(turn)])]);
+        let store = MemoryStore::new();
+        let service = LlmService::builder(store.clone(), backend)
+            .with_skill_tool_executor(Arc::new(FakeSkillExecutor))
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let err = service
+            .prompt(prompt_request("main", "search then fail"))
+            .await
+            .unwrap_err();
+        let context = match err {
+            Error::Backend { context, .. } => context,
+            other => panic!("expected backend error, got {other:?}"),
+        };
+
+        assert_eq!(
+            store.get_branch_head("main").unwrap(),
+            context.retry_from_node_id
+        );
+        let failure = store.get_node(&context.error_node_id).unwrap();
+        let tool_result = store.get_node(&failure.parent).unwrap();
+        assert!(
+            tool_result
+                .kind
+                .as_tool_results()
+                .is_some_and(|tool_results| {
+                    let results = tool_results.items().iter().collect::<Vec<_>>();
+                    results.len() == 1
+                        && results[0].id == "tool-call-1"
+                        && node_call_id_at(&tool_result, 0) == Some("call-1")
+                        && results[0].output == r#"{"skills":[]}"#
+                })
+        );
+
+        let tool_use = store.get_node(&tool_result.parent).unwrap();
+        assert!(tool_use.kind.as_tool_uses().is_some_and(|tool_uses| {
+            let uses = tool_uses.iter().collect::<Vec<_>>();
+            uses.len() == 2
+                && uses[0].id == "tool-call-1"
+                && uses[1].id == "tool-call-2"
+                && uses[1].name == "missing_tool"
+        }));
     }
 
     #[tokio::test]
@@ -5203,9 +6097,10 @@ mod tests {
         assert_eq!(assistant.id, result.response_node_id);
         assert!(tool_use.created_at < skill_result.created_at);
         assert!(skill_result.created_at < assistant.created_at);
-        assert!(matches!(
+        assert!(kind_has_tool_use(
             &tool_use.kind,
-            Kind::ToolUse(ToolUse { id, name, .. }) if id == "tool-call-1" && name == "use_skill"
+            "tool-call-1",
+            "use_skill"
         ));
         let Kind::Anchor(anchor) = &skill_result.kind else {
             panic!("expected skill result anchor");
@@ -5384,7 +6279,7 @@ mod tests {
             context_node(
                 Role::LLM,
                 metadata(Some("execution-1"), Some("call-1")),
-                Kind::ToolUse(ToolUse {
+                Kind::tool_use(ToolUse {
                     id: "tool-call-1".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "ls"}),
@@ -5393,7 +6288,7 @@ mod tests {
             context_node(
                 Role::LLM,
                 metadata(Some("execution-1"), Some("call-2")),
-                Kind::ToolUse(ToolUse {
+                Kind::tool_use(ToolUse {
                     id: "tool-call-2".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
@@ -5401,18 +6296,18 @@ mod tests {
             ),
             context_node(
                 Role::User,
-                metadata(Some("execution-1"), Some("call-1")),
-                Kind::ToolResult(ToolResult {
-                    id: "tool-call-1".to_owned(),
-                    output: "Cargo.toml".to_owned(),
+                metadata(Some("execution-1"), Some("call-2")),
+                Kind::tool_result(ToolResult {
+                    id: "tool-call-2".to_owned(),
+                    output: "/tmp".to_owned(),
                 }),
             ),
             context_node(
                 Role::User,
-                metadata(Some("execution-1"), Some("call-2")),
-                Kind::ToolResult(ToolResult {
-                    id: "tool-call-2".to_owned(),
-                    output: "/tmp".to_owned(),
+                metadata(Some("execution-1"), Some("call-1")),
+                Kind::tool_result(ToolResult {
+                    id: "tool-call-1".to_owned(),
+                    output: "Cargo.toml".to_owned(),
                 }),
             ),
             context_node(
@@ -5492,7 +6387,7 @@ mod tests {
             context_node(
                 Role::LLM,
                 metadata(Some("execution-1"), Some("call-legacy")),
-                Kind::ToolUse(ToolUse {
+                Kind::tool_use(ToolUse {
                     id: "tool-call-legacy".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
@@ -5501,7 +6396,7 @@ mod tests {
             context_node(
                 Role::User,
                 metadata(Some("execution-1"), Some("call-legacy")),
-                Kind::ToolResult(ToolResult {
+                Kind::tool_result(ToolResult {
                     id: "tool-call-legacy".to_owned(),
                     output: "/tmp".to_owned(),
                 }),
@@ -5531,12 +6426,103 @@ mod tests {
     }
 
     #[test]
+    fn rig_messages_from_nodes_uses_many_node_metadata_call_ids() {
+        let messages = rig_messages_from_nodes(&[
+            context_node(
+                Role::LLM,
+                Some(NodeMetadata::many(vec![
+                    BackendMetadata {
+                        execution_id: Some("execution-1".to_owned()),
+                        call_id: Some("call-payload".to_owned()),
+                    },
+                    BackendMetadata {
+                        execution_id: Some("execution-1".to_owned()),
+                        call_id: Some("call-next".to_owned()),
+                    },
+                ])),
+                Kind::tool_uses(vec![
+                    ToolUse {
+                        id: "tool-call-payload".to_owned(),
+                        name: "exec_command".to_owned(),
+                        input: serde_json::json!({"cmd": "pwd"}),
+                    },
+                    ToolUse {
+                        id: "tool-call-next".to_owned(),
+                        name: "exec_command".to_owned(),
+                        input: serde_json::json!({"cmd": "ls"}),
+                    },
+                ]),
+            ),
+            context_node(
+                Role::User,
+                Some(NodeMetadata::many(vec![
+                    BackendMetadata {
+                        execution_id: Some("execution-1".to_owned()),
+                        call_id: Some("call-payload".to_owned()),
+                    },
+                    BackendMetadata {
+                        execution_id: Some("execution-1".to_owned()),
+                        call_id: Some("call-next".to_owned()),
+                    },
+                ])),
+                Kind::tool_results(vec![
+                    ToolResult {
+                        id: "tool-call-payload".to_owned(),
+                        output: "/tmp".to_owned(),
+                    },
+                    ToolResult {
+                        id: "tool-call-next".to_owned(),
+                        output: "Cargo.toml".to_owned(),
+                    },
+                ]),
+            ),
+        ]);
+
+        assert!(matches!(
+            &messages[0],
+            rig::completion::message::Message::Assistant { content, .. }
+                if {
+                    let items = content.iter().collect::<Vec<_>>();
+                    items.len() == 2
+                        && matches!(
+                            items[0],
+                            rig::completion::message::AssistantContent::ToolCall(tool_call)
+                                if tool_call.call_id.as_deref() == Some("call-payload")
+                        )
+                        && matches!(
+                            items[1],
+                            rig::completion::message::AssistantContent::ToolCall(tool_call)
+                                if tool_call.call_id.as_deref() == Some("call-next")
+                        )
+                }
+        ));
+        assert!(matches!(
+            &messages[1],
+            rig::completion::message::Message::User { content }
+                if {
+                    let items = content.iter().collect::<Vec<_>>();
+                    items.len() == 2
+                        && matches!(
+                            items[0],
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.call_id.as_deref() == Some("call-payload")
+                        )
+                        && matches!(
+                            items[1],
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.call_id.as_deref() == Some("call-next")
+                        )
+                }
+        ));
+    }
+
+    #[test]
     fn rig_messages_from_nodes_omits_call_id_when_absent() {
         let messages = rig_messages_from_nodes(&[
             context_node(
                 Role::LLM,
                 metadata(Some("execution-1"), None),
-                Kind::ToolUse(ToolUse {
+                Kind::tool_use(ToolUse {
                     id: "tool-call-legacy".to_owned(),
                     name: "exec_command".to_owned(),
                     input: serde_json::json!({"cmd": "pwd"}),
@@ -5545,7 +6531,7 @@ mod tests {
             context_node(
                 Role::User,
                 metadata(Some("execution-1"), None),
-                Kind::ToolResult(ToolResult {
+                Kind::tool_result(ToolResult {
                     id: "tool-call-legacy".to_owned(),
                     output: "/tmp".to_owned(),
                 }),
@@ -5663,23 +6649,9 @@ mod tests {
         let tool_result = &ancestry[1];
         let tool_use = &ancestry[2];
 
-        assert_eq!(
-            assistant.metadata.as_ref().unwrap().execution_id.as_deref(),
-            Some("execution-step-2")
-        );
-        assert_eq!(
-            tool_result
-                .metadata
-                .as_ref()
-                .unwrap()
-                .execution_id
-                .as_deref(),
-            Some("execution-step-1")
-        );
-        assert_eq!(
-            tool_use.metadata.as_ref().unwrap().execution_id.as_deref(),
-            Some("execution-step-1")
-        );
+        assert_eq!(node_execution_id(assistant), Some("execution-step-2"));
+        assert_eq!(node_execution_id(tool_result), Some("execution-step-1"));
+        assert_eq!(node_execution_id(tool_use), Some("execution-step-1"));
         assert_eq!(result.execution_id, "execution-step-2");
 
         let session = service.resolve_session("main").unwrap();
@@ -5779,18 +6751,17 @@ mod tests {
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "trying again"));
 
         let tool_result = store.get_node(&assistant.parent).unwrap();
-        assert!(matches!(
+        assert!(kind_has_tool_result(
             &tool_result.kind,
-            Kind::ToolResult(ToolResult { id, output, .. })
-                if id == "tool-call-1"
-                    && output == "exit_status: 0\nstdout:\n\nstderr:\n"
+            "tool-call-1",
+            "exit_status: 0\nstdout:\n\nstderr:\n"
         ));
 
         let tool_use = store.get_node(&tool_result.parent).unwrap();
-        assert!(matches!(
+        assert!(kind_has_tool_use(
             &tool_use.kind,
-            Kind::ToolUse(ToolUse { id, name, .. })
-                if id == "tool-call-1" && name == "exec_command"
+            "tool-call-1",
+            "exec_command"
         ));
         assert_eq!(tool_use.parent, context.retry_from_node_id);
 

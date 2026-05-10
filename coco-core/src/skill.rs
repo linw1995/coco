@@ -8,7 +8,7 @@ use std::sync::Weak;
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
     Anchor, BranchStore, Kind, NewNode, NodeStore, Role, RuntimeStore, SessionAnchor, SessionRole,
-    SessionStore, SkillRecord, SkillRuntimeContext, SkillScript, SkillStore, ToolUse,
+    SessionStore, SkillRecord, SkillRuntimeContext, SkillScript, SkillStore,
 };
 use coco_llm::{
     ActiveSkillRuntimeContext, COCO_SKILL_PERSIST_DIR_ENV, COCO_SKILL_PERSIST_ROOT_ENV,
@@ -449,7 +449,11 @@ where
             source: Box::new(source),
         })?;
 
-    if matches!(&node.kind, Kind::ToolUse(ToolUse { name, .. }) if name == "use_skill") {
+    if node.kind.as_tool_uses().is_some_and(|tool_uses| {
+        tool_uses
+            .iter()
+            .any(|tool_use| tool_use.name == "use_skill")
+    }) {
         return Ok(());
     }
 

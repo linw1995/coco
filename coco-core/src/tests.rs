@@ -39,7 +39,7 @@ where
                 .execution(&ExecutionMetadata::new("execution-use-skill".to_owned()))
                 .provider(&ProviderMetadata::new(Some("tool-call-1".to_owned())))
                 .build(),
-            kind: Kind::ToolUse(ToolUse {
+            kind: Kind::tool_use(ToolUse {
                 id: "tool-call-1".to_owned(),
                 name: "use_skill".to_owned(),
                 input: serde_json::json!({ "name": skill_name }),
@@ -727,7 +727,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
                 .execution(&ExecutionMetadata::new("execution-step-1".to_owned()))
                 .provider(&ProviderMetadata::new(Some("tool-call-1".to_owned())))
                 .build(),
-            kind: Kind::ToolUse(ToolUse {
+            kind: Kind::tool_use(ToolUse {
                 id: "tool-call-1".to_owned(),
                 name: "exec_command".to_owned(),
                 input: serde_json::json!({"cmd": "printf 'hello' > trace.txt"}),
@@ -745,7 +745,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
                 .execution(&ExecutionMetadata::new("execution-step-2".to_owned()))
                 .provider(&ProviderMetadata::new(Some("tool-call-1".to_owned())))
                 .build(),
-            kind: Kind::ToolResult(ToolResult {
+            kind: Kind::tool_result(ToolResult {
                 id: "tool-call-1".to_owned(),
                 output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
             }),

@@ -770,7 +770,11 @@ fn collect_visible_anchor_child_subtrees(
 }
 
 fn is_use_skill_tool_use(node: &Node) -> bool {
-    matches!(&node.kind, Kind::ToolUse(tool_use) if tool_use.name == "use_skill")
+    node.kind.as_tool_uses().is_some_and(|tool_uses| {
+        tool_uses
+            .iter()
+            .any(|tool_use| tool_use.name == "use_skill")
+    })
 }
 
 fn render_session_show(
@@ -1122,8 +1126,14 @@ fn summarize_node(node: &Node) -> String {
             AnchorPayload::Prompt(prompt) => prompt.prompt.clone(),
             AnchorPayload::SkillResult(skill_result) => skill_result.output.clone(),
         },
-        Kind::ToolUse(tool_use) => tool_use.input.to_string(),
-        Kind::ToolResult(tool_result) => tool_result.output.clone(),
+        Kind::ToolUse(tool_uses) => tool_uses
+            .first()
+            .map(|tool_use| tool_use.input.to_string())
+            .unwrap_or_default(),
+        Kind::ToolResult(tool_results) => tool_results
+            .first()
+            .map(|tool_result| tool_result.output.clone())
+            .unwrap_or_default(),
         Kind::Text(text) => text.clone(),
         Kind::Failure(message) => message.clone(),
     };
@@ -1154,6 +1164,7 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
         .node
         .metadata
         .as_ref()
+        .and_then(|metadata| metadata.first())
         .and_then(|metadata| metadata.execution_id.as_deref())
     {
         lines.push(format!("execution_id: {execution_id}"));
@@ -1240,18 +1251,23 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
                 }
             }
         }
-        Kind::ToolUse(tool_use) => {
-            lines.push(format!("tool_id: {}", tool_use.id));
-            lines.push(format!("tool_name: {}", tool_use.name));
-            lines.push("input:".to_owned());
-            lines.push(
-                serde_json::to_string_pretty(&tool_use.input).expect("tool input should serialize"),
-            );
+        Kind::ToolUse(tool_uses) => {
+            for tool_use in tool_uses.iter() {
+                lines.push(format!("tool_id: {}", tool_use.id));
+                lines.push(format!("tool_name: {}", tool_use.name));
+                lines.push("input:".to_owned());
+                lines.push(
+                    serde_json::to_string_pretty(&tool_use.input)
+                        .expect("tool input should serialize"),
+                );
+            }
         }
-        Kind::ToolResult(tool_result) => {
-            lines.push(format!("tool_id: {}", tool_result.id));
-            lines.push("output:".to_owned());
-            lines.push(tool_result.output.clone());
+        Kind::ToolResult(tool_results) => {
+            for tool_result in tool_results.iter() {
+                lines.push(format!("tool_id: {}", tool_result.id));
+                lines.push("output:".to_owned());
+                lines.push(tool_result.output.clone());
+            }
         }
         Kind::Text(text) => {
             lines.push("text:".to_owned());
