@@ -363,7 +363,6 @@ impl ToolExecutionOutcome {
                 merge_parent,
                 provider_output,
             } => BackendEventPayload::SkillResult(SkillResultEvent {
-                tool_id,
                 skill_name,
                 merge_parent,
                 output: provider_output,
@@ -2508,7 +2507,6 @@ fn persisted_node_from_backend_event(
             Kind::Anchor(Anchor::skill_result(
                 vec![MergeParent::merge(skill_result.merge_parent)],
                 SkillResultAnchor {
-                    tool_id: skill_result.tool_id,
                     skill_name: skill_result.skill_name,
                     output: skill_result.output,
                 },
@@ -2687,11 +2685,7 @@ impl ProviderHistoryBuilder {
                 AnchorPayload::SessionPatch(_) => {}
                 AnchorPayload::Prompt(prompt) => self.push_user_text(&prompt.prompt),
                 AnchorPayload::SkillInvocation(_) => {}
-                AnchorPayload::SkillResult(result) => self.push_tool_result(
-                    node_metadata_first(node.metadata.as_ref()),
-                    &result.tool_id,
-                    &result.output,
-                ),
+                AnchorPayload::SkillResult(_) => {}
             },
             Kind::Text(text) => match node.role {
                 Role::User => self.push_user_text(text),
@@ -3803,7 +3797,6 @@ mod tests {
 
             let step_two_result = backend_event(
                 BackendEventPayload::SkillResult(SkillResultEvent {
-                    tool_id: "tool-call-1".to_owned(),
                     skill_name: "find-skills".to_owned(),
                     merge_parent: skill_merge_parent,
                     output: "delegated output".to_owned(),
@@ -6120,7 +6113,6 @@ mod tests {
         let persisted = anchor
             .as_skill_result()
             .expect("expected skill result payload");
-        assert_eq!(persisted.tool_id, "tool-call-1");
         assert_eq!(persisted.skill_name, "find-skills");
         assert_eq!(persisted.output, "delegated output");
         assert_eq!(anchor.merge_parent_node_ids(), [tool_use.parent.as_str()]);
@@ -6157,7 +6149,6 @@ mod tests {
                     events: vec![
                         backend_event(
                             BackendEventPayload::SkillResult(SkillResultEvent {
-                                tool_id: "tool-call-1".to_owned(),
                                 skill_name: "find-skills".to_owned(),
                                 merge_parent: draft_head.clone(),
                                 output: "Skill handoff".to_owned(),
@@ -6188,7 +6179,6 @@ mod tests {
         let skill_result = anchor
             .as_skill_result()
             .expect("expected skill result anchor");
-        assert_eq!(skill_result.tool_id, "tool-call-1");
         assert_eq!(skill_result.skill_name, "find-skills");
         assert_eq!(skill_result.output, "Skill handoff");
         assert_eq!(anchor.merge_parent_node_ids(), [draft_head.as_str()]);
@@ -6433,6 +6423,56 @@ mod tests {
                     rig::completion::message::UserContent::ToolResult(tool_result)
                         if tool_result.id == "tool-call-legacy"
                             && tool_result.call_id.as_deref() == Some("call-legacy")
+            )
+        ));
+    }
+
+    #[test]
+    fn rig_messages_from_nodes_ignores_skill_result_anchors() {
+        let messages = rig_messages_from_nodes(&[
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), Some("call-1")),
+                Kind::tool_use(ToolUse {
+                    id: "tool-call-1".to_owned(),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "coco skill run find-skills"}),
+                }),
+            ),
+            context_node(
+                Role::System,
+                None,
+                Kind::Anchor(Anchor::skill_result(
+                    vec![],
+                    SkillResultAnchor {
+                        skill_name: "find-skills".to_owned(),
+                        output: "domain result".to_owned(),
+                    },
+                )),
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), Some("call-1")),
+                Kind::tool_result(ToolResult {
+                    id: "tool-call-1".to_owned(),
+                    output: "command result".to_owned(),
+                }),
+            ),
+        ]);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[1],
+            rig::completion::message::Message::User { content }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::UserContent::ToolResult(tool_result)
+                        if tool_result.id == "tool-call-1"
+                            && matches!(
+                                tool_result.content.first_ref(),
+                                rig::completion::message::ToolResultContent::Text(text)
+                                    if text.text == "command result"
+                            )
                 )
         ));
     }

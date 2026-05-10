@@ -478,7 +478,6 @@ pub enum SkillInvocationMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillResultAnchor {
-    pub tool_id: String,
     pub skill_name: String,
     pub output: String,
 }
@@ -1114,7 +1113,6 @@ mod tests {
 
     fn make_skill_result_anchor() -> SkillResultAnchor {
         SkillResultAnchor {
-            tool_id: "tool-call-1".to_owned(),
             skill_name: "find-skills".to_owned(),
             output: "child result".to_owned(),
         }
@@ -1561,7 +1559,6 @@ mod tests {
             .expect("expected skill result anchor");
 
         assert_eq!(anchor.merge_parent_node_ids(), ["merge-a"]);
-        assert_eq!(skill_result.tool_id, "tool-call-1");
         assert_eq!(skill_result.skill_name, "find-skills");
         assert_eq!(skill_result.output, "child result");
     }

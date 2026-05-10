@@ -79,7 +79,6 @@ pub trait SkillToolExecutor: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillResultEvent {
-    pub tool_id: String,
     pub skill_name: String,
     pub merge_parent: String,
     pub output: String,

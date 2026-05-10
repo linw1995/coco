@@ -790,7 +790,6 @@ fn append_skill_result_anchor(
     store: &impl NodeStore,
     parent: &str,
     merge_parent: &str,
-    tool_id: &str,
     skill_name: &str,
     output: &str,
 ) -> String {
@@ -798,13 +797,10 @@ fn append_skill_result_anchor(
         .append(NewNode {
             parent: parent.to_owned(),
             role: Role::System,
-            metadata: BackendMetadata::builder()
-                .provider(&ProviderMetadata::new(Some(tool_id.to_owned())))
-                .build(),
+            metadata: None,
             kind: Kind::Anchor(Anchor::skill_result(
                 vec![MergeParent::merge(merge_parent)],
                 SkillResultAnchor {
-                    tool_id: tool_id.to_owned(),
                     skill_name: skill_name.to_owned(),
                     output: output.to_owned(),
                 },
@@ -1084,7 +1080,7 @@ async fn prompt_wires_skill_executor_for_use_skill() {
         .find_map(|node| match &node.kind {
             Kind::Anchor(anchor) => anchor
                 .as_skill_result()
-                .filter(|result| result.tool_id == "tool-call-1")
+                .filter(|result| result.skill_name == "fast-rust")
                 .map(|result| (node, anchor, result)),
             _ => None,
         })
@@ -2869,7 +2865,6 @@ async fn session_graph_and_show_render_skill_result_anchor() {
         &store,
         &tool_use_id,
         &session_head,
-        "tool-1",
         "find-skills",
         "Delegated result",
     );
@@ -2906,7 +2901,6 @@ async fn session_graph_and_show_render_skill_result_anchor() {
     .unwrap()
     .unwrap();
     assert!(show_output.contains("kind: skill_result"));
-    assert!(show_output.contains("tool_id: tool-1"));
     assert!(show_output.contains("skill_name: find-skills"));
     assert!(show_output.contains("Delegated result"));
 }

@@ -1254,7 +1254,6 @@ fn render_node_show_text(result: &NodeShowResult) -> String {
                     );
                 }
                 AnchorPayload::SkillResult(skill_result) => {
-                    lines.push(format!("tool_id: {}", skill_result.tool_id));
                     lines.push(format!("skill_name: {}", skill_result.skill_name));
                     lines.push("output:".to_owned());
                     lines.push(skill_result.output.clone());
