@@ -20,7 +20,7 @@ use coco_mem::{
     Role, RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillResultAnchor,
     StoreError, Tool, ToolResult, ToolUse,
 };
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::IntoError;
@@ -2261,11 +2261,13 @@ where
 
 const DEFAULT_AGENT_MAX_TURNS: usize = 100;
 
+#[derive(Clone)]
 struct RuntimeToolSet {
     definitions: Vec<CompletionToolDefinition>,
     tools: HashMap<String, RuntimeTool>,
 }
 
+#[derive(Clone)]
 enum RuntimeTool {
     ExecCommand(unified_exec_tool::UnifiedExecToolRuntime),
     WriteStdin(unified_exec_tool::UnifiedExecToolRuntime),
@@ -2880,11 +2882,13 @@ struct StepState {
 }
 
 struct ToolCallInvocation {
+    index: usize,
     tool_call: CompletionToolCall,
     tool_use_node_id: Option<String>,
 }
 
 struct ToolCallExecution {
+    index: usize,
     event: BackendEvent,
     tool_result: rig::completion::message::UserContent,
 }
@@ -3025,6 +3029,7 @@ impl CompletionRunner {
 
     fn prepare_tool_call_invocation(
         &mut self,
+        index: usize,
         tool_call: CompletionToolCall,
     ) -> std::result::Result<ToolCallInvocation, BackendError> {
         let tool_use_node_id = self.tool_use_node_ids.remove(&tool_call.id);
@@ -3036,20 +3041,21 @@ impl CompletionRunner {
         }
 
         Ok(ToolCallInvocation {
+            index,
             tool_call,
             tool_use_node_id,
         })
     }
 
     async fn execute_tool_call(
-        &self,
+        runtime_tools: RuntimeToolSet,
         invocation: ToolCallInvocation,
     ) -> std::result::Result<ToolCallExecution, BackendError> {
+        let index = invocation.index;
         let tool_call = invocation.tool_call;
         let args = serde_json::to_string(&tool_call.function.arguments)
             .map_err(|source| BackendError::failed(source.to_string()))?;
-        let outcome = self
-            .runtime_tools
+        let outcome = runtime_tools
             .execute(
                 &tool_call.function.name,
                 args,
@@ -3062,6 +3068,7 @@ impl CompletionRunner {
         let call_id = tool_call.call_id.clone();
         let event = outcome.into_backend_event(tool_call.id.clone(), call_id.clone());
         Ok(ToolCallExecution {
+            index,
             event,
             tool_result: rig_tool_result_content(
                 tool_call.id,
@@ -3104,32 +3111,42 @@ impl CompletionRunner {
         let invocations = turn
             .tool_calls
             .into_iter()
-            .map(|tool_call| self.prepare_tool_call_invocation(tool_call))
+            .enumerate()
+            .map(|(index, tool_call)| self.prepare_tool_call_invocation(index, tool_call))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let executions = join_all(
-            invocations
-                .into_iter()
-                .map(|invocation| self.execute_tool_call(invocation)),
-        )
-        .await;
+        let runtime_tools = self.runtime_tools.clone();
+        let mut executions = invocations
+            .into_iter()
+            .map(|invocation| {
+                let runtime_tools = runtime_tools.clone();
+                async move { Self::execute_tool_call(runtime_tools, invocation).await }
+            })
+            .collect::<FuturesUnordered<_>>();
 
+        let mut completed = Vec::new();
         let mut error = None;
-        for execution in executions {
+        while let Some(execution) = executions.next().await {
             match execution {
                 Ok(execution) => {
-                    next_events.push(execution.event);
-                    tool_results.push(execution.tool_result);
+                    self.persist_tool_result_events(
+                        &next_execution,
+                        std::slice::from_ref(&execution.event),
+                    )?;
+                    completed.push(execution);
                 }
                 Err(source) => {
                     error.get_or_insert(source);
                 }
             }
         }
+        completed.sort_by_key(|execution| execution.index);
+        for execution in completed {
+            next_events.push(execution.event);
+            tool_results.push(execution.tool_result);
+        }
         if let Some(source) = error {
-            self.persist_tool_result_events(&next_execution, &next_events)?;
             return Err(source);
         }
-        self.persist_tool_result_events(&next_execution, &next_events)?;
 
         self.steps.push(BackendStep {
             execution: state.execution,
@@ -3395,7 +3412,7 @@ mod tests {
     use std::time::Duration;
 
     use coco_mem::{BranchStore, MemoryStore, NodeStore, SessionStore};
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
 
     type RecordedCalls = Arc<Mutex<Vec<(ResolvedSession, ResolvedCompletionRequest)>>>;
     type FakeTurnQueue =
@@ -3610,6 +3627,52 @@ mod tests {
                 },
                 response_node_id,
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct StagedSkillExecutor {
+        first_done: Arc<Notify>,
+        release_second: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SkillToolExecutor for StagedSkillExecutor {
+        async fn search_skill_tool(
+            &self,
+            request: SearchSkillToolRequest,
+        ) -> std::result::Result<String, ExecutorError> {
+            if request.query == "slow" {
+                self.release_second.notified().await;
+            }
+            let output = format!(r#"{{"query":"{}"}}"#, request.query);
+            if request.query == "fast" {
+                self.first_done.notify_one();
+            }
+            Ok(output)
+        }
+
+        async fn execute_skill_tool(
+            &self,
+            request: UseSkillToolRequest,
+        ) -> std::result::Result<SkillToolExecutionResult, ExecutorError> {
+            if request.skill_name == "rust-patterns" {
+                self.release_second.notified().await;
+            }
+
+            let response_node_id = request.parent_tool_use_id.clone();
+            let result = SkillToolExecutionResult {
+                result: SkillToolRunResult {
+                    text: format!("Executed {}", request.skill_name),
+                },
+                response_node_id,
+            };
+
+            if request.skill_name == "fast-rust" {
+                self.first_done.notify_one();
+            }
+
+            Ok(result)
         }
     }
 
@@ -4044,6 +4107,81 @@ mod tests {
         assert_eq!(result.text, "done");
     }
 
+    #[tokio::test]
+    async fn sibling_tool_results_persist_as_each_call_finishes() {
+        let first = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "search_skill",
+            serde_json::json!({"query": "fast"}),
+        );
+        let second = rig_tool_call_content(
+            "tool-call-2",
+            Some("call-2".to_owned()),
+            "search_skill",
+            serde_json::json!({"query": "slow"}),
+        );
+        let turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::many(vec![first, second])
+                .expect("assistant choice should be non-empty"),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![Ok(turn), Ok(BackendTurn::finished("done"))],
+        )]);
+        let store = MemoryStore::new();
+        let first_done = Arc::new(Notify::new());
+        let release_second = Arc::new(Notify::new());
+        let service = LlmService::builder(store.clone(), backend)
+            .with_skill_tool_executor(Arc::new(StagedSkillExecutor {
+                first_done: first_done.clone(),
+                release_second: release_second.clone(),
+            }))
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+        let initial_head = store.get_branch_head("main").unwrap();
+
+        let prompt =
+            tokio::spawn(
+                async move { service.prompt(prompt_request("main", "search twice")).await },
+            );
+        first_done.notified().await;
+
+        let staged_nodes = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let nodes = tool_result_nodes(&store, &initial_head);
+                if !nodes.is_empty() {
+                    return nodes;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first completed sibling result should be persisted before the second finishes");
+
+        assert_eq!(staged_nodes.len(), 1);
+        assert!(kind_has_tool_result(
+            &staged_nodes[0].kind,
+            "tool-call-1",
+            r#"{"query":"fast"}"#
+        ));
+        assert_eq!(node_call_id_at(&staged_nodes[0], 0), Some("call-1"));
+
+        release_second.notify_one();
+        let result = prompt.await.unwrap().unwrap();
+        assert_eq!(result.text, "done");
+
+        let final_result_nodes = tool_result_nodes(&store, &initial_head);
+        assert_eq!(final_result_nodes.len(), 2);
+    }
+
     fn metadata(execution_id: Option<&str>, call_id: Option<&str>) -> Option<NodeMetadata> {
         let execution =
             execution_id.map(|execution_id| ExecutionMetadata::new(execution_id.to_owned()));
@@ -4080,6 +4218,29 @@ mod tests {
             .as_ref()
             .and_then(|metadata| metadata.items().get(index))
             .and_then(|metadata| metadata.call_id.as_deref())
+    }
+
+    fn collect_descendants(store: &MemoryStore, node_id: &str) -> Vec<coco_mem::Node> {
+        let mut descendants = Vec::new();
+        let mut stack = store
+            .list_children(node_id)
+            .expect("children should be listed");
+        while let Some(node) = stack.pop() {
+            stack.extend(
+                store
+                    .list_children(&node.id)
+                    .expect("children should be listed"),
+            );
+            descendants.push(node);
+        }
+        descendants
+    }
+
+    fn tool_result_nodes(store: &MemoryStore, root_id: &str) -> Vec<coco_mem::Node> {
+        collect_descendants(store, root_id)
+            .into_iter()
+            .filter(|node| matches!(node.kind, Kind::ToolResult(_)))
+            .collect()
     }
 
     fn kind_has_tool_use(kind: &Kind, expected_id: &str, expected_name: &str) -> bool {
