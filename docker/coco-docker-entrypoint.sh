@@ -77,40 +77,9 @@ start_cron() {
 
   cronjob_install_dir="${COCO_SKILL_PERSIST_ROOT:-/data/skills}/orchestrator/cronjob/data/install"
   cronjob_crontab_dir="${COCO_CRONTAB_DIR:-${cronjob_install_dir}/crontabs}"
-  cronjob_managed_crontab_dir="${cronjob_install_dir}/managed-crontabs"
-  mkdir -p "${cronjob_crontab_dir}" "${cronjob_managed_crontab_dir}"
+  mkdir -p "${cronjob_crontab_dir}"
   export COCO_CRONTAB_DIR="${cronjob_crontab_dir}"
-  restore_crontab_snapshots "${cronjob_managed_crontab_dir}" "${cronjob_crontab_dir}" \
-    || printf 'warning: failed to restore managed CoCo cronjob files\n' >&2
   supervise_crontabs "${cronjob_crontab_dir}" &
-}
-
-restore_crontab_snapshots() {
-  snapshot_dir="$1"
-  crontab_dir="$2"
-  if [ ! -d "${snapshot_dir}" ]; then
-    return 0
-  fi
-
-  mkdir -p "${crontab_dir}"
-  for snapshot_file in "${snapshot_dir}"/*.crontab; do
-    if [ ! -f "${snapshot_file}" ]; then
-      continue
-    fi
-    crontab_file="${crontab_dir}/$(basename "${snapshot_file}")"
-    tmp_file="${crontab_file}.tmp"
-    cp "${snapshot_file}" "${tmp_file}" || return 1
-    mv "${tmp_file}" "${crontab_file}" || return 1
-  done
-  for crontab_file in "${crontab_dir}"/*.crontab; do
-    if [ ! -f "${crontab_file}" ]; then
-      continue
-    fi
-    snapshot_file="${snapshot_dir}/$(basename "${crontab_file}")"
-    if [ ! -f "${snapshot_file}" ]; then
-      rm -f "${crontab_file}" || return 1
-    fi
-  done
 }
 
 supervise_crontabs() {

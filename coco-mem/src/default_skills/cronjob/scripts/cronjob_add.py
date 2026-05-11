@@ -90,8 +90,6 @@ def main() -> int:
     crontab_dir.mkdir(parents=True, exist_ok=True)
 
     runner_path = install_script(args.runner_source, install_dir, "cronjob_run.py")
-    restore_path = install_script(None, install_dir, "cronjob_restore.py")
-    install_script(None, install_dir, "cronjob_crontab.py")
     block = render_crontab_block(
         task_id=task_id,
         cronexpr=args.cronexpr,
@@ -133,7 +131,6 @@ def main() -> int:
                 "repeat": args.repeat,
                 "task_file": str(task_path),
                 "runner": str(runner_path),
-                "restore": str(restore_path),
                 "crontab_dir": str(crontab_dir),
                 "crontab_file": str(crontab_file),
             },

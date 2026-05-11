@@ -20,27 +20,6 @@ def write_crontab(crontab_file: Path, content: str) -> None:
     tmp.replace(crontab_file)
 
 
-def project_managed_crontabs(managed_crontab_dir: Path, crontab_dir: Path) -> None:
-    crontab_dir.mkdir(parents=True, exist_ok=True)
-    for snapshot_path in sorted(managed_crontab_dir.glob("*.crontab")):
-        snapshot = snapshot_path.read_text(encoding="utf-8")
-        crontab_file = crontab_dir / snapshot_path.name
-        active_crontab = read_crontab(crontab_file)
-        final_crontab = normalize_direct_crontab(snapshot, requested_timezone=None)
-        if final_crontab != active_crontab:
-            write_crontab(crontab_file, final_crontab)
-    prune_stale_crontabs(managed_crontab_dir, crontab_dir)
-
-
-def prune_stale_crontabs(managed_crontab_dir: Path, crontab_dir: Path) -> None:
-    for crontab_file in sorted(crontab_dir.glob("*.crontab")):
-        if not crontab_file.is_file():
-            continue
-        snapshot_path = managed_crontab_dir / crontab_file.name
-        if not snapshot_path.is_file():
-            crontab_file.unlink()
-
-
 def normalize_direct_crontab(content: str, *, requested_timezone: str | None) -> str:
     job_timezones, has_unqualified_jobs = collect_direct_job_timezones(content)
     timezones = set(job_timezones)
