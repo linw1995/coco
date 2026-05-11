@@ -63,7 +63,6 @@ def main() -> int:
     block = render_crontab_block(
         task_id=task_id,
         cronexpr=args.cronexpr,
-        timezone=timezone,
         uv_bin=args.uv_bin,
         runner_path=runner_path,
         task_path=task_path,
@@ -90,7 +89,6 @@ def main() -> int:
     block = render_crontab_block(
         task_id=task_id,
         cronexpr=args.cronexpr,
-        timezone=timezone,
         uv_bin=args.uv_bin,
         runner_path=runner_path,
         task_path=task_path,
@@ -523,7 +521,6 @@ def render_crontab_block(
     *,
     task_id: str,
     cronexpr: str,
-    timezone: str | None,
     uv_bin: str,
     runner_path: Path,
     task_path: Path,
@@ -542,8 +539,6 @@ def render_crontab_block(
     )
     redirect = f">> {shell_quote(str(log_path))} 2>&1"
     lines = [begin_marker(task_id)]
-    if timezone:
-        lines.append(f"CRON_TZ={timezone}")
     lines.append(f"{cronexpr} {command} {redirect}")
     lines.append(end_marker(task_id))
     return "\n".join(lines) + "\n"
@@ -580,7 +575,7 @@ def extract_direct_managed_crontab(content: str) -> str:
 
 
 def normalize_direct_crontab(content: str, *, requested_timezone: str | None) -> str:
-    job_timezones, has_unqualified_jobs = collect_direct_job_timezones(content)
+    job_timezones, _ = collect_direct_job_timezones(content)
     timezones = set(job_timezones)
     if requested_timezone is not None:
         timezones.add(requested_timezone)
@@ -589,12 +584,6 @@ def normalize_direct_crontab(content: str, *, requested_timezone: str | None) ->
             "direct crontab files run under supercronic and support only one "
             f"schedule timezone; found {', '.join(sorted(timezones))}"
         )
-    if requested_timezone is not None and has_unqualified_jobs:
-        raise SystemExit(
-            "direct crontab files run under supercronic and cannot mix "
-            "timezone-qualified jobs with timezone-less jobs"
-        )
-
     timezone = requested_timezone or next(iter(timezones), None)
     body = "\n".join(
         line
