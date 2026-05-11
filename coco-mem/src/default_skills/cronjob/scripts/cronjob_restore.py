@@ -55,6 +55,16 @@ def restore_snapshot_dir(snapshot_dir: Path, crontab_dir: Path) -> None:
         final_crontab = normalize_direct_crontab(snapshot)
         if final_crontab != active_crontab:
             write_crontab(crontab_file, final_crontab)
+    prune_stale_crontabs(snapshot_dir, crontab_dir)
+
+
+def prune_stale_crontabs(snapshot_dir: Path, crontab_dir: Path) -> None:
+    for crontab_file in sorted(crontab_dir.glob("*.crontab")):
+        if not crontab_file.is_file():
+            continue
+        snapshot_path = snapshot_dir / crontab_file.name
+        if not snapshot_path.is_file():
+            crontab_file.unlink()
 
 
 def normalize_timezone(value: str | None) -> str | None:

@@ -494,6 +494,45 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertTrue(crontab.startswith("CRON_TZ=Asia/Shanghai\n"))
         self.assertEqual(crontab.count("CRON_TZ="), 1)
 
+    def test_restore_prunes_crontab_files_missing_from_snapshot_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            snapshot_dir = workspace / "managed-crontabs"
+            crontab_dir = workspace / "supercronic"
+            snapshot_dir.mkdir()
+            crontab_dir.mkdir()
+            (snapshot_dir / "tz-Asia_Tokyo.crontab").write_text(
+                render_restore_block().replace("Asia/Shanghai", "Asia/Tokyo"),
+                encoding="utf-8",
+            )
+            stale_crontab = crontab_dir / "tz-Asia_Shanghai.crontab"
+            stale_crontab.write_text(render_restore_block(), encoding="utf-8")
+            placeholder_crontab = crontab_dir / "local.crontab"
+            placeholder_crontab.write_text("# CoCo cronjobs\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(RESTORE_SCRIPT),
+                    "--snapshot-dir",
+                    str(snapshot_dir),
+                    "--crontab-dir",
+                    str(crontab_dir),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            tokyo_crontab = (crontab_dir / "tz-Asia_Tokyo.crontab").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CRON_TZ=Asia/Tokyo", tokyo_crontab)
+        self.assertFalse(stale_crontab.exists())
+        self.assertFalse(placeholder_crontab.exists())
+
     def test_runner_skip_policy_does_not_submit_while_previous_job_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
