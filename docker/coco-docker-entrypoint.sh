@@ -79,9 +79,6 @@ start_cron() {
   cronjob_crontab_dir="${COCO_CRONTAB_DIR:-${cronjob_install_dir}/crontabs}"
   cronjob_managed_crontab_dir="${cronjob_install_dir}/managed-crontabs"
   mkdir -p "${cronjob_crontab_dir}" "${cronjob_managed_crontab_dir}"
-  if [ ! -f "${cronjob_crontab_dir}/local.crontab" ]; then
-    printf '# CoCo cronjobs\n' >"${cronjob_crontab_dir}/local.crontab"
-  fi
   export COCO_CRONTAB_DIR="${cronjob_crontab_dir}"
   restore_crontab_snapshots "${cronjob_managed_crontab_dir}" "${cronjob_crontab_dir}" \
     || printf 'warning: failed to restore managed CoCo cronjob files\n' >&2
@@ -104,6 +101,15 @@ restore_crontab_snapshots() {
     tmp_file="${crontab_file}.tmp"
     cp "${snapshot_file}" "${tmp_file}" || return 1
     mv "${tmp_file}" "${crontab_file}" || return 1
+  done
+  for crontab_file in "${crontab_dir}"/*.crontab; do
+    if [ ! -f "${crontab_file}" ]; then
+      continue
+    fi
+    snapshot_file="${snapshot_dir}/$(basename "${crontab_file}")"
+    if [ ! -f "${snapshot_file}" ]; then
+      rm -f "${crontab_file}" || return 1
+    fi
   done
 }
 
