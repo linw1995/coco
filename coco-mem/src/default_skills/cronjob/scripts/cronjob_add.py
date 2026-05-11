@@ -15,6 +15,14 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from cronjob_crontab import (
+    normalize_direct_crontab,
+    parse_env_assignment,
+    project_managed_crontabs,
+    read_crontab,
+    write_crontab,
+)
+
 
 MANAGED_PREFIX = "coco-cronjob"
 MANAGED_CRONTAB_DIR = "managed-crontabs"
@@ -88,6 +96,7 @@ def main() -> int:
 
     runner_path = install_script(args.runner_source, install_dir, "cronjob_run.py")
     restore_path = install_script(None, install_dir, "cronjob_restore.py")
+    install_script(None, install_dir, "cronjob_crontab.py")
     block = render_crontab_block(
         task_id=task_id,
         cronexpr=args.cronexpr,
@@ -117,7 +126,7 @@ def main() -> int:
             "log_dir": str(log_dir),
         },
     )
-    write_managed_crontab_snapshot(managed_crontab, final_crontab)
+    write_crontab(managed_crontab, final_crontab)
     apply_managed_crontab_cleanup_plan(cleanup_plan)
     project_managed_crontabs(managed_crontab_dir, crontab_dir)
     print(
@@ -544,19 +553,6 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def read_crontab(crontab_file: Path) -> str:
-    if not crontab_file.exists():
-        return ""
-    return crontab_file.read_text(encoding="utf-8")
-
-
-def write_crontab(crontab_file: Path, content: str) -> None:
-    crontab_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = crontab_file.with_suffix(crontab_file.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(crontab_file)
-
-
 def extract_direct_managed_crontab(content: str) -> str:
     timezone_lines = [
         line
@@ -568,66 +564,6 @@ def extract_direct_managed_crontab(content: str) -> str:
     if blocks.strip():
         parts.append(blocks.rstrip("\n"))
     return "\n".join(parts).rstrip("\n") + ("\n" if parts else "")
-
-
-def normalize_direct_crontab(content: str, *, requested_timezone: str | None) -> str:
-    job_timezones, _ = collect_direct_job_timezones(content)
-    timezones = set(job_timezones)
-    if requested_timezone is not None:
-        timezones.add(requested_timezone)
-    if len(timezones) > 1:
-        raise SystemExit(
-            "direct crontab files run under supercronic and support only one "
-            f"schedule timezone; found {', '.join(sorted(timezones))}"
-        )
-    timezone = requested_timezone or next(iter(timezones), None)
-    body = "\n".join(
-        line
-        for line in content.splitlines()
-        if parse_env_assignment(line.strip())[0] != "CRON_TZ"
-    ).strip("\n")
-    lines: list[str] = []
-    if timezone is not None:
-        lines.append(f"CRON_TZ={timezone}")
-    if body:
-        lines.append(body)
-    return "\n".join(lines).rstrip("\n") + ("\n" if lines else "")
-
-
-def collect_direct_job_timezones(content: str) -> tuple[set[str], bool]:
-    current_timezone: str | None = None
-    job_timezones: set[str] = set()
-    has_unqualified_jobs = False
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, value = parse_env_assignment(line)
-        if key is not None:
-            if key == "CRON_TZ":
-                current_timezone = normalize_timezone(value, allow_blank=True)
-            continue
-        if current_timezone is None:
-            has_unqualified_jobs = True
-        else:
-            job_timezones.add(current_timezone)
-    return job_timezones, has_unqualified_jobs
-
-
-def parse_env_assignment(line: str) -> tuple[str | None, str]:
-    if "=" not in line or line.split("=", 1)[0].strip() != line.split("=", 1)[0]:
-        return None, ""
-    key, value = line.split("=", 1)
-    if not key or any(char.isspace() for char in key):
-        return None, ""
-    return key, value.strip()
-
-
-def write_managed_crontab_snapshot(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
 
 
 def extract_managed_blocks(content: str) -> str:
@@ -716,26 +652,9 @@ def plan_task_removal_from_other_managed_crontabs(
 def apply_managed_crontab_cleanup_plan(plan: list[tuple[Path, str | None]]) -> None:
     for crontab_file, final_crontab in plan:
         if final_crontab is not None:
-            write_managed_crontab_snapshot(crontab_file, final_crontab)
+            write_crontab(crontab_file, final_crontab)
             continue
         crontab_file.unlink(missing_ok=True)
-
-
-def project_managed_crontabs(managed_crontab_dir: Path, crontab_dir: Path) -> None:
-    crontab_dir.mkdir(parents=True, exist_ok=True)
-    for snapshot_path in sorted(managed_crontab_dir.glob("*.crontab")):
-        snapshot = snapshot_path.read_text(encoding="utf-8")
-        crontab_file = crontab_dir / snapshot_path.name
-        active_crontab = read_crontab(crontab_file)
-        final_crontab = normalize_direct_crontab(snapshot, requested_timezone=None)
-        if final_crontab != active_crontab:
-            write_crontab(crontab_file, final_crontab)
-    for crontab_file in sorted(crontab_dir.glob("*.crontab")):
-        if not crontab_file.is_file():
-            continue
-        snapshot_path = managed_crontab_dir / crontab_file.name
-        if not snapshot_path.is_file():
-            crontab_file.unlink()
 
 
 def remove_managed_block(current: str, task_id: str) -> tuple[str, bool]:

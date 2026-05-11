@@ -408,6 +408,11 @@ pub fn default_skill_groups() -> SkillGroups {
                         content: include_str!("default_skills/cronjob/scripts/cronjob_restore.py")
                             .to_owned(),
                     },
+                    SkillScript {
+                        path: "scripts/cronjob_crontab.py".to_owned(),
+                        content: include_str!("default_skills/cronjob/scripts/cronjob_crontab.py")
+                            .to_owned(),
+                    },
                 ],
                 enable_coco_shim: true,
             },
