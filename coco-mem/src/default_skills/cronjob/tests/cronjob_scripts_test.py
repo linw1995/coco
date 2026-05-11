@@ -314,6 +314,66 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertIn("# BEGIN coco-cronjob id=daily-review", tokyo_crontab)
         self.assertIn("30 9 * * *", tokyo_crontab)
 
+    def test_add_keeps_existing_timezone_file_when_target_update_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            crontab_dir = workspace / "supercronic"
+
+            first = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "30 8 * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "First prompt",
+                "--timezone",
+                "Asia/Shanghai",
+                "--crontab-dir",
+                str(crontab_dir),
+            )
+            tokyo_crontab = crontab_dir / "tz-Asia_Tokyo.crontab"
+            tokyo_crontab.write_text(
+                "\n".join(
+                    [
+                        "CRON_TZ=Asia/Tokyo",
+                        "# BEGIN coco-cronjob id=broken",
+                        "30 9 * * * echo broken",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            second = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "30 9 * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Second prompt",
+                "--timezone",
+                "Asia/Tokyo",
+                "--crontab-dir",
+                str(crontab_dir),
+            )
+            shanghai_crontab = (crontab_dir / "tz-Asia_Shanghai.crontab").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("missing its end marker", second.stderr)
+        self.assertIn("# BEGIN coco-cronjob id=daily-review", shanghai_crontab)
+
     def test_add_dry_run_does_not_mutate_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -331,6 +391,7 @@ class CronjobScriptTests(unittest.TestCase):
                 "--prompt",
                 "Preview prompt",
                 "--dry-run",
+                env={"COCO_CRONTAB_DIR": ""},
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)

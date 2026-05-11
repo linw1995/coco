@@ -83,18 +83,34 @@ start_cron() {
     printf '# CoCo cronjobs\n' >"${cronjob_crontab_dir}/local.crontab"
   fi
   export COCO_CRONTAB_DIR="${cronjob_crontab_dir}"
-  if [ -f "${cronjob_install_dir}/cronjob_restore.py" ] && [ -d "${cronjob_managed_crontab_dir}" ]; then
-    uv run --script "${cronjob_install_dir}/cronjob_restore.py" \
-      --snapshot-dir "${cronjob_managed_crontab_dir}" \
-      --crontab-dir "${cronjob_crontab_dir}" \
-      || printf 'warning: failed to restore managed CoCo cronjob files\n' >&2
-  fi
+  restore_crontab_snapshots "${cronjob_managed_crontab_dir}" "${cronjob_crontab_dir}" \
+    || printf 'warning: failed to restore managed CoCo cronjob files\n' >&2
   supervise_crontabs "${cronjob_crontab_dir}" &
+}
+
+restore_crontab_snapshots() {
+  snapshot_dir="$1"
+  crontab_dir="$2"
+  if [ ! -d "${snapshot_dir}" ]; then
+    return 0
+  fi
+
+  mkdir -p "${crontab_dir}"
+  for snapshot_file in "${snapshot_dir}"/*.crontab; do
+    if [ ! -f "${snapshot_file}" ]; then
+      continue
+    fi
+    crontab_file="${crontab_dir}/$(basename "${snapshot_file}")"
+    tmp_file="${crontab_file}.tmp"
+    cp "${snapshot_file}" "${tmp_file}" || return 1
+    mv "${tmp_file}" "${crontab_file}" || return 1
+  done
 }
 
 supervise_crontabs() {
   crontab_dir="$1"
-  pid_dir="${crontab_dir}/.pids"
+  pid_dir="${TMPDIR:-/tmp}/coco-cronjob-pids"
+  rm -rf "${pid_dir}"
   mkdir -p "${pid_dir}"
   while :; do
     for crontab_file in "${crontab_dir}"/*.crontab; do

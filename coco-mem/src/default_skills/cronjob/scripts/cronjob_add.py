@@ -54,13 +54,10 @@ def main() -> int:
     timezone = normalize_timezone(args.timezone)
 
     install_dir = resolve_install_dir(args.install_dir)
-    crontab_dir = resolve_crontab_dir(args.crontab_dir)
-    crontab_file = crontab_dir / crontab_filename(timezone)
     timezone_reset = resolve_timezone_reset()
     task_dir = install_dir / "tasks"
     state_dir = resolve_state_dir(args.state_dir)
     log_dir = resolve_log_dir(args.log_dir)
-    managed_crontab = install_dir / MANAGED_CRONTAB_DIR / crontab_file.name
     task_path = task_dir / f"{task_id}.json"
     runner_path = install_dir / "cronjob_run.py"
 
@@ -79,6 +76,10 @@ def main() -> int:
         print(block, end="")
         return 0
 
+    crontab_dir = resolve_crontab_dir(args.crontab_dir)
+    crontab_file = crontab_dir / crontab_filename(timezone)
+    managed_crontab = install_dir / MANAGED_CRONTAB_DIR / crontab_file.name
+
     install_dir.mkdir(parents=True, exist_ok=True)
     task_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -88,6 +89,24 @@ def main() -> int:
 
     runner_path = install_script(args.runner_source, install_dir, "cronjob_run.py")
     restore_path = install_script(None, install_dir, "cronjob_restore.py")
+    block = render_crontab_block(
+        task_id=task_id,
+        cronexpr=args.cronexpr,
+        timezone=timezone,
+        timezone_reset=timezone_reset,
+        uv_bin=args.uv_bin,
+        runner_path=runner_path,
+        task_path=task_path,
+        log_path=log_dir / f"{task_id}.log",
+    )
+
+    active_crontab = read_crontab(crontab_file)
+    # Crontab files are active schedule files for this skill, not shared user
+    # crontabs. The skill owns the file completely, so keep it in a fixed managed-block
+    # format and discard any non-managed content that may have been written manually.
+    current = extract_direct_managed_crontab(active_crontab)
+    final_crontab, action = upsert_managed_block(current, task_id, block)
+    final_crontab = normalize_direct_crontab(final_crontab, requested_timezone=timezone)
     write_task_config(
         task_path,
         {
@@ -100,34 +119,15 @@ def main() -> int:
             "log_dir": str(log_dir),
         },
     )
-    block = render_crontab_block(
-        task_id=task_id,
-        cronexpr=args.cronexpr,
-        timezone=timezone,
-        timezone_reset=timezone_reset,
-        uv_bin=args.uv_bin,
-        runner_path=runner_path,
-        task_path=task_path,
-        log_path=log_dir / f"{task_id}.log",
-    )
-
+    if final_crontab != active_crontab:
+        write_crontab(crontab_file, final_crontab)
+    write_managed_crontab_snapshot(managed_crontab, final_crontab)
     remove_task_from_other_direct_crontabs(
         crontab_dir=crontab_dir,
         target_file=crontab_file,
         task_id=task_id,
         install_dir=install_dir,
     )
-
-    active_crontab = read_crontab(crontab_file)
-    # Crontab files are active schedule files for this skill, not shared user
-    # crontabs. The skill owns the file completely, so keep it in a fixed managed-block
-    # format and discard any non-managed content that may have been written manually.
-    current = extract_direct_managed_crontab(active_crontab)
-    final_crontab, action = upsert_managed_block(current, task_id, block)
-    final_crontab = normalize_direct_crontab(final_crontab, requested_timezone=timezone)
-    if final_crontab != active_crontab:
-        write_crontab(crontab_file, final_crontab)
-    write_managed_crontab_snapshot(managed_crontab, final_crontab)
     print(
         json.dumps(
             {
