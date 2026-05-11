@@ -233,9 +233,8 @@ task for a new timezone does not require a container restart.
 
 Persistent cronjob paths live under `/data/skills/orchestrator/cronjob`:
 
-- `data/install/crontabs/`: active crontab files, grouped by schedule timezone.
-- `data/install/managed-crontabs/`: CoCo managed block snapshots for active
-  crontab files.
+- `data/install/crontabs/`: CoCo-managed crontab files, grouped by schedule
+  timezone and consumed directly by `supercronic`.
 - `data/state/`: runner state.
 - `data/logs/`: cronjob logs.
 

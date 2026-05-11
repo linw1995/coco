@@ -1769,7 +1769,7 @@ where
     assert!(cronjob.current().unwrap().enable_coco_shim);
     assert!(telegram.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
-    assert_eq!(cronjob.current().unwrap().scripts.len(), 4);
+    assert_eq!(cronjob.current().unwrap().scripts.len(), 3);
     assert_eq!(telegram.current().unwrap().scripts.len(), 2);
     assert!(
         cronjob
