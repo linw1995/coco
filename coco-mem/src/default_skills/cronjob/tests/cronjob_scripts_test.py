@@ -170,17 +170,16 @@ class CronjobScriptTests(unittest.TestCase):
             crontab = crontab_file.read_text(encoding="utf-8")
             task_file = workspace / "install" / "tasks" / "daily-review.json"
             task = json.loads(task_file.read_text(encoding="utf-8"))
-            managed_crontab = (workspace / "install" / "managed-crontab").read_text(
-                encoding="utf-8"
-            )
+            result_data = json.loads(second.stdout)
+            snapshot_dir = workspace / "install" / "managed-crontabs"
 
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(crontab.count("# BEGIN coco-cronjob id=daily-review"), 1)
         self.assertIn("5 * * * * echo user-owned", crontab)
         self.assertIn("15 * * * *", crontab)
-        self.assertNotIn("echo user-owned", managed_crontab)
-        self.assertIn("# BEGIN coco-cronjob id=daily-review", managed_crontab)
+        self.assertIsNone(result_data["managed_crontab"])
+        self.assertFalse(snapshot_dir.exists())
         self.assertEqual(task["branch"], "release")
         self.assertEqual(task["prompt"], "Updated prompt")
         self.assertEqual(task["repeat"], "serial")
@@ -336,11 +335,120 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("support only one schedule timezone", result.stderr)
 
+    def test_add_crontab_dir_groups_direct_files_by_timezone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            crontab_dir = workspace / "supercronic"
+
+            shanghai = run_add(
+                workspace,
+                "--id",
+                "daily-shanghai",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "30 8 * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Shanghai prompt",
+                "--timezone",
+                "Asia/Shanghai",
+                "--crontab-dir",
+                str(crontab_dir),
+            )
+            tokyo = run_add(
+                workspace,
+                "--id",
+                "daily-tokyo",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "30 8 * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Tokyo prompt",
+                "--timezone",
+                "Asia/Tokyo",
+                "--crontab-dir",
+                str(crontab_dir),
+            )
+            shanghai_crontab = (crontab_dir / "tz-Asia_Shanghai.crontab").read_text(
+                encoding="utf-8"
+            )
+            tokyo_crontab = (crontab_dir / "tz-Asia_Tokyo.crontab").read_text(
+                encoding="utf-8"
+            )
+            shanghai_snapshot = (
+                workspace / "install" / "managed-crontabs" / "tz-Asia_Shanghai.crontab"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(shanghai.returncode, 0, shanghai.stderr)
+        self.assertEqual(tokyo.returncode, 0, tokyo.stderr)
+        self.assertTrue(shanghai_crontab.startswith("CRON_TZ=Asia/Shanghai\n"))
+        self.assertTrue(tokyo_crontab.startswith("CRON_TZ=Asia/Tokyo\n"))
+        self.assertIn("# BEGIN coco-cronjob id=daily-shanghai", shanghai_crontab)
+        self.assertIn("# BEGIN coco-cronjob id=daily-tokyo", tokyo_crontab)
+        self.assertEqual(shanghai_snapshot, shanghai_crontab)
+
+    def test_add_crontab_dir_moves_task_between_timezone_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            crontab_dir = workspace / "supercronic"
+
+            first = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "30 8 * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "First prompt",
+                "--timezone",
+                "Asia/Shanghai",
+                "--crontab-dir",
+                str(crontab_dir),
+            )
+            second = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "30 9 * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Second prompt",
+                "--timezone",
+                "Asia/Tokyo",
+                "--crontab-dir",
+                str(crontab_dir),
+            )
+            shanghai_crontab = (crontab_dir / "tz-Asia_Shanghai.crontab").read_text(
+                encoding="utf-8"
+            )
+            tokyo_crontab = (crontab_dir / "tz-Asia_Tokyo.crontab").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("# BEGIN coco-cronjob id=daily-review", shanghai_crontab)
+        self.assertIn("# BEGIN coco-cronjob id=daily-review", tokyo_crontab)
+        self.assertIn("30 9 * * *", tokyo_crontab)
+
     def test_restore_direct_crontab_file_promotes_legacy_timezone_to_file_header(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             crontab_file = workspace / "supercronic" / "crontab"
-            snapshot = workspace / "managed-crontab"
+            snapshot = workspace / "snapshot.crontab"
             block = render_restore_block()
             snapshot.write_text(block, encoding="utf-8")
 
@@ -461,7 +569,7 @@ class CronjobScriptTests(unittest.TestCase):
             fake_crontab = write_fake_crontab(workspace)
             crontab_file = workspace / "crontab.txt"
             crontab_file.write_text("5 * * * * echo user-owned\n", encoding="utf-8")
-            snapshot = workspace / "managed-crontab"
+            snapshot = workspace / "snapshot.crontab"
             snapshot.write_text(
                 textwrap.dedent(
                     """\
@@ -502,7 +610,7 @@ class CronjobScriptTests(unittest.TestCase):
             crontab_file.write_text(
                 "CRON_TZ=\n5 * * * * echo user-owned\n", encoding="utf-8"
             )
-            snapshot = workspace / "managed-crontab"
+            snapshot = workspace / "snapshot.crontab"
             snapshot.write_text(
                 textwrap.dedent(
                     """\
@@ -543,7 +651,7 @@ class CronjobScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             crontab_file = workspace / "supercronic" / "crontab"
-            snapshot = workspace / "managed-crontab"
+            snapshot = workspace / "snapshot.crontab"
             block = render_restore_block()
             crontab_file.parent.mkdir(parents=True)
             crontab_file.write_text(block, encoding="utf-8")
@@ -565,6 +673,39 @@ class CronjobScriptTests(unittest.TestCase):
                 env={**os.environ, "TZ": "UTC"},
             )
             crontab = crontab_file.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(crontab.startswith("CRON_TZ=Asia/Shanghai\n"))
+        self.assertEqual(crontab.count("CRON_TZ="), 1)
+
+    def test_restore_can_manage_crontab_dir_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            snapshot_dir = workspace / "managed-crontabs"
+            crontab_dir = workspace / "supercronic"
+            snapshot_dir.mkdir()
+            (snapshot_dir / "tz-Asia_Shanghai.crontab").write_text(
+                render_restore_block(),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(RESTORE_SCRIPT),
+                    "--snapshot-dir",
+                    str(snapshot_dir),
+                    "--crontab-dir",
+                    str(crontab_dir),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            crontab = (crontab_dir / "tz-Asia_Shanghai.crontab").read_text(
+                encoding="utf-8"
+            )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(crontab.startswith("CRON_TZ=Asia/Shanghai\n"))

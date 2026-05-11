@@ -63,8 +63,8 @@ The image uses these container paths:
 - `/data`: config, store, OAuth cache, skill data, and logs.
 - `/workspace`: workspace for the unified exec tool.
 - `/data/skills`: skill persistence root.
-- `/data/skills/orchestrator/cronjob/data/install/crontab`: active crontab
-  file for the cronjob skill.
+- `/data/skills/orchestrator/cronjob/data/install/crontabs`: active crontab
+  files for the cronjob skill.
 
 Compose reads `.env`, mounts `${COCO_DATA_DIR}` to `/data`, and mounts
 `${COCO_WORKSPACE_DIR}` to `/workspace`.
@@ -227,25 +227,26 @@ can build `.#coco-image-linux-arm64` locally.
 
 ## Cronjob Skill
 
-The entrypoint starts `supercronic -inotify` and watches the active crontab
-file. After the cronjob skill writes a task, `supercronic` should reload the
-file automatically.
+The entrypoint supervises one `supercronic -inotify` process per active
+crontab file. It scans the crontab directory periodically, so adding the first
+task for a new timezone does not require a container restart.
 
 Persistent cronjob paths live under `/data/skills/orchestrator/cronjob`:
 
-- `data/install/crontab`: active crontab file.
-- `data/install/managed-crontab`: CoCo managed block snapshot.
+- `data/install/crontabs/`: active crontab files, grouped by schedule timezone.
+- `data/install/managed-crontabs/`: CoCo managed block snapshots for active
+  crontab files.
 - `data/state/`: runner state.
 - `data/logs/`: cronjob logs.
 
 As long as `${COCO_DATA_DIR}` is persistent, cronjob config and state survive
 container rebuilds.
 
-The Docker path uses a direct `supercronic` crontab file. Current
-`supercronic` scheduling treats `CRON_TZ` as a file-wide timezone, so the
-cronjob skill normalizes direct crontab files to at most one file-level
-`CRON_TZ`. Keep all managed cronjobs in the container on the same schedule
-timezone, or set `TZ` in `.env` and omit per-job `--timezone`.
+The Docker path uses direct `supercronic` crontab files. Current `supercronic`
+scheduling treats `CRON_TZ` as a file-wide timezone, so the cronjob skill
+groups managed tasks by schedule timezone and writes one file-level `CRON_TZ`
+per crontab file. Tasks without `--timezone` go to `local.crontab` and use the
+container `TZ`.
 
 For one-shot CLI commands, set `COCO_START_CRON=0` so temporary containers do
 not start another scheduler:
@@ -266,12 +267,16 @@ docker compose ps
 docker compose logs --tail=100 coco
 ```
 
-Check the active crontab file:
+Check the active crontab files:
 
 ```bash
 docker compose exec coco sh -lc '
-  test -f "$COCO_CRONTAB_FILE" &&
-    sed -n "1,120p" "$COCO_CRONTAB_FILE"
+  crontab_dir="${COCO_SKILL_PERSIST_ROOT:-/data/skills}/orchestrator/cronjob/data/install/crontabs"
+  for file in "$crontab_dir"/*.crontab; do
+    test -f "$file" || continue
+    printf "== %s ==\n" "$file"
+    sed -n "1,120p" "$file"
+  done
 '
 ```
 
