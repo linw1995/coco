@@ -374,6 +374,72 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertIn("missing its end marker", second.stderr)
         self.assertIn("# BEGIN coco-cronjob id=daily-review", shanghai_crontab)
 
+    def test_add_does_not_write_target_when_cleanup_validation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            crontab_dir = workspace / "supercronic"
+
+            first = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "30 8 * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "First prompt",
+                "--timezone",
+                "Asia/Shanghai",
+                "--crontab-dir",
+                str(crontab_dir),
+            )
+            malformed_crontab = crontab_dir / "tz-Europe_London.crontab"
+            malformed_crontab.write_text(
+                "\n".join(
+                    [
+                        "CRON_TZ=Europe/London",
+                        "# BEGIN coco-cronjob id=broken",
+                        "30 7 * * * echo broken",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            second = run_add(
+                workspace,
+                "--id",
+                "daily-review",
+                "--branch",
+                "main",
+                "--cronexpr",
+                "30 9 * * *",
+                "--repeat",
+                "skip",
+                "--prompt",
+                "Second prompt",
+                "--timezone",
+                "Asia/Tokyo",
+                "--crontab-dir",
+                str(crontab_dir),
+            )
+            shanghai_crontab = (crontab_dir / "tz-Asia_Shanghai.crontab").read_text(
+                encoding="utf-8"
+            )
+            tokyo_crontab = crontab_dir / "tz-Asia_Tokyo.crontab"
+            tokyo_snapshot = (
+                workspace / "install" / "managed-crontabs" / tokyo_crontab.name
+            )
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("missing its end marker", second.stderr)
+        self.assertIn("# BEGIN coco-cronjob id=daily-review", shanghai_crontab)
+        self.assertFalse(tokyo_crontab.exists())
+        self.assertFalse(tokyo_snapshot.exists())
+
     def test_add_dry_run_does_not_mutate_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)

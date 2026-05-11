@@ -104,6 +104,12 @@ def main() -> int:
     current = extract_direct_managed_crontab(active_crontab)
     final_crontab, action = upsert_managed_block(current, task_id, block)
     final_crontab = normalize_direct_crontab(final_crontab, requested_timezone=timezone)
+    cleanup_plan = plan_task_removal_from_other_direct_crontabs(
+        crontab_dir=crontab_dir,
+        target_file=crontab_file,
+        task_id=task_id,
+        install_dir=install_dir,
+    )
     write_task_config(
         task_path,
         {
@@ -119,12 +125,7 @@ def main() -> int:
     if final_crontab != active_crontab:
         write_crontab(crontab_file, final_crontab)
     write_managed_crontab_snapshot(managed_crontab, final_crontab)
-    remove_task_from_other_direct_crontabs(
-        crontab_dir=crontab_dir,
-        target_file=crontab_file,
-        task_id=task_id,
-        install_dir=install_dir,
-    )
+    apply_direct_crontab_cleanup_plan(cleanup_plan)
     print(
         json.dumps(
             {
@@ -699,13 +700,14 @@ def upsert_managed_block(current: str, task_id: str, block: str) -> tuple[str, s
     return "\n".join(output).rstrip("\n") + "\n", "updated" if replaced else "added"
 
 
-def remove_task_from_other_direct_crontabs(
+def plan_task_removal_from_other_direct_crontabs(
     *,
     crontab_dir: Path,
     target_file: Path,
     task_id: str,
     install_dir: Path,
-) -> None:
+) -> list[tuple[Path, Path, str | None]]:
+    plan: list[tuple[Path, Path, str | None]] = []
     crontab_files = sorted(crontab_dir.glob("*.crontab"))
     for crontab_file in crontab_files:
         if crontab_file == target_file:
@@ -719,7 +721,19 @@ def remove_task_from_other_direct_crontabs(
             continue
         final_crontab = normalize_direct_crontab(updated, requested_timezone=None)
         snapshot_path = install_dir / MANAGED_CRONTAB_DIR / crontab_file.name
-        if final_crontab.strip():
+        plan.append(
+            (
+                crontab_file,
+                snapshot_path,
+                final_crontab if final_crontab.strip() else None,
+            )
+        )
+    return plan
+
+
+def apply_direct_crontab_cleanup_plan(plan: list[tuple[Path, Path, str | None]]) -> None:
+    for crontab_file, snapshot_path, final_crontab in plan:
+        if final_crontab is not None:
             write_crontab(crontab_file, final_crontab)
             write_managed_crontab_snapshot(snapshot_path, final_crontab)
             continue
