@@ -18,14 +18,12 @@ from pathlib import Path
 from cronjob_crontab import (
     normalize_direct_crontab,
     parse_env_assignment,
-    project_managed_crontabs,
     read_crontab,
     write_crontab,
 )
 
 
 MANAGED_PREFIX = "coco-cronjob"
-MANAGED_CRONTAB_DIR = "managed-crontabs"
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 TIMEZONE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+./:-]{0,127}$")
 MONTH_NAMES = {
@@ -84,15 +82,12 @@ def main() -> int:
     crontab_filename_value = crontab_filename(timezone)
     crontab_dir = resolve_crontab_dir(args.crontab_dir)
     crontab_file = crontab_dir / crontab_filename_value
-    managed_crontab_dir = install_dir / MANAGED_CRONTAB_DIR
-    managed_crontab = managed_crontab_dir / crontab_filename_value
 
     install_dir.mkdir(parents=True, exist_ok=True)
     task_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     crontab_dir.mkdir(parents=True, exist_ok=True)
-    managed_crontab_dir.mkdir(parents=True, exist_ok=True)
 
     runner_path = install_script(args.runner_source, install_dir, "cronjob_run.py")
     restore_path = install_script(None, install_dir, "cronjob_restore.py")
@@ -106,12 +101,12 @@ def main() -> int:
         log_path=log_dir / f"{task_id}.log",
     )
 
-    current = extract_direct_managed_crontab(read_crontab(managed_crontab))
+    current = extract_direct_managed_crontab(read_crontab(crontab_file))
     final_crontab, action = upsert_managed_block(current, task_id, block)
     final_crontab = normalize_direct_crontab(final_crontab, requested_timezone=timezone)
-    cleanup_plan = plan_task_removal_from_other_managed_crontabs(
-        managed_crontab_dir=managed_crontab_dir,
-        target_file=managed_crontab,
+    cleanup_plan = plan_task_removal_from_other_crontabs(
+        crontab_dir=crontab_dir,
+        target_file=crontab_file,
         task_id=task_id,
     )
     write_task_config(
@@ -126,9 +121,8 @@ def main() -> int:
             "log_dir": str(log_dir),
         },
     )
-    write_crontab(managed_crontab, final_crontab)
-    apply_managed_crontab_cleanup_plan(cleanup_plan)
-    project_managed_crontabs(managed_crontab_dir, crontab_dir)
+    write_crontab(crontab_file, final_crontab)
+    apply_crontab_cleanup_plan(cleanup_plan)
     print(
         json.dumps(
             {
@@ -140,7 +134,6 @@ def main() -> int:
                 "task_file": str(task_path),
                 "runner": str(runner_path),
                 "restore": str(restore_path),
-                "managed_crontab": str(managed_crontab),
                 "crontab_dir": str(crontab_dir),
                 "crontab_file": str(crontab_file),
             },
@@ -621,14 +614,14 @@ def upsert_managed_block(current: str, task_id: str, block: str) -> tuple[str, s
     return "\n".join(output).rstrip("\n") + "\n", "updated" if replaced else "added"
 
 
-def plan_task_removal_from_other_managed_crontabs(
+def plan_task_removal_from_other_crontabs(
     *,
-    managed_crontab_dir: Path,
+    crontab_dir: Path,
     target_file: Path,
     task_id: str,
 ) -> list[tuple[Path, str | None]]:
     plan: list[tuple[Path, str | None]] = []
-    crontab_files = sorted(managed_crontab_dir.glob("*.crontab"))
+    crontab_files = sorted(crontab_dir.glob("*.crontab"))
     for crontab_file in crontab_files:
         if crontab_file == target_file:
             continue
@@ -649,7 +642,7 @@ def plan_task_removal_from_other_managed_crontabs(
     return plan
 
 
-def apply_managed_crontab_cleanup_plan(plan: list[tuple[Path, str | None]]) -> None:
+def apply_crontab_cleanup_plan(plan: list[tuple[Path, str | None]]) -> None:
     for crontab_file, final_crontab in plan:
         if final_crontab is not None:
             write_crontab(crontab_file, final_crontab)
