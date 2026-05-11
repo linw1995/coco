@@ -44,10 +44,13 @@ repos:
       - id: markdownlint-cli2
 
   # TOML-specific hooks
-  - repo: https://github.com/ComPWA/taplo-pre-commit
-    rev: v0.9.3
+  - repo: local
     hooks:
       - id: taplo-format
+        name: taplo-format
+        entry: taplo fmt
+        language: system
+        types: [toml]
 
 # Configuration for specific hooks
 default_stages: [pre-commit]
