@@ -45,9 +45,11 @@ Rules:
   rebuilds.
 - The runner submits work with `coco prompt --async --json --branch <branch>
   <prompt>` and records the latest prompt job id in the task state file.
-- Use `--timezone <zone>` only when the host cron implementation supports
-  `CRON_TZ`. Docker users should prefer setting the container `TZ` environment
-  variable so the cron daemon and CoCo process share the same timezone.
+- Use `--timezone <zone>` only when the cron implementation supports
+  `CRON_TZ`. In Docker, the direct `supercronic` file is normalized to one
+  file-level `CRON_TZ`, so all managed jobs in that file must use the same
+  schedule timezone. Prefer setting the container `TZ` environment variable
+  when the scheduler and CoCo process should share one timezone.
 - Use `--dry-run` before changing a host crontab when reviewing the exact
   managed block matters.
 

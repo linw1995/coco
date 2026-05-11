@@ -241,6 +241,12 @@ Persistent cronjob paths live under `/data/skills/orchestrator/cronjob`:
 As long as `${COCO_DATA_DIR}` is persistent, cronjob config and state survive
 container rebuilds.
 
+The Docker path uses a direct `supercronic` crontab file. Current
+`supercronic` scheduling treats `CRON_TZ` as a file-wide timezone, so the
+cronjob skill normalizes direct crontab files to at most one file-level
+`CRON_TZ`. Keep all managed cronjobs in the container on the same schedule
+timezone, or set `TZ` in `.env` and omit per-job `--timezone`.
+
 For one-shot CLI commands, set `COCO_START_CRON=0` so temporary containers do
 not start another scheduler:
 

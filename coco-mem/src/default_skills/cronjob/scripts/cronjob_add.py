@@ -114,12 +114,17 @@ def main() -> int:
         # Direct crontab files are active schedule files for this skill, not shared user
         # crontabs. The skill owns the file completely, so keep it in a fixed managed-block
         # format and discard any non-managed content that may have been written manually.
-        current = normalize_direct_crontab(extract_managed_blocks(current), timezone_reset)
-        block = normalize_direct_crontab(block, timezone_reset)
+        current = extract_direct_managed_crontab(current)
     final_crontab, action = upsert_managed_block(current, task_id, block)
+    if crontab_file is not None:
+        final_crontab = normalize_direct_crontab(final_crontab, requested_timezone=timezone)
     if final_crontab != active_crontab:
         write_crontab(args.crontab_bin, crontab_file, final_crontab)
-    write_managed_crontab_snapshot(install_dir / MANAGED_CRONTAB_FILE, final_crontab)
+    write_managed_crontab_snapshot(
+        install_dir / MANAGED_CRONTAB_FILE,
+        final_crontab,
+        direct=crontab_file is not None,
+    )
     print(
         json.dumps(
             {
@@ -594,15 +599,80 @@ def write_crontab(crontab_bin: str, crontab_file: Path | None, content: str) -> 
         raise SystemExit(f"failed to install crontab: {result.stderr.strip()}")
 
 
-def normalize_direct_crontab(content: str, timezone_reset: str) -> str:
-    return "\n".join(
-        f"CRON_TZ={timezone_reset}" if line == "CRON_TZ=" else line
+def extract_direct_managed_crontab(content: str) -> str:
+    timezone_lines = [
+        line
         for line in content.splitlines()
-    ).rstrip("\n") + ("\n" if content.strip() else "")
+        if parse_env_assignment(line.strip())[0] == "CRON_TZ"
+    ]
+    blocks = extract_managed_blocks(content)
+    parts = [*timezone_lines]
+    if blocks.strip():
+        parts.append(blocks.rstrip("\n"))
+    return "\n".join(parts).rstrip("\n") + ("\n" if parts else "")
 
 
-def write_managed_crontab_snapshot(path: Path, content: str) -> None:
-    snapshot = extract_managed_blocks(content)
+def normalize_direct_crontab(content: str, *, requested_timezone: str | None) -> str:
+    job_timezones, has_unqualified_jobs = collect_direct_job_timezones(content)
+    timezones = set(job_timezones)
+    if requested_timezone is not None:
+        timezones.add(requested_timezone)
+    if len(timezones) > 1:
+        raise SystemExit(
+            "direct crontab files run under supercronic and support only one "
+            f"schedule timezone; found {', '.join(sorted(timezones))}"
+        )
+    if requested_timezone is not None and has_unqualified_jobs:
+        raise SystemExit(
+            "direct crontab files run under supercronic and cannot mix "
+            "timezone-qualified jobs with timezone-less jobs"
+        )
+
+    timezone = requested_timezone or next(iter(timezones), None)
+    body = "\n".join(
+        line
+        for line in content.splitlines()
+        if parse_env_assignment(line.strip())[0] != "CRON_TZ"
+    ).strip("\n")
+    lines: list[str] = []
+    if timezone is not None:
+        lines.append(f"CRON_TZ={timezone}")
+    if body:
+        lines.append(body)
+    return "\n".join(lines).rstrip("\n") + ("\n" if lines else "")
+
+
+def collect_direct_job_timezones(content: str) -> tuple[set[str], bool]:
+    current_timezone: str | None = None
+    job_timezones: set[str] = set()
+    has_unqualified_jobs = False
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, value = parse_env_assignment(line)
+        if key is not None:
+            if key == "CRON_TZ":
+                current_timezone = normalize_timezone(value, allow_blank=True)
+            continue
+        if current_timezone is None:
+            has_unqualified_jobs = True
+        else:
+            job_timezones.add(current_timezone)
+    return job_timezones, has_unqualified_jobs
+
+
+def parse_env_assignment(line: str) -> tuple[str | None, str]:
+    if "=" not in line or line.split("=", 1)[0].strip() != line.split("=", 1)[0]:
+        return None, ""
+    key, value = line.split("=", 1)
+    if not key or any(char.isspace() for char in key):
+        return None, ""
+    return key, value.strip()
+
+
+def write_managed_crontab_snapshot(path: Path, content: str, *, direct: bool) -> None:
+    snapshot = content if direct else extract_managed_blocks(content)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(snapshot, encoding="utf-8")
     tmp.replace(path)

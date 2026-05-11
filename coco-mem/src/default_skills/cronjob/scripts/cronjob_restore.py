@@ -25,13 +25,12 @@ def main() -> int:
     snapshot = snapshot_path.read_text(encoding="utf-8")
 
     crontab_file = resolve_crontab_file(args.crontab_file)
-    timezone_reset = resolve_timezone_reset(crontab_file)
     active_crontab = read_crontab(args.crontab_bin, crontab_file)
     if crontab_file is not None:
         # Direct crontab files are active schedule files for this skill, not shared user
         # crontabs. The managed snapshot is the canonical fixed-format source for this
         # path, so restore it as-is instead of merging with arbitrary existing content.
-        final_crontab = normalize_direct_crontab(snapshot, timezone_reset)
+        final_crontab = normalize_direct_crontab(snapshot)
     else:
         final_crontab = restore_managed_blocks(active_crontab, snapshot)
     if final_crontab != active_crontab:
@@ -54,22 +53,6 @@ def resolve_crontab_file(value: Path | None) -> Path | None:
     if not env_value:
         return None
     return Path(env_value).expanduser()
-
-
-def resolve_timezone_reset(crontab_file: Path | None) -> str:
-    if crontab_file is None:
-        return ""
-    timezone = normalize_timezone_reset(os.environ.get("TZ"))
-    return timezone or "UTC"
-
-
-def normalize_timezone_reset(value: str | None) -> str | None:
-    if value is None:
-        return None
-    timezone = value.strip()
-    if not timezone or not TIMEZONE_PATTERN.fullmatch(timezone):
-        return None
-    return timezone
 
 
 def normalize_timezone(value: str | None) -> str | None:
@@ -124,11 +107,60 @@ def write_crontab(crontab_bin: str, crontab_file: Path | None, content: str) -> 
         raise SystemExit(f"failed to install crontab: {result.stderr.strip()}")
 
 
-def normalize_direct_crontab(content: str, timezone_reset: str) -> str:
-    return "\n".join(
-        f"CRON_TZ={timezone_reset}" if line == "CRON_TZ=" else line
+def normalize_direct_crontab(content: str) -> str:
+    job_timezones, has_unqualified_jobs = collect_direct_job_timezones(content)
+    if len(job_timezones) > 1:
+        raise SystemExit(
+            "direct crontab files run under supercronic and support only one "
+            f"schedule timezone; found {', '.join(sorted(job_timezones))}"
+        )
+    if job_timezones and has_unqualified_jobs:
+        raise SystemExit(
+            "direct crontab files run under supercronic and cannot mix "
+            "timezone-qualified jobs with timezone-less jobs"
+        )
+
+    timezone = next(iter(job_timezones), None)
+    body = "\n".join(
+        line
         for line in content.splitlines()
-    ).rstrip("\n") + ("\n" if content.strip() else "")
+        if parse_env_assignment(line.strip())[0] != "CRON_TZ"
+    ).strip("\n")
+    lines: list[str] = []
+    if timezone is not None:
+        lines.append(f"CRON_TZ={timezone}")
+    if body:
+        lines.append(body)
+    return "\n".join(lines).rstrip("\n") + ("\n" if lines else "")
+
+
+def collect_direct_job_timezones(content: str) -> tuple[set[str], bool]:
+    current_timezone: str | None = None
+    job_timezones: set[str] = set()
+    has_unqualified_jobs = False
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, value = parse_env_assignment(line)
+        if key is not None:
+            if key == "CRON_TZ":
+                current_timezone = normalize_timezone(value)
+            continue
+        if current_timezone is None:
+            has_unqualified_jobs = True
+        else:
+            job_timezones.add(current_timezone)
+    return job_timezones, has_unqualified_jobs
+
+
+def parse_env_assignment(line: str) -> tuple[str | None, str]:
+    if "=" not in line or line.split("=", 1)[0].strip() != line.split("=", 1)[0]:
+        return None, ""
+    key, value = line.split("=", 1)
+    if not key or any(char.isspace() for char in key):
+        return None, ""
+    return key, value.strip()
 
 
 def restore_managed_blocks(current: str, snapshot: str) -> str:
