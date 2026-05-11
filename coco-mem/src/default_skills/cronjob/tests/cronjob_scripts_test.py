@@ -400,7 +400,7 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertFalse((workspace / "state").exists())
         self.assertFalse((workspace / "logs").exists())
 
-    def test_add_resets_cron_tz_inside_managed_block(self) -> None:
+    def test_add_dry_run_renders_timezone_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
 
@@ -419,7 +419,6 @@ class CronjobScriptTests(unittest.TestCase):
                 "--timezone",
                 "UTC",
                 "--dry-run",
-                env={"TZ": "UTC"},
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -433,7 +432,7 @@ class CronjobScriptTests(unittest.TestCase):
             ),
             result.stdout,
         )
-        self.assertIn("\nCRON_TZ=UTC\n# END coco-cronjob id=daily-review\n", result.stdout)
+        self.assertEqual(result.stdout.count("CRON_TZ=UTC"), 1)
 
     def test_add_rejects_cron_tz_injection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

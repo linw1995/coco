@@ -54,7 +54,6 @@ def main() -> int:
     timezone = normalize_timezone(args.timezone)
 
     install_dir = resolve_install_dir(args.install_dir)
-    timezone_reset = resolve_timezone_reset()
     task_dir = install_dir / "tasks"
     state_dir = resolve_state_dir(args.state_dir)
     log_dir = resolve_log_dir(args.log_dir)
@@ -65,7 +64,6 @@ def main() -> int:
         task_id=task_id,
         cronexpr=args.cronexpr,
         timezone=timezone,
-        timezone_reset=timezone_reset,
         uv_bin=args.uv_bin,
         runner_path=runner_path,
         task_path=task_path,
@@ -93,7 +91,6 @@ def main() -> int:
         task_id=task_id,
         cronexpr=args.cronexpr,
         timezone=timezone,
-        timezone_reset=timezone_reset,
         uv_bin=args.uv_bin,
         runner_path=runner_path,
         task_path=task_path,
@@ -500,20 +497,6 @@ def crontab_filename(timezone: str | None) -> str:
     return f"tz-{safe}.crontab"
 
 
-def resolve_timezone_reset() -> str:
-    timezone = normalize_timezone_reset(os.environ.get("TZ"))
-    return timezone or "UTC"
-
-
-def normalize_timezone_reset(value: str | None) -> str | None:
-    if value is None:
-        return None
-    timezone = value.strip()
-    if not timezone or not TIMEZONE_PATTERN.fullmatch(timezone):
-        return None
-    return timezone
-
-
 def install_script(source: Path | None, install_dir: Path, script_name: str) -> Path:
     source_path = source
     if source_path is None:
@@ -540,7 +523,6 @@ def render_crontab_block(
     task_id: str,
     cronexpr: str,
     timezone: str | None,
-    timezone_reset: str,
     uv_bin: str,
     runner_path: Path,
     task_path: Path,
@@ -562,8 +544,6 @@ def render_crontab_block(
     if timezone:
         lines.append(f"CRON_TZ={timezone}")
     lines.append(f"{cronexpr} {command} {redirect}")
-    if timezone:
-        lines.append(f"CRON_TZ={timezone_reset}")
     lines.append(end_marker(task_id))
     return "\n".join(lines) + "\n"
 
