@@ -647,6 +647,41 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
         self.assertEqual(crontab.count("CRON_TZ="), 1)
 
+    def test_restore_crontab_file_ignores_env_crontab_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            crontab_file = workspace / "supercronic" / "crontab"
+            env_crontab_dir = workspace / "env-crontabs"
+            crontab_file.parent.mkdir(parents=True)
+            snapshot = workspace / "snapshot.crontab"
+            snapshot.write_text(render_restore_block(), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(RESTORE_SCRIPT),
+                    "--snapshot",
+                    str(snapshot),
+                    "--crontab-file",
+                    str(crontab_file),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={
+                    **os.environ,
+                    "COCO_CRONTAB_DIR": str(env_crontab_dir),
+                    "TZ": "UTC",
+                },
+            )
+            crontab = crontab_file.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(env_crontab_dir.exists())
+        self.assertTrue(crontab.startswith("CRON_TZ=Asia/Shanghai\n"))
+        self.assertIn("# BEGIN coco-cronjob id=daily-review", crontab)
+
     def test_restore_direct_crontab_file_keeps_idempotent_file_timezone(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)

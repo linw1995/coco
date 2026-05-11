@@ -18,9 +18,9 @@ TIMEZONE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+./:-]{0,127}$")
 
 def main() -> int:
     args = parse_args()
-    snapshot_dir = resolve_snapshot_dir(args.snapshot_dir)
-    crontab_dir = resolve_crontab_dir(args.crontab_dir)
-    if snapshot_dir is not None or crontab_dir is not None:
+    if args.snapshot_dir is not None or args.crontab_dir is not None:
+        snapshot_dir = resolve_snapshot_dir(args.snapshot_dir)
+        crontab_dir = resolve_crontab_dir(args.crontab_dir)
         if snapshot_dir is None or crontab_dir is None:
             raise SystemExit("use --snapshot-dir and --crontab-dir together")
         restore_snapshot_dir(snapshot_dir, crontab_dir)
