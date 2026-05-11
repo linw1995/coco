@@ -738,11 +738,13 @@ def remove_task_from_other_direct_crontabs(
         if not removed:
             continue
         final_crontab = normalize_direct_crontab(updated, requested_timezone=None)
-        write_crontab(crontab_file, final_crontab)
-        write_managed_crontab_snapshot(
-            install_dir / MANAGED_CRONTAB_DIR / crontab_file.name,
-            final_crontab,
-        )
+        snapshot_path = install_dir / MANAGED_CRONTAB_DIR / crontab_file.name
+        if final_crontab.strip():
+            write_crontab(crontab_file, final_crontab)
+            write_managed_crontab_snapshot(snapshot_path, final_crontab)
+            continue
+        crontab_file.unlink(missing_ok=True)
+        snapshot_path.unlink(missing_ok=True)
 
 
 def remove_managed_block(current: str, task_id: str) -> tuple[str, bool]:

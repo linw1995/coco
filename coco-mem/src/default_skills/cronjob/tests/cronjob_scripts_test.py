@@ -299,8 +299,9 @@ class CronjobScriptTests(unittest.TestCase):
                 "--crontab-dir",
                 str(crontab_dir),
             )
-            shanghai_crontab = (crontab_dir / "tz-Asia_Shanghai.crontab").read_text(
-                encoding="utf-8"
+            shanghai_crontab = crontab_dir / "tz-Asia_Shanghai.crontab"
+            shanghai_snapshot = (
+                workspace / "install" / "managed-crontabs" / "tz-Asia_Shanghai.crontab"
             )
             tokyo_crontab = (crontab_dir / "tz-Asia_Tokyo.crontab").read_text(
                 encoding="utf-8"
@@ -308,7 +309,8 @@ class CronjobScriptTests(unittest.TestCase):
 
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertNotIn("# BEGIN coco-cronjob id=daily-review", shanghai_crontab)
+        self.assertFalse(shanghai_crontab.exists())
+        self.assertFalse(shanghai_snapshot.exists())
         self.assertIn("# BEGIN coco-cronjob id=daily-review", tokyo_crontab)
         self.assertIn("30 9 * * *", tokyo_crontab)
 
