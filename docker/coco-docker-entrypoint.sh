@@ -107,13 +107,16 @@ start_supercronic_file() {
     if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
       return 0
     fi
+    rm -f "${pid_file}"
   fi
-  supervise_supercronic_file "${crontab_file}" &
+  supervise_supercronic_file "${crontab_file}" "${pid_file}" &
   printf '%s\n' "$!" >"${pid_file}"
 }
 
 supervise_supercronic_file() {
   crontab_file="$1"
+  pid_file="$2"
+  trap 'rm -f "${pid_file}"' EXIT
   while [ -f "${crontab_file}" ]; do
     supercronic -inotify "${crontab_file}"
     printf 'warning: supercronic exited for %s; restarting\n' "${crontab_file}" >&2
