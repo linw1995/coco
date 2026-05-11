@@ -73,16 +73,18 @@ def main() -> int:
         print(block, end="")
         return 0
 
+    crontab_filename_value = crontab_filename(timezone)
     crontab_dir = resolve_crontab_dir(args.crontab_dir)
-    crontab_file = crontab_dir / crontab_filename(timezone)
-    managed_crontab = install_dir / MANAGED_CRONTAB_DIR / crontab_file.name
+    crontab_file = crontab_dir / crontab_filename_value
+    managed_crontab_dir = install_dir / MANAGED_CRONTAB_DIR
+    managed_crontab = managed_crontab_dir / crontab_filename_value
 
     install_dir.mkdir(parents=True, exist_ok=True)
     task_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     crontab_dir.mkdir(parents=True, exist_ok=True)
-    (install_dir / MANAGED_CRONTAB_DIR).mkdir(parents=True, exist_ok=True)
+    managed_crontab_dir.mkdir(parents=True, exist_ok=True)
 
     runner_path = install_script(args.runner_source, install_dir, "cronjob_run.py")
     restore_path = install_script(None, install_dir, "cronjob_restore.py")
@@ -95,18 +97,13 @@ def main() -> int:
         log_path=log_dir / f"{task_id}.log",
     )
 
-    active_crontab = read_crontab(crontab_file)
-    # Crontab files are active schedule files for this skill, not shared user
-    # crontabs. The skill owns the file completely, so keep it in a fixed managed-block
-    # format and discard any non-managed content that may have been written manually.
-    current = extract_direct_managed_crontab(active_crontab)
+    current = extract_direct_managed_crontab(read_crontab(managed_crontab))
     final_crontab, action = upsert_managed_block(current, task_id, block)
     final_crontab = normalize_direct_crontab(final_crontab, requested_timezone=timezone)
-    cleanup_plan = plan_task_removal_from_other_direct_crontabs(
-        crontab_dir=crontab_dir,
-        target_file=crontab_file,
+    cleanup_plan = plan_task_removal_from_other_managed_crontabs(
+        managed_crontab_dir=managed_crontab_dir,
+        target_file=managed_crontab,
         task_id=task_id,
-        install_dir=install_dir,
     )
     write_task_config(
         task_path,
@@ -120,10 +117,9 @@ def main() -> int:
             "log_dir": str(log_dir),
         },
     )
-    if final_crontab != active_crontab:
-        write_crontab(crontab_file, final_crontab)
     write_managed_crontab_snapshot(managed_crontab, final_crontab)
-    apply_direct_crontab_cleanup_plan(cleanup_plan)
+    apply_managed_crontab_cleanup_plan(cleanup_plan)
+    project_managed_crontabs(managed_crontab_dir, crontab_dir)
     print(
         json.dumps(
             {
@@ -689,15 +685,14 @@ def upsert_managed_block(current: str, task_id: str, block: str) -> tuple[str, s
     return "\n".join(output).rstrip("\n") + "\n", "updated" if replaced else "added"
 
 
-def plan_task_removal_from_other_direct_crontabs(
+def plan_task_removal_from_other_managed_crontabs(
     *,
-    crontab_dir: Path,
+    managed_crontab_dir: Path,
     target_file: Path,
     task_id: str,
-    install_dir: Path,
-) -> list[tuple[Path, Path, str | None]]:
-    plan: list[tuple[Path, Path, str | None]] = []
-    crontab_files = sorted(crontab_dir.glob("*.crontab"))
+) -> list[tuple[Path, str | None]]:
+    plan: list[tuple[Path, str | None]] = []
+    crontab_files = sorted(managed_crontab_dir.glob("*.crontab"))
     for crontab_file in crontab_files:
         if crontab_file == target_file:
             continue
@@ -709,25 +704,38 @@ def plan_task_removal_from_other_direct_crontabs(
         if not removed:
             continue
         final_crontab = normalize_direct_crontab(updated, requested_timezone=None)
-        snapshot_path = install_dir / MANAGED_CRONTAB_DIR / crontab_file.name
         plan.append(
             (
                 crontab_file,
-                snapshot_path,
                 final_crontab if final_crontab.strip() else None,
             )
         )
     return plan
 
 
-def apply_direct_crontab_cleanup_plan(plan: list[tuple[Path, Path, str | None]]) -> None:
-    for crontab_file, snapshot_path, final_crontab in plan:
+def apply_managed_crontab_cleanup_plan(plan: list[tuple[Path, str | None]]) -> None:
+    for crontab_file, final_crontab in plan:
         if final_crontab is not None:
-            write_crontab(crontab_file, final_crontab)
-            write_managed_crontab_snapshot(snapshot_path, final_crontab)
+            write_managed_crontab_snapshot(crontab_file, final_crontab)
             continue
         crontab_file.unlink(missing_ok=True)
-        snapshot_path.unlink(missing_ok=True)
+
+
+def project_managed_crontabs(managed_crontab_dir: Path, crontab_dir: Path) -> None:
+    crontab_dir.mkdir(parents=True, exist_ok=True)
+    for snapshot_path in sorted(managed_crontab_dir.glob("*.crontab")):
+        snapshot = snapshot_path.read_text(encoding="utf-8")
+        crontab_file = crontab_dir / snapshot_path.name
+        active_crontab = read_crontab(crontab_file)
+        final_crontab = normalize_direct_crontab(snapshot, requested_timezone=None)
+        if final_crontab != active_crontab:
+            write_crontab(crontab_file, final_crontab)
+    for crontab_file in sorted(crontab_dir.glob("*.crontab")):
+        if not crontab_file.is_file():
+            continue
+        snapshot_path = managed_crontab_dir / crontab_file.name
+        if not snapshot_path.is_file():
+            crontab_file.unlink()
 
 
 def remove_managed_block(current: str, task_id: str) -> tuple[str, bool]:

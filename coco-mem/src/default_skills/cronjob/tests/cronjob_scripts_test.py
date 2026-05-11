@@ -336,8 +336,10 @@ class CronjobScriptTests(unittest.TestCase):
                 "--crontab-dir",
                 str(crontab_dir),
             )
-            tokyo_crontab = crontab_dir / "tz-Asia_Tokyo.crontab"
-            tokyo_crontab.write_text(
+            tokyo_snapshot = (
+                workspace / "install" / "managed-crontabs" / "tz-Asia_Tokyo.crontab"
+            )
+            tokyo_snapshot.write_text(
                 "\n".join(
                     [
                         "CRON_TZ=Asia/Tokyo",
@@ -396,8 +398,10 @@ class CronjobScriptTests(unittest.TestCase):
                 "--crontab-dir",
                 str(crontab_dir),
             )
-            malformed_crontab = crontab_dir / "tz-Europe_London.crontab"
-            malformed_crontab.write_text(
+            malformed_snapshot = (
+                workspace / "install" / "managed-crontabs" / "tz-Europe_London.crontab"
+            )
+            malformed_snapshot.write_text(
                 "\n".join(
                     [
                         "CRON_TZ=Europe/London",
