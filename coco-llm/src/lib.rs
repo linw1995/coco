@@ -303,6 +303,7 @@ pub struct ResolvedCompletionRequest {
     pub additional_params: Option<Value>,
     runtime: RuntimeCapabilities,
     trace_node_appender: Option<TraceNodeAppenderHandle>,
+    trace_node_store: Option<TraceNodeStoreHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -363,15 +364,6 @@ trait TraceNodeAppender: Send + Sync {
     /// Returns the current trace tail.
     fn head_id(&self) -> std::result::Result<String, BackendError>;
 
-    fn get_node(&self, node_id: &str) -> std::result::Result<coco_mem::Node, BackendError>;
-
-    fn ancestry(&self, reference: &str) -> std::result::Result<Vec<coco_mem::Node>, BackendError>;
-
-    fn list_children(
-        &self,
-        node_id: &str,
-    ) -> std::result::Result<Vec<coco_mem::Node>, BackendError>;
-
     /// Appends a store node to the current trace tail.
     fn append(
         &self,
@@ -398,21 +390,6 @@ impl TraceNodeAppenderHandle {
     fn head_id(&self) -> std::result::Result<String, BackendError> {
         self.inner.head_id()
     }
-
-    fn get_node(&self, node_id: &str) -> std::result::Result<coco_mem::Node, BackendError> {
-        self.inner.get_node(node_id)
-    }
-
-    fn ancestry(&self, reference: &str) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
-        self.inner.ancestry(reference)
-    }
-
-    fn list_children(
-        &self,
-        node_id: &str,
-    ) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
-        self.inner.list_children(node_id)
-    }
 }
 
 impl std::fmt::Debug for TraceNodeAppenderHandle {
@@ -431,27 +408,6 @@ where
             .lock()
             .expect("trace node appender lock poisoned")
             .clone())
-    }
-
-    fn get_node(&self, node_id: &str) -> std::result::Result<coco_mem::Node, BackendError> {
-        self.store
-            .get_node(node_id)
-            .map_err(|source| BackendError::failed(source.to_string()))
-    }
-
-    fn ancestry(&self, reference: &str) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
-        self.store
-            .ancestry(reference)
-            .map_err(|source| BackendError::failed(source.to_string()))
-    }
-
-    fn list_children(
-        &self,
-        node_id: &str,
-    ) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
-        self.store
-            .list_children(node_id)
-            .map_err(|source| BackendError::failed(source.to_string()))
     }
 
     fn append(
@@ -475,6 +431,44 @@ where
             .map_err(|source| BackendError::failed(source.to_string()))?;
         *head_id = node_id.clone();
         Ok(node_id)
+    }
+}
+
+#[derive(Clone)]
+struct TraceNodeStoreHandle {
+    inner: Arc<dyn NodeStore + Send + Sync>,
+}
+
+impl TraceNodeStoreHandle {
+    fn new(inner: Arc<dyn NodeStore + Send + Sync>) -> Self {
+        Self { inner }
+    }
+
+    fn get_node(&self, node_id: &str) -> std::result::Result<coco_mem::Node, BackendError> {
+        self.inner
+            .get_node(node_id)
+            .map_err(|source| BackendError::failed(source.to_string()))
+    }
+
+    fn ancestry(&self, reference: &str) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
+        self.inner
+            .ancestry(reference)
+            .map_err(|source| BackendError::failed(source.to_string()))
+    }
+
+    fn list_children(
+        &self,
+        node_id: &str,
+    ) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
+        self.inner
+            .list_children(node_id)
+            .map_err(|source| BackendError::failed(source.to_string()))
+    }
+}
+
+impl std::fmt::Debug for TraceNodeStoreHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TraceNodeStoreHandle(..)")
     }
 }
 
@@ -1324,7 +1318,13 @@ where
             store: self.store.clone(),
             head_id: StdMutex::new(retry_from_node_id.clone()),
         }));
-        let resolved = self.resolve_request(&session, request.clone(), Some(trace_node_appender));
+        let trace_node_store = TraceNodeStoreHandle::new(Arc::new(self.store.clone()));
+        let resolved = self.resolve_request(
+            &session,
+            request.clone(),
+            Some(trace_node_appender),
+            Some(trace_node_store),
+        );
         match self
             .backend
             .complete(session.clone(), resolved.clone())
@@ -1353,6 +1353,7 @@ where
                                     &resolved.branch,
                                     &retry_from_node_id,
                                     trace_node_appender,
+                                    resolved.trace_node_store.as_ref(),
                                     &steps,
                                 )?,
                             },
@@ -1389,6 +1390,7 @@ where
                                             &resolved.branch,
                                             &retry_from_node_id,
                                             trace_node_appender,
+                                            resolved.trace_node_store.as_ref(),
                                             &steps,
                                         )
                                     },
@@ -1659,6 +1661,7 @@ where
         branch: &str,
         retry_from_node_id: &str,
         trace_node_appender: &TraceNodeAppenderHandle,
+        trace_node_store: Option<&TraceNodeStoreHandle>,
         steps: &[BackendStep],
     ) -> Result<String> {
         let mut head_id = retry_from_node_id.to_owned();
@@ -1666,15 +1669,20 @@ where
             if step.events.is_empty() {
                 continue;
             }
-            head_id = append_backend_events(trace_node_appender, &step.execution, &step.events)
-                .context(BackendSnafu {
-                    context: Box::new(BackendFailureContext {
-                        branch: branch.to_owned(),
-                        execution_id: step.execution.execution_id.clone(),
-                        error_node_id: retry_from_node_id.to_owned(),
-                        retry_from_node_id: retry_from_node_id.to_owned(),
-                    }),
-                })?;
+            head_id = append_backend_events(
+                trace_node_appender,
+                trace_node_store,
+                &step.execution,
+                &step.events,
+            )
+            .context(BackendSnafu {
+                context: Box::new(BackendFailureContext {
+                    branch: branch.to_owned(),
+                    execution_id: step.execution.execution_id.clone(),
+                    error_node_id: retry_from_node_id.to_owned(),
+                    retry_from_node_id: retry_from_node_id.to_owned(),
+                }),
+            })?;
         }
 
         Ok(head_id)
@@ -2219,6 +2227,7 @@ impl<B, S> LlmService<B, S> {
         session: &ResolvedSession,
         request: CompletionRequest,
         trace_node_appender: Option<TraceNodeAppenderHandle>,
+        trace_node_store: Option<TraceNodeStoreHandle>,
     ) -> ResolvedCompletionRequest {
         let provider = request
             .overrides
@@ -2248,6 +2257,7 @@ impl<B, S> LlmService<B, S> {
                 .or_else(|| session.config.additional_params.clone()),
             runtime: self.runtime.clone(),
             trace_node_appender,
+            trace_node_store,
         }
     }
 }
@@ -2747,10 +2757,10 @@ fn resolve_skill_source_tool_use<'a>(
 }
 
 fn newest_skill_response_descendant(
-    trace_node_appender: &TraceNodeAppenderHandle,
+    trace_node_store: &TraceNodeStoreHandle,
     invocation_node_id: &str,
 ) -> std::result::Result<Option<coco_mem::Node>, BackendError> {
-    let mut stack = trace_node_appender.list_children(invocation_node_id)?;
+    let mut stack = trace_node_store.list_children(invocation_node_id)?;
     let mut visited = HashSet::new();
     let mut response = None::<coco_mem::Node>;
 
@@ -2766,18 +2776,18 @@ fn newest_skill_response_descendant(
         {
             response = Some(node.clone());
         }
-        stack.extend(trace_node_appender.list_children(&node.id)?);
+        stack.extend(trace_node_store.list_children(&node.id)?);
     }
 
     Ok(response)
 }
 
 fn has_fanned_in_skill_result(
-    trace_node_appender: &TraceNodeAppenderHandle,
+    trace_node_store: &TraceNodeStoreHandle,
     tool_result_node_id: &str,
     response_node_id: &str,
 ) -> std::result::Result<bool, BackendError> {
-    let mut stack = trace_node_appender.list_children(tool_result_node_id)?;
+    let mut stack = trace_node_store.list_children(tool_result_node_id)?;
     let mut visited = HashSet::new();
 
     while let Some(node) = stack.pop() {
@@ -2793,7 +2803,7 @@ fn has_fanned_in_skill_result(
         {
             return Ok(true);
         }
-        stack.extend(trace_node_appender.list_children(&node.id)?);
+        stack.extend(trace_node_store.list_children(&node.id)?);
     }
 
     Ok(false)
@@ -2801,13 +2811,14 @@ fn has_fanned_in_skill_result(
 
 fn append_skill_results_after_tool_result(
     trace_node_appender: &TraceNodeAppenderHandle,
+    trace_node_store: &TraceNodeStoreHandle,
     tool_result_node_id: &str,
 ) -> std::result::Result<Vec<String>, BackendError> {
-    let tool_result_node = trace_node_appender.get_node(tool_result_node_id)?;
+    let tool_result_node = trace_node_store.get_node(tool_result_node_id)?;
     let Kind::ToolResult(tool_results) = &tool_result_node.kind else {
         return Ok(vec![]);
     };
-    let ancestry = trace_node_appender.ancestry(tool_result_node_id)?;
+    let ancestry = trace_node_store.ancestry(tool_result_node_id)?;
     let mut appended = Vec::new();
     let mut fanned_in = HashSet::new();
 
@@ -2818,14 +2829,14 @@ fn append_skill_results_after_tool_result(
         let Some(source_tool_use) = resolve_skill_source_tool_use(&ancestry, tool_result) else {
             continue;
         };
-        for child in trace_node_appender.list_children(&source_tool_use.id)? {
+        for child in trace_node_store.list_children(&source_tool_use.id)? {
             let Kind::Anchor(anchor) = &child.kind else {
                 continue;
             };
             let Some(invocation) = anchor.as_skill_invocation() else {
                 continue;
             };
-            let Some(response) = newest_skill_response_descendant(trace_node_appender, &child.id)?
+            let Some(response) = newest_skill_response_descendant(trace_node_store, &child.id)?
             else {
                 continue;
             };
@@ -2833,11 +2844,7 @@ fn append_skill_results_after_tool_result(
                 continue;
             };
             if !fanned_in.insert(response.id.clone())
-                || has_fanned_in_skill_result(
-                    trace_node_appender,
-                    tool_result_node_id,
-                    &response.id,
-                )?
+                || has_fanned_in_skill_result(trace_node_store, tool_result_node_id, &response.id)?
             {
                 continue;
             }
@@ -2865,6 +2872,7 @@ fn append_skill_results_after_tool_result(
 
 fn append_backend_event_nodes(
     trace_node_appender: &TraceNodeAppenderHandle,
+    trace_node_store: Option<&TraceNodeStoreHandle>,
     execution: &ExecutionMetadata,
     events: &[BackendEvent],
 ) -> std::result::Result<Vec<(String, Kind)>, BackendError> {
@@ -2874,11 +2882,15 @@ fn append_backend_event_nodes(
         let kind = normalize_kind_for_primary_parent(kind, &primary_parent);
         let node_id = trace_node_appender.append(role, metadata, kind.clone())?;
         appended.push((node_id.clone(), kind.clone()));
-        if matches!(kind, Kind::ToolResult(_)) {
-            for skill_result_node_id in
-                append_skill_results_after_tool_result(trace_node_appender, &node_id)?
-            {
-                let skill_result = trace_node_appender.get_node(&skill_result_node_id)?;
+        if matches!(kind, Kind::ToolResult(_))
+            && let Some(trace_node_store) = trace_node_store
+        {
+            for skill_result_node_id in append_skill_results_after_tool_result(
+                trace_node_appender,
+                trace_node_store,
+                &node_id,
+            )? {
+                let skill_result = trace_node_store.get_node(&skill_result_node_id)?;
                 appended.push((skill_result_node_id, skill_result.kind));
             }
         }
@@ -2889,10 +2901,11 @@ fn append_backend_event_nodes(
 
 fn append_backend_events(
     trace_node_appender: &TraceNodeAppenderHandle,
+    trace_node_store: Option<&TraceNodeStoreHandle>,
     execution: &ExecutionMetadata,
     events: &[BackendEvent],
 ) -> std::result::Result<String, BackendError> {
-    append_backend_event_nodes(trace_node_appender, execution, events)?
+    append_backend_event_nodes(trace_node_appender, trace_node_store, execution, events)?
         .last()
         .map(|(node_id, _)| node_id.clone())
         .ok_or_else(|| BackendError::failed("append_backend_events requires at least one event"))
@@ -3300,8 +3313,12 @@ impl CompletionRunner {
             && !turn.trace_persisted
             && !turn.events.is_empty()
         {
-            let appended =
-                append_backend_event_nodes(trace_node_appender, execution, &turn.events)?;
+            let appended = append_backend_event_nodes(
+                trace_node_appender,
+                self.request.trace_node_store.as_ref(),
+                execution,
+                &turn.events,
+            )?;
             for (node_id, kind) in &appended {
                 if let Kind::ToolUse(tool_uses) = kind {
                     for tool_use in tool_uses.iter() {
@@ -3416,7 +3433,12 @@ impl CompletionRunner {
             return Ok(());
         };
 
-        let appended = append_backend_event_nodes(trace_node_appender, execution, events)?;
+        let appended = append_backend_event_nodes(
+            trace_node_appender,
+            self.request.trace_node_store.as_ref(),
+            execution,
+            events,
+        )?;
         self.head = appended.last().map(|(node_id, _)| node_id.clone());
         Ok(())
     }
@@ -3961,6 +3983,7 @@ mod tests {
                 .trace_node_appender
                 .clone()
                 .expect("streaming backend requires trace node appender");
+            let trace_node_store = request.trace_node_store.as_ref();
 
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
@@ -3973,6 +3996,7 @@ mod tests {
             )];
             append_backend_events(
                 &trace_node_appender,
+                trace_node_store,
                 &execution("execution-step-1"),
                 &step_one_events,
             )?;
@@ -4035,6 +4059,7 @@ mod tests {
                 .trace_node_appender
                 .clone()
                 .expect("streaming backend requires trace node appender");
+            let trace_node_store = request.trace_node_store.as_ref();
 
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
@@ -4047,6 +4072,7 @@ mod tests {
             )];
             append_backend_events(
                 &trace_node_appender,
+                trace_node_store,
                 &execution("execution-step-1"),
                 &step_one_events,
             )?;
@@ -4066,6 +4092,7 @@ mod tests {
             ];
             let head = append_backend_events(
                 &trace_node_appender,
+                trace_node_store,
                 &execution("execution-step-2"),
                 &step_two_events,
             )?;
@@ -4101,6 +4128,7 @@ mod tests {
                 .trace_node_appender
                 .clone()
                 .expect("streaming backend requires trace node appender");
+            let trace_node_store = request.trace_node_store.as_ref();
 
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
@@ -4113,6 +4141,7 @@ mod tests {
             )];
             append_backend_events(
                 &trace_node_appender,
+                trace_node_store,
                 &execution("execution-step-1"),
                 &step_one_events,
             )?;
@@ -4127,6 +4156,7 @@ mod tests {
             )];
             let head = append_backend_events(
                 &trace_node_appender,
+                trace_node_store,
                 &execution("execution-step-2"),
                 &step_two_events,
             )?;
@@ -6620,6 +6650,10 @@ mod tests {
         }))
     }
 
+    fn test_trace_store(store: MemoryStore) -> TraceNodeStoreHandle {
+        TraceNodeStoreHandle::new(Arc::new(store))
+    }
+
     fn append_skill_invocation_fixture(
         store: &MemoryStore,
         parent_tool_use_id: &str,
@@ -6685,9 +6719,11 @@ mod tests {
             .await
             .unwrap();
         let trace = test_trace_appender(store.clone(), &session.anchor_id);
+        let trace_store = test_trace_store(store.clone());
         let execution = ExecutionMetadata::new("execution-step-1".to_owned());
         let appended = append_backend_event_nodes(
             &trace,
+            Some(&trace_store),
             &execution,
             &[BackendEventPayload::ToolUse(ToolUse {
                 id: "tool-call-1".to_owned(),
@@ -6703,6 +6739,7 @@ mod tests {
 
         let appended = append_backend_event_nodes(
             &trace,
+            Some(&trace_store),
             &execution,
             &[BackendEventPayload::ToolResult(ToolResult {
                 id: "tool-call-1".to_owned(),
@@ -6738,9 +6775,11 @@ mod tests {
             .await
             .unwrap();
         let trace = test_trace_appender(store.clone(), &session.anchor_id);
+        let trace_store = test_trace_store(store.clone());
         let execution = ExecutionMetadata::new("execution-step-1".to_owned());
         let appended = append_backend_event_nodes(
             &trace,
+            Some(&trace_store),
             &execution,
             &[BackendEventPayload::ToolUse(ToolUse {
                 id: "tool-call-1".to_owned(),
@@ -6753,6 +6792,7 @@ mod tests {
         let exec_tool_use_id = appended[0].0.clone();
         let running = append_backend_event_nodes(
             &trace,
+            Some(&trace_store),
             &execution,
             &[BackendEventPayload::ToolResult(ToolResult {
                 id: "tool-call-1".to_owned(),
@@ -6771,6 +6811,7 @@ mod tests {
         );
         append_backend_event_nodes(
             &trace,
+            Some(&trace_store),
             &execution,
             &[BackendEventPayload::ToolUse(ToolUse {
                 id: "tool-call-2".to_owned(),
@@ -6783,6 +6824,7 @@ mod tests {
 
         let appended = append_backend_event_nodes(
             &trace,
+            Some(&trace_store),
             &execution,
             &[BackendEventPayload::ToolResult(ToolResult {
                 id: "tool-call-2".to_owned(),
