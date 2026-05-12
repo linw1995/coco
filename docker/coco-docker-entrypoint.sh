@@ -71,14 +71,14 @@ chown_runtime_paths() {
 }
 
 start_cron() {
-  if [ "${COCO_START_CRON:-1}" != "1" ]; then
-    return 0
-  fi
-
   cronjob_install_dir="${COCO_SKILL_PERSIST_ROOT:-/data/skills}/orchestrator/cronjob/data/install"
   cronjob_crontab_dir="${COCO_CRONTAB_DIR:-${cronjob_install_dir}/crontabs}"
   mkdir -p "${cronjob_crontab_dir}"
   export COCO_CRONTAB_DIR="${cronjob_crontab_dir}"
+  if [ "${COCO_START_CRON:-1}" != "1" ]; then
+    return 0
+  fi
+
   supervise_crontabs "${cronjob_crontab_dir}" &
 }
 
