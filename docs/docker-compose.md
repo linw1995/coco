@@ -15,7 +15,7 @@ Deploy from the repository root:
 ├── .coco-data/
 │   ├── config.toml
 │   ├── .config/
-│   ├── .coco-store/
+│   ├── store/
 │   ├── logs/
 │   └── skills/
 ├── .coco-workspace/
@@ -44,7 +44,8 @@ id -g
 
 Use `.env.example` as the source of truth for available deployment variables.
 At minimum, review the image, host port, data directory, workspace directory,
-timezone, runtime uid/gid, and optional ChatGPT or Telegram secrets.
+store path, timezone, runtime uid/gid, and optional ChatGPT or Telegram
+secrets.
 
 `COCO_UID` and `COCO_GID` must match the current host user. CoCo uses them to
 write bind-mounted paths as the host user. Prefer these variables over Docker's
