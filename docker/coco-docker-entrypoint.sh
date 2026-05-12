@@ -71,24 +71,57 @@ chown_runtime_paths() {
 }
 
 start_cron() {
+  cronjob_install_dir="${COCO_SKILL_PERSIST_ROOT:-/data/skills}/orchestrator/cronjob/data/install"
+  cronjob_crontab_dir="${COCO_CRONTAB_DIR:-${cronjob_install_dir}/crontabs}"
+  mkdir -p "${cronjob_crontab_dir}"
+  export COCO_CRONTAB_DIR="${cronjob_crontab_dir}"
   if [ "${COCO_START_CRON:-1}" != "1" ]; then
     return 0
   fi
 
-  cronjob_install_dir="${COCO_SKILL_PERSIST_ROOT:-/data/skills}/orchestrator/cronjob/data/install"
-  cronjob_crontab_file="${COCO_CRONTAB_FILE:-${cronjob_install_dir}/crontab}"
-  mkdir -p "$(dirname "${cronjob_crontab_file}")"
-  if [ ! -f "${cronjob_crontab_file}" ]; then
-    printf '# CoCo cronjobs\n' >"${cronjob_crontab_file}"
+  supervise_crontabs "${cronjob_crontab_dir}" &
+}
+
+supervise_crontabs() {
+  crontab_dir="$1"
+  pid_dir="${TMPDIR:-/tmp}/coco-cronjob-pids"
+  rm -rf "${pid_dir}"
+  mkdir -p "${pid_dir}"
+  while :; do
+    for crontab_file in "${crontab_dir}"/*.crontab; do
+      if [ ! -f "${crontab_file}" ]; then
+        continue
+      fi
+      start_supercronic_file "${crontab_file}" "${pid_dir}"
+    done
+    sleep "${COCO_CRON_SCAN_INTERVAL:-5}"
+  done
+}
+
+start_supercronic_file() {
+  crontab_file="$1"
+  pid_dir="$2"
+  pid_file="${pid_dir}/$(basename "${crontab_file}").pid"
+  if [ -f "${pid_file}" ]; then
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "${pid_file}"
   fi
-  export COCO_CRONTAB_FILE="${cronjob_crontab_file}"
-  if [ -f "${cronjob_install_dir}/cronjob_restore.py" ] && [ -f "${cronjob_install_dir}/managed-crontab" ]; then
-    uv run --script "${cronjob_install_dir}/cronjob_restore.py" \
-      --snapshot "${cronjob_install_dir}/managed-crontab" \
-      --crontab-file "${cronjob_crontab_file}" \
-      || printf 'warning: failed to restore managed CoCo cronjobs\n' >&2
-  fi
-  supercronic -inotify "${cronjob_crontab_file}" &
+  supervise_supercronic_file "${crontab_file}" "${pid_file}" &
+  printf '%s\n' "$!" >"${pid_file}"
+}
+
+supervise_supercronic_file() {
+  crontab_file="$1"
+  pid_file="$2"
+  trap 'rm -f "${pid_file}"' EXIT
+  while [ -f "${crontab_file}" ]; do
+    supercronic -inotify "${crontab_file}"
+    printf 'warning: supercronic exited for %s; restarting\n' "${crontab_file}" >&2
+    sleep "${COCO_CRON_RESTART_DELAY:-2}"
+  done
 }
 
 validate_runtime_id_pair
