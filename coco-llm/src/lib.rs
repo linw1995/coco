@@ -363,6 +363,15 @@ trait TraceNodeAppender: Send + Sync {
     /// Returns the current trace tail.
     fn head_id(&self) -> std::result::Result<String, BackendError>;
 
+    fn get_node(&self, node_id: &str) -> std::result::Result<coco_mem::Node, BackendError>;
+
+    fn ancestry(&self, reference: &str) -> std::result::Result<Vec<coco_mem::Node>, BackendError>;
+
+    fn list_children(
+        &self,
+        node_id: &str,
+    ) -> std::result::Result<Vec<coco_mem::Node>, BackendError>;
+
     /// Appends a store node to the current trace tail.
     fn append(
         &self,
@@ -389,6 +398,21 @@ impl TraceNodeAppenderHandle {
     fn head_id(&self) -> std::result::Result<String, BackendError> {
         self.inner.head_id()
     }
+
+    fn get_node(&self, node_id: &str) -> std::result::Result<coco_mem::Node, BackendError> {
+        self.inner.get_node(node_id)
+    }
+
+    fn ancestry(&self, reference: &str) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
+        self.inner.ancestry(reference)
+    }
+
+    fn list_children(
+        &self,
+        node_id: &str,
+    ) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
+        self.inner.list_children(node_id)
+    }
 }
 
 impl std::fmt::Debug for TraceNodeAppenderHandle {
@@ -407,6 +431,27 @@ where
             .lock()
             .expect("trace node appender lock poisoned")
             .clone())
+    }
+
+    fn get_node(&self, node_id: &str) -> std::result::Result<coco_mem::Node, BackendError> {
+        self.store
+            .get_node(node_id)
+            .map_err(|source| BackendError::failed(source.to_string()))
+    }
+
+    fn ancestry(&self, reference: &str) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
+        self.store
+            .ancestry(reference)
+            .map_err(|source| BackendError::failed(source.to_string()))
+    }
+
+    fn list_children(
+        &self,
+        node_id: &str,
+    ) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
+        self.store
+            .list_children(node_id)
+            .map_err(|source| BackendError::failed(source.to_string()))
     }
 
     fn append(
@@ -2628,6 +2673,196 @@ fn append_backend_event(
     )
 }
 
+fn is_terminal_unified_exec_output(output: &str) -> bool {
+    output.contains("exit_status: ") && !output.contains("exit_status: running")
+}
+
+fn output_session_id(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("session_id: "))
+}
+
+fn tool_use_session_id(tool_use: &ToolUse) -> Option<&str> {
+    tool_use
+        .input
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+}
+
+fn find_tool_use_for_result<'a>(
+    ancestry: &'a [coco_mem::Node],
+    tool_result_id: &str,
+) -> Option<(&'a coco_mem::Node, &'a ToolUse)> {
+    ancestry.iter().find_map(|node| {
+        let tool_uses = node.kind.as_tool_uses()?;
+        tool_uses
+            .items()
+            .iter()
+            .find(|tool_use| tool_use.id == tool_result_id)
+            .map(|tool_use| (node, tool_use))
+    })
+}
+
+fn find_exec_command_tool_use_for_session<'a>(
+    ancestry: &'a [coco_mem::Node],
+    session_id: &str,
+) -> Option<&'a coco_mem::Node> {
+    for node in ancestry {
+        let Some(tool_results) = node.kind.as_tool_results() else {
+            continue;
+        };
+        for tool_result in tool_results.items() {
+            if output_session_id(&tool_result.output) != Some(session_id) {
+                continue;
+            }
+            let Some((tool_use_node, tool_use)) =
+                find_tool_use_for_result(ancestry, &tool_result.id)
+            else {
+                continue;
+            };
+            if tool_use.name == "exec_command" {
+                return Some(tool_use_node);
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_skill_source_tool_use<'a>(
+    ancestry: &'a [coco_mem::Node],
+    tool_result: &ToolResult,
+) -> Option<&'a coco_mem::Node> {
+    let (tool_use_node, tool_use) = find_tool_use_for_result(ancestry, &tool_result.id)?;
+    match tool_use.name.as_str() {
+        "exec_command" => Some(tool_use_node),
+        "write_stdin" => {
+            let session_id =
+                tool_use_session_id(tool_use).or_else(|| output_session_id(&tool_result.output))?;
+            find_exec_command_tool_use_for_session(ancestry, session_id)
+        }
+        _ => None,
+    }
+}
+
+fn newest_skill_response_descendant(
+    trace_node_appender: &TraceNodeAppenderHandle,
+    invocation_node_id: &str,
+) -> std::result::Result<Option<coco_mem::Node>, BackendError> {
+    let mut stack = trace_node_appender.list_children(invocation_node_id)?;
+    let mut visited = HashSet::new();
+    let mut response = None::<coco_mem::Node>;
+
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.id.clone()) {
+            continue;
+        }
+        if node.role == Role::LLM
+            && matches!(&node.kind, Kind::Text(_))
+            && response
+                .as_ref()
+                .is_none_or(|current| current.created_at < node.created_at)
+        {
+            response = Some(node.clone());
+        }
+        stack.extend(trace_node_appender.list_children(&node.id)?);
+    }
+
+    Ok(response)
+}
+
+fn has_fanned_in_skill_result(
+    trace_node_appender: &TraceNodeAppenderHandle,
+    tool_result_node_id: &str,
+    response_node_id: &str,
+) -> std::result::Result<bool, BackendError> {
+    let mut stack = trace_node_appender.list_children(tool_result_node_id)?;
+    let mut visited = HashSet::new();
+
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.id.clone()) {
+            continue;
+        }
+        if let Kind::Anchor(anchor) = &node.kind
+            && anchor.as_skill_result().is_some()
+            && anchor
+                .merge_parents()
+                .iter()
+                .any(|parent| parent.node_id() == response_node_id)
+        {
+            return Ok(true);
+        }
+        stack.extend(trace_node_appender.list_children(&node.id)?);
+    }
+
+    Ok(false)
+}
+
+fn append_skill_results_after_tool_result(
+    trace_node_appender: &TraceNodeAppenderHandle,
+    tool_result_node_id: &str,
+) -> std::result::Result<Vec<String>, BackendError> {
+    let tool_result_node = trace_node_appender.get_node(tool_result_node_id)?;
+    let Kind::ToolResult(tool_results) = &tool_result_node.kind else {
+        return Ok(vec![]);
+    };
+    let ancestry = trace_node_appender.ancestry(tool_result_node_id)?;
+    let mut appended = Vec::new();
+    let mut fanned_in = HashSet::new();
+
+    for tool_result in tool_results.items() {
+        if !is_terminal_unified_exec_output(&tool_result.output) {
+            continue;
+        }
+        let Some(source_tool_use) = resolve_skill_source_tool_use(&ancestry, tool_result) else {
+            continue;
+        };
+        for child in trace_node_appender.list_children(&source_tool_use.id)? {
+            let Kind::Anchor(anchor) = &child.kind else {
+                continue;
+            };
+            let Some(invocation) = anchor.as_skill_invocation() else {
+                continue;
+            };
+            let Some(response) = newest_skill_response_descendant(trace_node_appender, &child.id)?
+            else {
+                continue;
+            };
+            let Kind::Text(output) = &response.kind else {
+                continue;
+            };
+            if !fanned_in.insert(response.id.clone())
+                || has_fanned_in_skill_result(
+                    trace_node_appender,
+                    tool_result_node_id,
+                    &response.id,
+                )?
+            {
+                continue;
+            }
+            let primary_parent = trace_node_appender.head_id()?;
+            let node_id = trace_node_appender.append(
+                Role::System,
+                None,
+                normalize_kind_for_primary_parent(
+                    Kind::Anchor(Anchor::skill_result(
+                        vec![MergeParent::merge(response.id.clone())],
+                        SkillResultAnchor {
+                            skill_name: invocation.skill_name.clone(),
+                            output: output.clone(),
+                        },
+                    )),
+                    &primary_parent,
+                ),
+            )?;
+            appended.push(node_id);
+        }
+    }
+
+    Ok(appended)
+}
+
 fn append_backend_event_nodes(
     trace_node_appender: &TraceNodeAppenderHandle,
     execution: &ExecutionMetadata,
@@ -2638,7 +2873,15 @@ fn append_backend_event_nodes(
         let primary_parent = trace_node_appender.head_id()?;
         let kind = normalize_kind_for_primary_parent(kind, &primary_parent);
         let node_id = trace_node_appender.append(role, metadata, kind.clone())?;
-        appended.push((node_id, kind));
+        appended.push((node_id.clone(), kind.clone()));
+        if matches!(kind, Kind::ToolResult(_)) {
+            for skill_result_node_id in
+                append_skill_results_after_tool_result(trace_node_appender, &node_id)?
+            {
+                let skill_result = trace_node_appender.get_node(&skill_result_node_id)?;
+                appended.push((skill_result_node_id, skill_result.kind));
+            }
+        }
     }
 
     Ok(appended)
@@ -6368,6 +6611,199 @@ mod tests {
                             )
                 )
         ));
+    }
+
+    fn test_trace_appender(store: MemoryStore, head_id: &str) -> TraceNodeAppenderHandle {
+        TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
+            store,
+            head_id: StdMutex::new(head_id.to_owned()),
+        }))
+    }
+
+    fn append_skill_invocation_fixture(
+        store: &MemoryStore,
+        parent_tool_use_id: &str,
+        skill_name: &str,
+        response_text: &str,
+    ) -> (String, String) {
+        let invocation_id = store
+            .append(NewNode {
+                parent: parent_tool_use_id.to_owned(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    vec![],
+                    coco_mem::SkillInvocationAnchor {
+                        skill_name: skill_name.to_owned(),
+                        mode: coco_mem::SkillInvocationMode::InheritContext,
+                    },
+                )),
+            })
+            .unwrap();
+        let child_session_id = store
+            .append(NewNode {
+                parent: invocation_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(
+                    vec![],
+                    SessionAnchor {
+                        role: SessionRole::Runner,
+                        provider_profile: None,
+                        provider: Some(Provider::OpenAi.as_str().to_owned()),
+                        model: "gpt-4.1-mini".to_owned(),
+                        tools: vec![],
+                        system_prompt: "You are executing a skill.".to_owned(),
+                        prompt: "Run the skill.".to_owned(),
+                        temperature: Some(0.2),
+                        max_tokens: Some(64),
+                        additional_params: None,
+                        enable_coco_shim: false,
+                        active_skill: None,
+                    },
+                )),
+            })
+            .unwrap();
+        let response_id = store
+            .append(NewNode {
+                parent: child_session_id,
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text(response_text.to_owned()),
+            })
+            .unwrap();
+
+        (invocation_id, response_id)
+    }
+
+    #[tokio::test]
+    async fn terminal_exec_tool_result_appends_skill_result_fan_in() {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
+        let session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let trace = test_trace_appender(store.clone(), &session.anchor_id);
+        let execution = ExecutionMetadata::new("execution-step-1".to_owned());
+        let appended = append_backend_event_nodes(
+            &trace,
+            &execution,
+            &[BackendEventPayload::ToolUse(ToolUse {
+                id: "tool-call-1".to_owned(),
+                name: "exec_command".to_owned(),
+                input: serde_json::json!({"cmd": "coco skill run fast-rust"}),
+            })
+            .into()],
+        )
+        .unwrap();
+        let tool_use_id = appended[0].0.clone();
+        let (_invocation_id, response_id) =
+            append_skill_invocation_fixture(&store, &tool_use_id, "fast-rust", "delegated done");
+
+        let appended = append_backend_event_nodes(
+            &trace,
+            &execution,
+            &[BackendEventPayload::ToolResult(ToolResult {
+                id: "tool-call-1".to_owned(),
+                output:
+                    "Process exited with code 0\nexit_status: 0\nstdout:\ndelegated done\nstderr:\n"
+                        .to_owned(),
+            })
+            .into()],
+        )
+        .unwrap();
+
+        assert_eq!(appended.len(), 2);
+        let tool_result = store.get_node(&appended[0].0).unwrap();
+        let skill_result = store.get_node(&appended[1].0).unwrap();
+        assert!(matches!(tool_result.kind, Kind::ToolResult(_)));
+        assert_eq!(skill_result.parent, tool_result.id);
+        let Kind::Anchor(anchor) = &skill_result.kind else {
+            panic!("expected skill result anchor");
+        };
+        let result = anchor.as_skill_result().unwrap();
+        assert_eq!(result.skill_name, "fast-rust");
+        assert_eq!(result.output, "delegated done");
+        assert_eq!(anchor.merge_parent_node_ids(), [response_id.as_str()]);
+        assert_eq!(trace.head_id().unwrap(), skill_result.id);
+    }
+
+    #[tokio::test]
+    async fn terminal_write_stdin_tool_result_fans_in_original_exec_skill() {
+        let store = MemoryStore::new();
+        let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
+        let session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let trace = test_trace_appender(store.clone(), &session.anchor_id);
+        let execution = ExecutionMetadata::new("execution-step-1".to_owned());
+        let appended = append_backend_event_nodes(
+            &trace,
+            &execution,
+            &[BackendEventPayload::ToolUse(ToolUse {
+                id: "tool-call-1".to_owned(),
+                name: "exec_command".to_owned(),
+                input: serde_json::json!({"cmd": "coco skill run fast-rust", "tty": true}),
+            })
+            .into()],
+        )
+        .unwrap();
+        let exec_tool_use_id = appended[0].0.clone();
+        let running = append_backend_event_nodes(
+            &trace,
+            &execution,
+            &[BackendEventPayload::ToolResult(ToolResult {
+                id: "tool-call-1".to_owned(),
+                output: "Process running with session ID exec-123\nsession_id: exec-123\nexit_status: running\nstdout:\n\nstderr:\n"
+                    .to_owned(),
+            })
+            .into()],
+        )
+        .unwrap();
+        assert_eq!(running.len(), 1);
+        let (_invocation_id, response_id) = append_skill_invocation_fixture(
+            &store,
+            &exec_tool_use_id,
+            "fast-rust",
+            "delegated done",
+        );
+        append_backend_event_nodes(
+            &trace,
+            &execution,
+            &[BackendEventPayload::ToolUse(ToolUse {
+                id: "tool-call-2".to_owned(),
+                name: "write_stdin".to_owned(),
+                input: serde_json::json!({"session_id": "exec-123", "chars": ""}),
+            })
+            .into()],
+        )
+        .unwrap();
+
+        let appended = append_backend_event_nodes(
+            &trace,
+            &execution,
+            &[BackendEventPayload::ToolResult(ToolResult {
+                id: "tool-call-2".to_owned(),
+                output:
+                    "Process exited with code 0\nexit_status: 0\nstdout:\ndelegated done\nstderr:\n"
+                        .to_owned(),
+            })
+            .into()],
+        )
+        .unwrap();
+
+        assert_eq!(appended.len(), 2);
+        let tool_result = store.get_node(&appended[0].0).unwrap();
+        let skill_result = store.get_node(&appended[1].0).unwrap();
+        assert!(matches!(tool_result.kind, Kind::ToolResult(_)));
+        assert_eq!(skill_result.parent, tool_result.id);
+        let Kind::Anchor(anchor) = &skill_result.kind else {
+            panic!("expected skill result anchor");
+        };
+        assert_eq!(anchor.merge_parent_node_ids(), [response_id.as_str()]);
+        assert_eq!(anchor.as_skill_result().unwrap().skill_name, "fast-rust");
     }
 
     #[test]

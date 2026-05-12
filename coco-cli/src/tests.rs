@@ -2620,17 +2620,17 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
         "You are executing the skill `fast-rust` on an isolated branch.",
     );
     let child_output_id = append_text_node(&store, &child_session_id, "Delegated result");
+    let tool_result_id =
+        append_tool_result_node(&store, &tool_use_id, "tool-1", "Delegated result");
     let skill_result_id = append_skill_result_anchor(
         &store,
-        &invocation_id,
+        &tool_result_id,
         &child_output_id,
         "fast-rust",
         "Delegated result",
     );
-    let tool_result_id =
-        append_tool_result_node(&store, &tool_use_id, "tool-1", "Delegated result");
     store
-        .set_branch_head("main", &tool_use_id, &tool_result_id)
+        .set_branch_head("main", &tool_use_id, &skill_result_id)
         .unwrap();
 
     let graph_output = run_with_backend(
@@ -2643,8 +2643,8 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
     .unwrap();
 
     let short_id = |id: &str| id.chars().take(8).collect::<String>();
-    assert!(graph_output.contains(&format!("* {} tool_result", short_id(&tool_result_id))));
-    assert!(graph_output.contains(&format!("| * {} skill_result", short_id(&skill_result_id))));
+    assert!(graph_output.contains(&format!("* {} skill_result", short_id(&skill_result_id))));
+    assert!(graph_output.contains(&format!("{} tool_result", short_id(&tool_result_id))));
     assert!(graph_output.contains(&format!("| * {} text", short_id(&child_output_id))));
     assert!(graph_output.contains(&format!("| * {} session", short_id(&child_session_id))));
     assert!(graph_output.contains(&format!(
@@ -4558,20 +4558,16 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
         Some("Review the diff.")
     );
 
-    let skill_result = invocation_children
-        .iter()
-        .find_map(|node| match &node.kind {
-            Kind::Anchor(anchor) => anchor
-                .as_skill_result()
-                .filter(|result| result.skill_name == "fast-rust")
-                .map(|result| (anchor, result)),
-            _ => None,
-        })
-        .expect("expected skill result under skill invocation");
-    let response_node_id = output["response_node_id"].as_str().unwrap();
-    assert_eq!(skill_result.0.merge_parent_node_ids(), [response_node_id]);
-    let value: Value = serde_json::from_str(&skill_result.1.output).unwrap();
-    assert_eq!(value["text"], "delegated output");
+    assert!(
+        invocation_children.iter().all(|node| {
+            !matches!(
+                &node.kind,
+                Kind::Anchor(anchor) if anchor.as_skill_result().is_some()
+            )
+        }),
+        "skill run should leave SkillResult fan-in to the parent tool result"
+    );
+    assert!(!output["response_node_id"].as_str().unwrap().is_empty());
 }
 
 #[tokio::test]

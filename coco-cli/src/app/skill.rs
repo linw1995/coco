@@ -7,9 +7,9 @@ use std::sync::Arc;
 use coco_core::ConversationEngine;
 use coco_llm::{CompletionBackend, LlmService};
 use coco_mem::{
-    Anchor, Kind, MergeParent, NewNode, NodeStore, Role, SessionRole, SkillInvocationAnchor,
-    SkillInvocationMode, SkillRecord, SkillResultAnchor, SkillScript, SkillStore, SkillUpdatePatch,
-    SkillVersion, SkillVersionSpec, Store,
+    Anchor, Kind, NewNode, NodeStore, Role, SessionRole, SkillInvocationAnchor,
+    SkillInvocationMode, SkillRecord, SkillScript, SkillStore, SkillUpdatePatch, SkillVersion,
+    SkillVersionSpec, Store,
 };
 use serde::Serialize;
 use snafu::prelude::*;
@@ -50,7 +50,6 @@ struct SkillShowView {
 #[derive(Debug, Serialize)]
 struct SkillRunView {
     invocation_node_id: String,
-    skill_result_node_id: String,
     parent_tool_use_id: String,
     skill_name: String,
     mode: SkillInvocationMode,
@@ -300,26 +299,9 @@ where
         )
         .await
         .context(crate::error::CoreEngineSnafu)?;
-    let output =
-        serde_json::to_string_pretty(&result.result).expect("skill run result should serialize");
-    let skill_result_node_id = store
-        .append(NewNode {
-            parent: invocation_node_id.clone(),
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::skill_result(
-                vec![MergeParent::merge(result.response_node_id.clone())],
-                SkillResultAnchor {
-                    skill_name: skill_name.clone(),
-                    output,
-                },
-            )),
-        })
-        .context(StoreSnafu)?;
 
     Ok(SkillRunView {
         invocation_node_id,
-        skill_result_node_id,
         parent_tool_use_id,
         skill_name,
         mode,
@@ -553,9 +535,8 @@ fn render_skill_summary_text(skill: &SkillSummaryView) -> String {
 
 fn render_skill_run_text(invocation: &SkillRunView) -> String {
     format!(
-        "invocation_node_id: {}\nskill_result_node_id: {}\nparent_tool_use_id: {}\nskill_name: {}\nresponse_node_id: {}\nmode:\n{}\ntext:\n{}",
+        "invocation_node_id: {}\nparent_tool_use_id: {}\nskill_name: {}\nresponse_node_id: {}\nmode:\n{}\ntext:\n{}",
         invocation.invocation_node_id,
-        invocation.skill_result_node_id,
         invocation.parent_tool_use_id,
         invocation.skill_name,
         invocation.response_node_id,
