@@ -341,36 +341,6 @@ pub(crate) struct ToolInvocationContext {
     pub(crate) persisted_tool_use_node_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ToolExecutionOutcome {
-    ToolResult { provider_output: String },
-}
-
-impl ToolExecutionOutcome {
-    pub fn tool_result(provider_output: impl Into<String>) -> Self {
-        Self::ToolResult {
-            provider_output: provider_output.into(),
-        }
-    }
-
-    pub fn provider_output(&self) -> &str {
-        match self {
-            Self::ToolResult { provider_output } => provider_output,
-        }
-    }
-
-    pub fn into_backend_event(self, tool_id: String, call_id: Option<String>) -> BackendEvent {
-        let event = match self {
-            Self::ToolResult { provider_output } => BackendEventPayload::ToolResult(ToolResult {
-                id: tool_id,
-                output: provider_output,
-            }),
-        };
-
-        BackendEvent::new(event).with_metadata(Some(ProviderMetadata::new(call_id)))
-    }
-}
-
 #[derive(Debug)]
 struct StoreNodeAppender<S> {
     store: S,
@@ -2362,7 +2332,7 @@ impl RuntimeTool {
         &self,
         args: String,
         invocation: ToolInvocationContext,
-    ) -> std::result::Result<ToolExecutionOutcome, rig::tool::ToolError> {
+    ) -> std::result::Result<String, rig::tool::ToolError> {
         match self {
             Self::UnifiedExec(tool) => tool.execute(args, invocation).await,
             Self::SearchSkill(tool) => tool.execute(args, invocation).await,
@@ -2380,13 +2350,13 @@ impl RuntimeToolSet {
         tool_name: &str,
         args: String,
         invocation: ToolInvocationContext,
-    ) -> std::result::Result<ToolExecutionOutcome, BackendError> {
+    ) -> std::result::Result<String, BackendError> {
         let tool = self.tools.get(tool_name).ok_or_else(|| {
             BackendError::failed(format!("unsupported runtime tool {tool_name:?}"))
         })?;
         match tool.execute(args, invocation).await {
             Ok(outcome) => Ok(outcome),
-            Err(source) => Ok(ToolExecutionOutcome::tool_result(source.to_string())),
+            Err(source) => Ok(source.to_string()),
         }
     }
 }
@@ -3373,7 +3343,7 @@ impl CompletionRunner {
         let tool_call = invocation.tool_call;
         let args = serde_json::to_string(&tool_call.function.arguments)
             .map_err(|source| BackendError::failed(source.to_string()))?;
-        let outcome = runtime_tools
+        let provider_output = runtime_tools
             .execute(
                 &tool_call.function.name,
                 args,
@@ -3382,9 +3352,12 @@ impl CompletionRunner {
                 },
             )
             .await?;
-        let provider_output = outcome.provider_output().to_owned();
         let call_id = tool_call.call_id.clone();
-        let event = outcome.into_backend_event(tool_call.id.clone(), call_id.clone());
+        let event = BackendEvent::new(BackendEventPayload::ToolResult(ToolResult {
+            id: tool_call.id.clone(),
+            output: provider_output.clone(),
+        }))
+        .with_metadata(Some(ProviderMetadata::new(call_id.clone())));
         Ok(ToolCallExecution {
             index,
             event,

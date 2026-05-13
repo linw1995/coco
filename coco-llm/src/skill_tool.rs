@@ -4,7 +4,7 @@ use coco_mem::Tool;
 use serde_json::Value;
 use snafu::prelude::*;
 
-use crate::{SkillSearchRequest, ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv};
+use crate::{SkillSearchRequest, ToolInvocationContext, ToolRuntimeEnv};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SkillToolRuntime {
@@ -97,15 +97,14 @@ impl SkillToolRuntime {
         &self,
         args: String,
         _invocation: ToolInvocationContext,
-    ) -> std::result::Result<ToolExecutionOutcome, rig::tool::ToolError> {
+    ) -> std::result::Result<String, rig::tool::ToolError> {
         let workspace_root = self.workspace_root.clone();
         let context = self.context.clone();
 
         let args: Value = serde_json::from_str(&args).context(ParseArgsSnafu)?;
 
         let request = parse_search_request(workspace_root, context.session_role, args)?;
-        let output = context.skill_executor.search_skill(request).await?;
-        Ok(ToolExecutionOutcome::tool_result(output))
+        Ok(context.skill_executor.search_skill(request).await?)
     }
 }
 
@@ -127,12 +126,7 @@ impl rig::tool::ToolDyn for SkillToolRuntime {
         args: String,
     ) -> rig::wasm_compat::WasmBoxedFuture<'_, std::result::Result<String, rig::tool::ToolError>>
     {
-        Box::pin(async move {
-            match self.execute(args, ToolInvocationContext::default()).await {
-                Ok(outcome) => Ok(outcome.provider_output().to_owned()),
-                Err(source) => Err(source),
-            }
-        })
+        Box::pin(async move { self.execute(args, ToolInvocationContext::default()).await })
     }
 }
 
