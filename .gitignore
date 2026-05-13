@@ -6,6 +6,7 @@ coco-console/pkg
 *.sh
 !docker/coco-docker-entrypoint.sh
 !scripts/run-cov.sh
+!scripts/test-builtin-skill-scripts.sh
 
 # CoCo
 config.toml

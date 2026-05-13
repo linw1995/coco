@@ -25,7 +25,10 @@ def resolve_token(explicit_token: str | None) -> str:
 def split_message(text: str) -> list[str]:
     if not text:
         return [""]
-    return [text[index : index + MESSAGE_LIMIT] for index in range(0, len(text), MESSAGE_LIMIT)]
+    return [
+        text[index : index + MESSAGE_LIMIT]
+        for index in range(0, len(text), MESSAGE_LIMIT)
+    ]
 
 
 def post_api(token: str, method: str, payload: dict) -> dict:
@@ -45,7 +48,9 @@ def post_api(token: str, method: str, payload: dict) -> dict:
         raise SystemExit(f"Telegram API request failed: {error}") from error
 
     if not body.get("ok"):
-        raise SystemExit(f"Telegram API returned an error: {body.get('description', body)}")
+        raise SystemExit(
+            f"Telegram API returned an error: {body.get('description', body)}"
+        )
     return body["result"]
 
 
@@ -59,7 +64,9 @@ def main() -> int:
 
     token = resolve_token(args.token)
     sent = []
-    for chat_id in [value.strip() for value in args.chat_id.split(",") if value.strip()]:
+    for chat_id in [
+        value.strip() for value in args.chat_id.split(",") if value.strip()
+    ]:
         reply_to = args.reply_to
         for chunk in split_message(args.message):
             payload = {"chat_id": chat_id, "text": chunk}

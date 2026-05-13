@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import re
@@ -154,7 +153,9 @@ def parse_args() -> argparse.Namespace:
         help="Duplicate execution policy.",
     )
     parser.add_argument("--prompt", help="Prompt text to submit.")
-    parser.add_argument("--prompt-file", type=Path, help="Read prompt text from a file.")
+    parser.add_argument(
+        "--prompt-file", type=Path, help="Read prompt text from a file."
+    )
     parser.add_argument(
         "--timezone",
         help="Optional CRON_TZ value for cron implementations that support it.",
@@ -166,15 +167,21 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Manage direct crontab files in this directory, one file per schedule timezone.",
     )
-    parser.add_argument("--install-dir", type=Path, help="Persistent runner install directory.")
-    parser.add_argument("--state-dir", type=Path, help="Persistent task state directory.")
+    parser.add_argument(
+        "--install-dir", type=Path, help="Persistent runner install directory."
+    )
+    parser.add_argument(
+        "--state-dir", type=Path, help="Persistent task state directory."
+    )
     parser.add_argument("--log-dir", type=Path, help="Cronjob log directory.")
     parser.add_argument(
         "--runner-source",
         type=Path,
         help="Source cronjob_run.py path. Defaults to $COCO_SKILL_DIR/scripts/cronjob_run.py.",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Print the managed block only.")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the managed block only."
+    )
     return parser.parse_args()
 
 
@@ -225,7 +232,9 @@ def validate_cronexpr(value: str) -> None:
     minutes = expand_minute_field(fields[0])
     hours = expand_cron_field(fields[1], "hour", minimum=0, maximum=23)
     days_of_month = expand_cron_field(fields[2], "day-of-month", minimum=1, maximum=31)
-    months = expand_cron_field(fields[3], "month", minimum=1, maximum=12, names=MONTH_NAMES)
+    months = expand_cron_field(
+        fields[3], "month", minimum=1, maximum=12, names=MONTH_NAMES
+    )
     days_of_week = expand_cron_field(
         fields[4],
         "day-of-week",
@@ -358,12 +367,18 @@ def expand_cron_part(
         start, end = minimum, maximum
     if "-" in base:
         left, right = base.split("-", 1)
-        start = parse_cron_value(left, name, minimum=minimum, maximum=maximum, names=names)
-        end = parse_cron_value(right, name, minimum=minimum, maximum=maximum, names=names)
+        start = parse_cron_value(
+            left, name, minimum=minimum, maximum=maximum, names=names
+        )
+        end = parse_cron_value(
+            right, name, minimum=minimum, maximum=maximum, names=names
+        )
         if start > end:
             raise SystemExit(f"{name} ranges must be ascending")
     elif base != "*":
-        value = parse_cron_value(base, name, minimum=minimum, maximum=maximum, names=names)
+        value = parse_cron_value(
+            base, name, minimum=minimum, maximum=maximum, names=names
+        )
         if step is not None:
             raise SystemExit(f"single {name} values cannot use a step")
         return {value}
@@ -496,7 +511,9 @@ def install_script(source: Path | None, install_dir: Path, script_name: str) -> 
     if source_path is None:
         skill_dir = os.environ.get("COCO_SKILL_DIR")
         if not skill_dir:
-            raise SystemExit("COCO_SKILL_DIR is required unless --runner-source is provided")
+            raise SystemExit(
+                "COCO_SKILL_DIR is required unless --runner-source is provided"
+            )
         source_path = Path(skill_dir) / "scripts" / script_name
     if not source_path.is_file():
         raise SystemExit(f"script source does not exist: {source_path}")
@@ -508,7 +525,9 @@ def install_script(source: Path | None, install_dir: Path, script_name: str) -> 
 
 def write_task_config(path: Path, config: dict[str, str]) -> None:
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(
+        json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     tmp.replace(path)
 
 
@@ -574,7 +593,9 @@ def extract_managed_blocks(content: str) -> str:
                 break
             index += 1
         else:
-            raise SystemExit(f"managed crontab block {line!r} is missing its end marker")
+            raise SystemExit(
+                f"managed crontab block {line!r} is missing its end marker"
+            )
 
         blocks.append("\n".join(block))
         index += 1
@@ -595,7 +616,9 @@ def upsert_managed_block(current: str, task_id: str, block: str) -> tuple[str, s
             while end_index < len(lines) and lines[end_index] != end:
                 end_index += 1
             if end_index == len(lines):
-                raise SystemExit(f"managed crontab block for {task_id!r} is missing its end marker")
+                raise SystemExit(
+                    f"managed crontab block for {task_id!r} is missing its end marker"
+                )
             if not replaced:
                 output.extend(block.rstrip("\n").splitlines())
                 replaced = True
@@ -660,7 +683,9 @@ def remove_managed_block(current: str, task_id: str) -> tuple[str, bool]:
             while end_index < len(lines) and lines[end_index] != end:
                 end_index += 1
             if end_index == len(lines):
-                raise SystemExit(f"managed crontab block for {task_id!r} is missing its end marker")
+                raise SystemExit(
+                    f"managed crontab block for {task_id!r} is missing its end marker"
+                )
             index = end_index + 1
             removed = True
             continue

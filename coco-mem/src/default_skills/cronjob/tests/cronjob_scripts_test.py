@@ -502,14 +502,18 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertNotIn("echo injected", result.stdout)
         self.assertFalse((workspace / "install").exists())
 
-    def test_runner_skip_policy_does_not_submit_while_previous_job_is_active(self) -> None:
+    def test_runner_skip_policy_does_not_submit_while_previous_job_is_active(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             fake_coco = write_fake_coco(workspace, status="running")
             task_file = write_task_file(workspace, fake_coco, repeat="skip")
             state_file = workspace / "state" / "daily-review.state.json"
             state_file.parent.mkdir(parents=True)
-            state_file.write_text('{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8")
+            state_file.write_text(
+                '{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8"
+            )
 
             result = subprocess.run(
                 [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
@@ -531,7 +535,9 @@ class CronjobScriptTests(unittest.TestCase):
             task_file = write_task_file(workspace, fake_coco, repeat="serial")
             state_file = workspace / "state" / "daily-review.state.json"
             state_file.parent.mkdir(parents=True)
-            state_file.write_text('{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8")
+            state_file.write_text(
+                '{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8"
+            )
 
             result = subprocess.run(
                 [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
@@ -567,7 +573,9 @@ class CronjobScriptTests(unittest.TestCase):
                     timeout=5,
                 )
                 calls = read_fake_coco_calls(workspace)
-                pending_count = (state_dir / "daily-review.pending").read_text(encoding="utf-8")
+                pending_count = (state_dir / "daily-review.pending").read_text(
+                    encoding="utf-8"
+                )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Queued daily-review", result.stdout)
@@ -594,7 +602,9 @@ class CronjobScriptTests(unittest.TestCase):
             calls = read_fake_coco_calls(workspace)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call["kind"] for call in calls], ["submit", "status", "submit"])
+        self.assertEqual(
+            [call["kind"] for call in calls], ["submit", "status", "submit"]
+        )
         self.assertFalse(pending_file.exists())
 
     def test_runner_parallel_policy_serializes_state_writes_only(self) -> None:
@@ -635,7 +645,9 @@ class CronjobScriptTests(unittest.TestCase):
             task_file = write_task_file(workspace, fake_coco, repeat="skip")
             state_file = workspace / "state" / "daily-review.state.json"
             state_file.parent.mkdir(parents=True)
-            state_file.write_text('{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8")
+            state_file.write_text(
+                '{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8"
+            )
 
             result = subprocess.run(
                 [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
@@ -662,14 +674,18 @@ def run_add(
     full_env["COCO_CRONTAB_DIR"] = str(workspace / "supercronic")
     if env:
         full_env.update(env)
-    directory_args = [
-        "--install-dir",
-        str(workspace / "install"),
-        "--state-dir",
-        str(workspace / "state"),
-        "--log-dir",
-        str(workspace / "logs"),
-    ] if explicit_dirs else []
+    directory_args = (
+        [
+            "--install-dir",
+            str(workspace / "install"),
+            "--state-dir",
+            str(workspace / "state"),
+            "--log-dir",
+            str(workspace / "logs"),
+        ]
+        if explicit_dirs
+        else []
+    )
     return subprocess.run(
         [
             sys.executable,

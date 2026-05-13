@@ -9,7 +9,6 @@ import argparse
 import fcntl
 import json
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -37,12 +36,16 @@ def main() -> int:
                     f"({count} pending)."
                 )
             else:
-                print(f"Skipping {task_id}: another cron invocation is updating task state.")
+                print(
+                    f"Skipping {task_id}: another cron invocation is updating task state."
+                )
             return 0
         while True:
             wait_for_previous_job(task, state_path)
             job = submit_prompt(task)
-            write_state(state_path, {"last_job_id": job["job_id"], "branch": task["branch"]})
+            write_state(
+                state_path, {"last_job_id": job["job_id"], "branch": task["branch"]}
+            )
             print(json.dumps(job, indent=2, sort_keys=True))
             if repeat != "serial" or not consume_pending(pending_path):
                 break
@@ -230,14 +233,18 @@ def submit_prompt(task: dict[str, str]) -> dict[str, str]:
     except json.JSONDecodeError as error:
         raise SystemExit(f"coco prompt did not return JSON: {result.stdout}") from error
     if "job_id" not in payload:
-        raise SystemExit(f"coco prompt response did not include job_id: {result.stdout}")
+        raise SystemExit(
+            f"coco prompt response did not include job_id: {result.stdout}"
+        )
     return payload
 
 
 def write_state(path: Path, state: dict[str, str]) -> None:
     with state_file_lock(path):
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         tmp.replace(path)
 
 
