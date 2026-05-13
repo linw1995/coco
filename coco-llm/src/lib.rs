@@ -2346,15 +2346,14 @@ struct RuntimeToolSet {
 
 #[derive(Clone)]
 enum RuntimeTool {
-    ExecCommand(unified_exec_tool::UnifiedExecToolRuntime),
-    WriteStdin(unified_exec_tool::UnifiedExecToolRuntime),
+    UnifiedExec(unified_exec_tool::UnifiedExecToolRuntime),
     SearchSkill(skill_tool::SkillToolRuntime),
 }
 
 impl RuntimeTool {
     fn definition(&self) -> CompletionToolDefinition {
         match self {
-            Self::ExecCommand(tool) | Self::WriteStdin(tool) => tool.tool_definition(),
+            Self::UnifiedExec(tool) => tool.tool_definition(),
             Self::SearchSkill(tool) => tool.tool_definition(),
         }
     }
@@ -2365,9 +2364,7 @@ impl RuntimeTool {
         invocation: ToolInvocationContext,
     ) -> std::result::Result<ToolExecutionOutcome, rig::tool::ToolError> {
         match self {
-            Self::ExecCommand(tool) | Self::WriteStdin(tool) => {
-                tool.execute(args, invocation).await
-            }
+            Self::UnifiedExec(tool) => tool.execute(args, invocation).await,
             Self::SearchSkill(tool) => tool.execute(args, invocation).await,
         }
     }
@@ -2404,14 +2401,14 @@ fn build_runtime_tools(
 
     for tool in &session.config.tools {
         let runtime_tool = match tool.name.as_str() {
-            "exec_command" => RuntimeTool::ExecCommand(unified_exec_tool::runtime_with_sessions(
+            "exec_command" => RuntimeTool::UnifiedExec(unified_exec_tool::runtime_with_sessions(
                 tool.clone(),
                 workspace_root.clone(),
                 session.tool_runtime_env.clone(),
                 unified_exec_tool::UnifiedExecToolKind::ExecCommand,
                 exec_sessions.clone(),
             )),
-            "write_stdin" => RuntimeTool::WriteStdin(unified_exec_tool::runtime_with_sessions(
+            "write_stdin" => RuntimeTool::UnifiedExec(unified_exec_tool::runtime_with_sessions(
                 tool.clone(),
                 workspace_root.clone(),
                 session.tool_runtime_env.clone(),
