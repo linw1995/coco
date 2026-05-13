@@ -44,6 +44,17 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  builtin-skill-scripts:
+    needs:
+      - lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+
+      - name: Run builtin skill script tests
+        run: nix develop --command bash scripts/test-builtin-skill-scripts.sh
+
   nix-build:
     needs:
       - lint
