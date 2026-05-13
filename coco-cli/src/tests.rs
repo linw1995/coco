@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use clap::Parser;
 use coco_llm::coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, JobStore, Kind, MergeParent, NewNode,
-    NodeStore, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionRole, SessionStore,
-    SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor, ToolResult, ToolUse,
+    NodeStore, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch,
+    SessionRole, SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor,
+    ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendTurn, CompletionBackend, CompletionMessage, Provider,
@@ -4568,6 +4569,113 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
         "skill run should leave SkillResult fan-in to the parent tool result"
     );
     assert!(!output["response_node_id"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    store
+        .add_skill(
+            SessionRole::Orchestrator,
+            "fast-rust",
+            SkillVersionSpec {
+                description: "Orchestrator Rust review.".to_owned(),
+                body: "# Orchestrator Fast Rust".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "fast-rust",
+            SkillVersionSpec {
+                description: "Runner Rust review.".to_owned(),
+                body: "# Runner Fast Rust".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
+
+    let session_head = store.get_branch_head("main").unwrap();
+    let patch_id = store
+        .append(NewNode {
+            parent: session_head.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session_patch(
+                vec![],
+                SessionAnchorPatch {
+                    role: Some(SessionRole::Runner),
+                    ..Default::default()
+                },
+            )),
+        })
+        .unwrap();
+    let parent_tool_use = append_tool_use_node(&store, &patch_id, "tool-call-1", "exec_command");
+    store
+        .set_branch_head("main", &session_head, &patch_id)
+        .unwrap();
+    store
+        .set_branch_head("main", &patch_id, &parent_tool_use)
+        .unwrap();
+
+    let llm = llm_with_test_provider_config(store.clone(), SkillRunBackend);
+    let response = run_forwarded_with_services(
+        ForwardedRuntimeInputs {
+            args: &[
+                "skill".to_owned(),
+                "run".to_owned(),
+                "fast-rust".to_owned(),
+                "--json".to_owned(),
+            ],
+            stdin: &[],
+            branch_env: Some("main"),
+            session_role: Some(SessionRole::Orchestrator),
+            store_path_env: None,
+            parent_tool_use_id_env: Some(&parent_tool_use),
+        },
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
+            shared_engine: None,
+        },
+    )
+    .await;
+
+    assert_eq!(response.exit_code, 0);
+    assert!(response.stderr.is_empty());
+    let output: Value = serde_json::from_str(&response.stdout).unwrap();
+    assert_eq!(output["text"], "delegated output");
+
+    let invocation_node_id = output["invocation_node_id"].as_str().unwrap();
+    let invocation_children = store.list_children(invocation_node_id).unwrap();
+    let child_session = invocation_children
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::Anchor(anchor) => anchor.as_session(),
+            _ => None,
+        })
+        .expect("expected child session anchor under skill invocation");
+    assert_eq!(child_session.role, SessionRole::Runner);
 }
 
 #[tokio::test]

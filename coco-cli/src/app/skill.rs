@@ -312,11 +312,19 @@ where
 
 fn resolve_parent_session_role(store: &impl NodeStore, start_id: &str) -> Result<SessionRole> {
     let mut node = store.get_node(start_id).context(StoreSnafu)?;
+    let mut patches = Vec::new();
     loop {
-        if let Kind::Anchor(anchor) = &node.kind
-            && let Some(session) = anchor.as_session()
-        {
-            return Ok(session.role);
+        if let Kind::Anchor(anchor) = &node.kind {
+            if let Some(session) = anchor.as_session() {
+                let effective = patches
+                    .iter()
+                    .rev()
+                    .fold(session.clone(), |session, patch| session.apply_patch(patch));
+                return Ok(effective.role);
+            }
+            if let Some(patch) = anchor.as_session_patch() {
+                patches.push(patch.clone());
+            }
         }
 
         ensure!(
