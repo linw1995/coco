@@ -15,7 +15,7 @@ pub use message::{
 };
 pub use resolver::{BranchResolver, FixedBranchResolver};
 pub use service::CoreService;
-pub use skill::{CoreSkillToolExecutor, SkillMatch, SkillSearchResult};
+pub use skill::{CoreSkillSearchExecutor, SkillMatch, SkillSearchResult};
 
 #[cfg(test)]
 mod tests;

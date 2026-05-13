@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use coco_console::{ConsolePublisher, ConsoleStore};
 use coco_core::ConversationEngine;
-use coco_core::CoreSkillToolExecutor;
+use coco_core::CoreSkillSearchExecutor;
 use coco_llm::{
     CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge, LlmService, ProviderRuntimeConfig,
     RigBackend, UnifiedExecCliBridgeHandle,
@@ -180,11 +180,11 @@ where
             }
         }));
         let unified_exec_bridge = UnifiedExecCliBridgeHandle::new(unified_exec_bridge_impl);
-        let skill_bridge = Arc::new(CoreSkillToolExecutor::new(weak_llm.clone()));
+        let skill_bridge = Arc::new(CoreSkillSearchExecutor::new(weak_llm.clone()));
         LlmService::builder(shared_store.clone(), backend)
             .with_provider_configs(provider_configs)
             .with_unified_exec_cli_bridge(unified_exec_bridge)
-            .with_skill_tool_executor(skill_bridge)
+            .with_skill_search_executor(skill_bridge)
             .build()
     })
 }

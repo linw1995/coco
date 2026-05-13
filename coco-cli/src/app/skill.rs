@@ -2,10 +2,14 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
+use coco_core::ConversationEngine;
+use coco_llm::{CompletionBackend, LlmService};
 use coco_mem::{
-    SessionRole, SkillRecord, SkillScript, SkillStore, SkillUpdatePatch, SkillVersion,
-    SkillVersionSpec,
+    Anchor, Kind, NewNode, NodeStore, Role, SessionRole, SkillInvocationAnchor,
+    SkillInvocationMode, SkillRecord, SkillScript, SkillStore, SkillUpdatePatch, SkillVersion,
+    SkillVersionSpec, Store,
 };
 use serde::Serialize;
 use snafu::prelude::*;
@@ -17,7 +21,10 @@ use crate::{
         SkillSubcommand, SkillUpdateCommand,
     },
     error::{
-        InvalidSkillScriptPathSnafu, ReadSkillFileSnafu, ReadSkillScriptDirectorySnafu, StoreSnafu,
+        InvalidSkillInvocationParentSnafu, InvalidSkillRunHandoffSnafu,
+        InvalidSkillScriptPathSnafu, MissingSkillInvocationParentSnafu,
+        MissingSkillInvocationSessionSnafu, MissingSkillRunBranchSnafu, ReadSkillFileSnafu,
+        ReadSkillScriptDirectorySnafu, ResolveCurrentDirSnafu, StoreSnafu,
     },
 };
 
@@ -41,6 +48,16 @@ struct SkillShowView {
 }
 
 #[derive(Debug, Serialize)]
+struct SkillRunView {
+    invocation_node_id: String,
+    parent_tool_use_id: String,
+    skill_name: String,
+    mode: SkillInvocationMode,
+    response_node_id: String,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
 struct SkillVersionView {
     version: u64,
     created_at: String,
@@ -50,10 +67,15 @@ struct SkillVersionView {
     body: String,
 }
 
-pub(super) async fn run_skill_command(
+pub(super) async fn run_skill_command<B, S>(
     command: SkillCommand,
-    store: &impl SkillStore,
-) -> Result<Option<String>> {
+    store: &S,
+    llm: &Arc<LlmService<B, S>>,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
     match command.command {
         SkillSubcommand::Add(command) => {
             let json = command.json;
@@ -98,6 +120,15 @@ pub(super) async fn run_skill_command(
                 render_json(skill)
             } else {
                 render_skill_show_text(&skill)
+            }))
+        }
+        SkillSubcommand::Run(command) => {
+            let json = command.json;
+            let invocation = run_skill_run(command, store, llm).await?;
+            Ok(Some(if json {
+                render_json(invocation)
+            } else {
+                render_skill_run_text(&invocation)
             }))
         }
     }
@@ -201,6 +232,109 @@ fn run_skill_show(command: SkillShowCommand, store: &impl SkillStore) -> Result<
         current_version: record.current_version,
         versions,
     })
+}
+
+async fn run_skill_run<B, S>(
+    command: crate::cli::SkillRunCommand,
+    store: &S,
+    llm: &Arc<LlmService<B, S>>,
+) -> Result<SkillRunView>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let parent_tool_use_id = command
+        .parent_tool_use_id
+        .or_else(|| std::env::var(coco_llm::COCO_PARENT_TOOL_USE_ID_ENV).ok())
+        .context(MissingSkillInvocationParentSnafu)?;
+    let branch = command
+        .branch
+        .or_else(|| std::env::var(coco_llm::COCO_SESSION_BRANCH_ENV).ok())
+        .context(MissingSkillRunBranchSnafu)?;
+    let parent = store.get_node(&parent_tool_use_id).context(StoreSnafu)?;
+    ensure!(
+        parent.kind.as_tool_uses().is_some(),
+        InvalidSkillInvocationParentSnafu {
+            parent_tool_use_id: parent_tool_use_id.clone(),
+        }
+    );
+
+    let mode = match command.handoff {
+        Some(handoff) => {
+            let prompt = handoff.trim().to_owned();
+            ensure!(!prompt.is_empty(), InvalidSkillRunHandoffSnafu);
+            SkillInvocationMode::Handoff { prompt }
+        }
+        None => SkillInvocationMode::InheritContext,
+    };
+    let skill_name = command.name;
+    let session_role = resolve_parent_session_role(store, &parent_tool_use_id)?;
+    let invocation_node_id = store
+        .append(NewNode {
+            parent: parent_tool_use_id.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_invocation(
+                vec![],
+                SkillInvocationAnchor {
+                    skill_name: skill_name.clone(),
+                    mode: mode.clone(),
+                },
+            )),
+        })
+        .context(StoreSnafu)?;
+    let handoff = match &mode {
+        SkillInvocationMode::InheritContext => None,
+        SkillInvocationMode::Handoff { prompt } => Some(prompt.clone()),
+    };
+    let workspace_root = std::env::current_dir().context(ResolveCurrentDirSnafu)?;
+    let result = ConversationEngine::new(llm.clone())
+        .execute_skill_invocation(
+            &workspace_root,
+            &branch,
+            session_role,
+            &invocation_node_id,
+            &skill_name,
+            handoff,
+        )
+        .await
+        .context(crate::error::CoreEngineSnafu)?;
+
+    Ok(SkillRunView {
+        invocation_node_id,
+        parent_tool_use_id,
+        skill_name,
+        mode,
+        response_node_id: result.response_node_id,
+        text: result.text,
+    })
+}
+
+fn resolve_parent_session_role(store: &impl NodeStore, start_id: &str) -> Result<SessionRole> {
+    let mut node = store.get_node(start_id).context(StoreSnafu)?;
+    let mut patches = Vec::new();
+    loop {
+        if let Kind::Anchor(anchor) = &node.kind {
+            if let Some(session) = anchor.as_session() {
+                let effective = patches
+                    .iter()
+                    .rev()
+                    .fold(session.clone(), |session, patch| session.apply_patch(patch));
+                return Ok(effective.role);
+            }
+            if let Some(patch) = anchor.as_session_patch() {
+                patches.push(patch.clone());
+            }
+        }
+
+        ensure!(
+            !node.is_root(),
+            MissingSkillInvocationSessionSnafu {
+                parent_tool_use_id: start_id.to_owned(),
+            }
+        );
+        node = store.get_node(&node.parent).context(StoreSnafu)?;
+    }
 }
 
 fn read_skill_body(path: &std::path::Path) -> Result<String> {
@@ -404,6 +538,19 @@ fn render_skill_summary_text(skill: &SkillSummaryView) -> String {
         skill.scripts.join(","),
         skill.enable_coco_shim,
         skill.description
+    )
+}
+
+fn render_skill_run_text(invocation: &SkillRunView) -> String {
+    format!(
+        "invocation_node_id: {}\nparent_tool_use_id: {}\nskill_name: {}\nresponse_node_id: {}\nmode:\n{}\ntext:\n{}",
+        invocation.invocation_node_id,
+        invocation.parent_tool_use_id,
+        invocation.skill_name,
+        invocation.response_node_id,
+        serde_json::to_string_pretty(&invocation.mode)
+            .expect("skill invocation mode should serialize"),
+        invocation.text
     )
 }
 

@@ -1784,7 +1784,7 @@ where
             .current()
             .unwrap()
             .body
-            .contains("fork from the node before the `use_skill` ToolUse")
+            .contains("fork from the node before the `SkillInvocation`")
     );
     assert!(
         orchestrator
@@ -1792,6 +1792,13 @@ where
             .unwrap()
             .body
             .contains("--tool exec_command --tool write_stdin --tool search_skill")
+    );
+    assert!(
+        orchestrator
+            .current()
+            .unwrap()
+            .body
+            .contains("--enable-coco-shim")
     );
     assert!(new_skill.current().unwrap().body.contains("coco skill add"));
     assert!(

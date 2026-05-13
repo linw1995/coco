@@ -70,7 +70,7 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
         }),
         "search_skill" => Some(Tool {
             name: "search_skill".to_owned(),
-            description: "Search installed skills.".to_owned(),
+            description: "Search installed skills. To run a returned skill, call `coco skill run <name>` through `exec_command`; pass `--handoff <text>` for a bounded handoff, or omit it to inherit context.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -83,25 +83,6 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                         "description": "Optional maximum number of matches to return."
                     }
                 },
-                "additionalProperties": false
-            }),
-        }),
-        "use_skill" => Some(Tool {
-            name: "use_skill".to_owned(),
-            description: "Run an installed skill on an isolated child branch. When you provide `handoff`, call `use_skill` alone in that assistant turn so the bounded handoff is clear and the parent can inspect the skill result before deciding any next tool call.".to_owned(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "The exact skill name returned by search_skill."
-                    },
-                    "handoff": {
-                        "type": "string",
-                        "description": "Optional explicit handoff content for a bounded skill run. When present, the skill child session does not inherit the parent conversation history and uses this content as its bounded task. When omitted, the skill inherits parent context. In both cases, the skill output returns as a normal tool result for the parent model to inspect before it continues."
-                    }
-                },
-                "required": ["name"],
                 "additionalProperties": false
             }),
         }),

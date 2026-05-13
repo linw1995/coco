@@ -23,8 +23,8 @@ pub use session::{
     SessionSubcommand,
 };
 pub use skill::{
-    SkillAddCommand, SkillCommand, SkillListCommand, SkillRollbackCommand, SkillShowCommand,
-    SkillSubcommand, SkillUpdateCommand,
+    SkillAddCommand, SkillCommand, SkillListCommand, SkillRollbackCommand, SkillRunCommand,
+    SkillShowCommand, SkillSubcommand, SkillUpdateCommand,
 };
 pub use types::{CliProvider, CliSessionRole, CliTool};
 

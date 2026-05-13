@@ -22,7 +22,7 @@ use crate::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_TOOL_USE_ID_ENV,
     COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_SKILL_DIR_ENV, COCO_SKILL_NAME_ENV,
     COCO_SKILL_PERSIST_DIR_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
-    ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv,
+    ToolInvocationContext, ToolRuntimeEnv,
 };
 
 #[derive(Debug, Clone)]
@@ -1863,7 +1863,7 @@ impl UnifiedExecToolRuntime {
         &self,
         args: String,
         invocation: ToolInvocationContext,
-    ) -> std::result::Result<ToolExecutionOutcome, rig::tool::ToolError> {
+    ) -> std::result::Result<String, rig::tool::ToolError> {
         use rig::tool::ToolError;
 
         let workspace_root = self.workspace_root.clone();
@@ -1886,7 +1886,7 @@ impl UnifiedExecToolRuntime {
         }
         .await;
         match result {
-            Ok(output) => Ok(ToolExecutionOutcome::tool_result(output)),
+            Ok(output) => Ok(output),
             Err(source) => Err(ToolError::ToolCallError(Box::new(source))),
         }
     }
@@ -1910,12 +1910,7 @@ impl rig::tool::ToolDyn for UnifiedExecToolRuntime {
         args: String,
     ) -> rig::wasm_compat::WasmBoxedFuture<'a, std::result::Result<String, rig::tool::ToolError>>
     {
-        Box::pin(async move {
-            match self.execute(args, ToolInvocationContext::default()).await {
-                Ok(outcome) => Ok(outcome.provider_output().to_owned()),
-                Err(source) => Err(source),
-            }
-        })
+        Box::pin(async move { self.execute(args, ToolInvocationContext::default()).await })
     }
 }
 
@@ -1943,7 +1938,7 @@ mod tests {
             store_path: None,
             enable_coco_shim,
             cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-            skill_executor: crate::SkillToolExecutorHandle::default(),
+            skill_executor: crate::SkillSearchExecutorHandle::default(),
         }
     }
 
@@ -2919,7 +2914,7 @@ mod tests {
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-                skill_executor: crate::SkillToolExecutorHandle::default(),
+                skill_executor: crate::SkillSearchExecutorHandle::default(),
             },
         );
         let path_env = OsString::from(fake_bin.path().as_os_str());
@@ -3000,7 +2995,7 @@ mod tests {
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-                skill_executor: crate::SkillToolExecutorHandle::default(),
+                skill_executor: crate::SkillSearchExecutorHandle::default(),
             },
         );
 
@@ -3063,7 +3058,7 @@ mod tests {
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-                skill_executor: crate::SkillToolExecutorHandle::default(),
+                skill_executor: crate::SkillSearchExecutorHandle::default(),
             },
         );
 
@@ -3118,7 +3113,7 @@ mod tests {
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-                skill_executor: crate::SkillToolExecutorHandle::default(),
+                skill_executor: crate::SkillSearchExecutorHandle::default(),
             },
         );
 
@@ -3139,9 +3134,7 @@ mod tests {
             },
         )
         .await
-        .unwrap()
-        .provider_output()
-        .to_owned();
+        .unwrap();
 
         assert!(output.contains("stdout:\ntool-use-node"));
     }
@@ -3517,7 +3510,7 @@ mod tests {
             store_path: Some(runtime_store.clone()),
             enable_coco_shim: true,
             cli_bridge: bridge,
-            skill_executor: crate::SkillToolExecutorHandle::default(),
+            skill_executor: crate::SkillSearchExecutorHandle::default(),
         };
         let server = crate::with_process_env_async(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],

@@ -65,6 +65,7 @@ pub enum AnchorPayload {
     Session(Box<SessionAnchor>),
     SessionPatch(SessionAnchorPatch),
     Prompt(PromptAnchor),
+    SkillInvocation(SkillInvocationAnchor),
     SkillResult(SkillResultAnchor),
 }
 
@@ -462,9 +463,21 @@ pub struct PromptAnchor {
     pub prompt: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillInvocationAnchor {
+    pub skill_name: String,
+    pub mode: SkillInvocationMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SkillInvocationMode {
+    InheritContext,
+    Handoff { prompt: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillResultAnchor {
-    pub tool_id: String,
     pub skill_name: String,
     pub output: String,
 }
@@ -607,6 +620,16 @@ impl Anchor {
         }
     }
 
+    pub fn skill_invocation(
+        merge_parents: Vec<MergeParent>,
+        anchor: SkillInvocationAnchor,
+    ) -> Self {
+        Self {
+            merge_parents,
+            payload: AnchorPayload::SkillInvocation(anchor),
+        }
+    }
+
     pub fn skill_result(merge_parents: Vec<MergeParent>, anchor: SkillResultAnchor) -> Self {
         Self {
             merge_parents,
@@ -630,6 +653,7 @@ impl Anchor {
             AnchorPayload::Session(anchor) => Some(anchor.as_ref()),
             AnchorPayload::SessionPatch(_)
             | AnchorPayload::Prompt(_)
+            | AnchorPayload::SkillInvocation(_)
             | AnchorPayload::SkillResult(_) => None,
         }
     }
@@ -639,6 +663,7 @@ impl Anchor {
             AnchorPayload::SessionPatch(patch) => Some(patch),
             AnchorPayload::Session(_)
             | AnchorPayload::Prompt(_)
+            | AnchorPayload::SkillInvocation(_)
             | AnchorPayload::SkillResult(_) => None,
         }
     }
@@ -647,8 +672,19 @@ impl Anchor {
         match &self.payload {
             AnchorPayload::Session(_)
             | AnchorPayload::SessionPatch(_)
+            | AnchorPayload::SkillInvocation(_)
             | AnchorPayload::SkillResult(_) => None,
             AnchorPayload::Prompt(anchor) => Some(anchor),
+        }
+    }
+
+    pub fn as_skill_invocation(&self) -> Option<&SkillInvocationAnchor> {
+        match &self.payload {
+            AnchorPayload::Session(_)
+            | AnchorPayload::SessionPatch(_)
+            | AnchorPayload::Prompt(_)
+            | AnchorPayload::SkillResult(_) => None,
+            AnchorPayload::SkillInvocation(anchor) => Some(anchor),
         }
     }
 
@@ -656,7 +692,8 @@ impl Anchor {
         match &self.payload {
             AnchorPayload::Session(_)
             | AnchorPayload::SessionPatch(_)
-            | AnchorPayload::Prompt(_) => None,
+            | AnchorPayload::Prompt(_)
+            | AnchorPayload::SkillInvocation(_) => None,
             AnchorPayload::SkillResult(anchor) => Some(anchor),
         }
     }
@@ -1008,8 +1045,8 @@ mod tests {
     use super::{
         Anchor, BackendMetadata, BranchConfig, ExecutionMetadata, Kind, MergeParent, NewNode, Node,
         NodeMetadata, PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
-        SessionAnchorPatch, SessionRole, SessionState, SkillResultAnchor, Tool, ToolResult,
-        ToolUse,
+        SessionAnchorPatch, SessionRole, SessionState, SkillInvocationAnchor, SkillInvocationMode,
+        SkillResultAnchor, Tool, ToolResult, ToolUse,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -1065,9 +1102,17 @@ mod tests {
         }
     }
 
+    fn make_skill_invocation_anchor() -> SkillInvocationAnchor {
+        SkillInvocationAnchor {
+            skill_name: "find-skills".to_owned(),
+            mode: SkillInvocationMode::Handoff {
+                prompt: "find a skill for this task".to_owned(),
+            },
+        }
+    }
+
     fn make_skill_result_anchor() -> SkillResultAnchor {
         SkillResultAnchor {
-            tool_id: "tool-call-1".to_owned(),
             skill_name: "find-skills".to_owned(),
             output: "child result".to_owned(),
         }
@@ -1157,6 +1202,35 @@ mod tests {
             Kind::Anchor(Anchor::session(
                 vec![MergeParent::merge("merge-b")],
                 make_session_anchor(),
+            )),
+            fixed_timestamp(),
+        );
+
+        assert_ne!(left.id, right.id);
+    }
+
+    #[test]
+    fn node_id_changes_when_skill_invocation_anchor_mode_changes() {
+        let left = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_invocation(
+                vec![MergeParent::merge("merge-a")],
+                make_skill_invocation_anchor(),
+            )),
+            fixed_timestamp(),
+        );
+        let right = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_invocation(
+                vec![MergeParent::merge("merge-a")],
+                SkillInvocationAnchor {
+                    mode: SkillInvocationMode::InheritContext,
+                    ..make_skill_invocation_anchor()
+                },
             )),
             fixed_timestamp(),
         );
@@ -1485,9 +1559,40 @@ mod tests {
             .expect("expected skill result anchor");
 
         assert_eq!(anchor.merge_parent_node_ids(), ["merge-a"]);
-        assert_eq!(skill_result.tool_id, "tool-call-1");
         assert_eq!(skill_result.skill_name, "find-skills");
         assert_eq!(skill_result.output, "child result");
+    }
+
+    #[test]
+    fn skill_invocation_anchor_round_trip_preserves_fields() {
+        let node = Node::new(
+            "parent".to_owned(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_invocation(
+                vec![MergeParent::merge("merge-a")],
+                make_skill_invocation_anchor(),
+            )),
+            fixed_timestamp(),
+        );
+
+        let encoded = serde_json::to_string(&node).unwrap();
+        let decoded: Node = serde_json::from_str(&encoded).unwrap();
+        let Kind::Anchor(anchor) = decoded.kind else {
+            panic!("expected anchor node");
+        };
+        let invocation = anchor
+            .as_skill_invocation()
+            .expect("expected skill invocation anchor");
+
+        assert_eq!(anchor.merge_parent_node_ids(), ["merge-a"]);
+        assert_eq!(invocation.skill_name, "find-skills");
+        assert_eq!(
+            invocation.mode,
+            SkillInvocationMode::Handoff {
+                prompt: "find a skill for this task".to_owned()
+            }
+        );
     }
 
     #[test]

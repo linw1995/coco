@@ -214,6 +214,13 @@ fn resolve_prompt_session_patch(command: &PromptRunCommand) -> Option<SessionCon
         patch.tools = Some(resolve_cli_tools(&command.tools));
         has_patch = true;
     }
+    if command.enable_coco_shim {
+        patch.enable_coco_shim = Some(true);
+        has_patch = true;
+    } else if command.disable_coco_shim {
+        patch.enable_coco_shim = Some(false);
+        has_patch = true;
+    }
 
     has_patch.then_some(patch)
 }

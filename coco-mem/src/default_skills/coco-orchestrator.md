@@ -22,15 +22,17 @@ coco session rebase --preset <preset> --branch <branch>
 coco prompt --branch <branch> "<text>"
 coco prompt status --job <job>
 coco prompt branch-status --job <job> --branch <branch>
+coco skill run <skill>
+coco skill run <skill> --handoff "<task>"
 ```
 
 Rules:
 
 - Prefer `coco` commands over direct store edits.
-- Hand off bounded work with `coco session fork` and `coco prompt`; do not use
-  `use_skill` as the handoff mechanism here.
-- On a `*/skill/*` branch, fork from the node before the `use_skill` ToolUse
-  that invoked this skill, not from the skill session anchor.
+- Use `coco skill run <skill> --handoff "<task>"` for bounded skill handoff.
+  Omit `--handoff` only when the skill should inherit the current context.
+- On a `*/skill/*` branch, fork from the node before the `SkillInvocation`
+  anchor that invoked this skill, not from the skill session anchor.
 - After forking, apply the runner role and restricted tools on the runner
   prompt. Prompt-level role/tool changes are session patches; they preserve
   the forked branch history while changing the runner configuration.
@@ -41,9 +43,10 @@ Example:
 
 ```bash
 ANCHOR=$(coco session get --json --branch "$COCO_BRANCH" | jq -r '.anchor_id')
-USE_SKILL=$(coco session show --json "$ANCHOR" | jq -r '.node.parent')
-BASE=$(coco session show --json "$USE_SKILL" | jq -r '.node.parent')
+INVOCATION=$(coco session show --json "$ANCHOR" | jq -r '.node.parent')
+BASE=$(coco session show --json "$INVOCATION" | jq -r '.node.parent')
 coco session fork --branch "$RUNNER_BRANCH" --from-ref "$BASE"
 coco prompt --branch "$RUNNER_BRANCH" --role runner \
-  --tool exec_command --tool write_stdin --tool search_skill "<task>"
+  --tool exec_command --tool write_stdin --tool search_skill \
+  --enable-coco-shim "<task>"
 ```

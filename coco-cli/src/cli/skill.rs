@@ -17,6 +17,7 @@ pub enum SkillSubcommand {
     Rollback(SkillRollbackCommand),
     List(SkillListCommand),
     Show(SkillShowCommand),
+    Run(SkillRunCommand),
 }
 
 #[derive(Debug, Args)]
@@ -110,6 +111,23 @@ pub struct SkillShowCommand {
 
     #[arg(long)]
     pub name: String,
+
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillRunCommand {
+    pub name: String,
+
+    #[arg(long)]
+    pub handoff: Option<String>,
+
+    #[arg(long, hide = true)]
+    pub parent_tool_use_id: Option<String>,
+
+    #[arg(long, hide = true)]
+    pub branch: Option<String>,
 
     #[arg(long)]
     pub json: bool,

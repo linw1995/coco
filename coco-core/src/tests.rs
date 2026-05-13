@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use coco_llm::coco_mem::{
     Anchor, BackendMetadata, BranchStore, ExecutionMetadata, JobStatus, JobStore, Kind,
     MemoryStore, NewNode, NodeStore, PromptAnchor, ProviderMetadata, Role, SessionRole,
-    SessionStore, SkillScript, SkillStore, SkillVersionSpec, ToolResult, ToolUse,
+    SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillScript, SkillStore,
+    SkillVersionSpec, ToolResult, ToolUse,
 };
 use coco_llm::{
     BackendError, BackendEventPayload, BackendTurn, CompletionBackend, CompletionMessage,
@@ -27,23 +28,22 @@ use crate::{
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
-fn append_use_skill_node<S>(store: &S, parent: &str, skill_name: &str) -> String
+fn append_skill_invocation_node<S>(store: &S, parent: &str, skill_name: &str) -> String
 where
     S: NodeStore,
 {
     store
         .append(NewNode {
             parent: parent.to_owned(),
-            role: Role::LLM,
-            metadata: BackendMetadata::builder()
-                .execution(&ExecutionMetadata::new("execution-use-skill".to_owned()))
-                .provider(&ProviderMetadata::new(Some("tool-call-1".to_owned())))
-                .build(),
-            kind: Kind::tool_use(ToolUse {
-                id: "tool-call-1".to_owned(),
-                name: "use_skill".to_owned(),
-                input: serde_json::json!({ "name": skill_name }),
-            }),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_invocation(
+                vec![],
+                SkillInvocationAnchor {
+                    skill_name: skill_name.to_owned(),
+                    mode: SkillInvocationMode::InheritContext,
+                },
+            )),
         })
         .unwrap()
 }
@@ -801,20 +801,21 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
             )),
         })
         .unwrap();
-    let tool_use_id = append_use_skill_node(&store, &caller_prompt_id, "fast-rust");
+    let invocation_id = append_skill_invocation_node(&store, &caller_prompt_id, "fast-rust");
 
     let result = engine
-        .execute_skill(
+        .execute_skill_invocation(
             Path::new("."),
             "main",
             SessionRole::Orchestrator,
-            &tool_use_id,
+            &invocation_id,
             "fast-rust",
+            None,
         )
         .await
         .unwrap();
 
-    assert_eq!(result.result.text, "child result");
+    assert_eq!(result.text, "child result");
     let response_node = store.get_node(&result.response_node_id).unwrap();
     assert!(matches!(
         response_node.kind,
@@ -838,7 +839,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
     ));
     assert!(store.list_jobs().unwrap().is_empty());
 
-    let children = store.list_children(&tool_use_id).unwrap();
+    let children = store.list_children(&invocation_id).unwrap();
     let child_session_anchor = children
         .iter()
         .find_map(|node| match &node.kind {
@@ -846,7 +847,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
             _ => None,
         })
         .expect("child execution should persist a child session anchor");
-    assert_eq!(child_session_anchor.0.parent, tool_use_id);
+    assert_eq!(child_session_anchor.0.parent, invocation_id);
     assert_eq!(child_session_anchor.1.role, SessionRole::Runner);
     assert!(child_session_anchor.1.enable_coco_shim);
     assert!(
@@ -870,7 +871,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
     let provider_contexts = provider_contexts.lock().await;
     assert_eq!(provider_contexts.len(), 1);
     assert!(provider_contexts[0].contains(caller_task));
-    assert!(!provider_contexts[0].contains("use_skill"));
+    assert!(!provider_contexts[0].contains("skill_invocation"));
 }
 
 #[tokio::test]
@@ -896,20 +897,22 @@ async fn llm_engine_materializes_store_skill_scripts() {
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
-    let tool_use_id = append_use_skill_node(&store, &base_session.anchor_id, "scripted-skill");
+    let invocation_id =
+        append_skill_invocation_node(&store, &base_session.anchor_id, "scripted-skill");
 
     engine
-        .execute_skill(
+        .execute_skill_invocation(
             Path::new("."),
             "main",
             SessionRole::Orchestrator,
-            &tool_use_id,
+            &invocation_id,
             "scripted-skill",
+            None,
         )
         .await
         .unwrap();
 
-    let children = store.list_children(&tool_use_id).unwrap();
+    let children = store.list_children(&invocation_id).unwrap();
     let child_session_anchor = children
         .iter()
         .find_map(|node| match &node.kind {
@@ -970,15 +973,17 @@ async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
-    let tool_use_id = append_use_skill_node(&store, &base_session.anchor_id, "bad-scripted-skill");
+    let invocation_id =
+        append_skill_invocation_node(&store, &base_session.anchor_id, "bad-scripted-skill");
 
     let error = engine
-        .execute_skill(
+        .execute_skill_invocation(
             Path::new("."),
             "main",
             SessionRole::Orchestrator,
-            &tool_use_id,
+            &invocation_id,
             "bad-scripted-skill",
+            None,
         )
         .await
         .unwrap_err();
@@ -1007,15 +1012,16 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
             },
         )
         .unwrap();
-    let tool_use_id = append_use_skill_node(&store, &base_session.anchor_id, "fast-rust");
+    let invocation_id = append_skill_invocation_node(&store, &base_session.anchor_id, "fast-rust");
 
     let error = engine
-        .execute_skill(
+        .execute_skill_invocation(
             Path::new("."),
             "main",
             SessionRole::Orchestrator,
-            &tool_use_id,
+            &invocation_id,
             "fast-rust",
+            None,
         )
         .await
         .unwrap_err();

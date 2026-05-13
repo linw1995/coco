@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkillToolRequest {
+pub struct SkillInvocationRequest {
     pub workspace_root: PathBuf,
     pub base_branch: String,
     pub parent_tool_use_id: String,
@@ -21,33 +21,18 @@ pub struct SkillToolRequest {
     pub handoff: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkillToolRunResult {
-    pub text: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillToolExecutionResult {
-    pub result: SkillToolRunResult,
+pub struct SkillInvocationResult {
+    pub text: String,
     pub response_node_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchSkillToolRequest {
+pub struct SkillSearchRequest {
     pub workspace_root: PathBuf,
     pub session_role: SessionRole,
     pub query: String,
     pub limit: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UseSkillToolRequest {
-    pub workspace_root: PathBuf,
-    pub session_branch: String,
-    pub session_role: SessionRole,
-    pub parent_tool_use_id: String,
-    pub skill_name: String,
-    pub handoff: Option<String>,
 }
 
 #[derive(Debug, Snafu)]
@@ -65,22 +50,9 @@ pub enum ExecutorError {
 }
 
 #[async_trait]
-pub trait SkillToolExecutor: Send + Sync {
-    async fn search_skill_tool(
+pub trait SkillSearchExecutor: Send + Sync {
+    async fn search_skill(
         &self,
-        request: SearchSkillToolRequest,
+        request: SkillSearchRequest,
     ) -> std::result::Result<String, ExecutorError>;
-
-    async fn execute_skill_tool(
-        &self,
-        request: UseSkillToolRequest,
-    ) -> std::result::Result<SkillToolExecutionResult, ExecutorError>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillResultEvent {
-    pub tool_id: String,
-    pub skill_name: String,
-    pub merge_parent: String,
-    pub output: String,
 }

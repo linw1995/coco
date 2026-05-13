@@ -15,7 +15,7 @@ use crate::{
     cli::{
         Command, PresetCommand, PromptBranchStatusCommand, PromptCommand, PromptRunCommand,
         PromptStatusCommand, PromptSubcommand, SessionBranchCommand, SessionCommand,
-        SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand,
+        SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand, SkillSubcommand,
     },
 };
 
@@ -118,6 +118,8 @@ impl RunnerCli {
                     role: None,
                     tools: vec![],
                     clear_tools: false,
+                    enable_coco_shim: false,
+                    disable_coco_shim: false,
                     merge_parents: vec![],
                 },
             }),
@@ -197,7 +199,9 @@ where
             )
             .await
         }
-        Command::Skill(command) => run_skill_command(command, services.shared_store).await,
+        Command::Skill(command) => {
+            run_skill_command(command, services.shared_store, services.llm).await
+        }
         Command::Daemon(command) => {
             run_daemon_command(
                 command,
@@ -385,7 +389,9 @@ fn apply_forwarded_defaults(
     if scope == ForwardedRuntimeScope::Orchestrator
         && let Some(parent_tool_use_id) = parent_tool_use_id_env
     {
-        apply_forwarded_shadow_parent(cli, parent_tool_use_id.to_owned());
+        let parent_tool_use_id = parent_tool_use_id.to_owned();
+        apply_forwarded_shadow_parent(cli, parent_tool_use_id.clone());
+        apply_forwarded_skill_parent(cli, parent_tool_use_id, branch_env.map(str::to_owned));
     }
 
     if has_explicit_flag(args, "branch") {
@@ -434,6 +440,19 @@ fn apply_forwarded_shadow_parent(cli: &mut Cli, shadow_parent: String) {
                 .merge_parents
                 .push(MergeParent::shadow(shadow_parent)),
             Some(PromptSubcommand::Status(_)) | Some(PromptSubcommand::BranchStatus(_)) => {}
+        }
+    }
+}
+
+fn apply_forwarded_skill_parent(cli: &mut Cli, parent_tool_use_id: String, branch: Option<String>) {
+    if let Command::Skill(command) = &mut cli.command
+        && let SkillSubcommand::Run(command) = &mut command.command
+    {
+        if command.parent_tool_use_id.is_none() {
+            command.parent_tool_use_id = Some(parent_tool_use_id);
+        }
+        if command.branch.is_none() {
+            command.branch = branch;
         }
     }
 }
