@@ -61,10 +61,3 @@ pub trait SkillToolExecutor: Send + Sync {
         request: SearchSkillToolRequest,
     ) -> std::result::Result<String, ExecutorError>;
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillResultEvent {
-    pub skill_name: String,
-    pub merge_parent: String,
-    pub output: String,
-}

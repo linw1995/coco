@@ -28,8 +28,8 @@ use snafu::prelude::*;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use skill::{
-    ExecutorError, SearchSkillToolRequest, SkillResultEvent, SkillToolExecutionResult,
-    SkillToolExecutor, SkillToolRequest, SkillToolRunResult,
+    ExecutorError, SearchSkillToolRequest, SkillToolExecutionResult, SkillToolExecutor,
+    SkillToolRequest, SkillToolRunResult,
 };
 
 pub use coco_mem;
@@ -659,7 +659,6 @@ pub enum BackendEventPayload {
     AssistantText(String),
     ToolUse(ToolUse),
     ToolResult(ToolResult),
-    SkillResult(SkillResultEvent),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2568,17 +2567,6 @@ fn persisted_node_from_backend_event(
         BackendEventPayload::ToolResult(tool_result) => {
             (Role::User, metadata, Kind::tool_result(tool_result))
         }
-        BackendEventPayload::SkillResult(skill_result) => (
-            Role::System,
-            metadata,
-            Kind::Anchor(Anchor::skill_result(
-                vec![MergeParent::merge(skill_result.merge_parent)],
-                SkillResultAnchor {
-                    skill_name: skill_result.skill_name,
-                    output: skill_result.output,
-                },
-            )),
-        ),
     }
 }
 
@@ -2641,7 +2629,7 @@ fn persisted_nodes_from_backend_events(
                     .push(backend_metadata_item(execution, event.metadata.as_ref()));
                 tool_results.push(tool_result);
             }
-            BackendEventPayload::AssistantText(_) | BackendEventPayload::SkillResult(_) => {
+            BackendEventPayload::AssistantText(_) => {
                 flush_tool_uses(&mut nodes, &mut tool_uses, &mut tool_use_metadata);
                 flush_tool_results(&mut nodes, &mut tool_results, &mut tool_result_metadata);
                 nodes.push(persisted_node_from_backend_event(event.clone(), execution));
@@ -3977,7 +3965,6 @@ mod tests {
             session: ResolvedSession,
             request: ResolvedCompletionRequest,
         ) -> std::result::Result<BackendRun, BackendError> {
-            let skill_merge_parent = session.anchor_id.clone();
             self.calls.lock().await.push((session, request.clone()));
             let trace_node_appender = request
                 .trace_node_appender
@@ -4003,23 +3990,6 @@ mod tests {
 
             tokio::time::sleep(Duration::from_millis(5)).await;
 
-            let step_two_result = backend_event(
-                BackendEventPayload::SkillResult(SkillResultEvent {
-                    skill_name: "find-skills".to_owned(),
-                    merge_parent: skill_merge_parent,
-                    output: "delegated output".to_owned(),
-                }),
-                Some("execution-step-2"),
-                Some("tool-call-1"),
-            );
-            append_backend_event(
-                &trace_node_appender,
-                &execution("execution-step-2"),
-                step_two_result.clone(),
-            )?;
-
-            tokio::time::sleep(Duration::from_millis(5)).await;
-
             let step_two_text: BackendEvent =
                 BackendEventPayload::AssistantText("done".to_owned()).into();
             let head = Some(append_backend_event(
@@ -4037,7 +4007,7 @@ mod tests {
                     },
                     BackendStep {
                         execution: ExecutionMetadata::new("execution-step-2".to_owned()),
-                        events: vec![step_two_result, step_two_text],
+                        events: vec![step_two_text],
                     },
                 ],
             )
@@ -6262,101 +6232,16 @@ mod tests {
 
         let ancestry = store.ancestry("main").unwrap();
         let assistant = &ancestry[0];
-        let skill_result = &ancestry[1];
-        let tool_use = &ancestry[2];
+        let tool_use = &ancestry[1];
 
         assert_eq!(assistant.id, result.response_node_id);
-        assert!(tool_use.created_at < skill_result.created_at);
-        assert!(skill_result.created_at < assistant.created_at);
+        assert!(tool_use.created_at < assistant.created_at);
         assert!(kind_has_tool_use(
             &tool_use.kind,
             "tool-call-1",
             "exec_command"
         ));
-        let Kind::Anchor(anchor) = &skill_result.kind else {
-            panic!("expected skill result anchor");
-        };
-        let persisted = anchor
-            .as_skill_result()
-            .expect("expected skill result payload");
-        assert_eq!(persisted.skill_name, "find-skills");
-        assert_eq!(persisted.output, "delegated output");
-        assert_eq!(anchor.merge_parent_node_ids(), [tool_use.parent.as_str()]);
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
-    }
-
-    #[tokio::test]
-    async fn skill_result_event_persists_anchor_without_handoff_state_transition() {
-        let store = MemoryStore::new();
-        let service = LlmService::new(store.clone(), FakeBackend::with_completions(&[]));
-        let base_session = service
-            .create_session(session_config("main"))
-            .await
-            .unwrap();
-        service.fork("draft", &base_session.anchor_id).unwrap();
-        let draft_head = store.get_branch_head("draft").unwrap();
-        assert_eq!(draft_head, base_session.anchor_id);
-        store
-            .set_session_state(
-                "draft",
-                None,
-                SessionState::Attached {
-                    target_branch: "main".to_owned(),
-                    base_head_id: base_session.anchor_id.clone(),
-                },
-            )
-            .unwrap();
-        let backend = FakeBackend::with_completions(&[(
-            "main",
-            &[Ok(BackendRun::succeeded_with_steps(
-                "base done",
-                vec![BackendStep {
-                    execution: ExecutionMetadata::new("execution-step-1".to_owned()),
-                    events: vec![
-                        backend_event(
-                            BackendEventPayload::SkillResult(SkillResultEvent {
-                                skill_name: "find-skills".to_owned(),
-                                merge_parent: draft_head.clone(),
-                                output: "Skill handoff".to_owned(),
-                            }),
-                            Some("execution-step-1"),
-                            Some("tool-call-1"),
-                        ),
-                        BackendEventPayload::AssistantText("base done".to_owned()).into(),
-                    ],
-                }],
-            ))],
-        )]);
-        let service = LlmService::new(store.clone(), backend);
-
-        let result = service
-            .prompt(prompt_request("main", "use delegated skill"))
-            .await
-            .unwrap();
-
-        let ancestry = store.ancestry("main").unwrap();
-        let assistant = &ancestry[0];
-        let handoff_anchor = &ancestry[1];
-
-        assert!(matches!(&assistant.kind, Kind::Text(text) if text == "base done"));
-        let Kind::Anchor(anchor) = &handoff_anchor.kind else {
-            panic!("expected handoff skill result anchor");
-        };
-        let skill_result = anchor
-            .as_skill_result()
-            .expect("expected skill result anchor");
-        assert_eq!(skill_result.skill_name, "find-skills");
-        assert_eq!(skill_result.output, "Skill handoff");
-        assert_eq!(anchor.merge_parent_node_ids(), [draft_head.as_str()]);
-        assert_eq!(
-            store.get_session_state("draft").unwrap(),
-            SessionState::Attached {
-                target_branch: "main".to_owned(),
-                base_head_id: base_session.anchor_id.clone(),
-            }
-        );
-        assert_eq!(assistant.parent, handoff_anchor.id);
-        assert_eq!(result.text, "base done");
     }
 
     #[tokio::test]
