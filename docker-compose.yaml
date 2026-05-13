@@ -8,6 +8,7 @@ services:
     environment:
       COCO_UID: ${COCO_UID:?COCO_UID is required}
       COCO_GID: ${COCO_GID:?COCO_GID is required}
+      COCO_STORE_PATH: ${COCO_STORE_PATH:-/data/store}
     ports:
       - "${COCO_PORT:-17667}:17667"
     volumes:
