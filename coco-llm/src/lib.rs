@@ -291,7 +291,7 @@ pub struct ResolvedSession {
     pub tool_runtime_env: ToolRuntimeEnv,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedCompletionRequest {
     pub branch: String,
     pub provider: Provider,
@@ -303,7 +303,29 @@ pub struct ResolvedCompletionRequest {
     pub additional_params: Option<Value>,
     runtime: RuntimeCapabilities,
     trace_node_appender: Option<TraceNodeAppenderHandle>,
-    trace_node_store: Option<TraceNodeStoreHandle>,
+    trace_node_store: Option<Arc<TraceNodeStore>>,
+}
+
+impl std::fmt::Debug for ResolvedCompletionRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedCompletionRequest")
+            .field("branch", &self.branch)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("secrets", &self.secrets)
+            .field("base_url", &self.base_url)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("additional_params", &self.additional_params)
+            .field("runtime", &self.runtime)
+            .field("trace_node_appender", &self.trace_node_appender)
+            .field(
+                "trace_node_store",
+                &self.trace_node_store.as_ref().map(|_| "TraceNodeStore(..)"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -434,43 +456,7 @@ where
     }
 }
 
-#[derive(Clone)]
-struct TraceNodeStoreHandle {
-    inner: Arc<dyn NodeStore + Send + Sync>,
-}
-
-impl TraceNodeStoreHandle {
-    fn new(inner: Arc<dyn NodeStore + Send + Sync>) -> Self {
-        Self { inner }
-    }
-
-    fn get_node(&self, node_id: &str) -> std::result::Result<coco_mem::Node, BackendError> {
-        self.inner
-            .get_node(node_id)
-            .map_err(|source| BackendError::failed(source.to_string()))
-    }
-
-    fn ancestry(&self, reference: &str) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
-        self.inner
-            .ancestry(reference)
-            .map_err(|source| BackendError::failed(source.to_string()))
-    }
-
-    fn list_children(
-        &self,
-        node_id: &str,
-    ) -> std::result::Result<Vec<coco_mem::Node>, BackendError> {
-        self.inner
-            .list_children(node_id)
-            .map_err(|source| BackendError::failed(source.to_string()))
-    }
-}
-
-impl std::fmt::Debug for TraceNodeStoreHandle {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("TraceNodeStoreHandle(..)")
-    }
-}
+type TraceNodeStore = dyn NodeStore + Send + Sync;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CocoCliRuntimeRequest {
@@ -804,6 +790,12 @@ impl BackendError {
         Self::Failed {
             message: message.into(),
         }
+    }
+}
+
+impl From<StoreError> for BackendError {
+    fn from(source: StoreError) -> Self {
+        Self::failed(source.to_string())
     }
 }
 
@@ -1317,7 +1309,7 @@ where
             store: self.store.clone(),
             head_id: StdMutex::new(retry_from_node_id.clone()),
         }));
-        let trace_node_store = TraceNodeStoreHandle::new(Arc::new(self.store.clone()));
+        let trace_node_store: Arc<TraceNodeStore> = Arc::new(self.store.clone());
         let resolved = self.resolve_request(
             &session,
             request.clone(),
@@ -1352,7 +1344,7 @@ where
                                     &resolved.branch,
                                     &retry_from_node_id,
                                     trace_node_appender,
-                                    resolved.trace_node_store.as_ref(),
+                                    resolved.trace_node_store.as_deref(),
                                     &steps,
                                 )?,
                             },
@@ -1389,7 +1381,7 @@ where
                                             &resolved.branch,
                                             &retry_from_node_id,
                                             trace_node_appender,
-                                            resolved.trace_node_store.as_ref(),
+                                            resolved.trace_node_store.as_deref(),
                                             &steps,
                                         )
                                     },
@@ -1660,7 +1652,7 @@ where
         branch: &str,
         retry_from_node_id: &str,
         trace_node_appender: &TraceNodeAppenderHandle,
-        trace_node_store: Option<&TraceNodeStoreHandle>,
+        trace_node_store: Option<&TraceNodeStore>,
         steps: &[BackendStep],
     ) -> Result<String> {
         let mut head_id = retry_from_node_id.to_owned();
@@ -2226,7 +2218,7 @@ impl<B, S> LlmService<B, S> {
         session: &ResolvedSession,
         request: CompletionRequest,
         trace_node_appender: Option<TraceNodeAppenderHandle>,
-        trace_node_store: Option<TraceNodeStoreHandle>,
+        trace_node_store: Option<Arc<TraceNodeStore>>,
     ) -> ResolvedCompletionRequest {
         let provider = request
             .overrides
@@ -2745,7 +2737,7 @@ fn resolve_skill_source_tool_use<'a>(
 }
 
 fn newest_skill_response_descendant(
-    trace_node_store: &TraceNodeStoreHandle,
+    trace_node_store: &TraceNodeStore,
     invocation_node_id: &str,
 ) -> std::result::Result<Option<coco_mem::Node>, BackendError> {
     let mut stack = trace_node_store.list_children(invocation_node_id)?;
@@ -2771,7 +2763,7 @@ fn newest_skill_response_descendant(
 }
 
 fn has_fanned_in_skill_result(
-    trace_node_store: &TraceNodeStoreHandle,
+    trace_node_store: &TraceNodeStore,
     tool_result_node_id: &str,
     response_node_id: &str,
 ) -> std::result::Result<bool, BackendError> {
@@ -2799,7 +2791,7 @@ fn has_fanned_in_skill_result(
 
 fn append_skill_results_after_tool_result(
     trace_node_appender: &TraceNodeAppenderHandle,
-    trace_node_store: &TraceNodeStoreHandle,
+    trace_node_store: &TraceNodeStore,
     tool_result_node_id: &str,
 ) -> std::result::Result<Vec<String>, BackendError> {
     let tool_result_node = trace_node_store.get_node(tool_result_node_id)?;
@@ -2860,7 +2852,7 @@ fn append_skill_results_after_tool_result(
 
 fn append_backend_event_nodes(
     trace_node_appender: &TraceNodeAppenderHandle,
-    trace_node_store: Option<&TraceNodeStoreHandle>,
+    trace_node_store: Option<&TraceNodeStore>,
     execution: &ExecutionMetadata,
     events: &[BackendEvent],
 ) -> std::result::Result<Vec<(String, Kind)>, BackendError> {
@@ -2889,7 +2881,7 @@ fn append_backend_event_nodes(
 
 fn append_backend_events(
     trace_node_appender: &TraceNodeAppenderHandle,
-    trace_node_store: Option<&TraceNodeStoreHandle>,
+    trace_node_store: Option<&TraceNodeStore>,
     execution: &ExecutionMetadata,
     events: &[BackendEvent],
 ) -> std::result::Result<String, BackendError> {
@@ -3303,7 +3295,7 @@ impl CompletionRunner {
         {
             let appended = append_backend_event_nodes(
                 trace_node_appender,
-                self.request.trace_node_store.as_ref(),
+                self.request.trace_node_store.as_deref(),
                 execution,
                 &turn.events,
             )?;
@@ -3423,7 +3415,7 @@ impl CompletionRunner {
 
         let appended = append_backend_event_nodes(
             trace_node_appender,
-            self.request.trace_node_store.as_ref(),
+            self.request.trace_node_store.as_deref(),
             execution,
             events,
         )?;
@@ -3970,7 +3962,7 @@ mod tests {
                 .trace_node_appender
                 .clone()
                 .expect("streaming backend requires trace node appender");
-            let trace_node_store = request.trace_node_store.as_ref();
+            let trace_node_store = request.trace_node_store.as_deref();
 
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
@@ -4029,7 +4021,7 @@ mod tests {
                 .trace_node_appender
                 .clone()
                 .expect("streaming backend requires trace node appender");
-            let trace_node_store = request.trace_node_store.as_ref();
+            let trace_node_store = request.trace_node_store.as_deref();
 
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
@@ -4098,7 +4090,7 @@ mod tests {
                 .trace_node_appender
                 .clone()
                 .expect("streaming backend requires trace node appender");
-            let trace_node_store = request.trace_node_store.as_ref();
+            let trace_node_store = request.trace_node_store.as_deref();
 
             let step_one_events = vec![backend_event(
                 BackendEventPayload::ToolUse(ToolUse {
@@ -6535,8 +6527,8 @@ mod tests {
         }))
     }
 
-    fn test_trace_store(store: MemoryStore) -> TraceNodeStoreHandle {
-        TraceNodeStoreHandle::new(Arc::new(store))
+    fn test_trace_store(store: MemoryStore) -> Arc<TraceNodeStore> {
+        Arc::new(store)
     }
 
     fn append_skill_invocation_fixture(
@@ -6608,7 +6600,7 @@ mod tests {
         let execution = ExecutionMetadata::new("execution-step-1".to_owned());
         let appended = append_backend_event_nodes(
             &trace,
-            Some(&trace_store),
+            Some(trace_store.as_ref()),
             &execution,
             &[BackendEventPayload::ToolUse(ToolUse {
                 id: "tool-call-1".to_owned(),
@@ -6624,7 +6616,7 @@ mod tests {
 
         let appended = append_backend_event_nodes(
             &trace,
-            Some(&trace_store),
+            Some(trace_store.as_ref()),
             &execution,
             &[BackendEventPayload::ToolResult(ToolResult {
                 id: "tool-call-1".to_owned(),
@@ -6664,7 +6656,7 @@ mod tests {
         let execution = ExecutionMetadata::new("execution-step-1".to_owned());
         let appended = append_backend_event_nodes(
             &trace,
-            Some(&trace_store),
+            Some(trace_store.as_ref()),
             &execution,
             &[BackendEventPayload::ToolUse(ToolUse {
                 id: "tool-call-1".to_owned(),
@@ -6677,7 +6669,7 @@ mod tests {
         let exec_tool_use_id = appended[0].0.clone();
         let running = append_backend_event_nodes(
             &trace,
-            Some(&trace_store),
+            Some(trace_store.as_ref()),
             &execution,
             &[BackendEventPayload::ToolResult(ToolResult {
                 id: "tool-call-1".to_owned(),
@@ -6696,7 +6688,7 @@ mod tests {
         );
         append_backend_event_nodes(
             &trace,
-            Some(&trace_store),
+            Some(trace_store.as_ref()),
             &execution,
             &[BackendEventPayload::ToolUse(ToolUse {
                 id: "tool-call-2".to_owned(),
@@ -6709,7 +6701,7 @@ mod tests {
 
         let appended = append_backend_event_nodes(
             &trace,
-            Some(&trace_store),
+            Some(trace_store.as_ref()),
             &execution,
             &[BackendEventPayload::ToolResult(ToolResult {
                 id: "tool-call-2".to_owned(),
