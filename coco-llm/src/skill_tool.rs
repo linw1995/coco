@@ -4,7 +4,7 @@ use coco_mem::Tool;
 use serde_json::Value;
 use snafu::prelude::*;
 
-use crate::{SearchSkillToolRequest, ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv};
+use crate::{SkillSearchRequest, ToolExecutionOutcome, ToolInvocationContext, ToolRuntimeEnv};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SkillToolRuntime {
@@ -62,7 +62,7 @@ fn parse_search_request(
     workspace_root: PathBuf,
     session_role: coco_mem::SessionRole,
     args: Value,
-) -> std::result::Result<SearchSkillToolRequest, SkillToolError> {
+) -> std::result::Result<SkillSearchRequest, SkillToolError> {
     let object = args.as_object().context(InvalidInputTypeSnafu)?;
     let query = object
         .get("query")
@@ -76,7 +76,7 @@ fn parse_search_request(
         None => 10,
     };
 
-    Ok(SearchSkillToolRequest {
+    Ok(SkillSearchRequest {
         workspace_root,
         session_role,
         query,
@@ -104,7 +104,7 @@ impl SkillToolRuntime {
         let args: Value = serde_json::from_str(&args).context(ParseArgsSnafu)?;
 
         let request = parse_search_request(workspace_root, context.session_role, args)?;
-        let output = context.skill_executor.search_skill_tool(request).await?;
+        let output = context.skill_executor.search_skill(request).await?;
         Ok(ToolExecutionOutcome::tool_result(output))
     }
 }
@@ -144,13 +144,13 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::SkillToolExecutor;
+    use crate::SkillSearchExecutor;
 
     fn search_tool_definition() -> Tool {
         crate::builtin_tool_definition("search_skill").expect("builtin tool should exist")
     }
 
-    fn run_context(executor: Arc<dyn crate::SkillToolExecutor>) -> ToolRuntimeEnv {
+    fn run_context(executor: Arc<dyn crate::SkillSearchExecutor>) -> ToolRuntimeEnv {
         ToolRuntimeEnv {
             session_branch: "main".to_owned(),
             session_role: coco_mem::SessionRole::Orchestrator,
@@ -159,20 +159,20 @@ mod tests {
             store_path: None,
             enable_coco_shim: false,
             cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-            skill_executor: crate::SkillToolExecutorHandle::new(executor),
+            skill_executor: crate::SkillSearchExecutorHandle::new(executor),
         }
     }
 
     #[derive(Debug)]
     struct FakeExecutor {
-        search_requests: Arc<Mutex<Vec<SearchSkillToolRequest>>>,
+        search_requests: Arc<Mutex<Vec<SkillSearchRequest>>>,
     }
 
     #[async_trait]
-    impl SkillToolExecutor for FakeExecutor {
-        async fn search_skill_tool(
+    impl SkillSearchExecutor for FakeExecutor {
+        async fn search_skill(
             &self,
-            request: SearchSkillToolRequest,
+            request: SkillSearchRequest,
         ) -> std::result::Result<String, crate::ExecutorError> {
             self.search_requests.lock().await.push(request);
             Ok(r#"{

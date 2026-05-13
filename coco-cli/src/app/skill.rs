@@ -306,7 +306,7 @@ where
         skill_name,
         mode,
         response_node_id: result.response_node_id,
-        text: result.result.text,
+        text: result.text,
     })
 }
 

@@ -28,8 +28,8 @@ use snafu::prelude::*;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use skill::{
-    ExecutorError, SearchSkillToolRequest, SkillToolExecutionResult, SkillToolExecutor,
-    SkillToolRequest, SkillToolRunResult,
+    ExecutorError, SkillInvocationRequest, SkillInvocationResult, SkillSearchExecutor,
+    SkillSearchRequest,
 };
 
 pub use coco_mem;
@@ -548,47 +548,47 @@ impl Default for UnifiedExecCliBridgeHandle {
     }
 }
 #[derive(Debug)]
-struct UnavailableSkillToolExecutor;
+struct UnavailableSkillSearchExecutor;
 
 #[async_trait]
-impl SkillToolExecutor for UnavailableSkillToolExecutor {
-    async fn search_skill_tool(
+impl SkillSearchExecutor for UnavailableSkillSearchExecutor {
+    async fn search_skill(
         &self,
-        _request: SearchSkillToolRequest,
+        _request: SkillSearchRequest,
     ) -> std::result::Result<String, ExecutorError> {
         Err(ExecutorError::Unavailable)
     }
 }
 
 #[derive(Clone)]
-pub struct SkillToolExecutorHandle {
-    inner: Arc<dyn SkillToolExecutor>,
+pub struct SkillSearchExecutorHandle {
+    inner: Arc<dyn SkillSearchExecutor>,
 }
 
-impl SkillToolExecutorHandle {
-    pub fn new(inner: Arc<dyn SkillToolExecutor>) -> Self {
+impl SkillSearchExecutorHandle {
+    pub fn new(inner: Arc<dyn SkillSearchExecutor>) -> Self {
         Self { inner }
     }
 
     pub fn unavailable() -> Self {
-        Self::new(Arc::new(UnavailableSkillToolExecutor))
+        Self::new(Arc::new(UnavailableSkillSearchExecutor))
     }
 
-    pub async fn search_skill_tool(
+    pub async fn search_skill(
         &self,
-        request: SearchSkillToolRequest,
+        request: SkillSearchRequest,
     ) -> std::result::Result<String, ExecutorError> {
-        self.inner.search_skill_tool(request).await
+        self.inner.search_skill(request).await
     }
 }
 
-impl std::fmt::Debug for SkillToolExecutorHandle {
+impl std::fmt::Debug for SkillSearchExecutorHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SkillToolExecutorHandle(..)")
+        formatter.write_str("SkillSearchExecutorHandle(..)")
     }
 }
 
-impl Default for SkillToolExecutorHandle {
+impl Default for SkillSearchExecutorHandle {
     fn default() -> Self {
         Self::unavailable()
     }
@@ -621,7 +621,7 @@ pub struct ToolRuntimeEnv {
     pub store_path: Option<PathBuf>,
     pub enable_coco_shim: bool,
     pub cli_bridge: UnifiedExecCliBridgeHandle,
-    pub skill_executor: SkillToolExecutorHandle,
+    pub skill_executor: SkillSearchExecutorHandle,
 }
 
 impl std::fmt::Debug for ToolRuntimeEnv {
@@ -831,7 +831,7 @@ type WorkflowLock = Arc<Mutex<()>>;
 #[derive(Debug, Clone)]
 pub struct RuntimeCapabilities {
     pub unified_exec_cli_bridge: UnifiedExecCliBridgeHandle,
-    pub skill_tool_executor: SkillToolExecutorHandle,
+    pub skill_search_executor: SkillSearchExecutorHandle,
     unified_exec_sessions: unified_exec_tool::UnifiedExecSessionStoreHandle,
 }
 
@@ -839,7 +839,7 @@ impl Default for RuntimeCapabilities {
     fn default() -> Self {
         Self {
             unified_exec_cli_bridge: UnifiedExecCliBridgeHandle::default(),
-            skill_tool_executor: SkillToolExecutorHandle::default(),
+            skill_search_executor: SkillSearchExecutorHandle::default(),
             unified_exec_sessions: unified_exec_tool::session_store(),
         }
     }
@@ -859,7 +859,7 @@ pub struct LlmServiceBuilder<B, S> {
     backend: B,
     provider_configs: HashMap<String, ProviderRuntimeConfig>,
     unified_exec_cli_bridge: Option<UnifiedExecCliBridgeHandle>,
-    skill_tool_executor: Option<SkillToolExecutorHandle>,
+    skill_search_executor: Option<SkillSearchExecutorHandle>,
 }
 
 #[derive(Debug, Snafu)]
@@ -954,8 +954,8 @@ impl<B, S> LlmServiceBuilder<B, S> {
         self
     }
 
-    pub fn with_skill_tool_executor(mut self, executor: Arc<dyn SkillToolExecutor>) -> Self {
-        self.skill_tool_executor = Some(SkillToolExecutorHandle::new(executor));
+    pub fn with_skill_search_executor(mut self, executor: Arc<dyn SkillSearchExecutor>) -> Self {
+        self.skill_search_executor = Some(SkillSearchExecutorHandle::new(executor));
         self
     }
 
@@ -966,7 +966,7 @@ impl<B, S> LlmServiceBuilder<B, S> {
             provider_configs: self.provider_configs,
             runtime: RuntimeCapabilities {
                 unified_exec_cli_bridge: self.unified_exec_cli_bridge.unwrap_or_default(),
-                skill_tool_executor: self.skill_tool_executor.unwrap_or_default(),
+                skill_search_executor: self.skill_search_executor.unwrap_or_default(),
                 unified_exec_sessions: unified_exec_tool::session_store(),
             },
             branch_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -982,7 +982,7 @@ impl<B, S> LlmService<B, S> {
             backend,
             provider_configs: HashMap::new(),
             unified_exec_cli_bridge: None,
-            skill_tool_executor: None,
+            skill_search_executor: None,
         }
     }
 
@@ -2033,7 +2033,7 @@ where
                 store_path: self.store.runtime_store_path(),
                 enable_coco_shim: context.session_anchor.enable_coco_shim,
                 cli_bridge: self.runtime.unified_exec_cli_bridge.clone(),
-                skill_executor: self.runtime.skill_tool_executor.clone(),
+                skill_executor: self.runtime.skill_search_executor.clone(),
             },
         })
     }
@@ -3905,10 +3905,10 @@ mod tests {
     struct FakeSkillExecutor;
 
     #[async_trait]
-    impl SkillToolExecutor for FakeSkillExecutor {
-        async fn search_skill_tool(
+    impl SkillSearchExecutor for FakeSkillExecutor {
+        async fn search_skill(
             &self,
-            _request: SearchSkillToolRequest,
+            _request: SkillSearchRequest,
         ) -> std::result::Result<String, ExecutorError> {
             Ok(r#"{"skills":[]}"#.to_owned())
         }
@@ -3921,10 +3921,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl SkillToolExecutor for StagedSkillExecutor {
-        async fn search_skill_tool(
+    impl SkillSearchExecutor for StagedSkillExecutor {
+        async fn search_skill(
             &self,
-            request: SearchSkillToolRequest,
+            request: SkillSearchRequest,
         ) -> std::result::Result<String, ExecutorError> {
             if request.query == "slow" {
                 self.release_second.notified().await;
@@ -4319,7 +4319,7 @@ mod tests {
         let first_done = Arc::new(Notify::new());
         let release_second = Arc::new(Notify::new());
         let service = LlmService::builder(store.clone(), backend)
-            .with_skill_tool_executor(Arc::new(StagedSkillExecutor {
+            .with_skill_search_executor(Arc::new(StagedSkillExecutor {
                 first_done: first_done.clone(),
                 release_second: release_second.clone(),
             }))
@@ -4397,7 +4397,7 @@ mod tests {
             let first_done = Arc::new(Notify::new());
             let release_second = Arc::new(Notify::new());
             let service = LlmService::builder(store, backend)
-                .with_skill_tool_executor(Arc::new(StagedSkillExecutor {
+                .with_skill_search_executor(Arc::new(StagedSkillExecutor {
                     first_done: first_done.clone(),
                     release_second: release_second.clone(),
                 }))
@@ -6138,7 +6138,7 @@ mod tests {
         let backend = FakeBackend::with_turns(vec![("main", vec![Ok(turn)])]);
         let store = MemoryStore::new();
         let service = LlmService::builder(store.clone(), backend)
-            .with_skill_tool_executor(Arc::new(FakeSkillExecutor))
+            .with_skill_search_executor(Arc::new(FakeSkillExecutor))
             .build();
         service
             .create_session(SessionConfig {
@@ -7123,7 +7123,7 @@ mod tests {
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: UnifiedExecCliBridgeHandle::default(),
-                skill_executor: SkillToolExecutorHandle::default(),
+                skill_executor: SkillSearchExecutorHandle::default(),
             },
         );
         let output = with_process_env_async(

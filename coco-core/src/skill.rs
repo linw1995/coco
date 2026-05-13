@@ -13,8 +13,8 @@ use coco_llm::coco_mem::{
 use coco_llm::{
     ActiveSkillRuntimeContext, COCO_SKILL_PERSIST_DIR_ENV, COCO_SKILL_PERSIST_ROOT_ENV,
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
-    Error as LlmError, ExecutorError, LlmService, SearchSkillToolRequest, SkillToolExecutionResult,
-    SkillToolExecutor, SkillToolRequest, SkillToolRunResult,
+    Error as LlmError, ExecutorError, LlmService, SkillInvocationRequest, SkillInvocationResult,
+    SkillSearchExecutor, SkillSearchRequest,
 };
 use indoc::formatdoc;
 use serde::Serialize;
@@ -96,23 +96,23 @@ impl From<EngineError> for ExecutorError {
     }
 }
 
-pub struct CoreSkillToolExecutor<B, S> {
+pub struct CoreSkillSearchExecutor<B, S> {
     llm: Weak<LlmService<B, S>>,
 }
 
-impl<B, S> fmt::Debug for CoreSkillToolExecutor<B, S> {
+impl<B, S> fmt::Debug for CoreSkillSearchExecutor<B, S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("CoreSkillToolExecutor(..)")
+        formatter.write_str("CoreSkillSearchExecutor(..)")
     }
 }
 
-impl<B, S> CoreSkillToolExecutor<B, S> {
+impl<B, S> CoreSkillSearchExecutor<B, S> {
     pub fn new(llm: Weak<LlmService<B, S>>) -> Self {
         Self { llm }
     }
 }
 
-impl<B, S> CoreSkillToolExecutor<B, S>
+impl<B, S> CoreSkillSearchExecutor<B, S>
 where
     B: CompletionBackend + 'static,
     S: 'static,
@@ -124,7 +124,7 @@ where
 }
 
 #[async_trait]
-impl<B, S> SkillToolExecutor for CoreSkillToolExecutor<B, S>
+impl<B, S> SkillSearchExecutor for CoreSkillSearchExecutor<B, S>
 where
     B: CompletionBackend + 'static,
     S: NodeStore
@@ -137,9 +137,9 @@ where
         + Sync
         + 'static,
 {
-    async fn search_skill_tool(
+    async fn search_skill(
         &self,
-        request: SearchSkillToolRequest,
+        request: SkillSearchRequest,
     ) -> std::result::Result<String, ExecutorError> {
         let result = self.upgrade_engine()?.search_skills(
             &request.workspace_root,
@@ -202,7 +202,7 @@ impl Drop for SkillRuntimeDirectoryGuard {
 }
 
 fn materialize_skill_runtime(
-    request: &SkillToolRequest,
+    request: &SkillInvocationRequest,
 ) -> std::result::Result<MaterializedSkillRuntime, SkillError> {
     let persistent_directory = skill_persistent_directory(request);
     fs::create_dir_all(&persistent_directory).context(CreateSkillRuntimeDirectorySnafu {
@@ -326,14 +326,14 @@ where
         invocation_node_id: &str,
         skill_name: &str,
         handoff: Option<String>,
-    ) -> std::result::Result<SkillToolExecutionResult, EngineError> {
+    ) -> std::result::Result<SkillInvocationResult, EngineError> {
         let skill = resolve_skill(
             workspace_root,
             self.service().store(),
             session_role,
             skill_name,
         )?;
-        let request = SkillToolRequest {
+        let request = SkillInvocationRequest {
             workspace_root: workspace_root.to_path_buf(),
             base_branch: base_branch.to_owned(),
             parent_tool_use_id: invocation_node_id.to_owned(),
@@ -354,9 +354,9 @@ where
 
     async fn execute_resolved_skill(
         &self,
-        request: SkillToolRequest,
+        request: SkillInvocationRequest,
         runtime: MaterializedSkillRuntime,
-    ) -> std::result::Result<SkillToolExecutionResult, LlmError> {
+    ) -> std::result::Result<SkillInvocationResult, LlmError> {
         let service = self.service();
         let store = service.store();
         let child_branch = temporary_skill_branch_name(&request.base_branch, &request.skill_name);
@@ -380,10 +380,8 @@ where
         let cleanup_result = service.delete_session_branch(&child_branch).await;
 
         match (prompt_result, cleanup_result) {
-            (Ok(result), Ok(())) => Ok(SkillToolExecutionResult {
-                result: SkillToolRunResult {
-                    text: result.text.clone(),
-                },
+            (Ok(result), Ok(())) => Ok(SkillInvocationResult {
+                text: result.text.clone(),
                 response_node_id: result.response_node_id,
             }),
             (Err(workflow), Ok(())) => Err(workflow),
@@ -429,7 +427,7 @@ where
 
 fn append_skill_session_anchor<S>(
     store: &S,
-    request: &SkillToolRequest,
+    request: &SkillInvocationRequest,
 ) -> std::result::Result<String, LlmError>
 where
     S: NodeStore,
@@ -522,7 +520,7 @@ fn temporary_skill_branch_name(base_branch: &str, skill_name: &str) -> String {
     format!("{base_branch}/skill/{slug}-{}", nanoid::nanoid!(8))
 }
 
-fn skill_execution_prompt(request: &SkillToolRequest) -> String {
+fn skill_execution_prompt(request: &SkillInvocationRequest) -> String {
     let script_instructions = skill_script_instructions(request);
     let context_instruction = if let Some(handoff) = &request.handoff {
         format!(
@@ -576,7 +574,7 @@ fn skill_execution_prompt(request: &SkillToolRequest) -> String {
     )
 }
 
-fn skill_handoff_completion_instruction(request: &SkillToolRequest) -> &'static str {
+fn skill_handoff_completion_instruction(request: &SkillInvocationRequest) -> &'static str {
     if request.handoff.is_some() {
         "Return the final result for the caller as a normal tool result. The parent model will inspect it before it continues."
     } else {
@@ -584,7 +582,7 @@ fn skill_handoff_completion_instruction(request: &SkillToolRequest) -> &'static 
     }
 }
 
-fn skill_persistent_directory(request: &SkillToolRequest) -> PathBuf {
+fn skill_persistent_directory(request: &SkillInvocationRequest) -> PathBuf {
     skill_persistence_root(&request.workspace_root)
         .join(request.session_role.as_str())
         .join(encode_path_segment(&request.skill_name))
@@ -626,7 +624,7 @@ fn encode_path_segment(value: &str) -> String {
     }
 }
 
-fn skill_script_instructions(request: &SkillToolRequest) -> String {
+fn skill_script_instructions(request: &SkillInvocationRequest) -> String {
     let python_scripts = request
         .scripts
         .iter()
@@ -822,7 +820,7 @@ mod tests {
 
     #[test]
     fn skill_execution_prompt_includes_skill_context() {
-        let prompt = skill_execution_prompt(&SkillToolRequest {
+        let prompt = skill_execution_prompt(&SkillInvocationRequest {
             workspace_root: PathBuf::from("/workspace"),
             base_branch: "main".to_owned(),
             parent_tool_use_id: "tool-use-node".to_owned(),
@@ -868,7 +866,7 @@ mod tests {
 
     #[test]
     fn skill_persistent_directory_keeps_dot_only_names_isolated() {
-        let directory = skill_persistent_directory(&SkillToolRequest {
+        let directory = skill_persistent_directory(&SkillInvocationRequest {
             workspace_root: PathBuf::from("/workspace"),
             base_branch: "main".to_owned(),
             parent_tool_use_id: "tool-use-node".to_owned(),

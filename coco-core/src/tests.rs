@@ -815,7 +815,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
         .await
         .unwrap();
 
-    assert_eq!(result.result.text, "child result");
+    assert_eq!(result.text, "child result");
     let response_node = store.get_node(&result.response_node_id).unwrap();
     assert!(matches!(
         response_node.kind,

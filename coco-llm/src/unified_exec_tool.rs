@@ -1943,7 +1943,7 @@ mod tests {
             store_path: None,
             enable_coco_shim,
             cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-            skill_executor: crate::SkillToolExecutorHandle::default(),
+            skill_executor: crate::SkillSearchExecutorHandle::default(),
         }
     }
 
@@ -2919,7 +2919,7 @@ mod tests {
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-                skill_executor: crate::SkillToolExecutorHandle::default(),
+                skill_executor: crate::SkillSearchExecutorHandle::default(),
             },
         );
         let path_env = OsString::from(fake_bin.path().as_os_str());
@@ -3000,7 +3000,7 @@ mod tests {
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-                skill_executor: crate::SkillToolExecutorHandle::default(),
+                skill_executor: crate::SkillSearchExecutorHandle::default(),
             },
         );
 
@@ -3063,7 +3063,7 @@ mod tests {
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-                skill_executor: crate::SkillToolExecutorHandle::default(),
+                skill_executor: crate::SkillSearchExecutorHandle::default(),
             },
         );
 
@@ -3118,7 +3118,7 @@ mod tests {
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
-                skill_executor: crate::SkillToolExecutorHandle::default(),
+                skill_executor: crate::SkillSearchExecutorHandle::default(),
             },
         );
 
@@ -3517,7 +3517,7 @@ mod tests {
             store_path: Some(runtime_store.clone()),
             enable_coco_shim: true,
             cli_bridge: bridge,
-            skill_executor: crate::SkillToolExecutorHandle::default(),
+            skill_executor: crate::SkillSearchExecutorHandle::default(),
         };
         let server = crate::with_process_env_async(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],
