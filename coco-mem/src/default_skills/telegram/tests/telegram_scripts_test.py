@@ -31,7 +31,9 @@ class TelegramSendScriptTests(unittest.TestCase):
         message = ("a" * module.MESSAGE_LIMIT) + "b"
 
         self.assertEqual(module.split_message(""), [""])
-        self.assertEqual(module.split_message(message), ["a" * module.MESSAGE_LIMIT, "b"])
+        self.assertEqual(
+            module.split_message(message), ["a" * module.MESSAGE_LIMIT, "b"]
+        )
 
     def test_resolve_token_prefers_explicit_token_then_environment(self) -> None:
         module = load_script(SEND_SCRIPT)
@@ -147,7 +149,9 @@ class TelegramEditScriptTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(json.loads(stdout.getvalue()), {"chat_id": 100, "message_id": 42})
+        self.assertEqual(
+            json.loads(stdout.getvalue()), {"chat_id": 100, "message_id": 42}
+        )
 
 
 if __name__ == "__main__":

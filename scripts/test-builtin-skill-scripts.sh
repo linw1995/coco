@@ -12,4 +12,4 @@ if [[ "${#tests[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-python -m unittest "${tests[@]}"
+python -m unittest -v "${tests[@]}"

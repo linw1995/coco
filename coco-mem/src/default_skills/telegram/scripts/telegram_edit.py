@@ -38,7 +38,9 @@ def post_api(token: str, method: str, payload: dict) -> dict:
         raise SystemExit(f"Telegram API request failed: {error}") from error
 
     if not body.get("ok"):
-        raise SystemExit(f"Telegram API returned an error: {body.get('description', body)}")
+        raise SystemExit(
+            f"Telegram API returned an error: {body.get('description', body)}"
+        )
     return body["result"]
 
 

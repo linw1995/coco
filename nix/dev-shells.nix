@@ -14,6 +14,7 @@
       wasm-bindgen-cli
 
       nono
+      ruff
       taplo
       uv
     ];

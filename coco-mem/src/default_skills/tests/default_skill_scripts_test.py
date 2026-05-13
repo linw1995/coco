@@ -18,10 +18,9 @@ class DefaultSkillScriptTests(unittest.TestCase):
             cache_dir = Path(directory)
             for script in scripts:
                 with self.subTest(script=script.relative_to(DEFAULT_SKILLS_DIR)):
-                    cfile = (
-                        cache_dir
-                        / script.relative_to(DEFAULT_SKILLS_DIR).with_suffix(".pyc")
-                    )
+                    cfile = cache_dir / script.relative_to(
+                        DEFAULT_SKILLS_DIR
+                    ).with_suffix(".pyc")
                     cfile.parent.mkdir(parents=True, exist_ok=True)
                     py_compile.compile(str(script), cfile=str(cfile), doraise=True)
 

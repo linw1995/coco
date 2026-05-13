@@ -43,9 +43,21 @@ repos:
     hooks:
       - id: markdownlint-cli2
 
-  # TOML-specific hooks
+  # Local system hooks
   - repo: local
     hooks:
+      - id: ruff-check
+        name: ruff-check
+        entry: ruff check
+        language: system
+        types: [python]
+
+      - id: ruff-format
+        name: ruff-format
+        entry: ruff format --check
+        language: system
+        types: [python]
+
       - id: taplo-format
         name: taplo-format
         entry: taplo fmt
