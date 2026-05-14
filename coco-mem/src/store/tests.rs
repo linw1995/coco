@@ -2554,7 +2554,7 @@ fn open_upgrades_legacy_store_format_version() {
 
     let upgraded: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(upgraded["version"], 8);
+    assert_eq!(upgraded["version"], 9);
 }
 
 #[test]
@@ -2569,12 +2569,12 @@ fn open_reads_legacy_store_without_message_queues_file() {
         serde_json::to_string_pretty(&meta).unwrap(),
     )
     .unwrap();
-    fs::remove_file(path.join("queues.json")).unwrap();
+    fs::remove_file(path.join("queues.jsonl")).unwrap();
 
     let reopened = FsStore::open(&path).unwrap();
 
     assert!(reopened.list_queue_messages("hooks").unwrap().is_empty());
-    assert!(path.join("queues.json").is_file());
+    assert!(path.join("queues.jsonl").is_file());
 }
 
 #[test]
@@ -2589,6 +2589,46 @@ fn queue_messages_survive_fs_store_reopen() {
     let reopened = FsStore::open(&path).unwrap();
 
     assert_eq!(reopened.list_queue_messages("hooks").unwrap(), vec![item]);
+}
+
+#[test]
+fn queue_wal_records_dequeue_before_state_change() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let first = store
+        .enqueue_message("hooks", json!({"text": "first"}))
+        .unwrap();
+    let second = store
+        .enqueue_message("hooks", json!({"text": "second"}))
+        .unwrap();
+
+    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(first.clone()));
+
+    let entries = read_jsonl_values(&path.join("queues.jsonl"));
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["op"], "enqueued");
+    assert_eq!(entries[1]["op"], "enqueued");
+    assert_eq!(entries[2]["op"], "dequeued");
+    assert_eq!(entries[2]["queue"], "hooks");
+    assert_eq!(entries[2]["message_id"], first.message_id);
+
+    drop(store);
+    let reopened = FsStore::open(&path).unwrap();
+    assert_eq!(reopened.list_queue_messages("hooks").unwrap(), vec![second]);
+}
+
+#[test]
+fn queue_wal_compacts_when_queues_are_empty() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let item = store
+        .enqueue_message("hooks", json!({"text": "transient"}))
+        .unwrap();
+
+    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(item));
+
+    assert!(store.list_queue_messages("hooks").unwrap().is_empty());
+    assert!(read_jsonl_values(&path.join("queues.jsonl")).is_empty());
 }
 
 #[test]
