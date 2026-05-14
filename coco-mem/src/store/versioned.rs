@@ -9,59 +9,22 @@ use crate::StoreResult as Result;
 use crate::error::CorruptedStoreSnafu;
 use crate::{BranchConfigRecord, BranchConfigVersion, SkillRecord, SkillVersion};
 
-pub trait VersionId: Copy + Ord + std::fmt::Display {
-    fn first() -> Self;
-    fn next(self) -> Self;
-}
-
-impl VersionId for u64 {
-    fn first() -> Self {
-        1
-    }
-
-    fn next(self) -> Self {
-        self + 1
-    }
-}
-
-pub trait VersionedValue {
-    type Id: VersionId;
-
-    fn version(&self) -> Self::Id;
-}
-
-pub type VersionMap<V> = BTreeMap<<V as VersionedValue>::Id, V>;
-pub type VersionReplay<V> = (<V as VersionedValue>::Id, VersionMap<V>);
+pub type VersionMap<V> = BTreeMap<u64, V>;
+pub type VersionReplay<V> = (u64, VersionMap<V>);
 
 pub trait VersionedRecord {
-    type Version: VersionedValue;
+    type Version;
 
     fn record_key(&self) -> &str;
-    fn current_version(&self) -> <Self::Version as VersionedValue>::Id;
+    fn current_version(&self) -> u64;
     fn versions(&self) -> &VersionMap<Self::Version>;
 }
 
 pub trait VersionedLogEntry: Clone + LogEntry {
-    type Version: VersionedValue;
+    type Version;
 
-    fn version(&self) -> <Self::Version as VersionedValue>::Id;
+    fn version(&self) -> u64;
     fn into_version(self) -> Self::Version;
-}
-
-impl VersionedValue for BranchConfigVersion {
-    type Id = u64;
-
-    fn version(&self) -> Self::Id {
-        self.version
-    }
-}
-
-impl VersionedValue for SkillVersion {
-    type Id = u64;
-
-    fn version(&self) -> Self::Id {
-        self.version
-    }
 }
 
 impl VersionedRecord for BranchConfigRecord {
@@ -71,7 +34,7 @@ impl VersionedRecord for BranchConfigRecord {
         &self.name
     }
 
-    fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
+    fn current_version(&self) -> u64 {
         self.current_version
     }
 
@@ -87,7 +50,7 @@ impl VersionedRecord for SkillRecord {
         &self.name
     }
 
-    fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
+    fn current_version(&self) -> u64 {
         self.current_version
     }
 
@@ -96,9 +59,15 @@ impl VersionedRecord for SkillRecord {
     }
 }
 
-pub(crate) fn validate_record<R>(context: &ProjectionContext, path: &Path, record: &R) -> Result<()>
+pub(crate) fn validate_record<R, F>(
+    context: &ProjectionContext,
+    path: &Path,
+    record: &R,
+    version_of: F,
+) -> Result<()>
 where
     R: VersionedRecord,
+    F: Fn(&R::Version) -> u64,
 {
     ensure!(
         !record.versions().is_empty(),
@@ -123,16 +92,24 @@ where
             ),
         }
     );
-    validate_versions(context, path, record.record_key(), record.versions())
+    validate_versions(
+        context,
+        path,
+        record.record_key(),
+        record.versions(),
+        version_of,
+    )
 }
 
-pub(crate) fn versions_from_history<E>(
+pub(crate) fn versions_from_history<E, F>(
     context: &ProjectionContext,
     fallback_path: &Path,
     entries: &[(PathBuf, E)],
+    version_of: F,
 ) -> Result<VersionReplay<E::Version>>
 where
     E: VersionedLogEntry,
+    F: Fn(&E::Version) -> u64,
 {
     let mut versions = BTreeMap::new();
     let mut source_path = None;
@@ -143,15 +120,16 @@ where
         key.get_or_insert_with(|| entry.log_key().to_owned());
         let entry_version = entry.version();
         let version = entry.clone().into_version();
+        let version_number = version_of(&version);
         ensure!(
-            version.version() == entry_version,
+            version_number == entry_version,
             CorruptedStoreSnafu {
                 path: path.clone(),
                 message: format!(
                     "{} {:?} stores version {} in history entry {}",
                     context.entity(),
                     entry.log_key(),
-                    version.version(),
+                    version_number,
                     entry_version
                 ),
             }
@@ -179,7 +157,7 @@ where
             message: format!("empty {} history for {:?}", context.entity(), key),
         }
     );
-    validate_versions(context, &path, &key, &versions)?;
+    validate_versions(context, &path, &key, &versions, &version_of)?;
     let current_version = versions
         .keys()
         .next_back()
@@ -192,13 +170,10 @@ where
 pub(crate) fn validate_snapshot<V>(
     context: &ProjectionContext,
     snapshot_key: &str,
-    current_version: V::Id,
+    current_version: u64,
     versions: &VersionMap<V>,
     matches_version: impl FnOnce(&V) -> bool,
-) -> Result<()>
-where
-    V: VersionedValue,
-{
+) -> Result<()> {
     let persisted_current = versions
         .get(&current_version)
         .context(CorruptedStoreSnafu {
@@ -224,16 +199,17 @@ where
     Ok(())
 }
 
-fn validate_versions<V>(
+fn validate_versions<V, F>(
     context: &ProjectionContext,
     path: &Path,
     key: &str,
     versions: &VersionMap<V>,
+    version_of: F,
 ) -> Result<()>
 where
-    V: VersionedValue,
+    F: Fn(&V) -> u64,
 {
-    let mut expected_version = V::Id::first();
+    let mut expected_version = 1;
     for (version, entry) in versions {
         ensure!(
             *version == expected_version,
@@ -248,20 +224,21 @@ where
                 ),
             }
         );
+        let entry_version = version_of(entry);
         ensure!(
-            entry.version() == *version,
+            entry_version == *version,
             CorruptedStoreSnafu {
                 path: path.to_owned(),
                 message: format!(
                     "{} {:?} stores version {} under key {}",
                     context.entity(),
                     key,
-                    entry.version(),
+                    entry_version,
                     version
                 ),
             }
         );
-        expected_version = expected_version.next();
+        expected_version += 1;
     }
     Ok(())
 }

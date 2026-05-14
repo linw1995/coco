@@ -13,8 +13,7 @@ use super::log::LogEntry;
 use super::projection::ProjectionContext;
 use super::state::StoreState;
 use super::versioned::{
-    VersionedLogEntry, VersionedRecord, VersionedValue, validate_record, validate_snapshot,
-    versions_from_history,
+    VersionedLogEntry, VersionedRecord, validate_record, validate_snapshot, versions_from_history,
 };
 use super::{
     BranchConfigStore, BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore, SkillStore,
@@ -214,7 +213,7 @@ impl LogEntry for SkillHistoryEntry {
 impl VersionedLogEntry for BranchConfigHistoryEntry {
     type Version = BranchConfigVersion;
 
-    fn version(&self) -> <Self::Version as VersionedValue>::Id {
+    fn version(&self) -> u64 {
         self.version
     }
 
@@ -226,7 +225,7 @@ impl VersionedLogEntry for BranchConfigHistoryEntry {
 impl VersionedLogEntry for SkillHistoryEntry {
     type Version = SkillVersion;
 
-    fn version(&self) -> <Self::Version as VersionedValue>::Id {
+    fn version(&self) -> u64 {
         self.version
     }
 
@@ -1231,6 +1230,7 @@ fn validate_branch_config_record(
         &ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME),
         path,
         record,
+        |version| version.version,
     )
 }
 
@@ -1320,6 +1320,7 @@ fn branch_config_record_from_history(
         &ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME),
         Path::new(BRANCH_CONFIG_HISTORY_DIR_NAME),
         entries,
+        |version| version.version,
     )?;
 
     Ok(BranchConfigRecord {
@@ -1409,6 +1410,7 @@ fn skill_record_from_history(
         &ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME),
         Path::new(SKILL_HISTORY_DIR_NAME),
         entries,
+        |version| version.version,
     )?;
 
     Ok(SkillRecord {
