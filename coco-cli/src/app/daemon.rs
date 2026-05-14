@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,7 +12,6 @@ use coco_mem::{JobStatus, SessionRole, Store};
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::sync::mpsc;
 
 use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
@@ -335,116 +333,66 @@ where
     })))
 }
 
-struct CoreChannelMessageHandler {
+struct CoreChannelMessageHandler<B, S> {
     branch: String,
-    sender: mpsc::UnboundedSender<InboundMessage>,
-    worker_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    engine: ConversationEngine<B, S>,
+    service: CoreService<FixedBranchResolver, B, S>,
 }
 
-impl CoreChannelMessageHandler {
-    fn new<B, S>(branch: impl Into<String>, engine: ConversationEngine<B, S>) -> Self
-    where
-        B: CompletionBackend + 'static,
-        S: Store + Clone + Send + Sync + 'static,
-    {
+impl<B, S> CoreChannelMessageHandler<B, S>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    fn new(branch: impl Into<String>, engine: ConversationEngine<B, S>) -> Self {
         let branch = branch.into();
-        let (sender, receiver) = mpsc::unbounded_channel();
         let service = CoreService::new(FixedBranchResolver::new(branch.clone()), engine.clone());
-        let worker_task = tokio::spawn(run_channel_message_worker(
-            branch.clone(),
-            engine,
-            service,
-            receiver,
-        ));
 
         Self {
             branch,
-            sender,
-            worker_task: Mutex::new(Some(worker_task)),
+            engine,
+            service,
         }
     }
 }
 
 #[async_trait]
-impl MessageHandler for CoreChannelMessageHandler {
-    async fn handle(&self, message: InboundMessage) -> coco_channel::Result<OutboundMessage> {
-        self.sender.send(message).map_err(|_| {
-            ChannelError::handler(std::io::Error::other(format!(
-                "channel message worker for branch {:?} stopped",
-                self.branch
-            )))
-        })?;
-
-        Ok(OutboundMessage {
-            text: "queued".to_owned(),
-        })
-    }
-}
-
-impl Drop for CoreChannelMessageHandler {
-    fn drop(&mut self) {
-        if let Some(worker_task) = self.worker_task.lock().unwrap().take() {
-            worker_task.abort();
-        }
-    }
-}
-
-async fn run_channel_message_worker<B, S>(
-    branch: String,
-    engine: ConversationEngine<B, S>,
-    service: CoreService<FixedBranchResolver, B, S>,
-    mut receiver: mpsc::UnboundedReceiver<InboundMessage>,
-) where
+impl<B, S> MessageHandler for CoreChannelMessageHandler<B, S>
+where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    while let Some(message) = receiver.recv().await {
+    async fn handle(&self, message: InboundMessage) -> coco_channel::Result<OutboundMessage> {
         let channel_kind = message.channel_kind;
         let conversation_id = message.conversation_id.clone();
         let source_message_id = message.source_message_id.clone();
 
         tracing::debug!(
-            branch = %branch,
+            branch = %self.branch,
             channel_kind = %channel_kind,
             conversation_id = %conversation_id,
             source_message_id = ?source_message_id,
-            "handling queued channel message"
+            "handling channel message"
         );
 
-        if let Err(error) = wait_for_branch_to_accept_channel_prompt(&engine, &branch).await {
-            tracing::warn!(
-                error = %error,
-                branch = %branch,
-                channel_kind = %channel_kind,
-                conversation_id = %conversation_id,
-                source_message_id = ?source_message_id,
-                "failed while waiting for active branch prompt job"
-            );
-            continue;
-        }
+        wait_for_branch_to_accept_channel_prompt(&self.engine, &self.branch)
+            .await
+            .map_err(ChannelError::handler)?;
 
-        match service.handle_message(message).await {
-            Ok(response) => {
+        self.service
+            .handle_message(message)
+            .await
+            .inspect(|response| {
                 tracing::debug!(
-                    branch = %branch,
+                    branch = %self.branch,
                     channel_kind = %channel_kind,
                     conversation_id = %conversation_id,
                     source_message_id = ?source_message_id,
                     response_bytes = response.text.len(),
-                    "handled queued channel message"
+                    "handled channel message"
                 );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    branch = %branch,
-                    channel_kind = %channel_kind,
-                    conversation_id = %conversation_id,
-                    source_message_id = ?source_message_id,
-                    "queued channel message failed"
-                );
-            }
-        }
+            })
+            .map_err(ChannelError::handler)
     }
 }
 
@@ -695,7 +643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_channel_handler_queues_messages_without_concurrent_engine_runs() {
+    async fn core_channel_handler_returns_after_message_processing_finishes() {
         let store = MemoryStore::new();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
@@ -704,31 +652,22 @@ mod tests {
         llm.create_session(session_config("main")).await.unwrap();
         let handler = CoreChannelMessageHandler::new("main", ConversationEngine::new(llm.clone()));
 
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            handler.handle(InboundMessage::telegram("chat", "user", "first")),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let handle_task = tokio::spawn(async move {
+            handler
+                .handle(InboundMessage::telegram("chat", "user", "first"))
+                .await
+        });
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
-
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            handler.handle(InboundMessage::telegram("chat", "user", "second")),
-        )
-        .await
-        .unwrap()
-        .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!handle_task.is_finished());
 
         release_first.notify_waiters();
-        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
+        let response = handle_task.await.unwrap().unwrap();
+        assert_eq!(response.text, "done");
     }
 
     #[tokio::test]
-    async fn core_channel_worker_waits_for_active_target_branch_job() {
+    async fn core_channel_handler_waits_for_active_target_branch_job() {
         let store = MemoryStore::new();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
@@ -746,20 +685,20 @@ mod tests {
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
 
         let handler = CoreChannelMessageHandler::new("main", engine);
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            handler.handle(InboundMessage::telegram("chat", "user", "next")),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let handle_task = tokio::spawn(async move {
+            handler
+                .handle(InboundMessage::telegram("chat", "user", "next"))
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!handle_task.is_finished());
 
         release_first.notify_waiters();
         let snapshot = drive_task.await.unwrap().unwrap();
         assert_eq!(snapshot.status, JobStatus::Finished);
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
+        assert_eq!(handle_task.await.unwrap().unwrap().text, "done");
     }
 
     #[derive(Debug, Clone, Default)]
