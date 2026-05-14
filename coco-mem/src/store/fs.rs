@@ -18,7 +18,8 @@ use super::versioned::{
     validate_snapshot_in_collection, versions_from_history,
 };
 use super::{
-    BranchConfigStore, BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore, SkillStore,
+    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, RuntimeStore,
+    SessionStore, SkillStore,
 };
 use crate::error::{
     CorruptedStoreSnafu, ParseStoreLogSnafu, ParseStoreMetaSnafu, SerializeStoreRecordSnafu,
@@ -26,19 +27,20 @@ use crate::error::{
     WriteStoreLogSnafu, WriteStoreMetaSnafu,
 };
 use crate::{
-    BranchConfig, BranchConfigRecord, BranchConfigVersion, Job, JobStatus, NewNode, Node,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillScript,
-    SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError, StoreResult as Result,
-    default_skill_groups,
+    BranchConfig, BranchConfigRecord, BranchConfigVersion, Job, JobStatus, MessageQueueItem,
+    NewNode, Node, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
+    SkillScript, SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError,
+    StoreResult as Result, default_skill_groups,
 };
 
-const STORE_FORMAT_VERSION: u64 = 7;
+const STORE_FORMAT_VERSION: u64 = 8;
 const LEGACY_STORE_FORMAT_VERSION: u64 = 6;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
 const BRANCH_CONFIGS_FILE_NAME: &str = "branch-configs.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
+const QUEUES_FILE_NAME: &str = "queues.json";
 const SKILLS_FILE_NAME: &str = "skills.json";
 const BRANCH_CONFIG_HISTORY_DIR_NAME: &str = "branch-config-history";
 const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
@@ -64,6 +66,7 @@ pub struct Persistence {
     sessions_path: PathBuf,
     branch_configs_path: PathBuf,
     jobs_path: PathBuf,
+    queues_path: PathBuf,
     skills_path: PathBuf,
     branch_config_history_dir: PathBuf,
     skill_history_dir: PathBuf,
@@ -643,6 +646,7 @@ impl Persistence {
             sessions_path: path.join(SESSIONS_FILE_NAME),
             branch_configs_path: path.join(BRANCH_CONFIGS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
+            queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             branch_config_history_dir: path.join(BRANCH_CONFIG_HISTORY_DIR_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
@@ -672,6 +676,7 @@ impl Persistence {
             sessions_path: path.join(SESSIONS_FILE_NAME),
             branch_configs_path: path.join(BRANCH_CONFIGS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
+            queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             branch_config_history_dir: path.join(BRANCH_CONFIG_HISTORY_DIR_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
@@ -882,6 +887,10 @@ impl Persistence {
         )?;
         write_json_file(&self.jobs_path, &HashMap::<String, Job>::new())?;
         write_json_file(
+            &self.queues_path,
+            &HashMap::<String, Vec<MessageQueueItem>>::new(),
+        )?;
+        write_json_file(
             &self.skills_path,
             &PersistedSkillGroups::from_groups(&skill_groups),
         )?;
@@ -941,7 +950,7 @@ impl Persistence {
         ensure!(
             matches!(
                 meta.version,
-                LEGACY_STORE_FORMAT_VERSION | STORE_FORMAT_VERSION
+                LEGACY_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION
             ),
             CorruptedStoreSnafu {
                 path: self.meta_path.clone(),
@@ -1062,6 +1071,24 @@ impl Persistence {
         validate_branch_config_snapshots(&branch_config_snapshots.current, &branch_configs)?;
         store.branch_configs = branch_configs;
         store.jobs = read_json_file::<HashMap<String, Job>>(&self.jobs_path)?;
+        store.message_queues = if self.queues_path.exists() {
+            ensure!(
+                self.queues_path.is_file(),
+                CorruptedStoreSnafu {
+                    path: self.queues_path.clone(),
+                    message: "message queue metadata entry must be a file".to_owned(),
+                }
+            );
+            read_json_file::<HashMap<String, Vec<MessageQueueItem>>>(&self.queues_path)?
+        } else {
+            if self.access == StoreAccess::ReadWrite {
+                write_json_file(
+                    &self.queues_path,
+                    &HashMap::<String, Vec<MessageQueueItem>>::new(),
+                )?;
+            }
+            HashMap::new()
+        };
         let skill_groups = read_json_file::<PersistedSkillGroups>(&self.skills_path)?;
         if skill_groups.is_empty() {
             store.skill_groups = default_skill_groups();
@@ -1119,6 +1146,11 @@ impl Persistence {
     pub fn persist_jobs(&self, state: &StoreState) -> Result<()> {
         self.ensure_writable()?;
         write_json_file(&self.jobs_path, &state.jobs)
+    }
+
+    pub fn persist_message_queues(&self, state: &StoreState) -> Result<()> {
+        self.ensure_writable()?;
+        write_json_file(&self.queues_path, &state.message_queues)
     }
 }
 
@@ -1861,6 +1893,34 @@ impl JobStore for FsStore {
         self.persistence.persist_jobs(&temp)?;
         state.jobs = temp.jobs;
         Ok(updated)
+    }
+}
+
+impl MessageQueueStore for FsStore {
+    fn enqueue_message(&self, queue: &str, payload: serde_json::Value) -> Result<MessageQueueItem> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let item = temp.enqueue_message(queue, payload);
+        self.persistence.persist_message_queues(&temp)?;
+        state.message_queues = temp.message_queues;
+        Ok(item)
+    }
+
+    fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let item = temp.dequeue_message(queue);
+        self.persistence.persist_message_queues(&temp)?;
+        state.message_queues = temp.message_queues;
+        Ok(item)
+    }
+
+    fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_queue_messages(queue))
     }
 }
 
