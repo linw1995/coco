@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use coco_channel::{ChannelRuntime, InboundMessage, MessageHandler, OutboundMessage};
@@ -7,10 +8,13 @@ use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
 use coco_core::{ConversationEngine, CoreService, FixedBranchResolver};
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::{SessionRole, Store};
+use coco_mem::{MessageQueueItem, SessionRole, Store};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
+use tokio::sync::Notify;
 
 use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
@@ -30,6 +34,8 @@ use crate::{
 const DEFAULT_SESSION_BRANCH: &str = "main";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
+const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
+const TELEGRAM_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
@@ -240,7 +246,7 @@ where
     if let Some(console) = &console {
         tracing::info!(addr = %console.addr(), "coco console listening");
     }
-    let channel_task = start_channel_task(options.channel_configs, &shared_engine)?;
+    let channel_task = start_channel_task(options.channel_configs, &shared_store, &shared_engine)?;
     let handle_llm = llm.clone();
 
     let socket_task = tokio::spawn(async move {
@@ -296,6 +302,7 @@ where
 
 fn start_channel_task<B, S>(
     channel_configs: &ChannelConfigs,
+    shared_store: &S,
     shared_engine: &Arc<ConversationEngine<B, S>>,
 ) -> Result<Option<tokio::task::JoinHandle<Result<()>>>>
 where
@@ -323,38 +330,191 @@ where
         allowed_chat_ids: config.allowed_chat_ids.clone(),
     })
     .context(ChannelSnafu)?;
-    let handler =
-        CoreChannelMessageHandler::new(config.branch.clone(), shared_engine.as_ref().clone());
+    let notify = Arc::new(Notify::new());
+    let handler = TelegramMessageQueuePublisher::new(shared_store.clone(), notify.clone());
+    let worker = TelegramMessageQueueWorker::new(
+        config.branch.clone(),
+        shared_store.clone(),
+        shared_engine.as_ref().clone(),
+        notify,
+    );
 
     Ok(Some(tokio::spawn(async move {
-        channel.run(&handler).await.context(ChannelSnafu)
+        tokio::select! {
+            channel_result = channel.run(&handler) => channel_result.context(ChannelSnafu),
+            worker_result = worker.run() => worker_result,
+        }
     })))
 }
 
-struct CoreChannelMessageHandler<B, S> {
-    service: CoreService<FixedBranchResolver, B, S>,
+#[derive(Debug, Serialize, Deserialize)]
+struct QueuedTelegramMessage {
+    channel_kind: String,
+    conversation_id: String,
+    sender_id: String,
+    source_message_id: Option<String>,
+    text: String,
 }
 
-impl<B, S> CoreChannelMessageHandler<B, S> {
-    fn new(branch: impl Into<String>, engine: ConversationEngine<B, S>) -> Self {
-        Self {
-            service: CoreService::new(FixedBranchResolver::new(branch), engine),
-        }
+#[derive(Debug, Snafu)]
+enum TelegramQueuePayloadError {
+    #[snafu(display("Failed to decode Telegram queue payload: {source}"))]
+    Decode { source: serde_json::Error },
+
+    #[snafu(display("Unsupported Telegram queue channel kind {channel_kind:?}"))]
+    UnsupportedChannelKind { channel_kind: String },
+}
+
+struct TelegramMessageQueuePublisher<S> {
+    store: S,
+    notify: Arc<Notify>,
+}
+
+impl<S> TelegramMessageQueuePublisher<S> {
+    fn new(store: S, notify: Arc<Notify>) -> Self {
+        Self { store, notify }
     }
 }
 
 #[async_trait]
-impl<B, S> MessageHandler for CoreChannelMessageHandler<B, S>
+impl<S> MessageHandler for TelegramMessageQueuePublisher<S>
 where
-    B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
     async fn handle(&self, message: InboundMessage) -> coco_channel::Result<OutboundMessage> {
-        self.service
-            .handle_message(message)
-            .await
-            .map_err(ChannelError::handler)
+        let item = self
+            .store
+            .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
+            .map_err(ChannelError::handler)?;
+        tracing::info!(
+            message_id = %item.message_id,
+            queue = TELEGRAM_INBOUND_QUEUE,
+            conversation_id = %message.conversation_id,
+            sender_id = %message.sender_id,
+            "queued telegram inbound message"
+        );
+        self.notify.notify_one();
+        Ok(OutboundMessage {
+            text: "queued telegram inbound message".to_owned(),
+        })
     }
+}
+
+struct TelegramMessageQueueWorker<B, S> {
+    store: S,
+    service: CoreService<FixedBranchResolver, B, S>,
+    notify: Arc<Notify>,
+}
+
+impl<B, S> TelegramMessageQueueWorker<B, S> {
+    fn new(
+        branch: impl Into<String>,
+        store: S,
+        engine: ConversationEngine<B, S>,
+        notify: Arc<Notify>,
+    ) -> Self {
+        Self {
+            store,
+            service: CoreService::new(FixedBranchResolver::new(branch), engine),
+            notify,
+        }
+    }
+
+    async fn run(self) -> Result<()>
+    where
+        B: CompletionBackend + 'static,
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        loop {
+            if self.drain_once().await? == 0 {
+                tokio::select! {
+                    () = self.notify.notified() => {}
+                    () = tokio::time::sleep(TELEGRAM_QUEUE_IDLE_DELAY) => {}
+                }
+            }
+        }
+    }
+
+    async fn drain_once(&self) -> Result<usize>
+    where
+        B: CompletionBackend + 'static,
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        let mut handled = 0;
+        while let Some(item) = self
+            .store
+            .dequeue_message(TELEGRAM_INBOUND_QUEUE)
+            .context(StoreSnafu)?
+        {
+            handled += 1;
+            self.handle_item(item).await;
+        }
+        Ok(handled)
+    }
+
+    async fn handle_item(&self, item: MessageQueueItem)
+    where
+        B: CompletionBackend + 'static,
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        let message = match decode_telegram_message(item.payload) {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::error!(
+                    message_id = %item.message_id,
+                    queue = TELEGRAM_INBOUND_QUEUE,
+                    error = %error,
+                    "discarded invalid telegram queue message"
+                );
+                return;
+            }
+        };
+
+        tracing::info!(
+            message_id = %item.message_id,
+            queue = TELEGRAM_INBOUND_QUEUE,
+            conversation_id = %message.conversation_id,
+            sender_id = %message.sender_id,
+            "handling queued telegram inbound message"
+        );
+        if let Err(error) = self.service.handle_message(message).await {
+            tracing::error!(
+                message_id = %item.message_id,
+                queue = TELEGRAM_INBOUND_QUEUE,
+                error = %error,
+                "queued telegram inbound message failed"
+            );
+        }
+    }
+}
+
+fn encode_telegram_message(message: &InboundMessage) -> serde_json::Value {
+    json!({
+        "channel_kind": message.channel_kind.as_str(),
+        "conversation_id": message.conversation_id.clone(),
+        "sender_id": message.sender_id.clone(),
+        "source_message_id": message.source_message_id.clone(),
+        "text": message.text.clone(),
+    })
+}
+
+fn decode_telegram_message(
+    payload: serde_json::Value,
+) -> std::result::Result<InboundMessage, TelegramQueuePayloadError> {
+    let message = serde_json::from_value::<QueuedTelegramMessage>(payload).context(DecodeSnafu)?;
+    ensure!(
+        message.channel_kind == coco_channel::ChannelKind::Telegram.as_str(),
+        UnsupportedChannelKindSnafu {
+            channel_kind: message.channel_kind,
+        }
+    );
+    Ok(InboundMessage {
+        channel_kind: coco_channel::ChannelKind::Telegram,
+        conversation_id: message.conversation_id,
+        sender_id: message.sender_id,
+        source_message_id: message.source_message_id,
+        text: message.text,
+    })
 }
 
 impl<B, S> CocoCliDaemonServerHandle<B, S> {
@@ -546,13 +706,69 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
-    use super::resolve_daemon_socket_path;
+    use coco_channel::{InboundMessage, MessageHandler};
+    use coco_mem::{MemoryStore, MessageQueueStore};
+    use serde_json::json;
+    use tokio::sync::Notify;
+
+    use super::{
+        TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher, decode_telegram_message,
+        encode_telegram_message, resolve_daemon_socket_path,
+    };
 
     #[test]
     fn resolve_daemon_socket_path_uses_explicit_socket() {
         let path = resolve_daemon_socket_path(Some(Path::new("/tmp/coco.sock"))).unwrap();
 
         assert_eq!(path, PathBuf::from("/tmp/coco.sock"));
+    }
+
+    #[test]
+    fn telegram_queue_payload_round_trips_inbound_message() {
+        let message =
+            InboundMessage::telegram_with_message_id("chat-1", "sender-1", "message-1", "hello");
+
+        let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn telegram_queue_payload_rejects_non_telegram_channel_kind() {
+        let payload = json!({
+            "channel_kind": "discord",
+            "conversation_id": "channel-1",
+            "sender_id": "sender-1",
+            "source_message_id": null,
+            "text": "hello",
+        });
+
+        let error = decode_telegram_message(payload).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported Telegram queue channel kind")
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_message_queue_publisher_persists_inbound_message() {
+        let store = MemoryStore::new();
+        let publisher = TelegramMessageQueuePublisher::new(store.clone(), Arc::new(Notify::new()));
+        let message =
+            InboundMessage::telegram_with_message_id("chat-1", "sender-1", "message-1", "hello");
+
+        let response = publisher.handle(message.clone()).await.unwrap();
+
+        assert_eq!(response.text, "queued telegram inbound message");
+        let items = store.list_queue_messages(TELEGRAM_INBOUND_QUEUE).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            decode_telegram_message(items[0].payload.clone()).unwrap(),
+            message
+        );
     }
 }
