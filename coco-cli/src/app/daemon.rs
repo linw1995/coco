@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use coco_channel::{ChannelRuntime, InboundMessage, MessageHandler, OutboundMessage};
@@ -11,6 +12,7 @@ use coco_mem::{SessionRole, Store};
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
+use tokio::sync::mpsc;
 
 use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
@@ -331,29 +333,101 @@ where
     })))
 }
 
-struct CoreChannelMessageHandler<B, S> {
-    service: CoreService<FixedBranchResolver, B, S>,
+struct CoreChannelMessageHandler {
+    branch: String,
+    sender: mpsc::UnboundedSender<InboundMessage>,
+    worker_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-impl<B, S> CoreChannelMessageHandler<B, S> {
-    fn new(branch: impl Into<String>, engine: ConversationEngine<B, S>) -> Self {
+impl CoreChannelMessageHandler {
+    fn new<B, S>(branch: impl Into<String>, engine: ConversationEngine<B, S>) -> Self
+    where
+        B: CompletionBackend + 'static,
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        let branch = branch.into();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let worker_task = tokio::spawn(run_channel_message_worker(
+            branch.clone(),
+            CoreService::new(FixedBranchResolver::new(branch.clone()), engine),
+            receiver,
+        ));
+
         Self {
-            service: CoreService::new(FixedBranchResolver::new(branch), engine),
+            branch,
+            sender,
+            worker_task: Mutex::new(Some(worker_task)),
         }
     }
 }
 
 #[async_trait]
-impl<B, S> MessageHandler for CoreChannelMessageHandler<B, S>
-where
+impl MessageHandler for CoreChannelMessageHandler {
+    async fn handle(&self, message: InboundMessage) -> coco_channel::Result<OutboundMessage> {
+        self.sender.send(message).map_err(|_| {
+            ChannelError::handler(std::io::Error::other(format!(
+                "channel message worker for branch {:?} stopped",
+                self.branch
+            )))
+        })?;
+
+        Ok(OutboundMessage {
+            text: "queued".to_owned(),
+        })
+    }
+}
+
+impl Drop for CoreChannelMessageHandler {
+    fn drop(&mut self) {
+        if let Some(worker_task) = self.worker_task.lock().unwrap().take() {
+            worker_task.abort();
+        }
+    }
+}
+
+async fn run_channel_message_worker<B, S>(
+    branch: String,
+    service: CoreService<FixedBranchResolver, B, S>,
+    mut receiver: mpsc::UnboundedReceiver<InboundMessage>,
+) where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    async fn handle(&self, message: InboundMessage) -> coco_channel::Result<OutboundMessage> {
-        self.service
-            .handle_message(message)
-            .await
-            .map_err(ChannelError::handler)
+    while let Some(message) = receiver.recv().await {
+        let channel_kind = message.channel_kind;
+        let conversation_id = message.conversation_id.clone();
+        let source_message_id = message.source_message_id.clone();
+
+        tracing::debug!(
+            branch = %branch,
+            channel_kind = %channel_kind,
+            conversation_id = %conversation_id,
+            source_message_id = ?source_message_id,
+            "handling queued channel message"
+        );
+
+        match service.handle_message(message).await {
+            Ok(response) => {
+                tracing::debug!(
+                    branch = %branch,
+                    channel_kind = %channel_kind,
+                    conversation_id = %conversation_id,
+                    source_message_id = ?source_message_id,
+                    response_bytes = response.text.len(),
+                    "handled queued channel message"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    branch = %branch,
+                    channel_kind = %channel_kind,
+                    conversation_id = %conversation_id,
+                    source_message_id = ?source_message_id,
+                    "queued channel message failed"
+                );
+            }
+        }
     }
 }
 
@@ -546,13 +620,118 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
 
-    use super::resolve_daemon_socket_path;
+    use async_trait::async_trait;
+    use coco_channel::{InboundMessage, MessageHandler};
+    use coco_core::ConversationEngine;
+    use coco_llm::{
+        BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
+        SessionConfig, StepContext,
+    };
+    use coco_mem::{MemoryStore, SessionRole};
+    use tokio::sync::Notify;
+
+    use super::{CoreChannelMessageHandler, resolve_daemon_socket_path};
 
     #[test]
     fn resolve_daemon_socket_path_uses_explicit_socket() {
         let path = resolve_daemon_socket_path(Some(Path::new("/tmp/coco.sock"))).unwrap();
 
         assert_eq!(path, PathBuf::from("/tmp/coco.sock"));
+    }
+
+    #[tokio::test]
+    async fn core_channel_handler_queues_messages_without_concurrent_engine_runs() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let calls = backend.calls.clone();
+        let release_first = backend.release_first.clone();
+        let llm = Arc::new(LlmService::new(store, backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let handler = CoreChannelMessageHandler::new("main", ConversationEngine::new(llm.clone()));
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handler.handle(InboundMessage::telegram("chat", "user", "first")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handler.handle(InboundMessage::telegram("chat", "user", "second")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release_first.notify_waiters();
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct BlockingOnceBackend {
+        calls: Arc<AtomicUsize>,
+        release_first: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl CompletionBackend for BlockingOnceBackend {
+        async fn step(
+            &self,
+            _ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                self.release_first.notified().await;
+            }
+
+            Ok(BackendTurn {
+                message: CompletionMessage::assistant("done"),
+                events: vec![],
+                tool_calls: vec![],
+                final_text: Some("done".to_owned()),
+                trace_persisted: false,
+            })
+        }
+    }
+
+    fn session_config(branch: &str) -> SessionConfig {
+        SessionConfig {
+            branch: branch.to_owned(),
+            merge_parents: vec![],
+            provider_profile: None,
+            role: SessionRole::Orchestrator,
+            provider: Provider::OpenAi,
+            model: "gpt-4.1-mini".to_owned(),
+            system_prompt: "You are helpful.".to_owned(),
+            prompt: String::new(),
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+            enable_coco_shim: false,
+        }
+    }
+
+    async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("condition was not met before timeout");
     }
 }
