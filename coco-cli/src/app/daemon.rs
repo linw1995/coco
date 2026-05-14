@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use coco_channel::{ChannelRuntime, InboundMessage, MessageHandler, OutboundMessage};
@@ -8,7 +9,7 @@ use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
 use coco_core::{ConversationEngine, CoreService, FixedBranchResolver};
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::{SessionRole, Store};
+use coco_mem::{JobStatus, SessionRole, Store};
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -32,6 +33,7 @@ use crate::{
 const DEFAULT_SESSION_BRANCH: &str = "main";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
+const CHANNEL_BRANCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
@@ -347,9 +349,11 @@ impl CoreChannelMessageHandler {
     {
         let branch = branch.into();
         let (sender, receiver) = mpsc::unbounded_channel();
+        let service = CoreService::new(FixedBranchResolver::new(branch.clone()), engine.clone());
         let worker_task = tokio::spawn(run_channel_message_worker(
             branch.clone(),
-            CoreService::new(FixedBranchResolver::new(branch.clone()), engine),
+            engine,
+            service,
             receiver,
         ));
 
@@ -387,6 +391,7 @@ impl Drop for CoreChannelMessageHandler {
 
 async fn run_channel_message_worker<B, S>(
     branch: String,
+    engine: ConversationEngine<B, S>,
     service: CoreService<FixedBranchResolver, B, S>,
     mut receiver: mpsc::UnboundedReceiver<InboundMessage>,
 ) where
@@ -405,6 +410,18 @@ async fn run_channel_message_worker<B, S>(
             source_message_id = ?source_message_id,
             "handling queued channel message"
         );
+
+        if let Err(error) = wait_for_branch_to_accept_channel_prompt(&engine, &branch).await {
+            tracing::warn!(
+                error = %error,
+                branch = %branch,
+                channel_kind = %channel_kind,
+                conversation_id = %conversation_id,
+                source_message_id = ?source_message_id,
+                "failed while waiting for active branch prompt job"
+            );
+            continue;
+        }
 
         match service.handle_message(message).await {
             Ok(response) => {
@@ -427,6 +444,38 @@ async fn run_channel_message_worker<B, S>(
                     "queued channel message failed"
                 );
             }
+        }
+    }
+}
+
+async fn wait_for_branch_to_accept_channel_prompt<B, S>(
+    engine: &ConversationEngine<B, S>,
+    branch: &str,
+) -> std::result::Result<(), coco_core::EngineError>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    loop {
+        let active_job = engine
+            .list_jobs()?
+            .into_values()
+            .filter(|job| job.branch == branch && !matches!(job.status, JobStatus::Finished))
+            .min_by_key(|job| job.created_at);
+        let Some(active_job) = active_job else {
+            return Ok(());
+        };
+
+        tracing::info!(
+            branch = %branch,
+            active_job_id = %active_job.job_id,
+            active_job_status = ?active_job.status,
+            "waiting for active branch prompt job before handling channel message"
+        );
+
+        let snapshot = engine.drive_job(&active_job.job_id).await?;
+        if !matches!(snapshot.status, JobStatus::Finished) {
+            tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
         }
     }
 }
@@ -633,7 +682,7 @@ mod tests {
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
         SessionConfig, StepContext,
     };
-    use coco_mem::{MemoryStore, SessionRole};
+    use coco_mem::{JobStatus, MemoryStore, SessionRole};
     use tokio::sync::Notify;
 
     use super::{CoreChannelMessageHandler, resolve_daemon_socket_path};
@@ -675,6 +724,41 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         release_first.notify_waiters();
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
+    }
+
+    #[tokio::test]
+    async fn core_channel_worker_waits_for_active_target_branch_job() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let calls = backend.calls.clone();
+        let release_first = backend.release_first.clone();
+        let llm = Arc::new(LlmService::new(store, backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let engine = ConversationEngine::new(llm.clone());
+        let active_job = engine
+            .submit_job("main", "existing work", vec![])
+            .await
+            .unwrap();
+        let drive_engine = engine.clone();
+        let drive_task =
+            tokio::spawn(async move { drive_engine.drive_job(&active_job.job_id).await });
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
+
+        let handler = CoreChannelMessageHandler::new("main", engine);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handler.handle(InboundMessage::telegram("chat", "user", "next")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release_first.notify_waiters();
+        let snapshot = drive_task.await.unwrap().unwrap();
+        assert_eq!(snapshot.status, JobStatus::Finished);
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
     }
 
