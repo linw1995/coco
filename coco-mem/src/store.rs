@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub(crate) mod fs;
-pub(crate) mod log;
 pub mod memory;
 pub(crate) mod projection;
 pub(crate) mod state;

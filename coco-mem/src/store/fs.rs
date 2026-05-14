@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::prelude::*;
 
-use super::log::LogEntry;
 use super::projection::ProjectionContext;
 use super::state::StoreState;
 use super::versioned::{
@@ -198,20 +197,12 @@ impl BranchConfigHistoryEntry {
     }
 }
 
-impl LogEntry for BranchConfigHistoryEntry {
-    fn log_key(&self) -> &str {
-        &self.name
-    }
-}
-
-impl LogEntry for SkillHistoryEntry {
-    fn log_key(&self) -> &str {
-        &self.name
-    }
-}
-
 impl VersionedLogEntry for BranchConfigHistoryEntry {
     type Version = BranchConfigVersion;
+
+    fn log_key(&self) -> &str {
+        &self.name
+    }
 
     fn version(&self) -> u64 {
         self.version
@@ -224,6 +215,10 @@ impl VersionedLogEntry for BranchConfigHistoryEntry {
 
 impl VersionedLogEntry for SkillHistoryEntry {
     type Version = SkillVersion;
+
+    fn log_key(&self) -> &str {
+        &self.name
+    }
 
     fn version(&self) -> u64 {
         self.version

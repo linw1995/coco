@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use snafu::prelude::*;
 
-use super::log::LogEntry;
 use super::projection::ProjectionContext;
 use crate::StoreResult as Result;
 use crate::error::CorruptedStoreSnafu;
@@ -20,9 +19,10 @@ pub trait VersionedRecord {
     fn versions(&self) -> &VersionMap<Self::Version>;
 }
 
-pub trait VersionedLogEntry: Clone + LogEntry {
+pub trait VersionedLogEntry: Clone {
     type Version;
 
+    fn log_key(&self) -> &str;
     fn version(&self) -> u64;
     fn into_version(self) -> Self::Version;
 }
