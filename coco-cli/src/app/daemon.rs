@@ -8,7 +8,7 @@ use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
 use coco_core::{ConversationEngine, CoreService, FixedBranchResolver};
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::{MessageQueueItem, SessionRole, Store};
+use coco_mem::{JobStatus, MessageQueueItem, SessionRole, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
@@ -36,6 +36,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const TELEGRAM_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
+const CHANNEL_BRANCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
@@ -401,7 +402,9 @@ where
 }
 
 struct TelegramMessageQueueWorker<B, S> {
+    branch: String,
     store: S,
+    engine: ConversationEngine<B, S>,
     service: CoreService<FixedBranchResolver, B, S>,
     notify: Arc<Notify>,
 }
@@ -413,9 +416,13 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
         engine: ConversationEngine<B, S>,
         notify: Arc<Notify>,
     ) -> Self {
+        let branch = branch.into();
+        let service = CoreService::new(FixedBranchResolver::new(branch.clone()), engine.clone());
         Self {
+            branch,
             store,
-            service: CoreService::new(FixedBranchResolver::new(branch), engine),
+            engine,
+            service,
             notify,
         }
     }
@@ -470,20 +477,86 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
             }
         };
 
+        let conversation_id = message.conversation_id.clone();
+        let sender_id = message.sender_id.clone();
+        let source_message_id = message.source_message_id.clone();
         tracing::info!(
             message_id = %item.message_id,
             queue = TELEGRAM_INBOUND_QUEUE,
-            conversation_id = %message.conversation_id,
-            sender_id = %message.sender_id,
+            branch = %self.branch,
+            conversation_id = %conversation_id,
+            sender_id = %sender_id,
+            source_message_id = ?source_message_id,
             "handling queued telegram inbound message"
         );
-        if let Err(error) = self.service.handle_message(message).await {
+
+        if let Err(error) =
+            wait_for_branch_to_accept_channel_prompt(&self.engine, &self.branch).await
+        {
             tracing::error!(
                 message_id = %item.message_id,
                 queue = TELEGRAM_INBOUND_QUEUE,
+                branch = %self.branch,
                 error = %error,
-                "queued telegram inbound message failed"
+                "queued telegram inbound message failed while waiting for branch"
             );
+            return;
+        }
+
+        match self.service.handle_message(message).await {
+            Ok(response) => {
+                tracing::debug!(
+                    message_id = %item.message_id,
+                    queue = TELEGRAM_INBOUND_QUEUE,
+                    branch = %self.branch,
+                    conversation_id = %conversation_id,
+                    sender_id = %sender_id,
+                    source_message_id = ?source_message_id,
+                    response_bytes = response.text.len(),
+                    "handled queued telegram inbound message"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    message_id = %item.message_id,
+                    queue = TELEGRAM_INBOUND_QUEUE,
+                    branch = %self.branch,
+                    error = %error,
+                    "queued telegram inbound message failed"
+                );
+            }
+        }
+    }
+}
+
+async fn wait_for_branch_to_accept_channel_prompt<B, S>(
+    engine: &ConversationEngine<B, S>,
+    branch: &str,
+) -> std::result::Result<(), coco_core::EngineError>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    loop {
+        let active_job = engine
+            .list_jobs()?
+            .into_values()
+            .filter(|job| job.branch == branch && !matches!(job.status, JobStatus::Finished))
+            .min_by_key(|job| job.created_at);
+        let Some(active_job) = active_job else {
+            return Ok(());
+        };
+
+        tracing::info!(
+            branch = %branch,
+            active_job_id = %active_job.job_id,
+            active_job_status = ?active_job.status,
+            "waiting for active branch prompt job before handling queued telegram message"
+        );
+
+        let snapshot = engine.drive_job(&active_job.job_id).await?;
+        if !matches!(snapshot.status, JobStatus::Finished) {
+            tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
         }
     }
 }
@@ -706,16 +779,26 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
 
+    use async_trait::async_trait;
     use coco_channel::{InboundMessage, MessageHandler};
-    use coco_mem::{MemoryStore, MessageQueueStore};
+    use coco_core::ConversationEngine;
+    use coco_llm::{
+        BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
+        SessionConfig, StepContext,
+    };
+    use coco_mem::{JobStatus, MemoryStore, MessageQueueStore, SessionRole};
     use serde_json::json;
     use tokio::sync::Notify;
 
     use super::{
-        TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher, decode_telegram_message,
-        encode_telegram_message, resolve_daemon_socket_path,
+        TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher, TelegramMessageQueueWorker,
+        decode_telegram_message, encode_telegram_message, resolve_daemon_socket_path,
     };
 
     #[test]
@@ -770,5 +853,132 @@ mod tests {
             decode_telegram_message(items[0].payload.clone()).unwrap(),
             message
         );
+    }
+
+    #[tokio::test]
+    async fn telegram_queue_worker_returns_after_message_processing_finishes() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let calls = backend.calls.clone();
+        let release_first = backend.release_first.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let message = InboundMessage::telegram("chat", "user", "first");
+        store
+            .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
+            .unwrap();
+        let worker = TelegramMessageQueueWorker::new(
+            "main",
+            store.clone(),
+            ConversationEngine::new(llm.clone()),
+            Arc::new(Notify::new()),
+        );
+
+        let drain_task = tokio::spawn(async move { worker.drain_once().await });
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!drain_task.is_finished());
+
+        release_first.notify_waiters();
+        assert_eq!(drain_task.await.unwrap().unwrap(), 1);
+        assert!(
+            store
+                .list_queue_messages(TELEGRAM_INBOUND_QUEUE)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_queue_worker_waits_for_active_target_branch_job() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let calls = backend.calls.clone();
+        let release_first = backend.release_first.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let engine = ConversationEngine::new(llm.clone());
+        let active_job = engine
+            .submit_job("main", "existing work", vec![])
+            .await
+            .unwrap();
+        let drive_engine = engine.clone();
+        let drive_task =
+            tokio::spawn(async move { drive_engine.drive_job(&active_job.job_id).await });
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
+
+        let message = InboundMessage::telegram("chat", "user", "next");
+        store
+            .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
+            .unwrap();
+        let worker =
+            TelegramMessageQueueWorker::new("main", store, engine, Arc::new(Notify::new()));
+        let drain_task = tokio::spawn(async move { worker.drain_once().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!drain_task.is_finished());
+
+        release_first.notify_waiters();
+        let snapshot = drive_task.await.unwrap().unwrap();
+        assert_eq!(snapshot.status, JobStatus::Finished);
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
+        assert_eq!(drain_task.await.unwrap().unwrap(), 1);
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct BlockingOnceBackend {
+        calls: Arc<AtomicUsize>,
+        release_first: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl CompletionBackend for BlockingOnceBackend {
+        async fn step(
+            &self,
+            _ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                self.release_first.notified().await;
+            }
+
+            Ok(BackendTurn {
+                message: CompletionMessage::assistant("done"),
+                events: vec![],
+                tool_calls: vec![],
+                final_text: Some("done".to_owned()),
+                trace_persisted: false,
+            })
+        }
+    }
+
+    fn session_config(branch: &str) -> SessionConfig {
+        SessionConfig {
+            branch: branch.to_owned(),
+            merge_parents: vec![],
+            provider_profile: None,
+            role: SessionRole::Orchestrator,
+            provider: Provider::OpenAi,
+            model: "gpt-4.1-mini".to_owned(),
+            system_prompt: "You are helpful.".to_owned(),
+            prompt: String::new(),
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+            enable_coco_shim: false,
+        }
+    }
+
+    async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("condition was not met before timeout");
     }
 }
