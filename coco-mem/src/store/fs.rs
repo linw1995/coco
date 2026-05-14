@@ -11,11 +11,10 @@ use snafu::prelude::*;
 
 use super::log::LogEntry;
 use super::projection::ProjectionContext;
-use super::snapshot::Snapshot;
 use super::state::StoreState;
 use super::versioned::{
-    VersionedLogEntry, VersionedSnapshot, VersionedValue, validate_record,
-    validate_snapshot_in_collection, versions_from_history,
+    VersionedLogEntry, VersionedRecord, VersionedValue, validate_record, validate_snapshot,
+    versions_from_history,
 };
 use super::{
     BranchConfigStore, BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore, SkillStore,
@@ -209,46 +208,6 @@ impl LogEntry for BranchConfigHistoryEntry {
 impl LogEntry for SkillHistoryEntry {
     fn log_key(&self) -> &str {
         &self.name
-    }
-}
-
-impl Snapshot for PersistedBranchConfigRecord {
-    fn snapshot_key(&self) -> &str {
-        &self.name
-    }
-}
-
-impl VersionedSnapshot for PersistedBranchConfigRecord {
-    type Version = BranchConfigVersion;
-
-    fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
-        self.current_version
-    }
-
-    fn matches_version(&self, version: &Self::Version) -> bool {
-        version.created_at == self.created_at && version.config == self.config
-    }
-}
-
-impl Snapshot for PersistedSkillRecord {
-    fn snapshot_key(&self) -> &str {
-        &self.name
-    }
-}
-
-impl VersionedSnapshot for PersistedSkillRecord {
-    type Version = SkillVersion;
-
-    fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
-        self.current_version
-    }
-
-    fn matches_version(&self, version: &Self::Version) -> bool {
-        version.created_at == self.created_at
-            && version.description == self.description
-            && version.body == self.body
-            && version.scripts == self.scripts
-            && version.enable_coco_shim == self.enable_coco_shim
     }
 }
 
@@ -1332,7 +1291,23 @@ fn validate_branch_config_snapshots(
 ) -> Result<()> {
     let context = ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME);
     for snapshot in current.values() {
-        validate_snapshot_in_collection(&context, snapshot, history)?;
+        let record = history.get(&snapshot.name).context(CorruptedStoreSnafu {
+            path: context.history_path().to_owned(),
+            message: format!(
+                "missing {} history for {:?}",
+                context.entity(),
+                snapshot.name
+            ),
+        })?;
+        validate_snapshot(
+            &context,
+            &snapshot.name,
+            snapshot.current_version,
+            record.versions(),
+            |version| {
+                version.created_at == snapshot.created_at && version.config == snapshot.config
+            },
+        )?;
     }
     Ok(())
 }
@@ -1386,7 +1361,27 @@ fn validate_skill_snapshots(current: &PersistedSkillGroups, history: &SkillGroup
             ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME);
         let history = history.for_role(role);
         for snapshot in records.values() {
-            validate_snapshot_in_collection(&context, snapshot, history)?;
+            let record = history.get(&snapshot.name).context(CorruptedStoreSnafu {
+                path: context.history_path().to_owned(),
+                message: format!(
+                    "missing {} history for {:?}",
+                    context.entity(),
+                    snapshot.name
+                ),
+            })?;
+            validate_snapshot(
+                &context,
+                &snapshot.name,
+                snapshot.current_version,
+                record.versions(),
+                |version| {
+                    version.created_at == snapshot.created_at
+                        && version.description == snapshot.description
+                        && version.body == snapshot.body
+                        && version.scripts == snapshot.scripts
+                        && version.enable_coco_shim == snapshot.enable_coco_shim
+                },
+            )?;
         }
     }
     Ok(())

@@ -3,10 +3,8 @@ use std::path::{Path, PathBuf};
 
 use snafu::prelude::*;
 
-use super::collection::{Collection, CollectionRecord};
 use super::log::LogEntry;
 use super::projection::ProjectionContext;
-use super::snapshot::Snapshot;
 use crate::StoreResult as Result;
 use crate::error::CorruptedStoreSnafu;
 use crate::{BranchConfigRecord, BranchConfigVersion, SkillRecord, SkillVersion};
@@ -35,9 +33,10 @@ pub trait VersionedValue {
 pub type VersionMap<V> = BTreeMap<<V as VersionedValue>::Id, V>;
 pub type VersionReplay<V> = (<V as VersionedValue>::Id, VersionMap<V>);
 
-pub trait VersionedRecord: CollectionRecord {
+pub trait VersionedRecord {
     type Version: VersionedValue;
 
+    fn record_key(&self) -> &str;
     fn current_version(&self) -> <Self::Version as VersionedValue>::Id;
     fn versions(&self) -> &VersionMap<Self::Version>;
 }
@@ -47,13 +46,6 @@ pub trait VersionedLogEntry: Clone + LogEntry {
 
     fn version(&self) -> <Self::Version as VersionedValue>::Id;
     fn into_version(self) -> Self::Version;
-}
-
-pub trait VersionedSnapshot: Snapshot {
-    type Version: VersionedValue;
-
-    fn current_version(&self) -> <Self::Version as VersionedValue>::Id;
-    fn matches_version(&self, version: &Self::Version) -> bool;
 }
 
 impl VersionedValue for BranchConfigVersion {
@@ -75,6 +67,10 @@ impl VersionedValue for SkillVersion {
 impl VersionedRecord for BranchConfigRecord {
     type Version = BranchConfigVersion;
 
+    fn record_key(&self) -> &str {
+        &self.name
+    }
+
     fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
         self.current_version
     }
@@ -86,6 +82,10 @@ impl VersionedRecord for BranchConfigRecord {
 
 impl VersionedRecord for SkillRecord {
     type Version = SkillVersion;
+
+    fn record_key(&self) -> &str {
+        &self.name
+    }
 
     fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
         self.current_version
@@ -107,7 +107,7 @@ where
             message: format!(
                 "{} {:?} has no versions",
                 context.entity(),
-                record.collection_key()
+                record.record_key()
             ),
         }
     );
@@ -118,12 +118,12 @@ where
             message: format!(
                 "{} {:?} missing current version {}",
                 context.entity(),
-                record.collection_key(),
+                record.record_key(),
                 record.current_version()
             ),
         }
     );
-    validate_versions(context, path, record.collection_key(), record.versions())
+    validate_versions(context, path, record.record_key(), record.versions())
 }
 
 pub(crate) fn versions_from_history<E>(
@@ -189,55 +189,35 @@ where
     Ok((current_version, versions))
 }
 
-pub(crate) fn validate_snapshot_in_collection<C, S>(
+pub(crate) fn validate_snapshot<V>(
     context: &ProjectionContext,
-    snapshot: &S,
-    collection: &C,
+    snapshot_key: &str,
+    current_version: V::Id,
+    versions: &VersionMap<V>,
+    matches_version: impl FnOnce(&V) -> bool,
 ) -> Result<()>
 where
-    C: Collection,
-    C::Record: VersionedRecord,
-    S: VersionedSnapshot<Version = <C::Record as VersionedRecord>::Version>,
+    V: VersionedValue,
 {
-    let record = collection
-        .get_record(snapshot.snapshot_key())
+    let persisted_current = versions
+        .get(&current_version)
         .context(CorruptedStoreSnafu {
             path: context.history_path().to_owned(),
             message: format!(
-                "missing {} history for {:?}",
+                "missing current {} version {} for {:?}",
                 context.entity(),
-                snapshot.snapshot_key()
+                current_version,
+                snapshot_key
             ),
         })?;
-    validate_snapshot(context, snapshot, record)
-}
-
-fn validate_snapshot<S, R>(context: &ProjectionContext, snapshot: &S, record: &R) -> Result<()>
-where
-    S: VersionedSnapshot<Version = R::Version>,
-    R: VersionedRecord,
-{
-    let persisted_current =
-        record
-            .versions()
-            .get(&snapshot.current_version())
-            .context(CorruptedStoreSnafu {
-                path: context.history_path().to_owned(),
-                message: format!(
-                    "missing current {} version {} for {:?}",
-                    context.entity(),
-                    snapshot.current_version(),
-                    snapshot.snapshot_key()
-                ),
-            })?;
     ensure!(
-        snapshot.matches_version(persisted_current),
+        matches_version(persisted_current),
         CorruptedStoreSnafu {
             path: context.history_path().to_owned(),
             message: format!(
                 "current {} snapshot mismatch for {:?}",
                 context.entity(),
-                snapshot.snapshot_key()
+                snapshot_key
             ),
         }
     );
