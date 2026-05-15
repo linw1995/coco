@@ -15,10 +15,10 @@ use crate::error::{
     SkillAlreadyExistsSnafu, SkillNotFoundSnafu, SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
-    Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind, NewNode, Node,
-    PauseReason, ProviderProfile, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
-    SessionState, SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
-    default_skill_groups,
+    Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind,
+    MessageQueueItem, NewNode, Node, PauseReason, ProviderProfile, Role, SessionAnchor,
+    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
+    SkillVersionSpec, default_skill_groups,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +31,7 @@ pub struct StoreState {
     pub branch_configs: HashMap<String, BranchConfigRecord>,
     pub provider_profiles: HashMap<String, ProviderProfile>,
     pub jobs: HashMap<String, Job>,
+    pub message_queues: HashMap<String, Vec<MessageQueueItem>>,
     pub skill_groups: SkillGroups,
 }
 
@@ -78,6 +79,7 @@ impl StoreState {
             branch_configs: HashMap::new(),
             provider_profiles: HashMap::new(),
             jobs: HashMap::new(),
+            message_queues: HashMap::new(),
             skill_groups: default_skill_groups(),
         }
     }
@@ -96,6 +98,7 @@ impl StoreState {
             branch_configs: HashMap::new(),
             provider_profiles: HashMap::new(),
             jobs: HashMap::new(),
+            message_queues: HashMap::new(),
             skill_groups: default_skill_groups(),
         }
     }
@@ -565,6 +568,32 @@ impl StoreState {
             _ => None,
         };
         Ok(job.clone())
+    }
+
+    pub fn enqueue_message(&mut self, queue: &str, payload: serde_json::Value) -> MessageQueueItem {
+        let item = MessageQueueItem::new(queue, payload, Timestamp::now());
+        self.message_queues
+            .entry(queue.to_owned())
+            .or_default()
+            .push(item.clone());
+        item
+    }
+
+    pub fn dequeue_message(&mut self, queue: &str) -> Option<MessageQueueItem> {
+        let messages = self.message_queues.get_mut(queue)?;
+        if messages.is_empty() {
+            return None;
+        }
+
+        let item = messages.remove(0);
+        if messages.is_empty() {
+            self.message_queues.remove(queue);
+        }
+        Some(item)
+    }
+
+    pub fn list_queue_messages(&self, queue: &str) -> Vec<MessageQueueItem> {
+        self.message_queues.get(queue).cloned().unwrap_or_default()
     }
 
     fn next_job_id(&self) -> String {

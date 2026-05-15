@@ -18,7 +18,8 @@ use super::versioned::{
     validate_snapshot_in_collection, versions_from_history,
 };
 use super::{
-    BranchConfigStore, BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore, SkillStore,
+    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, RuntimeStore,
+    SessionStore, SkillStore,
 };
 use crate::error::{
     CorruptedStoreSnafu, ParseStoreLogSnafu, ParseStoreMetaSnafu, SerializeStoreRecordSnafu,
@@ -26,19 +27,20 @@ use crate::error::{
     WriteStoreLogSnafu, WriteStoreMetaSnafu,
 };
 use crate::{
-    BranchConfig, BranchConfigRecord, BranchConfigVersion, Job, JobStatus, NewNode, Node,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillScript,
-    SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError, StoreResult as Result,
-    default_skill_groups,
+    BranchConfig, BranchConfigRecord, BranchConfigVersion, Job, JobStatus, MessageQueueItem,
+    NewNode, Node, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
+    SkillScript, SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError,
+    StoreResult as Result, default_skill_groups,
 };
 
-const STORE_FORMAT_VERSION: u64 = 7;
+const STORE_FORMAT_VERSION: u64 = 9;
 const LEGACY_STORE_FORMAT_VERSION: u64 = 6;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
 const BRANCH_CONFIGS_FILE_NAME: &str = "branch-configs.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
+const QUEUES_FILE_NAME: &str = "queues.jsonl";
 const SKILLS_FILE_NAME: &str = "skills.json";
 const BRANCH_CONFIG_HISTORY_DIR_NAME: &str = "branch-config-history";
 const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
@@ -47,6 +49,7 @@ const ORCHESTRATOR_SKILL_HISTORY_DIR_NAME: &str = "orchestrator";
 const RUNNER_SKILL_HISTORY_DIR_NAME: &str = "runner";
 const BRANCHES_DIR_NAME: &str = "branches";
 const LOCK_FILE_NAME: &str = "store.lock";
+const MESSAGE_QUEUE_COMPACT_MIN_LOG_ENTRIES: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct FsStore {
@@ -64,6 +67,7 @@ pub struct Persistence {
     sessions_path: PathBuf,
     branch_configs_path: PathBuf,
     jobs_path: PathBuf,
+    queues_path: PathBuf,
     skills_path: PathBuf,
     branch_config_history_dir: PathBuf,
     skill_history_dir: PathBuf,
@@ -100,6 +104,13 @@ struct BranchConfigHistoryEntry {
     created_at: jiff::Timestamp,
     #[serde(flatten)]
     config: BranchConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum MessageQueueHistoryEntry {
+    Enqueued { item: MessageQueueItem },
+    Dequeued { queue: String, message_id: String },
 }
 
 #[derive(Debug, Default)]
@@ -209,6 +220,15 @@ impl LogEntry for BranchConfigHistoryEntry {
 impl LogEntry for SkillHistoryEntry {
     fn log_key(&self) -> &str {
         &self.name
+    }
+}
+
+impl LogEntry for MessageQueueHistoryEntry {
+    fn log_key(&self) -> &str {
+        match self {
+            Self::Enqueued { item } => &item.message_id,
+            Self::Dequeued { message_id, .. } => message_id,
+        }
     }
 }
 
@@ -643,6 +663,7 @@ impl Persistence {
             sessions_path: path.join(SESSIONS_FILE_NAME),
             branch_configs_path: path.join(BRANCH_CONFIGS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
+            queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             branch_config_history_dir: path.join(BRANCH_CONFIG_HISTORY_DIR_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
@@ -672,6 +693,7 @@ impl Persistence {
             sessions_path: path.join(SESSIONS_FILE_NAME),
             branch_configs_path: path.join(BRANCH_CONFIGS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
+            queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             branch_config_history_dir: path.join(BRANCH_CONFIG_HISTORY_DIR_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
@@ -881,6 +903,7 @@ impl Persistence {
             &HashMap::<String, PersistedBranchConfigRecord>::new(),
         )?;
         write_json_file(&self.jobs_path, &HashMap::<String, Job>::new())?;
+        write_jsonl_file(&self.queues_path, &[] as &[MessageQueueHistoryEntry])?;
         write_json_file(
             &self.skills_path,
             &PersistedSkillGroups::from_groups(&skill_groups),
@@ -941,7 +964,7 @@ impl Persistence {
         ensure!(
             matches!(
                 meta.version,
-                LEGACY_STORE_FORMAT_VERSION | STORE_FORMAT_VERSION
+                LEGACY_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION
             ),
             CorruptedStoreSnafu {
                 path: self.meta_path.clone(),
@@ -1062,6 +1085,13 @@ impl Persistence {
         validate_branch_config_snapshots(&branch_config_snapshots.current, &branch_configs)?;
         store.branch_configs = branch_configs;
         store.jobs = read_json_file::<HashMap<String, Job>>(&self.jobs_path)?;
+        let (message_queues, message_queue_log_len) = self.load_message_queues()?;
+        store.message_queues = message_queues;
+        if self.access == StoreAccess::ReadWrite
+            && message_queue_log_should_compact(&store.message_queues, message_queue_log_len)
+        {
+            self.rewrite_message_queue_history(&store)?;
+        }
         let skill_groups = read_json_file::<PersistedSkillGroups>(&self.skills_path)?;
         if skill_groups.is_empty() {
             store.skill_groups = default_skill_groups();
@@ -1120,6 +1150,43 @@ impl Persistence {
         self.ensure_writable()?;
         write_json_file(&self.jobs_path, &state.jobs)
     }
+
+    fn load_message_queues(&self) -> Result<(HashMap<String, Vec<MessageQueueItem>>, usize)> {
+        if self.queues_path.exists() {
+            ensure!(
+                self.queues_path.is_file(),
+                CorruptedStoreSnafu {
+                    path: self.queues_path.clone(),
+                    message: "message queue WAL entry must be a file".to_owned(),
+                }
+            );
+            let entries = read_jsonl_file::<MessageQueueHistoryEntry>(&self.queues_path)?;
+            let len = entries.len();
+            return Ok((message_queues_from_history(entries), len));
+        }
+
+        if self.access == StoreAccess::ReadWrite {
+            write_jsonl_file(&self.queues_path, &[] as &[MessageQueueHistoryEntry])?;
+        }
+        Ok((HashMap::new(), 0))
+    }
+
+    fn append_message_queue_history_entry(&self, entry: &MessageQueueHistoryEntry) -> Result<()> {
+        self.ensure_writable()?;
+        append_jsonl_record_create(&self.queues_path, entry)
+    }
+
+    fn rewrite_message_queue_history(&self, state: &StoreState) -> Result<()> {
+        self.ensure_writable()?;
+        self.rewrite_message_queue_history_from_map(&state.message_queues)
+    }
+
+    fn rewrite_message_queue_history_from_map(
+        &self,
+        queues: &HashMap<String, Vec<MessageQueueItem>>,
+    ) -> Result<()> {
+        write_jsonl_file(&self.queues_path, &message_queue_history_entries(queues))
+    }
 }
 
 fn load_skill_groups_from_history(
@@ -1143,6 +1210,62 @@ fn persisted_branch_config_records(
             )
         })
         .collect()
+}
+
+fn message_queues_from_history(
+    entries: Vec<MessageQueueHistoryEntry>,
+) -> HashMap<String, Vec<MessageQueueItem>> {
+    let mut queues = HashMap::<String, Vec<MessageQueueItem>>::new();
+    for entry in entries {
+        match entry {
+            MessageQueueHistoryEntry::Enqueued { item } => {
+                queues.entry(item.queue.clone()).or_default().push(item);
+            }
+            MessageQueueHistoryEntry::Dequeued { queue, message_id } => {
+                if let Some(items) = queues.get_mut(&queue) {
+                    if let Some(index) = items.iter().position(|item| item.message_id == message_id)
+                    {
+                        items.remove(index);
+                    }
+                    if items.is_empty() {
+                        queues.remove(&queue);
+                    }
+                }
+            }
+        }
+    }
+    queues
+}
+
+fn message_queue_history_entries(
+    queues: &HashMap<String, Vec<MessageQueueItem>>,
+) -> Vec<MessageQueueHistoryEntry> {
+    let mut entries = Vec::new();
+    let mut queue_names = queues.keys().collect::<Vec<_>>();
+    queue_names.sort();
+    for queue in queue_names {
+        if let Some(items) = queues.get(queue) {
+            entries.extend(
+                items
+                    .iter()
+                    .cloned()
+                    .map(|item| MessageQueueHistoryEntry::Enqueued { item }),
+            );
+        }
+    }
+    entries
+}
+
+fn message_queue_log_should_compact(
+    queues: &HashMap<String, Vec<MessageQueueItem>>,
+    log_len: usize,
+) -> bool {
+    let live_len = queues.values().map(Vec::len).sum::<usize>();
+    if live_len == 0 {
+        return log_len > 0;
+    }
+
+    log_len >= MESSAGE_QUEUE_COMPACT_MIN_LOG_ENTRIES && log_len > live_len.saturating_mul(2)
 }
 
 fn open_store_lock(store_dir: &Path) -> Result<Arc<File>> {
@@ -1861,6 +1984,48 @@ impl JobStore for FsStore {
         self.persistence.persist_jobs(&temp)?;
         state.jobs = temp.jobs;
         Ok(updated)
+    }
+}
+
+impl MessageQueueStore for FsStore {
+    fn enqueue_message(&self, queue: &str, payload: serde_json::Value) -> Result<MessageQueueItem> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let item = temp.enqueue_message(queue, payload);
+        self.persistence.append_message_queue_history_entry(
+            &MessageQueueHistoryEntry::Enqueued { item: item.clone() },
+        )?;
+        state.message_queues = temp.message_queues;
+        Ok(item)
+    }
+
+    fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let item = temp.dequeue_message(queue);
+        let Some(item) = item else {
+            return Ok(None);
+        };
+
+        self.persistence.append_message_queue_history_entry(
+            &MessageQueueHistoryEntry::Dequeued {
+                queue: queue.to_owned(),
+                message_id: item.message_id.clone(),
+            },
+        )?;
+        state.message_queues = temp.message_queues;
+        if state.message_queues.is_empty() {
+            let _ = self.persistence.rewrite_message_queue_history(&state);
+        }
+        Ok(Some(item))
+    }
+
+    fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_queue_messages(queue))
     }
 }
 
