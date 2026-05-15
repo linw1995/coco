@@ -9,8 +9,8 @@ use super::{
 use crate::StoreResult as Result;
 use crate::{
     BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
-    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
-    SkillUpdatePatch, SkillVersionSpec,
+    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch,
+    SkillVersionSpec,
 };
 
 #[derive(Clone, Debug)]
@@ -241,14 +241,6 @@ impl ProviderProfileStore for MemoryStore {
 }
 
 impl SkillStore for MemoryStore {
-    fn skill_groups(&self) -> Result<SkillGroups> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .skill_groups())
-    }
-
     fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
         Ok(self
             .inner

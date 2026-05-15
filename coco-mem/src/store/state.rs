@@ -437,10 +437,6 @@ impl StoreState {
         Ok(job)
     }
 
-    pub fn skill_groups(&self) -> SkillGroups {
-        self.skill_groups.clone()
-    }
-
     pub fn list_skills(&self, role: SessionRole) -> Vec<SkillRecord> {
         self.skill_groups.for_role(role).values().cloned().collect()
     }

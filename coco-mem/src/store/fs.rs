@@ -2012,14 +2012,6 @@ impl BranchConfigStore for FsStore {
 }
 
 impl SkillStore for FsStore {
-    fn skill_groups(&self) -> Result<SkillGroups> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .skill_groups())
-    }
-
     fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
         Ok(self
             .inner

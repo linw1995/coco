@@ -5,8 +5,7 @@ use coco_mem::{
     BranchConfig, BranchConfigRecord, BranchConfigStore, BranchStore, Job, JobStatus, JobStore,
     MessageQueueItem, MessageQueueStore, NewNode, Node, NodeStore, ProviderProfile,
     ProviderProfileStore, RuntimeStore, SessionAnchorPatch, SessionRole, SessionState,
-    SessionStore, SkillGroups, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersionSpec,
-    StoreResult,
+    SessionStore, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 use crate::ConsolePublisher;
@@ -192,10 +191,6 @@ impl<S> SkillStore for ConsoleStore<S>
 where
     S: SkillStore,
 {
-    fn skill_groups(&self) -> StoreResult<SkillGroups> {
-        self.inner.skill_groups()
-    }
-
     fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>> {
         self.inner.list_skills(role)
     }

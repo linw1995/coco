@@ -11,8 +11,8 @@ mod tests;
 
 use crate::{
     BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
-    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
-    SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch,
+    SkillVersionSpec, StoreResult,
 };
 
 /// Node graph storage API used by CoCo services.
@@ -127,9 +127,6 @@ pub trait ProviderProfileStore {
 
 /// Persisted skill storage API.
 pub trait SkillStore {
-    /// Returns the persisted skill groups.
-    fn skill_groups(&self) -> StoreResult<SkillGroups>;
-
     /// Returns all persisted skills for the given role.
     fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>>;
 
