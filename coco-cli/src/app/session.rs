@@ -336,6 +336,7 @@ pub fn resolve_session_config(
         .get_provider_profile(&provider_profile)
         .context(StoreSnafu)?;
     let provider = coco_llm::Provider::parse(&profile.provider).context(LlmSnafu)?;
+    let profile_additional_params = coco_llm::provider_profile_additional_params(&profile);
     let model = profile
         .default_model
         .context(MissingProviderProfileModelSnafu {
@@ -346,7 +347,10 @@ pub fn resolve_session_config(
     } else {
         resolve_cli_tools(&command.tools)
     };
-    let additional_params = parse_session_additional_params(command.additional_params)?;
+    let additional_params = coco_llm::merge_completion_additional_params(
+        profile_additional_params,
+        parse_session_additional_params(command.additional_params)?,
+    );
 
     let enable_coco_shim = command.enable_coco_shim && !command.disable_coco_shim;
 

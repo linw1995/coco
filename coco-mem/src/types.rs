@@ -182,6 +182,17 @@ pub struct ProviderProfile {
     pub base_url: Option<String>,
     #[serde(default)]
     pub default_model: Option<String>,
+    #[serde(
+        default,
+        alias = "model_reasoning_effort",
+        alias = "reasoning_effort",
+        alias = "reasoning-level"
+    )]
+    pub reasoning_level: Option<String>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    #[serde(default)]
+    pub fast: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
