@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use super::state::StoreState;
 use super::{
     BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, ProviderProfileStore,
-    RuntimeStore, SessionStore, SkillStore,
+    SessionStore, SkillStore,
 };
 use crate::StoreResult as Result;
 use crate::{
@@ -345,5 +345,3 @@ impl MessageQueueStore for MemoryStore {
             .list_queue_messages(queue))
     }
 }
-
-impl RuntimeStore for MemoryStore {}

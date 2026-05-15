@@ -1,8 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, Node, NodeStore,
-    RuntimeStore, SessionStore, SkillStore,
+    SessionStore, SkillStore,
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
@@ -70,6 +70,10 @@ impl<B, S> ConversationEngine<B, S> {
     pub(crate) fn service(&self) -> &Arc<LlmService<B, S>> {
         &self.service
     }
+
+    pub fn runtime_store_path(&self) -> Option<&Path> {
+        self.service.runtime_store_path()
+    }
 }
 
 impl<B, S> ConversationEngine<B, S>
@@ -79,7 +83,6 @@ where
         + BranchStore
         + SessionStore
         + JobStore
-        + RuntimeStore
         + SkillStore
         + Clone
         + Send

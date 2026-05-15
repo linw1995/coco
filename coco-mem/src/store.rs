@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 
 pub(crate) mod fs;
 pub mod memory;
@@ -196,12 +196,10 @@ pub trait MessageQueueStore {
     fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;
 }
 
-/// Optional runtime metadata for stores with a process-shareable backing path.
-pub trait RuntimeStore {
-    /// Returns the backing store directory when the store is process-shareable.
-    fn runtime_store_path(&self) -> Option<PathBuf> {
-        None
-    }
+/// Capability for stores with a process-shareable backing path.
+pub trait ProcessShareableStore {
+    /// Returns the backing store directory that another process can reopen.
+    fn store_path(&self) -> &Path;
 }
 
 /// Complete storage API used by CoCo application services.
@@ -213,7 +211,6 @@ pub trait Store:
     + SkillStore
     + JobStore
     + MessageQueueStore
-    + RuntimeStore
 {
 }
 
@@ -225,6 +222,5 @@ impl<T> Store for T where
         + SkillStore
         + JobStore
         + MessageQueueStore
-        + RuntimeStore
 {
 }

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use coco_console::{ConsolePublisher, ConsoleStore};
@@ -9,7 +10,7 @@ use coco_llm::{
     CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge, LlmService, ProviderRuntimeConfig,
     RigBackend, UnifiedExecCliBridgeHandle,
 };
-use coco_mem::{ProviderProfileStore, Store};
+use coco_mem::{ProcessShareableStore, ProviderProfileStore, Store};
 use snafu::prelude::*;
 
 #[cfg(test)]
@@ -62,6 +63,7 @@ where
                 backend,
                 provider_profiles.clone(),
                 provider_configs,
+                Some(shared_store.store_path().to_path_buf()),
             );
             daemon::run_daemon_command(
                 command,
@@ -84,6 +86,7 @@ where
                 backend,
                 provider_profiles.clone(),
                 provider_configs,
+                Some(shared_store.store_path().to_path_buf()),
             );
 
             run_with_services_with_provider_profiles(
@@ -146,6 +149,7 @@ fn build_llm_service<B, S>(
     backend: B,
     provider_profiles: config::ProviderProfiles,
     provider_configs: HashMap<String, ProviderRuntimeConfig>,
+    store_path: Option<PathBuf>,
 ) -> Arc<LlmService<B, S>>
 where
     B: CompletionBackend + 'static,
@@ -185,6 +189,7 @@ where
             .with_provider_configs(provider_configs)
             .with_unified_exec_cli_bridge(unified_exec_bridge)
             .with_skill_search_executor(skill_bridge)
+            .with_optional_store_path(store_path)
             .build()
     })
 }

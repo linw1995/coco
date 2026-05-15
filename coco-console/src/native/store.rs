@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 
 use coco_mem::{
     BranchConfig, BranchConfigRecord, BranchConfigStore, BranchStore, Job, JobStatus, JobStore,
-    MessageQueueItem, MessageQueueStore, NewNode, Node, NodeStore, ProviderProfile,
-    ProviderProfileStore, RuntimeStore, SessionAnchorPatch, SessionRole, SessionState,
+    MessageQueueItem, MessageQueueStore, NewNode, Node, NodeStore, ProcessShareableStore,
+    ProviderProfile, ProviderProfileStore, SessionAnchorPatch, SessionRole, SessionState,
     SessionStore, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
@@ -274,11 +274,11 @@ where
     }
 }
 
-impl<S> RuntimeStore for ConsoleStore<S>
+impl<S> ProcessShareableStore for ConsoleStore<S>
 where
-    S: RuntimeStore,
+    S: ProcessShareableStore,
 {
-    fn runtime_store_path(&self) -> Option<PathBuf> {
-        self.inner.runtime_store_path()
+    fn store_path(&self) -> &Path {
+        self.inner.store_path()
     }
 }

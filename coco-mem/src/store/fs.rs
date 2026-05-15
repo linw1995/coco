@@ -12,7 +12,7 @@ use snafu::prelude::*;
 use super::projection::ProjectionContext;
 use super::state::StoreState;
 use super::{
-    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, RuntimeStore,
+    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, ProcessShareableStore,
     SessionStore, SkillStore,
 };
 use crate::error::{
@@ -2173,9 +2173,9 @@ impl MessageQueueStore for FsStore {
     }
 }
 
-impl RuntimeStore for FsStore {
-    fn runtime_store_path(&self) -> Option<PathBuf> {
-        Some(self.path().to_path_buf())
+impl ProcessShareableStore for FsStore {
+    fn store_path(&self) -> &Path {
+        self.path()
     }
 }
 

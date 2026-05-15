@@ -16,8 +16,8 @@ use coco_llm::{
     ProviderRuntimeConfig, StepContext,
 };
 use coco_mem::{
-    BranchConfigStore, ProviderProfile, ProviderProfileStore, SessionState, SkillStore,
-    SkillVersionSpec,
+    BranchConfigStore, ProcessShareableStore, ProviderProfile, ProviderProfileStore, SessionState,
+    SkillStore, SkillVersionSpec,
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -573,6 +573,7 @@ where
     let llm = Arc::new(
         coco_llm::LlmService::builder(store.clone(), backend)
             .with_provider_configs(provider_configs)
+            .with_store_path(store.store_path())
             .build(),
     );
 
