@@ -10,9 +10,9 @@ pub(crate) mod state;
 mod tests;
 
 use crate::{
-    BranchConfig, BranchConfigRecord, Job, JobStatus, NewNode, Node, ProviderProfile,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
-    SkillVersionSpec, StoreResult,
+    BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
+    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
+    SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 /// Node graph storage API used by CoCo services.
@@ -183,6 +183,22 @@ pub trait JobStore {
     ) -> StoreResult<Job>;
 }
 
+/// Generic persistent message queue storage API.
+pub trait MessageQueueStore {
+    /// Enqueues one message in a named queue.
+    fn enqueue_message(
+        &self,
+        queue: &str,
+        payload: serde_json::Value,
+    ) -> StoreResult<MessageQueueItem>;
+
+    /// Removes and returns the oldest message in a named queue.
+    fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
+
+    /// Returns all persisted messages for a named queue in dequeue order.
+    fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;
+}
+
 /// Optional runtime metadata for stores with a process-shareable backing path.
 pub trait RuntimeStore {
     /// Returns the backing store directory when the store is process-shareable.
@@ -193,7 +209,14 @@ pub trait RuntimeStore {
 
 /// Complete storage API used by CoCo application services.
 pub trait Store:
-    NodeStore + BranchStore + SessionStore + BranchConfigStore + SkillStore + JobStore + RuntimeStore
+    NodeStore
+    + BranchStore
+    + SessionStore
+    + BranchConfigStore
+    + SkillStore
+    + JobStore
+    + MessageQueueStore
+    + RuntimeStore
 {
 }
 
@@ -204,6 +227,7 @@ impl<T> Store for T where
         + BranchConfigStore
         + SkillStore
         + JobStore
+        + MessageQueueStore
         + RuntimeStore
 {
 }

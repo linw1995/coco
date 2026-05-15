@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use coco_mem::{
     BranchConfig, BranchConfigRecord, BranchConfigStore, BranchStore, Job, JobStatus, JobStore,
-    NewNode, Node, NodeStore, ProviderProfile, ProviderProfileStore, RuntimeStore,
-    SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillGroups, SkillRecord,
-    SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    MessageQueueItem, MessageQueueStore, NewNode, Node, NodeStore, ProviderProfile,
+    ProviderProfileStore, RuntimeStore, SessionAnchorPatch, SessionRole, SessionState,
+    SessionStore, SkillGroups, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersionSpec,
+    StoreResult,
 };
 
 use crate::ConsolePublisher;
@@ -254,6 +255,27 @@ where
         next: JobStatus,
     ) -> StoreResult<Job> {
         self.notify_if_ok(self.inner.set_job_status(job_id, expected, next))
+    }
+}
+
+impl<S> MessageQueueStore for ConsoleStore<S>
+where
+    S: MessageQueueStore,
+{
+    fn enqueue_message(
+        &self,
+        queue: &str,
+        payload: serde_json::Value,
+    ) -> StoreResult<MessageQueueItem> {
+        self.notify_if_ok(self.inner.enqueue_message(queue, payload))
+    }
+
+    fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
+        self.notify_if_ok(self.inner.dequeue_message(queue))
+    }
+
+    fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>> {
+        self.inner.list_queue_messages(queue)
     }
 }
 

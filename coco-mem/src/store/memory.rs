@@ -3,14 +3,14 @@ use std::sync::{Arc, RwLock};
 
 use super::state::StoreState;
 use super::{
-    BranchConfigStore, BranchStore, JobStore, NodeStore, ProviderProfileStore, RuntimeStore,
-    SessionStore, SkillStore,
+    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, ProviderProfileStore,
+    RuntimeStore, SessionStore, SkillStore,
 };
 use crate::StoreResult as Result;
 use crate::{
-    BranchConfig, BranchConfigRecord, Job, JobStatus, NewNode, Node, ProviderProfile,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
-    SkillVersionSpec,
+    BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
+    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
+    SkillUpdatePatch, SkillVersionSpec,
 };
 
 #[derive(Clone, Debug)]
@@ -325,6 +325,32 @@ impl JobStore for MemoryStore {
             .write()
             .expect("store lock poisoned")
             .set_job_status(job_id, expected, next)
+    }
+}
+
+impl MessageQueueStore for MemoryStore {
+    fn enqueue_message(&self, queue: &str, payload: serde_json::Value) -> Result<MessageQueueItem> {
+        Ok(self
+            .inner
+            .write()
+            .expect("store lock poisoned")
+            .enqueue_message(queue, payload))
+    }
+
+    fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        Ok(self
+            .inner
+            .write()
+            .expect("store lock poisoned")
+            .dequeue_message(queue))
+    }
+
+    fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_queue_messages(queue))
     }
 }
 

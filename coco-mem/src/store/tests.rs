@@ -8,9 +8,9 @@ use super::memory::MemoryStore;
 use super::state::StoreState;
 use crate::{
     Anchor, BranchConfig, BranchConfigStore, BranchStore, JobStatus, JobStore, Kind, MergeParent,
-    NewNode, Node, NodeStore, PauseReason, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch,
-    SessionRole, SessionState, SessionStore, SkillScript, SkillStore, SkillUpdatePatch,
-    SkillVersionSpec, StoreError as Error,
+    MessageQueueItem, MessageQueueStore, NewNode, Node, NodeStore, PauseReason, PromptAnchor, Role,
+    SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillScript,
+    SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError as Error,
 };
 use serde_json::json;
 
@@ -157,6 +157,7 @@ trait TestStoreFactory {
         + BranchStore
         + InspectableStore
         + JobStore
+        + MessageQueueStore
         + NodeStore
         + SessionStore
         + SkillStore;
@@ -1609,6 +1610,86 @@ where
     assert_eq!(second.status, JobStatus::Queued);
 }
 
+fn assert_message_queue_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let first = store
+        .enqueue_message("hooks", json!({"text": "first"}))
+        .unwrap();
+    let second = store
+        .enqueue_message("hooks", json!({"text": "second"}))
+        .unwrap();
+
+    assert_eq!(
+        store.list_queue_messages("hooks").unwrap(),
+        vec![first.clone(), second.clone(),]
+    );
+    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(first));
+    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(second));
+    assert_eq!(store.dequeue_message("hooks").unwrap(), None);
+    assert!(store.list_queue_messages("hooks").unwrap().is_empty());
+}
+
+fn assert_message_queue_isolates_named_queues<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let hook = store
+        .enqueue_message("hooks", json!({"text": "hook"}))
+        .unwrap();
+    let scheduler = store
+        .enqueue_message("scheduler", json!({"text": "scheduler"}))
+        .unwrap();
+
+    assert_eq!(
+        store.list_queue_messages("hooks").unwrap(),
+        vec![hook.clone()]
+    );
+    assert_eq!(
+        store.list_queue_messages("scheduler").unwrap(),
+        vec![scheduler.clone()]
+    );
+    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(hook));
+    assert_eq!(store.dequeue_message("scheduler").unwrap(), Some(scheduler));
+}
+
+fn assert_message_queue_ids_are_content_derived<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let first = store
+        .enqueue_message("hooks", json!({"text": "same"}))
+        .unwrap();
+    let second = store
+        .enqueue_message("hooks", json!({"text": "same"}))
+        .unwrap();
+
+    assert_ne!(first.message_id, second.message_id);
+    assert_eq!(first.message_id.len(), 64);
+    assert!(
+        first
+            .message_id
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    );
+
+    let same = MessageQueueItem::new(first.queue.clone(), first.payload.clone(), first.created_at);
+    let different_queue = MessageQueueItem::new("other", first.payload.clone(), first.created_at);
+    let different_payload = MessageQueueItem::new(
+        first.queue.clone(),
+        json!({"text": "different"}),
+        first.created_at,
+    );
+
+    assert_eq!(same.message_id, first.message_id);
+    assert_ne!(different_queue.message_id, first.message_id);
+    assert_ne!(different_payload.message_id, first.message_id);
+}
+
 fn assert_add_skill_starts_at_version_one<F>()
 where
     F: TestStoreFactory,
@@ -2137,6 +2218,21 @@ macro_rules! define_common_store_tests {
                 assert_submit_job_allows_new_job_after_previous_job_finishes::<$factory>();
             }
 
+            #[test]
+            fn message_queue_round_trip() {
+                assert_message_queue_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn message_queue_isolates_named_queues() {
+                assert_message_queue_isolates_named_queues::<$factory>();
+            }
+
+            #[test]
+            fn message_queue_ids_are_content_derived() {
+                assert_message_queue_ids_are_content_derived::<$factory>();
+            }
+
         }
     };
 }
@@ -2458,7 +2554,81 @@ fn open_upgrades_legacy_store_format_version() {
 
     let upgraded: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(upgraded["version"], 7);
+    assert_eq!(upgraded["version"], 9);
+}
+
+#[test]
+fn open_reads_legacy_store_without_message_queues_file() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!(7);
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(path.join("queues.jsonl")).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert!(reopened.list_queue_messages("hooks").unwrap().is_empty());
+    assert!(path.join("queues.jsonl").is_file());
+}
+
+#[test]
+fn queue_messages_survive_fs_store_reopen() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let item = store
+        .enqueue_message("hooks", json!({"text": "persisted"}))
+        .unwrap();
+
+    drop(store);
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.list_queue_messages("hooks").unwrap(), vec![item]);
+}
+
+#[test]
+fn queue_wal_records_dequeue_before_state_change() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let first = store
+        .enqueue_message("hooks", json!({"text": "first"}))
+        .unwrap();
+    let second = store
+        .enqueue_message("hooks", json!({"text": "second"}))
+        .unwrap();
+
+    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(first.clone()));
+
+    let entries = read_jsonl_values(&path.join("queues.jsonl"));
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["op"], "enqueued");
+    assert_eq!(entries[1]["op"], "enqueued");
+    assert_eq!(entries[2]["op"], "dequeued");
+    assert_eq!(entries[2]["queue"], "hooks");
+    assert_eq!(entries[2]["message_id"], first.message_id);
+
+    drop(store);
+    let reopened = FsStore::open(&path).unwrap();
+    assert_eq!(reopened.list_queue_messages("hooks").unwrap(), vec![second]);
+}
+
+#[test]
+fn queue_wal_compacts_when_queues_are_empty() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let item = store
+        .enqueue_message("hooks", json!({"text": "transient"}))
+        .unwrap();
+
+    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(item));
+
+    assert!(store.list_queue_messages("hooks").unwrap().is_empty());
+    assert!(read_jsonl_values(&path.join("queues.jsonl")).is_empty());
 }
 
 #[test]
