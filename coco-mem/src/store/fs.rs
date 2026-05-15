@@ -11,9 +11,6 @@ use snafu::prelude::*;
 
 use super::projection::ProjectionContext;
 use super::state::StoreState;
-use super::versioned::{
-    VersionedLogEntry, VersionedRecord, validate_record, validate_snapshot, versions_from_history,
-};
 use super::{
     BranchConfigStore, BranchStore, JobStore, NodeStore, RuntimeStore, SessionStore, SkillStore,
 };
@@ -28,6 +25,15 @@ use crate::{
     SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError, StoreResult as Result,
     default_skill_groups,
 };
+
+type VersionMap<V> = BTreeMap<u64, V>;
+type VersionReplay<V> = (u64, VersionMap<V>);
+
+struct VersionedRecordRef<'a, V> {
+    key: &'a str,
+    current_version: u64,
+    versions: &'a VersionMap<V>,
+}
 
 const STORE_FORMAT_VERSION: u64 = 7;
 const LEGACY_STORE_FORMAT_VERSION: u64 = 6;
@@ -197,38 +203,6 @@ impl BranchConfigHistoryEntry {
     }
 }
 
-impl VersionedLogEntry for BranchConfigHistoryEntry {
-    type Version = BranchConfigVersion;
-
-    fn log_key(&self) -> &str {
-        &self.name
-    }
-
-    fn version(&self) -> u64 {
-        self.version
-    }
-
-    fn into_version(self) -> Self::Version {
-        BranchConfigHistoryEntry::into_version(self)
-    }
-}
-
-impl VersionedLogEntry for SkillHistoryEntry {
-    type Version = SkillVersion;
-
-    fn log_key(&self) -> &str {
-        &self.name
-    }
-
-    fn version(&self) -> u64 {
-        self.version
-    }
-
-    fn into_version(self) -> Self::Version {
-        SkillHistoryEntry::into_version(self)
-    }
-}
-
 impl PersistedSkillRecord {
     fn from_record(record: &SkillRecord) -> Self {
         let current = record
@@ -291,6 +265,191 @@ impl SkillHistoryEntry {
             enable_coco_shim: self.enable_coco_shim,
         }
     }
+}
+
+fn branch_config_history_key(entry: &BranchConfigHistoryEntry) -> &str {
+    &entry.name
+}
+
+fn branch_config_history_entry_version(entry: &BranchConfigHistoryEntry) -> u64 {
+    entry.version
+}
+
+fn skill_history_key(entry: &SkillHistoryEntry) -> &str {
+    &entry.name
+}
+
+fn skill_history_entry_version(entry: &SkillHistoryEntry) -> u64 {
+    entry.version
+}
+
+fn validate_versioned_record<V>(
+    context: &ProjectionContext,
+    path: &Path,
+    record: VersionedRecordRef<'_, V>,
+    version_of: impl Fn(&V) -> u64,
+) -> Result<()> {
+    ensure!(
+        !record.versions.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("{} {:?} has no versions", context.entity(), record.key),
+        }
+    );
+    ensure!(
+        record.versions.contains_key(&record.current_version),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "{} {:?} missing current version {}",
+                context.entity(),
+                record.key,
+                record.current_version
+            ),
+        }
+    );
+    validate_versions(context, path, record.key, record.versions, version_of)
+}
+
+fn versions_from_history<E, V>(
+    context: &ProjectionContext,
+    fallback_path: &Path,
+    entries: &[(PathBuf, E)],
+    key_of: impl for<'a> Fn(&'a E) -> &'a str,
+    entry_version_of: impl Fn(&E) -> u64,
+    into_version: impl Fn(E) -> V,
+    version_of: impl Fn(&V) -> u64,
+) -> Result<VersionReplay<V>>
+where
+    E: Clone,
+{
+    let mut versions = BTreeMap::new();
+    let mut source_path = None;
+    let mut key = None;
+
+    for (path, entry) in entries {
+        source_path.get_or_insert_with(|| path.clone());
+        key.get_or_insert_with(|| key_of(entry).to_owned());
+        let entry_version = entry_version_of(entry);
+        let version = into_version(entry.clone());
+        let version_number = version_of(&version);
+        ensure!(
+            version_number == entry_version,
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "{} {:?} stores version {} in history entry {}",
+                    context.entity(),
+                    key_of(entry),
+                    version_number,
+                    entry_version
+                ),
+            }
+        );
+        ensure!(
+            versions.insert(entry_version, version).is_none(),
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "duplicate history version {} for {} {:?}",
+                    entry_version,
+                    context.entity(),
+                    key_of(entry)
+                ),
+            }
+        );
+    }
+
+    let path = source_path.unwrap_or_else(|| fallback_path.to_owned());
+    let key = key.unwrap_or_else(|| "<unknown>".to_owned());
+    ensure!(
+        !versions.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.clone(),
+            message: format!("empty {} history for {:?}", context.entity(), key),
+        }
+    );
+    validate_versions(context, &path, &key, &versions, &version_of)?;
+    let current_version = versions
+        .keys()
+        .next_back()
+        .copied()
+        .expect("versions checked non-empty");
+
+    Ok((current_version, versions))
+}
+
+fn validate_snapshot<V>(
+    context: &ProjectionContext,
+    snapshot_key: &str,
+    current_version: u64,
+    versions: &VersionMap<V>,
+    matches_version: impl FnOnce(&V) -> bool,
+) -> Result<()> {
+    let persisted_current = versions
+        .get(&current_version)
+        .context(CorruptedStoreSnafu {
+            path: context.history_path().to_owned(),
+            message: format!(
+                "missing current {} version {} for {:?}",
+                context.entity(),
+                current_version,
+                snapshot_key
+            ),
+        })?;
+    ensure!(
+        matches_version(persisted_current),
+        CorruptedStoreSnafu {
+            path: context.history_path().to_owned(),
+            message: format!(
+                "current {} snapshot mismatch for {:?}",
+                context.entity(),
+                snapshot_key
+            ),
+        }
+    );
+    Ok(())
+}
+
+fn validate_versions<V>(
+    context: &ProjectionContext,
+    path: &Path,
+    key: &str,
+    versions: &VersionMap<V>,
+    version_of: impl Fn(&V) -> u64,
+) -> Result<()> {
+    let mut expected_version = 1;
+    for (version, entry) in versions {
+        ensure!(
+            *version == expected_version,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "non-contiguous history version {} for {} {:?}, expected {}",
+                    version,
+                    context.entity(),
+                    key,
+                    expected_version
+                ),
+            }
+        );
+        let entry_version = version_of(entry);
+        ensure!(
+            entry_version == *version,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "{} {:?} stores version {} under key {}",
+                    context.entity(),
+                    key,
+                    entry_version,
+                    version
+                ),
+            }
+        );
+        expected_version += 1;
+    }
+    Ok(())
 }
 
 impl SkillHistoryScope {
@@ -1221,10 +1380,14 @@ fn validate_branch_config_record(
             ),
         }
     );
-    validate_record(
+    validate_versioned_record(
         &ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME),
         path,
-        record,
+        VersionedRecordRef {
+            key: &record.name,
+            current_version: record.current_version,
+            versions: &record.versions,
+        },
         |version| version.version,
     )
 }
@@ -1298,7 +1461,7 @@ fn validate_branch_config_snapshots(
             &context,
             &snapshot.name,
             snapshot.current_version,
-            record.versions(),
+            &record.versions,
             |version| {
                 version.created_at == snapshot.created_at && version.config == snapshot.config
             },
@@ -1315,6 +1478,9 @@ fn branch_config_record_from_history(
         &ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME),
         Path::new(BRANCH_CONFIG_HISTORY_DIR_NAME),
         entries,
+        branch_config_history_key,
+        branch_config_history_entry_version,
+        BranchConfigHistoryEntry::into_version,
         |version| version.version,
     )?;
 
@@ -1369,7 +1535,7 @@ fn validate_skill_snapshots(current: &PersistedSkillGroups, history: &SkillGroup
                 &context,
                 &snapshot.name,
                 snapshot.current_version,
-                record.versions(),
+                &record.versions,
                 |version| {
                     version.created_at == snapshot.created_at
                         && version.description == snapshot.description
@@ -1405,6 +1571,9 @@ fn skill_record_from_history(
         &ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME),
         Path::new(SKILL_HISTORY_DIR_NAME),
         entries,
+        skill_history_key,
+        skill_history_entry_version,
+        SkillHistoryEntry::into_version,
         |version| version.version,
     )?;
 

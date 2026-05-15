@@ -5,7 +5,6 @@ pub(crate) mod fs;
 pub mod memory;
 pub(crate) mod projection;
 pub(crate) mod state;
-pub(crate) mod versioned;
 
 #[cfg(test)]
 mod tests;
