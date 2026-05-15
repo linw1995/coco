@@ -3869,8 +3869,12 @@ async fn preset_commands_manage_versions_in_store() {
     let (_tempdir, store_path) = temp_store_path();
     let preset_name = "coding";
 
+    let (openai_name, mut openai_profile) =
+        provider_profile("openai", "openai", "${OPENAI_API_KEY}", None, None);
+    openai_profile.spec.gpt.reasoning_level = Some("high".to_owned());
+    openai_profile.spec.gpt.service_tier = Some("fast".to_owned());
     let provider_profiles = ProviderProfiles::from_profiles(HashMap::from([
-        provider_profile("openai", "openai", "${OPENAI_API_KEY}", None, None),
+        (openai_name, openai_profile),
         provider_profile("anthropic", "anthropic", "${ANTHROPIC_API_KEY}", None, None),
     ]));
 
@@ -5412,7 +5416,7 @@ fn resolve_session_config_parses_additional_params_json_object() {
 }
 
 #[test]
-fn resolve_session_config_merges_gpt_profile_params() {
+fn resolve_session_config_persists_only_explicit_additional_params() {
     let (_, mut profile) = provider_profile(
         "work-openai",
         "openai",
@@ -5445,10 +5449,7 @@ fn resolve_session_config_merges_gpt_profile_params() {
 
     assert_eq!(
         config.additional_params,
-        Some(json!({
-            "reasoning_effort": "high",
-            "service_tier": "flex",
-        }))
+        Some(json!({"service_tier": "flex"}))
     );
 }
 

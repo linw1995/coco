@@ -164,7 +164,6 @@ fn resolve_branch_config(
     let profile = store
         .get_provider_profile(&provider_profile)
         .context(StoreSnafu)?;
-    let profile_additional_params = coco_llm::provider_profile_additional_params(&profile);
 
     Ok(BranchConfig {
         role: command.role.into(),
@@ -178,10 +177,7 @@ fn resolve_branch_config(
         prompt: command.prompt,
         temperature: command.temperature,
         max_tokens: command.max_tokens,
-        additional_params: coco_llm::merge_completion_additional_params(
-            profile_additional_params,
-            parse_preset_additional_params(command.additional_params)?,
-        ),
+        additional_params: parse_preset_additional_params(command.additional_params)?,
         enable_coco_shim: command.enable_coco_shim && !command.disable_coco_shim,
     })
 }
