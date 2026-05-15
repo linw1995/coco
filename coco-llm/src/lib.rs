@@ -339,9 +339,10 @@ pub struct ProviderRuntimeConfig {
 
 pub fn provider_profile_additional_params(profile: &coco_mem::ProviderProfile) -> Option<Value> {
     let provider = Provider::parse(&profile.provider).ok()?;
+    let spec = gpt_provider_spec(profile)?;
     let mut params = serde_json::Map::new();
 
-    if let Some(reasoning_level) = profile.reasoning_level.as_deref() {
+    if let Some(reasoning_level) = spec.reasoning_level.as_deref() {
         match provider {
             Provider::OpenAi => {
                 params.insert(
@@ -360,7 +361,7 @@ pub fn provider_profile_additional_params(profile: &coco_mem::ProviderProfile) -
     }
 
     if matches!(provider, Provider::OpenAi | Provider::ChatGpt)
-        && let Some(service_tier) = profile_service_tier(profile).as_deref()
+        && let Some(service_tier) = spec.service_tier.as_deref()
     {
         params.insert(
             "service_tier".to_owned(),
@@ -369,6 +370,13 @@ pub fn provider_profile_additional_params(profile: &coco_mem::ProviderProfile) -
     }
 
     (!params.is_empty()).then_some(Value::Object(params))
+}
+
+fn gpt_provider_spec(profile: &coco_mem::ProviderProfile) -> Option<&coco_mem::GptProviderSpec> {
+    match Provider::parse(&profile.provider).ok()? {
+        Provider::OpenAi | Provider::ChatGpt => Some(&profile.spec.gpt),
+        Provider::Anthropic => None,
+    }
 }
 
 pub fn merge_completion_additional_params(
@@ -384,15 +392,6 @@ pub fn merge_completion_additional_params(
         (None, Some(overrides)) => Some(overrides),
         (None, None) => None,
     }
-}
-
-fn profile_service_tier(profile: &coco_mem::ProviderProfile) -> Option<String> {
-    profile.service_tier.clone().or_else(|| {
-        profile
-            .fast
-            .is_some_and(|fast| fast)
-            .then(|| "fast".to_owned())
-    })
 }
 
 fn resolve_gpt_service_tier(service_tier: &str) -> &str {

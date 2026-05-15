@@ -264,9 +264,7 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
             secrets: BTreeMap::new(),
             base_url: None,
             default_model: Some("gpt-5.4".to_owned()),
-            reasoning_level: None,
-            service_tier: None,
-            fast: None,
+            spec: Default::default(),
         },
     );
     let provider_profiles = config::ProviderProfiles::from_profiles(profiles);

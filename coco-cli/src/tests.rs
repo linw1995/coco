@@ -505,9 +505,7 @@ fn provider_profile(
             secrets,
             base_url: base_url.map(str::to_owned),
             default_model: default_model.map(str::to_owned),
-            reasoning_level: None,
-            service_tier: None,
-            fast: None,
+            spec: Default::default(),
         },
     )
 }
@@ -3744,7 +3742,7 @@ fn provider_profiles_load_from_cwd_config_toml() {
 provider = "openai"
 base_url = "https://openai.example.test/v1"
 default_model = "gpt-4.1-mini"
-model_reasoning_effort = "high"
+reasoning_level = "high"
 service_tier = "fast"
 
 [providers.work-openai.secrets]
@@ -3771,8 +3769,8 @@ allowed_chat_ids = ["123", "-456"]
         Some("${COCO_WORK_OPENAI_API_KEY}")
     );
     assert_eq!(profile.default_model.as_deref(), Some("gpt-4.1-mini"));
-    assert_eq!(profile.reasoning_level.as_deref(), Some("high"));
-    assert_eq!(profile.service_tier.as_deref(), Some("fast"));
+    assert_eq!(profile.spec.gpt.reasoning_level.as_deref(), Some("high"));
+    assert_eq!(profile.spec.gpt.service_tier.as_deref(), Some("fast"));
     let telegram = config.channels.telegram.unwrap();
     assert!(telegram.enabled);
     assert_eq!(telegram.token, "${COCO_TELEGRAM_BOT_TOKEN}");
@@ -5422,8 +5420,8 @@ fn resolve_session_config_merges_gpt_profile_params() {
         None,
         Some("gpt-5.4"),
     );
-    profile.reasoning_level = Some("high".to_owned());
-    profile.fast = Some(true);
+    profile.spec.gpt.reasoning_level = Some("high".to_owned());
+    profile.spec.gpt.service_tier = Some("fast".to_owned());
     let provider_profiles =
         ProviderProfiles::from_profiles(HashMap::from([("work-openai".to_owned(), profile)]));
 

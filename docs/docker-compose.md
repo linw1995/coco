@@ -79,15 +79,15 @@ cat > .coco-data/config.toml <<'EOF'
 [providers.gpt-subscription]
 provider = "chatgpt"
 default_model = "gpt-5.4"
-model_reasoning_effort = "high"
+reasoning_level = "high"
 service_tier = "fast"
 EOF
 ```
 
 The `chatgpt` provider uses ChatGPT subscription access, not the OpenAI API-key
 flow. Do not set `COCO_API_KEY` for `chatgpt`.
-`model_reasoning_effort` accepts GPT reasoning levels such as `low`, `medium`,
-`high`, and `xhigh`. `service_tier = "fast"` requests the priority GPT tier.
+`reasoning_level` accepts GPT reasoning levels such as `low`, `medium`, `high`,
+and `xhigh`. `service_tier = "fast"` requests the priority GPT tier.
 
 ## Get ChatGPT OAuth Cache
 
