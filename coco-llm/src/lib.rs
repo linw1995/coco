@@ -5050,6 +5050,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_profile_additional_params_maps_fast_to_priority_service_tier() {
+        let profile = coco_mem::ProviderProfile {
+            provider: "chatgpt".to_owned(),
+            secrets: std::collections::BTreeMap::new(),
+            base_url: None,
+            default_model: Some("gpt-5.4".to_owned()),
+            spec: coco_mem::ProviderSpec {
+                gpt: coco_mem::GptProviderSpec {
+                    reasoning_level: Some("high".to_owned()),
+                    service_tier: Some("fast".to_owned()),
+                },
+            },
+        };
+
+        assert_eq!(
+            provider_profile_additional_params(&profile),
+            Some(serde_json::json!({
+                "reasoning": { "effort": "high" },
+                "service_tier": "priority",
+            }))
+        );
+    }
+
     #[tokio::test]
     async fn provider_profile_additional_params_do_not_leak_to_provider_override() {
         let store = MemoryStore::new();
