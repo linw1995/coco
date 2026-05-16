@@ -105,11 +105,11 @@ where
                 continue;
             };
             if !self.allowed_chat_ids.is_empty()
-                && !self.allowed_chat_ids.contains(&inbound.conversation_id)
+                && !self.allowed_chat_ids.contains(inbound.conversation_id())
             {
                 tracing::info!(
-                    conversation_id = %inbound.conversation_id,
-                    sender_id = %inbound.sender_id,
+                    conversation_id = %inbound.conversation_id(),
+                    sender_id = %inbound.sender_id(),
                     allowed_chat_ids = ?self.allowed_chat_ids,
                     "filtered telegram inbound message by allowed_chat_ids"
                 );
@@ -401,13 +401,9 @@ mod tests {
         assert_eq!(channel.offset(), Some(101));
         assert_eq!(
             handler.messages(),
-            vec![InboundMessage {
-                channel_kind: crate::ChannelKind::Telegram,
-                conversation_id: "42".to_owned(),
-                sender_id: "7".to_owned(),
-                source_message_id: Some("1000".to_owned()),
-                text: "hello".to_owned(),
-            }]
+            vec![InboundMessage::telegram_with_message_id(
+                "42", "7", "1000", "hello"
+            )]
         );
     }
 
@@ -461,10 +457,10 @@ mod tests {
 
         let message = update.to_inbound_message().unwrap();
 
-        assert_eq!(message.conversation_id, "-42");
-        assert_eq!(message.sender_id, "-42");
-        assert_eq!(message.source_message_id.as_deref(), Some("1000"));
-        assert_eq!(message.text, "hello");
+        assert_eq!(message.conversation_id(), "-42");
+        assert_eq!(message.sender_id(), "-42");
+        assert_eq!(message.source_message_id(), Some("1000"));
+        assert_eq!(message.text(), "hello");
     }
 
     #[tokio::test]

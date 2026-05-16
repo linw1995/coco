@@ -350,8 +350,7 @@ where
 
 #[derive(Debug, Serialize, Deserialize)]
 struct QueuedTelegramMessage {
-    channel_kind: String,
-    conversation_id: String,
+    chat_id: String,
     sender_id: String,
     source_message_id: Option<String>,
     text: String,
@@ -361,9 +360,6 @@ struct QueuedTelegramMessage {
 enum TelegramQueuePayloadError {
     #[snafu(display("Failed to decode Telegram queue payload: {source}"))]
     Decode { source: serde_json::Error },
-
-    #[snafu(display("Unsupported Telegram queue channel kind {channel_kind:?}"))]
-    UnsupportedChannelKind { channel_kind: String },
 }
 
 struct TelegramMessageQueuePublisher<S> {
@@ -387,11 +383,13 @@ where
             .store
             .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
             .map_err(ChannelError::handler)?;
+        let conversation_id = message.conversation_id().to_owned();
+        let sender_id = message.sender_id().to_owned();
         tracing::info!(
             message_id = %item.message_id,
             queue = TELEGRAM_INBOUND_QUEUE,
-            conversation_id = %message.conversation_id,
-            sender_id = %message.sender_id,
+            conversation_id = %conversation_id,
+            sender_id = %sender_id,
             "queued telegram inbound message"
         );
         self.notify.notify_one();
@@ -477,9 +475,9 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
             }
         };
 
-        let conversation_id = message.conversation_id.clone();
-        let sender_id = message.sender_id.clone();
-        let source_message_id = message.source_message_id.clone();
+        let conversation_id = message.conversation_id().to_owned();
+        let sender_id = message.sender_id().to_owned();
+        let source_message_id = message.source_message_id().map(str::to_owned);
         tracing::info!(
             message_id = %item.message_id,
             queue = TELEGRAM_INBOUND_QUEUE,
@@ -562,12 +560,15 @@ where
 }
 
 fn encode_telegram_message(message: &InboundMessage) -> serde_json::Value {
+    let InboundMessage::Telegram(message) = message else {
+        unreachable!("telegram queue only accepts telegram inbound messages");
+    };
+
     json!({
-        "channel_kind": message.channel_kind.as_str(),
-        "conversation_id": message.conversation_id.clone(),
-        "sender_id": message.sender_id.clone(),
-        "source_message_id": message.source_message_id.clone(),
-        "text": message.text.clone(),
+        "chat_id": message.chat_id(),
+        "sender_id": message.sender_id(),
+        "source_message_id": message.source_message_id(),
+        "text": message.text(),
     })
 }
 
@@ -575,18 +576,14 @@ fn decode_telegram_message(
     payload: serde_json::Value,
 ) -> std::result::Result<InboundMessage, TelegramQueuePayloadError> {
     let message = serde_json::from_value::<QueuedTelegramMessage>(payload).context(DecodeSnafu)?;
-    ensure!(
-        message.channel_kind == coco_channel::ChannelKind::Telegram.as_str(),
-        UnsupportedChannelKindSnafu {
-            channel_kind: message.channel_kind,
-        }
-    );
-    Ok(InboundMessage {
-        channel_kind: coco_channel::ChannelKind::Telegram,
-        conversation_id: message.conversation_id,
-        sender_id: message.sender_id,
-        source_message_id: message.source_message_id,
-        text: message.text,
+    Ok(match message.source_message_id {
+        Some(source_message_id) => InboundMessage::telegram_with_message_id(
+            message.chat_id,
+            message.sender_id,
+            source_message_id,
+            message.text,
+        ),
+        None => InboundMessage::telegram(message.chat_id, message.sender_id, message.text),
     })
 }
 
@@ -793,7 +790,6 @@ mod tests {
         SessionConfig, StepContext,
     };
     use coco_mem::{JobStatus, MemoryStore, MessageQueueStore, SessionRole};
-    use serde_json::json;
     use tokio::sync::Notify;
 
     use super::{
@@ -816,25 +812,6 @@ mod tests {
         let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
 
         assert_eq!(decoded, message);
-    }
-
-    #[test]
-    fn telegram_queue_payload_rejects_non_telegram_channel_kind() {
-        let payload = json!({
-            "channel_kind": "discord",
-            "conversation_id": "channel-1",
-            "sender_id": "sender-1",
-            "source_message_id": null,
-            "text": "hello",
-        });
-
-        let error = decode_telegram_message(payload).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("Unsupported Telegram queue channel kind")
-        );
     }
 
     #[tokio::test]

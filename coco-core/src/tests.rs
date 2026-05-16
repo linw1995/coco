@@ -564,7 +564,7 @@ async fn core_service_rejects_empty_message_text() {
     );
 
     let error = service
-        .handle_message(InboundMessage::discord("channel", "user", "   "))
+        .handle_message(InboundMessage::cli("cli", "cli", "   "))
         .await
         .unwrap_err();
 

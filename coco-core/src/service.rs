@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use crate::{
     BatchPromptRequest, BatchPromptResult, BranchResolver, ConversationEngine, EngineError, Error,
-    InboundMessage, OutboundMessage,
+    InboundMessage, OutboundMessage, TelegramInboundMessage,
     error::{BranchResolveFailedSnafu, InvalidInputSnafu},
 };
 
@@ -41,7 +41,7 @@ where
         + 'static,
 {
     pub async fn handle_message(&self, message: InboundMessage) -> Result<OutboundMessage> {
-        let text = message.text.trim();
+        let text = message.text().trim();
         ensure!(
             !text.is_empty(),
             InvalidInputSnafu {
@@ -53,8 +53,8 @@ where
             .resolver
             .resolve_branch(&message)
             .context(BranchResolveFailedSnafu {
-                channel_kind: message.channel_kind,
-                conversation_id: message.conversation_id.clone(),
+                channel_kind: message.channel_kind(),
+                conversation_id: message.conversation_id().to_owned(),
             })?;
 
         let prompt = channel_prompt(&message, text);
@@ -109,11 +109,14 @@ where
 }
 
 fn channel_prompt(message: &InboundMessage, text: &str) -> String {
-    if message.channel_kind != coco_channel::ChannelKind::Telegram {
-        return text.to_owned();
+    match message {
+        InboundMessage::Telegram(telegram) => telegram_prompt(telegram, text),
+        InboundMessage::Cli(_) => text.to_owned(),
     }
+}
 
-    let reply_to_message_id = message.source_message_id.as_deref().unwrap_or("unknown");
+fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
+    let reply_to_message_id = message.source_message_id().unwrap_or("unknown");
 
     formatdoc!(
         "
@@ -138,6 +141,6 @@ fn channel_prompt(message: &InboundMessage, text: &str) -> String {
         Incoming message:
         {text}
         ",
-        chat_id = message.conversation_id,
+        chat_id = message.chat_id(),
     )
 }
