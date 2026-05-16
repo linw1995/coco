@@ -19,6 +19,9 @@ sha2 = "0.10.9"
 # Error handling.
 snafu.workspace = true
 
+# Observability.
+tracing.workspace = true
+
 [dev-dependencies]
 # Test fixtures.
 tempfile = "3.23.0"

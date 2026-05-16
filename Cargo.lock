@@ -446,6 +446,7 @@ dependencies = [
  "sha2",
  "snafu",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

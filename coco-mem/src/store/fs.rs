@@ -27,7 +27,8 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: u64 = 10;
+const STORE_FORMAT_VERSION: &str = "2026-05-16";
+const MAIN_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
@@ -40,9 +41,58 @@ const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
 const SHARED_SKILL_HISTORY_DIR_NAME: &str = "shared";
 const ORCHESTRATOR_SKILL_HISTORY_DIR_NAME: &str = "orchestrator";
 const RUNNER_SKILL_HISTORY_DIR_NAME: &str = "runner";
+const BUILTIN_COCO_ORCHESTRATOR_REVISION_ID: &str =
+    "cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438";
+const BUILTIN_NEW_SKILL_REVISION_ID: &str =
+    "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
+const BUILTIN_CRONJOB_REVISION_ID: &str =
+    "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e";
+const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
+    "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22";
+const BUILTIN_TELEGRAM_REVISION_ID: &str =
+    "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c";
 const BRANCHES_DIR_NAME: &str = "branches";
 const LOCK_FILE_NAME: &str = "store.lock";
 const MESSAGE_QUEUE_COMPACT_MIN_LOG_ENTRIES: usize = 64;
+const BUILTIN_SKILL_MIGRATIONS_2026_05_16: &[BuiltinSkillMigration] = &[
+    BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "coco-orchestrator",
+        from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+        target_revision_id: BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "new-skill",
+        from_revision_ids: &[BUILTIN_NEW_SKILL_REVISION_ID],
+        target_revision_id: BUILTIN_NEW_SKILL_REVISION_ID,
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "cronjob",
+        from_revision_ids: &[BUILTIN_CRONJOB_REVISION_ID],
+        target_revision_id: BUILTIN_CRONJOB_REVISION_ID,
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Runner,
+        name: "coco-runner",
+        from_revision_ids: &[BUILTIN_COCO_RUNNER_REVISION_ID],
+        target_revision_id: BUILTIN_COCO_RUNNER_REVISION_ID,
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Runner,
+        name: "telegram",
+        from_revision_ids: &[BUILTIN_TELEGRAM_REVISION_ID],
+        target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
+    },
+];
+const STORE_MIGRATIONS: &[StoreMigration] = &[StoreMigration {
+    name: "main-to-2026-05-16",
+    from: StoreSchemaVersion::Main,
+    to: StoreSchemaVersion::Current,
+    run: Persistence::migrate_main_store_to_chronicle_format,
+    builtin_skills: BUILTIN_SKILL_MIGRATIONS_2026_05_16,
+}];
 
 #[derive(Clone, Debug)]
 pub struct FsStore {
@@ -75,9 +125,44 @@ enum StoreAccess {
     ReadOnly,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StoreFormatVersion {
+    Legacy(u64),
+    Chronicle(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StoreSchemaVersion {
+    Main,
+    Current,
+}
+
+struct StoreMigration {
+    name: &'static str,
+    from: StoreSchemaVersion,
+    to: StoreSchemaVersion,
+    run: fn(&Persistence) -> Result<()>,
+    builtin_skills: &'static [BuiltinSkillMigration],
+}
+
+struct BuiltinSkillMigration {
+    role: SessionRole,
+    name: &'static str,
+    from_revision_ids: &'static [&'static str],
+    target_revision_id: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct BuiltinSkillMigrationSummary {
+    added: usize,
+    updated: usize,
+    skipped_user_modified: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
-    pub version: u64,
+    pub version: StoreFormatVersion,
     pub root_id: String,
 }
 
@@ -110,6 +195,8 @@ enum MessageQueueHistoryEntry {
 struct PersistedSkillRecord {
     name: String,
     current_version: u64,
+    #[serde(default)]
+    id: String,
     created_at: jiff::Timestamp,
     description: String,
     body: String,
@@ -131,6 +218,8 @@ struct PersistedSkillGroups {
 struct SkillHistoryEntry {
     role: SessionRole,
     name: String,
+    #[serde(default)]
+    id: String,
     version: u64,
     created_at: jiff::Timestamp,
     description: String,
@@ -158,6 +247,53 @@ enum SkillPersistenceFailpoint {
 #[derive(Debug, Default)]
 struct SkillPersistenceFailpoints {
     next: Option<SkillPersistenceFailpoint>,
+}
+
+impl std::fmt::Display for StoreFormatVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy(version) => write!(formatter, "{version}"),
+            Self::Chronicle(version) => formatter.write_str(version),
+        }
+    }
+}
+
+impl StoreFormatVersion {
+    fn current() -> Self {
+        Self::Chronicle(STORE_FORMAT_VERSION.to_owned())
+    }
+
+    fn schema_version(&self) -> Option<StoreSchemaVersion> {
+        match self {
+            Self::Legacy(MAIN_STORE_FORMAT_VERSION) => Some(StoreSchemaVersion::Main),
+            Self::Chronicle(version) if version == STORE_FORMAT_VERSION => {
+                Some(StoreSchemaVersion::Current)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl StoreSchemaVersion {
+    fn format_label(self) -> &'static str {
+        match self {
+            Self::Main => "10",
+            Self::Current => STORE_FORMAT_VERSION,
+        }
+    }
+
+    fn meta_version(self) -> StoreFormatVersion {
+        match self {
+            Self::Main => StoreFormatVersion::Legacy(MAIN_STORE_FORMAT_VERSION),
+            Self::Current => StoreFormatVersion::current(),
+        }
+    }
+}
+
+impl BuiltinSkillMigrationSummary {
+    fn changed(&self) -> bool {
+        self.added > 0 || self.updated > 0
+    }
 }
 
 impl PersistedPresetRecord {
@@ -205,12 +341,29 @@ impl PersistedSkillRecord {
         Self {
             name: record.name.clone(),
             current_version: record.current_version,
+            id: current.id.clone(),
             created_at: current.created_at,
             description: current.description.clone(),
             body: current.body.clone(),
             scripts: current.scripts.clone(),
             enable_coco_shim: current.enable_coco_shim,
         }
+    }
+
+    fn normalize_id(&mut self) -> bool {
+        let previous = self.id.clone();
+        let mut version = SkillVersion {
+            id: self.id.clone(),
+            version: self.current_version,
+            created_at: self.created_at,
+            description: self.description.clone(),
+            body: self.body.clone(),
+            scripts: self.scripts.clone(),
+            enable_coco_shim: self.enable_coco_shim,
+        };
+        version.normalize_id();
+        self.id = version.id;
+        self.id != previous
     }
 }
 
@@ -233,6 +386,17 @@ impl PersistedSkillGroups {
     fn is_empty(&self) -> bool {
         self.orchestrator.is_empty() && self.runner.is_empty()
     }
+
+    fn normalize_ids(&mut self) -> bool {
+        let mut changed = false;
+        for record in self.orchestrator.values_mut() {
+            changed |= record.normalize_id();
+        }
+        for record in self.runner.values_mut() {
+            changed |= record.normalize_id();
+        }
+        changed
+    }
 }
 
 impl SkillHistoryEntry {
@@ -240,6 +404,7 @@ impl SkillHistoryEntry {
         Self {
             role,
             name: name.to_owned(),
+            id: version.id.clone(),
             version: version.version,
             created_at: version.created_at,
             description: version.description.clone(),
@@ -250,14 +415,25 @@ impl SkillHistoryEntry {
     }
 
     fn into_version(self) -> SkillVersion {
-        SkillVersion {
+        let mut version = SkillVersion {
+            id: self.id,
             version: self.version,
             created_at: self.created_at,
             description: self.description,
             body: self.body,
             scripts: self.scripts,
             enable_coco_shim: self.enable_coco_shim,
-        }
+        };
+        version.normalize_id();
+        version
+    }
+
+    fn normalize_id(&mut self) -> bool {
+        let previous = self.id.clone();
+        let mut version = self.clone().into_version();
+        version.normalize_id();
+        self.id = version.id;
+        self.id != previous
     }
 }
 
@@ -655,6 +831,144 @@ impl Persistence {
         .fail()
     }
 
+    fn migrate_store(&self, from: StoreSchemaVersion, root_id: &str) -> Result<()> {
+        debug_assert_eq!(self.access, StoreAccess::ReadWrite);
+
+        tracing::info!(
+            store_path = %self.dir.display(),
+            from_version = from.format_label(),
+            to_version = STORE_FORMAT_VERSION,
+            "starting store format migration"
+        );
+
+        let mut current = from;
+        while current != StoreSchemaVersion::Current {
+            let migration = store_migration_from(current).context(CorruptedStoreSnafu {
+                path: self.meta_path.clone(),
+                message: format!(
+                    "missing store migration from version {} to {}",
+                    current.format_label(),
+                    STORE_FORMAT_VERSION
+                ),
+            })?;
+            tracing::info!(
+                store_path = %self.dir.display(),
+                migration = migration.name,
+                from_version = migration.from.format_label(),
+                to_version = migration.to.format_label(),
+                "running store migration"
+            );
+            (migration.run)(self)?;
+            self.migrate_builtin_skills_for_store_schema(migration.builtin_skills)?;
+            self.persist_store_schema_version(migration.to, root_id)?;
+            tracing::info!(
+                store_path = %self.dir.display(),
+                migration = migration.name,
+                from_version = migration.from.format_label(),
+                to_version = migration.to.format_label(),
+                "completed store migration"
+            );
+            current = migration.to;
+        }
+
+        tracing::info!(
+            store_path = %self.dir.display(),
+            meta_path = %self.meta_path.display(),
+            to_version = STORE_FORMAT_VERSION,
+            "completed store format migration"
+        );
+        Ok(())
+    }
+
+    fn migrate_main_store_to_chronicle_format(&self) -> Result<()> {
+        if !self.queues_path.exists() {
+            tracing::info!(
+                store_path = %self.dir.display(),
+                path = %self.queues_path.display(),
+                "creating missing message queue history during store migration"
+            );
+            write_jsonl_file(&self.queues_path, &[] as &[MessageQueueHistoryEntry])?;
+        }
+        self.migrate_skill_version_ids()?;
+        Ok(())
+    }
+
+    fn migrate_skill_version_ids(&self) -> Result<()> {
+        if self.skills_path.exists() {
+            let mut skills = read_json_file::<PersistedSkillGroups>(&self.skills_path)?;
+            if skills.normalize_ids() {
+                tracing::info!(
+                    store_path = %self.dir.display(),
+                    path = %self.skills_path.display(),
+                    "adding skill revision ids to current skill snapshots during store migration"
+                );
+                write_json_file(&self.skills_path, &skills)?;
+            }
+        }
+
+        for path in self.list_skill_history_paths()? {
+            let mut entries = read_jsonl_file::<SkillHistoryEntry>(&path)?;
+            let mut changed = false;
+            for entry in &mut entries {
+                changed |= entry.normalize_id();
+            }
+            if changed {
+                tracing::info!(
+                    store_path = %self.dir.display(),
+                    path = %path.display(),
+                    "adding skill revision ids to skill history during store migration"
+                );
+                write_jsonl_file(&path, &entries)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn migrate_builtin_skills_for_store_schema(
+        &self,
+        migrations: &[BuiltinSkillMigration],
+    ) -> Result<()> {
+        if migrations.is_empty() {
+            return Ok(());
+        }
+        let skill_groups = read_json_file::<PersistedSkillGroups>(&self.skills_path)?;
+        if skill_groups.is_empty() {
+            return Ok(());
+        }
+
+        let mut groups = load_skill_groups_from_history(self, &skill_groups)?;
+        let builtin_skill_migration = migrate_builtin_skills(&mut groups, migrations);
+        if builtin_skill_migration.changed() {
+            tracing::info!(
+                store_path = %self.dir.display(),
+                added = builtin_skill_migration.added,
+                updated = builtin_skill_migration.updated,
+                skipped_user_modified = builtin_skill_migration.skipped_user_modified,
+                "persisting builtin skill migrations during store migration"
+            );
+            self.rewrite_skill_history(&groups)?;
+            write_json_file(
+                &self.skills_path,
+                &PersistedSkillGroups::from_groups(&groups),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn persist_store_schema_version(
+        &self,
+        version: StoreSchemaVersion,
+        root_id: &str,
+    ) -> Result<()> {
+        write_json_file(
+            &self.meta_path,
+            &Meta {
+                version: version.meta_version(),
+                root_id: root_id.to_owned(),
+            },
+        )
+    }
+
     fn branch_path(&self, branch: &str) -> PathBuf {
         self.branches_dir
             .join(format!("{}.jsonl", encode_branch_name(branch)))
@@ -831,7 +1145,7 @@ impl Persistence {
         let root = store.root_node().clone();
         let skill_groups = store.skill_groups.clone();
         let meta = Meta {
-            version: STORE_FORMAT_VERSION,
+            version: StoreFormatVersion::current(),
             root_id: root.id.clone(),
         };
 
@@ -900,17 +1214,44 @@ impl Persistence {
                 }
             );
         }
-        let meta = read_json_file::<Meta>(&self.meta_path)?;
-        ensure!(
-            meta.version == STORE_FORMAT_VERSION,
-            CorruptedStoreSnafu {
-                path: self.meta_path.clone(),
-                message: format!(
-                    "unsupported store format version {}, expected {}",
-                    meta.version, STORE_FORMAT_VERSION
-                ),
+        let mut meta = read_json_file::<Meta>(&self.meta_path)?;
+        let schema_version = meta.version.schema_version().context(CorruptedStoreSnafu {
+            path: self.meta_path.clone(),
+            message: format!(
+                "unsupported store format version {}, expected {}",
+                meta.version, STORE_FORMAT_VERSION
+            ),
+        })?;
+        if schema_version != StoreSchemaVersion::Current {
+            if self.access != StoreAccess::ReadWrite {
+                tracing::warn!(
+                    store_path = %self.dir.display(),
+                    from_version = schema_version.format_label(),
+                    to_version = STORE_FORMAT_VERSION,
+                    "read-only store requires writable format migration"
+                );
+                return CorruptedStoreSnafu {
+                    path: self.meta_path.clone(),
+                    message: format!(
+                        "store format version {} requires writable migration to {}",
+                        meta.version, STORE_FORMAT_VERSION
+                    ),
+                }
+                .fail();
             }
-        );
+            self.migrate_store(schema_version, &meta.root_id)?;
+            meta = read_json_file::<Meta>(&self.meta_path)?;
+            ensure!(
+                meta.version.schema_version() == Some(StoreSchemaVersion::Current),
+                CorruptedStoreSnafu {
+                    path: self.meta_path.clone(),
+                    message: format!(
+                        "store migration did not upgrade format version to {}",
+                        STORE_FORMAT_VERSION
+                    ),
+                }
+            );
+        }
 
         let nodes = read_jsonl_file::<Node>(&self.nodes_path)?;
         let mut node_iter = nodes.into_iter();
@@ -1104,6 +1445,122 @@ fn load_skill_groups_from_history(
     Ok(history)
 }
 
+fn migrate_builtin_skills(
+    groups: &mut SkillGroups,
+    migrations: &[BuiltinSkillMigration],
+) -> BuiltinSkillMigrationSummary {
+    let defaults = default_skill_groups();
+    let mut summary = BuiltinSkillMigrationSummary::default();
+
+    for migration in migrations {
+        let Some(default_record) = defaults
+            .for_role(migration.role)
+            .get(migration.name)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(default_version) = default_record.current().cloned() else {
+            continue;
+        };
+        if default_version.id != migration.target_revision_id {
+            tracing::warn!(
+                role = migration.role.as_str(),
+                skill = migration.name,
+                expected_revision = migration.target_revision_id,
+                actual_revision = %default_version.id,
+                "builtin skill migration target revision does not match compiled default skill"
+            );
+        }
+        let records = groups.for_role_mut(migration.role);
+        let Some(record) = records.get_mut(migration.name) else {
+            tracing::info!(
+                role = migration.role.as_str(),
+                skill = migration.name,
+                "adding missing builtin skill during store migration"
+            );
+            records.insert(migration.name.to_owned(), default_record);
+            summary.added += 1;
+            continue;
+        };
+
+        match builtin_skill_migration_action(migration, record, &default_version) {
+            BuiltinSkillMigrationAction::Update => {
+                tracing::info!(
+                    role = migration.role.as_str(),
+                    skill = migration.name,
+                    from_version = record.current_version,
+                    from_revision = %record.current().map(|version| version.id.as_str()).unwrap_or(""),
+                    to_revision = %default_version.id,
+                    "updating builtin skill during store migration"
+                );
+                let patch = SkillUpdatePatch {
+                    description: Some(default_version.description),
+                    body: Some(default_version.body),
+                    scripts: Some(default_version.scripts),
+                    enable_coco_shim: Some(default_version.enable_coco_shim),
+                };
+                if record.update(&patch).is_some() {
+                    summary.updated += 1;
+                }
+            }
+            BuiltinSkillMigrationAction::SkipUserModified => {
+                tracing::debug!(
+                    role = migration.role.as_str(),
+                    skill = migration.name,
+                    current_version = record.current_version,
+                    "skipping user-modified builtin skill during store migration"
+                );
+                summary.skipped_user_modified += 1;
+            }
+            BuiltinSkillMigrationAction::Unchanged => {}
+        }
+    }
+
+    if summary.changed() {
+        tracing::info!(
+            added = summary.added,
+            updated = summary.updated,
+            skipped_user_modified = summary.skipped_user_modified,
+            "completed builtin skill migration"
+        );
+    }
+
+    summary
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinSkillMigrationAction {
+    Update,
+    SkipUserModified,
+    Unchanged,
+}
+
+fn builtin_skill_migration_action(
+    migration: &BuiltinSkillMigration,
+    record: &SkillRecord,
+    target: &SkillVersion,
+) -> BuiltinSkillMigrationAction {
+    let Some(current) = record.current() else {
+        return BuiltinSkillMigrationAction::Unchanged;
+    };
+    if skill_version_matches(current, target) {
+        return BuiltinSkillMigrationAction::Unchanged;
+    }
+    if migration.from_revision_ids.contains(&current.id.as_str()) {
+        BuiltinSkillMigrationAction::Update
+    } else {
+        BuiltinSkillMigrationAction::SkipUserModified
+    }
+}
+
+fn skill_version_matches(left: &SkillVersion, right: &SkillVersion) -> bool {
+    left.description == right.description
+        && left.body == right.body
+        && left.scripts == right.scripts
+        && left.enable_coco_shim == right.enable_coco_shim
+}
+
 fn persisted_preset_records(
     records: &HashMap<String, PresetRecord>,
 ) -> HashMap<String, PersistedPresetRecord> {
@@ -1167,6 +1624,12 @@ fn message_queue_log_should_compact(
     }
 
     log_len >= MESSAGE_QUEUE_COMPACT_MIN_LOG_ENTRIES && log_len > live_len.saturating_mul(2)
+}
+
+fn store_migration_from(from: StoreSchemaVersion) -> Option<&'static StoreMigration> {
+    STORE_MIGRATIONS
+        .iter()
+        .find(|migration| migration.from == from)
 }
 
 fn open_store_lock(store_dir: &Path) -> Result<Arc<File>> {
@@ -1391,6 +1854,26 @@ fn validate_skill_snapshots(current: &PersistedSkillGroups, history: &SkillGroup
         let history_path = Path::new(SKILL_HISTORY_DIR_NAME);
         let history = history.for_role(role);
         for snapshot in records.values() {
+            let expected_snapshot_id = SkillVersion {
+                id: String::new(),
+                version: snapshot.current_version,
+                created_at: snapshot.created_at,
+                description: snapshot.description.clone(),
+                body: snapshot.body.clone(),
+                scripts: snapshot.scripts.clone(),
+                enable_coco_shim: snapshot.enable_coco_shim,
+            }
+            .expected_id();
+            ensure!(
+                snapshot.id.is_empty() || snapshot.id == expected_snapshot_id,
+                CorruptedStoreSnafu {
+                    path: history_path.to_owned(),
+                    message: format!(
+                        "current {entity} snapshot for {:?} has invalid id",
+                        snapshot.name
+                    ),
+                }
+            );
             let record = history.get(&snapshot.name).context(CorruptedStoreSnafu {
                 path: history_path.to_owned(),
                 message: format!("missing {entity} history for {:?}", snapshot.name),
@@ -1402,7 +1885,8 @@ fn validate_skill_snapshots(current: &PersistedSkillGroups, history: &SkillGroup
                 snapshot.current_version,
                 &record.versions,
                 |version| {
-                    version.created_at == snapshot.created_at
+                    version.id == expected_snapshot_id
+                        && version.created_at == snapshot.created_at
                         && version.description == snapshot.description
                         && version.body == snapshot.body
                         && version.scripts == snapshot.scripts
@@ -1458,10 +1942,19 @@ fn skill_record_from_history(
                 ),
             }
         );
+        let version = entry.clone().into_version();
         ensure!(
-            versions
-                .insert(entry.version, entry.clone().into_version())
-                .is_none(),
+            version.id_matches_content(),
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "skill history version {} for role {:?} {:?} has invalid id",
+                    entry.version, role, name
+                ),
+            }
+        );
+        ensure!(
+            versions.insert(entry.version, version).is_none(),
             CorruptedStoreSnafu {
                 path: path.clone(),
                 message: format!(
@@ -2278,4 +2771,102 @@ where
     }
 
     Ok(values)
+}
+
+#[cfg(test)]
+mod builtin_skill_migration_tests {
+    use super::{
+        BUILTIN_COCO_ORCHESTRATOR_REVISION_ID, BuiltinSkillMigration, BuiltinSkillMigrationAction,
+        STORE_MIGRATIONS, SessionRole, SkillVersion, SkillVersionSpec,
+        builtin_skill_migration_action, default_skill_groups,
+    };
+
+    #[test]
+    fn store_migration_builtin_targets_match_current_defaults() {
+        let defaults = default_skill_groups();
+
+        for store_migration in STORE_MIGRATIONS {
+            for builtin_migration in store_migration.builtin_skills {
+                let default_record = defaults
+                    .for_role(builtin_migration.role)
+                    .get(builtin_migration.name)
+                    .expect("builtin migration should point at a default skill");
+                let default_version = default_record
+                    .current()
+                    .expect("default skill should have a current version");
+
+                assert_eq!(
+                    builtin_migration.target_revision_id, default_version.id,
+                    "builtin skill changes must update the store migration version and target revision for {}",
+                    builtin_migration.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn updates_known_builtin_revision_to_new_target() {
+        let defaults = default_skill_groups();
+        let record = defaults
+            .orchestrator
+            .get("coco-orchestrator")
+            .expect("default skill should exist");
+        let target = SkillVersion::new(
+            1,
+            SkillVersionSpec {
+                description: "New default".to_owned(),
+                body: "New body".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        );
+
+        assert_ne!(record.current().unwrap().id, target.id);
+        let migration = BuiltinSkillMigration {
+            role: SessionRole::Orchestrator,
+            name: "coco-orchestrator",
+            from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+            target_revision_id: "new-target-revision",
+        };
+        assert_eq!(
+            builtin_skill_migration_action(&migration, record, &target),
+            BuiltinSkillMigrationAction::Update
+        );
+    }
+
+    #[test]
+    fn skips_unknown_builtin_revision() {
+        let mut record = default_skill_groups()
+            .orchestrator
+            .remove("coco-orchestrator")
+            .expect("default skill should exist");
+        record
+            .update(&crate::SkillUpdatePatch {
+                description: Some("Custom".to_owned()),
+                body: Some("Custom body".to_owned()),
+                scripts: None,
+                enable_coco_shim: None,
+            })
+            .expect("custom update should create a version");
+        let target = SkillVersion::new(
+            1,
+            SkillVersionSpec {
+                description: "New default".to_owned(),
+                body: "New body".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        );
+        let migration = BuiltinSkillMigration {
+            role: SessionRole::Orchestrator,
+            name: "coco-orchestrator",
+            from_revision_ids: &["known-builtin-revision"],
+            target_revision_id: "new-target-revision",
+        };
+
+        assert_eq!(
+            builtin_skill_migration_action(&migration, &record, &target),
+            BuiltinSkillMigrationAction::SkipUserModified
+        );
+    }
 }

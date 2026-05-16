@@ -152,6 +152,16 @@ fn read_jsonl_values(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn write_jsonl_values(path: &Path, values: &[serde_json::Value]) {
+    let mut text = values
+        .iter()
+        .map(|value| serde_json::to_string(value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push('\n');
+    fs::write(path, text).unwrap();
+}
+
 fn temp_store_path() -> (tempfile::TempDir, std::path::PathBuf) {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
@@ -2306,6 +2316,10 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     let nodes = fs::read_to_string(path.join("nodes.jsonl")).unwrap();
     assert!(nodes.lines().count() >= 1);
     assert_eq!(store.ancestry(&store.root_id()).unwrap().len(), 1);
+
+    let meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["version"], "2026-05-16");
 }
 
 #[test]
@@ -2497,12 +2511,77 @@ fn open_does_not_restore_deleted_preset() {
 }
 
 #[test]
+fn open_migrates_numeric_store_format_version_to_chronicle_version() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!(10);
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    skills["orchestrator"]["coco-orchestrator"]
+        .as_object_mut()
+        .unwrap()
+        .remove("id");
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+    let history_path = path.join("skill-history/orchestrator/coco-orchestrator.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[0].as_object_mut().unwrap().remove("id");
+    write_jsonl_values(&history_path, &history);
+
+    FsStore::open(&path).unwrap();
+
+    let migrated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(migrated["version"], "2026-05-16");
+    let migrated_skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
+        .as_str()
+        .unwrap();
+    let migrated_history = read_jsonl_values(&history_path);
+    let history_id = migrated_history[0]["id"].as_str().unwrap();
+    assert_eq!(snapshot_id.len(), 64);
+    assert_eq!(history_id, snapshot_id);
+}
+
+#[test]
+fn open_read_only_rejects_store_that_requires_format_migration() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!(10);
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let err = FsStore::open_read_only(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+    let unchanged: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(unchanged["version"], 10);
+}
+
+#[test]
 fn open_rejects_unsupported_store_format_version() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
     let mut meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    meta["version"] = json!(9);
+    meta["version"] = json!("2020-01-01");
     fs::write(
         path.join("meta.json"),
         serde_json::to_string_pretty(&meta).unwrap(),
@@ -2836,6 +2915,127 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
             .is_file()
     );
     assert!(path.join("skill-history/runner/telegram.jsonl").is_file());
+}
+
+#[test]
+fn store_migration_adds_missing_builtin_skill() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    skills["orchestrator"]
+        .as_object_mut()
+        .unwrap()
+        .remove("new-skill");
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(path.join("skill-history/orchestrator/new-skill.jsonl")).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!(10);
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    let skill = reopened
+        .get_skill(SessionRole::Orchestrator, "new-skill")
+        .unwrap();
+    assert_eq!(skill.current_version, 1);
+    assert!(
+        path.join("skill-history/orchestrator/new-skill.jsonl")
+            .is_file()
+    );
+}
+
+#[test]
+fn open_current_store_does_not_run_builtin_skill_migrations() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    skills["orchestrator"]
+        .as_object_mut()
+        .unwrap()
+        .remove("new-skill");
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(path.join("skill-history/orchestrator/new-skill.jsonl")).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert!(matches!(
+        reopened.get_skill(SessionRole::Orchestrator, "new-skill"),
+        Err(Error::SkillNotFound { name, .. }) if name == "new-skill"
+    ));
+}
+
+#[test]
+fn open_rejects_skill_history_with_invalid_revision_id() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    drop(store);
+
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    skills["orchestrator"]["coco-orchestrator"]["description"] = json!("old builtin");
+    skills["orchestrator"]["coco-orchestrator"]["body"] = json!("old body");
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+
+    let history_path = path.join("skill-history/orchestrator/coco-orchestrator.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[0]["description"] = json!("old builtin");
+    history[0]["body"] = json!("old body");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+    match err {
+        Error::CorruptedStore { message, .. } => {
+            assert!(message.contains("has invalid id"), "{message}");
+        }
+        other => panic!("expected corrupted store, got {other:?}"),
+    }
+}
+
+#[test]
+fn open_does_not_overwrite_user_modified_builtin_skill() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "coco-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("custom".to_owned()),
+                body: Some("custom body".to_owned()),
+                scripts: None,
+                enable_coco_shim: None,
+            },
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = FsStore::open(&path).unwrap();
+    let skill = reopened
+        .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+        .unwrap();
+
+    assert_eq!(skill.current_version, 2);
+    assert_eq!(skill.current().unwrap().description, "custom");
+    assert_eq!(skill.current().unwrap().body, "custom body");
 }
 
 #[test]

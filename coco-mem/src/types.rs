@@ -264,6 +264,8 @@ pub struct SkillUpdatePatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillVersion {
+    #[serde(default)]
+    pub id: String,
     pub version: u64,
     pub created_at: Timestamp,
     pub description: String,
@@ -302,6 +304,12 @@ impl SkillUpdatePatch {
 impl SkillVersion {
     pub fn new(version: u64, spec: SkillVersionSpec) -> Self {
         Self {
+            id: compute_skill_version_id(
+                &spec.description,
+                &spec.body,
+                &spec.scripts,
+                spec.enable_coco_shim,
+            ),
             version,
             created_at: Timestamp::now(),
             description: spec.description,
@@ -309,6 +317,25 @@ impl SkillVersion {
             scripts: spec.scripts,
             enable_coco_shim: spec.enable_coco_shim,
         }
+    }
+
+    pub fn expected_id(&self) -> String {
+        compute_skill_version_id(
+            &self.description,
+            &self.body,
+            &self.scripts,
+            self.enable_coco_shim,
+        )
+    }
+
+    pub fn normalize_id(&mut self) {
+        if self.id.is_empty() {
+            self.id = self.expected_id();
+        }
+    }
+
+    pub fn id_matches_content(&self) -> bool {
+        self.id == self.expected_id()
     }
 }
 
@@ -333,13 +360,18 @@ impl SkillRecord {
     pub fn update(&mut self, patch: &SkillUpdatePatch) -> Option<&SkillVersion> {
         let current = self.current()?.clone();
         let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
+        let description = patch.description.clone().unwrap_or(current.description);
+        let body = patch.body.clone().unwrap_or(current.body);
+        let scripts = patch.scripts.clone().unwrap_or(current.scripts);
+        let enable_coco_shim = patch.enable_coco_shim.unwrap_or(current.enable_coco_shim);
         let next = SkillVersion {
+            id: compute_skill_version_id(&description, &body, &scripts, enable_coco_shim),
             version: next_version,
             created_at: Timestamp::now(),
-            description: patch.description.clone().unwrap_or(current.description),
-            body: patch.body.clone().unwrap_or(current.body),
-            scripts: patch.scripts.clone().unwrap_or(current.scripts),
-            enable_coco_shim: patch.enable_coco_shim.unwrap_or(current.enable_coco_shim),
+            description,
+            body,
+            scripts,
+            enable_coco_shim,
         };
 
         self.current_version = next_version;
@@ -351,6 +383,7 @@ impl SkillRecord {
         let target = self.versions.get(&target_version)?.clone();
         let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
         let next = SkillVersion {
+            id: target.id,
             version: next_version,
             created_at: Timestamp::now(),
             description: target.description,
@@ -1062,6 +1095,15 @@ struct MessageQueueItemHashPayload<'a> {
     created_at: &'a Timestamp,
 }
 
+// Skill revision ids are content-addressed so builtin revisions remain stable across stores.
+#[derive(Serialize)]
+struct SkillVersionHashPayload<'a> {
+    description: &'a str,
+    body: &'a str,
+    scripts: &'a [SkillScript],
+    enable_coco_shim: bool,
+}
+
 fn compute_node_id(
     parent: &str,
     role: &Role,
@@ -1100,6 +1142,27 @@ fn compute_message_queue_item_id(queue: &str, payload: &Value, created_at: &Time
     hex_encode(&hasher.finalize())
 }
 
+fn compute_skill_version_id(
+    description: &str,
+    body: &str,
+    scripts: &[SkillScript],
+    enable_coco_shim: bool,
+) -> String {
+    let payload = serde_json::to_vec(&SkillVersionHashPayload {
+        description,
+        body,
+        scripts,
+        enable_coco_shim,
+    })
+    .expect("skill version hash payload should serialize");
+
+    let mut hasher = Sha256::new();
+    hasher.update(format!("skill_version {}\0", payload.len()).as_bytes());
+    hasher.update(&payload);
+
+    hex_encode(&hasher.finalize())
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -1118,7 +1181,7 @@ mod tests {
         Anchor, BackendMetadata, ExecutionMetadata, Kind, MergeParent, NewNode, Node, NodeMetadata,
         PauseReason, Preset, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
         SessionAnchorPatch, SessionRole, SessionState, SkillInvocationAnchor, SkillInvocationMode,
-        SkillResultAnchor, Tool, ToolResult, ToolUse,
+        SkillResultAnchor, SkillScript, SkillVersion, SkillVersionSpec, Tool, ToolResult, ToolUse,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -1427,6 +1490,65 @@ mod tests {
         assert_eq!(decoded.id, node.id);
         assert_eq!(decoded.parent, node.parent);
         assert_eq!(decoded.created_at, node.created_at);
+    }
+
+    #[test]
+    fn skill_version_id_is_stable_for_same_content() {
+        let spec = SkillVersionSpec {
+            description: "description".to_owned(),
+            body: "body".to_owned(),
+            scripts: vec![SkillScript {
+                path: "scripts/run.py".to_owned(),
+                content: "print('ok')".to_owned(),
+            }],
+            enable_coco_shim: true,
+        };
+        let left = SkillVersion::new(1, spec.clone());
+        let right = SkillVersion::new(2, spec);
+
+        assert_eq!(left.id, right.id);
+        assert!(left.id_matches_content());
+    }
+
+    #[test]
+    fn skill_version_id_changes_when_content_changes() {
+        let left = SkillVersion::new(
+            1,
+            SkillVersionSpec {
+                description: "description".to_owned(),
+                body: "body".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        );
+        let right = SkillVersion::new(
+            1,
+            SkillVersionSpec {
+                description: "description".to_owned(),
+                body: "different".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        );
+
+        assert_ne!(left.id, right.id);
+    }
+
+    #[test]
+    fn skill_version_id_is_lower_hex_sha256() {
+        let version = SkillVersion::new(
+            1,
+            SkillVersionSpec {
+                description: "description".to_owned(),
+                body: "body".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: false,
+            },
+        );
+
+        assert_eq!(version.id.len(), 64);
+        assert!(version.id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(version.id, version.id.to_ascii_lowercase());
     }
 
     #[test]
