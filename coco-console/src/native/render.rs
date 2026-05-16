@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 
 use coco_mem::{PauseReason, SessionState};
-use leptos::{html::HtmlElement, prelude::*};
+use leptos::prelude::*;
 
-use crate::graph::{GraphNode, GraphSnapshot, css_token, node_target_id, shorten_id};
+use crate::graph::{GraphBranch, GraphNode, GraphSnapshot, css_token, shorten_id};
 use crate::layout::{
-    GraphLayout, GraphLayoutEdgeKind, layout_graph, line_points, routed_elbow_points,
+    GraphLane, GraphLayout, GraphLayoutEdge, GraphLayoutEdgeKind, GraphNodeOccurrence, Point,
+    layout_graph, line_points, routed_elbow_points,
 };
+
+const GRAPH_CULL_EDGE_MARGIN: i32 = 180;
 
 pub fn render_index_page(snapshot: &GraphSnapshot) -> String {
     render_snapshot_document(snapshot, true)
@@ -18,16 +21,23 @@ pub fn render_snapshot_page(snapshot: &GraphSnapshot) -> String {
 }
 
 pub fn render_fragment(snapshot: &GraphSnapshot) -> String {
-    render_root(snapshot).to_html()
+    view! { <ConsoleRoot snapshot=snapshot /> }.to_html()
 }
 
 fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> String {
-    let root = render_root(snapshot);
+    let rendered = view! { <ConsoleDocument snapshot=snapshot include_client=include_client /> };
+
+    format!("<!doctype html>{}", rendered.to_html())
+}
+
+#[component]
+fn ConsoleDocument<'a>(snapshot: &'a GraphSnapshot, include_client: bool) -> impl IntoView {
     let client_script = include_client
         .then(|| view! { <script type="module" src="/pkg/coco_console.js"></script> }.into_any())
         .into_iter()
         .collect::<Vec<_>>();
-    let rendered: View<HtmlElement<_, _, _>> = view! {
+
+    view! {
         <html lang="en">
             <head>
                 <meta charset="utf-8" />
@@ -37,28 +47,24 @@ fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> S
                 {client_script}
             </head>
             <body>
-                {root}
+                <ConsoleRoot snapshot=snapshot />
             </body>
         </html>
-    };
-
-    format!("<!doctype html>{}", rendered.to_html())
+    }
 }
 
-fn render_root(snapshot: &GraphSnapshot) -> AnyView {
+#[component]
+fn ConsoleRoot<'a>(snapshot: &'a GraphSnapshot) -> impl IntoView {
     let stats = format!(
         "{} nodes / {} edges / version {}",
         snapshot.nodes.len(),
         snapshot.edges.len(),
         snapshot.version
     );
-    let selection_style = render_selection_style(snapshot);
-    let content = render_content(snapshot);
     let version = snapshot.version.to_string();
 
     view! {
         <main id="console-root" class="shell" data-version=version>
-            <style id="selection-style">{selection_style}</style>
             <header class="topbar">
                 <section class="brand">
                     <h1>"CoCo Console"</h1>
@@ -66,13 +72,13 @@ fn render_root(snapshot: &GraphSnapshot) -> AnyView {
                 </section>
                 <p class="stats">{stats}</p>
             </header>
-            {content}
+            <ConsoleContent snapshot=snapshot />
         </main>
     }
-    .into_any()
 }
 
-fn render_content(snapshot: &GraphSnapshot) -> AnyView {
+#[component]
+fn ConsoleContent<'a>(snapshot: &'a GraphSnapshot) -> AnyView {
     if snapshot.nodes.is_empty() {
         return view! {
             <section class="content">
@@ -81,117 +87,67 @@ fn render_content(snapshot: &GraphSnapshot) -> AnyView {
                         <div class="empty">"No sessions found."</div>
                     </div>
                 </div>
-                {render_side(snapshot)}
+                <SidePanel snapshot=snapshot />
             </section>
         }
         .into_any();
     }
 
     let layout = layout_graph(snapshot);
-    let graph = render_graph(snapshot, &layout);
-    let minimap = render_minimap(&layout);
-    let side = render_side(snapshot);
-
     view! {
         <section class="content">
-            <div class="graph-shell">
-                <div class="graph-wrap">{graph}</div>
-                {minimap}
-            </div>
-            {side}
+            <GraphPanel snapshot=snapshot layout=&layout />
+            <SidePanel snapshot=snapshot />
         </section>
     }
     .into_any()
 }
 
-fn render_graph(snapshot: &GraphSnapshot, layout: &GraphLayout) -> AnyView {
-    let edge_views = layout
-        .primary_edges
-        .iter()
-        .chain(layout.fork_edges.iter())
-        .chain(layout.merge_edges.iter())
-        .map(|edge| {
-            let marker = match edge.kind {
-                GraphLayoutEdgeKind::PrimaryParent => "url(#arrowhead)",
-                GraphLayoutEdgeKind::Fork => "url(#fork-arrowhead)",
-                GraphLayoutEdgeKind::MergeParent => "url(#merge-arrowhead)",
-            };
-            match edge.kind {
-                GraphLayoutEdgeKind::PrimaryParent => {
-                    let (x1, y1, x2, y2) =
-                        line_points(edge.source, edge.target, edge.target_port_offset);
-                    view! { <line class="edge primary-parent" marker-end=marker x1=x1 y1=y1 x2=x2 y2=y2 /> }
-                        .into_any()
-                }
-                GraphLayoutEdgeKind::Fork => {
-                    let points = routed_elbow_points(
-                        edge.source,
-                        edge.target,
-                        edge.route_slot,
-                        edge.target_port_offset,
-                    );
-                    view! { <polyline class="edge fork" marker-end=marker points=points /> }
-                        .into_any()
-                }
-                GraphLayoutEdgeKind::MergeParent => {
-                    let points = routed_elbow_points(
-                        edge.source,
-                        edge.target,
-                        edge.route_slot,
-                        edge.target_port_offset,
-                    );
-                    view! { <polyline class="edge merge-parent" marker-end=marker points=points /> }
-                        .into_any()
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    let lane_views = layout
+#[component]
+fn GraphPanel<'a>(snapshot: &'a GraphSnapshot, layout: &'a GraphLayout) -> impl IntoView {
+    view! {
+        <div class="graph-shell">
+            <GraphToolbar />
+            <div class="graph-wrap">
+                <GraphSvg snapshot=snapshot layout=layout />
+            </div>
+            <Minimap layout=layout />
+        </div>
+    }
+}
+
+#[component]
+fn GraphToolbar() -> impl IntoView {
+    view! {
+        <div class="graph-toolbar" aria-label="Graph controls">
+            <button class="graph-control" type="button" data-zoom-action="out" aria-label="Zoom out">"-"</button>
+            <button class="graph-control graph-scale" type="button" data-zoom-action="reset" aria-label="Reset zoom">"100%"</button>
+            <button class="graph-control" type="button" data-zoom-action="in" aria-label="Zoom in">"+"</button>
+        </div>
+    }
+}
+
+#[component]
+fn GraphSvg<'a>(snapshot: &'a GraphSnapshot, layout: &'a GraphLayout) -> impl IntoView {
+    let lanes = layout
         .lanes
         .iter()
-        .map(|lane| {
-            let y = lane.y.to_string();
-            let label = lane.label.clone();
-            view! { <text class="lane-label" x="64" y=y>{label}</text> }
-        })
+        .map(|lane| view! { <GraphLaneLabel lane=lane /> })
+        .collect::<Vec<_>>();
+    let edges = graph_edges(layout)
+        .map(|edge| view! { <GraphEdgeView edge=edge /> })
         .collect::<Vec<_>>();
     let nodes_by_id = snapshot
         .nodes
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<HashMap<_, _>>();
-    let node_views = layout
+    let nodes = layout
         .occurrences
         .iter()
         .filter_map(|occurrence| {
             let node = nodes_by_id.get(occurrence.node_id.as_str())?;
-            let labels = if node.labels.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", node.labels.join(", "))
-            };
-            let class = if node.labels.is_empty() {
-                format!("node {}", css_token(&node.kind))
-            } else {
-                format!("node {} active", css_token(&node.kind))
-            };
-            let transform = format!("translate({} {})", occurrence.point.x, occurrence.point.y);
-            let title = format!("{}: {}", node.short_id, node.summary);
-            let label = format!("{}{}", node.short_id, labels);
-            let kind = node.kind.clone();
-            let node_target = occurrence.node_target.clone();
-            let href = format!("#{node_target}");
-            let node_id = node.id.clone();
-            Some(view! {
-                <a class="node-link" href=href data-node-target=node_target data-node-id=node_id>
-                    <g class=class transform=transform>
-                        <title>{title}</title>
-                        <circle class="core" r="26" />
-                        <text class="node-label" y="44">{label}</text>
-                        <text class="node-kind" y="58">{kind}</text>
-                    </g>
-                </a>
-            })
+            Some(view! { <GraphNodeView node=*node occurrence=occurrence /> })
         })
         .collect::<Vec<_>>();
     let view_box = format!("0 0 {} {}", layout.width, layout.height);
@@ -199,68 +155,153 @@ fn render_graph(snapshot: &GraphSnapshot, layout: &GraphLayout) -> AnyView {
     let height = layout.height.to_string();
 
     view! {
-        <svg class="graph" role="img" aria-label="CoCo node graph" viewBox=view_box width=width.clone() height=height.clone()>
-            <defs>
-                <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
-                    <path class="arrowhead" d="M 0 0 L 10 4 L 0 8 z" />
-                </marker>
-                <marker id="merge-arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
-                    <path class="merge-arrowhead" d="M 0 0 L 10 4 L 0 8 z" />
-                </marker>
-                <marker id="fork-arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
-                    <path class="fork-arrowhead" d="M 0 0 L 10 4 L 0 8 z" />
-                </marker>
-            </defs>
+        <svg
+            class="graph"
+            role="img"
+            aria-label="CoCo node graph"
+            viewBox=view_box
+            width=width.clone()
+            height=height.clone()
+            data-graph-width=width.clone()
+            data-graph-height=height.clone()
+            data-zoom="1"
+        >
+            <GraphMarkers />
             <rect class="graph-bg" width=width.clone() height=height.clone() />
-            {lane_views}
-            {edge_views}
-            {node_views}
+            {lanes}
+            {edges}
+            {nodes}
         </svg>
     }
-    .into_any()
 }
 
-fn render_minimap(layout: &GraphLayout) -> AnyView {
-    let edge_views = layout
-        .primary_edges
-        .iter()
-        .chain(layout.fork_edges.iter())
-        .chain(layout.merge_edges.iter())
-        .map(|edge| match edge.kind {
-            GraphLayoutEdgeKind::PrimaryParent => {
-                let (x1, y1, x2, y2) =
-                    line_points(edge.source, edge.target, edge.target_port_offset);
-                view! { <line class="minimap-edge primary-parent" x1=x1 y1=y1 x2=x2 y2=y2 /> }
-                    .into_any()
+#[component]
+fn GraphMarkers() -> impl IntoView {
+    view! {
+        <defs>
+            <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+                <path class="arrowhead" d="M 0 0 L 10 4 L 0 8 z" />
+            </marker>
+            <marker id="merge-arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+                <path class="merge-arrowhead" d="M 0 0 L 10 4 L 0 8 z" />
+            </marker>
+            <marker id="fork-arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+                <path class="fork-arrowhead" d="M 0 0 L 10 4 L 0 8 z" />
+            </marker>
+        </defs>
+    }
+}
+
+#[component]
+fn GraphLaneLabel<'a>(lane: &'a GraphLane) -> impl IntoView {
+    let y = lane.y.to_string();
+    let label = lane.label.clone();
+
+    view! { <text class="lane-label" x="64" y=y>{label}</text> }
+}
+
+#[component]
+fn GraphEdgeView<'a>(edge: &'a GraphLayoutEdge) -> AnyView {
+    let marker = edge_marker(edge.kind);
+    let bounds = edge_bounds(edge.source, edge.target);
+
+    match edge.kind {
+        GraphLayoutEdgeKind::PrimaryParent => {
+            let (x1, y1, x2, y2) = line_points(edge.source, edge.target, edge.target_port_offset);
+            view! {
+                <line
+                    class="edge primary-parent graph-item"
+                    marker-end=marker
+                    x1=x1
+                    y1=y1
+                    x2=x2
+                    y2=y2
+                    data-graph-min-x=bounds.min_x
+                    data-graph-min-y=bounds.min_y
+                    data-graph-max-x=bounds.max_x
+                    data-graph-max-y=bounds.max_y
+                />
             }
-            GraphLayoutEdgeKind::Fork => {
-                let points = routed_elbow_points(
-                    edge.source,
-                    edge.target,
-                    edge.route_slot,
-                    edge.target_port_offset,
-                );
-                view! { <polyline class="minimap-edge fork" points=points /> }.into_any()
+            .into_any()
+        }
+        GraphLayoutEdgeKind::Fork | GraphLayoutEdgeKind::MergeParent => {
+            let points = routed_elbow_points(
+                edge.source,
+                edge.target,
+                edge.route_slot,
+                edge.target_port_offset,
+            );
+            let class = match edge.kind {
+                GraphLayoutEdgeKind::Fork => "edge fork graph-item",
+                GraphLayoutEdgeKind::MergeParent => "edge merge-parent graph-item",
+                GraphLayoutEdgeKind::PrimaryParent => unreachable!(),
+            };
+            view! {
+                <polyline
+                    class=class
+                    marker-end=marker
+                    points=points
+                    data-graph-min-x=bounds.min_x
+                    data-graph-min-y=bounds.min_y
+                    data-graph-max-x=bounds.max_x
+                    data-graph-max-y=bounds.max_y
+                />
             }
-            GraphLayoutEdgeKind::MergeParent => {
-                let points = routed_elbow_points(
-                    edge.source,
-                    edge.target,
-                    edge.route_slot,
-                    edge.target_port_offset,
-                );
-                view! { <polyline class="minimap-edge merge-parent" points=points /> }.into_any()
-            }
-        })
+            .into_any()
+        }
+    }
+}
+
+#[component]
+fn GraphNodeView<'a>(node: &'a GraphNode, occurrence: &'a GraphNodeOccurrence) -> impl IntoView {
+    let labels = if node.labels.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", node.labels.join(", "))
+    };
+    let class = if node.labels.is_empty() {
+        format!("node {}", css_token(&node.kind))
+    } else {
+        format!("node {} active", css_token(&node.kind))
+    };
+    let transform = format!("translate({} {})", occurrence.point.x, occurrence.point.y);
+    let title = format!("{}: {}", node.short_id, node.summary);
+    let label = format!("{}{}", node.short_id, labels);
+    let kind = node.kind.clone();
+    let href = format!("#{}", occurrence.node_target);
+    let node_id = node.id.clone();
+    let node_target = occurrence.node_target.clone();
+    let graph_x = occurrence.point.x.to_string();
+    let graph_y = occurrence.point.y.to_string();
+
+    view! {
+        <a
+            class="node-link graph-item"
+            href=href
+            data-node-target=node_target
+            data-node-id=node_id
+            data-graph-x=graph_x
+            data-graph-y=graph_y
+        >
+            <g class=class transform=transform>
+                <title>{title}</title>
+                <circle class="core" r="26" />
+                <text class="node-label" y="44">{label}</text>
+                <text class="node-kind" y="58">{kind}</text>
+            </g>
+        </a>
+    }
+}
+
+#[component]
+fn Minimap<'a>(layout: &'a GraphLayout) -> impl IntoView {
+    let edges = graph_edges(layout)
+        .map(|edge| view! { <MinimapEdge edge=edge /> })
         .collect::<Vec<_>>();
-    let node_views = layout
+    let nodes = layout
         .occurrences
         .iter()
-        .map(|occurrence| {
-            let x = occurrence.point.x.to_string();
-            let y = occurrence.point.y.to_string();
-            view! { <circle class="minimap-node" cx=x cy=y r="26" /> }
-        })
+        .map(|occurrence| view! { <MinimapNode occurrence=occurrence /> })
         .collect::<Vec<_>>();
     let view_box = format!("0 0 {} {}", layout.width, layout.height);
     let graph_width = layout.width.to_string();
@@ -277,30 +318,60 @@ fn render_minimap(layout: &GraphLayout) -> AnyView {
             data-graph-height=graph_height
         >
             <rect class="minimap-bg" x="0" y="0" width=layout.width.to_string() height=layout.height.to_string() />
-            {edge_views}
-            {node_views}
+            {edges}
+            {nodes}
             <rect class="minimap-viewport" x="0" y="0" width="0" height="0" rx="18" />
         </svg>
     }
-    .into_any()
 }
 
-fn render_selection_style(snapshot: &GraphSnapshot) -> String {
-    snapshot
-        .nodes
-        .iter()
-        .map(|node| {
-            let target = node_target_id(&node.id);
-            format!(
-                "body:has(#{target}:target) [data-node-target=\"{target}\"] .core {{ stroke: #facc15; stroke-width: 3.2; }}"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+#[component]
+fn MinimapEdge<'a>(edge: &'a GraphLayoutEdge) -> AnyView {
+    match edge.kind {
+        GraphLayoutEdgeKind::PrimaryParent => {
+            let (x1, y1, x2, y2) = line_points(edge.source, edge.target, edge.target_port_offset);
+            view! { <line class="minimap-edge primary-parent" x1=x1 y1=y1 x2=x2 y2=y2 /> }
+                .into_any()
+        }
+        GraphLayoutEdgeKind::Fork | GraphLayoutEdgeKind::MergeParent => {
+            let points = routed_elbow_points(
+                edge.source,
+                edge.target,
+                edge.route_slot,
+                edge.target_port_offset,
+            );
+            let class = match edge.kind {
+                GraphLayoutEdgeKind::Fork => "minimap-edge fork",
+                GraphLayoutEdgeKind::MergeParent => "minimap-edge merge-parent",
+                GraphLayoutEdgeKind::PrimaryParent => unreachable!(),
+            };
+            view! { <polyline class=class points=points /> }.into_any()
+        }
+    }
 }
 
-fn render_side(snapshot: &GraphSnapshot) -> AnyView {
-    let default_details = view! {
+#[component]
+fn MinimapNode<'a>(occurrence: &'a GraphNodeOccurrence) -> impl IntoView {
+    let x = occurrence.point.x.to_string();
+    let y = occurrence.point.y.to_string();
+
+    view! { <circle class="minimap-node" cx=x cy=y r="26" /> }
+}
+
+#[component]
+fn SidePanel<'a>(snapshot: &'a GraphSnapshot) -> impl IntoView {
+    view! {
+        <aside class="side">
+            <NodeDetailsDefault />
+            <NodeDetailPanel />
+            <BranchSection branches=&snapshot.branches />
+        </aside>
+    }
+}
+
+#[component]
+fn NodeDetailsDefault() -> impl IntoView {
+    view! {
         <section class="node-details node-details-default">
             <h2>"Node"</h2>
             <dl class="detail-list">
@@ -310,90 +381,105 @@ fn render_side(snapshot: &GraphSnapshot) -> AnyView {
                 </div>
             </dl>
         </section>
-    };
-    let detail_views = snapshot
-        .nodes
-        .iter()
-        .map(render_node_details)
-        .collect::<Vec<_>>();
-    let branches = render_branches(snapshot);
-
-    view! {
-        <aside class="side">
-            {default_details}
-            {detail_views}
-            {branches}
-        </aside>
     }
-    .into_any()
 }
 
-fn render_node_details(node: &GraphNode) -> AnyView {
-    let labels = if node.labels.is_empty() {
-        "None".to_owned()
-    } else {
-        node.labels.join(", ")
-    };
-    let id = node.id.clone();
-    let kind = node.kind.clone();
-    let role = node.role.clone();
-    let created_at = node.created_at.clone();
-    let content = node.content.clone();
-    let target = node_target_id(&node.id);
-
+#[component]
+fn NodeDetailPanel() -> impl IntoView {
     view! {
-        <section id=target class="node-details node-detail">
+        <section class="node-details node-detail-panel" hidden="true">
             <h2>"Node"</h2>
             <dl class="detail-list">
-                <div>
-                    <dt>"Id"</dt>
-                    <dd>{id}</dd>
-                </div>
-                <div>
-                    <dt>"Kind"</dt>
-                    <dd>{kind}</dd>
-                </div>
-                <div>
-                    <dt>"Role"</dt>
-                    <dd>{role}</dd>
-                </div>
-                <div>
-                    <dt>"Created"</dt>
-                    <dd>{created_at}</dd>
-                </div>
-                <div>
-                    <dt>"Labels"</dt>
-                    <dd>{labels}</dd>
-                </div>
-                <div>
-                    <dt>"Content"</dt>
-                    <dd>{content}</dd>
-                </div>
+                <DetailField label="Id" field="id" />
+                <DetailField label="Kind" field="kind" />
+                <DetailField label="Role" field="role" />
+                <DetailField label="Created" field="created_at" />
+                <DetailField label="Labels" field="labels" />
+                <DetailField label="Content" field="content" />
             </dl>
         </section>
     }
-    .into_any()
 }
 
-fn render_branches(snapshot: &GraphSnapshot) -> AnyView {
-    let items = snapshot
-        .branches
+#[component]
+fn DetailField(label: &'static str, field: &'static str) -> impl IntoView {
+    view! {
+        <div>
+            <dt>{label}</dt>
+            <dd data-node-field=field></dd>
+        </div>
+    }
+}
+
+#[component]
+fn BranchSection<'a>(branches: &'a [GraphBranch]) -> impl IntoView {
+    let items = branches
         .iter()
-        .map(|branch| {
-            let name = branch.name.clone();
-            let head = format!("head {}", shorten_id(&branch.head_id));
-            let state = format_session_state(&branch.state);
-            view! {
-                <li class="branch">
-                    <strong>{name}</strong>
-                    <span>{head}</span>
-                    <span>{state}</span>
-                </li>
-            }
-        })
+        .map(|branch| view! { <BranchItem branch=branch /> })
         .collect::<Vec<_>>();
 
-    view! { <section><h2>"Branches"</h2><ul class="branch-list">{items}</ul></section> }.into_any()
+    view! {
+        <details class="branch-section">
+            <summary>
+                <h2>"Branches"</h2>
+                <span>{branches.len().to_string()}</span>
+            </summary>
+            <ul class="branch-list">{items}</ul>
+        </details>
+    }
+}
+
+#[component]
+fn BranchItem<'a>(branch: &'a GraphBranch) -> impl IntoView {
+    let name = branch.name.clone();
+    let head = format!("head {}", shorten_id(&branch.head_id));
+    let state = format_session_state(&branch.state);
+
+    view! {
+        <li class="branch">
+            <strong>{name}</strong>
+            <span>{head}</span>
+            <span>{state}</span>
+        </li>
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GraphItemBounds {
+    min_x: String,
+    min_y: String,
+    max_x: String,
+    max_y: String,
+}
+
+fn graph_edges(layout: &GraphLayout) -> impl Iterator<Item = &GraphLayoutEdge> {
+    layout
+        .primary_edges
+        .iter()
+        .chain(layout.fork_edges.iter())
+        .chain(layout.merge_edges.iter())
+}
+
+fn edge_marker(kind: GraphLayoutEdgeKind) -> &'static str {
+    match kind {
+        GraphLayoutEdgeKind::PrimaryParent => "url(#arrowhead)",
+        GraphLayoutEdgeKind::Fork => "url(#fork-arrowhead)",
+        GraphLayoutEdgeKind::MergeParent => "url(#merge-arrowhead)",
+    }
+}
+
+fn edge_bounds(source: Point, target: Point) -> GraphItemBounds {
+    let min_x = source.x.min(target.x) - GRAPH_CULL_EDGE_MARGIN;
+    let min_y = source.y.min(target.y) - GRAPH_CULL_EDGE_MARGIN;
+    let max_x = source.x.max(target.x) + GRAPH_CULL_EDGE_MARGIN;
+    let max_y = source.y.max(target.y) + GRAPH_CULL_EDGE_MARGIN;
+
+    GraphItemBounds {
+        min_x: min_x.to_string(),
+        min_y: min_y.to_string(),
+        max_x: max_x.to_string(),
+        max_y: max_y.to_string(),
+    }
 }
 
 fn format_session_state(state: &SessionState) -> String {

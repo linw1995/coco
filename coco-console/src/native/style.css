@@ -68,6 +68,51 @@ body {
   position: relative;
 }
 
+.graph-toolbar {
+  align-items: center;
+  background: rgba(8, 11, 18, 0.86);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.30);
+  display: flex;
+  gap: 0.35rem;
+  padding: 0.35rem;
+  position: absolute;
+  right: 1rem;
+  top: 1rem;
+  z-index: 5;
+}
+
+.graph-control {
+  align-items: center;
+  background: rgba(15, 23, 42, 0.94);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 6px;
+  color: #dbeafe;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 0.78rem;
+  height: 2rem;
+  justify-content: center;
+  min-width: 2rem;
+  padding: 0 0.58rem;
+}
+
+.graph-control:hover {
+  border-color: rgba(125, 211, 252, 0.54);
+  color: #f8fafc;
+}
+
+.graph-control:disabled {
+  color: #64748b;
+  cursor: default;
+}
+
+.graph-scale {
+  min-width: 3.6rem;
+}
+
 .graph-wrap {
   height: 100%;
   min-width: 0;
@@ -173,6 +218,10 @@ body {
   text-decoration: none;
 }
 
+.graph-item.is-culled {
+  display: none;
+}
+
 .node .core {
   fill: rgba(28, 36, 55, 0.96);
   stroke: rgba(148, 163, 184, 0.50);
@@ -187,6 +236,7 @@ body {
 .node.text .core { fill: #1f2937; stroke: #94a3b8; }
 .node.failure .core { fill: #b91c1c; stroke: #fecaca; }
 .node.active .core { stroke: #7dd3fc; stroke-width: 2.4; }
+.node-link.node-selected .core { stroke: #facc15; stroke-width: 3.2; }
 
 .node-link.node-new .core {
   animation: node-grow 680ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -280,21 +330,43 @@ body {
   padding-bottom: 1rem;
 }
 
-.node-detail {
+.node-detail-panel[hidden] {
   display: none;
 }
 
-.node-detail:target {
-  display: block;
-}
-
-body:has(.node-detail:target) .node-details-default {
+.side.has-selection .node-details-default {
   display: none;
 }
 
 .branch-section {
   min-height: 0;
   overflow: auto;
+}
+
+.branch-section summary {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
+  list-style: none;
+}
+
+.branch-section summary::-webkit-details-marker {
+  display: none;
+}
+
+.branch-section summary h2 {
+  margin-bottom: 0;
+}
+
+.branch-section summary span {
+  color: #94a3b8;
+  font-size: 0.74rem;
+}
+
+.branch-section .branch-list {
+  margin-top: 0.75rem;
 }
 
 .detail-list {

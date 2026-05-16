@@ -146,7 +146,12 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
 
     let html = render_snapshot_page(&snapshot);
     assert!(html.contains("href=\"#detail-"));
-    assert!(html.contains("body:has(#detail-"));
+    assert!(html.contains("class=\"graph-control"));
+    assert!(html.contains("data-zoom-action=\"in\""));
+    assert!(html.contains("data-graph-x="));
+    assert!(html.contains("data-graph-min-x="));
+    assert!(html.contains("class=\"node-details node-detail-panel\""));
+    assert!(html.contains("class=\"branch-section\""));
     assert!(html.contains("class=\"minimap\""));
     assert!(html.contains("preserveAspectRatio=\"xMidYMid meet\""));
     assert!(html.contains("class=\"minimap-viewport\""));

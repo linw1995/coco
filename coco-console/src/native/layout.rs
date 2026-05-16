@@ -1,5 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
+use coco_mem::SessionState;
+
 use crate::graph::{GraphBranch, GraphEdgeKind, GraphSnapshot, node_target_id, shorten_id};
 
 const NODE_RADIUS: f64 = 26.0;
@@ -566,7 +568,12 @@ fn branch_lane_priority(branch: &GraphBranch) -> (u8, &str) {
     if branch.name == "main" {
         (0, branch.name.as_str())
     } else {
-        (1, branch.name.as_str())
+        let state_priority = match &branch.state {
+            SessionState::Active => 1,
+            SessionState::Attached { .. } => 2,
+            SessionState::Paused { .. } => 3,
+        };
+        (state_priority, branch.name.as_str())
     }
 }
 
