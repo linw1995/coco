@@ -3,7 +3,6 @@ use std::path::Path;
 
 pub(crate) mod fs;
 pub mod memory;
-pub(crate) mod projection;
 pub(crate) mod state;
 
 #[cfg(test)]

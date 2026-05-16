@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
-use super::projection::ProjectionContext;
 use super::state::StoreState;
 use super::{
     BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, ProcessShareableStore,
@@ -263,7 +262,8 @@ impl SkillHistoryEntry {
 }
 
 fn validate_snapshot<V>(
-    context: &ProjectionContext,
+    entity: &str,
+    history_path: &Path,
     snapshot_key: &str,
     current_version: u64,
     versions: &VersionMap<V>,
@@ -272,30 +272,23 @@ fn validate_snapshot<V>(
     let persisted_current = versions
         .get(&current_version)
         .context(CorruptedStoreSnafu {
-            path: context.history_path().to_owned(),
+            path: history_path.to_owned(),
             message: format!(
-                "missing current {} version {} for {:?}",
-                context.entity(),
-                current_version,
-                snapshot_key
+                "missing current {entity} version {current_version} for {snapshot_key:?}",
             ),
         })?;
     ensure!(
         matches_version(persisted_current),
         CorruptedStoreSnafu {
-            path: context.history_path().to_owned(),
-            message: format!(
-                "current {} snapshot mismatch for {:?}",
-                context.entity(),
-                snapshot_key
-            ),
+            path: history_path.to_owned(),
+            message: format!("current {entity} snapshot mismatch for {snapshot_key:?}"),
         }
     );
     Ok(())
 }
 
 fn validate_versions<V>(
-    context: &ProjectionContext,
+    entity: &str,
     path: &Path,
     key: &str,
     versions: &VersionMap<V>,
@@ -309,10 +302,7 @@ fn validate_versions<V>(
                 path: path.to_owned(),
                 message: format!(
                     "non-contiguous history version {} for {} {:?}, expected {}",
-                    version,
-                    context.entity(),
-                    key,
-                    expected_version
+                    version, entity, key, expected_version
                 ),
             }
         );
@@ -323,10 +313,7 @@ fn validate_versions<V>(
                 path: path.to_owned(),
                 message: format!(
                     "{} {:?} stores version {} under key {}",
-                    context.entity(),
-                    key,
-                    entry_version,
-                    version
+                    entity, key, entry_version, version
                 ),
             }
         );
@@ -1297,18 +1284,15 @@ fn validate_preset_snapshots(
     current: &HashMap<String, PersistedPresetRecord>,
     history: &HashMap<String, PresetRecord>,
 ) -> Result<()> {
-    let context = ProjectionContext::new("preset", PRESET_HISTORY_DIR_NAME);
+    let history_path = Path::new(PRESET_HISTORY_DIR_NAME);
     for snapshot in current.values() {
         let record = history.get(&snapshot.name).context(CorruptedStoreSnafu {
-            path: context.history_path().to_owned(),
-            message: format!(
-                "missing {} history for {:?}",
-                context.entity(),
-                snapshot.name
-            ),
+            path: history_path.to_owned(),
+            message: format!("missing preset history for {:?}", snapshot.name),
         })?;
         validate_snapshot(
-            &context,
+            "preset",
+            history_path,
             &snapshot.name,
             snapshot.current_version,
             &record.versions,
@@ -1324,7 +1308,6 @@ fn preset_record_from_history(
     name: &str,
     entries: &[(PathBuf, PresetHistoryEntry)],
 ) -> Result<PresetRecord> {
-    let context = ProjectionContext::new("preset", PRESET_HISTORY_DIR_NAME);
     let mut versions = BTreeMap::new();
     let mut source_path = None;
 
@@ -1362,7 +1345,7 @@ fn preset_record_from_history(
             message: format!("empty preset history for {:?}", name),
         }
     );
-    validate_versions(&context, &path, name, &versions, |version| version.version)?;
+    validate_versions("preset", &path, name, &versions, |version| version.version)?;
     let current_version = versions
         .keys()
         .next_back()
@@ -1404,20 +1387,17 @@ fn validate_skill_snapshots(current: &PersistedSkillGroups, history: &SkillGroup
         (SessionRole::Orchestrator, &current.orchestrator),
         (SessionRole::Runner, &current.runner),
     ] {
-        let context =
-            ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME);
+        let entity = format!("skill role {:?}", role);
+        let history_path = Path::new(SKILL_HISTORY_DIR_NAME);
         let history = history.for_role(role);
         for snapshot in records.values() {
             let record = history.get(&snapshot.name).context(CorruptedStoreSnafu {
-                path: context.history_path().to_owned(),
-                message: format!(
-                    "missing {} history for {:?}",
-                    context.entity(),
-                    snapshot.name
-                ),
+                path: history_path.to_owned(),
+                message: format!("missing {entity} history for {:?}", snapshot.name),
             })?;
             validate_snapshot(
-                &context,
+                &entity,
+                history_path,
                 &snapshot.name,
                 snapshot.current_version,
                 &record.versions,
@@ -1452,7 +1432,7 @@ fn skill_record_from_history(
     name: &str,
     entries: &[(PathBuf, SkillHistoryEntry)],
 ) -> Result<SkillRecord> {
-    let context = ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME);
+    let entity = format!("skill role {:?}", role);
     let mut versions = BTreeMap::new();
     let mut source_path = None;
 
@@ -1500,7 +1480,7 @@ fn skill_record_from_history(
             message: format!("empty skill role {:?} history for {:?}", role, name),
         }
     );
-    validate_versions(&context, &path, name, &versions, |version| version.version)?;
+    validate_versions(&entity, &path, name, &versions, |version| version.version)?;
     let current_version = versions
         .keys()
         .next_back()
