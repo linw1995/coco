@@ -737,22 +737,7 @@ impl Persistence {
     }
 
     fn migrate_store(&self, from: StoreSchemaVersion, root_id: &str) -> Result<()> {
-        if self.access != StoreAccess::ReadWrite {
-            tracing::warn!(
-                store_path = %self.dir.display(),
-                from_version = from.format_label(),
-                to_version = STORE_FORMAT_VERSION,
-                "store format migration requires writable access"
-            );
-            return CorruptedStoreSnafu {
-                path: self.meta_path.clone(),
-                message: format!(
-                    "store format version requires writable migration to {}",
-                    STORE_FORMAT_VERSION
-                ),
-            }
-            .fail();
-        }
+        debug_assert_eq!(self.access, StoreAccess::ReadWrite);
 
         tracing::info!(
             store_path = %self.dir.display(),
@@ -1079,6 +1064,22 @@ impl Persistence {
             ),
         })?;
         if schema_version != StoreSchemaVersion::Current {
+            if self.access != StoreAccess::ReadWrite {
+                tracing::warn!(
+                    store_path = %self.dir.display(),
+                    from_version = schema_version.format_label(),
+                    to_version = STORE_FORMAT_VERSION,
+                    "read-only store requires writable format migration"
+                );
+                return CorruptedStoreSnafu {
+                    path: self.meta_path.clone(),
+                    message: format!(
+                        "store format version {} requires writable migration to {}",
+                        meta.version, STORE_FORMAT_VERSION
+                    ),
+                }
+                .fail();
+            }
             self.migrate_store(schema_version, &meta.root_id)?;
             meta = read_json_file::<Meta>(&self.meta_path)?;
             ensure!(

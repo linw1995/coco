@@ -2531,6 +2531,27 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 }
 
 #[test]
+fn open_read_only_rejects_store_that_requires_format_migration() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!(10);
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let err = FsStore::open_read_only(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+    let unchanged: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(unchanged["version"], 10);
+}
+
+#[test]
 fn open_rejects_unsupported_store_format_version() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
