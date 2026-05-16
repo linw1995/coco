@@ -505,6 +505,7 @@ fn provider_profile(
             secrets,
             base_url: base_url.map(str::to_owned),
             default_model: default_model.map(str::to_owned),
+            spec: Default::default(),
         },
     )
 }
@@ -533,6 +534,7 @@ fn llm_with_test_provider_config<B, S>(store: S, backend: B) -> Arc<coco_llm::Ll
             secrets: BTreeMap::new(),
             base_url: None,
             default_model: Some("gpt-5.4".to_owned()),
+            additional_params: None,
         },
     );
     Arc::new(
@@ -564,6 +566,7 @@ where
                     ProviderRuntimeConfig {
                         provider: Provider::parse(&profile.provider).unwrap(),
                         secrets: BTreeMap::new(),
+                        additional_params: coco_llm::provider_profile_additional_params(&profile),
                         base_url: profile.base_url,
                         default_model: profile.default_model,
                     },
@@ -3739,6 +3742,8 @@ fn provider_profiles_load_from_cwd_config_toml() {
 provider = "openai"
 base_url = "https://openai.example.test/v1"
 default_model = "gpt-4.1-mini"
+reasoning_level = "high"
+service_tier = "fast"
 
 [providers.work-openai.secrets]
 api_key = "${COCO_WORK_OPENAI_API_KEY}"
@@ -3764,6 +3769,8 @@ allowed_chat_ids = ["123", "-456"]
         Some("${COCO_WORK_OPENAI_API_KEY}")
     );
     assert_eq!(profile.default_model.as_deref(), Some("gpt-4.1-mini"));
+    assert_eq!(profile.spec.gpt.reasoning_level.as_deref(), Some("high"));
+    assert_eq!(profile.spec.gpt.service_tier.as_deref(), Some("fast"));
     let telegram = config.channels.telegram.unwrap();
     assert!(telegram.enabled);
     assert_eq!(telegram.token, "${COCO_TELEGRAM_BOT_TOKEN}");
@@ -3862,8 +3869,12 @@ async fn preset_commands_manage_versions_in_store() {
     let (_tempdir, store_path) = temp_store_path();
     let preset_name = "coding";
 
+    let (openai_name, mut openai_profile) =
+        provider_profile("openai", "openai", "${OPENAI_API_KEY}", None, None);
+    openai_profile.spec.gpt.reasoning_level = Some("high".to_owned());
+    openai_profile.spec.gpt.service_tier = Some("fast".to_owned());
     let provider_profiles = ProviderProfiles::from_profiles(HashMap::from([
-        provider_profile("openai", "openai", "${OPENAI_API_KEY}", None, None),
+        (openai_name, openai_profile),
         provider_profile("anthropic", "anthropic", "${ANTHROPIC_API_KEY}", None, None),
     ]));
 
@@ -5401,6 +5412,44 @@ fn resolve_session_config_parses_additional_params_json_object() {
             "service_tier": "priority",
             "reasoning_effort": "low",
         }))
+    );
+}
+
+#[test]
+fn resolve_session_config_persists_only_explicit_additional_params() {
+    let (_, mut profile) = provider_profile(
+        "work-openai",
+        "openai",
+        "${COCO_WORK_OPENAI_API_KEY}",
+        None,
+        Some("gpt-5.4"),
+    );
+    profile.spec.gpt.reasoning_level = Some("high".to_owned());
+    profile.spec.gpt.service_tier = Some("fast".to_owned());
+    let provider_profiles =
+        ProviderProfiles::from_profiles(HashMap::from([("work-openai".to_owned(), profile)]));
+
+    let config = crate::app::resolve_session_config_with_store(
+        SessionCreateCommand {
+            branch: "main".to_owned(),
+            role: crate::cli::CliSessionRole::Orchestrator,
+            provider_profile: Some("work-openai".to_owned()),
+            system_prompt: "You are helpful.".to_owned(),
+            prompt: "".to_owned(),
+            temperature: Some(0.2),
+            max_tokens: Some(64),
+            additional_params: Some("{\"service_tier\":\"flex\"}".to_owned()),
+            tools: vec![],
+            enable_coco_shim: false,
+            disable_coco_shim: false,
+        },
+        &provider_profiles,
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.additional_params,
+        Some(json!({"service_tier": "flex"}))
     );
 }
 

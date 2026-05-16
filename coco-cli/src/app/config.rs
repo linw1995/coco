@@ -151,6 +151,7 @@ fn test_provider_profiles() -> ProviderProfiles {
             secrets: BTreeMap::new(),
             base_url: None,
             default_model: Some("gpt-5.4".to_owned()),
+            spec: Default::default(),
         },
     )]))
 }

@@ -31,6 +31,9 @@ pub(crate) mod runtime;
 mod session;
 mod skill;
 
+#[cfg(test)]
+pub(crate) use session::resolve_session_config as resolve_session_config_with_store;
+
 pub async fn run<R>(cli: Cli, reader: &mut R) -> Result<Option<String>>
 where
     R: Read,
@@ -198,6 +201,7 @@ fn resolve_provider_runtime_configs(
         .into_iter()
         .map(|(name, profile)| {
             let provider = coco_llm::Provider::parse(&profile.provider).context(LlmSnafu)?;
+            let additional_params = coco_llm::provider_profile_additional_params(&profile);
             let secrets = resolve_provider_secrets(&name, profile.secrets)?;
             Ok((
                 name,
@@ -206,6 +210,7 @@ fn resolve_provider_runtime_configs(
                     secrets,
                     base_url: profile.base_url,
                     default_model: profile.default_model,
+                    additional_params,
                 },
             ))
         })
@@ -259,6 +264,7 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
             secrets: BTreeMap::new(),
             base_url: None,
             default_model: Some("gpt-5.4".to_owned()),
+            spec: Default::default(),
         },
     );
     let provider_profiles = config::ProviderProfiles::from_profiles(profiles);
