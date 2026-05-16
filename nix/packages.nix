@@ -29,7 +29,7 @@
     cargoExtraArgs = "--package coco-cli";
 
     outputHashes = {
-      "git+https://github.com/0xPlaygrounds/rig?branch=main#6dc36d803adaf4f89de774577b9c4f7ac9057644" = "sha256-tnSi5EOq9BCEXlJxj2bFzlynG33qB+UuPDufW92kAj8=";
+      "git+https://github.com/0xPlaygrounds/rig?branch=main#327e4d447f233ef5c27ba16cc0e66b76d71bed34" = "sha256-Bt97w3yNwVY/0T5p5Ju6HygFnlDdWm0a8V40s9D19Fk=";
     };
 
     nativeBuildInputs = with packagePkgs; [
