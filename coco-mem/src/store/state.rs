@@ -609,19 +609,6 @@ impl StoreState {
         self.plan_rebase_session_with(name, |session_anchor| session_anchor.apply_patch(patch))
     }
 
-    pub fn plan_rebase_session_system_prompt(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        system_prompt: &str,
-    ) -> Result<RebasePlan> {
-        self.plan_rebase_session_with(name, |session_anchor| {
-            let mut rebased = session_anchor.apply_patch(patch);
-            rebased.system_prompt = system_prompt.to_owned();
-            rebased
-        })
-    }
-
     fn plan_rebase_session_with(
         &self,
         name: &str,

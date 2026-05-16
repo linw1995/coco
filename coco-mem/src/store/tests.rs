@@ -1352,7 +1352,7 @@ where
     );
 }
 
-fn assert_rebase_session_system_prompt_rebuilds_branch_chain<F>()
+fn assert_rebase_session_patch_system_prompt_rebuilds_branch_chain<F>()
 where
     F: TestStoreFactory,
 {
@@ -1363,13 +1363,13 @@ where
     store.fork("main", &child_id).unwrap();
 
     let new_head = store
-        .rebase_session_system_prompt(
+        .rebase_session(
             "main",
             &SessionAnchorPatch {
                 model: Some("claude-sonnet-4-20250514".to_owned()),
+                system_prompt: Some("You are strict.".to_owned()),
                 ..SessionAnchorPatch::default()
             },
-            "You are strict.",
         )
         .unwrap();
 
@@ -2149,8 +2149,8 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
-            fn rebase_session_system_prompt_rebuilds_branch_chain() {
-                assert_rebase_session_system_prompt_rebuilds_branch_chain::<$factory>();
+            fn rebase_session_patch_system_prompt_rebuilds_branch_chain() {
+                assert_rebase_session_patch_system_prompt_rebuilds_branch_chain::<$factory>();
             }
 
             #[test]

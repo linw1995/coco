@@ -1895,17 +1895,6 @@ impl SessionStore for FsStore {
         let plan = state.plan_rebase_session(name, patch)?;
         apply_rebase_plan(&mut state, &self.persistence, plan)
     }
-
-    fn rebase_session_system_prompt(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        system_prompt: &str,
-    ) -> Result<String> {
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let plan = state.plan_rebase_session_system_prompt(name, patch, system_prompt)?;
-        apply_rebase_plan(&mut state, &self.persistence, plan)
-    }
 }
 
 fn apply_rebase_plan(

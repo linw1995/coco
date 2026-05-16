@@ -119,18 +119,6 @@ where
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
         self.notify_if_ok(self.inner.rebase_session(name, patch))
     }
-
-    fn rebase_session_system_prompt(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        system_prompt: &str,
-    ) -> StoreResult<String> {
-        self.notify_if_ok(
-            self.inner
-                .rebase_session_system_prompt(name, patch, system_prompt),
-        )
-    }
 }
 
 impl<S> BranchConfigStore for ConsoleStore<S>

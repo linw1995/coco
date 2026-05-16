@@ -160,6 +160,7 @@ pub struct SessionAnchorPatch {
     pub provider: Option<Option<String>>,
     pub model: Option<String>,
     pub tools: Option<Vec<Tool>>,
+    pub system_prompt: Option<String>,
     pub temperature: Option<Option<f64>>,
     pub max_tokens: Option<Option<u64>>,
     pub additional_params: Option<Option<Value>>,
@@ -727,7 +728,10 @@ impl SessionAnchor {
                 .unwrap_or_else(|| self.provider.clone()),
             model: patch.model.clone().unwrap_or_else(|| self.model.clone()),
             tools: patch.tools.clone().unwrap_or_else(|| self.tools.clone()),
-            system_prompt: self.system_prompt.clone(),
+            system_prompt: patch
+                .system_prompt
+                .clone()
+                .unwrap_or_else(|| self.system_prompt.clone()),
             prompt: self.prompt.clone(),
             temperature: patch.temperature.unwrap_or(self.temperature),
             max_tokens: patch.max_tokens.unwrap_or(self.max_tokens),
@@ -742,10 +746,10 @@ impl SessionAnchor {
 }
 
 impl BranchConfig {
-    /// Builds the runtime-only patch used by session rebase.
+    /// Builds the runtime patch used by session rebase.
     ///
-    /// The durable session prompts are intentionally excluded: changing them
-    /// requires a new session anchor rather than patching the current one.
+    /// The durable user prompt is intentionally excluded: changing it requires
+    /// a new session anchor rather than patching the current one.
     pub fn to_session_anchor_patch(&self) -> SessionAnchorPatch {
         SessionAnchorPatch {
             role: Some(self.role),
@@ -753,6 +757,7 @@ impl BranchConfig {
             provider: Some(None),
             model: Some(self.model.clone()),
             tools: Some(self.tools.clone()),
+            system_prompt: Some(self.system_prompt.clone()),
             temperature: Some(self.temperature),
             max_tokens: Some(self.max_tokens),
             additional_params: Some(self.additional_params.clone()),
@@ -1684,6 +1689,7 @@ mod tests {
             provider: Some(Some("anthropic".to_owned())),
             model: Some("claude-sonnet-4-20250514".to_owned()),
             tools: Some(vec![]),
+            system_prompt: Some("new system".to_owned()),
             temperature: Some(None),
             max_tokens: Some(Some(256)),
             additional_params: Some(Some(json!({"service_tier": "priority"}))),
@@ -1695,7 +1701,7 @@ mod tests {
         assert_eq!(updated.provider.as_deref(), Some("anthropic"));
         assert_eq!(updated.model, "claude-sonnet-4-20250514");
         assert!(updated.tools.is_empty());
-        assert_eq!(updated.system_prompt, "system");
+        assert_eq!(updated.system_prompt, "new system");
         assert_eq!(updated.prompt, "prompt");
         assert_eq!(updated.temperature, None);
         assert_eq!(updated.max_tokens, Some(256));

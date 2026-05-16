@@ -149,22 +149,6 @@ impl SessionStore for MemoryStore {
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
     }
-
-    fn rebase_session_system_prompt(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        system_prompt: &str,
-    ) -> Result<String> {
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let plan = state.plan_rebase_session_system_prompt(name, patch, system_prompt)?;
-
-        for node in plan.nodes {
-            state.insert_existing_node(node)?;
-        }
-        state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
-        Ok(plan.new_head)
-    }
 }
 
 impl BranchConfigStore for MemoryStore {

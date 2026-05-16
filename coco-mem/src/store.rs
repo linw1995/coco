@@ -74,14 +74,6 @@ pub trait SessionStore {
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
-
-    /// Rewrites the visible session chain with a new system prompt and returns the new head id.
-    fn rebase_session_system_prompt(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        system_prompt: &str,
-    ) -> StoreResult<String>;
 }
 
 /// Branch preset config storage API.

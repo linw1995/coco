@@ -1041,29 +1041,6 @@ where
         );
         Ok(anchor_id)
     }
-
-    pub async fn rebase_session_system_prompt(
-        &self,
-        branch: &str,
-        patch: SessionConfigPatch,
-        system_prompt: &str,
-    ) -> Result<String> {
-        let _guard = self.lock_branch(branch).await;
-        let has_tool_patch = patch.tools.is_some();
-        let has_model_patch = patch.model.is_some();
-        let anchor_id = self
-            .store
-            .rebase_session_system_prompt(branch, &patch, system_prompt)
-            .context(MemorySnafu)?;
-        tracing::info!(
-            branch = %branch,
-            anchor_id = %anchor_id,
-            has_tool_patch,
-            has_model_patch,
-            "rebased session with system prompt"
-        );
-        Ok(anchor_id)
-    }
 }
 
 impl<B, S> LlmService<B, S>
@@ -4168,6 +4145,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             additional_params: None,
+            system_prompt: None,
             enable_coco_shim: None,
         }
     }
@@ -5830,7 +5808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebase_session_system_prompt_rebuilds_session_anchor() {
+    async fn rebase_session_patch_system_prompt_rebuilds_session_anchor() {
         let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[("main", &[Ok("updated")])]);
         let calls = backend.calls.clone();
@@ -5841,7 +5819,13 @@ mod tests {
             .unwrap();
 
         let new_head = service
-            .rebase_session_system_prompt("main", session_patch(), "You are strict.")
+            .rebase_session(
+                "main",
+                SessionConfigPatch {
+                    system_prompt: Some("You are strict.".to_owned()),
+                    ..session_patch()
+                },
+            )
             .await
             .unwrap();
 

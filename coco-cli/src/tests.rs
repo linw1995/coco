@@ -4324,7 +4324,7 @@ async fn session_rebase_applies_preset_patch() {
     assert_eq!(session_json["anchor"]["provider_profile"], "anthropic-main");
     assert_eq!(session_json["anchor"]["provider"], json!(null));
     assert_eq!(session_json["anchor"]["model"], "claude-sonnet-4-20250514");
-    assert_eq!(session_json["anchor"]["system_prompt"], "You are helpful.");
+    assert_eq!(session_json["anchor"]["system_prompt"], "You are precise.");
     assert_eq!(session_json["anchor"]["prompt"], "");
     assert_eq!(session_json["anchor"]["temperature"], json!(null));
     assert_eq!(session_json["anchor"]["max_tokens"], 256);
