@@ -2285,10 +2285,10 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     assert!(path.join("store.lock").is_file());
     assert!(path.join("nodes.jsonl").is_file());
     assert!(path.join("sessions.json").is_file());
-    assert!(path.join("branch-configs.json").is_file());
+    assert!(path.join("presets.json").is_file());
     assert!(path.join("skills.json").is_file());
     assert!(path.join("branches").is_dir());
-    assert!(path.join("branch-config-history").is_dir());
+    assert!(path.join("preset-history").is_dir());
     assert!(path.join("skill-history").is_dir());
     assert!(path.join("skill-history/shared").is_dir());
     assert!(path.join("skill-history/orchestrator").is_dir());
@@ -2367,7 +2367,7 @@ fn open_read_only_does_not_create_missing_history_directories() {
         r#"{"orchestrator":{},"runner":{}}"#,
     )
     .unwrap();
-    fs::remove_dir_all(path.join("branch-config-history")).unwrap();
+    fs::remove_dir_all(path.join("preset-history")).unwrap();
     fs::remove_dir_all(path.join("skill-history")).unwrap();
 
     let lock_path = path.join("store.lock");
@@ -2382,7 +2382,7 @@ fn open_read_only_does_not_create_missing_history_directories() {
     let read_only = FsStore::open_read_only(&path).unwrap();
 
     assert_eq!(read_only.root_id(), root_id);
-    assert!(!path.join("branch-config-history").exists());
+    assert!(!path.join("preset-history").exists());
     assert!(!path.join("skill-history").exists());
 }
 
@@ -2424,8 +2424,7 @@ fn presets_json_only_stores_current_snapshots() {
         .unwrap();
 
     let configs: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.join("branch-configs.json")).unwrap())
-            .unwrap();
+        serde_json::from_str(&fs::read_to_string(path.join("presets.json")).unwrap()).unwrap();
     let coding = &configs[preset_name];
 
     assert_eq!(coding["current_version"], 2);
@@ -2435,7 +2434,7 @@ fn presets_json_only_stores_current_snapshots() {
 }
 
 #[test]
-fn preset_history_is_appended_in_legacy_history_directory() {
+fn preset_history_is_appended_in_history_directory() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let preset_name = "coding";
@@ -2453,7 +2452,7 @@ fn preset_history_is_appended_in_legacy_history_directory() {
         .unwrap();
     store.rollback_preset(preset_name, 1).unwrap();
 
-    let history = read_jsonl_values(&path.join("branch-config-history/coding.jsonl"));
+    let history = read_jsonl_values(&path.join("preset-history/coding.jsonl"));
 
     assert_eq!(history.len(), 3);
     assert_eq!(history[0]["name"], preset_name);
@@ -2465,15 +2464,14 @@ fn preset_history_is_appended_in_legacy_history_directory() {
 }
 
 #[test]
-fn open_creates_missing_branch_config_metadata_for_legacy_store() {
+fn open_rejects_missing_preset_metadata_file() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
-    fs::remove_file(path.join("branch-configs.json")).unwrap();
+    fs::remove_file(path.join("presets.json")).unwrap();
 
-    let reopened = FsStore::open(&path).unwrap();
+    let err = FsStore::open(&path).unwrap_err();
 
-    assert!(reopened.list_preset_records().unwrap().is_empty());
-    assert!(path.join("branch-configs.json").is_file());
+    assert!(matches!(err, Error::CorruptedStore { .. }));
 }
 
 #[test]
@@ -2495,72 +2493,31 @@ fn open_does_not_restore_deleted_preset() {
         reopened.get_preset_record(preset_name),
         Err(Error::PresetNotFound { name }) if name == preset_name
     ));
-    assert!(!path.join("branch-config-history/coding.jsonl").exists());
+    assert!(!path.join("preset-history/coding.jsonl").exists());
 }
 
 #[test]
-fn open_migrates_legacy_branch_config_values() {
-    let (_tempdir, path) = temp_store_path();
-    FsStore::open(&path).unwrap();
-    let preset_name = "coding";
-    let config = make_preset("gpt-5.4", SessionRole::Orchestrator);
-    let legacy_configs = HashMap::from([(preset_name.to_owned(), config.clone())]);
-    fs::write(
-        path.join("branch-configs.json"),
-        serde_json::to_string_pretty(&legacy_configs).unwrap(),
-    )
-    .unwrap();
-
-    let reopened = FsStore::open(&path).unwrap();
-
-    assert_eq!(current_preset(&reopened, preset_name).unwrap(), config);
-    let record = reopened.get_preset_record(preset_name).unwrap();
-    assert_eq!(record.current_version, 1);
-    assert_eq!(record.current_preset(), Some(config));
-
-    let repaired: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.join("branch-configs.json")).unwrap())
-            .unwrap();
-    assert_eq!(repaired[preset_name]["current_version"], 1);
-    assert!(repaired[preset_name].get("versions").is_none());
-    let history = read_jsonl_values(&path.join("branch-config-history/coding.jsonl"));
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0]["name"], preset_name);
-    assert_eq!(history[0]["version"], 1);
-}
-
-#[test]
-fn open_upgrades_legacy_store_format_version() {
+fn open_rejects_unsupported_store_format_version() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
     let mut meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    meta["version"] = json!(6);
+    meta["version"] = json!(9);
     fs::write(
         path.join("meta.json"),
         serde_json::to_string_pretty(&meta).unwrap(),
     )
     .unwrap();
 
-    FsStore::open(&path).unwrap();
+    let err = FsStore::open(&path).unwrap_err();
 
-    let upgraded: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(upgraded["version"], 9);
+    assert!(matches!(err, Error::CorruptedStore { .. }));
 }
 
 #[test]
-fn open_reads_legacy_store_without_message_queues_file() {
+fn open_creates_missing_message_queue_wal() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
-    let mut meta: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    meta["version"] = json!(7);
-    fs::write(
-        path.join("meta.json"),
-        serde_json::to_string_pretty(&meta).unwrap(),
-    )
-    .unwrap();
     fs::remove_file(path.join("queues.jsonl")).unwrap();
 
     let reopened = FsStore::open(&path).unwrap();
@@ -2662,7 +2619,7 @@ fn open_rejects_missing_session_metadata_file() {
 }
 
 #[test]
-fn open_reads_legacy_jobs_without_finished_at() {
+fn open_defaults_missing_job_finished_at() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let root_id = store.root_id();

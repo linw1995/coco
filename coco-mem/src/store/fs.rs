@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use snafu::prelude::*;
 
 use super::projection::ProjectionContext;
@@ -30,22 +29,15 @@ use crate::{
 type VersionMap<V> = BTreeMap<u64, V>;
 type VersionReplay<V> = (u64, VersionMap<V>);
 
-struct VersionedRecordRef<'a, V> {
-    key: &'a str,
-    current_version: u64,
-    versions: &'a VersionMap<V>,
-}
-
-const STORE_FORMAT_VERSION: u64 = 9;
-const LEGACY_STORE_FORMAT_VERSION: u64 = 6;
+const STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
-const PRESETS_FILE_NAME: &str = "branch-configs.json";
+const PRESETS_FILE_NAME: &str = "presets.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
 const QUEUES_FILE_NAME: &str = "queues.jsonl";
 const SKILLS_FILE_NAME: &str = "skills.json";
-const PRESET_HISTORY_DIR_NAME: &str = "branch-config-history";
+const PRESET_HISTORY_DIR_NAME: &str = "preset-history";
 const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
 const SHARED_SKILL_HISTORY_DIR_NAME: &str = "shared";
 const ORCHESTRATOR_SKILL_HISTORY_DIR_NAME: &str = "orchestrator";
@@ -114,13 +106,6 @@ struct PresetHistoryEntry {
 enum MessageQueueHistoryEntry {
     Enqueued { item: MessageQueueItem },
     Dequeued { queue: String, message_id: String },
-}
-
-#[derive(Debug, Default)]
-struct PresetSnapshotRead {
-    current: HashMap<String, PersistedPresetRecord>,
-    history_seeds: HashMap<String, PresetRecord>,
-    migrated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -292,34 +277,6 @@ fn skill_history_key(entry: &SkillHistoryEntry) -> &str {
 
 fn skill_history_entry_version(entry: &SkillHistoryEntry) -> u64 {
     entry.version
-}
-
-fn validate_versioned_record<V>(
-    context: &ProjectionContext,
-    path: &Path,
-    record: VersionedRecordRef<'_, V>,
-    version_of: impl Fn(&V) -> u64,
-) -> Result<()> {
-    ensure!(
-        !record.versions.is_empty(),
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!("{} {:?} has no versions", context.entity(), record.key),
-        }
-    );
-    ensure!(
-        record.versions.contains_key(&record.current_version),
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!(
-                "{} {:?} missing current version {}",
-                context.entity(),
-                record.key,
-                record.current_version
-            ),
-        }
-    );
-    validate_versions(context, path, record.key, record.versions, version_of)
 }
 
 fn versions_from_history<E, V>(
@@ -666,20 +623,6 @@ impl Persistence {
             &self.preset_history_path(name),
             &PresetHistoryEntry::from_version(name, version),
         )
-    }
-
-    pub fn rewrite_preset_history(&self, records: &HashMap<String, PresetRecord>) -> Result<()> {
-        self.ensure_writable()?;
-        self.create_preset_history_directory()?;
-        for (name, record) in records {
-            let entries = record
-                .versions
-                .values()
-                .map(|version| PresetHistoryEntry::from_version(name, version))
-                .collect::<Vec<_>>();
-            write_jsonl_file(&self.preset_history_path(name), &entries)?;
-        }
-        Ok(())
     }
 
     pub fn delete_preset_history(&self, name: &str) -> Result<()> {
@@ -1057,10 +1000,7 @@ impl Persistence {
         }
         let meta = read_json_file::<Meta>(&self.meta_path)?;
         ensure!(
-            matches!(
-                meta.version,
-                LEGACY_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION
-            ),
+            meta.version == STORE_FORMAT_VERSION,
             CorruptedStoreSnafu {
                 path: self.meta_path.clone(),
                 message: format!(
@@ -1153,31 +1093,16 @@ impl Persistence {
                 }
             );
         }
-        let preset_snapshots = if self.presets_path.exists() {
-            ensure!(
-                self.presets_path.is_file(),
-                CorruptedStoreSnafu {
-                    path: self.presets_path.clone(),
-                    message: "preset metadata entry must be a file".to_owned(),
-                }
-            );
-            read_preset_snapshots(&self.presets_path)?
-        } else {
-            let snapshots = PresetSnapshotRead::default();
-            if self.access == StoreAccess::ReadWrite {
-                write_json_file(&self.presets_path, &snapshots.current)?;
+        ensure!(
+            self.presets_path.is_file(),
+            CorruptedStoreSnafu {
+                path: self.presets_path.clone(),
+                message: "missing presets metadata file".to_owned(),
             }
-            snapshots
-        };
-        let mut presets = load_preset_history_records(self)?;
-        let mut preset_history_repaired = false;
-        for (name, record) in preset_snapshots.history_seeds {
-            if let std::collections::hash_map::Entry::Vacant(entry) = presets.entry(name) {
-                entry.insert(record);
-                preset_history_repaired = true;
-            }
-        }
-        validate_preset_snapshots(&preset_snapshots.current, &presets)?;
+        );
+        let preset_snapshots = read_preset_snapshots(&self.presets_path)?;
+        let presets = load_preset_history_records(self)?;
+        validate_preset_snapshots(&preset_snapshots, &presets)?;
         store.presets = presets;
         store.jobs = read_json_file::<HashMap<String, Job>>(&self.jobs_path)?;
         let (message_queues, message_queue_log_len) = self.load_message_queues()?;
@@ -1205,22 +1130,8 @@ impl Persistence {
             }
         }
         let recovered_preset_snapshots = persisted_preset_records(&store.presets);
-        if self.access == StoreAccess::ReadWrite
-            && (preset_snapshots.migrated || recovered_preset_snapshots != preset_snapshots.current)
-        {
+        if self.access == StoreAccess::ReadWrite && recovered_preset_snapshots != preset_snapshots {
             self.persist_presets(&store)?;
-        }
-        if preset_history_repaired && self.access == StoreAccess::ReadWrite {
-            self.rewrite_preset_history(&store.presets)?;
-        }
-        if meta.version != STORE_FORMAT_VERSION && self.access == StoreAccess::ReadWrite {
-            write_json_file(
-                &self.meta_path,
-                &Meta {
-                    version: STORE_FORMAT_VERSION,
-                    root_id: meta.root_id,
-                },
-            )?;
         }
 
         Ok((self.clone(), store))
@@ -1410,75 +1321,12 @@ fn store_lock_key(store_dir: &Path) -> PathBuf {
     })
 }
 
-fn read_preset_snapshots(path: &Path) -> Result<PresetSnapshotRead> {
-    let values = read_json_file::<HashMap<String, Value>>(path)?;
-    let mut read = PresetSnapshotRead::default();
-
-    for (name, value) in values {
-        if is_embedded_preset_record_value(&value) {
-            let record =
-                serde_json::from_value::<PresetRecord>(value).context(ParseStoreMetaSnafu {
-                    path: path.to_owned(),
-                })?;
-            validate_preset_record(path, &name, &record)?;
-            read.current
-                .insert(name.clone(), PersistedPresetRecord::from_record(&record));
-            read.history_seeds.insert(name, record);
-            read.migrated = true;
-        } else if is_preset_snapshot_value(&value) {
-            let snapshot = serde_json::from_value::<PersistedPresetRecord>(value).context(
-                ParseStoreMetaSnafu {
-                    path: path.to_owned(),
-                },
-            )?;
-            validate_preset_snapshot(path, &name, &snapshot)?;
-            read.current.insert(name, snapshot);
-        } else {
-            let config = serde_json::from_value::<Preset>(value).context(ParseStoreMetaSnafu {
-                path: path.to_owned(),
-            })?;
-            let record = PresetRecord::new(name.clone(), config);
-            read.current
-                .insert(name.clone(), PersistedPresetRecord::from_record(&record));
-            read.history_seeds.insert(name, record);
-            read.migrated = true;
-        }
+fn read_preset_snapshots(path: &Path) -> Result<HashMap<String, PersistedPresetRecord>> {
+    let snapshots = read_json_file::<HashMap<String, PersistedPresetRecord>>(path)?;
+    for (name, snapshot) in &snapshots {
+        validate_preset_snapshot(path, name, snapshot)?;
     }
-
-    Ok(read)
-}
-
-fn is_embedded_preset_record_value(value: &Value) -> bool {
-    value.get("versions").is_some()
-}
-
-fn is_preset_snapshot_value(value: &Value) -> bool {
-    value.get("name").is_some()
-        || value.get("current_version").is_some()
-        || value.get("created_at").is_some()
-}
-
-fn validate_preset_record(path: &Path, name: &str, record: &PresetRecord) -> Result<()> {
-    ensure!(
-        record.name == name,
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!(
-                "preset record key {:?} mismatches record name {:?}",
-                name, record.name
-            ),
-        }
-    );
-    validate_versioned_record(
-        &ProjectionContext::new("preset", PRESET_HISTORY_DIR_NAME),
-        path,
-        VersionedRecordRef {
-            key: &record.name,
-            current_version: record.current_version,
-            versions: &record.versions,
-        },
-        |version| version.version,
-    )
+    Ok(snapshots)
 }
 
 fn validate_preset_snapshot(
