@@ -289,6 +289,7 @@ pub struct ResolvedSession {
     pub config: SessionModelConfig,
     pub provider_history: Vec<rig::completion::message::Message>,
     pub tool_runtime_env: ToolRuntimeEnv,
+    profile_additional_params: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -2076,10 +2077,7 @@ where
                 tools: context.session_anchor.tools.clone(),
                 temperature: context.session_anchor.temperature,
                 max_tokens: context.session_anchor.max_tokens,
-                additional_params: merge_completion_additional_params(
-                    profile_additional_params,
-                    context.session_anchor.additional_params.clone(),
-                ),
+                additional_params: context.session_anchor.additional_params.clone(),
                 enable_coco_shim: context.session_anchor.enable_coco_shim,
             },
             provider_history,
@@ -2093,6 +2091,7 @@ where
                 cli_bridge: self.runtime.unified_exec_cli_bridge.clone(),
                 skill_executor: self.runtime.skill_search_executor.clone(),
             },
+            profile_additional_params,
         })
     }
 }
@@ -2278,18 +2277,29 @@ impl<B, S> LlmService<B, S> {
         trace_node_appender: Option<TraceNodeAppenderHandle>,
         trace_node_store: Option<Arc<TraceNodeStore>>,
     ) -> ResolvedCompletionRequest {
-        let provider = request
-            .overrides
-            .provider
-            .unwrap_or(session.config.provider);
+        let CompletionOverrides {
+            provider,
+            model,
+            temperature,
+            max_tokens,
+            additional_params,
+        } = request.overrides;
+        let provider = provider.unwrap_or(session.config.provider);
         let uses_session_provider = provider == session.config.provider;
+        let profile_additional_params = uses_session_provider
+            .then(|| session.profile_additional_params.clone())
+            .flatten();
+        let additional_params = merge_completion_additional_params(
+            merge_completion_additional_params(
+                profile_additional_params,
+                session.config.additional_params.clone(),
+            ),
+            additional_params,
+        );
         ResolvedCompletionRequest {
             branch: request.branch,
             provider,
-            model: request
-                .overrides
-                .model
-                .unwrap_or_else(|| session.config.model.clone()),
+            model: model.unwrap_or_else(|| session.config.model.clone()),
             secrets: if uses_session_provider {
                 session.config.secrets.clone()
             } else {
@@ -2298,12 +2308,9 @@ impl<B, S> LlmService<B, S> {
             base_url: uses_session_provider
                 .then(|| session.config.base_url.clone())
                 .flatten(),
-            temperature: request.overrides.temperature.or(session.config.temperature),
-            max_tokens: request.overrides.max_tokens.or(session.config.max_tokens),
-            additional_params: request
-                .overrides
-                .additional_params
-                .or_else(|| session.config.additional_params.clone()),
+            temperature: temperature.or(session.config.temperature),
+            max_tokens: max_tokens.or(session.config.max_tokens),
+            additional_params,
             runtime: self.runtime.clone(),
             trace_node_appender,
             trace_node_store,
@@ -5033,6 +5040,7 @@ mod tests {
             .unwrap();
 
         let calls = calls.lock().await;
+        assert_eq!(calls[0].0.config.additional_params, None);
         assert_eq!(
             calls[0].1.additional_params,
             Some(serde_json::json!({
@@ -5040,6 +5048,51 @@ mod tests {
                 "service_tier": "priority",
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn provider_profile_additional_params_do_not_leak_to_provider_override() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[("main", &[Ok("hello")])]);
+        let calls = backend.calls.clone();
+        let service = LlmService::builder(store, backend)
+            .with_provider_configs(HashMap::from([(
+                "gpt-subscription".to_owned(),
+                ProviderRuntimeConfig {
+                    provider: Provider::ChatGpt,
+                    secrets: BTreeMap::new(),
+                    base_url: None,
+                    default_model: Some("gpt-5.4".to_owned()),
+                    additional_params: Some(serde_json::json!({
+                        "reasoning": { "effort": "high" },
+                        "service_tier": "priority",
+                    })),
+                },
+            )]))
+            .build();
+        let mut config = session_config("main");
+        config.provider_profile = Some("gpt-subscription".to_owned());
+
+        service.create_session(config).await.unwrap();
+        service
+            .run(CompletionRequest {
+                branch: "main".to_owned(),
+                origin: CompletionOrigin::BranchHead,
+                input: CompletionInput::Continue,
+                overrides: CompletionOverrides {
+                    provider: Some(Provider::Anthropic),
+                    model: Some("claude-sonnet-4-20250514".to_owned()),
+                    ..CompletionOverrides::default()
+                },
+                active_skill_runtime: None,
+            })
+            .await
+            .unwrap();
+
+        let calls = calls.lock().await;
+        assert_eq!(calls[0].1.provider, Provider::Anthropic);
+        assert_eq!(calls[0].1.model, "claude-sonnet-4-20250514");
+        assert_eq!(calls[0].1.additional_params, None);
     }
 
     #[tokio::test]
