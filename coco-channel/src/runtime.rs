@@ -23,7 +23,9 @@ mod tests {
     #[async_trait]
     impl MessageHandler for EchoHandler {
         async fn handle(&self, message: InboundMessage) -> Result<OutboundMessage> {
-            Ok(OutboundMessage { text: message.text })
+            Ok(OutboundMessage {
+                text: message.into_text(),
+            })
         }
     }
 

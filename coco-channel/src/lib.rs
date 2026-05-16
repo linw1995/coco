@@ -5,5 +5,7 @@ mod runtime;
 pub mod telegram;
 
 pub use error::{BoxError, Error, Result};
-pub use message::{ChannelKind, InboundMessage, OutboundMessage};
+pub use message::{
+    ChannelInboundMessage, ChannelKind, InboundMessage, OutboundMessage, TelegramInboundMessage,
+};
 pub use runtime::{ChannelRuntime, MessageHandler};
