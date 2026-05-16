@@ -2918,7 +2918,44 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
 }
 
 #[test]
-fn open_adds_missing_builtin_skill() {
+fn store_migration_adds_missing_builtin_skill() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    skills["orchestrator"]
+        .as_object_mut()
+        .unwrap()
+        .remove("new-skill");
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(path.join("skill-history/orchestrator/new-skill.jsonl")).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!(10);
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    let skill = reopened
+        .get_skill(SessionRole::Orchestrator, "new-skill")
+        .unwrap();
+    assert_eq!(skill.current_version, 1);
+    assert!(
+        path.join("skill-history/orchestrator/new-skill.jsonl")
+            .is_file()
+    );
+}
+
+#[test]
+fn open_current_store_does_not_run_builtin_skill_migrations() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
     let mut skills: serde_json::Value =
@@ -2936,14 +2973,10 @@ fn open_adds_missing_builtin_skill() {
 
     let reopened = FsStore::open(&path).unwrap();
 
-    let skill = reopened
-        .get_skill(SessionRole::Orchestrator, "new-skill")
-        .unwrap();
-    assert_eq!(skill.current_version, 1);
-    assert!(
-        path.join("skill-history/orchestrator/new-skill.jsonl")
-            .is_file()
-    );
+    assert!(matches!(
+        reopened.get_skill(SessionRole::Orchestrator, "new-skill"),
+        Err(Error::SkillNotFound { name, .. }) if name == "new-skill"
+    ));
 }
 
 #[test]

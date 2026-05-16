@@ -54,11 +54,39 @@ const BUILTIN_TELEGRAM_REVISION_ID: &str =
 const BRANCHES_DIR_NAME: &str = "branches";
 const LOCK_FILE_NAME: &str = "store.lock";
 const MESSAGE_QUEUE_COMPACT_MIN_LOG_ENTRIES: usize = 64;
+const BUILTIN_SKILL_MIGRATIONS_2026_05_16: &[BuiltinSkillMigration] = &[
+    BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "coco-orchestrator",
+        from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "new-skill",
+        from_revision_ids: &[BUILTIN_NEW_SKILL_REVISION_ID],
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "cronjob",
+        from_revision_ids: &[BUILTIN_CRONJOB_REVISION_ID],
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Runner,
+        name: "coco-runner",
+        from_revision_ids: &[BUILTIN_COCO_RUNNER_REVISION_ID],
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Runner,
+        name: "telegram",
+        from_revision_ids: &[BUILTIN_TELEGRAM_REVISION_ID],
+    },
+];
 const STORE_MIGRATIONS: &[StoreMigration] = &[StoreMigration {
     name: "main-to-2026-05-16",
     from: StoreSchemaVersion::Main,
     to: StoreSchemaVersion::Current,
     run: Persistence::migrate_main_store_to_chronicle_format,
+    builtin_skills: BUILTIN_SKILL_MIGRATIONS_2026_05_16,
 }];
 
 #[derive(Clone, Debug)]
@@ -110,6 +138,13 @@ struct StoreMigration {
     from: StoreSchemaVersion,
     to: StoreSchemaVersion,
     run: fn(&Persistence) -> Result<()>,
+    builtin_skills: &'static [BuiltinSkillMigration],
+}
+
+struct BuiltinSkillMigration {
+    role: SessionRole,
+    name: &'static str,
+    from_revision_ids: &'static [&'static str],
 }
 
 #[derive(Debug, Default)]
@@ -818,6 +853,7 @@ impl Persistence {
                 "running store migration"
             );
             (migration.run)(self)?;
+            self.migrate_builtin_skills_for_store_schema(migration.builtin_skills)?;
             self.persist_store_schema_version(migration.to, root_id)?;
             tracing::info!(
                 store_path = %self.dir.display(),
@@ -878,6 +914,37 @@ impl Persistence {
                 );
                 write_jsonl_file(&path, &entries)?;
             }
+        }
+        Ok(())
+    }
+
+    fn migrate_builtin_skills_for_store_schema(
+        &self,
+        migrations: &[BuiltinSkillMigration],
+    ) -> Result<()> {
+        if migrations.is_empty() {
+            return Ok(());
+        }
+        let skill_groups = read_json_file::<PersistedSkillGroups>(&self.skills_path)?;
+        if skill_groups.is_empty() {
+            return Ok(());
+        }
+
+        let mut groups = load_skill_groups_from_history(self, &skill_groups)?;
+        let builtin_skill_migration = migrate_builtin_skills(&mut groups, migrations);
+        if builtin_skill_migration.changed() {
+            tracing::info!(
+                store_path = %self.dir.display(),
+                added = builtin_skill_migration.added,
+                updated = builtin_skill_migration.updated,
+                skipped_user_modified = builtin_skill_migration.skipped_user_modified,
+                "persisting builtin skill migrations during store migration"
+            );
+            self.rewrite_skill_history(&groups)?;
+            write_json_file(
+                &self.skills_path,
+                &PersistedSkillGroups::from_groups(&groups),
+            )?;
         }
         Ok(())
     }
@@ -1299,25 +1366,6 @@ impl Persistence {
                 let _ = write_json_file(&self.skills_path, &recovered);
             }
         }
-        if self.access == StoreAccess::ReadWrite {
-            let builtin_skill_migration = migrate_builtin_skills(&mut store.skill_groups);
-            if builtin_skill_migration.changed() {
-                tracing::info!(
-                    store_path = %self.dir.display(),
-                    added = builtin_skill_migration.added,
-                    updated = builtin_skill_migration.updated,
-                    skipped_user_modified = builtin_skill_migration.skipped_user_modified,
-                    "persisting builtin skill migrations"
-                );
-                self.rewrite_skill_history(&store.skill_groups)?;
-                self.persist_skill_groups(&store)?;
-            }
-        } else {
-            tracing::debug!(
-                store_path = %self.dir.display(),
-                "skipping builtin skill migrations for read-only store"
-            );
-        }
         let recovered_preset_snapshots = persisted_preset_records(&store.presets);
         if self.access == StoreAccess::ReadWrite && recovered_preset_snapshots != preset_snapshots {
             self.persist_presets(&store)?;
@@ -1391,61 +1439,66 @@ fn load_skill_groups_from_history(
     Ok(history)
 }
 
-fn migrate_builtin_skills(groups: &mut SkillGroups) -> BuiltinSkillMigrationSummary {
+fn migrate_builtin_skills(
+    groups: &mut SkillGroups,
+    migrations: &[BuiltinSkillMigration],
+) -> BuiltinSkillMigrationSummary {
     let defaults = default_skill_groups();
     let mut summary = BuiltinSkillMigrationSummary::default();
 
-    for (role, default_records) in [
-        (SessionRole::Orchestrator, defaults.orchestrator),
-        (SessionRole::Runner, defaults.runner),
-    ] {
-        for (name, default_record) in default_records {
-            let records = groups.for_role_mut(role);
-            let Some(default_version) = default_record.current().cloned() else {
-                continue;
-            };
-            let Some(record) = records.get_mut(&name) else {
-                tracing::info!(
-                    role = role.as_str(),
-                    skill = %name,
-                    "adding missing builtin skill during migration"
-                );
-                records.insert(name, default_record);
-                summary.added += 1;
-                continue;
-            };
+    for migration in migrations {
+        let Some(default_record) = defaults
+            .for_role(migration.role)
+            .get(migration.name)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(default_version) = default_record.current().cloned() else {
+            continue;
+        };
+        let records = groups.for_role_mut(migration.role);
+        let Some(record) = records.get_mut(migration.name) else {
+            tracing::info!(
+                role = migration.role.as_str(),
+                skill = migration.name,
+                "adding missing builtin skill during store migration"
+            );
+            records.insert(migration.name.to_owned(), default_record);
+            summary.added += 1;
+            continue;
+        };
 
-            match builtin_skill_migration_action(role, &name, record, &default_version) {
-                BuiltinSkillMigrationAction::Update => {
-                    tracing::info!(
-                        role = role.as_str(),
-                        skill = %name,
-                        from_version = record.current_version,
-                        from_revision = %record.current().map(|version| version.id.as_str()).unwrap_or(""),
-                        to_revision = %default_version.id,
-                        "updating builtin skill during migration"
-                    );
-                    let patch = SkillUpdatePatch {
-                        description: Some(default_version.description),
-                        body: Some(default_version.body),
-                        scripts: Some(default_version.scripts),
-                        enable_coco_shim: Some(default_version.enable_coco_shim),
-                    };
-                    if record.update(&patch).is_some() {
-                        summary.updated += 1;
-                    }
+        match builtin_skill_migration_action(migration, record, &default_version) {
+            BuiltinSkillMigrationAction::Update => {
+                tracing::info!(
+                    role = migration.role.as_str(),
+                    skill = migration.name,
+                    from_version = record.current_version,
+                    from_revision = %record.current().map(|version| version.id.as_str()).unwrap_or(""),
+                    to_revision = %default_version.id,
+                    "updating builtin skill during store migration"
+                );
+                let patch = SkillUpdatePatch {
+                    description: Some(default_version.description),
+                    body: Some(default_version.body),
+                    scripts: Some(default_version.scripts),
+                    enable_coco_shim: Some(default_version.enable_coco_shim),
+                };
+                if record.update(&patch).is_some() {
+                    summary.updated += 1;
                 }
-                BuiltinSkillMigrationAction::SkipUserModified => {
-                    tracing::debug!(
-                        role = role.as_str(),
-                        skill = %name,
-                        current_version = record.current_version,
-                        "skipping user-modified builtin skill during migration"
-                    );
-                    summary.skipped_user_modified += 1;
-                }
-                BuiltinSkillMigrationAction::Unchanged => {}
             }
+            BuiltinSkillMigrationAction::SkipUserModified => {
+                tracing::debug!(
+                    role = migration.role.as_str(),
+                    skill = migration.name,
+                    current_version = record.current_version,
+                    "skipping user-modified builtin skill during store migration"
+                );
+                summary.skipped_user_modified += 1;
+            }
+            BuiltinSkillMigrationAction::Unchanged => {}
         }
     }
 
@@ -1469,8 +1522,7 @@ enum BuiltinSkillMigrationAction {
 }
 
 fn builtin_skill_migration_action(
-    role: SessionRole,
-    name: &str,
+    migration: &BuiltinSkillMigration,
     record: &SkillRecord,
     target: &SkillVersion,
 ) -> BuiltinSkillMigrationAction {
@@ -1480,23 +1532,10 @@ fn builtin_skill_migration_action(
     if skill_version_matches(current, target) {
         return BuiltinSkillMigrationAction::Unchanged;
     }
-    if builtin_skill_known_revision_ids(role, name).contains(&current.id.as_str()) {
+    if migration.from_revision_ids.contains(&current.id.as_str()) {
         BuiltinSkillMigrationAction::Update
     } else {
         BuiltinSkillMigrationAction::SkipUserModified
-    }
-}
-
-fn builtin_skill_known_revision_ids(role: SessionRole, name: &str) -> &'static [&'static str] {
-    match (role, name) {
-        (SessionRole::Orchestrator, "coco-orchestrator") => {
-            &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID]
-        }
-        (SessionRole::Orchestrator, "new-skill") => &[BUILTIN_NEW_SKILL_REVISION_ID],
-        (SessionRole::Orchestrator, "cronjob") => &[BUILTIN_CRONJOB_REVISION_ID],
-        (SessionRole::Runner, "coco-runner") => &[BUILTIN_COCO_RUNNER_REVISION_ID],
-        (SessionRole::Runner, "telegram") => &[BUILTIN_TELEGRAM_REVISION_ID],
-        _ => &[],
     }
 }
 
@@ -2722,8 +2761,9 @@ where
 #[cfg(test)]
 mod builtin_skill_migration_tests {
     use super::{
-        BuiltinSkillMigrationAction, SessionRole, SkillVersion, SkillVersionSpec,
-        builtin_skill_migration_action, default_skill_groups,
+        BUILTIN_COCO_ORCHESTRATOR_REVISION_ID, BuiltinSkillMigration, BuiltinSkillMigrationAction,
+        SessionRole, SkillVersion, SkillVersionSpec, builtin_skill_migration_action,
+        default_skill_groups,
     };
 
     #[test]
@@ -2744,13 +2784,13 @@ mod builtin_skill_migration_tests {
         );
 
         assert_ne!(record.current().unwrap().id, target.id);
+        let migration = BuiltinSkillMigration {
+            role: SessionRole::Orchestrator,
+            name: "coco-orchestrator",
+            from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+        };
         assert_eq!(
-            builtin_skill_migration_action(
-                SessionRole::Orchestrator,
-                "coco-orchestrator",
-                record,
-                &target,
-            ),
+            builtin_skill_migration_action(&migration, record, &target),
             BuiltinSkillMigrationAction::Update
         );
     }
@@ -2778,14 +2818,14 @@ mod builtin_skill_migration_tests {
                 enable_coco_shim: true,
             },
         );
+        let migration = BuiltinSkillMigration {
+            role: SessionRole::Orchestrator,
+            name: "coco-orchestrator",
+            from_revision_ids: &["known-builtin-revision"],
+        };
 
         assert_eq!(
-            builtin_skill_migration_action(
-                SessionRole::Orchestrator,
-                "coco-orchestrator",
-                &record,
-                &target,
-            ),
+            builtin_skill_migration_action(&migration, &record, &target),
             BuiltinSkillMigrationAction::SkipUserModified
         );
     }
