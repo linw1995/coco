@@ -2306,6 +2306,10 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     let nodes = fs::read_to_string(path.join("nodes.jsonl")).unwrap();
     assert!(nodes.lines().count() >= 1);
     assert_eq!(store.ancestry(&store.root_id()).unwrap().len(), 1);
+
+    let meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["version"], "2026-05-16");
 }
 
 #[test]
@@ -2497,12 +2501,32 @@ fn open_does_not_restore_deleted_preset() {
 }
 
 #[test]
+fn open_migrates_numeric_store_format_version_to_chronicle_version() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!(10);
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    FsStore::open(&path).unwrap();
+
+    let migrated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(migrated["version"], "2026-05-16");
+}
+
+#[test]
 fn open_rejects_unsupported_store_format_version() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
     let mut meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    meta["version"] = json!(9);
+    meta["version"] = json!("2020-01-01");
     fs::write(
         path.join("meta.json"),
         serde_json::to_string_pretty(&meta).unwrap(),

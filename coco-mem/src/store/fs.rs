@@ -27,7 +27,8 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: u64 = 10;
+const STORE_FORMAT_VERSION: &str = "2026-05-16";
+const MAIN_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
@@ -75,9 +76,22 @@ enum StoreAccess {
     ReadOnly,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StoreFormatVersion {
+    Legacy(u64),
+    Chronicle(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StoreSchemaVersion {
+    Main,
+    Current,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
-    pub version: u64,
+    pub version: StoreFormatVersion,
     pub root_id: String,
 }
 
@@ -158,6 +172,31 @@ enum SkillPersistenceFailpoint {
 #[derive(Debug, Default)]
 struct SkillPersistenceFailpoints {
     next: Option<SkillPersistenceFailpoint>,
+}
+
+impl std::fmt::Display for StoreFormatVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy(version) => write!(formatter, "{version}"),
+            Self::Chronicle(version) => formatter.write_str(version),
+        }
+    }
+}
+
+impl StoreFormatVersion {
+    fn current() -> Self {
+        Self::Chronicle(STORE_FORMAT_VERSION.to_owned())
+    }
+
+    fn schema_version(&self) -> Option<StoreSchemaVersion> {
+        match self {
+            Self::Legacy(MAIN_STORE_FORMAT_VERSION) => Some(StoreSchemaVersion::Main),
+            Self::Chronicle(version) if version == STORE_FORMAT_VERSION => {
+                Some(StoreSchemaVersion::Current)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl PersistedPresetRecord {
@@ -655,6 +694,31 @@ impl Persistence {
         .fail()
     }
 
+    fn migrate_store(&self, from: StoreSchemaVersion, root_id: &str) -> Result<()> {
+        if self.access != StoreAccess::ReadWrite {
+            return CorruptedStoreSnafu {
+                path: self.meta_path.clone(),
+                message: format!(
+                    "store format version requires writable migration to {}",
+                    STORE_FORMAT_VERSION
+                ),
+            }
+            .fail();
+        }
+
+        if from == StoreSchemaVersion::Main && !self.queues_path.exists() {
+            write_jsonl_file(&self.queues_path, &[] as &[MessageQueueHistoryEntry])?;
+        }
+
+        write_json_file(
+            &self.meta_path,
+            &Meta {
+                version: StoreFormatVersion::current(),
+                root_id: root_id.to_owned(),
+            },
+        )
+    }
+
     fn branch_path(&self, branch: &str) -> PathBuf {
         self.branches_dir
             .join(format!("{}.jsonl", encode_branch_name(branch)))
@@ -831,7 +895,7 @@ impl Persistence {
         let root = store.root_node().clone();
         let skill_groups = store.skill_groups.clone();
         let meta = Meta {
-            version: STORE_FORMAT_VERSION,
+            version: StoreFormatVersion::current(),
             root_id: root.id.clone(),
         };
 
@@ -900,17 +964,28 @@ impl Persistence {
                 }
             );
         }
-        let meta = read_json_file::<Meta>(&self.meta_path)?;
-        ensure!(
-            meta.version == STORE_FORMAT_VERSION,
-            CorruptedStoreSnafu {
-                path: self.meta_path.clone(),
-                message: format!(
-                    "unsupported store format version {}, expected {}",
-                    meta.version, STORE_FORMAT_VERSION
-                ),
-            }
-        );
+        let mut meta = read_json_file::<Meta>(&self.meta_path)?;
+        let schema_version = meta.version.schema_version().context(CorruptedStoreSnafu {
+            path: self.meta_path.clone(),
+            message: format!(
+                "unsupported store format version {}, expected {}",
+                meta.version, STORE_FORMAT_VERSION
+            ),
+        })?;
+        if schema_version != StoreSchemaVersion::Current {
+            self.migrate_store(schema_version, &meta.root_id)?;
+            meta = read_json_file::<Meta>(&self.meta_path)?;
+            ensure!(
+                meta.version.schema_version() == Some(StoreSchemaVersion::Current),
+                CorruptedStoreSnafu {
+                    path: self.meta_path.clone(),
+                    message: format!(
+                        "store migration did not upgrade format version to {}",
+                        STORE_FORMAT_VERSION
+                    ),
+                }
+            );
+        }
 
         let nodes = read_jsonl_file::<Node>(&self.nodes_path)?;
         let mut node_iter = nodes.into_iter();
