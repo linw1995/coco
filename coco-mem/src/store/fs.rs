@@ -1926,26 +1926,12 @@ fn apply_rebase_plan(
 }
 
 impl BranchConfigStore for FsStore {
-    fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .list_branch_configs()
-    }
-
     fn list_branch_config_records(&self) -> Result<HashMap<String, BranchConfigRecord>> {
         Ok(self
             .inner
             .read()
             .expect("store lock poisoned")
             .list_branch_config_records())
-    }
-
-    fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_branch_config(name)
     }
 
     fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {

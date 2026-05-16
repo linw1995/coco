@@ -63,6 +63,19 @@ fn make_branch_config(model: &str, role: SessionRole) -> BranchConfig {
     }
 }
 
+fn current_branch_config(
+    store: &impl BranchConfigStore,
+    name: &str,
+) -> std::result::Result<BranchConfig, Error> {
+    let record = store.get_branch_config_record(name)?;
+    record
+        .current_config()
+        .ok_or_else(|| Error::BranchConfigVersionNotFound {
+            name: name.to_owned(),
+            version: record.current_version,
+        })
+}
+
 fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> NewNode {
     NewNode {
         parent: parent.to_owned(),
@@ -984,17 +997,13 @@ where
     assert_eq!(stored.current_version, 1);
     assert_eq!(stored.current_config(), Some(config.clone()));
     assert_eq!(stored.versions.keys().copied().collect::<Vec<_>>(), vec![1]);
-    assert_eq!(store.get_branch_config(preset_name).unwrap(), config);
+    assert_eq!(current_branch_config(&store, preset_name).unwrap(), config);
     assert_eq!(
         store
             .get_branch_config_record(preset_name)
             .unwrap()
             .current_version,
         1
-    );
-    assert_eq!(
-        store.list_branch_configs().unwrap().get(preset_name),
-        Some(&config)
     );
     assert_eq!(
         store
@@ -1036,7 +1045,7 @@ where
         make_branch_config("gpt-5.4", SessionRole::Orchestrator)
     );
     assert_eq!(stored.versions.get(&2).unwrap().to_config(), updated);
-    assert_eq!(store.get_branch_config(preset_name).unwrap(), updated);
+    assert_eq!(current_branch_config(&store, preset_name).unwrap(), updated);
 }
 
 fn assert_rollback_branch_config_creates_new_current_version<F>()
@@ -1063,7 +1072,10 @@ where
     );
     assert_eq!(rolled_back.current_config(), Some(original.clone()));
     assert_eq!(rolled_back.versions.get(&2).unwrap().to_config(), updated);
-    assert_eq!(store.get_branch_config(preset_name).unwrap(), original);
+    assert_eq!(
+        current_branch_config(&store, preset_name).unwrap(),
+        original
+    );
 }
 
 fn assert_delete_branch_config_removes_only_config<F>()
@@ -1083,9 +1095,9 @@ where
 
     store.delete_branch_config(preset_name).unwrap();
 
-    assert!(store.list_branch_configs().unwrap().is_empty());
+    assert!(store.list_branch_config_records().unwrap().is_empty());
     assert!(matches!(
-        store.get_branch_config(preset_name),
+        store.get_branch_config_record(preset_name),
         Err(Error::BranchConfigNotFound { name }) if name == preset_name
     ));
     assert_eq!(store.get_branch_head("main").unwrap(), root_id);
@@ -1110,7 +1122,7 @@ where
         store.get_branch_head("main"),
         Err(Error::BranchNotFound { name }) if name == "main"
     ));
-    assert_eq!(store.get_branch_config(preset_name).unwrap(), config);
+    assert_eq!(current_branch_config(&store, preset_name).unwrap(), config);
 }
 
 fn assert_get_branch_config_rejects_missing_config<F>()
@@ -1119,7 +1131,9 @@ where
 {
     let store = F::create();
 
-    let err = store.get_branch_config("missing-preset").unwrap_err();
+    let err = store
+        .get_branch_config_record("missing-preset")
+        .unwrap_err();
 
     assert!(matches!(
         err,
@@ -2406,7 +2420,10 @@ fn open_replays_branch_configs() {
 
     let reopened = FsStore::open(&path).unwrap();
 
-    assert_eq!(reopened.get_branch_config(preset_name).unwrap(), updated);
+    assert_eq!(
+        current_branch_config(&reopened, preset_name).unwrap(),
+        updated
+    );
     let record = reopened.get_branch_config_record(preset_name).unwrap();
     assert_eq!(record.current_version, 2);
     assert_eq!(record.versions.get(&1).unwrap().to_config(), config);
@@ -2480,7 +2497,7 @@ fn open_creates_missing_branch_config_metadata_for_legacy_store() {
 
     let reopened = FsStore::open(&path).unwrap();
 
-    assert!(reopened.list_branch_configs().unwrap().is_empty());
+    assert!(reopened.list_branch_config_records().unwrap().is_empty());
     assert!(path.join("branch-configs.json").is_file());
 }
 
@@ -2500,7 +2517,7 @@ fn open_does_not_restore_deleted_branch_config() {
     let reopened = FsStore::open(&path).unwrap();
 
     assert!(matches!(
-        reopened.get_branch_config(preset_name),
+        reopened.get_branch_config_record(preset_name),
         Err(Error::BranchConfigNotFound { name }) if name == preset_name
     ));
     assert!(!path.join("branch-config-history/coding.jsonl").exists());
@@ -2521,7 +2538,10 @@ fn open_migrates_legacy_branch_config_values() {
 
     let reopened = FsStore::open(&path).unwrap();
 
-    assert_eq!(reopened.get_branch_config(preset_name).unwrap(), config);
+    assert_eq!(
+        current_branch_config(&reopened, preset_name).unwrap(),
+        config
+    );
     let record = reopened.get_branch_config_record(preset_name).unwrap();
     assert_eq!(record.current_version, 1);
     assert_eq!(record.current_config(), Some(config));

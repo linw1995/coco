@@ -1391,7 +1391,14 @@ fn resolve_session_rebase(
         .preset
         .as_deref()
         .map(|name| {
-            let config = store.get_branch_config(name).context(StoreSnafu)?;
+            let record = store.get_branch_config_record(name).context(StoreSnafu)?;
+            let config = record
+                .current_config()
+                .ok_or_else(|| StoreError::BranchConfigVersionNotFound {
+                    name: name.to_owned(),
+                    version: record.current_version,
+                })
+                .context(StoreSnafu)?;
             branch_config_to_session_anchor_patch(&config, provider_profiles)
         })
         .transpose()?

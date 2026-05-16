@@ -3967,7 +3967,9 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(second_json["config"]["enable_coco_shim"], false);
     let persisted = open_store(&store_path)
         .unwrap()
-        .get_branch_config(preset_name)
+        .get_branch_config_record(preset_name)
+        .unwrap()
+        .current_config()
         .unwrap();
     assert_eq!(persisted.temperature, None);
     assert_eq!(persisted.max_tokens, None);

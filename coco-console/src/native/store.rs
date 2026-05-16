@@ -125,16 +125,8 @@ impl<S> BranchConfigStore for ConsoleStore<S>
 where
     S: BranchConfigStore,
 {
-    fn list_branch_configs(&self) -> StoreResult<HashMap<String, BranchConfig>> {
-        self.inner.list_branch_configs()
-    }
-
     fn list_branch_config_records(&self) -> StoreResult<HashMap<String, BranchConfigRecord>> {
         self.inner.list_branch_config_records()
-    }
-
-    fn get_branch_config(&self, name: &str) -> StoreResult<BranchConfig> {
-        self.inner.get_branch_config(name)
     }
 
     fn get_branch_config_record(&self, name: &str) -> StoreResult<BranchConfigRecord> {

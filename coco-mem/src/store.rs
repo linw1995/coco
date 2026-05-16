@@ -78,14 +78,8 @@ pub trait SessionStore {
 
 /// Branch preset config storage API.
 pub trait BranchConfigStore {
-    /// Returns all persisted branch preset configs keyed by preset name.
-    fn list_branch_configs(&self) -> StoreResult<HashMap<String, BranchConfig>>;
-
     /// Returns all persisted branch preset config records keyed by preset name.
     fn list_branch_config_records(&self) -> StoreResult<HashMap<String, BranchConfigRecord>>;
-
-    /// Returns one branch preset config by preset name.
-    fn get_branch_config(&self, name: &str) -> StoreResult<BranchConfig>;
 
     /// Returns one branch preset config record by preset name.
     fn get_branch_config_record(&self, name: &str) -> StoreResult<BranchConfigRecord>;

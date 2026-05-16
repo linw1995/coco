@@ -313,33 +313,8 @@ impl StoreState {
         Ok(state.clone())
     }
 
-    pub fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
-        self.branch_configs
-            .iter()
-            .map(|(name, record)| {
-                let config = record
-                    .current_config()
-                    .context(BranchConfigVersionNotFoundSnafu {
-                        name: name.clone(),
-                        version: record.current_version,
-                    })?;
-                Ok((name.clone(), config))
-            })
-            .collect()
-    }
-
     pub fn list_branch_config_records(&self) -> HashMap<String, BranchConfigRecord> {
         self.branch_configs.clone()
-    }
-
-    pub fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
-        let record = self.get_branch_config_record(name)?;
-        record
-            .current_config()
-            .context(BranchConfigVersionNotFoundSnafu {
-                name: name.to_owned(),
-                version: record.current_version,
-            })
     }
 
     pub fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {
