@@ -7,8 +7,8 @@ use std::sync::Weak;
 
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
-    Anchor, BranchStore, Kind, NewNode, NodeStore, Role, RuntimeStore, SessionAnchor, SessionRole,
-    SessionStore, SkillRecord, SkillRuntimeContext, SkillScript, SkillStore,
+    Anchor, BranchStore, Kind, NewNode, NodeStore, Role, SessionAnchor, SessionRole, SessionStore,
+    SkillRecord, SkillRuntimeContext, SkillScript, SkillStore,
 };
 use coco_llm::{
     ActiveSkillRuntimeContext, COCO_SKILL_PERSIST_DIR_ENV, COCO_SKILL_PERSIST_ROOT_ENV,
@@ -127,15 +127,7 @@ where
 impl<B, S> SkillSearchExecutor for CoreSkillSearchExecutor<B, S>
 where
     B: CompletionBackend + 'static,
-    S: NodeStore
-        + BranchStore
-        + SessionStore
-        + SkillStore
-        + RuntimeStore
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    S: NodeStore + BranchStore + SessionStore + SkillStore + Clone + Send + Sync + 'static,
 {
     async fn search_skill(
         &self,
@@ -291,15 +283,7 @@ fn validate_runtime_script_path(path: &str) -> std::result::Result<String, Skill
 impl<B, S> ConversationEngine<B, S>
 where
     B: CompletionBackend + 'static,
-    S: NodeStore
-        + BranchStore
-        + SessionStore
-        + SkillStore
-        + RuntimeStore
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    S: NodeStore + BranchStore + SessionStore + SkillStore + Clone + Send + Sync + 'static,
 {
     pub fn search_skills(
         &self,

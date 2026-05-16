@@ -7,7 +7,7 @@ mod unified_exec_tool;
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(test)]
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
     MergeParent, NewNode, NodeMetadata, NodeStore, PauseReason, PromptAnchor, ProviderMetadata,
-    Role, RuntimeStore, SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord,
-    SkillResultAnchor, SkillStore, StoreError, Tool, ToolResult, ToolUse,
+    Role, SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord, SkillResultAnchor,
+    SkillStore, StoreError, Tool, ToolResult, ToolUse,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -886,6 +886,7 @@ type WorkflowLock = Arc<Mutex<()>>;
 pub struct RuntimeCapabilities {
     pub unified_exec_cli_bridge: UnifiedExecCliBridgeHandle,
     pub skill_search_executor: SkillSearchExecutorHandle,
+    pub store_path: Option<PathBuf>,
     unified_exec_sessions: unified_exec_tool::UnifiedExecSessionStoreHandle,
 }
 
@@ -894,6 +895,7 @@ impl Default for RuntimeCapabilities {
         Self {
             unified_exec_cli_bridge: UnifiedExecCliBridgeHandle::default(),
             skill_search_executor: SkillSearchExecutorHandle::default(),
+            store_path: None,
             unified_exec_sessions: unified_exec_tool::session_store(),
         }
     }
@@ -914,6 +916,7 @@ pub struct LlmServiceBuilder<B, S> {
     provider_configs: HashMap<String, ProviderRuntimeConfig>,
     unified_exec_cli_bridge: Option<UnifiedExecCliBridgeHandle>,
     skill_search_executor: Option<SkillSearchExecutorHandle>,
+    store_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Snafu)]
@@ -1013,6 +1016,16 @@ impl<B, S> LlmServiceBuilder<B, S> {
         self
     }
 
+    pub fn with_store_path(mut self, store_path: impl Into<PathBuf>) -> Self {
+        self.store_path = Some(store_path.into());
+        self
+    }
+
+    pub fn with_optional_store_path(mut self, store_path: Option<PathBuf>) -> Self {
+        self.store_path = store_path;
+        self
+    }
+
     pub fn build(self) -> LlmService<B, S> {
         LlmService {
             store: self.store,
@@ -1021,6 +1034,7 @@ impl<B, S> LlmServiceBuilder<B, S> {
             runtime: RuntimeCapabilities {
                 unified_exec_cli_bridge: self.unified_exec_cli_bridge.unwrap_or_default(),
                 skill_search_executor: self.skill_search_executor.unwrap_or_default(),
+                store_path: self.store_path,
                 unified_exec_sessions: unified_exec_tool::session_store(),
             },
             branch_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1037,6 +1051,7 @@ impl<B, S> LlmService<B, S> {
             provider_configs: HashMap::new(),
             unified_exec_cli_bridge: None,
             skill_search_executor: None,
+            store_path: None,
         }
     }
 
@@ -1046,6 +1061,10 @@ impl<B, S> LlmService<B, S> {
 
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    pub fn runtime_store_path(&self) -> Option<&Path> {
+        self.runtime.store_path.as_deref()
     }
 
     async fn lock_branch(&self, branch: &str) -> OwnedMutexGuard<()> {
@@ -1103,29 +1122,6 @@ where
             has_tool_patch,
             has_model_patch,
             "rebased session"
-        );
-        Ok(anchor_id)
-    }
-
-    pub async fn rebase_session_system_prompt(
-        &self,
-        branch: &str,
-        patch: SessionConfigPatch,
-        system_prompt: &str,
-    ) -> Result<String> {
-        let _guard = self.lock_branch(branch).await;
-        let has_tool_patch = patch.tools.is_some();
-        let has_model_patch = patch.model.is_some();
-        let anchor_id = self
-            .store
-            .rebase_session_system_prompt(branch, &patch, system_prompt)
-            .context(MemorySnafu)?;
-        tracing::info!(
-            branch = %branch,
-            anchor_id = %anchor_id,
-            has_tool_patch,
-            has_model_patch,
-            "rebased session with system prompt"
         );
         Ok(anchor_id)
     }
@@ -1269,15 +1265,7 @@ where
 impl<B, S> LlmService<B, S>
 where
     B: CompletionBackend,
-    S: NodeStore
-        + BranchStore
-        + SessionStore
-        + RuntimeStore
-        + SkillStore
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    S: NodeStore + BranchStore + SessionStore + SkillStore + Clone + Send + Sync + 'static,
 {
     pub async fn prompt(&self, request: PromptRequest) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
@@ -1523,7 +1511,7 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + RuntimeStore + SkillStore,
+    S: NodeStore + SkillStore,
 {
     fn resolve_session_from_reference(
         &self,
@@ -1564,7 +1552,7 @@ fn resolve_session_model(anchor: &SessionAnchor, config: Option<&ProviderRuntime
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + BranchStore + RuntimeStore,
+    S: NodeStore + BranchStore,
 {
     pub fn append_prompt_job_base(
         &self,
@@ -1606,7 +1594,7 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + RuntimeStore,
+    S: NodeStore,
 {
     fn append_prompt_anchor_to_parent_with_session_patch(
         &self,
@@ -1938,7 +1926,7 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + RuntimeStore + SkillStore,
+    S: NodeStore + SkillStore,
 {
     #[cfg(test)]
     fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
@@ -2028,7 +2016,7 @@ fn append_skills_to_system_prompt(system_prompt: &str, skills: &[SessionSkillSum
 
 impl<B, S> LlmService<B, S>
 where
-    S: RuntimeStore + SkillStore,
+    S: SkillStore,
 {
     fn session_from_context(
         &self,
@@ -2086,7 +2074,7 @@ where
                 session_role: context.session_anchor.role,
                 current_skill_name: current_skill_name_from_prompt(&context.session_anchor.prompt),
                 active_skill: None,
-                store_path: self.store.runtime_store_path(),
+                store_path: self.runtime.store_path.clone(),
                 enable_coco_shim: context.session_anchor.enable_coco_shim,
                 cli_bridge: self.runtime.unified_exec_cli_bridge.clone(),
                 skill_executor: self.runtime.skill_search_executor.clone(),
@@ -4252,6 +4240,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             additional_params: None,
+            system_prompt: None,
             enable_coco_shim: None,
         }
     }
@@ -6023,7 +6012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebase_session_system_prompt_rebuilds_session_anchor() {
+    async fn rebase_session_patch_system_prompt_rebuilds_session_anchor() {
         let store = MemoryStore::new();
         let backend = FakeBackend::with_responses(&[("main", &[Ok("updated")])]);
         let calls = backend.calls.clone();
@@ -6034,7 +6023,13 @@ mod tests {
             .unwrap();
 
         let new_head = service
-            .rebase_session_system_prompt("main", session_patch(), "You are strict.")
+            .rebase_session(
+                "main",
+                SessionConfigPatch {
+                    system_prompt: Some("You are strict.".to_owned()),
+                    ..session_patch()
+                },
+            )
             .await
             .unwrap();
 

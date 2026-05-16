@@ -5,7 +5,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use coco_mem::{ProviderProfile, ProviderProfileStore, StoreError, StoreResult};
+use coco_mem::{ProviderProfile, StoreError, StoreResult};
 use serde::Deserialize;
 use snafu::prelude::*;
 
@@ -68,7 +68,13 @@ impl ProviderProfiles {
     }
 }
 
-impl ProviderProfileStore for ProviderProfiles {
+pub trait ProviderProfileLookup {
+    fn list_provider_profiles(&self) -> StoreResult<HashMap<String, ProviderProfile>>;
+
+    fn get_provider_profile(&self, name: &str) -> StoreResult<ProviderProfile>;
+}
+
+impl ProviderProfileLookup for ProviderProfiles {
     fn list_provider_profiles(&self) -> StoreResult<HashMap<String, ProviderProfile>> {
         Ok(self.profiles.clone())
     }

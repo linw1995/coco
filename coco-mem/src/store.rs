@@ -1,22 +1,16 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 
-pub(crate) mod collection;
 pub(crate) mod fs;
-pub(crate) mod log;
 pub mod memory;
-pub(crate) mod projection;
-pub(crate) mod snapshot;
 pub(crate) mod state;
-pub(crate) mod versioned;
 
 #[cfg(test)]
 mod tests;
 
 use crate::{
-    BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
-    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
-    SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    Job, JobStatus, MessageQueueItem, NewNode, Node, Preset, PresetRecord, SessionAnchorPatch,
+    SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 /// Node graph storage API used by CoCo services.
@@ -78,62 +72,28 @@ pub trait SessionStore {
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
-
-    /// Rewrites the visible session chain with a new system prompt and returns the new head id.
-    fn rebase_session_system_prompt(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        system_prompt: &str,
-    ) -> StoreResult<String>;
 }
 
-/// Branch preset config storage API.
-pub trait BranchConfigStore {
-    /// Returns all persisted branch preset configs keyed by preset name.
-    fn list_branch_configs(&self) -> StoreResult<HashMap<String, BranchConfig>>;
+/// Preset storage API.
+pub trait PresetStore {
+    /// Returns all persisted preset records keyed by preset name.
+    fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>>;
 
-    /// Returns all persisted branch preset config records keyed by preset name.
-    fn list_branch_config_records(&self) -> StoreResult<HashMap<String, BranchConfigRecord>>;
+    /// Returns one preset record by preset name.
+    fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord>;
 
-    /// Returns one branch preset config by preset name.
-    fn get_branch_config(&self, name: &str) -> StoreResult<BranchConfig>;
+    /// Creates a new version for a preset under a preset name.
+    fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord>;
 
-    /// Returns one branch preset config record by preset name.
-    fn get_branch_config_record(&self, name: &str) -> StoreResult<BranchConfigRecord>;
+    /// Creates a new version cloned from a previous preset version.
+    fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord>;
 
-    /// Creates a new version for a branch preset config under a preset name.
-    fn set_branch_config(
-        &self,
-        name: &str,
-        config: BranchConfig,
-    ) -> StoreResult<BranchConfigRecord>;
-
-    /// Creates a new version cloned from a previous branch preset config version.
-    fn rollback_branch_config(
-        &self,
-        name: &str,
-        target_version: u64,
-    ) -> StoreResult<BranchConfigRecord>;
-
-    /// Deletes one branch preset config by preset name.
-    fn delete_branch_config(&self, name: &str) -> StoreResult<()>;
-}
-
-/// Provider profile lookup API.
-pub trait ProviderProfileStore {
-    /// Returns all provider profiles keyed by profile name.
-    fn list_provider_profiles(&self) -> StoreResult<HashMap<String, ProviderProfile>>;
-
-    /// Returns one provider profile by profile name.
-    fn get_provider_profile(&self, name: &str) -> StoreResult<ProviderProfile>;
+    /// Deletes one preset by preset name.
+    fn delete_preset(&self, name: &str) -> StoreResult<()>;
 }
 
 /// Persisted skill storage API.
 pub trait SkillStore {
-    /// Returns the persisted skill groups.
-    fn skill_groups(&self) -> StoreResult<SkillGroups>;
-
     /// Returns all persisted skills for the given role.
     fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>>;
 
@@ -203,24 +163,15 @@ pub trait MessageQueueStore {
     fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;
 }
 
-/// Optional runtime metadata for stores with a process-shareable backing path.
-pub trait RuntimeStore {
-    /// Returns the backing store directory when the store is process-shareable.
-    fn runtime_store_path(&self) -> Option<PathBuf> {
-        None
-    }
+/// Capability for stores with a process-shareable backing path.
+pub trait ProcessShareableStore {
+    /// Returns the backing store directory that another process can reopen.
+    fn store_path(&self) -> &Path;
 }
 
 /// Complete storage API used by CoCo application services.
 pub trait Store:
-    NodeStore
-    + BranchStore
-    + SessionStore
-    + BranchConfigStore
-    + SkillStore
-    + JobStore
-    + MessageQueueStore
-    + RuntimeStore
+    NodeStore + BranchStore + SessionStore + PresetStore + SkillStore + JobStore + MessageQueueStore
 {
 }
 
@@ -228,10 +179,9 @@ impl<T> Store for T where
     T: NodeStore
         + BranchStore
         + SessionStore
-        + BranchConfigStore
+        + PresetStore
         + SkillStore
         + JobStore
         + MessageQueueStore
-        + RuntimeStore
 {
 }

@@ -160,6 +160,7 @@ pub struct SessionAnchorPatch {
     pub provider: Option<Option<String>>,
     pub model: Option<String>,
     pub tools: Option<Vec<Tool>>,
+    pub system_prompt: Option<String>,
     pub temperature: Option<Option<f64>>,
     pub max_tokens: Option<Option<u64>>,
     pub additional_params: Option<Option<Value>>,
@@ -168,7 +169,7 @@ pub struct SessionAnchorPatch {
 
 /// Preset configuration for creating sessions and rebasing runtime defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BranchConfig {
+pub struct Preset {
     pub role: SessionRole,
     pub provider_profile: String,
     pub model: String,
@@ -216,19 +217,19 @@ pub struct GptProviderSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BranchConfigVersion {
+pub struct PresetVersion {
     pub version: u64,
     pub created_at: Timestamp,
     #[serde(flatten)]
-    pub config: BranchConfig,
+    pub config: Preset,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct BranchConfigRecord {
+pub struct PresetRecord {
     pub name: String,
     pub current_version: u64,
     #[serde(default)]
-    pub versions: BTreeMap<u64, BranchConfigVersion>,
+    pub versions: BTreeMap<u64, PresetVersion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -744,7 +745,10 @@ impl SessionAnchor {
                 .unwrap_or_else(|| self.provider.clone()),
             model: patch.model.clone().unwrap_or_else(|| self.model.clone()),
             tools: patch.tools.clone().unwrap_or_else(|| self.tools.clone()),
-            system_prompt: self.system_prompt.clone(),
+            system_prompt: patch
+                .system_prompt
+                .clone()
+                .unwrap_or_else(|| self.system_prompt.clone()),
             prompt: self.prompt.clone(),
             temperature: patch.temperature.unwrap_or(self.temperature),
             max_tokens: patch.max_tokens.unwrap_or(self.max_tokens),
@@ -758,11 +762,11 @@ impl SessionAnchor {
     }
 }
 
-impl BranchConfig {
-    /// Builds the runtime-only patch used by session rebase.
+impl Preset {
+    /// Builds the runtime patch used by session rebase.
     ///
-    /// The durable session prompts are intentionally excluded: changing them
-    /// requires a new session anchor rather than patching the current one.
+    /// The durable user prompt is intentionally excluded: changing it requires
+    /// a new session anchor rather than patching the current one.
     pub fn to_session_anchor_patch(&self) -> SessionAnchorPatch {
         SessionAnchorPatch {
             role: Some(self.role),
@@ -770,6 +774,7 @@ impl BranchConfig {
             provider: Some(None),
             model: Some(self.model.clone()),
             tools: Some(self.tools.clone()),
+            system_prompt: Some(self.system_prompt.clone()),
             temperature: Some(self.temperature),
             max_tokens: Some(self.max_tokens),
             additional_params: Some(self.additional_params.clone()),
@@ -919,8 +924,8 @@ impl BackendMetadataBuilder {
     }
 }
 
-impl BranchConfigVersion {
-    pub fn new(version: u64, config: BranchConfig) -> Self {
+impl PresetVersion {
+    pub fn new(version: u64, config: Preset) -> Self {
         Self {
             version,
             created_at: Timestamp::now(),
@@ -928,14 +933,14 @@ impl BranchConfigVersion {
         }
     }
 
-    pub fn to_config(&self) -> BranchConfig {
+    pub fn to_preset(&self) -> Preset {
         self.config.clone()
     }
 }
 
-impl BranchConfigRecord {
-    pub fn new(name: impl Into<String>, config: BranchConfig) -> Self {
-        let version = BranchConfigVersion::new(1, config);
+impl PresetRecord {
+    pub fn new(name: impl Into<String>, config: Preset) -> Self {
+        let version = PresetVersion::new(1, config);
         let current_version = version.version;
         let mut versions = BTreeMap::new();
         versions.insert(current_version, version);
@@ -947,28 +952,28 @@ impl BranchConfigRecord {
         }
     }
 
-    pub fn current(&self) -> Option<&BranchConfigVersion> {
+    pub fn current(&self) -> Option<&PresetVersion> {
         self.versions.get(&self.current_version)
     }
 
-    pub fn current_config(&self) -> Option<BranchConfig> {
-        self.current().map(BranchConfigVersion::to_config)
+    pub fn current_preset(&self) -> Option<Preset> {
+        self.current().map(PresetVersion::to_preset)
     }
 
-    pub fn update(&mut self, config: BranchConfig) -> Option<&BranchConfigVersion> {
+    pub fn update(&mut self, config: Preset) -> Option<&PresetVersion> {
         self.current()?;
         let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
-        let next = BranchConfigVersion::new(next_version, config);
+        let next = PresetVersion::new(next_version, config);
 
         self.current_version = next_version;
         self.versions.insert(next_version, next);
         self.current()
     }
 
-    pub fn rollback(&mut self, target_version: u64) -> Option<&BranchConfigVersion> {
-        let target = self.versions.get(&target_version)?.to_config();
+    pub fn rollback(&mut self, target_version: u64) -> Option<&PresetVersion> {
+        let target = self.versions.get(&target_version)?.to_preset();
         let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
-        let next = BranchConfigVersion::new(next_version, target);
+        let next = PresetVersion::new(next_version, target);
 
         self.current_version = next_version;
         self.versions.insert(next_version, next);
@@ -1110,8 +1115,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchor, BackendMetadata, BranchConfig, ExecutionMetadata, Kind, MergeParent, NewNode, Node,
-        NodeMetadata, PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
+        Anchor, BackendMetadata, ExecutionMetadata, Kind, MergeParent, NewNode, Node, NodeMetadata,
+        PauseReason, Preset, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
         SessionAnchorPatch, SessionRole, SessionState, SkillInvocationAnchor, SkillInvocationMode,
         SkillResultAnchor, Tool, ToolResult, ToolUse,
     };
@@ -1701,6 +1706,7 @@ mod tests {
             provider: Some(Some("anthropic".to_owned())),
             model: Some("claude-sonnet-4-20250514".to_owned()),
             tools: Some(vec![]),
+            system_prompt: Some("new system".to_owned()),
             temperature: Some(None),
             max_tokens: Some(Some(256)),
             additional_params: Some(Some(json!({"service_tier": "priority"}))),
@@ -1712,7 +1718,7 @@ mod tests {
         assert_eq!(updated.provider.as_deref(), Some("anthropic"));
         assert_eq!(updated.model, "claude-sonnet-4-20250514");
         assert!(updated.tools.is_empty());
-        assert_eq!(updated.system_prompt, "system");
+        assert_eq!(updated.system_prompt, "new system");
         assert_eq!(updated.prompt, "prompt");
         assert_eq!(updated.temperature, None);
         assert_eq!(updated.max_tokens, Some(256));
@@ -1724,8 +1730,8 @@ mod tests {
     }
 
     #[test]
-    fn branch_config_applies_session_and_role_settings() {
-        let updated = BranchConfig {
+    fn preset_applies_session_and_role_settings() {
+        let updated = Preset {
             role: SessionRole::Runner,
             provider_profile: "anthropic-main".to_owned(),
             model: "claude-sonnet-4-20250514".to_owned(),

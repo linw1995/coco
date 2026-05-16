@@ -3,14 +3,12 @@ use std::sync::{Arc, RwLock};
 
 use super::state::StoreState;
 use super::{
-    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, ProviderProfileStore,
-    RuntimeStore, SessionStore, SkillStore,
+    BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, SessionStore, SkillStore,
 };
 use crate::StoreResult as Result;
 use crate::{
-    BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
-    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
-    SkillUpdatePatch, SkillVersionSpec,
+    Job, JobStatus, MessageQueueItem, NewNode, Node, Preset, PresetRecord, SessionAnchorPatch,
+    SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
 };
 
 #[derive(Clone, Debug)]
@@ -149,106 +147,47 @@ impl SessionStore for MemoryStore {
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
     }
-
-    fn rebase_session_system_prompt(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        system_prompt: &str,
-    ) -> Result<String> {
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let plan = state.plan_rebase_session_system_prompt(name, patch, system_prompt)?;
-
-        for node in plan.nodes {
-            state.insert_existing_node(node)?;
-        }
-        state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
-        Ok(plan.new_head)
-    }
 }
 
-impl BranchConfigStore for MemoryStore {
-    fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .list_branch_configs()
-    }
-
-    fn list_branch_config_records(&self) -> Result<HashMap<String, BranchConfigRecord>> {
+impl PresetStore for MemoryStore {
+    fn list_preset_records(&self) -> Result<HashMap<String, PresetRecord>> {
         Ok(self
             .inner
             .read()
             .expect("store lock poisoned")
-            .list_branch_config_records())
+            .list_preset_records())
     }
 
-    fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
+    fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
         self.inner
             .read()
             .expect("store lock poisoned")
-            .get_branch_config(name)
+            .get_preset_record(name)
     }
 
-    fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_branch_config_record(name)
-    }
-
-    fn set_branch_config(&self, name: &str, config: BranchConfig) -> Result<BranchConfigRecord> {
+    fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
         self.inner
             .write()
             .expect("store lock poisoned")
-            .set_branch_config(name, config)
+            .set_preset(name, config)
     }
 
-    fn rollback_branch_config(
-        &self,
-        name: &str,
-        target_version: u64,
-    ) -> Result<BranchConfigRecord> {
+    fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
         self.inner
             .write()
             .expect("store lock poisoned")
-            .rollback_branch_config(name, target_version)
+            .rollback_preset(name, target_version)
     }
 
-    fn delete_branch_config(&self, name: &str) -> Result<()> {
+    fn delete_preset(&self, name: &str) -> Result<()> {
         self.inner
             .write()
             .expect("store lock poisoned")
-            .delete_branch_config(name)
-    }
-}
-
-impl ProviderProfileStore for MemoryStore {
-    fn list_provider_profiles(&self) -> Result<HashMap<String, ProviderProfile>> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .list_provider_profiles())
-    }
-
-    fn get_provider_profile(&self, name: &str) -> Result<ProviderProfile> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_provider_profile(name)
+            .delete_preset(name)
     }
 }
 
 impl SkillStore for MemoryStore {
-    fn skill_groups(&self) -> Result<SkillGroups> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .skill_groups())
-    }
-
     fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
         Ok(self
             .inner
@@ -353,5 +292,3 @@ impl MessageQueueStore for MemoryStore {
             .list_queue_messages(queue))
     }
 }
-
-impl RuntimeStore for MemoryStore {}

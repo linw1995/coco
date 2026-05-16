@@ -6,19 +6,18 @@ use snafu::prelude::*;
 
 use crate::StoreResult as Result;
 use crate::error::{
-    AmbiguousNodePrefixSnafu, BranchConfigNotFoundSnafu, BranchConfigVersionNotFoundSnafu,
-    BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu, DuplicateMergeParentSnafu,
-    InvalidAnchorSnafu, InvalidSkillNameSnafu, MergeParentMatchesParentSnafu,
-    MissingSessionAnchorSnafu, MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu,
+    AmbiguousNodePrefixSnafu, BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu,
+    DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSkillNameSnafu,
+    MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, MultipleShadowParentsSnafu,
+    NotFoundSnafu, ParentNotFoundSnafu, PresetNotFoundSnafu, PresetVersionNotFoundSnafu,
     PromptJobActiveOnBranchSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
-    ProviderProfileNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
-    SkillAlreadyExistsSnafu, SkillNotFoundSnafu, SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
+    RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu,
+    SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
-    Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind,
-    MessageQueueItem, NewNode, Node, PauseReason, ProviderProfile, Role, SessionAnchor,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch,
-    SkillVersionSpec, default_skill_groups,
+    Anchor, AnchorPayload, Job, JobStatus, Kind, MessageQueueItem, NewNode, Node, PauseReason,
+    Preset, PresetRecord, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
+    SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec, default_skill_groups,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,8 +27,7 @@ pub struct StoreState {
     pub root: String,
     pub branches: HashMap<String, String>,
     pub sessions: HashMap<String, SessionState>,
-    pub branch_configs: HashMap<String, BranchConfigRecord>,
-    pub provider_profiles: HashMap<String, ProviderProfile>,
+    pub presets: HashMap<String, PresetRecord>,
     pub jobs: HashMap<String, Job>,
     pub message_queues: HashMap<String, Vec<MessageQueueItem>>,
     pub skill_groups: SkillGroups,
@@ -76,8 +74,7 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
-            branch_configs: HashMap::new(),
-            provider_profiles: HashMap::new(),
+            presets: HashMap::new(),
             jobs: HashMap::new(),
             message_queues: HashMap::new(),
             skill_groups: default_skill_groups(),
@@ -95,8 +92,7 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
-            branch_configs: HashMap::new(),
-            provider_profiles: HashMap::new(),
+            presets: HashMap::new(),
             jobs: HashMap::new(),
             message_queues: HashMap::new(),
             skill_groups: default_skill_groups(),
@@ -316,104 +312,53 @@ impl StoreState {
         Ok(state.clone())
     }
 
-    pub fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
-        self.branch_configs
-            .iter()
-            .map(|(name, record)| {
-                let config = record
-                    .current_config()
-                    .context(BranchConfigVersionNotFoundSnafu {
-                        name: name.clone(),
-                        version: record.current_version,
-                    })?;
-                Ok((name.clone(), config))
-            })
-            .collect()
+    pub fn list_preset_records(&self) -> HashMap<String, PresetRecord> {
+        self.presets.clone()
     }
 
-    pub fn list_branch_config_records(&self) -> HashMap<String, BranchConfigRecord> {
-        self.branch_configs.clone()
-    }
-
-    pub fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
-        let record = self.get_branch_config_record(name)?;
-        record
-            .current_config()
-            .context(BranchConfigVersionNotFoundSnafu {
-                name: name.to_owned(),
-                version: record.current_version,
-            })
-    }
-
-    pub fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {
-        self.branch_configs
+    pub fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
+        self.presets
             .get(name)
             .cloned()
-            .context(BranchConfigNotFoundSnafu {
+            .context(PresetNotFoundSnafu {
                 name: name.to_owned(),
             })
     }
 
-    pub fn set_branch_config(
-        &mut self,
-        name: &str,
-        config: BranchConfig,
-    ) -> Result<BranchConfigRecord> {
-        let record = if let Some(record) = self.branch_configs.get_mut(name) {
+    pub fn set_preset(&mut self, name: &str, config: Preset) -> Result<PresetRecord> {
+        let record = if let Some(record) = self.presets.get_mut(name) {
             let current_version = record.current_version;
-            record
-                .update(config)
-                .context(BranchConfigVersionNotFoundSnafu {
-                    name: name.to_owned(),
-                    version: current_version,
-                })?;
+            record.update(config).context(PresetVersionNotFoundSnafu {
+                name: name.to_owned(),
+                version: current_version,
+            })?;
             record.clone()
         } else {
-            let record = BranchConfigRecord::new(name.to_owned(), config);
-            self.branch_configs.insert(name.to_owned(), record.clone());
+            let record = PresetRecord::new(name.to_owned(), config);
+            self.presets.insert(name.to_owned(), record.clone());
             record
         };
         Ok(record)
     }
 
-    pub fn rollback_branch_config(
-        &mut self,
-        name: &str,
-        target_version: u64,
-    ) -> Result<BranchConfigRecord> {
-        let record = self
-            .branch_configs
-            .get_mut(name)
-            .context(BranchConfigNotFoundSnafu {
-                name: name.to_owned(),
-            })?;
+    pub fn rollback_preset(&mut self, name: &str, target_version: u64) -> Result<PresetRecord> {
+        let record = self.presets.get_mut(name).context(PresetNotFoundSnafu {
+            name: name.to_owned(),
+        })?;
         record
             .rollback(target_version)
-            .context(BranchConfigVersionNotFoundSnafu {
+            .context(PresetVersionNotFoundSnafu {
                 name: name.to_owned(),
                 version: target_version,
             })?;
         Ok(record.clone())
     }
 
-    pub fn delete_branch_config(&mut self, name: &str) -> Result<()> {
-        self.branch_configs
+    pub fn delete_preset(&mut self, name: &str) -> Result<()> {
+        self.presets
             .remove(name)
             .map(|_| ())
-            .context(BranchConfigNotFoundSnafu {
-                name: name.to_owned(),
-            })
-    }
-
-    pub fn list_provider_profiles(&self) -> HashMap<String, ProviderProfile> {
-        self.provider_profiles.clone()
-    }
-
-    pub fn get_provider_profile(&self, name: &str) -> Result<ProviderProfile> {
-        self.provider_profiles
-            .get(name)
-            .cloned()
-            .context(ProviderProfileNotFoundSnafu {
+            .context(PresetNotFoundSnafu {
                 name: name.to_owned(),
             })
     }
@@ -435,10 +380,6 @@ impl StoreState {
         let job = Job::new(self.next_job_id(), branch, base);
         self.jobs.insert(job.job_id.clone(), job.clone());
         Ok(job)
-    }
-
-    pub fn skill_groups(&self) -> SkillGroups {
-        self.skill_groups.clone()
     }
 
     pub fn list_skills(&self, role: SessionRole) -> Vec<SkillRecord> {
@@ -611,19 +552,6 @@ impl StoreState {
         patch: &SessionAnchorPatch,
     ) -> Result<RebasePlan> {
         self.plan_rebase_session_with(name, |session_anchor| session_anchor.apply_patch(patch))
-    }
-
-    pub fn plan_rebase_session_system_prompt(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        system_prompt: &str,
-    ) -> Result<RebasePlan> {
-        self.plan_rebase_session_with(name, |session_anchor| {
-            let mut rebased = session_anchor.apply_patch(patch);
-            rebased.system_prompt = system_prompt.to_owned();
-            rebased
-        })
     }
 
     fn plan_rebase_session_with(

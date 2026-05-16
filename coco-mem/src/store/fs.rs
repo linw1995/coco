@@ -6,19 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use snafu::prelude::*;
 
-use super::log::LogEntry;
-use super::projection::ProjectionContext;
-use super::snapshot::Snapshot;
 use super::state::StoreState;
-use super::versioned::{
-    VersionedLogEntry, VersionedSnapshot, VersionedValue, validate_record,
-    validate_snapshot_in_collection, versions_from_history,
-};
 use super::{
-    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, RuntimeStore,
+    BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, ProcessShareableStore,
     SessionStore, SkillStore,
 };
 use crate::error::{
@@ -27,22 +19,23 @@ use crate::error::{
     WriteStoreLogSnafu, WriteStoreMetaSnafu,
 };
 use crate::{
-    BranchConfig, BranchConfigRecord, BranchConfigVersion, Job, JobStatus, MessageQueueItem,
-    NewNode, Node, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
-    SkillScript, SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError,
-    StoreResult as Result, default_skill_groups,
+    Job, JobStatus, MessageQueueItem, NewNode, Node, Preset, PresetRecord, PresetVersion,
+    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord, SkillScript,
+    SkillUpdatePatch, SkillVersion, SkillVersionSpec, StoreError, StoreResult as Result,
+    default_skill_groups,
 };
 
-const STORE_FORMAT_VERSION: u64 = 9;
-const LEGACY_STORE_FORMAT_VERSION: u64 = 6;
+type VersionMap<V> = BTreeMap<u64, V>;
+
+const STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
-const BRANCH_CONFIGS_FILE_NAME: &str = "branch-configs.json";
+const PRESETS_FILE_NAME: &str = "presets.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
 const QUEUES_FILE_NAME: &str = "queues.jsonl";
 const SKILLS_FILE_NAME: &str = "skills.json";
-const BRANCH_CONFIG_HISTORY_DIR_NAME: &str = "branch-config-history";
+const PRESET_HISTORY_DIR_NAME: &str = "preset-history";
 const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
 const SHARED_SKILL_HISTORY_DIR_NAME: &str = "shared";
 const ORCHESTRATOR_SKILL_HISTORY_DIR_NAME: &str = "orchestrator";
@@ -65,11 +58,11 @@ pub struct Persistence {
     meta_path: PathBuf,
     nodes_path: PathBuf,
     sessions_path: PathBuf,
-    branch_configs_path: PathBuf,
+    presets_path: PathBuf,
     jobs_path: PathBuf,
     queues_path: PathBuf,
     skills_path: PathBuf,
-    branch_config_history_dir: PathBuf,
+    preset_history_dir: PathBuf,
     skill_history_dir: PathBuf,
     branches_dir: PathBuf,
     #[cfg(test)]
@@ -89,21 +82,21 @@ pub struct Meta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct PersistedBranchConfigRecord {
+struct PersistedPresetRecord {
     name: String,
     current_version: u64,
     created_at: jiff::Timestamp,
     #[serde(flatten)]
-    config: BranchConfig,
+    config: Preset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct BranchConfigHistoryEntry {
+struct PresetHistoryEntry {
     name: String,
     version: u64,
     created_at: jiff::Timestamp,
     #[serde(flatten)]
-    config: BranchConfig,
+    config: Preset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -111,13 +104,6 @@ struct BranchConfigHistoryEntry {
 enum MessageQueueHistoryEntry {
     Enqueued { item: MessageQueueItem },
     Dequeued { queue: String, message_id: String },
-}
-
-#[derive(Debug, Default)]
-struct BranchConfigSnapshotRead {
-    current: HashMap<String, PersistedBranchConfigRecord>,
-    history_seeds: HashMap<String, BranchConfigRecord>,
-    migrated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,125 +160,40 @@ struct SkillPersistenceFailpoints {
     next: Option<SkillPersistenceFailpoint>,
 }
 
-impl PersistedBranchConfigRecord {
-    fn from_record(record: &BranchConfigRecord) -> Self {
+impl PersistedPresetRecord {
+    fn from_record(record: &PresetRecord) -> Self {
         let current = record
             .current()
-            .expect("branch config record should always have a current version");
+            .expect("preset record should always have a current version");
         Self::from_version(&record.name, record.current_version, current)
     }
 
-    fn from_version(name: &str, current_version: u64, version: &BranchConfigVersion) -> Self {
+    fn from_version(name: &str, current_version: u64, version: &PresetVersion) -> Self {
         Self {
             name: name.to_owned(),
             current_version,
             created_at: version.created_at,
-            config: version.to_config(),
+            config: version.to_preset(),
         }
     }
 }
 
-impl BranchConfigHistoryEntry {
-    fn from_version(name: &str, version: &BranchConfigVersion) -> Self {
+impl PresetHistoryEntry {
+    fn from_version(name: &str, version: &PresetVersion) -> Self {
         Self {
             name: name.to_owned(),
             version: version.version,
             created_at: version.created_at,
-            config: version.to_config(),
+            config: version.to_preset(),
         }
     }
 
-    fn into_version(self) -> BranchConfigVersion {
-        BranchConfigVersion {
+    fn into_version(self) -> PresetVersion {
+        PresetVersion {
             version: self.version,
             created_at: self.created_at,
             config: self.config,
         }
-    }
-}
-
-impl LogEntry for BranchConfigHistoryEntry {
-    fn log_key(&self) -> &str {
-        &self.name
-    }
-}
-
-impl LogEntry for SkillHistoryEntry {
-    fn log_key(&self) -> &str {
-        &self.name
-    }
-}
-
-impl LogEntry for MessageQueueHistoryEntry {
-    fn log_key(&self) -> &str {
-        match self {
-            Self::Enqueued { item } => &item.message_id,
-            Self::Dequeued { message_id, .. } => message_id,
-        }
-    }
-}
-
-impl Snapshot for PersistedBranchConfigRecord {
-    fn snapshot_key(&self) -> &str {
-        &self.name
-    }
-}
-
-impl VersionedSnapshot for PersistedBranchConfigRecord {
-    type Version = BranchConfigVersion;
-
-    fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
-        self.current_version
-    }
-
-    fn matches_version(&self, version: &Self::Version) -> bool {
-        version.created_at == self.created_at && version.config == self.config
-    }
-}
-
-impl Snapshot for PersistedSkillRecord {
-    fn snapshot_key(&self) -> &str {
-        &self.name
-    }
-}
-
-impl VersionedSnapshot for PersistedSkillRecord {
-    type Version = SkillVersion;
-
-    fn current_version(&self) -> <Self::Version as VersionedValue>::Id {
-        self.current_version
-    }
-
-    fn matches_version(&self, version: &Self::Version) -> bool {
-        version.created_at == self.created_at
-            && version.description == self.description
-            && version.body == self.body
-            && version.scripts == self.scripts
-            && version.enable_coco_shim == self.enable_coco_shim
-    }
-}
-
-impl VersionedLogEntry for BranchConfigHistoryEntry {
-    type Version = BranchConfigVersion;
-
-    fn version(&self) -> <Self::Version as VersionedValue>::Id {
-        self.version
-    }
-
-    fn into_version(self) -> Self::Version {
-        BranchConfigHistoryEntry::into_version(self)
-    }
-}
-
-impl VersionedLogEntry for SkillHistoryEntry {
-    type Version = SkillVersion;
-
-    fn version(&self) -> <Self::Version as VersionedValue>::Id {
-        self.version
-    }
-
-    fn into_version(self) -> Self::Version {
-        SkillHistoryEntry::into_version(self)
     }
 }
 
@@ -358,6 +259,67 @@ impl SkillHistoryEntry {
             enable_coco_shim: self.enable_coco_shim,
         }
     }
+}
+
+fn validate_snapshot<V>(
+    entity: &str,
+    history_path: &Path,
+    snapshot_key: &str,
+    current_version: u64,
+    versions: &VersionMap<V>,
+    matches_version: impl FnOnce(&V) -> bool,
+) -> Result<()> {
+    let persisted_current = versions
+        .get(&current_version)
+        .context(CorruptedStoreSnafu {
+            path: history_path.to_owned(),
+            message: format!(
+                "missing current {entity} version {current_version} for {snapshot_key:?}",
+            ),
+        })?;
+    ensure!(
+        matches_version(persisted_current),
+        CorruptedStoreSnafu {
+            path: history_path.to_owned(),
+            message: format!("current {entity} snapshot mismatch for {snapshot_key:?}"),
+        }
+    );
+    Ok(())
+}
+
+fn validate_versions<V>(
+    entity: &str,
+    path: &Path,
+    key: &str,
+    versions: &VersionMap<V>,
+    version_of: impl Fn(&V) -> u64,
+) -> Result<()> {
+    let mut expected_version = 1;
+    for (version, entry) in versions {
+        ensure!(
+            *version == expected_version,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "non-contiguous history version {} for {} {:?}, expected {}",
+                    version, entity, key, expected_version
+                ),
+            }
+        );
+        let entry_version = version_of(entry);
+        ensure!(
+            entry_version == *version,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "{} {:?} stores version {} under key {}",
+                    entity, key, entry_version, version
+                ),
+            }
+        );
+        expected_version += 1;
+    }
+    Ok(())
 }
 
 impl SkillHistoryScope {
@@ -556,39 +518,18 @@ impl Persistence {
         )
     }
 
-    pub fn append_branch_config_history_entry(
-        &self,
-        name: &str,
-        version: &BranchConfigVersion,
-    ) -> Result<()> {
+    pub fn append_preset_history_entry(&self, name: &str, version: &PresetVersion) -> Result<()> {
         self.ensure_writable()?;
-        self.create_branch_config_history_directory()?;
+        self.create_preset_history_directory()?;
         append_jsonl_record_create(
-            &self.branch_config_history_path(name),
-            &BranchConfigHistoryEntry::from_version(name, version),
+            &self.preset_history_path(name),
+            &PresetHistoryEntry::from_version(name, version),
         )
     }
 
-    pub fn rewrite_branch_config_history(
-        &self,
-        records: &HashMap<String, BranchConfigRecord>,
-    ) -> Result<()> {
+    pub fn delete_preset_history(&self, name: &str) -> Result<()> {
         self.ensure_writable()?;
-        self.create_branch_config_history_directory()?;
-        for (name, record) in records {
-            let entries = record
-                .versions
-                .values()
-                .map(|version| BranchConfigHistoryEntry::from_version(name, version))
-                .collect::<Vec<_>>();
-            write_jsonl_file(&self.branch_config_history_path(name), &entries)?;
-        }
-        Ok(())
-    }
-
-    pub fn delete_branch_config_history(&self, name: &str) -> Result<()> {
-        self.ensure_writable()?;
-        let path = self.branch_config_history_path(name);
+        let path = self.preset_history_path(name);
         if path.exists() {
             fs::remove_file(&path).context(WriteStoreDirectorySnafu { path })?;
         }
@@ -661,11 +602,11 @@ impl Persistence {
             meta_path: path.join(META_FILE_NAME),
             nodes_path: path.join(NODES_FILE_NAME),
             sessions_path: path.join(SESSIONS_FILE_NAME),
-            branch_configs_path: path.join(BRANCH_CONFIGS_FILE_NAME),
+            presets_path: path.join(PRESETS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
             queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
-            branch_config_history_dir: path.join(BRANCH_CONFIG_HISTORY_DIR_NAME),
+            preset_history_dir: path.join(PRESET_HISTORY_DIR_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
             branches_dir: path.join(BRANCHES_DIR_NAME),
             #[cfg(test)]
@@ -691,11 +632,11 @@ impl Persistence {
             meta_path: path.join(META_FILE_NAME),
             nodes_path: path.join(NODES_FILE_NAME),
             sessions_path: path.join(SESSIONS_FILE_NAME),
-            branch_configs_path: path.join(BRANCH_CONFIGS_FILE_NAME),
+            presets_path: path.join(PRESETS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
             queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
-            branch_config_history_dir: path.join(BRANCH_CONFIG_HISTORY_DIR_NAME),
+            preset_history_dir: path.join(PRESET_HISTORY_DIR_NAME),
             skill_history_dir: path.join(SKILL_HISTORY_DIR_NAME),
             branches_dir: path.join(BRANCHES_DIR_NAME),
             #[cfg(test)]
@@ -719,46 +660,45 @@ impl Persistence {
             .join(format!("{}.jsonl", encode_branch_name(branch)))
     }
 
-    fn create_branch_config_history_directory(&self) -> Result<()> {
-        fs::create_dir_all(&self.branch_config_history_dir).context(WriteStoreDirectorySnafu {
-            path: self.branch_config_history_dir.clone(),
+    fn create_preset_history_directory(&self) -> Result<()> {
+        fs::create_dir_all(&self.preset_history_dir).context(WriteStoreDirectorySnafu {
+            path: self.preset_history_dir.clone(),
         })
     }
 
-    fn branch_config_history_path(&self, name: &str) -> PathBuf {
-        self.branch_config_history_dir
+    fn preset_history_path(&self, name: &str) -> PathBuf {
+        self.preset_history_dir
             .join(format!("{}.jsonl", encode_branch_name(name)))
     }
 
-    fn list_branch_config_history_paths(&self) -> Result<Vec<PathBuf>> {
-        if !self.branch_config_history_dir.exists() {
+    fn list_preset_history_paths(&self) -> Result<Vec<PathBuf>> {
+        if !self.preset_history_dir.exists() {
             if self.access == StoreAccess::ReadOnly {
                 return Ok(Vec::new());
             }
-            self.create_branch_config_history_directory()?;
+            self.create_preset_history_directory()?;
         }
         ensure!(
-            self.branch_config_history_dir.is_dir(),
+            self.preset_history_dir.is_dir(),
             CorruptedStoreSnafu {
-                path: self.branch_config_history_dir.clone(),
-                message: "branch config history entry must be a directory".to_owned(),
+                path: self.preset_history_dir.clone(),
+                message: "preset history entry must be a directory".to_owned(),
             }
         );
-        let entries =
-            fs::read_dir(&self.branch_config_history_dir).context(WriteStoreDirectorySnafu {
-                path: self.branch_config_history_dir.clone(),
-            })?;
+        let entries = fs::read_dir(&self.preset_history_dir).context(WriteStoreDirectorySnafu {
+            path: self.preset_history_dir.clone(),
+        })?;
         let mut paths = Vec::new();
         for entry in entries {
             let entry = entry.context(WriteStoreDirectorySnafu {
-                path: self.branch_config_history_dir.clone(),
+                path: self.preset_history_dir.clone(),
             })?;
             let path = entry.path();
             ensure!(
                 path.is_file(),
                 CorruptedStoreSnafu {
                     path: path.clone(),
-                    message: "branch config history entry must be a file".to_owned(),
+                    message: "preset history entry must be a file".to_owned(),
                 }
             );
             paths.push(path);
@@ -884,7 +824,7 @@ impl Persistence {
         fs::create_dir_all(&self.branches_dir).context(WriteStoreDirectorySnafu {
             path: self.branches_dir.clone(),
         })?;
-        self.create_branch_config_history_directory()?;
+        self.create_preset_history_directory()?;
         self.create_skill_history_directories()?;
 
         let store = StoreState::new();
@@ -899,8 +839,8 @@ impl Persistence {
         write_jsonl_file(&self.nodes_path, &[root])?;
         write_json_file(&self.sessions_path, &HashMap::<String, SessionState>::new())?;
         write_json_file(
-            &self.branch_configs_path,
-            &HashMap::<String, PersistedBranchConfigRecord>::new(),
+            &self.presets_path,
+            &HashMap::<String, PersistedPresetRecord>::new(),
         )?;
         write_json_file(&self.jobs_path, &HashMap::<String, Job>::new())?;
         write_jsonl_file(&self.queues_path, &[] as &[MessageQueueHistoryEntry])?;
@@ -962,10 +902,7 @@ impl Persistence {
         }
         let meta = read_json_file::<Meta>(&self.meta_path)?;
         ensure!(
-            matches!(
-                meta.version,
-                LEGACY_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION
-            ),
+            meta.version == STORE_FORMAT_VERSION,
             CorruptedStoreSnafu {
                 path: self.meta_path.clone(),
                 message: format!(
@@ -1048,42 +985,27 @@ impl Persistence {
         store.sessions = read_json_file::<HashMap<String, SessionState>>(&self.sessions_path)?;
         map_session_validation_error(&self.sessions_path, store.validate_session_records())?;
         if self.access == StoreAccess::ReadWrite {
-            self.create_branch_config_history_directory()?;
-        } else if self.branch_config_history_dir.exists() {
+            self.create_preset_history_directory()?;
+        } else if self.preset_history_dir.exists() {
             ensure!(
-                self.branch_config_history_dir.is_dir(),
+                self.preset_history_dir.is_dir(),
                 CorruptedStoreSnafu {
-                    path: self.branch_config_history_dir.clone(),
-                    message: "branch config history entry must be a directory".to_owned(),
+                    path: self.preset_history_dir.clone(),
+                    message: "preset history entry must be a directory".to_owned(),
                 }
             );
         }
-        let branch_config_snapshots = if self.branch_configs_path.exists() {
-            ensure!(
-                self.branch_configs_path.is_file(),
-                CorruptedStoreSnafu {
-                    path: self.branch_configs_path.clone(),
-                    message: "branch preset config metadata entry must be a file".to_owned(),
-                }
-            );
-            read_branch_config_snapshots(&self.branch_configs_path)?
-        } else {
-            let snapshots = BranchConfigSnapshotRead::default();
-            if self.access == StoreAccess::ReadWrite {
-                write_json_file(&self.branch_configs_path, &snapshots.current)?;
+        ensure!(
+            self.presets_path.is_file(),
+            CorruptedStoreSnafu {
+                path: self.presets_path.clone(),
+                message: "missing presets metadata file".to_owned(),
             }
-            snapshots
-        };
-        let mut branch_configs = load_branch_config_history_records(self)?;
-        let mut branch_config_history_repaired = false;
-        for (name, record) in branch_config_snapshots.history_seeds {
-            if let std::collections::hash_map::Entry::Vacant(entry) = branch_configs.entry(name) {
-                entry.insert(record);
-                branch_config_history_repaired = true;
-            }
-        }
-        validate_branch_config_snapshots(&branch_config_snapshots.current, &branch_configs)?;
-        store.branch_configs = branch_configs;
+        );
+        let preset_snapshots = read_preset_snapshots(&self.presets_path)?;
+        let presets = load_preset_history_records(self)?;
+        validate_preset_snapshots(&preset_snapshots, &presets)?;
+        store.presets = presets;
         store.jobs = read_json_file::<HashMap<String, Job>>(&self.jobs_path)?;
         let (message_queues, message_queue_log_len) = self.load_message_queues()?;
         store.message_queues = message_queues;
@@ -1109,25 +1031,9 @@ impl Persistence {
                 let _ = write_json_file(&self.skills_path, &recovered);
             }
         }
-        let recovered_branch_config_snapshots =
-            persisted_branch_config_records(&store.branch_configs);
-        if self.access == StoreAccess::ReadWrite
-            && (branch_config_snapshots.migrated
-                || recovered_branch_config_snapshots != branch_config_snapshots.current)
-        {
-            self.persist_branch_configs(&store)?;
-        }
-        if branch_config_history_repaired && self.access == StoreAccess::ReadWrite {
-            self.rewrite_branch_config_history(&store.branch_configs)?;
-        }
-        if meta.version != STORE_FORMAT_VERSION && self.access == StoreAccess::ReadWrite {
-            write_json_file(
-                &self.meta_path,
-                &Meta {
-                    version: STORE_FORMAT_VERSION,
-                    root_id: meta.root_id,
-                },
-            )?;
+        let recovered_preset_snapshots = persisted_preset_records(&store.presets);
+        if self.access == StoreAccess::ReadWrite && recovered_preset_snapshots != preset_snapshots {
+            self.persist_presets(&store)?;
         }
 
         Ok((self.clone(), store))
@@ -1138,11 +1044,11 @@ impl Persistence {
         write_json_file(&self.sessions_path, &state.list_session_states())
     }
 
-    pub fn persist_branch_configs(&self, state: &StoreState) -> Result<()> {
+    pub fn persist_presets(&self, state: &StoreState) -> Result<()> {
         self.ensure_writable()?;
         write_json_file(
-            &self.branch_configs_path,
-            &persisted_branch_config_records(&state.branch_configs),
+            &self.presets_path,
+            &persisted_preset_records(&state.presets),
         )
     }
 
@@ -1198,17 +1104,12 @@ fn load_skill_groups_from_history(
     Ok(history)
 }
 
-fn persisted_branch_config_records(
-    records: &HashMap<String, BranchConfigRecord>,
-) -> HashMap<String, PersistedBranchConfigRecord> {
+fn persisted_preset_records(
+    records: &HashMap<String, PresetRecord>,
+) -> HashMap<String, PersistedPresetRecord> {
     records
         .iter()
-        .map(|(name, record)| {
-            (
-                name.clone(),
-                PersistedBranchConfigRecord::from_record(record),
-            )
-        })
+        .map(|(name, record)| (name.clone(), PersistedPresetRecord::from_record(record)))
         .collect()
 }
 
@@ -1322,93 +1223,25 @@ fn store_lock_key(store_dir: &Path) -> PathBuf {
     })
 }
 
-fn read_branch_config_snapshots(path: &Path) -> Result<BranchConfigSnapshotRead> {
-    let values = read_json_file::<HashMap<String, Value>>(path)?;
-    let mut read = BranchConfigSnapshotRead::default();
-
-    for (name, value) in values {
-        if is_embedded_branch_config_record_value(&value) {
-            let record = serde_json::from_value::<BranchConfigRecord>(value).context(
-                ParseStoreMetaSnafu {
-                    path: path.to_owned(),
-                },
-            )?;
-            validate_branch_config_record(path, &name, &record)?;
-            read.current.insert(
-                name.clone(),
-                PersistedBranchConfigRecord::from_record(&record),
-            );
-            read.history_seeds.insert(name, record);
-            read.migrated = true;
-        } else if is_branch_config_snapshot_value(&value) {
-            let snapshot = serde_json::from_value::<PersistedBranchConfigRecord>(value).context(
-                ParseStoreMetaSnafu {
-                    path: path.to_owned(),
-                },
-            )?;
-            validate_branch_config_snapshot(path, &name, &snapshot)?;
-            read.current.insert(name, snapshot);
-        } else {
-            let config =
-                serde_json::from_value::<BranchConfig>(value).context(ParseStoreMetaSnafu {
-                    path: path.to_owned(),
-                })?;
-            let record = BranchConfigRecord::new(name.clone(), config);
-            read.current.insert(
-                name.clone(),
-                PersistedBranchConfigRecord::from_record(&record),
-            );
-            read.history_seeds.insert(name, record);
-            read.migrated = true;
-        }
+fn read_preset_snapshots(path: &Path) -> Result<HashMap<String, PersistedPresetRecord>> {
+    let snapshots = read_json_file::<HashMap<String, PersistedPresetRecord>>(path)?;
+    for (name, snapshot) in &snapshots {
+        validate_preset_snapshot(path, name, snapshot)?;
     }
-
-    Ok(read)
+    Ok(snapshots)
 }
 
-fn is_embedded_branch_config_record_value(value: &Value) -> bool {
-    value.get("versions").is_some()
-}
-
-fn is_branch_config_snapshot_value(value: &Value) -> bool {
-    value.get("name").is_some()
-        || value.get("current_version").is_some()
-        || value.get("created_at").is_some()
-}
-
-fn validate_branch_config_record(
+fn validate_preset_snapshot(
     path: &Path,
     name: &str,
-    record: &BranchConfigRecord,
-) -> Result<()> {
-    ensure!(
-        record.name == name,
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!(
-                "branch preset config record key {:?} mismatches record name {:?}",
-                name, record.name
-            ),
-        }
-    );
-    validate_record(
-        &ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME),
-        path,
-        record,
-    )
-}
-
-fn validate_branch_config_snapshot(
-    path: &Path,
-    name: &str,
-    snapshot: &PersistedBranchConfigRecord,
+    snapshot: &PersistedPresetRecord,
 ) -> Result<()> {
     ensure!(
         snapshot.name == name,
         CorruptedStoreSnafu {
             path: path.to_owned(),
             message: format!(
-                "branch preset config snapshot key {:?} mismatches record name {:?}",
+                "preset snapshot key {:?} mismatches record name {:?}",
                 name, snapshot.name
             ),
         }
@@ -1418,7 +1251,7 @@ fn validate_branch_config_snapshot(
         CorruptedStoreSnafu {
             path: path.to_owned(),
             message: format!(
-                "branch preset config snapshot {:?} has invalid current version {}",
+                "preset snapshot {:?} has invalid current version {}",
                 name, snapshot.current_version
             ),
         }
@@ -1426,12 +1259,10 @@ fn validate_branch_config_snapshot(
     Ok(())
 }
 
-fn load_branch_config_history_records(
-    persistence: &Persistence,
-) -> Result<HashMap<String, BranchConfigRecord>> {
-    let mut grouped = BTreeMap::<String, Vec<(PathBuf, BranchConfigHistoryEntry)>>::new();
-    for path in persistence.list_branch_config_history_paths()? {
-        let entries = read_jsonl_file::<BranchConfigHistoryEntry>(&path)?;
+fn load_preset_history_records(persistence: &Persistence) -> Result<HashMap<String, PresetRecord>> {
+    let mut grouped = BTreeMap::<String, Vec<(PathBuf, PresetHistoryEntry)>>::new();
+    for path in persistence.list_preset_history_paths()? {
+        let entries = read_jsonl_file::<PresetHistoryEntry>(&path)?;
         for entry in entries {
             grouped
                 .entry(entry.name.clone())
@@ -1443,34 +1274,85 @@ fn load_branch_config_history_records(
     grouped
         .iter()
         .map(|(name, entries)| {
-            let record = branch_config_record_from_history(name, entries)?;
+            let record = preset_record_from_history(name, entries)?;
             Ok((name.clone(), record))
         })
         .collect()
 }
 
-fn validate_branch_config_snapshots(
-    current: &HashMap<String, PersistedBranchConfigRecord>,
-    history: &HashMap<String, BranchConfigRecord>,
+fn validate_preset_snapshots(
+    current: &HashMap<String, PersistedPresetRecord>,
+    history: &HashMap<String, PresetRecord>,
 ) -> Result<()> {
-    let context = ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME);
+    let history_path = Path::new(PRESET_HISTORY_DIR_NAME);
     for snapshot in current.values() {
-        validate_snapshot_in_collection(&context, snapshot, history)?;
+        let record = history.get(&snapshot.name).context(CorruptedStoreSnafu {
+            path: history_path.to_owned(),
+            message: format!("missing preset history for {:?}", snapshot.name),
+        })?;
+        validate_snapshot(
+            "preset",
+            history_path,
+            &snapshot.name,
+            snapshot.current_version,
+            &record.versions,
+            |version| {
+                version.created_at == snapshot.created_at && version.config == snapshot.config
+            },
+        )?;
     }
     Ok(())
 }
 
-fn branch_config_record_from_history(
+fn preset_record_from_history(
     name: &str,
-    entries: &[(PathBuf, BranchConfigHistoryEntry)],
-) -> Result<BranchConfigRecord> {
-    let (current_version, versions) = versions_from_history(
-        &ProjectionContext::new("branch preset config", BRANCH_CONFIG_HISTORY_DIR_NAME),
-        Path::new(BRANCH_CONFIG_HISTORY_DIR_NAME),
-        entries,
-    )?;
+    entries: &[(PathBuf, PresetHistoryEntry)],
+) -> Result<PresetRecord> {
+    let mut versions = BTreeMap::new();
+    let mut source_path = None;
 
-    Ok(BranchConfigRecord {
+    for (path, entry) in entries {
+        source_path.get_or_insert_with(|| path.clone());
+        ensure!(
+            entry.name == name,
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "preset history entry name {:?} mismatches file name {:?}",
+                    entry.name, name
+                ),
+            }
+        );
+        ensure!(
+            versions
+                .insert(entry.version, entry.clone().into_version())
+                .is_none(),
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "duplicate history version {} for preset {:?}",
+                    entry.version, name
+                ),
+            }
+        );
+    }
+
+    let path = source_path.unwrap_or_else(|| PathBuf::from(PRESET_HISTORY_DIR_NAME));
+    ensure!(
+        !versions.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.clone(),
+            message: format!("empty preset history for {:?}", name),
+        }
+    );
+    validate_versions("preset", &path, name, &versions, |version| version.version)?;
+    let current_version = versions
+        .keys()
+        .next_back()
+        .copied()
+        .expect("versions checked non-empty");
+
+    Ok(PresetRecord {
         name: name.to_owned(),
         current_version,
         versions,
@@ -1505,11 +1387,28 @@ fn validate_skill_snapshots(current: &PersistedSkillGroups, history: &SkillGroup
         (SessionRole::Orchestrator, &current.orchestrator),
         (SessionRole::Runner, &current.runner),
     ] {
-        let context =
-            ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME);
+        let entity = format!("skill role {:?}", role);
+        let history_path = Path::new(SKILL_HISTORY_DIR_NAME);
         let history = history.for_role(role);
         for snapshot in records.values() {
-            validate_snapshot_in_collection(&context, snapshot, history)?;
+            let record = history.get(&snapshot.name).context(CorruptedStoreSnafu {
+                path: history_path.to_owned(),
+                message: format!("missing {entity} history for {:?}", snapshot.name),
+            })?;
+            validate_snapshot(
+                &entity,
+                history_path,
+                &snapshot.name,
+                snapshot.current_version,
+                &record.versions,
+                |version| {
+                    version.created_at == snapshot.created_at
+                        && version.description == snapshot.description
+                        && version.body == snapshot.body
+                        && version.scripts == snapshot.scripts
+                        && version.enable_coco_shim == snapshot.enable_coco_shim
+                },
+            )?;
         }
     }
     Ok(())
@@ -1533,11 +1432,60 @@ fn skill_record_from_history(
     name: &str,
     entries: &[(PathBuf, SkillHistoryEntry)],
 ) -> Result<SkillRecord> {
-    let (current_version, versions) = versions_from_history(
-        &ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME),
-        Path::new(SKILL_HISTORY_DIR_NAME),
-        entries,
-    )?;
+    let entity = format!("skill role {:?}", role);
+    let mut versions = BTreeMap::new();
+    let mut source_path = None;
+
+    for (path, entry) in entries {
+        source_path.get_or_insert_with(|| path.clone());
+        ensure!(
+            entry.role == role,
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "skill history entry role {:?} mismatches expected role {:?}",
+                    entry.role, role
+                ),
+            }
+        );
+        ensure!(
+            entry.name == name,
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "skill history entry name {:?} mismatches file name {:?}",
+                    entry.name, name
+                ),
+            }
+        );
+        ensure!(
+            versions
+                .insert(entry.version, entry.clone().into_version())
+                .is_none(),
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "duplicate history version {} for skill role {:?} {:?}",
+                    entry.version, role, name
+                ),
+            }
+        );
+    }
+
+    let path = source_path.unwrap_or_else(|| PathBuf::from(SKILL_HISTORY_DIR_NAME));
+    ensure!(
+        !versions.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.clone(),
+            message: format!("empty skill role {:?} history for {:?}", role, name),
+        }
+    );
+    validate_versions(&entity, &path, name, &versions, |version| version.version)?;
+    let current_version = versions
+        .keys()
+        .next_back()
+        .copied()
+        .expect("versions checked non-empty");
 
     Ok(SkillRecord {
         name: name.to_owned(),
@@ -1743,17 +1691,6 @@ impl SessionStore for FsStore {
         let plan = state.plan_rebase_session(name, patch)?;
         apply_rebase_plan(&mut state, &self.persistence, plan)
     }
-
-    fn rebase_session_system_prompt(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        system_prompt: &str,
-    ) -> Result<String> {
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let plan = state.plan_rebase_session_system_prompt(name, patch, system_prompt)?;
-        apply_rebase_plan(&mut state, &self.persistence, plan)
-    }
 }
 
 fn apply_rebase_plan(
@@ -1784,90 +1721,64 @@ fn apply_rebase_plan(
     Ok(plan.new_head)
 }
 
-impl BranchConfigStore for FsStore {
-    fn list_branch_configs(&self) -> Result<HashMap<String, BranchConfig>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .list_branch_configs()
-    }
-
-    fn list_branch_config_records(&self) -> Result<HashMap<String, BranchConfigRecord>> {
+impl PresetStore for FsStore {
+    fn list_preset_records(&self) -> Result<HashMap<String, PresetRecord>> {
         Ok(self
             .inner
             .read()
             .expect("store lock poisoned")
-            .list_branch_config_records())
+            .list_preset_records())
     }
 
-    fn get_branch_config(&self, name: &str) -> Result<BranchConfig> {
+    fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
         self.inner
             .read()
             .expect("store lock poisoned")
-            .get_branch_config(name)
+            .get_preset_record(name)
     }
 
-    fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_branch_config_record(name)
-    }
-
-    fn set_branch_config(&self, name: &str, config: BranchConfig) -> Result<BranchConfigRecord> {
+    fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
-        let updated = temp.set_branch_config(name, config)?;
+        let updated = temp.set_preset(name, config)?;
         let version = updated
             .current()
-            .expect("updated branch config should have a current version")
+            .expect("updated preset should have a current version")
             .clone();
         self.persistence
-            .append_branch_config_history_entry(&updated.name, &version)?;
-        let _ = self.persistence.persist_branch_configs(&temp);
-        state.branch_configs = temp.branch_configs;
+            .append_preset_history_entry(&updated.name, &version)?;
+        let _ = self.persistence.persist_presets(&temp);
+        state.presets = temp.presets;
         Ok(updated)
     }
 
-    fn rollback_branch_config(
-        &self,
-        name: &str,
-        target_version: u64,
-    ) -> Result<BranchConfigRecord> {
+    fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
-        let updated = temp.rollback_branch_config(name, target_version)?;
+        let updated = temp.rollback_preset(name, target_version)?;
         let version = updated
             .current()
-            .expect("rolled back branch config should have a current version")
+            .expect("rolled back preset should have a current version")
             .clone();
         self.persistence
-            .append_branch_config_history_entry(&updated.name, &version)?;
-        let _ = self.persistence.persist_branch_configs(&temp);
-        state.branch_configs = temp.branch_configs;
+            .append_preset_history_entry(&updated.name, &version)?;
+        let _ = self.persistence.persist_presets(&temp);
+        state.presets = temp.presets;
         Ok(updated)
     }
 
-    fn delete_branch_config(&self, name: &str) -> Result<()> {
+    fn delete_preset(&self, name: &str) -> Result<()> {
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
-        temp.delete_branch_config(name)?;
-        self.persistence.delete_branch_config_history(name)?;
-        self.persistence.persist_branch_configs(&temp)?;
-        state.branch_configs = temp.branch_configs;
+        temp.delete_preset(name)?;
+        self.persistence.delete_preset_history(name)?;
+        self.persistence.persist_presets(&temp)?;
+        state.presets = temp.presets;
         Ok(())
     }
 }
 
 impl SkillStore for FsStore {
-    fn skill_groups(&self) -> Result<SkillGroups> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .skill_groups())
-    }
-
     fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
         Ok(self
             .inner
@@ -2029,9 +1940,9 @@ impl MessageQueueStore for FsStore {
     }
 }
 
-impl RuntimeStore for FsStore {
-    fn runtime_store_path(&self) -> Option<PathBuf> {
-        Some(self.path().to_path_buf())
+impl ProcessShareableStore for FsStore {
+    fn store_path(&self) -> &Path {
+        self.path()
     }
 }
 

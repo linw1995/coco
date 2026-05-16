@@ -7,9 +7,9 @@ use super::fs::FsStore;
 use super::memory::MemoryStore;
 use super::state::StoreState;
 use crate::{
-    Anchor, BranchConfig, BranchConfigStore, BranchStore, JobStatus, JobStore, Kind, MergeParent,
-    MessageQueueItem, MessageQueueStore, NewNode, Node, NodeStore, PauseReason, PromptAnchor, Role,
-    SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillScript,
+    Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueItem,
+    MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset, PresetStore, PromptAnchor,
+    Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillScript,
     SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError as Error,
 };
 use serde_json::json;
@@ -48,8 +48,8 @@ fn make_session_anchor_node(parent: &str) -> NewNode {
     }
 }
 
-fn make_branch_config(model: &str, role: SessionRole) -> BranchConfig {
-    BranchConfig {
+fn make_preset(model: &str, role: SessionRole) -> Preset {
+    Preset {
         role,
         provider_profile: "openai".to_owned(),
         model: model.to_owned(),
@@ -61,6 +61,16 @@ fn make_branch_config(model: &str, role: SessionRole) -> BranchConfig {
         additional_params: Some(json!({"reasoning_effort": "medium"})),
         enable_coco_shim: true,
     }
+}
+
+fn current_preset(store: &impl PresetStore, name: &str) -> std::result::Result<Preset, Error> {
+    let record = store.get_preset_record(name)?;
+    record
+        .current_preset()
+        .ok_or_else(|| Error::PresetVersionNotFound {
+            name: name.to_owned(),
+            version: record.current_version,
+        })
 }
 
 fn make_session_anchor_with_merge_parent(parent: &str, merge_parent: &str) -> NewNode {
@@ -153,7 +163,7 @@ trait InspectableStore {
 }
 
 trait TestStoreFactory {
-    type Backend: BranchConfigStore
+    type Backend: PresetStore
         + BranchStore
         + InspectableStore
         + JobStore
@@ -969,104 +979,92 @@ where
     );
 }
 
-fn assert_branch_config_round_trip<F>()
+fn assert_preset_round_trip<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
     let preset_name = "coding";
-    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+    let config = make_preset("gpt-5.4", SessionRole::Orchestrator);
 
-    let stored = store
-        .set_branch_config(preset_name, config.clone())
-        .unwrap();
+    let stored = store.set_preset(preset_name, config.clone()).unwrap();
 
     assert_eq!(stored.current_version, 1);
-    assert_eq!(stored.current_config(), Some(config.clone()));
+    assert_eq!(stored.current_preset(), Some(config.clone()));
     assert_eq!(stored.versions.keys().copied().collect::<Vec<_>>(), vec![1]);
-    assert_eq!(store.get_branch_config(preset_name).unwrap(), config);
+    assert_eq!(current_preset(&store, preset_name).unwrap(), config);
     assert_eq!(
         store
-            .get_branch_config_record(preset_name)
+            .get_preset_record(preset_name)
             .unwrap()
             .current_version,
         1
     );
     assert_eq!(
-        store.list_branch_configs().unwrap().get(preset_name),
-        Some(&config)
-    );
-    assert_eq!(
         store
-            .list_branch_config_records()
+            .list_preset_records()
             .unwrap()
             .get(preset_name)
             .unwrap()
-            .current_config(),
+            .current_preset(),
         Some(config)
     );
 }
 
-fn assert_branch_config_replaces_existing_value<F>()
+fn assert_preset_replaces_existing_value<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
     let preset_name = "coding";
     store
-        .set_branch_config(
+        .set_preset(
             preset_name,
-            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+            make_preset("gpt-5.4", SessionRole::Orchestrator),
         )
         .unwrap();
-    let updated = make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner);
+    let updated = make_preset("claude-sonnet-4-20250514", SessionRole::Runner);
 
-    let stored = store
-        .set_branch_config(preset_name, updated.clone())
-        .unwrap();
+    let stored = store.set_preset(preset_name, updated.clone()).unwrap();
 
     assert_eq!(stored.current_version, 2);
-    assert_eq!(stored.current_config(), Some(updated.clone()));
+    assert_eq!(stored.current_preset(), Some(updated.clone()));
     assert_eq!(
         stored.versions.keys().copied().collect::<Vec<_>>(),
         vec![1, 2]
     );
     assert_eq!(
-        stored.versions.get(&1).unwrap().to_config(),
-        make_branch_config("gpt-5.4", SessionRole::Orchestrator)
+        stored.versions.get(&1).unwrap().to_preset(),
+        make_preset("gpt-5.4", SessionRole::Orchestrator)
     );
-    assert_eq!(stored.versions.get(&2).unwrap().to_config(), updated);
-    assert_eq!(store.get_branch_config(preset_name).unwrap(), updated);
+    assert_eq!(stored.versions.get(&2).unwrap().to_preset(), updated);
+    assert_eq!(current_preset(&store, preset_name).unwrap(), updated);
 }
 
-fn assert_rollback_branch_config_creates_new_current_version<F>()
+fn assert_rollback_preset_creates_new_current_version<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
     let preset_name = "coding";
-    let original = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
-    let updated = make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner);
-    store
-        .set_branch_config(preset_name, original.clone())
-        .unwrap();
-    store
-        .set_branch_config(preset_name, updated.clone())
-        .unwrap();
+    let original = make_preset("gpt-5.4", SessionRole::Orchestrator);
+    let updated = make_preset("claude-sonnet-4-20250514", SessionRole::Runner);
+    store.set_preset(preset_name, original.clone()).unwrap();
+    store.set_preset(preset_name, updated.clone()).unwrap();
 
-    let rolled_back = store.rollback_branch_config(preset_name, 1).unwrap();
+    let rolled_back = store.rollback_preset(preset_name, 1).unwrap();
 
     assert_eq!(rolled_back.current_version, 3);
     assert_eq!(
         rolled_back.versions.keys().copied().collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
-    assert_eq!(rolled_back.current_config(), Some(original.clone()));
-    assert_eq!(rolled_back.versions.get(&2).unwrap().to_config(), updated);
-    assert_eq!(store.get_branch_config(preset_name).unwrap(), original);
+    assert_eq!(rolled_back.current_preset(), Some(original.clone()));
+    assert_eq!(rolled_back.versions.get(&2).unwrap().to_preset(), updated);
+    assert_eq!(current_preset(&store, preset_name).unwrap(), original);
 }
 
-fn assert_delete_branch_config_removes_only_config<F>()
+fn assert_delete_preset_removes_only_config<F>()
 where
     F: TestStoreFactory,
 {
@@ -1075,34 +1073,32 @@ where
     let preset_name = "coding";
     store.fork("main", &root_id).unwrap();
     store
-        .set_branch_config(
+        .set_preset(
             preset_name,
-            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+            make_preset("gpt-5.4", SessionRole::Orchestrator),
         )
         .unwrap();
 
-    store.delete_branch_config(preset_name).unwrap();
+    store.delete_preset(preset_name).unwrap();
 
-    assert!(store.list_branch_configs().unwrap().is_empty());
+    assert!(store.list_preset_records().unwrap().is_empty());
     assert!(matches!(
-        store.get_branch_config(preset_name),
-        Err(Error::BranchConfigNotFound { name }) if name == preset_name
+        store.get_preset_record(preset_name),
+        Err(Error::PresetNotFound { name }) if name == preset_name
     ));
     assert_eq!(store.get_branch_head("main").unwrap(), root_id);
 }
 
-fn assert_delete_branch_preserves_branch_config_preset<F>()
+fn assert_delete_branch_preserves_preset<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
     let root_id = store.root_id();
     let preset_name = "coding";
-    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
+    let config = make_preset("gpt-5.4", SessionRole::Orchestrator);
     store.fork("main", &root_id).unwrap();
-    store
-        .set_branch_config(preset_name, config.clone())
-        .unwrap();
+    store.set_preset(preset_name, config.clone()).unwrap();
 
     store.delete_branch("main").unwrap();
 
@@ -1110,34 +1106,34 @@ where
         store.get_branch_head("main"),
         Err(Error::BranchNotFound { name }) if name == "main"
     ));
-    assert_eq!(store.get_branch_config(preset_name).unwrap(), config);
+    assert_eq!(current_preset(&store, preset_name).unwrap(), config);
 }
 
-fn assert_get_branch_config_rejects_missing_config<F>()
+fn assert_get_preset_rejects_missing_config<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
 
-    let err = store.get_branch_config("missing-preset").unwrap_err();
+    let err = store.get_preset_record("missing-preset").unwrap_err();
 
     assert!(matches!(
         err,
-        Error::BranchConfigNotFound { name } if name == "missing-preset"
+        Error::PresetNotFound { name } if name == "missing-preset"
     ));
 }
 
-fn assert_delete_branch_config_rejects_missing_config<F>()
+fn assert_delete_preset_rejects_missing_config<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
 
-    let err = store.delete_branch_config("missing-preset").unwrap_err();
+    let err = store.delete_preset("missing-preset").unwrap_err();
 
     assert!(matches!(
         err,
-        Error::BranchConfigNotFound { name } if name == "missing-preset"
+        Error::PresetNotFound { name } if name == "missing-preset"
     ));
 }
 
@@ -1352,7 +1348,7 @@ where
     );
 }
 
-fn assert_rebase_session_system_prompt_rebuilds_branch_chain<F>()
+fn assert_rebase_session_patch_system_prompt_rebuilds_branch_chain<F>()
 where
     F: TestStoreFactory,
 {
@@ -1363,13 +1359,13 @@ where
     store.fork("main", &child_id).unwrap();
 
     let new_head = store
-        .rebase_session_system_prompt(
+        .rebase_session(
             "main",
             &SessionAnchorPatch {
                 model: Some("claude-sonnet-4-20250514".to_owned()),
+                system_prompt: Some("You are strict.".to_owned()),
                 ..SessionAnchorPatch::default()
             },
-            "You are strict.",
         )
         .unwrap();
 
@@ -2074,38 +2070,38 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
-            fn branch_config_round_trip() {
-                assert_branch_config_round_trip::<$factory>();
+            fn preset_round_trip() {
+                assert_preset_round_trip::<$factory>();
             }
 
             #[test]
-            fn branch_config_replaces_existing_value() {
-                assert_branch_config_replaces_existing_value::<$factory>();
+            fn preset_replaces_existing_value() {
+                assert_preset_replaces_existing_value::<$factory>();
             }
 
             #[test]
-            fn rollback_branch_config_creates_new_current_version() {
-                assert_rollback_branch_config_creates_new_current_version::<$factory>();
+            fn rollback_preset_creates_new_current_version() {
+                assert_rollback_preset_creates_new_current_version::<$factory>();
             }
 
             #[test]
-            fn delete_branch_config_removes_only_config() {
-                assert_delete_branch_config_removes_only_config::<$factory>();
+            fn delete_preset_removes_only_config() {
+                assert_delete_preset_removes_only_config::<$factory>();
             }
 
             #[test]
-            fn delete_branch_preserves_branch_config_preset() {
-                assert_delete_branch_preserves_branch_config_preset::<$factory>();
+            fn delete_branch_preserves_preset() {
+                assert_delete_branch_preserves_preset::<$factory>();
             }
 
             #[test]
-            fn get_branch_config_rejects_missing_config() {
-                assert_get_branch_config_rejects_missing_config::<$factory>();
+            fn get_preset_rejects_missing_config() {
+                assert_get_preset_rejects_missing_config::<$factory>();
             }
 
             #[test]
-            fn delete_branch_config_rejects_missing_config() {
-                assert_delete_branch_config_rejects_missing_config::<$factory>();
+            fn delete_preset_rejects_missing_config() {
+                assert_delete_preset_rejects_missing_config::<$factory>();
             }
 
             #[test]
@@ -2149,8 +2145,8 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
-            fn rebase_session_system_prompt_rebuilds_branch_chain() {
-                assert_rebase_session_system_prompt_rebuilds_branch_chain::<$factory>();
+            fn rebase_session_patch_system_prompt_rebuilds_branch_chain() {
+                assert_rebase_session_patch_system_prompt_rebuilds_branch_chain::<$factory>();
             }
 
             #[test]
@@ -2289,10 +2285,10 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     assert!(path.join("store.lock").is_file());
     assert!(path.join("nodes.jsonl").is_file());
     assert!(path.join("sessions.json").is_file());
-    assert!(path.join("branch-configs.json").is_file());
+    assert!(path.join("presets.json").is_file());
     assert!(path.join("skills.json").is_file());
     assert!(path.join("branches").is_dir());
-    assert!(path.join("branch-config-history").is_dir());
+    assert!(path.join("preset-history").is_dir());
     assert!(path.join("skill-history").is_dir());
     assert!(path.join("skill-history/shared").is_dir());
     assert!(path.join("skill-history/orchestrator").is_dir());
@@ -2371,7 +2367,7 @@ fn open_read_only_does_not_create_missing_history_directories() {
         r#"{"orchestrator":{},"runner":{}}"#,
     )
     .unwrap();
-    fs::remove_dir_all(path.join("branch-config-history")).unwrap();
+    fs::remove_dir_all(path.join("preset-history")).unwrap();
     fs::remove_dir_all(path.join("skill-history")).unwrap();
 
     let lock_path = path.join("store.lock");
@@ -2386,54 +2382,49 @@ fn open_read_only_does_not_create_missing_history_directories() {
     let read_only = FsStore::open_read_only(&path).unwrap();
 
     assert_eq!(read_only.root_id(), root_id);
-    assert!(!path.join("branch-config-history").exists());
+    assert!(!path.join("preset-history").exists());
     assert!(!path.join("skill-history").exists());
 }
 
 #[test]
-fn open_replays_branch_configs() {
+fn open_replays_presets() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let preset_name = "coding";
-    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
-    let updated = make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner);
-    store
-        .set_branch_config(preset_name, config.clone())
-        .unwrap();
-    store
-        .set_branch_config(preset_name, updated.clone())
-        .unwrap();
+    let config = make_preset("gpt-5.4", SessionRole::Orchestrator);
+    let updated = make_preset("claude-sonnet-4-20250514", SessionRole::Runner);
+    store.set_preset(preset_name, config.clone()).unwrap();
+    store.set_preset(preset_name, updated.clone()).unwrap();
 
     let reopened = FsStore::open(&path).unwrap();
 
-    assert_eq!(reopened.get_branch_config(preset_name).unwrap(), updated);
-    let record = reopened.get_branch_config_record(preset_name).unwrap();
+    assert_eq!(current_preset(&reopened, preset_name).unwrap(), updated);
+    let record = reopened.get_preset_record(preset_name).unwrap();
     assert_eq!(record.current_version, 2);
-    assert_eq!(record.versions.get(&1).unwrap().to_config(), config);
-    assert_eq!(record.versions.get(&2).unwrap().to_config(), updated);
+    assert_eq!(record.versions.get(&1).unwrap().to_preset(), config);
+    assert_eq!(record.versions.get(&2).unwrap().to_preset(), updated);
 }
 
 #[test]
-fn branch_configs_json_only_stores_current_snapshots() {
+fn presets_json_only_stores_current_snapshots() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let preset_name = "coding";
     store
-        .set_branch_config(
+        .set_preset(
             preset_name,
-            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+            make_preset("gpt-5.4", SessionRole::Orchestrator),
         )
         .unwrap();
     store
-        .set_branch_config(
+        .set_preset(
             preset_name,
-            make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner),
+            make_preset("claude-sonnet-4-20250514", SessionRole::Runner),
         )
         .unwrap();
 
     let configs: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.join("branch-configs.json")).unwrap())
-            .unwrap();
+        serde_json::from_str(&fs::read_to_string(path.join("presets.json")).unwrap()).unwrap();
     let coding = &configs[preset_name];
 
     assert_eq!(coding["current_version"], 2);
@@ -2443,25 +2434,25 @@ fn branch_configs_json_only_stores_current_snapshots() {
 }
 
 #[test]
-fn branch_config_history_is_appended_in_history_directory() {
+fn preset_history_is_appended_in_history_directory() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let preset_name = "coding";
     store
-        .set_branch_config(
+        .set_preset(
             preset_name,
-            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+            make_preset("gpt-5.4", SessionRole::Orchestrator),
         )
         .unwrap();
     store
-        .set_branch_config(
+        .set_preset(
             preset_name,
-            make_branch_config("claude-sonnet-4-20250514", SessionRole::Runner),
+            make_preset("claude-sonnet-4-20250514", SessionRole::Runner),
         )
         .unwrap();
-    store.rollback_branch_config(preset_name, 1).unwrap();
+    store.rollback_preset(preset_name, 1).unwrap();
 
-    let history = read_jsonl_values(&path.join("branch-config-history/coding.jsonl"));
+    let history = read_jsonl_values(&path.join("preset-history/coding.jsonl"));
 
     assert_eq!(history.len(), 3);
     assert_eq!(history[0]["name"], preset_name);
@@ -2473,102 +2464,60 @@ fn branch_config_history_is_appended_in_history_directory() {
 }
 
 #[test]
-fn open_creates_missing_branch_config_metadata_for_legacy_store() {
+fn open_rejects_missing_preset_metadata_file() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
-    fs::remove_file(path.join("branch-configs.json")).unwrap();
+    fs::remove_file(path.join("presets.json")).unwrap();
 
-    let reopened = FsStore::open(&path).unwrap();
+    let err = FsStore::open(&path).unwrap_err();
 
-    assert!(reopened.list_branch_configs().unwrap().is_empty());
-    assert!(path.join("branch-configs.json").is_file());
+    assert!(matches!(err, Error::CorruptedStore { .. }));
 }
 
 #[test]
-fn open_does_not_restore_deleted_branch_config() {
+fn open_does_not_restore_deleted_preset() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let preset_name = "coding";
     store
-        .set_branch_config(
+        .set_preset(
             preset_name,
-            make_branch_config("gpt-5.4", SessionRole::Orchestrator),
+            make_preset("gpt-5.4", SessionRole::Orchestrator),
         )
         .unwrap();
 
-    store.delete_branch_config(preset_name).unwrap();
+    store.delete_preset(preset_name).unwrap();
     let reopened = FsStore::open(&path).unwrap();
 
     assert!(matches!(
-        reopened.get_branch_config(preset_name),
-        Err(Error::BranchConfigNotFound { name }) if name == preset_name
+        reopened.get_preset_record(preset_name),
+        Err(Error::PresetNotFound { name }) if name == preset_name
     ));
-    assert!(!path.join("branch-config-history/coding.jsonl").exists());
+    assert!(!path.join("preset-history/coding.jsonl").exists());
 }
 
 #[test]
-fn open_migrates_legacy_branch_config_values() {
-    let (_tempdir, path) = temp_store_path();
-    FsStore::open(&path).unwrap();
-    let preset_name = "coding";
-    let config = make_branch_config("gpt-5.4", SessionRole::Orchestrator);
-    let legacy_configs = HashMap::from([(preset_name.to_owned(), config.clone())]);
-    fs::write(
-        path.join("branch-configs.json"),
-        serde_json::to_string_pretty(&legacy_configs).unwrap(),
-    )
-    .unwrap();
-
-    let reopened = FsStore::open(&path).unwrap();
-
-    assert_eq!(reopened.get_branch_config(preset_name).unwrap(), config);
-    let record = reopened.get_branch_config_record(preset_name).unwrap();
-    assert_eq!(record.current_version, 1);
-    assert_eq!(record.current_config(), Some(config));
-
-    let repaired: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.join("branch-configs.json")).unwrap())
-            .unwrap();
-    assert_eq!(repaired[preset_name]["current_version"], 1);
-    assert!(repaired[preset_name].get("versions").is_none());
-    let history = read_jsonl_values(&path.join("branch-config-history/coding.jsonl"));
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0]["name"], preset_name);
-    assert_eq!(history[0]["version"], 1);
-}
-
-#[test]
-fn open_upgrades_legacy_store_format_version() {
+fn open_rejects_unsupported_store_format_version() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
     let mut meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    meta["version"] = json!(6);
+    meta["version"] = json!(9);
     fs::write(
         path.join("meta.json"),
         serde_json::to_string_pretty(&meta).unwrap(),
     )
     .unwrap();
 
-    FsStore::open(&path).unwrap();
+    let err = FsStore::open(&path).unwrap_err();
 
-    let upgraded: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(upgraded["version"], 9);
+    assert!(matches!(err, Error::CorruptedStore { .. }));
 }
 
 #[test]
-fn open_reads_legacy_store_without_message_queues_file() {
+fn open_creates_missing_message_queue_wal() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
-    let mut meta: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    meta["version"] = json!(7);
-    fs::write(
-        path.join("meta.json"),
-        serde_json::to_string_pretty(&meta).unwrap(),
-    )
-    .unwrap();
     fs::remove_file(path.join("queues.jsonl")).unwrap();
 
     let reopened = FsStore::open(&path).unwrap();
@@ -2670,7 +2619,7 @@ fn open_rejects_missing_session_metadata_file() {
 }
 
 #[test]
-fn open_reads_legacy_jobs_without_finished_at() {
+fn open_defaults_missing_job_finished_at() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let root_id = store.root_id();

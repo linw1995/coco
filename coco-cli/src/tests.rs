@@ -16,8 +16,7 @@ use coco_llm::{
     ProviderRuntimeConfig, StepContext,
 };
 use coco_mem::{
-    BranchConfigStore, ProviderProfile, ProviderProfileStore, SessionState, SkillStore,
-    SkillVersionSpec,
+    PresetStore, ProcessShareableStore, ProviderProfile, SessionState, SkillStore, SkillVersionSpec,
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -28,7 +27,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::{
     Cli,
     app::{
-        config::{ChannelConfigs, ProviderProfiles},
+        config::{ChannelConfigs, ProviderProfileLookup, ProviderProfiles},
         daemon::{
             DaemonServerOptions, ensure_initial_session, resume_incomplete_jobs,
             start_daemon_server,
@@ -576,6 +575,7 @@ where
     let llm = Arc::new(
         coco_llm::LlmService::builder(store.clone(), backend)
             .with_provider_configs(provider_configs)
+            .with_store_path(store.store_path())
             .build(),
     );
 
@@ -3966,7 +3966,9 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(second_json["config"]["enable_coco_shim"], false);
     let persisted = open_store(&store_path)
         .unwrap()
-        .get_branch_config(preset_name)
+        .get_preset_record(preset_name)
+        .unwrap()
+        .current_preset()
         .unwrap();
     assert_eq!(persisted.temperature, None);
     assert_eq!(persisted.max_tokens, None);
@@ -4131,7 +4133,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert!(
         open_store(&store_path)
             .unwrap()
-            .list_branch_config_records()
+            .list_preset_records()
             .unwrap()
             .is_empty()
     );
@@ -4334,7 +4336,7 @@ async fn session_rebase_applies_preset_patch() {
     assert_eq!(session_json["anchor"]["provider_profile"], "anthropic-main");
     assert_eq!(session_json["anchor"]["provider"], json!(null));
     assert_eq!(session_json["anchor"]["model"], "claude-sonnet-4-20250514");
-    assert_eq!(session_json["anchor"]["system_prompt"], "You are helpful.");
+    assert_eq!(session_json["anchor"]["system_prompt"], "You are precise.");
     assert_eq!(session_json["anchor"]["prompt"], "");
     assert_eq!(session_json["anchor"]["temperature"], json!(null));
     assert_eq!(session_json["anchor"]["max_tokens"], 256);

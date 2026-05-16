@@ -35,11 +35,11 @@ pub enum StoreError {
     #[snafu(display("Branch {name:?} already exists"))]
     BranchExists { name: String },
 
-    #[snafu(display("Branch preset config {name:?} not found"))]
-    BranchConfigNotFound { name: String },
+    #[snafu(display("Preset {name:?} not found"))]
+    PresetNotFound { name: String },
 
-    #[snafu(display("Branch preset config {name:?} version {version} not found"))]
-    BranchConfigVersionNotFound { name: String, version: u64 },
+    #[snafu(display("Preset {name:?} version {version} not found"))]
+    PresetVersionNotFound { name: String, version: u64 },
 
     #[snafu(display("Provider profile {name:?} not found"))]
     ProviderProfileNotFound { name: String },

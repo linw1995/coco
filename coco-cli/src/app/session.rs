@@ -6,8 +6,8 @@ use coco_llm::{
     CompletionBackend, LlmService, SessionConfig, SessionConfigPatch, SessionFeedback, SessionMerge,
 };
 use coco_mem::{
-    AnchorPayload, BranchConfigStore, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason,
-    ProviderProfileStore, SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
+    AnchorPayload, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, PresetStore,
+    SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -15,7 +15,7 @@ use snafu::prelude::*;
 
 use crate::{
     Result,
-    app::config::ProviderProfiles,
+    app::config::{ProviderProfileLookup, ProviderProfiles},
     cli::{CliTool, SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand},
     env::resolve_env_tools,
     error::{
@@ -62,7 +62,6 @@ struct SessionRebaseResult {
 #[derive(Debug, PartialEq)]
 struct ResolvedSessionRebase {
     patch: SessionConfigPatch,
-    system_prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -229,14 +228,10 @@ where
             let branch = command.branch.clone();
             let json = command.json;
             let rebase = resolve_session_rebase(command, store, provider_profiles)?;
-            let head_id = match rebase.system_prompt {
-                Some(system_prompt) => {
-                    llm.rebase_session_system_prompt(&branch, rebase.patch, &system_prompt)
-                        .await
-                }
-                None => llm.rebase_session(&branch, rebase.patch).await,
-            }
-            .context(LlmSnafu)?;
+            let head_id = llm
+                .rebase_session(&branch, rebase.patch)
+                .await
+                .context(LlmSnafu)?;
             let result = SessionRebaseResult { branch, head_id };
             Ok(Some(if json {
                 render_json(result)
@@ -329,7 +324,7 @@ where
 
 pub fn resolve_session_config(
     command: SessionCreateCommand,
-    store: &impl ProviderProfileStore,
+    store: &impl ProviderProfileLookup,
 ) -> Result<SessionConfig> {
     let provider_profile = resolve_create_provider_profile(command.provider_profile, store)?;
     let profile = store
@@ -369,7 +364,7 @@ pub fn resolve_session_config(
 
 fn resolve_create_provider_profile(
     explicit: Option<String>,
-    store: &impl ProviderProfileStore,
+    store: &impl ProviderProfileLookup,
 ) -> Result<String> {
     if let Some(explicit) = explicit {
         return Ok(explicit);
@@ -1389,15 +1384,22 @@ fn resolve_visible_session_anchor(
 
 fn resolve_session_rebase(
     command: SessionRebaseCommand,
-    store: &impl BranchConfigStore,
-    provider_profiles: &impl ProviderProfileStore,
+    store: &impl PresetStore,
+    provider_profiles: &impl ProviderProfileLookup,
 ) -> Result<ResolvedSessionRebase> {
     let mut patch = command
         .preset
         .as_deref()
         .map(|name| {
-            let config = store.get_branch_config(name).context(StoreSnafu)?;
-            branch_config_to_session_anchor_patch(&config, provider_profiles)
+            let record = store.get_preset_record(name).context(StoreSnafu)?;
+            let config = record
+                .current_preset()
+                .ok_or_else(|| StoreError::PresetVersionNotFound {
+                    name: name.to_owned(),
+                    version: record.current_version,
+                })
+                .context(StoreSnafu)?;
+            preset_to_session_anchor_patch(&config, provider_profiles)
         })
         .transpose()?
         .unwrap_or_default();
@@ -1423,7 +1425,9 @@ fn resolve_session_rebase(
     if command.model.is_some() {
         patch.model = command.model;
     }
-    let system_prompt = command.system_prompt;
+    if command.system_prompt.is_some() {
+        patch.system_prompt = command.system_prompt;
+    }
     if command.clear_tools {
         patch.tools = Some(vec![]);
     } else if !command.tools.is_empty() {
@@ -1440,15 +1444,12 @@ fn resolve_session_rebase(
         patch.max_tokens = Some(Some(max_tokens));
     }
 
-    Ok(ResolvedSessionRebase {
-        patch,
-        system_prompt,
-    })
+    Ok(ResolvedSessionRebase { patch })
 }
 
-fn branch_config_to_session_anchor_patch(
-    config: &coco_mem::BranchConfig,
-    store: &impl ProviderProfileStore,
+fn preset_to_session_anchor_patch(
+    config: &coco_mem::Preset,
+    store: &impl ProviderProfileLookup,
 ) -> Result<SessionConfigPatch> {
     store
         .get_provider_profile(&config.provider_profile)
