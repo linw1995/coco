@@ -653,7 +653,7 @@ struct ScrollState {
 impl ScrollState {
     fn read(document: &Document) -> Self {
         let graph = scroll_element(document, ".graph-wrap");
-        let side = scroll_element(document, ".branch-section");
+        let side = scroll_element(document, ".entity-workspace");
         let detail = scroll_element(document, ".node-detail-panel");
 
         Self {
@@ -669,7 +669,7 @@ impl ScrollState {
             graph.set_scroll_left(self.graph_left);
             graph.set_scroll_top(self.graph_top);
         }
-        if let Some(side) = scroll_element(document, ".branch-section") {
+        if let Some(side) = scroll_element(document, ".entity-workspace") {
             side.set_scroll_top(self.side_top);
         }
         if let Some(detail) = scroll_element(document, ".node-detail-panel") {

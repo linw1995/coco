@@ -1,8 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use coco_mem::{
-    AnchorPayload, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, SessionState,
-    SessionStore,
+    AnchorPayload, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent, MessageQueueItem,
+    MessageQueueStore, Node, NodeStore, PauseReason, PresetRecord, PresetStore, SessionRole,
+    SessionState, SessionStore, SkillRecord, SkillStore,
 };
 use serde::Serialize;
 use snafu::prelude::*;
@@ -18,6 +19,11 @@ pub struct GraphSnapshot {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub branches: Vec<GraphBranch>,
+    pub sessions: Vec<GraphSession>,
+    pub presets: Vec<GraphPreset>,
+    pub skills: Vec<GraphSkill>,
+    pub jobs: Vec<GraphJob>,
+    pub queues: Vec<GraphQueue>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -55,6 +61,65 @@ pub struct GraphBranch {
     pub state: SessionState,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+pub struct GraphSession {
+    pub branch: String,
+    pub head_id: String,
+    pub state: String,
+    pub target_branch: Option<String>,
+    pub base_head_id: Option<String>,
+    pub pause_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct GraphPreset {
+    pub name: String,
+    pub current_version: u64,
+    pub version_count: usize,
+    pub role: String,
+    pub provider_profile: String,
+    pub model: String,
+    pub tool_count: usize,
+    pub prompt: String,
+    pub system_prompt: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct GraphSkill {
+    pub role: String,
+    pub name: String,
+    pub current_version: u64,
+    pub version_count: usize,
+    pub revision_id: String,
+    pub description: String,
+    pub script_count: usize,
+    pub enable_coco_shim: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct GraphJob {
+    pub job_id: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub branch: String,
+    pub base: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct GraphQueue {
+    pub name: String,
+    pub message_count: usize,
+    pub messages: Vec<GraphQueueMessage>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct GraphQueueMessage {
+    pub message_id: String,
+    pub created_at: String,
+    pub payload: String,
+}
+
 #[derive(Debug, Clone)]
 struct GraphBranchLabel {
     branch: String,
@@ -70,7 +135,15 @@ struct GraphNodeEntry {
 }
 
 pub fn build_graph_snapshot(
-    store: &(impl BranchStore + NodeStore + SessionStore),
+    store: &(
+         impl BranchStore
+         + JobStore
+         + MessageQueueStore
+         + NodeStore
+         + PresetStore
+         + SessionStore
+         + SkillStore
+     ),
     version: u64,
 ) -> Result<GraphSnapshot> {
     let states = store.list_session_states().context(StoreSnafu)?;
@@ -174,13 +247,198 @@ pub fn build_graph_snapshot(
         });
     }
 
+    let sessions = build_sessions(&graph_branches);
+    let presets = build_presets(store)?;
+    let skills = build_skills(store)?;
+    let jobs = build_jobs(store)?;
+    let queues = build_queues(store)?;
+
     Ok(GraphSnapshot {
         version,
         root_id: store.root_id(),
         nodes,
         edges,
         branches: graph_branches,
+        sessions,
+        presets,
+        skills,
+        jobs,
+        queues,
     })
+}
+
+fn build_sessions(branches: &[GraphBranch]) -> Vec<GraphSession> {
+    branches
+        .iter()
+        .map(|branch| {
+            let (state, target_branch, base_head_id, pause_reason) = match &branch.state {
+                SessionState::Active => ("Active".to_owned(), None, None, None),
+                SessionState::Attached {
+                    target_branch,
+                    base_head_id,
+                } => (
+                    "Attached".to_owned(),
+                    Some(target_branch.clone()),
+                    Some(base_head_id.clone()),
+                    None,
+                ),
+                SessionState::Paused {
+                    target_branch,
+                    reason,
+                } => (
+                    "Paused".to_owned(),
+                    Some(target_branch.clone()),
+                    None,
+                    Some(format_pause_reason(reason)),
+                ),
+            };
+
+            GraphSession {
+                branch: branch.name.clone(),
+                head_id: branch.head_id.clone(),
+                state,
+                target_branch,
+                base_head_id,
+                pause_reason,
+            }
+        })
+        .collect()
+}
+
+fn build_presets(store: &impl PresetStore) -> Result<Vec<GraphPreset>> {
+    let mut records = store
+        .list_preset_records()
+        .context(StoreSnafu)?
+        .into_values()
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Ok(records.iter().map(render_preset).collect())
+}
+
+fn render_preset(record: &PresetRecord) -> GraphPreset {
+    let current = record.versions.get(&record.current_version);
+
+    GraphPreset {
+        name: record.name.clone(),
+        current_version: record.current_version,
+        version_count: record.versions.len(),
+        role: current
+            .map(|version| format_session_role(version.config.role))
+            .unwrap_or_default(),
+        provider_profile: current
+            .map(|version| version.config.provider_profile.clone())
+            .unwrap_or_default(),
+        model: current
+            .map(|version| version.config.model.clone())
+            .unwrap_or_default(),
+        tool_count: current
+            .map(|version| version.config.tools.len())
+            .unwrap_or_default(),
+        prompt: current
+            .map(|version| truncate_summary(&version.config.prompt))
+            .unwrap_or_default(),
+        system_prompt: current
+            .map(|version| truncate_summary(&version.config.system_prompt))
+            .unwrap_or_default(),
+    }
+}
+
+fn build_skills(store: &impl SkillStore) -> Result<Vec<GraphSkill>> {
+    let mut skills = Vec::new();
+    for role in [SessionRole::Orchestrator, SessionRole::Runner] {
+        skills.extend(
+            store
+                .list_skills(role)
+                .context(StoreSnafu)?
+                .iter()
+                .map(|record| render_skill(role, record)),
+        );
+    }
+    skills.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(skills)
+}
+
+fn render_skill(role: SessionRole, record: &SkillRecord) -> GraphSkill {
+    let current = record.current();
+
+    GraphSkill {
+        role: format_session_role(role),
+        name: record.name.clone(),
+        current_version: record.current_version,
+        version_count: record.versions.len(),
+        revision_id: current
+            .map(|version| version.id.clone())
+            .unwrap_or_default(),
+        description: current
+            .map(|version| truncate_summary(&version.description))
+            .unwrap_or_default(),
+        script_count: current
+            .map(|version| version.scripts.len())
+            .unwrap_or_default(),
+        enable_coco_shim: current
+            .map(|version| version.enable_coco_shim)
+            .unwrap_or_default(),
+    }
+}
+
+fn build_jobs(store: &impl JobStore) -> Result<Vec<GraphJob>> {
+    let mut jobs = store
+        .list_jobs()
+        .context(StoreSnafu)?
+        .into_values()
+        .map(render_job)
+        .collect::<Vec<_>>();
+    jobs.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.job_id.cmp(&right.job_id))
+    });
+    Ok(jobs)
+}
+
+fn render_job(job: Job) -> GraphJob {
+    GraphJob {
+        job_id: job.job_id,
+        created_at: job.created_at.to_string(),
+        finished_at: job.finished_at.map(|finished_at| finished_at.to_string()),
+        branch: job.branch,
+        base: job.base,
+        status: format_job_status(job.status),
+    }
+}
+
+fn build_queues(store: &impl MessageQueueStore) -> Result<Vec<GraphQueue>> {
+    let mut queues = store
+        .list_message_queues()
+        .context(StoreSnafu)?
+        .into_iter()
+        .map(|(name, messages)| render_queue(name, messages))
+        .collect::<Vec<_>>();
+    queues.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(queues)
+}
+
+fn render_queue(name: String, messages: Vec<MessageQueueItem>) -> GraphQueue {
+    GraphQueue {
+        name,
+        message_count: messages.len(),
+        messages: messages.into_iter().map(render_queue_message).collect(),
+    }
+}
+
+fn render_queue_message(message: MessageQueueItem) -> GraphQueueMessage {
+    GraphQueueMessage {
+        message_id: message.message_id,
+        created_at: message.created_at.to_string(),
+        payload: serde_json::to_string_pretty(&message.payload)
+            .unwrap_or_else(|_| message.payload.to_string()),
+    }
 }
 
 fn collect_visible_graph_nodes(
@@ -372,5 +630,29 @@ fn format_state_suffix(state: &SessionState) -> String {
             PauseReason::Merged { .. } => format!("@Paused({target_branch},merged)"),
             PauseReason::Closed => format!("@Paused({target_branch},closed)"),
         },
+    }
+}
+
+fn format_pause_reason(reason: &PauseReason) -> String {
+    match reason {
+        PauseReason::Merged { merged_anchor_id } => {
+            format!("Merged at {}", shorten_id(merged_anchor_id))
+        }
+        PauseReason::Closed => "Closed".to_owned(),
+    }
+}
+
+fn format_session_role(role: SessionRole) -> String {
+    match role {
+        SessionRole::Orchestrator => "Orchestrator".to_owned(),
+        SessionRole::Runner => "Runner".to_owned(),
+    }
+}
+
+fn format_job_status(status: JobStatus) -> String {
+    match status {
+        JobStatus::Queued => "Queued".to_owned(),
+        JobStatus::Running => "Running".to_owned(),
+        JobStatus::Finished => "Finished".to_owned(),
     }
 }

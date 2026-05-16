@@ -15,7 +15,8 @@ mod native {
     pub use config::{ConsoleConfig, default_console_addr};
     pub use error::{Error, Result};
     pub use graph::{
-        GraphBranch, GraphEdge, GraphEdgeKind, GraphNode, GraphSnapshot, build_graph_snapshot,
+        GraphBranch, GraphEdge, GraphEdgeKind, GraphJob, GraphNode, GraphPreset, GraphQueue,
+        GraphQueueMessage, GraphSession, GraphSkill, GraphSnapshot, build_graph_snapshot,
     };
     pub use publisher::ConsolePublisher;
     pub use server::{ConsoleServerHandle, start_console_server};
@@ -28,8 +29,9 @@ mod native {
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
     ConsoleConfig, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error, GraphBranch,
-    GraphEdge, GraphEdgeKind, GraphNode, GraphSnapshot, Result, build_graph_snapshot,
-    default_console_addr, start_console_server,
+    GraphEdge, GraphEdgeKind, GraphJob, GraphNode, GraphPreset, GraphQueue, GraphQueueMessage,
+    GraphSession, GraphSkill, GraphSnapshot, Result, build_graph_snapshot, default_console_addr,
+    start_console_server,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use native::{config, error, graph, layout, publisher, render};

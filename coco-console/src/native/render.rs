@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use coco_mem::{PauseReason, SessionState};
 use leptos::prelude::*;
 
-use crate::graph::{GraphBranch, GraphNode, GraphSnapshot, css_token, shorten_id};
+use crate::graph::{
+    GraphBranch, GraphJob, GraphNode, GraphPreset, GraphQueue, GraphQueueMessage, GraphSession,
+    GraphSkill, GraphSnapshot, css_token, shorten_id,
+};
 use crate::layout::{
     GraphLane, GraphLayout, GraphLayoutEdge, GraphLayoutEdgeKind, GraphNodeOccurrence, Point,
     layout_graph, line_points, routed_elbow_points,
@@ -78,33 +81,83 @@ fn ConsoleRoot<'a>(snapshot: &'a GraphSnapshot) -> impl IntoView {
 }
 
 #[component]
-fn ConsoleContent<'a>(snapshot: &'a GraphSnapshot) -> AnyView {
-    if snapshot.nodes.is_empty() {
-        return view! {
-            <section class="content">
-                <div class="graph-shell">
-                    <div class="graph-wrap">
-                        <div class="empty">"No sessions found."</div>
-                    </div>
-                </div>
-                <SidePanel snapshot=snapshot />
-            </section>
-        }
-        .into_any();
-    }
-
-    let layout = layout_graph(snapshot);
+fn ConsoleContent<'a>(snapshot: &'a GraphSnapshot) -> impl IntoView {
+    let layout = (!snapshot.nodes.is_empty()).then(|| layout_graph(snapshot));
     view! {
         <section class="content">
-            <GraphPanel snapshot=snapshot layout=&layout />
+            <EntityNav snapshot=snapshot />
+            <main class="entity-workspace">
+                <section id="nodes" class="entity-section graph-entity">
+                    <EntitySectionHeader title="Nodes" count=snapshot.nodes.len() />
+                    <GraphPanel snapshot=snapshot layout=layout.as_ref() />
+                </section>
+                <BranchesSection branches=&snapshot.branches />
+                <SessionsSection sessions=&snapshot.sessions />
+                <PresetsSection presets=&snapshot.presets />
+                <SkillsSection skills=&snapshot.skills />
+                <JobsSection jobs=&snapshot.jobs />
+                <QueuesSection queues=&snapshot.queues />
+            </main>
             <SidePanel snapshot=snapshot />
         </section>
     }
-    .into_any()
 }
 
 #[component]
-fn GraphPanel<'a>(snapshot: &'a GraphSnapshot, layout: &'a GraphLayout) -> impl IntoView {
+fn EntityNav<'a>(snapshot: &'a GraphSnapshot) -> impl IntoView {
+    view! {
+        <nav class="entity-nav" aria-label="Store entities">
+            <EntityNavLink href="#nodes" icon="N" label="Nodes" count=snapshot.nodes.len() />
+            <EntityNavLink href="#branches" icon="B" label="Branches" count=snapshot.branches.len() />
+            <EntityNavLink href="#sessions" icon="S" label="Sessions" count=snapshot.sessions.len() />
+            <EntityNavLink href="#presets" icon="P" label="Presets" count=snapshot.presets.len() />
+            <EntityNavLink href="#skills" icon="K" label="Skills" count=snapshot.skills.len() />
+            <EntityNavLink href="#jobs" icon="J" label="Jobs" count=snapshot.jobs.len() />
+            <EntityNavLink href="#queues" icon="Q" label="Queues" count=snapshot.queues.len() />
+        </nav>
+    }
+}
+
+#[component]
+fn EntityNavLink(
+    href: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    count: usize,
+) -> impl IntoView {
+    let count = count.to_string();
+
+    view! {
+        <a class="entity-nav-link" href=href aria-label=label title=label>
+            <span class="entity-nav-icon">{icon}</span>
+            <span class="entity-nav-count">{count}</span>
+        </a>
+    }
+}
+
+#[component]
+fn EntitySectionHeader(title: &'static str, count: usize) -> impl IntoView {
+    view! {
+        <header class="entity-section-header">
+            <h2>{title}</h2>
+            <span>{count.to_string()}</span>
+        </header>
+    }
+}
+
+#[component]
+fn GraphPanel<'a>(snapshot: &'a GraphSnapshot, layout: Option<&'a GraphLayout>) -> AnyView {
+    let Some(layout) = layout else {
+        return view! {
+            <div class="graph-shell">
+                <div class="graph-wrap">
+                    <div class="empty">"No sessions found."</div>
+                </div>
+            </div>
+        }
+        .into_any();
+    };
+
     view! {
         <div class="graph-shell">
             <GraphToolbar />
@@ -114,6 +167,7 @@ fn GraphPanel<'a>(snapshot: &'a GraphSnapshot, layout: &'a GraphLayout) -> impl 
             <Minimap layout=layout />
         </div>
     }
+    .into_any()
 }
 
 #[component]
@@ -364,7 +418,7 @@ fn SidePanel<'a>(snapshot: &'a GraphSnapshot) -> impl IntoView {
         <aside class="side">
             <NodeDetailsDefault />
             <NodeDetailPanel />
-            <BranchSection branches=&snapshot.branches />
+            <StoreSummary snapshot=snapshot />
         </aside>
     }
 }
@@ -412,20 +466,44 @@ fn DetailField(label: &'static str, field: &'static str) -> impl IntoView {
 }
 
 #[component]
-fn BranchSection<'a>(branches: &'a [GraphBranch]) -> impl IntoView {
+fn StoreSummary<'a>(snapshot: &'a GraphSnapshot) -> impl IntoView {
+    view! {
+        <section class="store-summary">
+            <h2>"Store"</h2>
+            <dl class="summary-grid">
+                <SummaryMetric label="Nodes" value=snapshot.nodes.len() />
+                <SummaryMetric label="Branches" value=snapshot.branches.len() />
+                <SummaryMetric label="Presets" value=snapshot.presets.len() />
+                <SummaryMetric label="Skills" value=snapshot.skills.len() />
+                <SummaryMetric label="Jobs" value=snapshot.jobs.len() />
+                <SummaryMetric label="Queues" value=snapshot.queues.len() />
+            </dl>
+        </section>
+    }
+}
+
+#[component]
+fn SummaryMetric(label: &'static str, value: usize) -> impl IntoView {
+    view! {
+        <div>
+            <dt>{label}</dt>
+            <dd>{value.to_string()}</dd>
+        </div>
+    }
+}
+
+#[component]
+fn BranchesSection<'a>(branches: &'a [GraphBranch]) -> impl IntoView {
     let items = branches
         .iter()
         .map(|branch| view! { <BranchItem branch=branch /> })
         .collect::<Vec<_>>();
 
     view! {
-        <details class="branch-section">
-            <summary>
-                <h2>"Branches"</h2>
-                <span>{branches.len().to_string()}</span>
-            </summary>
-            <ul class="branch-list">{items}</ul>
-        </details>
+        <section id="branches" class="entity-section">
+            <EntitySectionHeader title="Branches" count=branches.len() />
+            <ul class="entity-list">{items}</ul>
+        </section>
     }
 }
 
@@ -440,6 +518,204 @@ fn BranchItem<'a>(branch: &'a GraphBranch) -> impl IntoView {
             <strong>{name}</strong>
             <span>{head}</span>
             <span>{state}</span>
+        </li>
+    }
+}
+
+#[component]
+fn SessionsSection<'a>(sessions: &'a [GraphSession]) -> impl IntoView {
+    let items = sessions
+        .iter()
+        .map(|session| view! { <SessionItem session=session /> })
+        .collect::<Vec<_>>();
+
+    view! {
+        <section id="sessions" class="entity-section">
+            <EntitySectionHeader title="Sessions" count=sessions.len() />
+            <ul class="entity-list">{items}</ul>
+        </section>
+    }
+}
+
+#[component]
+fn SessionItem<'a>(session: &'a GraphSession) -> impl IntoView {
+    let head = format!("head {}", shorten_id(&session.head_id));
+    let target = session
+        .target_branch
+        .as_ref()
+        .map(|branch| format!("target {branch}"));
+    let base = session
+        .base_head_id
+        .as_ref()
+        .map(|base| format!("base {}", shorten_id(base)));
+    let reason = session.pause_reason.clone();
+
+    view! {
+        <li class="entity-card">
+            <strong>{session.branch.clone()}</strong>
+            <span>{session.state.clone()}</span>
+            <span>{head}</span>
+            {target.map(|value| view! { <span>{value}</span> })}
+            {base.map(|value| view! { <span>{value}</span> })}
+            {reason.map(|value| view! { <span>{value}</span> })}
+        </li>
+    }
+}
+
+#[component]
+fn PresetsSection<'a>(presets: &'a [GraphPreset]) -> impl IntoView {
+    let items = presets
+        .iter()
+        .map(|preset| view! { <PresetItem preset=preset /> })
+        .collect::<Vec<_>>();
+
+    view! {
+        <section id="presets" class="entity-section">
+            <EntitySectionHeader title="Presets" count=presets.len() />
+            <ul class="entity-list">{items}</ul>
+        </section>
+    }
+}
+
+#[component]
+fn PresetItem<'a>(preset: &'a GraphPreset) -> impl IntoView {
+    let version = format!(
+        "v{} / {} versions",
+        preset.current_version, preset.version_count
+    );
+    let tools = format!("{} tools", preset.tool_count);
+
+    view! {
+        <li class="entity-card">
+            <strong>{preset.name.clone()}</strong>
+            <span>{version}</span>
+            <span>{preset.role.clone()}</span>
+            <span>{preset.provider_profile.clone()}</span>
+            <span>{preset.model.clone()}</span>
+            <span>{tools}</span>
+            <p>{preset.prompt.clone()}</p>
+            <p>{preset.system_prompt.clone()}</p>
+        </li>
+    }
+}
+
+#[component]
+fn SkillsSection<'a>(skills: &'a [GraphSkill]) -> impl IntoView {
+    let items = skills
+        .iter()
+        .map(|skill| view! { <SkillItem skill=skill /> })
+        .collect::<Vec<_>>();
+
+    view! {
+        <section id="skills" class="entity-section">
+            <EntitySectionHeader title="Skills" count=skills.len() />
+            <ul class="entity-list">{items}</ul>
+        </section>
+    }
+}
+
+#[component]
+fn SkillItem<'a>(skill: &'a GraphSkill) -> impl IntoView {
+    let version = format!(
+        "v{} / {} versions",
+        skill.current_version, skill.version_count
+    );
+    let revision = format!("revision {}", shorten_id(&skill.revision_id));
+    let scripts = format!("{} scripts", skill.script_count);
+    let shim = if skill.enable_coco_shim {
+        "shim enabled"
+    } else {
+        "shim disabled"
+    };
+
+    view! {
+        <li class="entity-card">
+            <strong>{skill.name.clone()}</strong>
+            <span>{skill.role.clone()}</span>
+            <span>{version}</span>
+            <span>{revision}</span>
+            <span>{scripts}</span>
+            <span>{shim}</span>
+            <p>{skill.description.clone()}</p>
+        </li>
+    }
+}
+
+#[component]
+fn JobsSection<'a>(jobs: &'a [GraphJob]) -> impl IntoView {
+    let items = jobs
+        .iter()
+        .map(|job| view! { <JobItem job=job /> })
+        .collect::<Vec<_>>();
+
+    view! {
+        <section id="jobs" class="entity-section">
+            <EntitySectionHeader title="Jobs" count=jobs.len() />
+            <ul class="entity-list">{items}</ul>
+        </section>
+    }
+}
+
+#[component]
+fn JobItem<'a>(job: &'a GraphJob) -> impl IntoView {
+    let base = format!("base {}", shorten_id(&job.base));
+    let finished = job
+        .finished_at
+        .as_ref()
+        .map(|finished_at| format!("finished {finished_at}"));
+
+    view! {
+        <li class="entity-card">
+            <strong>{shorten_id(&job.job_id)}</strong>
+            <span>{job.status.clone()}</span>
+            <span>{job.branch.clone()}</span>
+            <span>{base}</span>
+            <span>{job.created_at.clone()}</span>
+            {finished.map(|value| view! { <span>{value}</span> })}
+        </li>
+    }
+}
+
+#[component]
+fn QueuesSection<'a>(queues: &'a [GraphQueue]) -> impl IntoView {
+    let items = queues
+        .iter()
+        .map(|queue| view! { <QueueItem queue=queue /> })
+        .collect::<Vec<_>>();
+
+    view! {
+        <section id="queues" class="entity-section">
+            <EntitySectionHeader title="Queues" count=queues.len() />
+            <ul class="entity-list">{items}</ul>
+        </section>
+    }
+}
+
+#[component]
+fn QueueItem<'a>(queue: &'a GraphQueue) -> impl IntoView {
+    let count = format!("{} messages", queue.message_count);
+    let messages = queue
+        .messages
+        .iter()
+        .map(|message| view! { <QueueMessageItem message=message /> })
+        .collect::<Vec<_>>();
+
+    view! {
+        <li class="entity-card">
+            <strong>{queue.name.clone()}</strong>
+            <span>{count}</span>
+            <ul class="queue-message-list">{messages}</ul>
+        </li>
+    }
+}
+
+#[component]
+fn QueueMessageItem<'a>(message: &'a GraphQueueMessage) -> impl IntoView {
+    view! {
+        <li>
+            <strong>{shorten_id(&message.message_id)}</strong>
+            <span>{message.created_at.clone()}</span>
+            <pre>{message.payload.clone()}</pre>
         </li>
     }
 }

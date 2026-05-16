@@ -572,6 +572,10 @@ impl StoreState {
         self.message_queues.get(queue).cloned().unwrap_or_default()
     }
 
+    pub fn list_message_queues(&self) -> HashMap<String, Vec<MessageQueueItem>> {
+        self.message_queues.clone()
+    }
+
     fn next_job_id(&self) -> String {
         loop {
             let candidate = format!("job-{}", nanoid::nanoid!());

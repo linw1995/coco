@@ -1,6 +1,7 @@
 use coco_mem::{
-    Anchor, BranchStore, Kind, MemoryStore, MergeParent, NewNode, NodeStore, Role, SessionAnchor,
-    SessionRole, SessionState, Tool,
+    Anchor, BranchStore, JobStore, Kind, MemoryStore, MergeParent, MessageQueueStore, NewNode,
+    NodeStore, Preset, PresetStore, Role, SessionAnchor, SessionRole, SessionState, SkillStore,
+    SkillVersionSpec, Tool,
 };
 use serde_json::json;
 
@@ -40,6 +41,21 @@ fn graph_node(id: &str, created_at_ns: i128) -> GraphNode {
         content: String::new(),
         summary: String::new(),
         labels: Vec::new(),
+    }
+}
+
+fn empty_snapshot() -> GraphSnapshot {
+    GraphSnapshot {
+        version: 0,
+        root_id: "root".to_owned(),
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        branches: Vec::new(),
+        sessions: Vec::new(),
+        presets: Vec::new(),
+        skills: Vec::new(),
+        jobs: Vec::new(),
+        queues: Vec::new(),
     }
 }
 
@@ -151,7 +167,9 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
     assert!(html.contains("data-graph-x="));
     assert!(html.contains("data-graph-min-x="));
     assert!(html.contains("class=\"node-details node-detail-panel\""));
-    assert!(html.contains("class=\"branch-section\""));
+    assert!(html.contains("class=\"entity-nav\""));
+    assert!(html.contains("id=\"branches\""));
+    assert!(html.contains("id=\"sessions\""));
     assert!(html.contains("class=\"minimap\""));
     assert!(html.contains("preserveAspectRatio=\"xMidYMid meet\""));
     assert!(html.contains("class=\"minimap-viewport\""));
@@ -206,6 +224,71 @@ fn graph_snapshot_contains_shadow_parent_edges() {
 }
 
 #[test]
+fn graph_snapshot_contains_store_entities() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &session).unwrap();
+    store
+        .set_preset(
+            "default",
+            Preset {
+                role: SessionRole::Orchestrator,
+                provider_profile: "default".to_owned(),
+                model: "gpt-4.1-mini".to_owned(),
+                tools: Vec::new(),
+                system_prompt: "System prompt".to_owned(),
+                prompt: "Prompt".to_owned(),
+                temperature: None,
+                max_tokens: None,
+                additional_params: None,
+                enable_coco_shim: false,
+            },
+        )
+        .unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "demo",
+            SkillVersionSpec {
+                description: "Demo skill".to_owned(),
+                body: "Run demo".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
+    store.submit_job("main", &session).unwrap();
+    store
+        .enqueue_message("hooks", json!({ "event": "created" }))
+        .unwrap();
+
+    let snapshot = build_graph_snapshot(&store, 9).unwrap();
+
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.presets.len(), 1);
+    assert!(snapshot.skills.iter().any(|skill| skill.name == "demo"));
+    assert_eq!(snapshot.jobs.len(), 1);
+    assert_eq!(snapshot.queues.len(), 1);
+    assert_eq!(snapshot.queues[0].message_count, 1);
+
+    let html = render_snapshot_page(&snapshot);
+    assert!(html.contains("href=\"#presets\""));
+    assert!(html.contains("href=\"#skills\""));
+    assert!(html.contains("href=\"#jobs\""));
+    assert!(html.contains("href=\"#queues\""));
+    assert!(html.contains("Demo skill"));
+    assert!(html.contains("hooks"));
+}
+
+#[test]
 fn layout_expands_empty_columns_from_event_order() {
     let snapshot = GraphSnapshot {
         version: 1,
@@ -226,6 +309,11 @@ fn layout_expands_empty_columns_from_event_order() {
             head_id: "merged".to_owned(),
             state: SessionState::Active,
         }],
+        sessions: Vec::new(),
+        presets: Vec::new(),
+        skills: Vec::new(),
+        jobs: Vec::new(),
+        queues: Vec::new(),
     };
 
     let layout = layout_graph(&snapshot);
@@ -281,13 +369,7 @@ fn console_store_notifies_after_successful_writes() {
 
 #[test]
 fn rendered_page_does_not_embed_javascript() {
-    let snapshot = GraphSnapshot {
-        version: 0,
-        root_id: "root".to_owned(),
-        nodes: Vec::new(),
-        edges: Vec::new(),
-        branches: Vec::new(),
-    };
+    let snapshot = empty_snapshot();
     let html = render_snapshot_page(&snapshot);
 
     assert!(!html.contains("<script"));
@@ -297,13 +379,7 @@ fn rendered_page_does_not_embed_javascript() {
 
 #[test]
 fn fragment_renders_refresh_free_console_root() {
-    let snapshot = GraphSnapshot {
-        version: 0,
-        root_id: "root".to_owned(),
-        nodes: Vec::new(),
-        edges: Vec::new(),
-        branches: Vec::new(),
-    };
+    let snapshot = empty_snapshot();
     let html = render_fragment(&snapshot);
 
     assert!(html.contains("id=\"console-root\""));
@@ -316,13 +392,7 @@ fn fragment_renders_refresh_free_console_root() {
 
 #[test]
 fn index_page_loads_wasm_client_without_document_refresh() {
-    let snapshot = GraphSnapshot {
-        version: 0,
-        root_id: "root".to_owned(),
-        nodes: Vec::new(),
-        edges: Vec::new(),
-        branches: Vec::new(),
-    };
+    let snapshot = empty_snapshot();
     let html = render_index_page(&snapshot);
 
     assert!(html.contains("src=\"/pkg/coco_console.js\""));

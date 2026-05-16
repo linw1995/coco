@@ -2801,6 +2801,14 @@ impl MessageQueueStore for FsStore {
             .expect("store lock poisoned")
             .list_queue_messages(queue))
     }
+
+    fn list_message_queues(&self) -> Result<HashMap<String, Vec<MessageQueueItem>>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_message_queues())
+    }
 }
 
 impl ProcessShareableStore for FsStore {
