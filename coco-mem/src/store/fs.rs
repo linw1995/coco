@@ -27,7 +27,6 @@ use crate::{
 };
 
 type VersionMap<V> = BTreeMap<u64, V>;
-type VersionReplay<V> = (u64, VersionMap<V>);
 
 const STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
@@ -261,90 +260,6 @@ impl SkillHistoryEntry {
             enable_coco_shim: self.enable_coco_shim,
         }
     }
-}
-
-fn preset_history_key(entry: &PresetHistoryEntry) -> &str {
-    &entry.name
-}
-
-fn preset_history_entry_version(entry: &PresetHistoryEntry) -> u64 {
-    entry.version
-}
-
-fn skill_history_key(entry: &SkillHistoryEntry) -> &str {
-    &entry.name
-}
-
-fn skill_history_entry_version(entry: &SkillHistoryEntry) -> u64 {
-    entry.version
-}
-
-fn versions_from_history<E, V>(
-    context: &ProjectionContext,
-    fallback_path: &Path,
-    entries: &[(PathBuf, E)],
-    key_of: impl for<'a> Fn(&'a E) -> &'a str,
-    entry_version_of: impl Fn(&E) -> u64,
-    into_version: impl Fn(E) -> V,
-    version_of: impl Fn(&V) -> u64,
-) -> Result<VersionReplay<V>>
-where
-    E: Clone,
-{
-    let mut versions = BTreeMap::new();
-    let mut source_path = None;
-    let mut key = None;
-
-    for (path, entry) in entries {
-        source_path.get_or_insert_with(|| path.clone());
-        key.get_or_insert_with(|| key_of(entry).to_owned());
-        let entry_version = entry_version_of(entry);
-        let version = into_version(entry.clone());
-        let version_number = version_of(&version);
-        ensure!(
-            version_number == entry_version,
-            CorruptedStoreSnafu {
-                path: path.clone(),
-                message: format!(
-                    "{} {:?} stores version {} in history entry {}",
-                    context.entity(),
-                    key_of(entry),
-                    version_number,
-                    entry_version
-                ),
-            }
-        );
-        ensure!(
-            versions.insert(entry_version, version).is_none(),
-            CorruptedStoreSnafu {
-                path: path.clone(),
-                message: format!(
-                    "duplicate history version {} for {} {:?}",
-                    entry_version,
-                    context.entity(),
-                    key_of(entry)
-                ),
-            }
-        );
-    }
-
-    let path = source_path.unwrap_or_else(|| fallback_path.to_owned());
-    let key = key.unwrap_or_else(|| "<unknown>".to_owned());
-    ensure!(
-        !versions.is_empty(),
-        CorruptedStoreSnafu {
-            path: path.clone(),
-            message: format!("empty {} history for {:?}", context.entity(), key),
-        }
-    );
-    validate_versions(context, &path, &key, &versions, &version_of)?;
-    let current_version = versions
-        .keys()
-        .next_back()
-        .copied()
-        .expect("versions checked non-empty");
-
-    Ok((current_version, versions))
 }
 
 fn validate_snapshot<V>(
@@ -1409,15 +1324,50 @@ fn preset_record_from_history(
     name: &str,
     entries: &[(PathBuf, PresetHistoryEntry)],
 ) -> Result<PresetRecord> {
-    let (current_version, versions) = versions_from_history(
-        &ProjectionContext::new("preset", PRESET_HISTORY_DIR_NAME),
-        Path::new(PRESET_HISTORY_DIR_NAME),
-        entries,
-        preset_history_key,
-        preset_history_entry_version,
-        PresetHistoryEntry::into_version,
-        |version| version.version,
-    )?;
+    let context = ProjectionContext::new("preset", PRESET_HISTORY_DIR_NAME);
+    let mut versions = BTreeMap::new();
+    let mut source_path = None;
+
+    for (path, entry) in entries {
+        source_path.get_or_insert_with(|| path.clone());
+        ensure!(
+            entry.name == name,
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "preset history entry name {:?} mismatches file name {:?}",
+                    entry.name, name
+                ),
+            }
+        );
+        ensure!(
+            versions
+                .insert(entry.version, entry.clone().into_version())
+                .is_none(),
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "duplicate history version {} for preset {:?}",
+                    entry.version, name
+                ),
+            }
+        );
+    }
+
+    let path = source_path.unwrap_or_else(|| PathBuf::from(PRESET_HISTORY_DIR_NAME));
+    ensure!(
+        !versions.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.clone(),
+            message: format!("empty preset history for {:?}", name),
+        }
+    );
+    validate_versions(&context, &path, name, &versions, |version| version.version)?;
+    let current_version = versions
+        .keys()
+        .next_back()
+        .copied()
+        .expect("versions checked non-empty");
 
     Ok(PresetRecord {
         name: name.to_owned(),
@@ -1502,15 +1452,60 @@ fn skill_record_from_history(
     name: &str,
     entries: &[(PathBuf, SkillHistoryEntry)],
 ) -> Result<SkillRecord> {
-    let (current_version, versions) = versions_from_history(
-        &ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME),
-        Path::new(SKILL_HISTORY_DIR_NAME),
-        entries,
-        skill_history_key,
-        skill_history_entry_version,
-        SkillHistoryEntry::into_version,
-        |version| version.version,
-    )?;
+    let context = ProjectionContext::new(format!("skill role {:?}", role), SKILL_HISTORY_DIR_NAME);
+    let mut versions = BTreeMap::new();
+    let mut source_path = None;
+
+    for (path, entry) in entries {
+        source_path.get_or_insert_with(|| path.clone());
+        ensure!(
+            entry.role == role,
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "skill history entry role {:?} mismatches expected role {:?}",
+                    entry.role, role
+                ),
+            }
+        );
+        ensure!(
+            entry.name == name,
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "skill history entry name {:?} mismatches file name {:?}",
+                    entry.name, name
+                ),
+            }
+        );
+        ensure!(
+            versions
+                .insert(entry.version, entry.clone().into_version())
+                .is_none(),
+            CorruptedStoreSnafu {
+                path: path.clone(),
+                message: format!(
+                    "duplicate history version {} for skill role {:?} {:?}",
+                    entry.version, role, name
+                ),
+            }
+        );
+    }
+
+    let path = source_path.unwrap_or_else(|| PathBuf::from(SKILL_HISTORY_DIR_NAME));
+    ensure!(
+        !versions.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.clone(),
+            message: format!("empty skill role {:?} history for {:?}", role, name),
+        }
+    );
+    validate_versions(&context, &path, name, &versions, |version| version.version)?;
+    let current_version = versions
+        .keys()
+        .next_back()
+        .copied()
+        .expect("versions checked non-empty");
 
     Ok(SkillRecord {
         name: name.to_owned(),
