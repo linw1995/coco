@@ -9,6 +9,7 @@ use crate::error::TelegramTransportSnafu;
 use crate::{ChannelRuntime, Error, InboundMessage, MessageHandler, Result};
 
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 30;
+const POLL_TIMEOUT_GRACE_SECS: u64 = 15;
 const TRANSPORT_RETRY_DELAY_SECS: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,14 +179,23 @@ impl TelegramTransport for ReqwestTelegramTransport {
             allowed_updates: ["message"],
         };
         let updates = self
-            .post_api::<_, Vec<TelegramUpdate>>("getUpdates", &request)
+            .post_api::<_, Vec<TelegramUpdate>>(
+                "getUpdates",
+                &request,
+                request_timeout_for_poll(request.timeout),
+            )
             .await?;
         Ok(GetUpdatesResponse { updates })
     }
 }
 
 impl ReqwestTelegramTransport {
-    async fn post_api<Request, Response>(&self, method: &str, request: &Request) -> Result<Response>
+    async fn post_api<Request, Response>(
+        &self,
+        method: &str,
+        request: &Request,
+        request_timeout: Duration,
+    ) -> Result<Response>
     where
         Request: Serialize + Sync,
         Response: for<'de> Deserialize<'de>,
@@ -194,7 +204,7 @@ impl ReqwestTelegramTransport {
             .client
             .post(format!("{}/{}", self.base_url, method))
             .json(request)
-            .timeout(Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS + 5))
+            .timeout(request_timeout)
             .send()
             .await
             .context(RequestSnafu)
@@ -209,6 +219,10 @@ impl ReqwestTelegramTransport {
 
         response.into_result().context(TelegramTransportSnafu)
     }
+}
+
+fn request_timeout_for_poll(poll_timeout_secs: u64) -> Duration {
+    Duration::from_secs(poll_timeout_secs.saturating_add(POLL_TIMEOUT_GRACE_SECS))
 }
 
 #[derive(Debug, Snafu)]
@@ -499,6 +513,16 @@ mod tests {
 
         assert!(!message.contains(token));
         assert!(!message.contains("/bot"));
+    }
+
+    #[test]
+    fn get_updates_request_timeout_tracks_poll_timeout() {
+        assert_eq!(request_timeout_for_poll(30), Duration::from_secs(45));
+        assert_eq!(request_timeout_for_poll(120), Duration::from_secs(135));
+        assert_eq!(
+            request_timeout_for_poll(u64::MAX),
+            Duration::from_secs(u64::MAX)
+        );
     }
 
     fn text_update(update_id: i64, chat_id: i64, user_id: i64, text: &str) -> TelegramUpdate {
