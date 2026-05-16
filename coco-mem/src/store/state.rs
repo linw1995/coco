@@ -15,10 +15,9 @@ use crate::error::{
     SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
-    Anchor, AnchorPayload, BranchConfig, BranchConfigRecord, Job, JobStatus, Kind,
-    MessageQueueItem, NewNode, Node, PauseReason, Role, SessionAnchor, SessionAnchorPatch,
-    SessionRole, SessionState, SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
-    default_skill_groups,
+    Anchor, AnchorPayload, Job, JobStatus, Kind, MessageQueueItem, NewNode, Node, PauseReason,
+    Preset, PresetRecord, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
+    SkillGroups, SkillRecord, SkillUpdatePatch, SkillVersionSpec, default_skill_groups,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,7 +27,7 @@ pub struct StoreState {
     pub root: String,
     pub branches: HashMap<String, String>,
     pub sessions: HashMap<String, SessionState>,
-    pub branch_configs: HashMap<String, BranchConfigRecord>,
+    pub branch_configs: HashMap<String, PresetRecord>,
     pub jobs: HashMap<String, Job>,
     pub message_queues: HashMap<String, Vec<MessageQueueItem>>,
     pub skill_groups: SkillGroups,
@@ -313,11 +312,11 @@ impl StoreState {
         Ok(state.clone())
     }
 
-    pub fn list_branch_config_records(&self) -> HashMap<String, BranchConfigRecord> {
+    pub fn list_preset_records(&self) -> HashMap<String, PresetRecord> {
         self.branch_configs.clone()
     }
 
-    pub fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {
+    pub fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
         self.branch_configs
             .get(name)
             .cloned()
@@ -326,11 +325,7 @@ impl StoreState {
             })
     }
 
-    pub fn set_branch_config(
-        &mut self,
-        name: &str,
-        config: BranchConfig,
-    ) -> Result<BranchConfigRecord> {
+    pub fn set_preset(&mut self, name: &str, config: Preset) -> Result<PresetRecord> {
         let record = if let Some(record) = self.branch_configs.get_mut(name) {
             let current_version = record.current_version;
             record
@@ -341,18 +336,14 @@ impl StoreState {
                 })?;
             record.clone()
         } else {
-            let record = BranchConfigRecord::new(name.to_owned(), config);
+            let record = PresetRecord::new(name.to_owned(), config);
             self.branch_configs.insert(name.to_owned(), record.clone());
             record
         };
         Ok(record)
     }
 
-    pub fn rollback_branch_config(
-        &mut self,
-        name: &str,
-        target_version: u64,
-    ) -> Result<BranchConfigRecord> {
+    pub fn rollback_preset(&mut self, name: &str, target_version: u64) -> Result<PresetRecord> {
         let record = self
             .branch_configs
             .get_mut(name)
@@ -368,7 +359,7 @@ impl StoreState {
         Ok(record.clone())
     }
 
-    pub fn delete_branch_config(&mut self, name: &str) -> Result<()> {
+    pub fn delete_preset(&mut self, name: &str) -> Result<()> {
         self.branch_configs
             .remove(name)
             .map(|_| ())

@@ -6,7 +6,7 @@ use coco_llm::{
     CompletionBackend, LlmService, SessionConfig, SessionConfigPatch, SessionFeedback, SessionMerge,
 };
 use coco_mem::{
-    AnchorPayload, BranchConfigStore, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason,
+    AnchorPayload, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, PresetStore,
     SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
 };
 use serde::Serialize;
@@ -1384,22 +1384,22 @@ fn resolve_visible_session_anchor(
 
 fn resolve_session_rebase(
     command: SessionRebaseCommand,
-    store: &impl BranchConfigStore,
+    store: &impl PresetStore,
     provider_profiles: &impl ProviderProfileLookup,
 ) -> Result<ResolvedSessionRebase> {
     let mut patch = command
         .preset
         .as_deref()
         .map(|name| {
-            let record = store.get_branch_config_record(name).context(StoreSnafu)?;
+            let record = store.get_preset_record(name).context(StoreSnafu)?;
             let config = record
-                .current_config()
+                .current_preset()
                 .ok_or_else(|| StoreError::BranchConfigVersionNotFound {
                     name: name.to_owned(),
                     version: record.current_version,
                 })
                 .context(StoreSnafu)?;
-            branch_config_to_session_anchor_patch(&config, provider_profiles)
+            preset_to_session_anchor_patch(&config, provider_profiles)
         })
         .transpose()?
         .unwrap_or_default();
@@ -1447,8 +1447,8 @@ fn resolve_session_rebase(
     Ok(ResolvedSessionRebase { patch })
 }
 
-fn branch_config_to_session_anchor_patch(
-    config: &coco_mem::BranchConfig,
+fn preset_to_session_anchor_patch(
+    config: &coco_mem::Preset,
     store: &impl ProviderProfileLookup,
 ) -> Result<SessionConfigPatch> {
     store

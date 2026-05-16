@@ -10,9 +10,8 @@ pub(crate) mod state;
 mod tests;
 
 use crate::{
-    BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
-    SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
-    StoreResult,
+    Job, JobStatus, MessageQueueItem, NewNode, Node, Preset, PresetRecord, SessionAnchorPatch,
+    SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 /// Node graph storage API used by CoCo services.
@@ -76,30 +75,22 @@ pub trait SessionStore {
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
 }
 
-/// Branch preset config storage API.
-pub trait BranchConfigStore {
-    /// Returns all persisted branch preset config records keyed by preset name.
-    fn list_branch_config_records(&self) -> StoreResult<HashMap<String, BranchConfigRecord>>;
+/// Preset storage API.
+pub trait PresetStore {
+    /// Returns all persisted preset records keyed by preset name.
+    fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>>;
 
-    /// Returns one branch preset config record by preset name.
-    fn get_branch_config_record(&self, name: &str) -> StoreResult<BranchConfigRecord>;
+    /// Returns one preset record by preset name.
+    fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord>;
 
-    /// Creates a new version for a branch preset config under a preset name.
-    fn set_branch_config(
-        &self,
-        name: &str,
-        config: BranchConfig,
-    ) -> StoreResult<BranchConfigRecord>;
+    /// Creates a new version for a preset under a preset name.
+    fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord>;
 
-    /// Creates a new version cloned from a previous branch preset config version.
-    fn rollback_branch_config(
-        &self,
-        name: &str,
-        target_version: u64,
-    ) -> StoreResult<BranchConfigRecord>;
+    /// Creates a new version cloned from a previous preset version.
+    fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord>;
 
-    /// Deletes one branch preset config by preset name.
-    fn delete_branch_config(&self, name: &str) -> StoreResult<()>;
+    /// Deletes one preset by preset name.
+    fn delete_preset(&self, name: &str) -> StoreResult<()>;
 }
 
 /// Persisted skill storage API.
@@ -181,13 +172,7 @@ pub trait ProcessShareableStore {
 
 /// Complete storage API used by CoCo application services.
 pub trait Store:
-    NodeStore
-    + BranchStore
-    + SessionStore
-    + BranchConfigStore
-    + SkillStore
-    + JobStore
-    + MessageQueueStore
+    NodeStore + BranchStore + SessionStore + PresetStore + SkillStore + JobStore + MessageQueueStore
 {
 }
 
@@ -195,7 +180,7 @@ impl<T> Store for T where
     T: NodeStore
         + BranchStore
         + SessionStore
-        + BranchConfigStore
+        + PresetStore
         + SkillStore
         + JobStore
         + MessageQueueStore

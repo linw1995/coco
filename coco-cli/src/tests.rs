@@ -16,8 +16,7 @@ use coco_llm::{
     ProviderRuntimeConfig, StepContext,
 };
 use coco_mem::{
-    BranchConfigStore, ProcessShareableStore, ProviderProfile, SessionState, SkillStore,
-    SkillVersionSpec,
+    PresetStore, ProcessShareableStore, ProviderProfile, SessionState, SkillStore, SkillVersionSpec,
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -3967,9 +3966,9 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(second_json["config"]["enable_coco_shim"], false);
     let persisted = open_store(&store_path)
         .unwrap()
-        .get_branch_config_record(preset_name)
+        .get_preset_record(preset_name)
         .unwrap()
-        .current_config()
+        .current_preset()
         .unwrap();
     assert_eq!(persisted.temperature, None);
     assert_eq!(persisted.max_tokens, None);
@@ -4134,7 +4133,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert!(
         open_store(&store_path)
             .unwrap()
-            .list_branch_config_records()
+            .list_preset_records()
             .unwrap()
             .is_empty()
     );

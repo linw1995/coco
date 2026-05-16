@@ -8,7 +8,7 @@ pub use error::{StoreError, StoreResult};
 pub use store::fs::FsStore;
 pub use store::memory::MemoryStore;
 pub use store::{
-    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, ProcessShareableStore,
+    BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, ProcessShareableStore,
     SessionStore, SkillStore, Store,
 };
 pub use types::*;

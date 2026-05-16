@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use coco_mem::{
-    BranchConfig, BranchConfigRecord, BranchConfigStore, BranchStore, Job, JobStatus, JobStore,
-    MessageQueueItem, MessageQueueStore, NewNode, Node, NodeStore, ProcessShareableStore,
-    SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillRecord, SkillStore,
-    SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    BranchStore, Job, JobStatus, JobStore, MessageQueueItem, MessageQueueStore, NewNode, Node,
+    NodeStore, Preset, PresetRecord, PresetStore, ProcessShareableStore, SessionAnchorPatch,
+    SessionRole, SessionState, SessionStore, SkillRecord, SkillStore, SkillUpdatePatch,
+    SkillVersionSpec, StoreResult,
 };
 
 use crate::ConsolePublisher;
@@ -121,36 +121,28 @@ where
     }
 }
 
-impl<S> BranchConfigStore for ConsoleStore<S>
+impl<S> PresetStore for ConsoleStore<S>
 where
-    S: BranchConfigStore,
+    S: PresetStore,
 {
-    fn list_branch_config_records(&self) -> StoreResult<HashMap<String, BranchConfigRecord>> {
-        self.inner.list_branch_config_records()
+    fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>> {
+        self.inner.list_preset_records()
     }
 
-    fn get_branch_config_record(&self, name: &str) -> StoreResult<BranchConfigRecord> {
-        self.inner.get_branch_config_record(name)
+    fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord> {
+        self.inner.get_preset_record(name)
     }
 
-    fn set_branch_config(
-        &self,
-        name: &str,
-        config: BranchConfig,
-    ) -> StoreResult<BranchConfigRecord> {
-        self.notify_if_ok(self.inner.set_branch_config(name, config))
+    fn set_preset(&self, name: &str, config: Preset) -> StoreResult<PresetRecord> {
+        self.notify_if_ok(self.inner.set_preset(name, config))
     }
 
-    fn rollback_branch_config(
-        &self,
-        name: &str,
-        target_version: u64,
-    ) -> StoreResult<BranchConfigRecord> {
-        self.notify_if_ok(self.inner.rollback_branch_config(name, target_version))
+    fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord> {
+        self.notify_if_ok(self.inner.rollback_preset(name, target_version))
     }
 
-    fn delete_branch_config(&self, name: &str) -> StoreResult<()> {
-        self.notify_if_ok(self.inner.delete_branch_config(name))
+    fn delete_preset(&self, name: &str) -> StoreResult<()> {
+        self.notify_if_ok(self.inner.delete_preset(name))
     }
 }
 

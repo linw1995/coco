@@ -1,4 +1,4 @@
-use coco_mem::{BranchConfig, BranchConfigRecord, BranchConfigStore, BranchConfigVersion};
+use coco_mem::{Preset, PresetRecord, PresetStore, PresetVersion};
 use serde::Serialize;
 use serde_json::Value;
 use snafu::prelude::*;
@@ -18,7 +18,7 @@ struct PresetSummaryView {
     name: String,
     current_version: u64,
     available_versions: Vec<u64>,
-    config: BranchConfig,
+    config: Preset,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -32,7 +32,7 @@ struct PresetShowView {
 struct PresetVersionView {
     version: u64,
     created_at: String,
-    config: BranchConfig,
+    config: Preset,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -46,7 +46,7 @@ pub(super) async fn run_preset_command<S>(
     provider_profiles: &ProviderProfiles,
 ) -> Result<Option<String>>
 where
-    S: BranchConfigStore,
+    S: PresetStore,
 {
     match command.command {
         PresetSubcommand::Set(command) => {
@@ -102,17 +102,17 @@ fn run_preset_set<S>(
     provider_profiles: &ProviderProfiles,
 ) -> Result<PresetSummaryView>
 where
-    S: BranchConfigStore,
+    S: PresetStore,
 {
     let name = command.name.clone();
-    let config = resolve_branch_config(command, provider_profiles)?;
-    let record = store.set_branch_config(&name, config).context(StoreSnafu)?;
+    let config = resolve_preset(command, provider_profiles)?;
+    let record = store.set_preset(&name, config).context(StoreSnafu)?;
     Ok(preset_summary_view(&record))
 }
 
-fn run_preset_list(store: &impl BranchConfigStore) -> Result<Vec<PresetSummaryView>> {
+fn run_preset_list(store: &impl PresetStore) -> Result<Vec<PresetSummaryView>> {
     let mut records = store
-        .list_branch_config_records()
+        .list_preset_records()
         .context(StoreSnafu)?
         .into_values()
         .collect::<Vec<_>>();
@@ -120,13 +120,8 @@ fn run_preset_list(store: &impl BranchConfigStore) -> Result<Vec<PresetSummaryVi
     Ok(records.iter().map(preset_summary_view).collect())
 }
 
-fn run_preset_show(
-    command: PresetNameCommand,
-    store: &impl BranchConfigStore,
-) -> Result<PresetShowView> {
-    let record = store
-        .get_branch_config_record(&command.name)
-        .context(StoreSnafu)?;
+fn run_preset_show(command: PresetNameCommand, store: &impl PresetStore) -> Result<PresetShowView> {
+    let record = store.get_preset_record(&command.name).context(StoreSnafu)?;
     Ok(PresetShowView {
         name: record.name,
         current_version: record.current_version,
@@ -136,34 +131,29 @@ fn run_preset_show(
 
 fn run_preset_rollback(
     command: PresetRollbackCommand,
-    store: &impl BranchConfigStore,
+    store: &impl PresetStore,
 ) -> Result<PresetSummaryView> {
     let record = store
-        .rollback_branch_config(&command.name, command.to_version)
+        .rollback_preset(&command.name, command.to_version)
         .context(StoreSnafu)?;
     Ok(preset_summary_view(&record))
 }
 
 fn run_preset_delete(
     command: PresetNameCommand,
-    store: &impl BranchConfigStore,
+    store: &impl PresetStore,
 ) -> Result<PresetDeleteResult> {
-    store
-        .delete_branch_config(&command.name)
-        .context(StoreSnafu)?;
+    store.delete_preset(&command.name).context(StoreSnafu)?;
     Ok(PresetDeleteResult { name: command.name })
 }
 
-fn resolve_branch_config(
-    command: PresetSetCommand,
-    store: &impl ProviderProfileLookup,
-) -> Result<BranchConfig> {
+fn resolve_preset(command: PresetSetCommand, store: &impl ProviderProfileLookup) -> Result<Preset> {
     let provider_profile = command.provider_profile;
     let profile = store
         .get_provider_profile(&provider_profile)
         .context(StoreSnafu)?;
 
-    Ok(BranchConfig {
+    Ok(Preset {
         role: command.role.into(),
         provider_profile,
         model: command
@@ -206,22 +196,22 @@ fn parse_preset_additional_params(additional_params: Option<String>) -> Result<O
     Ok(Some(value))
 }
 
-fn preset_summary_view(record: &BranchConfigRecord) -> PresetSummaryView {
+fn preset_summary_view(record: &PresetRecord) -> PresetSummaryView {
     PresetSummaryView {
         name: record.name.clone(),
         current_version: record.current_version,
         available_versions: record.versions.keys().copied().collect(),
         config: record
-            .current_config()
+            .current_preset()
             .expect("preset record should always have a current version"),
     }
 }
 
-fn preset_version_view(version: &BranchConfigVersion) -> PresetVersionView {
+fn preset_version_view(version: &PresetVersion) -> PresetVersionView {
     PresetVersionView {
         version: version.version,
         created_at: version.created_at.to_string(),
-        config: version.to_config(),
+        config: version.to_preset(),
     }
 }
 
@@ -287,7 +277,7 @@ fn render_preset_show_text(preset: &PresetShowView) -> String {
     lines.join("\n")
 }
 
-fn render_preset_config_summary(config: &BranchConfig) -> String {
+fn render_preset_config_summary(config: &Preset) -> String {
     format!(
         "role={} profile={} model={} shim={}",
         config.role.as_str(),

@@ -169,7 +169,7 @@ pub struct SessionAnchorPatch {
 
 /// Preset configuration for creating sessions and rebasing runtime defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BranchConfig {
+pub struct Preset {
     pub role: SessionRole,
     pub provider_profile: String,
     pub model: String,
@@ -217,19 +217,19 @@ pub struct GptProviderSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BranchConfigVersion {
+pub struct PresetVersion {
     pub version: u64,
     pub created_at: Timestamp,
     #[serde(flatten)]
-    pub config: BranchConfig,
+    pub config: Preset,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct BranchConfigRecord {
+pub struct PresetRecord {
     pub name: String,
     pub current_version: u64,
     #[serde(default)]
-    pub versions: BTreeMap<u64, BranchConfigVersion>,
+    pub versions: BTreeMap<u64, PresetVersion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -762,7 +762,7 @@ impl SessionAnchor {
     }
 }
 
-impl BranchConfig {
+impl Preset {
     /// Builds the runtime patch used by session rebase.
     ///
     /// The durable user prompt is intentionally excluded: changing it requires
@@ -924,8 +924,8 @@ impl BackendMetadataBuilder {
     }
 }
 
-impl BranchConfigVersion {
-    pub fn new(version: u64, config: BranchConfig) -> Self {
+impl PresetVersion {
+    pub fn new(version: u64, config: Preset) -> Self {
         Self {
             version,
             created_at: Timestamp::now(),
@@ -933,14 +933,14 @@ impl BranchConfigVersion {
         }
     }
 
-    pub fn to_config(&self) -> BranchConfig {
+    pub fn to_preset(&self) -> Preset {
         self.config.clone()
     }
 }
 
-impl BranchConfigRecord {
-    pub fn new(name: impl Into<String>, config: BranchConfig) -> Self {
-        let version = BranchConfigVersion::new(1, config);
+impl PresetRecord {
+    pub fn new(name: impl Into<String>, config: Preset) -> Self {
+        let version = PresetVersion::new(1, config);
         let current_version = version.version;
         let mut versions = BTreeMap::new();
         versions.insert(current_version, version);
@@ -952,28 +952,28 @@ impl BranchConfigRecord {
         }
     }
 
-    pub fn current(&self) -> Option<&BranchConfigVersion> {
+    pub fn current(&self) -> Option<&PresetVersion> {
         self.versions.get(&self.current_version)
     }
 
-    pub fn current_config(&self) -> Option<BranchConfig> {
-        self.current().map(BranchConfigVersion::to_config)
+    pub fn current_preset(&self) -> Option<Preset> {
+        self.current().map(PresetVersion::to_preset)
     }
 
-    pub fn update(&mut self, config: BranchConfig) -> Option<&BranchConfigVersion> {
+    pub fn update(&mut self, config: Preset) -> Option<&PresetVersion> {
         self.current()?;
         let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
-        let next = BranchConfigVersion::new(next_version, config);
+        let next = PresetVersion::new(next_version, config);
 
         self.current_version = next_version;
         self.versions.insert(next_version, next);
         self.current()
     }
 
-    pub fn rollback(&mut self, target_version: u64) -> Option<&BranchConfigVersion> {
-        let target = self.versions.get(&target_version)?.to_config();
+    pub fn rollback(&mut self, target_version: u64) -> Option<&PresetVersion> {
+        let target = self.versions.get(&target_version)?.to_preset();
         let next_version = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
-        let next = BranchConfigVersion::new(next_version, target);
+        let next = PresetVersion::new(next_version, target);
 
         self.current_version = next_version;
         self.versions.insert(next_version, next);
@@ -1115,8 +1115,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchor, BackendMetadata, BranchConfig, ExecutionMetadata, Kind, MergeParent, NewNode, Node,
-        NodeMetadata, PauseReason, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
+        Anchor, BackendMetadata, ExecutionMetadata, Kind, MergeParent, NewNode, Node, NodeMetadata,
+        PauseReason, Preset, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
         SessionAnchorPatch, SessionRole, SessionState, SkillInvocationAnchor, SkillInvocationMode,
         SkillResultAnchor, Tool, ToolResult, ToolUse,
     };
@@ -1731,7 +1731,7 @@ mod tests {
 
     #[test]
     fn branch_config_applies_session_and_role_settings() {
-        let updated = BranchConfig {
+        let updated = Preset {
             role: SessionRole::Runner,
             provider_profile: "anthropic-main".to_owned(),
             model: "claude-sonnet-4-20250514".to_owned(),

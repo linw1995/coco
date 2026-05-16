@@ -3,13 +3,12 @@ use std::sync::{Arc, RwLock};
 
 use super::state::StoreState;
 use super::{
-    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, SessionStore,
-    SkillStore,
+    BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, SessionStore, SkillStore,
 };
 use crate::StoreResult as Result;
 use crate::{
-    BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
-    SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
+    Job, JobStatus, MessageQueueItem, NewNode, Node, Preset, PresetRecord, SessionAnchorPatch,
+    SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
 };
 
 #[derive(Clone, Debug)]
@@ -150,45 +149,41 @@ impl SessionStore for MemoryStore {
     }
 }
 
-impl BranchConfigStore for MemoryStore {
-    fn list_branch_config_records(&self) -> Result<HashMap<String, BranchConfigRecord>> {
+impl PresetStore for MemoryStore {
+    fn list_preset_records(&self) -> Result<HashMap<String, PresetRecord>> {
         Ok(self
             .inner
             .read()
             .expect("store lock poisoned")
-            .list_branch_config_records())
+            .list_preset_records())
     }
 
-    fn get_branch_config_record(&self, name: &str) -> Result<BranchConfigRecord> {
+    fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
         self.inner
             .read()
             .expect("store lock poisoned")
-            .get_branch_config_record(name)
+            .get_preset_record(name)
     }
 
-    fn set_branch_config(&self, name: &str, config: BranchConfig) -> Result<BranchConfigRecord> {
+    fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
         self.inner
             .write()
             .expect("store lock poisoned")
-            .set_branch_config(name, config)
+            .set_preset(name, config)
     }
 
-    fn rollback_branch_config(
-        &self,
-        name: &str,
-        target_version: u64,
-    ) -> Result<BranchConfigRecord> {
+    fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
         self.inner
             .write()
             .expect("store lock poisoned")
-            .rollback_branch_config(name, target_version)
+            .rollback_preset(name, target_version)
     }
 
-    fn delete_branch_config(&self, name: &str) -> Result<()> {
+    fn delete_preset(&self, name: &str) -> Result<()> {
         self.inner
             .write()
             .expect("store lock poisoned")
-            .delete_branch_config(name)
+            .delete_preset(name)
     }
 }
 
