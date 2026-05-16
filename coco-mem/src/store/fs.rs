@@ -59,26 +59,31 @@ const BUILTIN_SKILL_MIGRATIONS_2026_05_16: &[BuiltinSkillMigration] = &[
         role: SessionRole::Orchestrator,
         name: "coco-orchestrator",
         from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+        target_revision_id: BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "new-skill",
         from_revision_ids: &[BUILTIN_NEW_SKILL_REVISION_ID],
+        target_revision_id: BUILTIN_NEW_SKILL_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "cronjob",
         from_revision_ids: &[BUILTIN_CRONJOB_REVISION_ID],
+        target_revision_id: BUILTIN_CRONJOB_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Runner,
         name: "coco-runner",
         from_revision_ids: &[BUILTIN_COCO_RUNNER_REVISION_ID],
+        target_revision_id: BUILTIN_COCO_RUNNER_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Runner,
         name: "telegram",
         from_revision_ids: &[BUILTIN_TELEGRAM_REVISION_ID],
+        target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
     },
 ];
 const STORE_MIGRATIONS: &[StoreMigration] = &[StoreMigration {
@@ -145,6 +150,7 @@ struct BuiltinSkillMigration {
     role: SessionRole,
     name: &'static str,
     from_revision_ids: &'static [&'static str],
+    target_revision_id: &'static str,
 }
 
 #[derive(Debug, Default)]
@@ -1457,6 +1463,15 @@ fn migrate_builtin_skills(
         let Some(default_version) = default_record.current().cloned() else {
             continue;
         };
+        if default_version.id != migration.target_revision_id {
+            tracing::warn!(
+                role = migration.role.as_str(),
+                skill = migration.name,
+                expected_revision = migration.target_revision_id,
+                actual_revision = %default_version.id,
+                "builtin skill migration target revision does not match compiled default skill"
+            );
+        }
         let records = groups.for_role_mut(migration.role);
         let Some(record) = records.get_mut(migration.name) else {
             tracing::info!(
@@ -2762,9 +2777,32 @@ where
 mod builtin_skill_migration_tests {
     use super::{
         BUILTIN_COCO_ORCHESTRATOR_REVISION_ID, BuiltinSkillMigration, BuiltinSkillMigrationAction,
-        SessionRole, SkillVersion, SkillVersionSpec, builtin_skill_migration_action,
-        default_skill_groups,
+        STORE_MIGRATIONS, SessionRole, SkillVersion, SkillVersionSpec,
+        builtin_skill_migration_action, default_skill_groups,
     };
+
+    #[test]
+    fn store_migration_builtin_targets_match_current_defaults() {
+        let defaults = default_skill_groups();
+
+        for store_migration in STORE_MIGRATIONS {
+            for builtin_migration in store_migration.builtin_skills {
+                let default_record = defaults
+                    .for_role(builtin_migration.role)
+                    .get(builtin_migration.name)
+                    .expect("builtin migration should point at a default skill");
+                let default_version = default_record
+                    .current()
+                    .expect("default skill should have a current version");
+
+                assert_eq!(
+                    builtin_migration.target_revision_id, default_version.id,
+                    "builtin skill changes must update the store migration version and target revision for {}",
+                    builtin_migration.name
+                );
+            }
+        }
+    }
 
     #[test]
     fn updates_known_builtin_revision_to_new_target() {
@@ -2788,6 +2826,7 @@ mod builtin_skill_migration_tests {
             role: SessionRole::Orchestrator,
             name: "coco-orchestrator",
             from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+            target_revision_id: "new-target-revision",
         };
         assert_eq!(
             builtin_skill_migration_action(&migration, record, &target),
@@ -2822,6 +2861,7 @@ mod builtin_skill_migration_tests {
             role: SessionRole::Orchestrator,
             name: "coco-orchestrator",
             from_revision_ids: &["known-builtin-revision"],
+            target_revision_id: "new-target-revision",
         };
 
         assert_eq!(
