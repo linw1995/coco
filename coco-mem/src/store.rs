@@ -11,8 +11,8 @@ mod tests;
 
 use crate::{
     BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
-    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch,
-    SkillVersionSpec, StoreResult,
+    SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
+    StoreResult,
 };
 
 /// Node graph storage API used by CoCo services.
@@ -106,15 +106,6 @@ pub trait BranchConfigStore {
 
     /// Deletes one branch preset config by preset name.
     fn delete_branch_config(&self, name: &str) -> StoreResult<()>;
-}
-
-/// Provider profile lookup API.
-pub trait ProviderProfileStore {
-    /// Returns all provider profiles keyed by profile name.
-    fn list_provider_profiles(&self) -> StoreResult<HashMap<String, ProviderProfile>>;
-
-    /// Returns one provider profile by profile name.
-    fn get_provider_profile(&self, name: &str) -> StoreResult<ProviderProfile>;
 }
 
 /// Persisted skill storage API.

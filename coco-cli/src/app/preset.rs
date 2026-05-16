@@ -1,13 +1,11 @@
-use coco_mem::{
-    BranchConfig, BranchConfigRecord, BranchConfigStore, BranchConfigVersion, ProviderProfileStore,
-};
+use coco_mem::{BranchConfig, BranchConfigRecord, BranchConfigStore, BranchConfigVersion};
 use serde::Serialize;
 use serde_json::Value;
 use snafu::prelude::*;
 
 use crate::{
     Result,
-    app::config::ProviderProfiles,
+    app::config::{ProviderProfileLookup, ProviderProfiles},
     cli::{
         CliTool, PresetCommand, PresetNameCommand, PresetRollbackCommand, PresetSetCommand,
         PresetSubcommand,
@@ -158,7 +156,7 @@ fn run_preset_delete(
 
 fn resolve_branch_config(
     command: PresetSetCommand,
-    store: &impl ProviderProfileStore,
+    store: &impl ProviderProfileLookup,
 ) -> Result<BranchConfig> {
     let provider_profile = command.provider_profile;
     let profile = store

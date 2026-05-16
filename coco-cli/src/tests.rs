@@ -16,8 +16,8 @@ use coco_llm::{
     ProviderRuntimeConfig, StepContext,
 };
 use coco_mem::{
-    BranchConfigStore, ProcessShareableStore, ProviderProfile, ProviderProfileStore, SessionState,
-    SkillStore, SkillVersionSpec,
+    BranchConfigStore, ProcessShareableStore, ProviderProfile, SessionState, SkillStore,
+    SkillVersionSpec,
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -28,7 +28,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::{
     Cli,
     app::{
-        config::{ChannelConfigs, ProviderProfiles},
+        config::{ChannelConfigs, ProviderProfileLookup, ProviderProfiles},
         daemon::{
             DaemonServerOptions, ensure_initial_session, resume_incomplete_jobs,
             start_daemon_server,

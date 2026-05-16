@@ -3,14 +3,13 @@ use std::sync::{Arc, RwLock};
 
 use super::state::StoreState;
 use super::{
-    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, ProviderProfileStore,
-    SessionStore, SkillStore,
+    BranchConfigStore, BranchStore, JobStore, MessageQueueStore, NodeStore, SessionStore,
+    SkillStore,
 };
 use crate::StoreResult as Result;
 use crate::{
     BranchConfig, BranchConfigRecord, Job, JobStatus, MessageQueueItem, NewNode, Node,
-    ProviderProfile, SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch,
-    SkillVersionSpec,
+    SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
 };
 
 #[derive(Clone, Debug)]
@@ -204,23 +203,6 @@ impl BranchConfigStore for MemoryStore {
             .write()
             .expect("store lock poisoned")
             .delete_branch_config(name)
-    }
-}
-
-impl ProviderProfileStore for MemoryStore {
-    fn list_provider_profiles(&self) -> Result<HashMap<String, ProviderProfile>> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .list_provider_profiles())
-    }
-
-    fn get_provider_profile(&self, name: &str) -> Result<ProviderProfile> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_provider_profile(name)
     }
 }
 

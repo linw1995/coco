@@ -7,7 +7,7 @@ use coco_llm::{
 };
 use coco_mem::{
     AnchorPayload, BranchConfigStore, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason,
-    ProviderProfileStore, SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
+    SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -15,7 +15,7 @@ use snafu::prelude::*;
 
 use crate::{
     Result,
-    app::config::ProviderProfiles,
+    app::config::{ProviderProfileLookup, ProviderProfiles},
     cli::{CliTool, SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand},
     env::resolve_env_tools,
     error::{
@@ -324,7 +324,7 @@ where
 
 pub fn resolve_session_config(
     command: SessionCreateCommand,
-    store: &impl ProviderProfileStore,
+    store: &impl ProviderProfileLookup,
 ) -> Result<SessionConfig> {
     let provider_profile = resolve_create_provider_profile(command.provider_profile, store)?;
     let profile = store
@@ -364,7 +364,7 @@ pub fn resolve_session_config(
 
 fn resolve_create_provider_profile(
     explicit: Option<String>,
-    store: &impl ProviderProfileStore,
+    store: &impl ProviderProfileLookup,
 ) -> Result<String> {
     if let Some(explicit) = explicit {
         return Ok(explicit);
@@ -1385,7 +1385,7 @@ fn resolve_visible_session_anchor(
 fn resolve_session_rebase(
     command: SessionRebaseCommand,
     store: &impl BranchConfigStore,
-    provider_profiles: &impl ProviderProfileStore,
+    provider_profiles: &impl ProviderProfileLookup,
 ) -> Result<ResolvedSessionRebase> {
     let mut patch = command
         .preset
@@ -1442,7 +1442,7 @@ fn resolve_session_rebase(
 
 fn branch_config_to_session_anchor_patch(
     config: &coco_mem::BranchConfig,
-    store: &impl ProviderProfileStore,
+    store: &impl ProviderProfileLookup,
 ) -> Result<SessionConfigPatch> {
     store
         .get_provider_profile(&config.provider_profile)

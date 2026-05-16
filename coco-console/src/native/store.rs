@@ -4,8 +4,8 @@ use std::path::Path;
 use coco_mem::{
     BranchConfig, BranchConfigRecord, BranchConfigStore, BranchStore, Job, JobStatus, JobStore,
     MessageQueueItem, MessageQueueStore, NewNode, Node, NodeStore, ProcessShareableStore,
-    ProviderProfile, ProviderProfileStore, SessionAnchorPatch, SessionRole, SessionState,
-    SessionStore, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillRecord, SkillStore,
+    SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 use crate::ConsolePublisher;
@@ -159,19 +159,6 @@ where
 
     fn delete_branch_config(&self, name: &str) -> StoreResult<()> {
         self.notify_if_ok(self.inner.delete_branch_config(name))
-    }
-}
-
-impl<S> ProviderProfileStore for ConsoleStore<S>
-where
-    S: ProviderProfileStore,
-{
-    fn list_provider_profiles(&self) -> StoreResult<HashMap<String, ProviderProfile>> {
-        self.inner.list_provider_profiles()
-    }
-
-    fn get_provider_profile(&self, name: &str) -> StoreResult<ProviderProfile> {
-        self.inner.get_provider_profile(name)
     }
 }
 

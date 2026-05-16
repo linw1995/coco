@@ -10,7 +10,7 @@ use coco_llm::{
     CocoCliRuntimeResponse, CompletionBackend, LlmRuntimeBridge, LlmService, ProviderRuntimeConfig,
     RigBackend, UnifiedExecCliBridgeHandle,
 };
-use coco_mem::{ProcessShareableStore, ProviderProfileStore, Store};
+use coco_mem::{ProcessShareableStore, Store};
 use snafu::prelude::*;
 
 #[cfg(test)]
@@ -198,7 +198,7 @@ where
 }
 
 fn resolve_provider_runtime_configs(
-    store: &impl ProviderProfileStore,
+    store: &impl config::ProviderProfileLookup,
 ) -> Result<HashMap<String, ProviderRuntimeConfig>> {
     store
         .list_provider_profiles()
