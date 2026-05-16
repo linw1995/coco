@@ -6,10 +6,10 @@ use snafu::prelude::*;
 
 use crate::StoreResult as Result;
 use crate::error::{
-    AmbiguousNodePrefixSnafu, BranchConfigNotFoundSnafu, BranchConfigVersionNotFoundSnafu,
-    BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu, DuplicateMergeParentSnafu,
-    InvalidAnchorSnafu, InvalidSkillNameSnafu, MergeParentMatchesParentSnafu,
-    MissingSessionAnchorSnafu, MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu,
+    AmbiguousNodePrefixSnafu, BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu,
+    DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSkillNameSnafu,
+    MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, MultipleShadowParentsSnafu,
+    NotFoundSnafu, ParentNotFoundSnafu, PresetNotFoundSnafu, PresetVersionNotFoundSnafu,
     PromptJobActiveOnBranchSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
     RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu,
     SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
@@ -27,7 +27,7 @@ pub struct StoreState {
     pub root: String,
     pub branches: HashMap<String, String>,
     pub sessions: HashMap<String, SessionState>,
-    pub branch_configs: HashMap<String, PresetRecord>,
+    pub presets: HashMap<String, PresetRecord>,
     pub jobs: HashMap<String, Job>,
     pub message_queues: HashMap<String, Vec<MessageQueueItem>>,
     pub skill_groups: SkillGroups,
@@ -74,7 +74,7 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
-            branch_configs: HashMap::new(),
+            presets: HashMap::new(),
             jobs: HashMap::new(),
             message_queues: HashMap::new(),
             skill_groups: default_skill_groups(),
@@ -92,7 +92,7 @@ impl StoreState {
             root: root_id,
             branches: HashMap::new(),
             sessions: HashMap::new(),
-            branch_configs: HashMap::new(),
+            presets: HashMap::new(),
             jobs: HashMap::new(),
             message_queues: HashMap::new(),
             skill_groups: default_skill_groups(),
@@ -313,46 +313,41 @@ impl StoreState {
     }
 
     pub fn list_preset_records(&self) -> HashMap<String, PresetRecord> {
-        self.branch_configs.clone()
+        self.presets.clone()
     }
 
     pub fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
-        self.branch_configs
+        self.presets
             .get(name)
             .cloned()
-            .context(BranchConfigNotFoundSnafu {
+            .context(PresetNotFoundSnafu {
                 name: name.to_owned(),
             })
     }
 
     pub fn set_preset(&mut self, name: &str, config: Preset) -> Result<PresetRecord> {
-        let record = if let Some(record) = self.branch_configs.get_mut(name) {
+        let record = if let Some(record) = self.presets.get_mut(name) {
             let current_version = record.current_version;
-            record
-                .update(config)
-                .context(BranchConfigVersionNotFoundSnafu {
-                    name: name.to_owned(),
-                    version: current_version,
-                })?;
+            record.update(config).context(PresetVersionNotFoundSnafu {
+                name: name.to_owned(),
+                version: current_version,
+            })?;
             record.clone()
         } else {
             let record = PresetRecord::new(name.to_owned(), config);
-            self.branch_configs.insert(name.to_owned(), record.clone());
+            self.presets.insert(name.to_owned(), record.clone());
             record
         };
         Ok(record)
     }
 
     pub fn rollback_preset(&mut self, name: &str, target_version: u64) -> Result<PresetRecord> {
-        let record = self
-            .branch_configs
-            .get_mut(name)
-            .context(BranchConfigNotFoundSnafu {
-                name: name.to_owned(),
-            })?;
+        let record = self.presets.get_mut(name).context(PresetNotFoundSnafu {
+            name: name.to_owned(),
+        })?;
         record
             .rollback(target_version)
-            .context(BranchConfigVersionNotFoundSnafu {
+            .context(PresetVersionNotFoundSnafu {
                 name: name.to_owned(),
                 version: target_version,
             })?;
@@ -360,10 +355,10 @@ impl StoreState {
     }
 
     pub fn delete_preset(&mut self, name: &str) -> Result<()> {
-        self.branch_configs
+        self.presets
             .remove(name)
             .map(|_| ())
-            .context(BranchConfigNotFoundSnafu {
+            .context(PresetNotFoundSnafu {
                 name: name.to_owned(),
             })
     }

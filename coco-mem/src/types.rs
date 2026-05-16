@@ -1730,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_config_applies_session_and_role_settings() {
+    fn preset_applies_session_and_role_settings() {
         let updated = Preset {
             role: SessionRole::Runner,
             provider_profile: "anthropic-main".to_owned(),

@@ -67,7 +67,7 @@ fn current_preset(store: &impl PresetStore, name: &str) -> std::result::Result<P
     let record = store.get_preset_record(name)?;
     record
         .current_preset()
-        .ok_or_else(|| Error::BranchConfigVersionNotFound {
+        .ok_or_else(|| Error::PresetVersionNotFound {
             name: name.to_owned(),
             version: record.current_version,
         })
@@ -1084,12 +1084,12 @@ where
     assert!(store.list_preset_records().unwrap().is_empty());
     assert!(matches!(
         store.get_preset_record(preset_name),
-        Err(Error::BranchConfigNotFound { name }) if name == preset_name
+        Err(Error::PresetNotFound { name }) if name == preset_name
     ));
     assert_eq!(store.get_branch_head("main").unwrap(), root_id);
 }
 
-fn assert_delete_branch_preserves_branch_config_preset<F>()
+fn assert_delete_branch_preserves_preset<F>()
 where
     F: TestStoreFactory,
 {
@@ -1119,7 +1119,7 @@ where
 
     assert!(matches!(
         err,
-        Error::BranchConfigNotFound { name } if name == "missing-preset"
+        Error::PresetNotFound { name } if name == "missing-preset"
     ));
 }
 
@@ -1133,7 +1133,7 @@ where
 
     assert!(matches!(
         err,
-        Error::BranchConfigNotFound { name } if name == "missing-preset"
+        Error::PresetNotFound { name } if name == "missing-preset"
     ));
 }
 
@@ -2090,8 +2090,8 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
-            fn delete_branch_preserves_branch_config_preset() {
-                assert_delete_branch_preserves_branch_config_preset::<$factory>();
+            fn delete_branch_preserves_preset() {
+                assert_delete_branch_preserves_preset::<$factory>();
             }
 
             #[test]
@@ -2387,7 +2387,7 @@ fn open_read_only_does_not_create_missing_history_directories() {
 }
 
 #[test]
-fn open_replays_branch_configs() {
+fn open_replays_presets() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let preset_name = "coding";
@@ -2406,7 +2406,7 @@ fn open_replays_branch_configs() {
 }
 
 #[test]
-fn branch_configs_json_only_stores_current_snapshots() {
+fn presets_json_only_stores_current_snapshots() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let preset_name = "coding";
@@ -2435,7 +2435,7 @@ fn branch_configs_json_only_stores_current_snapshots() {
 }
 
 #[test]
-fn branch_config_history_is_appended_in_history_directory() {
+fn preset_history_is_appended_in_legacy_history_directory() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let preset_name = "coding";
@@ -2477,7 +2477,7 @@ fn open_creates_missing_branch_config_metadata_for_legacy_store() {
 }
 
 #[test]
-fn open_does_not_restore_deleted_branch_config() {
+fn open_does_not_restore_deleted_preset() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let preset_name = "coding";
@@ -2493,7 +2493,7 @@ fn open_does_not_restore_deleted_branch_config() {
 
     assert!(matches!(
         reopened.get_preset_record(preset_name),
-        Err(Error::BranchConfigNotFound { name }) if name == preset_name
+        Err(Error::PresetNotFound { name }) if name == preset_name
     ));
     assert!(!path.join("branch-config-history/coding.jsonl").exists());
 }

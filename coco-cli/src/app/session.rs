@@ -1394,7 +1394,7 @@ fn resolve_session_rebase(
             let record = store.get_preset_record(name).context(StoreSnafu)?;
             let config = record
                 .current_preset()
-                .ok_or_else(|| StoreError::BranchConfigVersionNotFound {
+                .ok_or_else(|| StoreError::PresetVersionNotFound {
                     name: name.to_owned(),
                     version: record.current_version,
                 })
