@@ -8,7 +8,10 @@ use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
 use coco_core::{ConversationEngine, CoreService, EngineError, FixedBranchResolver};
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::{JobStatus, MessageQueueItem, SessionRole, Store};
+use coco_mem::{
+    JobStatus, LlmFailureSystemMessage, MessageQueueItem, SYSTEM_MESSAGE_QUEUE, SessionRole, Store,
+    SystemMessage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
@@ -34,6 +37,8 @@ use crate::{
 };
 
 const DEFAULT_SESSION_BRANCH: &str = "main";
+const GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES: &[&str] =
+    &["Brother Dawn", "Brother Day", "Brother Dusk"];
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
@@ -117,20 +122,25 @@ where
         return Ok(());
     }
 
-    let config = resolve_session_config(default_session_create_command(), provider_profiles)?;
-    tracing::info!(
-        branch = %config.branch,
-        max_tokens = config.max_tokens,
-        tool_count = config.tools.len(),
-        "creating default session on empty store"
-    );
-    llm.create_session(config).await.context(LlmSnafu)?;
+    for branch in std::iter::once(DEFAULT_SESSION_BRANCH)
+        .chain(GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES.iter().copied())
+    {
+        let config =
+            resolve_session_config(default_session_create_command(branch), provider_profiles)?;
+        tracing::info!(
+            branch = %config.branch,
+            max_tokens = config.max_tokens,
+            tool_count = config.tools.len(),
+            "creating default orchestrator session on empty store"
+        );
+        llm.create_session(config).await.context(LlmSnafu)?;
+    }
     Ok(())
 }
 
-fn default_session_create_command() -> SessionCreateCommand {
+fn default_session_create_command(branch: &str) -> SessionCreateCommand {
     SessionCreateCommand {
-        branch: DEFAULT_SESSION_BRANCH.to_owned(),
+        branch: branch.to_owned(),
         role: CliSessionRole::Orchestrator,
         provider_profile: None,
         system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
@@ -315,8 +325,7 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let worker =
-        PromptJobMessageQueueWorker::new(shared_store.clone(), shared_engine.as_ref().clone());
+    let worker = MessageQueueWorker::new(shared_store.clone(), shared_engine.as_ref().clone());
     tokio::spawn(async move { worker.run().await })
 }
 
@@ -367,6 +376,50 @@ where
     })))
 }
 
+#[derive(Debug, Snafu)]
+enum SystemQueuePayloadError {
+    #[snafu(display("Failed to decode system queue payload: {source}"))]
+    DecodeSystem { source: serde_json::Error },
+}
+
+#[cfg(test)]
+fn encode_system_message(message: SystemMessage) -> serde_json::Value {
+    serde_json::to_value(message).expect("system message should serialize")
+}
+
+fn decode_system_message(
+    payload: serde_json::Value,
+) -> std::result::Result<SystemMessage, SystemQueuePayloadError> {
+    serde_json::from_value(payload).context(DecodeSystemSnafu)
+}
+
+fn llm_failure_recovery_prompt(message: &LlmFailureSystemMessage) -> String {
+    format!(
+        "\
+You are handling a CoCo system recovery event after an LLM completion failed.
+
+Failure context:
+- branch: {branch}
+- execution_id: {execution_id}
+- error_node_id: {error_node_id}
+- retry_from_node_id: {retry_from_node_id}
+- error: {error}
+
+Required workflow:
+- Inspect the current branch and the failure context before taking action.
+- Use `coco skill run recovery --handoff <task>` when the branch needs a focused recovery workflow.
+- Use `coco skill run compact --handoff <task>` first when the failure looks caused by excessive or noisy context; compact work must happen on an isolated branch with a fresh session anchor, never directly on the failed branch.
+- Preserve the failed node for auditability and continue from the safest recoverable point.
+- Return a concise status with the chosen action and final branch state.
+",
+        branch = message.branch,
+        execution_id = message.execution_id,
+        error_node_id = message.error_node_id,
+        retry_from_node_id = message.retry_from_node_id,
+        error = message.message,
+    )
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct QueuedTelegramMessage {
     chat_id: String,
@@ -387,12 +440,25 @@ enum PromptJobQueuePayloadError {
     DecodePromptJob { source: serde_json::Error },
 }
 
-struct PromptJobMessageQueueWorker<B, S> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueDrain {
+    Idle,
+    Progress,
+    Blocked,
+}
+
+impl QueueDrain {
+    fn made_progress(self) -> bool {
+        matches!(self, Self::Progress)
+    }
+}
+
+struct MessageQueueWorker<B, S> {
     store: S,
     engine: ConversationEngine<B, S>,
 }
 
-impl<B, S> PromptJobMessageQueueWorker<B, S> {
+impl<B, S> MessageQueueWorker<B, S> {
     fn new(store: S, engine: ConversationEngine<B, S>) -> Self {
         Self { store, engine }
     }
@@ -403,15 +469,136 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         S: Store + Clone + Send + Sync + 'static,
     {
         loop {
-            self.drain_once().await?;
+            if !self.drain_once().await?.made_progress() {
+                tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
+            }
         }
     }
 
-    async fn drain_once(&self) -> Result<()>
+    async fn drain_once(&self) -> Result<QueueDrain>
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
+        let prompt_jobs = self.drain_prompt_queue_once().await?;
+        let system = self.drain_system_queue_once().await?;
+
+        Ok(if prompt_jobs.made_progress() || system.made_progress() {
+            QueueDrain::Progress
+        } else if matches!(prompt_jobs, QueueDrain::Blocked) {
+            QueueDrain::Blocked
+        } else {
+            QueueDrain::Idle
+        })
+    }
+
+    async fn drain_system_queue_once(&self) -> Result<QueueDrain>
+    where
+        B: CompletionBackend + 'static,
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        let mut handled = 0;
+        while let Some(item) = self
+            .store
+            .dequeue_message(SYSTEM_MESSAGE_QUEUE)
+            .context(StoreSnafu)?
+        {
+            handled += 1;
+            self.handle_system_item(item).await;
+        }
+        Ok(if handled > 0 {
+            QueueDrain::Progress
+        } else {
+            QueueDrain::Idle
+        })
+    }
+
+    async fn handle_system_item(&self, item: MessageQueueItem)
+    where
+        B: CompletionBackend + 'static,
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        let message = match decode_system_message(item.payload.clone()) {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::error!(
+                    message_id = %item.message_id,
+                    queue = SYSTEM_MESSAGE_QUEUE,
+                    error = %error,
+                    "discarded invalid system queue message"
+                );
+                return;
+            }
+        };
+
+        match message {
+            SystemMessage::LlmFailure(message) => self.handle_llm_failure(item, message).await,
+        }
+    }
+
+    async fn handle_llm_failure(&self, item: MessageQueueItem, message: LlmFailureSystemMessage)
+    where
+        B: CompletionBackend + 'static,
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        tracing::info!(
+            message_id = %item.message_id,
+            queue = SYSTEM_MESSAGE_QUEUE,
+            branch = %message.branch,
+            execution_id = %message.execution_id,
+            error_node_id = %message.error_node_id,
+            retry_from_node_id = %message.retry_from_node_id,
+            "handling queued llm failure system message"
+        );
+
+        if let Err(error) =
+            wait_for_branch_to_accept_channel_prompt(&self.engine, &message.branch).await
+        {
+            tracing::error!(
+                message_id = %item.message_id,
+                queue = SYSTEM_MESSAGE_QUEUE,
+                branch = %message.branch,
+                error = %error,
+                "queued llm failure message failed while waiting for branch"
+            );
+            return;
+        }
+
+        let prompt = llm_failure_recovery_prompt(&message);
+        let overrides = coco_llm::CompletionOverrides {
+            suppress_failure_queue: true,
+            ..Default::default()
+        };
+        match self
+            .engine
+            .reply_with_overrides(&message.branch, &prompt, vec![], None, overrides)
+            .await
+        {
+            Ok(response) => tracing::debug!(
+                message_id = %item.message_id,
+                queue = SYSTEM_MESSAGE_QUEUE,
+                branch = %message.branch,
+                execution_id = %message.execution_id,
+                response_bytes = response.len(),
+                "handled queued llm failure system message"
+            ),
+            Err(error) => tracing::error!(
+                message_id = %item.message_id,
+                queue = SYSTEM_MESSAGE_QUEUE,
+                branch = %message.branch,
+                execution_id = %message.execution_id,
+                error = %error,
+                "queued llm failure system message failed"
+            ),
+        }
+    }
+
+    async fn drain_prompt_queue_once(&self) -> Result<QueueDrain>
+    where
+        B: CompletionBackend + 'static,
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        let mut made_progress = false;
         while let Some(item) = self.peek_prompt_queue_head()? {
             match decode_prompt_job_message(item.payload.clone()) {
                 Ok(request) => {
@@ -419,9 +606,13 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                         .handle_prompt_request_queue_head(&item, &request)
                         .await?
                     {
-                        tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
-                        return Ok(());
+                        return Ok(if made_progress {
+                            QueueDrain::Progress
+                        } else {
+                            QueueDrain::Blocked
+                        });
                     }
+                    made_progress = true;
                 }
                 Err(_) => {
                     let Some(item) = self
@@ -431,12 +622,16 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     else {
                         continue;
                     };
-                    self.handle_item(item).await;
+                    self.handle_prompt_item(item).await;
+                    made_progress = true;
                 }
             }
         }
-        tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
-        Ok(())
+        Ok(if made_progress {
+            QueueDrain::Progress
+        } else {
+            QueueDrain::Idle
+        })
     }
 
     fn peek_prompt_queue_head(&self) -> Result<Option<MessageQueueItem>>
@@ -525,7 +720,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 else {
                     return Ok(true);
                 };
-                self.handle_item(item).await;
+                self.handle_prompt_item(item).await;
                 return Ok(true);
             }
         };
@@ -591,7 +786,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         else {
             return Ok(true);
         };
-        self.handle_item(item).await;
+        self.handle_prompt_item(item).await;
         Ok(true)
     }
 
@@ -627,7 +822,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         }
     }
 
-    async fn handle_item(&self, item: MessageQueueItem)
+    async fn handle_prompt_item(&self, item: MessageQueueItem)
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
@@ -1074,6 +1269,12 @@ async fn wait_daemon_tasks<B, S>(
             message_queue_result.context(JoinMessageQueueTaskSnafu)??;
             Ok(())
         }
+        else => {
+            abort_message_queue_task(message_queue_task).await?;
+            llm.cleanup_runtime_processes().await;
+            cleanup_socket(&socket_path);
+            Ok(())
+        }
     }
 }
 
@@ -1200,6 +1401,7 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashMap};
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
@@ -1214,16 +1416,21 @@ mod tests {
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
         SessionConfig, StepContext,
     };
-    use coco_mem::{JobStatus, MemoryStore, MessageQueueStore, SessionRole};
+    use coco_mem::{
+        AnchorPayload, JobStatus, LlmFailureSystemMessage, MemoryStore, MessageQueueStore,
+        NodeStore, ProviderProfile, SessionRole, SessionState, SessionStore, SystemMessage,
+    };
     use serde_json::json;
     use tokio::sync::Notify;
 
-    use crate::app::prompt::QueuedPromptRequest;
+    use crate::app::{config::ProviderProfiles, prompt::QueuedPromptRequest};
 
     use super::{
-        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_telegram_message,
-        encode_telegram_message, resolve_daemon_socket_path,
+        DEFAULT_SESSION_BRANCH, GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES, MessageQueueWorker,
+        PROMPT_JOB_QUEUE, QueueDrain, SYSTEM_MESSAGE_QUEUE, TELEGRAM_INBOUND_QUEUE,
+        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_system_message,
+        decode_telegram_message, encode_system_message, encode_telegram_message,
+        ensure_initial_session, resolve_daemon_socket_path,
     };
 
     #[test]
@@ -1241,6 +1448,62 @@ mod tests {
         let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
 
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn system_queue_payload_round_trips_llm_failure_message() {
+        let message = SystemMessage::LlmFailure(LlmFailureSystemMessage {
+            branch: "main".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            error_node_id: "failure-node".to_owned(),
+            retry_from_node_id: "retry-node".to_owned(),
+            message: "rate limited".to_owned(),
+        });
+
+        let decoded = decode_system_message(encode_system_message(message.clone())).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[tokio::test]
+    async fn ensure_initial_session_creates_genetic_dynasty_orchestrators() {
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(store.clone(), ImmediateBackend));
+        let provider_profiles = ProviderProfiles::from_profiles(HashMap::from([(
+            "openai-codex".to_owned(),
+            ProviderProfile {
+                provider: "openai".to_owned(),
+                secrets: BTreeMap::new(),
+                base_url: None,
+                default_model: Some("gpt-4.1-mini".to_owned()),
+                spec: Default::default(),
+            },
+        )]));
+
+        ensure_initial_session(&store, &llm, &provider_profiles)
+            .await
+            .unwrap();
+
+        let states = store.list_session_states().unwrap();
+        let expected_branches = std::iter::once(DEFAULT_SESSION_BRANCH)
+            .chain(GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(states.len(), expected_branches.len());
+        for branch in expected_branches {
+            assert_eq!(states.get(branch), Some(&SessionState::Active));
+            let ancestry = store.ancestry(branch).unwrap();
+            let session = ancestry
+                .iter()
+                .find_map(|node| match &node.kind {
+                    coco_mem::Kind::Anchor(anchor) => match &anchor.payload {
+                        AnchorPayload::Session(session) => Some(session.as_ref()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("initialized branch should have a session anchor");
+            assert_eq!(session.role, SessionRole::Orchestrator);
+        }
     }
 
     #[tokio::test]
@@ -1358,7 +1621,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
+        let worker = MessageQueueWorker::new(store.clone(), engine.clone());
         let drain_task = tokio::spawn(async move { worker.drain_once().await });
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
         assert!(engine.get_job("job-request").is_err());
@@ -1403,7 +1666,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
+        let worker = MessageQueueWorker::new(store.clone(), engine.clone());
 
         worker.drain_once().await.unwrap();
 
@@ -1439,7 +1702,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine);
+        let worker = MessageQueueWorker::new(store.clone(), engine);
 
         worker.drain_once().await.unwrap();
 
@@ -1452,10 +1715,76 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn system_queue_worker_submits_llm_failure_recovery_prompt() {
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(store.clone(), ImmediateBackend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let failure = LlmFailureSystemMessage {
+            branch: "main".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            error_node_id: "failure-node".to_owned(),
+            retry_from_node_id: "retry-node".to_owned(),
+            message: "rate limited".to_owned(),
+        };
+        store
+            .enqueue_message(
+                SYSTEM_MESSAGE_QUEUE,
+                encode_system_message(SystemMessage::LlmFailure(failure.clone())),
+            )
+            .unwrap();
+        let worker = MessageQueueWorker::new(store.clone(), ConversationEngine::new(llm.clone()));
+
+        assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
+
+        assert!(
+            store
+                .list_queue_messages(SYSTEM_MESSAGE_QUEUE)
+                .unwrap()
+                .is_empty()
+        );
+        let ancestry = store.ancestry("main").unwrap();
+        let prompt = ancestry
+            .iter()
+            .find_map(|node| match &node.kind {
+                coco_mem::Kind::Anchor(anchor) => match &anchor.payload {
+                    AnchorPayload::Prompt(prompt) if prompt.prompt.contains("recovery event") => {
+                        Some(prompt.prompt.as_str())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("system recovery prompt should be appended");
+        assert!(prompt.contains("coco skill run recovery"));
+        assert!(prompt.contains("coco skill run compact"));
+        assert!(prompt.contains("fresh session anchor"));
+        assert!(prompt.contains(&failure.execution_id));
+    }
+
     #[derive(Debug, Clone, Default)]
     struct BlockingOnceBackend {
         calls: Arc<AtomicUsize>,
         release_first: Arc<Notify>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ImmediateBackend;
+
+    #[async_trait]
+    impl CompletionBackend for ImmediateBackend {
+        async fn step(
+            &self,
+            _ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            Ok(BackendTurn {
+                message: CompletionMessage::assistant("done"),
+                events: vec![],
+                tool_calls: vec![],
+                final_text: Some("done".to_owned()),
+                trace_persisted: false,
+            })
+        }
     }
 
     #[async_trait]

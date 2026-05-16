@@ -27,7 +27,7 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-17";
+const STORE_FORMAT_VERSION: &str = "2026-05-19";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -47,6 +47,10 @@ const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
     "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e";
+const BUILTIN_RECOVERY_REVISION_ID: &str =
+    "5ecbbff4414c69844fafa88f762e57d872d84ce035c714b055216e88e91d9347";
+const BUILTIN_COMPACT_REVISION_ID: &str =
+    "de2b1b63d7ec505a5dc7ca24a3174bbdfadbb65614e28ff388c0b2df54fe1c49";
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
@@ -74,6 +78,18 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         target_revision_id: BUILTIN_CRONJOB_REVISION_ID,
     },
     BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "recovery",
+        from_revision_ids: &[BUILTIN_RECOVERY_REVISION_ID],
+        target_revision_id: BUILTIN_RECOVERY_REVISION_ID,
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "compact",
+        from_revision_ids: &[BUILTIN_COMPACT_REVISION_ID],
+        target_revision_id: BUILTIN_COMPACT_REVISION_ID,
+    },
+    BuiltinSkillMigration {
         role: SessionRole::Runner,
         name: "coco-runner",
         from_revision_ids: &[BUILTIN_COCO_RUNNER_REVISION_ID],
@@ -88,7 +104,7 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
 ];
 const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
-        name: "main-to-2026-05-17",
+        name: "main-to-2026-05-19",
         from: StoreFormatVersion::Legacy(LEGACY_STORE_FORMAT_VERSION),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_main_store_to_chronicle_format,
@@ -97,6 +113,13 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-16-to-2026-05-17",
         from: StoreFormatVersion::Chronicle("2026-05-16"),
+        to: StoreFormatVersion::Chronicle("2026-05-17"),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-17-to-2026-05-19",
+        from: StoreFormatVersion::Chronicle("2026-05-17"),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,

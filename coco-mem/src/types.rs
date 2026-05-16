@@ -153,6 +153,23 @@ pub struct MessageQueueItem {
     pub payload: Value,
 }
 
+pub const SYSTEM_MESSAGE_QUEUE: &str = "system";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SystemMessage {
+    LlmFailure(LlmFailureSystemMessage),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmFailureSystemMessage {
+    pub branch: String,
+    pub execution_id: String,
+    pub error_node_id: String,
+    pub retry_from_node_id: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionAnchorPatch {
     pub role: Option<SessionRole>,
@@ -475,6 +492,32 @@ pub fn default_skill_groups() -> SkillGroups {
                             .to_owned(),
                     },
                 ],
+                enable_coco_shim: true,
+            },
+        ),
+    );
+    groups.orchestrator.insert(
+        "recovery".to_owned(),
+        SkillRecord::new(
+            "recovery",
+            SkillVersionSpec {
+                description: "Recover a CoCo session after failed LLM or runtime execution."
+                    .to_owned(),
+                body: include_str!("default_skills/recovery.md").trim().to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        ),
+    );
+    groups.orchestrator.insert(
+        "compact".to_owned(),
+        SkillRecord::new(
+            "compact",
+            SkillVersionSpec {
+                description: "Compact noisy branch context into a concise continuation checkpoint."
+                    .to_owned(),
+                body: include_str!("default_skills/compact.md").trim().to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: true,
             },
         ),
@@ -1182,6 +1225,7 @@ mod tests {
         PauseReason, Preset, PromptAnchor, ProviderMetadata, Role, SessionAnchor,
         SessionAnchorPatch, SessionRole, SessionState, SkillInvocationAnchor, SkillInvocationMode,
         SkillResultAnchor, SkillScript, SkillVersion, SkillVersionSpec, Tool, ToolResult, ToolUse,
+        default_skill_groups,
     };
     use jiff::Timestamp;
     use serde_json::json;
@@ -1208,6 +1252,14 @@ mod tests {
             Kind::Failure(text.to_owned()),
             created_at,
         )
+    }
+
+    #[test]
+    fn default_skills_include_recovery_and_compact() {
+        let groups = default_skill_groups();
+
+        assert!(groups.orchestrator.contains_key("recovery"));
+        assert!(groups.orchestrator.contains_key("compact"));
     }
 
     fn make_session_anchor() -> SessionAnchor {

@@ -1,5 +1,7 @@
 use coco_llm::CompletionBackend;
-use coco_llm::coco_mem::{BranchStore, JobStore, NodeStore, SessionStore, SkillStore};
+use coco_llm::coco_mem::{
+    BranchStore, JobStore, MessageQueueStore, NodeStore, SessionStore, SkillStore,
+};
 use indoc::formatdoc;
 use snafu::prelude::*;
 use std::collections::HashSet;
@@ -32,6 +34,7 @@ where
         + SessionStore
         + JobStore
         + SkillStore
+        + MessageQueueStore
         + Clone
         + Send
         + Sync

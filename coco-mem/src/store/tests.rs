@@ -1847,17 +1847,27 @@ where
     let cronjob = store
         .get_skill(SessionRole::Orchestrator, "cronjob")
         .unwrap();
+    let recovery = store
+        .get_skill(SessionRole::Orchestrator, "recovery")
+        .unwrap();
+    let compact = store
+        .get_skill(SessionRole::Orchestrator, "compact")
+        .unwrap();
     let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
     let telegram = store.get_skill(SessionRole::Runner, "telegram").unwrap();
 
     assert_eq!(orchestrator.current_version, 1);
     assert_eq!(new_skill.current_version, 1);
     assert_eq!(cronjob.current_version, 1);
+    assert_eq!(recovery.current_version, 1);
+    assert_eq!(compact.current_version, 1);
     assert_eq!(telegram.current_version, 1);
     assert_eq!(runner.current_version, 1);
     assert!(orchestrator.current().unwrap().enable_coco_shim);
     assert!(new_skill.current().unwrap().enable_coco_shim);
     assert!(cronjob.current().unwrap().enable_coco_shim);
+    assert!(recovery.current().unwrap().enable_coco_shim);
+    assert!(compact.current().unwrap().enable_coco_shim);
     assert!(telegram.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
     assert_eq!(cronjob.current().unwrap().scripts.len(), 3);
@@ -2323,7 +2333,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["version"], "2026-05-17");
+    assert_eq!(meta["version"], "2026-05-19");
 }
 
 #[test]
@@ -2546,7 +2556,7 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated["version"], "2026-05-17");
+    assert_eq!(migrated["version"], "2026-05-19");
     let migrated_skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
@@ -2898,6 +2908,16 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
     );
     assert!(
         reopened
+            .get_skill(SessionRole::Orchestrator, "recovery")
+            .is_ok()
+    );
+    assert!(
+        reopened
+            .get_skill(SessionRole::Orchestrator, "compact")
+            .is_ok()
+    );
+    assert!(
+        reopened
             .get_skill(SessionRole::Runner, "coco-runner")
             .is_ok()
     );
@@ -2912,6 +2932,14 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
     );
     assert!(
         path.join("skill-history/orchestrator/cronjob.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/orchestrator/recovery.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/orchestrator/compact.jsonl")
             .is_file()
     );
     assert!(
@@ -2956,6 +2984,60 @@ fn store_migration_adds_missing_builtin_skill() {
         path.join("skill-history/orchestrator/new-skill.jsonl")
             .is_file()
     );
+}
+
+#[test]
+fn store_migration_from_2026_05_17_adds_recovery_builtin_skills() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    let orchestrator = skills["orchestrator"].as_object_mut().unwrap();
+    orchestrator.remove("recovery");
+    orchestrator.remove("compact");
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(path.join("skill-history/orchestrator/recovery.jsonl")).unwrap();
+    fs::remove_file(path.join("skill-history/orchestrator/compact.jsonl")).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!("2026-05-17");
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Orchestrator, "recovery")
+            .unwrap()
+            .current_version,
+        1
+    );
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Orchestrator, "compact")
+            .unwrap()
+            .current_version,
+        1
+    );
+    assert!(
+        path.join("skill-history/orchestrator/recovery.jsonl")
+            .is_file()
+    );
+    assert!(
+        path.join("skill-history/orchestrator/compact.jsonl")
+            .is_file()
+    );
+    let migrated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(migrated["version"], "2026-05-19");
 }
 
 #[test]

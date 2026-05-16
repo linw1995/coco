@@ -89,6 +89,7 @@ where
         + SessionStore
         + JobStore
         + SkillStore
+        + coco_llm::coco_mem::MessageQueueStore
         + Clone
         + Send
         + Sync
@@ -119,8 +120,26 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<String, EngineError> {
+        self.reply_with_overrides(
+            branch,
+            prompt,
+            merge_parents,
+            session_patch,
+            CompletionOverrides::default(),
+        )
+        .await
+    }
+
+    pub async fn reply_with_overrides(
+        &self,
+        branch: &str,
+        prompt: &str,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionConfigPatch>,
+        overrides: CompletionOverrides,
+    ) -> std::result::Result<String, EngineError> {
         Ok(self
-            .run_prompt_job(branch, prompt, merge_parents, session_patch)
+            .run_prompt_job(branch, prompt, merge_parents, session_patch, overrides)
             .await?
             .text)
     }
@@ -149,7 +168,13 @@ where
                     .expect("batch prompt semaphore should stay open");
                 let branch = item.branch;
                 match engine
-                    .run_prompt_job(&branch, &item.prompt, item.merge_parents, None)
+                    .run_prompt_job(
+                        &branch,
+                        &item.prompt,
+                        item.merge_parents,
+                        None,
+                        CompletionOverrides::default(),
+                    )
                     .await
                 {
                     Ok(result) => (
@@ -188,11 +213,14 @@ where
         prompt: &str,
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
+        overrides: CompletionOverrides,
     ) -> std::result::Result<PromptReply, EngineError> {
         let job = self
             .submit_job_with_session_patch(branch, prompt, merge_parents, session_patch)
             .await?;
-        let snapshot = self.drive_job_for_prompt(&job.job_id).await?;
+        let snapshot = self
+            .drive_job_for_prompt_with_overrides(&job.job_id, overrides)
+            .await?;
         let job = self.service.store().get_job(&job.job_id)?;
         build_prompt_reply(self.service.store(), &job, &snapshot)
     }
@@ -342,7 +370,9 @@ where
         &self,
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let _ = self.drive_job_singleflight(job_id, vec![]).await;
+        let _ = self
+            .drive_job_singleflight(job_id, vec![], CompletionOverrides::default())
+            .await;
         self.get_job(job_id)
     }
 
@@ -351,15 +381,19 @@ where
         job_id: &str,
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let _ = self.drive_job_singleflight(job_id, merge_parents).await;
+        let _ = self
+            .drive_job_singleflight(job_id, merge_parents, CompletionOverrides::default())
+            .await;
         self.get_job(job_id)
     }
 
-    async fn drive_job_for_prompt(
+    async fn drive_job_for_prompt_with_overrides(
         &self,
         job_id: &str,
+        overrides: CompletionOverrides,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        self.drive_job_singleflight(job_id, vec![]).await?;
+        self.drive_job_singleflight(job_id, vec![], overrides)
+            .await?;
         self.get_job(job_id)
     }
 
@@ -367,6 +401,7 @@ where
         &self,
         job_id: &str,
         merge_parents: Vec<MergeParent>,
+        overrides: CompletionOverrides,
     ) -> std::result::Result<String, EngineError> {
         let job_id = job_id.to_owned();
         let merge_parent_count = merge_parents.len();
@@ -375,7 +410,9 @@ where
             merge_parent_count,
             "joining prompt job singleflight"
         );
-        let inflight_job = self.get_or_start_inflight_job(&job_id, merge_parents).await;
+        let inflight_job = self
+            .get_or_start_inflight_job(&job_id, merge_parents, overrides)
+            .await;
         let result = inflight_job.clone().await;
 
         self.inflight_jobs.lock().await.remove(&job_id);
@@ -387,6 +424,7 @@ where
         &self,
         job_id: &str,
         merge_parents: Vec<MergeParent>,
+        overrides: CompletionOverrides,
     ) -> std::result::Result<String, EngineError> {
         let mut job = self.service.store().get_job(job_id)?;
         tracing::info!(
@@ -416,7 +454,7 @@ where
             // Prompt jobs must reach a terminal finished state even when execution fails so they
             // remain recoverable and auditable. The caller decides whether to surface the
             // execution error or only inspect the persisted snapshot afterwards.
-            let run_result = self.resume_or_run_job(&job, merge_parents).await;
+            let run_result = self.resume_or_run_job(&job, merge_parents, overrides).await;
             self.finish_job(&job).await?;
             run_result?;
         }
@@ -435,6 +473,7 @@ where
         &self,
         job: &Job,
         merge_parents: Vec<MergeParent>,
+        overrides: CompletionOverrides,
     ) -> std::result::Result<(), EngineError> {
         let store = self.service.store();
         let last_node = find_job_last_node(store, job)?;
@@ -479,7 +518,7 @@ where
             branch: job.branch.clone(),
             origin,
             input,
-            overrides: CompletionOverrides::default(),
+            overrides,
             active_skill_runtime: None,
         };
 
@@ -571,6 +610,7 @@ where
         &self,
         job_id: &str,
         merge_parents: Vec<MergeParent>,
+        overrides: CompletionOverrides,
     ) -> InflightJob {
         let mut inflight_jobs = self.inflight_jobs.lock().await;
         let exists = inflight_jobs.contains_key(job_id);
@@ -584,9 +624,13 @@ where
             .or_insert_with(|| {
                 let engine = self.clone();
                 let job_id = job_id.to_owned();
-                async move { engine.drive_job_once(&job_id, merge_parents).await }
-                    .boxed()
-                    .shared()
+                async move {
+                    engine
+                        .drive_job_once(&job_id, merge_parents, overrides)
+                        .await
+                }
+                .boxed()
+                .shared()
             })
             .clone()
     }

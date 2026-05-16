@@ -15,10 +15,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use coco_mem::{
-    Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
-    MergeParent, NewNode, NodeMetadata, NodeStore, PauseReason, PromptAnchor, ProviderMetadata,
-    Role, SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord, SkillResultAnchor,
-    SkillStore, StoreError, Tool, ToolResult, ToolUse,
+    Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind,
+    LlmFailureSystemMessage, MemoryStore, MergeParent, MessageQueueStore, NewNode, NodeMetadata,
+    NodeStore, PauseReason, PromptAnchor, ProviderMetadata, Role, SYSTEM_MESSAGE_QUEUE,
+    SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord, SkillResultAnchor,
+    SkillStore, StoreError, SystemMessage, Tool, ToolResult, ToolUse,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -220,6 +221,7 @@ pub struct CompletionOverrides {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
+    pub suppress_failure_queue: bool,
 }
 
 fn completion_origin_kind(origin: &CompletionOrigin) -> &'static str {
@@ -1300,7 +1302,15 @@ where
 impl<B, S> LlmService<B, S>
 where
     B: CompletionBackend,
-    S: NodeStore + BranchStore + SessionStore + SkillStore + Clone + Send + Sync + 'static,
+    S: NodeStore
+        + BranchStore
+        + SessionStore
+        + SkillStore
+        + MessageQueueStore
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     pub async fn prompt(&self, request: PromptRequest) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
@@ -1484,6 +1494,15 @@ where
                             &original_head,
                             &retry_from_node_id,
                         )?;
+                        if !request.overrides.suppress_failure_queue {
+                            self.enqueue_llm_failure_system_message(
+                                &resolved.branch,
+                                &execution_id,
+                                &error_node_id,
+                                &retry_from_node_id,
+                                &message,
+                            );
+                        }
                         tracing::warn!(
                             branch = %resolved.branch,
                             execution_id = %execution_id,
@@ -1522,6 +1541,15 @@ where
                     )?,
                 };
                 self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
+                if !request.overrides.suppress_failure_queue {
+                    self.enqueue_llm_failure_system_message(
+                        &resolved.branch,
+                        &execution_id,
+                        &error_node_id,
+                        &retry_from_node_id,
+                        &source.to_string(),
+                    );
+                }
                 tracing::error!(
                     branch = %resolved.branch,
                     execution_id = %execution_id,
@@ -1540,6 +1568,52 @@ where
                 }
                 .into_error(source))
             }
+        }
+    }
+
+    fn enqueue_llm_failure_system_message(
+        &self,
+        branch: &str,
+        execution_id: &str,
+        error_node_id: &str,
+        retry_from_node_id: &str,
+        message: &str,
+    ) {
+        let payload =
+            match serde_json::to_value(SystemMessage::LlmFailure(LlmFailureSystemMessage {
+                branch: branch.to_owned(),
+                execution_id: execution_id.to_owned(),
+                error_node_id: error_node_id.to_owned(),
+                retry_from_node_id: retry_from_node_id.to_owned(),
+                message: message.to_owned(),
+            })) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!(
+                        branch,
+                        execution_id,
+                        error = %error,
+                        "failed to encode llm failure system message"
+                    );
+                    return;
+                }
+            };
+
+        match self.store.enqueue_message(SYSTEM_MESSAGE_QUEUE, payload) {
+            Ok(item) => tracing::info!(
+                branch,
+                execution_id,
+                message_id = %item.message_id,
+                queue = SYSTEM_MESSAGE_QUEUE,
+                "queued llm failure system message"
+            ),
+            Err(error) => tracing::warn!(
+                branch,
+                execution_id,
+                queue = SYSTEM_MESSAGE_QUEUE,
+                error = %error,
+                "failed to queue llm failure system message"
+            ),
         }
     }
 }
@@ -2306,6 +2380,7 @@ impl<B, S> LlmService<B, S> {
             temperature,
             max_tokens,
             additional_params,
+            suppress_failure_queue: _,
         } = request.overrides;
         let provider = provider.unwrap_or(session.config.provider);
         let uses_session_provider = provider == session.config.provider;
@@ -3825,7 +3900,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::time::Duration;
 
-    use coco_mem::{BranchStore, FsStore, MemoryStore, NodeStore, SessionStore};
+    use coco_mem::{BranchStore, FsStore, MemoryStore, MessageQueueStore, NodeStore, SessionStore};
     use tokio::sync::{Barrier, Notify};
 
     type RecordedCalls = Arc<Mutex<Vec<(ResolvedSession, ResolvedCompletionRequest)>>>;
@@ -5416,6 +5491,16 @@ mod tests {
                 (Role::User, "retry me".to_owned()),
             ]
         );
+
+        let queued = store.list_queue_messages(SYSTEM_MESSAGE_QUEUE).unwrap();
+        assert_eq!(queued.len(), 1);
+        let message: SystemMessage = serde_json::from_value(queued[0].payload.clone()).unwrap();
+        let SystemMessage::LlmFailure(message) = message;
+        assert_eq!(message.branch, "main");
+        assert_eq!(message.execution_id, execution_id);
+        assert_eq!(message.error_node_id, error_node_id);
+        assert_eq!(message.retry_from_node_id, retry_from_node_id);
+        assert_eq!(message.message, "rate limited");
     }
 
     #[tokio::test]
