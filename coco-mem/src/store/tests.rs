@@ -2522,12 +2522,36 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
         serde_json::to_string_pretty(&meta).unwrap(),
     )
     .unwrap();
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    skills["orchestrator"]["coco-orchestrator"]
+        .as_object_mut()
+        .unwrap()
+        .remove("id");
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+    let history_path = path.join("skill-history/orchestrator/coco-orchestrator.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[0].as_object_mut().unwrap().remove("id");
+    write_jsonl_values(&history_path, &history);
 
     FsStore::open(&path).unwrap();
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
     assert_eq!(migrated["version"], "2026-05-16");
+    let migrated_skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
+        .as_str()
+        .unwrap();
+    let migrated_history = read_jsonl_values(&history_path);
+    let history_id = migrated_history[0]["id"].as_str().unwrap();
+    assert_eq!(snapshot_id.len(), 64);
+    assert_eq!(history_id, snapshot_id);
 }
 
 #[test]
@@ -2923,15 +2947,9 @@ fn open_adds_missing_builtin_skill() {
 }
 
 #[test]
-fn open_migrates_unmodified_builtin_skill() {
+fn open_rejects_skill_history_with_invalid_revision_id() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
-    let expected = store
-        .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
-        .unwrap()
-        .current()
-        .unwrap()
-        .clone();
     drop(store);
 
     let mut skills: serde_json::Value =
@@ -2950,17 +2968,13 @@ fn open_migrates_unmodified_builtin_skill() {
     history[0]["body"] = json!("old body");
     write_jsonl_values(&history_path, &history);
 
-    let reopened = FsStore::open(&path).unwrap();
-    let migrated = reopened
-        .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
-        .unwrap();
-
-    assert_eq!(migrated.current_version, 2);
-    assert_eq!(
-        migrated.current().unwrap().description,
-        expected.description
-    );
-    assert_eq!(migrated.current().unwrap().body, expected.body);
+    let err = FsStore::open(&path).unwrap_err();
+    match err {
+        Error::CorruptedStore { message, .. } => {
+            assert!(message.contains("has invalid id"), "{message}");
+        }
+        other => panic!("expected corrupted store, got {other:?}"),
+    }
 }
 
 #[test]
