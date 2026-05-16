@@ -89,6 +89,13 @@ enum StoreSchemaVersion {
     Current,
 }
 
+#[derive(Debug, Default)]
+struct BuiltinSkillMigrationSummary {
+    added: usize,
+    updated: usize,
+    skipped_user_modified: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub version: StoreFormatVersion,
@@ -196,6 +203,12 @@ impl StoreFormatVersion {
             }
             _ => None,
         }
+    }
+}
+
+impl BuiltinSkillMigrationSummary {
+    fn changed(&self) -> bool {
+        self.added > 0 || self.updated > 0
     }
 }
 
@@ -696,6 +709,12 @@ impl Persistence {
 
     fn migrate_store(&self, from: StoreSchemaVersion, root_id: &str) -> Result<()> {
         if self.access != StoreAccess::ReadWrite {
+            tracing::warn!(
+                store_path = %self.dir.display(),
+                from_version = ?from,
+                to_version = STORE_FORMAT_VERSION,
+                "store format migration requires writable access"
+            );
             return CorruptedStoreSnafu {
                 path: self.meta_path.clone(),
                 message: format!(
@@ -706,17 +725,38 @@ impl Persistence {
             .fail();
         }
 
+        tracing::info!(
+            store_path = %self.dir.display(),
+            from_version = ?from,
+            to_version = STORE_FORMAT_VERSION,
+            "starting store format migration"
+        );
+
         if from == StoreSchemaVersion::Main && !self.queues_path.exists() {
+            tracing::info!(
+                store_path = %self.dir.display(),
+                path = %self.queues_path.display(),
+                "creating missing message queue history during store migration"
+            );
             write_jsonl_file(&self.queues_path, &[] as &[MessageQueueHistoryEntry])?;
         }
 
-        write_json_file(
+        let result = write_json_file(
             &self.meta_path,
             &Meta {
                 version: StoreFormatVersion::current(),
                 root_id: root_id.to_owned(),
             },
-        )
+        );
+        if result.is_ok() {
+            tracing::info!(
+                store_path = %self.dir.display(),
+                meta_path = %self.meta_path.display(),
+                to_version = STORE_FORMAT_VERSION,
+                "completed store format migration"
+            );
+        }
+        result
     }
 
     fn branch_path(&self, branch: &str) -> PathBuf {
@@ -1106,10 +1146,24 @@ impl Persistence {
                 let _ = write_json_file(&self.skills_path, &recovered);
             }
         }
-        if self.access == StoreAccess::ReadWrite && migrate_builtin_skills(&mut store.skill_groups)
-        {
-            self.rewrite_skill_history(&store.skill_groups)?;
-            self.persist_skill_groups(&store)?;
+        if self.access == StoreAccess::ReadWrite {
+            let builtin_skill_migration = migrate_builtin_skills(&mut store.skill_groups);
+            if builtin_skill_migration.changed() {
+                tracing::info!(
+                    store_path = %self.dir.display(),
+                    added = builtin_skill_migration.added,
+                    updated = builtin_skill_migration.updated,
+                    skipped_user_modified = builtin_skill_migration.skipped_user_modified,
+                    "persisting builtin skill migrations"
+                );
+                self.rewrite_skill_history(&store.skill_groups)?;
+                self.persist_skill_groups(&store)?;
+            }
+        } else {
+            tracing::debug!(
+                store_path = %self.dir.display(),
+                "skipping builtin skill migrations for read-only store"
+            );
         }
         let recovered_preset_snapshots = persisted_preset_records(&store.presets);
         if self.access == StoreAccess::ReadWrite && recovered_preset_snapshots != preset_snapshots {
@@ -1184,9 +1238,9 @@ fn load_skill_groups_from_history(
     Ok(history)
 }
 
-fn migrate_builtin_skills(groups: &mut SkillGroups) -> bool {
+fn migrate_builtin_skills(groups: &mut SkillGroups) -> BuiltinSkillMigrationSummary {
     let defaults = default_skill_groups();
-    let mut migrated = false;
+    let mut summary = BuiltinSkillMigrationSummary::default();
 
     for (role, default_records) in [
         (SessionRole::Orchestrator, defaults.orchestrator),
@@ -1198,31 +1252,82 @@ fn migrate_builtin_skills(groups: &mut SkillGroups) -> bool {
                 continue;
             };
             let Some(record) = records.get_mut(&name) else {
+                tracing::info!(
+                    role = role.as_str(),
+                    skill = %name,
+                    "adding missing builtin skill during migration"
+                );
                 records.insert(name, default_record);
-                migrated = true;
+                summary.added += 1;
                 continue;
             };
 
-            if should_migrate_builtin_skill(record, &default_version) {
-                let patch = SkillUpdatePatch {
-                    description: Some(default_version.description),
-                    body: Some(default_version.body),
-                    scripts: Some(default_version.scripts),
-                    enable_coco_shim: Some(default_version.enable_coco_shim),
-                };
-                migrated |= record.update(&patch).is_some();
+            match builtin_skill_migration_action(record, &default_version) {
+                BuiltinSkillMigrationAction::Update => {
+                    tracing::info!(
+                        role = role.as_str(),
+                        skill = %name,
+                        from_version = record.current_version,
+                        "updating builtin skill during migration"
+                    );
+                    let patch = SkillUpdatePatch {
+                        description: Some(default_version.description),
+                        body: Some(default_version.body),
+                        scripts: Some(default_version.scripts),
+                        enable_coco_shim: Some(default_version.enable_coco_shim),
+                    };
+                    if record.update(&patch).is_some() {
+                        summary.updated += 1;
+                    }
+                }
+                BuiltinSkillMigrationAction::SkipUserModified => {
+                    tracing::debug!(
+                        role = role.as_str(),
+                        skill = %name,
+                        current_version = record.current_version,
+                        "skipping user-modified builtin skill during migration"
+                    );
+                    summary.skipped_user_modified += 1;
+                }
+                BuiltinSkillMigrationAction::Unchanged => {}
             }
         }
     }
 
-    migrated
+    if summary.changed() {
+        tracing::info!(
+            added = summary.added,
+            updated = summary.updated,
+            skipped_user_modified = summary.skipped_user_modified,
+            "completed builtin skill migration"
+        );
+    }
+
+    summary
 }
 
-fn should_migrate_builtin_skill(record: &SkillRecord, target: &SkillVersion) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinSkillMigrationAction {
+    Update,
+    SkipUserModified,
+    Unchanged,
+}
+
+fn builtin_skill_migration_action(
+    record: &SkillRecord,
+    target: &SkillVersion,
+) -> BuiltinSkillMigrationAction {
     let Some(current) = record.current() else {
-        return false;
+        return BuiltinSkillMigrationAction::Unchanged;
     };
-    record.versions.len() == 1 && !skill_version_matches(current, target)
+    if skill_version_matches(current, target) {
+        return BuiltinSkillMigrationAction::Unchanged;
+    }
+    if record.versions.len() == 1 {
+        BuiltinSkillMigrationAction::Update
+    } else {
+        BuiltinSkillMigrationAction::SkipUserModified
+    }
 }
 
 fn skill_version_matches(left: &SkillVersion, right: &SkillVersion) -> bool {
