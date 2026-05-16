@@ -152,6 +152,16 @@ fn read_jsonl_values(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn write_jsonl_values(path: &Path, values: &[serde_json::Value]) {
+    let mut text = values
+        .iter()
+        .map(|value| serde_json::to_string(value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push('\n');
+    fs::write(path, text).unwrap();
+}
+
 fn temp_store_path() -> (tempfile::TempDir, std::path::PathBuf) {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
@@ -2860,6 +2870,104 @@ fn open_seeds_default_skills_when_skills_file_is_empty() {
             .is_file()
     );
     assert!(path.join("skill-history/runner/telegram.jsonl").is_file());
+}
+
+#[test]
+fn open_adds_missing_builtin_skill() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    skills["orchestrator"]
+        .as_object_mut()
+        .unwrap()
+        .remove("new-skill");
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(path.join("skill-history/orchestrator/new-skill.jsonl")).unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    let skill = reopened
+        .get_skill(SessionRole::Orchestrator, "new-skill")
+        .unwrap();
+    assert_eq!(skill.current_version, 1);
+    assert!(
+        path.join("skill-history/orchestrator/new-skill.jsonl")
+            .is_file()
+    );
+}
+
+#[test]
+fn open_migrates_unmodified_builtin_skill() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let expected = store
+        .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+        .unwrap()
+        .current()
+        .unwrap()
+        .clone();
+    drop(store);
+
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    skills["orchestrator"]["coco-orchestrator"]["description"] = json!("old builtin");
+    skills["orchestrator"]["coco-orchestrator"]["body"] = json!("old body");
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+
+    let history_path = path.join("skill-history/orchestrator/coco-orchestrator.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[0]["description"] = json!("old builtin");
+    history[0]["body"] = json!("old body");
+    write_jsonl_values(&history_path, &history);
+
+    let reopened = FsStore::open(&path).unwrap();
+    let migrated = reopened
+        .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+        .unwrap();
+
+    assert_eq!(migrated.current_version, 2);
+    assert_eq!(
+        migrated.current().unwrap().description,
+        expected.description
+    );
+    assert_eq!(migrated.current().unwrap().body, expected.body);
+}
+
+#[test]
+fn open_does_not_overwrite_user_modified_builtin_skill() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store
+        .update_skill(
+            SessionRole::Orchestrator,
+            "coco-orchestrator",
+            &SkillUpdatePatch {
+                description: Some("custom".to_owned()),
+                body: Some("custom body".to_owned()),
+                scripts: None,
+                enable_coco_shim: None,
+            },
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = FsStore::open(&path).unwrap();
+    let skill = reopened
+        .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+        .unwrap();
+
+    assert_eq!(skill.current_version, 2);
+    assert_eq!(skill.current().unwrap().description, "custom");
+    assert_eq!(skill.current().unwrap().body, "custom body");
 }
 
 #[test]

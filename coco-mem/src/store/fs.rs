@@ -1106,6 +1106,11 @@ impl Persistence {
                 let _ = write_json_file(&self.skills_path, &recovered);
             }
         }
+        if self.access == StoreAccess::ReadWrite && migrate_builtin_skills(&mut store.skill_groups)
+        {
+            self.rewrite_skill_history(&store.skill_groups)?;
+            self.persist_skill_groups(&store)?;
+        }
         let recovered_preset_snapshots = persisted_preset_records(&store.presets);
         if self.access == StoreAccess::ReadWrite && recovered_preset_snapshots != preset_snapshots {
             self.persist_presets(&store)?;
@@ -1177,6 +1182,54 @@ fn load_skill_groups_from_history(
     let history = load_skill_history_records(persistence)?;
     validate_skill_snapshots(current, &history)?;
     Ok(history)
+}
+
+fn migrate_builtin_skills(groups: &mut SkillGroups) -> bool {
+    let defaults = default_skill_groups();
+    let mut migrated = false;
+
+    for (role, default_records) in [
+        (SessionRole::Orchestrator, defaults.orchestrator),
+        (SessionRole::Runner, defaults.runner),
+    ] {
+        for (name, default_record) in default_records {
+            let records = groups.for_role_mut(role);
+            let Some(default_version) = default_record.current().cloned() else {
+                continue;
+            };
+            let Some(record) = records.get_mut(&name) else {
+                records.insert(name, default_record);
+                migrated = true;
+                continue;
+            };
+
+            if should_migrate_builtin_skill(record, &default_version) {
+                let patch = SkillUpdatePatch {
+                    description: Some(default_version.description),
+                    body: Some(default_version.body),
+                    scripts: Some(default_version.scripts),
+                    enable_coco_shim: Some(default_version.enable_coco_shim),
+                };
+                migrated |= record.update(&patch).is_some();
+            }
+        }
+    }
+
+    migrated
+}
+
+fn should_migrate_builtin_skill(record: &SkillRecord, target: &SkillVersion) -> bool {
+    let Some(current) = record.current() else {
+        return false;
+    };
+    record.versions.len() == 1 && !skill_version_matches(current, target)
+}
+
+fn skill_version_matches(left: &SkillVersion, right: &SkillVersion) -> bool {
+    left.description == right.description
+        && left.body == right.body
+        && left.scripts == right.scripts
+        && left.enable_coco_shim == right.enable_coco_shim
 }
 
 fn persisted_preset_records(
