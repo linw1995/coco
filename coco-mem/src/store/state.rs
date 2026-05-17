@@ -544,6 +544,13 @@ impl StoreState {
         Some(item)
     }
 
+    pub fn peek_message(&self, queue: &str) -> Option<MessageQueueItem> {
+        self.message_queues
+            .get(queue)
+            .and_then(|messages| messages.first())
+            .cloned()
+    }
+
     pub fn list_queue_messages(&self, queue: &str) -> Vec<MessageQueueItem> {
         self.message_queues.get(queue).cloned().unwrap_or_default()
     }

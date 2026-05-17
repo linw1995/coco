@@ -232,6 +232,10 @@ where
         self.notify_if_ok(self.inner.dequeue_message(queue))
     }
 
+    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
+        self.inner.peek_message(queue)
+    }
+
     fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>> {
         self.inner.list_queue_messages(queue)
     }

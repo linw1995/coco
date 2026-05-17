@@ -1632,9 +1632,13 @@ where
         store.list_queue_messages("hooks").unwrap(),
         vec![first.clone(), second.clone(),]
     );
+    assert_eq!(store.peek_message("hooks").unwrap(), Some(first.clone()));
+    assert_eq!(store.peek_message("missing").unwrap(), None);
     assert_eq!(store.dequeue_message("hooks").unwrap(), Some(first));
+    assert_eq!(store.peek_message("hooks").unwrap(), Some(second.clone()));
     assert_eq!(store.dequeue_message("hooks").unwrap(), Some(second));
     assert_eq!(store.dequeue_message("hooks").unwrap(), None);
+    assert_eq!(store.peek_message("hooks").unwrap(), None);
     assert!(store.list_queue_messages("hooks").unwrap().is_empty());
 }
 

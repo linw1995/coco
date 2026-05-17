@@ -164,6 +164,9 @@ pub trait MessageQueueStore {
     /// Removes and returns the oldest message in a named queue.
     fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
 
+    /// Returns the oldest message in a named queue without removing it.
+    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
+
     /// Returns all persisted messages for a named queue in dequeue order.
     fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;
 }

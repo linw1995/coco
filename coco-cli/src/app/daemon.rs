@@ -443,12 +443,9 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
     where
         S: Store,
     {
-        Ok(self
-            .store
-            .list_queue_messages(PROMPT_JOB_QUEUE)
-            .context(StoreSnafu)?
-            .into_iter()
-            .next())
+        self.store
+            .peek_message(PROMPT_JOB_QUEUE)
+            .context(StoreSnafu)
     }
 
     async fn handle_prompt_request_queue_head(

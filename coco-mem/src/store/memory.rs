@@ -291,6 +291,14 @@ impl MessageQueueStore for MemoryStore {
             .dequeue_message(queue))
     }
 
+    fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .peek_message(queue))
+    }
+
     fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
         Ok(self
             .inner
