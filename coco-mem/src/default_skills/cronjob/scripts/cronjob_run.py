@@ -20,8 +20,10 @@ def main() -> int:
     task = load_task(args.task_file)
     task_id = task["id"]
     repeat = task["repeat"]
-    state_dir = Path(task["state_dir"])
+    data_dir = resolve_task_data_dir(task, args.task_file)
+    state_dir = data_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
+    task["data_dir"] = str(data_dir)
 
     lock_path = state_dir / f"{task_id}.lock"
     pending_path = state_dir / f"{task_id}.pending"
@@ -54,13 +56,27 @@ def parse_args() -> argparse.Namespace:
 
 def load_task(path: Path) -> dict[str, str]:
     task = json.loads(path.read_text(encoding="utf-8"))
-    required = {"id", "branch", "prompt", "repeat", "coco_bin", "state_dir"}
+    required = {"id", "branch", "prompt", "repeat", "coco_bin"}
     missing = sorted(required - task.keys())
     if missing:
         raise SystemExit(f"task file is missing required fields: {', '.join(missing)}")
+    if "data_dir" not in task and "state_dir" not in task:
+        raise SystemExit("task file is missing required fields: data_dir")
     if task["repeat"] not in {"parallel", "serial", "skip"}:
         raise SystemExit("repeat must be one of parallel, serial, or skip")
     return task
+
+
+def resolve_task_data_dir(task: dict[str, str], task_file: Path) -> Path:
+    if "data_dir" in task:
+        return Path(task["data_dir"]).expanduser().resolve()
+    state_dir = Path(task["state_dir"]).expanduser()
+    if not state_dir.is_absolute():
+        state_dir = task_file.parent / state_dir
+    state_dir = state_dir.resolve()
+    if state_dir.name == "state":
+        return state_dir.parent
+    return state_dir
 
 
 class lock_for_policy:
@@ -154,7 +170,7 @@ def enqueue_task_event(task: dict[str, str]) -> dict[str, str]:
             "branch": task["branch"],
             "prompt": task["prompt"],
             "repeat": task["repeat"],
-            "state_dir": task["state_dir"],
+            "data_dir": task["data_dir"],
         },
         separators=(",", ":"),
     )

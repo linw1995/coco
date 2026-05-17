@@ -62,6 +62,7 @@ def main() -> int:
     task_dir = install_dir / "tasks"
     state_dir = resolve_state_dir(args.state_dir)
     log_dir = resolve_log_dir(args.log_dir)
+    data_dir = resolve_data_dir(install_dir, state_dir, log_dir)
     task_path = task_dir / f"{task_id}.json"
     runner_path = install_dir / "cronjob_run.py"
 
@@ -114,6 +115,7 @@ def main() -> int:
             "prompt": prompt,
             "repeat": args.repeat,
             "coco_bin": args.coco_bin,
+            "data_dir": str(data_dir),
             "state_dir": str(state_dir),
             "log_dir": str(log_dir),
         },
@@ -479,6 +481,19 @@ def resolve_log_dir(value: Path | None) -> Path:
         return persist_dir / "logs"
     state_home = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
     return state_home / "coco" / "logs" / "cronjob"
+
+
+def resolve_data_dir(install_dir: Path, state_dir: Path, log_dir: Path) -> Path:
+    if (
+        install_dir.name == "install"
+        and state_dir.name == "state"
+        and log_dir.name == "logs"
+        and install_dir.parent == state_dir.parent == log_dir.parent
+    ):
+        return install_dir.parent
+    if state_dir.name == "state":
+        return state_dir.parent
+    return state_dir
 
 
 def resolve_skill_persist_dir() -> Path | None:

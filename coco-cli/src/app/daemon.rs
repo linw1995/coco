@@ -395,7 +395,10 @@ struct QueuedCronjobTaskEvent {
     branch: String,
     prompt: String,
     repeat: CronjobRepeatPolicy,
-    state_dir: PathBuf,
+    #[serde(default)]
+    data_dir: Option<PathBuf>,
+    #[serde(default)]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -408,6 +411,9 @@ struct CronjobTaskState {
 enum CronjobQueuePayloadError {
     #[snafu(display("Failed to decode cronjob queue payload: {source}"))]
     DecodeCronjob { source: serde_json::Error },
+
+    #[snafu(display("Cronjob queue payload is missing data_dir"))]
+    MissingDataDir,
 }
 
 #[derive(Debug, Snafu)]
@@ -868,13 +874,22 @@ fn decode_telegram_message(
 fn decode_cronjob_task_event(
     payload: serde_json::Value,
 ) -> std::result::Result<QueuedCronjobTaskEvent, CronjobQueuePayloadError> {
-    serde_json::from_value(payload).context(DecodeCronjobSnafu)
+    let event =
+        serde_json::from_value::<QueuedCronjobTaskEvent>(payload).context(DecodeCronjobSnafu)?;
+    if event.data_dir.is_none() && event.state_dir.is_none() {
+        return MissingDataDirSnafu.fail();
+    }
+    Ok(event)
 }
 
 fn cronjob_task_state_path(event: &QueuedCronjobTaskEvent) -> PathBuf {
-    event
-        .state_dir
-        .join(format!("{}.state.json", event.task_id))
+    let state_dir = event
+        .data_dir
+        .as_ref()
+        .map(|data_dir| data_dir.join("state"))
+        .or_else(|| event.state_dir.clone())
+        .expect("decoded cronjob task event should include a state root");
+    state_dir.join(format!("{}.state.json", event.task_id))
 }
 
 fn read_cronjob_task_state(
@@ -1410,9 +1425,9 @@ mod tests {
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("main")).await.unwrap();
         let engine = ConversationEngine::new(llm);
-        let mut event = cronjob_event(tempdir.path(), CronjobRepeatPolicy::Serial);
-        event.state_dir = tempdir.path().join("state");
-        std::fs::write(&event.state_dir, "not a directory").unwrap();
+        let event = cronjob_event(tempdir.path(), CronjobRepeatPolicy::Serial);
+        let state_dir = tempdir.path().join("state");
+        std::fs::write(&state_dir, "not a directory").unwrap();
         let item = store
             .enqueue_message(CRONJOB_TASK_QUEUE, serde_json::to_value(&event).unwrap())
             .unwrap();
@@ -1527,7 +1542,8 @@ mod tests {
             branch: "main".to_owned(),
             prompt: "Review the work queue.".to_owned(),
             repeat,
-            state_dir: base.join("state"),
+            data_dir: Some(base.to_path_buf()),
+            state_dir: None,
         }
     }
 
