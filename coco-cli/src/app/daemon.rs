@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -408,6 +409,12 @@ struct CronjobTaskState {
 enum CronjobQueuePayloadError {
     #[snafu(display("Failed to decode cronjob queue payload: {source}"))]
     DecodeCronjob { source: serde_json::Error },
+
+    #[snafu(display("Invalid cronjob task id {task_id:?}"))]
+    InvalidTaskId { task_id: String },
+
+    #[snafu(display("Invalid cronjob data directory {path:?}"))]
+    InvalidDataDir { path: PathBuf },
 }
 
 #[derive(Debug, Snafu)]
@@ -868,7 +875,21 @@ fn decode_telegram_message(
 fn decode_cronjob_task_event(
     payload: serde_json::Value,
 ) -> std::result::Result<QueuedCronjobTaskEvent, CronjobQueuePayloadError> {
-    serde_json::from_value(payload).context(DecodeCronjobSnafu)
+    let event =
+        serde_json::from_value::<QueuedCronjobTaskEvent>(payload).context(DecodeCronjobSnafu)?;
+    ensure!(
+        is_valid_cronjob_task_id(&event.task_id),
+        InvalidTaskIdSnafu {
+            task_id: event.task_id.clone(),
+        }
+    );
+    ensure!(
+        is_safe_cronjob_data_dir(&event.data_dir),
+        InvalidDataDirSnafu {
+            path: event.data_dir.clone(),
+        }
+    );
+    Ok(event)
 }
 
 fn cronjob_task_state_path(event: &QueuedCronjobTaskEvent) -> PathBuf {
@@ -876,6 +897,28 @@ fn cronjob_task_state_path(event: &QueuedCronjobTaskEvent) -> PathBuf {
         .data_dir
         .join("state")
         .join(format!("{}.state.json", event.task_id))
+}
+
+fn is_valid_cronjob_task_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    value.len() <= 128
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
+fn is_safe_cronjob_data_dir(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        })
 }
 
 fn read_cronjob_task_state(
@@ -1165,13 +1208,15 @@ mod tests {
         SessionConfig, StepContext,
     };
     use coco_mem::{JobStatus, MemoryStore, MessageQueueStore, SessionRole};
+    use serde_json::json;
     use tokio::sync::Notify;
 
     use super::{
         CRONJOB_TASK_QUEUE, CronjobMessageQueueWorker, CronjobRepeatPolicy, CronjobTaskState,
         QueuedCronjobTaskEvent, TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher,
-        TelegramMessageQueueWorker, cronjob_task_state_path, decode_telegram_message,
-        encode_telegram_message, resolve_daemon_socket_path, write_cronjob_task_state,
+        TelegramMessageQueueWorker, cronjob_task_state_path, decode_cronjob_task_event,
+        decode_telegram_message, encode_telegram_message, resolve_daemon_socket_path,
+        write_cronjob_task_state,
     };
 
     #[test]
@@ -1189,6 +1234,36 @@ mod tests {
         let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
 
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn cronjob_queue_payload_rejects_path_traversal_task_id() {
+        let payload = json!({
+            "task_id": "../daily-review",
+            "branch": "main",
+            "prompt": "Review the work queue.",
+            "repeat": "skip",
+            "data_dir": "/tmp/coco-cronjob",
+        });
+
+        let error = decode_cronjob_task_event(payload).unwrap_err();
+
+        assert!(error.to_string().contains("Invalid cronjob task id"));
+    }
+
+    #[test]
+    fn cronjob_queue_payload_rejects_relative_data_dir() {
+        let payload = json!({
+            "task_id": "daily-review",
+            "branch": "main",
+            "prompt": "Review the work queue.",
+            "repeat": "skip",
+            "data_dir": "relative/data",
+        });
+
+        let error = decode_cronjob_task_event(payload).unwrap_err();
+
+        assert!(error.to_string().contains("Invalid cronjob data directory"));
     }
 
     #[tokio::test]
