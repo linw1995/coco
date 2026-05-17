@@ -248,6 +248,13 @@ impl JobStore for MemoryStore {
             .submit_job(branch, base)
     }
 
+    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .submit_job_with_id(job_id, branch, base)
+    }
+
     fn get_job(&self, job_id: &str) -> Result<Job> {
         self.inner
             .read()

@@ -209,6 +209,43 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<Job, EngineError> {
+        self.submit_job_with_optional_id_and_session_patch(
+            None,
+            branch,
+            prompt,
+            merge_parents,
+            session_patch,
+        )
+        .await
+    }
+
+    pub async fn submit_job_with_id_and_session_patch(
+        &self,
+        job_id: &str,
+        branch: &str,
+        prompt: &str,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionConfigPatch>,
+    ) -> std::result::Result<Job, EngineError> {
+        self.submit_job_with_optional_id_and_session_patch(
+            Some(job_id),
+            branch,
+            prompt,
+            merge_parents,
+            session_patch,
+        )
+        .await
+    }
+
+    async fn submit_job_with_optional_id_and_session_patch(
+        &self,
+        job_id: Option<&str>,
+        branch: &str,
+        prompt: &str,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionConfigPatch>,
+    ) -> std::result::Result<Job, EngineError> {
+        self.ensure_prompt_job_can_submit(job_id, branch)?;
         let merge_parent_count = merge_parents.len();
         let has_session_patch = session_patch.is_some();
         let base = self.service.append_prompt_job_base(
@@ -217,7 +254,13 @@ where
             &merge_parents,
             session_patch.as_ref(),
         )?;
-        let job = self.service.store().submit_job(branch, &base)?;
+        let job = match job_id {
+            Some(job_id) => self
+                .service
+                .store()
+                .submit_job_with_id(job_id, branch, &base)?,
+            None => self.service.store().submit_job(branch, &base)?,
+        };
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
@@ -227,6 +270,33 @@ where
             "submitted prompt job"
         );
         Ok(job)
+    }
+
+    fn ensure_prompt_job_can_submit(
+        &self,
+        job_id: Option<&str>,
+        branch: &str,
+    ) -> std::result::Result<(), EngineError> {
+        let jobs = self.service.store().list_jobs()?;
+        if let Some(job_id) = job_id
+            && jobs.contains_key(job_id)
+        {
+            return Err(EngineError::EngineFailed {
+                message: format!("Prompt job {job_id:?} already exists"),
+            });
+        }
+        if let Some(active_job) = jobs
+            .values()
+            .find(|job| job.branch == branch && !matches!(job.status, JobStatus::Finished))
+        {
+            return Err(EngineError::EngineFailed {
+                message: format!(
+                    "Branch {branch:?} already has an active prompt job {:?}",
+                    active_job.job_id
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub fn get_job(&self, job_id: &str) -> std::result::Result<JobStatusSnapshot, EngineError> {

@@ -2380,6 +2380,15 @@ impl JobStore for FsStore {
         Ok(created)
     }
 
+    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let created = temp.submit_job_with_id(job_id, branch, base)?;
+        self.persistence.persist_jobs(&temp)?;
+        state.jobs = temp.jobs;
+        Ok(created)
+    }
+
     fn get_job(&self, job_id: &str) -> Result<Job> {
         self.inner
             .read()

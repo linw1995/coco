@@ -1110,7 +1110,40 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
     assert!(text_output.contains("status: Queued"));
     assert!(text_output.contains("branch: main"));
-    assert_eq!(store.list_queue_messages("prompt.job").unwrap().len(), 1);
+    let queued_messages = store.list_queue_messages("prompt.job").unwrap();
+    assert_eq!(queued_messages.len(), 1);
+    let text_job_id = queued_messages[0].payload["job_id"].as_str().unwrap();
+    assert!(store.get_job(text_job_id).is_err());
+    assert_eq!(queued_messages[0].payload["branch"], "main");
+    assert_eq!(queued_messages[0].payload["prompt"], "hello");
+
+    let pending_status_output = crate::app::runtime::run_with_services(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "prompt",
+            "status",
+            "--json",
+            "--job",
+            text_job_id,
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
+            shared_engine: None,
+        },
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pending_status: Value = serde_json::from_str(&pending_status_output).unwrap();
+    assert_eq!(pending_status["job"]["status"], "queued");
+    assert_eq!(pending_status["job"]["branch"], "main");
 
     let json_output = crate::app::runtime::run_with_services(
         Cli::try_parse_from([

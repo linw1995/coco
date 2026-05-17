@@ -10,9 +10,9 @@ use crate::error::{
     DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSkillNameSnafu,
     MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, MultipleShadowParentsSnafu,
     NotFoundSnafu, ParentNotFoundSnafu, PresetNotFoundSnafu, PresetVersionNotFoundSnafu,
-    PromptJobActiveOnBranchSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
-    RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu,
-    SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
+    PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu, PromptJobMovedSnafu,
+    PromptJobNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu,
+    SkillNotFoundSnafu, SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
     Anchor, AnchorPayload, Job, JobStatus, Kind, MessageQueueItem, NewNode, Node, PauseReason,
@@ -364,8 +364,19 @@ impl StoreState {
     }
 
     pub fn submit_job(&mut self, branch: &str, base: &str) -> Result<Job> {
+        let job_id = self.next_job_id();
+        self.submit_job_with_id(&job_id, branch, base)
+    }
+
+    pub fn submit_job_with_id(&mut self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
         self.get_branch_head(branch)?;
         self.get_node(base)?;
+        ensure!(
+            !self.jobs.contains_key(job_id),
+            PromptJobAlreadyExistsSnafu {
+                job_id: job_id.to_owned(),
+            }
+        );
         if let Some(active_job) = self
             .jobs
             .values()
@@ -377,7 +388,7 @@ impl StoreState {
             }
             .fail();
         }
-        let job = Job::new(self.next_job_id(), branch, base);
+        let job = Job::new(job_id, branch, base);
         self.jobs.insert(job.job_id.clone(), job.clone());
         Ok(job)
     }

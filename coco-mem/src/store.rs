@@ -127,10 +127,15 @@ pub trait SkillStore {
 
 /// Prompt job storage API.
 pub trait JobStore {
-    /// Creates a new single-task prompt job record.
+    /// Creates a new single-task prompt job record with a generated id.
     ///
     /// Rejects the request when the branch already has an unfinished prompt job.
     fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job>;
+
+    /// Creates a new single-task prompt job record with a caller-provided id.
+    ///
+    /// Rejects the request when the branch already has an unfinished prompt job.
+    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job>;
 
     /// Returns a persisted prompt job.
     fn get_job(&self, job_id: &str) -> StoreResult<Job>;
