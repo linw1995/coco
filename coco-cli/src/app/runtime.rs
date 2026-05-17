@@ -7,15 +7,17 @@ use coco_llm::{CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{MergeParent, SessionRole, Store};
 
 use super::{
-    config::ProviderProfiles, daemon::run_daemon_command, preset::run_preset_command,
-    prompt::run_prompt_command, session::run_session_command, skill::run_skill_command,
+    config::ProviderProfiles, daemon::run_daemon_command, mq::run_mq_command,
+    preset::run_preset_command, prompt::run_prompt_command, session::run_session_command,
+    skill::run_skill_command,
 };
 use crate::{
     Cli, Result,
     cli::{
-        Command, PresetCommand, PromptBranchStatusCommand, PromptCommand, PromptRunCommand,
-        PromptStatusCommand, PromptSubcommand, SessionBranchCommand, SessionCommand,
-        SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand, SkillSubcommand,
+        Command, MqCommand, PresetCommand, PromptBranchStatusCommand, PromptCommand,
+        PromptRunCommand, PromptStatusCommand, PromptSubcommand, SessionBranchCommand,
+        SessionCommand, SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand,
+        SkillSubcommand,
     },
 };
 
@@ -55,6 +57,7 @@ struct ForwardedCli {
 #[derive(Debug, Subcommand)]
 enum ForwardedCommand {
     Preset(PresetCommand),
+    Mq(MqCommand),
     Prompt(PromptCommand),
     Session(SessionCommand),
     Skill(SkillCommand),
@@ -150,6 +153,7 @@ impl ForwardedCli {
             store_path: default_forwarded_store_path(),
             command: match self.command {
                 ForwardedCommand::Preset(command) => Command::Preset(command),
+                ForwardedCommand::Mq(command) => Command::Mq(command),
                 ForwardedCommand::Prompt(command) => Command::Prompt(command),
                 ForwardedCommand::Session(command) => Command::Session(command),
                 ForwardedCommand::Skill(command) => Command::Skill(command),
@@ -179,6 +183,7 @@ where
         Command::Preset(command) => {
             run_preset_command(command, services.shared_store, services.provider_profiles).await
         }
+        Command::Mq(command) => run_mq_command(command, services.shared_store).await,
         Command::Prompt(command) => {
             run_prompt_command(
                 command,
@@ -297,6 +302,7 @@ where
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Preset(_) => "preset",
+        Command::Mq(_) => "mq",
         Command::Prompt(_) => "prompt",
         Command::Session(_) => "session",
         Command::Skill(_) => "skill",
@@ -404,6 +410,7 @@ fn apply_forwarded_defaults(
 
     match &mut cli.command {
         Command::Preset(_) => {}
+        Command::Mq(_) => {}
         Command::Prompt(command) => {
             if command.command.is_none() {
                 command.run.branch = branch;

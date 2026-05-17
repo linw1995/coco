@@ -62,6 +62,9 @@ pub enum Error {
     #[snafu(display("Failed to parse preset additional params JSON: {source}"))]
     ParsePresetAdditionalParams { source: serde_json::Error },
 
+    #[snafu(display("Failed to parse MQ payload JSON: {source}"))]
+    ParseMqPayload { source: serde_json::Error },
+
     #[snafu(display(
         "Session additional params must be a JSON object, got {kind}",
         kind = JsonValueKind(value)
@@ -132,6 +135,9 @@ pub enum Error {
 
     #[snafu(display("Channel task failed: {source}"))]
     JoinChannelTask { source: tokio::task::JoinError },
+
+    #[snafu(display("Message queue task failed: {source}"))]
+    JoinMessageQueueTask { source: tokio::task::JoinError },
 
     #[snafu(display("{source}"))]
     Channel { source: coco_channel::Error },

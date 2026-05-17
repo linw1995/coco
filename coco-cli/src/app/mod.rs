@@ -26,6 +26,7 @@ use coco_llm::SessionConfig;
 
 pub(crate) mod config;
 pub(crate) mod daemon;
+mod mq;
 mod preset;
 mod prompt;
 pub(crate) mod runtime;
