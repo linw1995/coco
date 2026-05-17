@@ -61,6 +61,9 @@ pub enum StoreError {
     #[snafu(display("Prompt job {job_id:?} not found"))]
     PromptJobNotFound { job_id: String },
 
+    #[snafu(display("Prompt job {job_id:?} already exists"))]
+    PromptJobAlreadyExists { job_id: String },
+
     #[snafu(display("Prompt job {job_id:?} moved from {expected:?} to {actual:?}"))]
     PromptJobMoved {
         job_id: String,

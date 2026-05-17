@@ -194,6 +194,10 @@ where
         self.notify_if_ok(self.inner.submit_job(branch, base))
     }
 
+    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
+        self.notify_if_ok(self.inner.submit_job_with_id(job_id, branch, base))
+    }
+
     fn get_job(&self, job_id: &str) -> StoreResult<Job> {
         self.inner.get_job(job_id)
     }
@@ -226,6 +230,10 @@ where
 
     fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
         self.notify_if_ok(self.inner.dequeue_message(queue))
+    }
+
+    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
+        self.inner.peek_message(queue)
     }
 
     fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>> {

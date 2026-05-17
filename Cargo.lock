@@ -370,6 +370,7 @@ dependencies = [
  "coco-core",
  "coco-llm",
  "coco-mem",
+ "nanoid 0.5.0",
  "serde",
  "serde_json",
  "snafu",

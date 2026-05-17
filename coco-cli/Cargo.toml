@@ -27,6 +27,9 @@ toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# Identifiers.
+nanoid.workspace = true
+
 # Error handling.
 snafu.workspace = true
 

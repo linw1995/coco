@@ -133,6 +133,9 @@ pub enum Error {
     #[snafu(display("Channel task failed: {source}"))]
     JoinChannelTask { source: tokio::task::JoinError },
 
+    #[snafu(display("Message queue task failed: {source}"))]
+    JoinMessageQueueTask { source: tokio::task::JoinError },
+
     #[snafu(display("{source}"))]
     Channel { source: coco_channel::Error },
 

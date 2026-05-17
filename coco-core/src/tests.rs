@@ -439,6 +439,41 @@ async fn llm_engine_rejects_second_active_job_on_same_branch() {
 }
 
 #[tokio::test]
+async fn llm_engine_branch_lock_uses_service_lock() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[]);
+    let llm = Arc::new(LlmService::new(store, backend));
+    let engine = ConversationEngine::new(llm.clone());
+
+    let guard = llm.lock_branch_scope("main").await;
+    let started = Arc::new(Notify::new());
+    let acquired = Arc::new(Notify::new());
+    let waiter = tokio::spawn({
+        let engine = engine.clone();
+        let started = started.clone();
+        let acquired = acquired.clone();
+        async move {
+            started.notify_one();
+            let _guard = engine.lock_branch("main").await;
+            acquired.notify_one();
+        }
+    });
+
+    started.notified().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), acquired.notified())
+            .await
+            .is_err()
+    );
+
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(1), acquired.notified())
+        .await
+        .unwrap();
+    waiter.await.unwrap();
+}
+
+#[tokio::test]
 async fn llm_engine_coalesces_duplicate_drive_job_calls() {
     let store = MemoryStore::new();
     let backend = BlockingBackend {

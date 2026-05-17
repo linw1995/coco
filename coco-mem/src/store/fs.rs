@@ -27,8 +27,8 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-16";
-const MAIN_STORE_FORMAT_VERSION: u64 = 10;
+const STORE_FORMAT_VERSION: &str = "2026-05-17";
+const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
@@ -54,7 +54,7 @@ const BUILTIN_TELEGRAM_REVISION_ID: &str =
 const BRANCHES_DIR_NAME: &str = "branches";
 const LOCK_FILE_NAME: &str = "store.lock";
 const MESSAGE_QUEUE_COMPACT_MIN_LOG_ENTRIES: usize = 64;
-const BUILTIN_SKILL_MIGRATIONS_2026_05_16: &[BuiltinSkillMigration] = &[
+const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "coco-orchestrator",
@@ -86,13 +86,22 @@ const BUILTIN_SKILL_MIGRATIONS_2026_05_16: &[BuiltinSkillMigration] = &[
         target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
     },
 ];
-const STORE_MIGRATIONS: &[StoreMigration] = &[StoreMigration {
-    name: "main-to-2026-05-16",
-    from: StoreSchemaVersion::Main,
-    to: StoreSchemaVersion::Current,
-    run: Persistence::migrate_main_store_to_chronicle_format,
-    builtin_skills: BUILTIN_SKILL_MIGRATIONS_2026_05_16,
-}];
+const STORE_MIGRATIONS: &[StoreMigration] = &[
+    StoreMigration {
+        name: "main-to-2026-05-17",
+        from: StoreFormatVersion::Legacy(LEGACY_STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
+        run: Persistence::migrate_main_store_to_chronicle_format,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-16-to-2026-05-17",
+        from: StoreFormatVersion::Chronicle("2026-05-16"),
+        to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+];
 
 #[derive(Clone, Debug)]
 pub struct FsStore {
@@ -125,23 +134,17 @@ enum StoreAccess {
     ReadOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum StoreFormatVersion {
+pub enum StoreFormatVersion<S = String> {
     Legacy(u64),
-    Chronicle(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum StoreSchemaVersion {
-    Main,
-    Current,
+    Chronicle(S),
 }
 
 struct StoreMigration {
     name: &'static str,
-    from: StoreSchemaVersion,
-    to: StoreSchemaVersion,
+    from: StoreFormatVersion<&'static str>,
+    to: StoreFormatVersion<&'static str>,
     run: fn(&Persistence) -> Result<()>,
     builtin_skills: &'static [BuiltinSkillMigration],
 }
@@ -249,43 +252,26 @@ struct SkillPersistenceFailpoints {
     next: Option<SkillPersistenceFailpoint>,
 }
 
-impl std::fmt::Display for StoreFormatVersion {
+impl<S: AsRef<str>> std::fmt::Display for StoreFormatVersion<S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Legacy(version) => write!(formatter, "{version}"),
-            Self::Chronicle(version) => formatter.write_str(version),
+            Self::Chronicle(version) => formatter.write_str(version.as_ref()),
         }
     }
 }
 
-impl StoreFormatVersion {
+impl StoreFormatVersion<String> {
     fn current() -> Self {
         Self::Chronicle(STORE_FORMAT_VERSION.to_owned())
     }
-
-    fn schema_version(&self) -> Option<StoreSchemaVersion> {
-        match self {
-            Self::Legacy(MAIN_STORE_FORMAT_VERSION) => Some(StoreSchemaVersion::Main),
-            Self::Chronicle(version) if version == STORE_FORMAT_VERSION => {
-                Some(StoreSchemaVersion::Current)
-            }
-            _ => None,
-        }
-    }
 }
 
-impl StoreSchemaVersion {
-    fn format_label(self) -> &'static str {
-        match self {
-            Self::Main => "10",
-            Self::Current => STORE_FORMAT_VERSION,
-        }
-    }
-
-    fn meta_version(self) -> StoreFormatVersion {
-        match self {
-            Self::Main => StoreFormatVersion::Legacy(MAIN_STORE_FORMAT_VERSION),
-            Self::Current => StoreFormatVersion::current(),
+impl From<StoreFormatVersion<&'static str>> for StoreFormatVersion<String> {
+    fn from(version: StoreFormatVersion<&'static str>) -> Self {
+        match version {
+            StoreFormatVersion::Legacy(version) => Self::Legacy(version),
+            StoreFormatVersion::Chronicle(version) => Self::Chronicle(version.to_owned()),
         }
     }
 }
@@ -831,44 +817,43 @@ impl Persistence {
         .fail()
     }
 
-    fn migrate_store(&self, from: StoreSchemaVersion, root_id: &str) -> Result<()> {
+    fn migrate_store(&self, from: StoreFormatVersion, root_id: &str) -> Result<()> {
         debug_assert_eq!(self.access, StoreAccess::ReadWrite);
 
         tracing::info!(
             store_path = %self.dir.display(),
-            from_version = from.format_label(),
+            from_version = %from,
             to_version = STORE_FORMAT_VERSION,
             "starting store format migration"
         );
 
         let mut current = from;
-        while current != StoreSchemaVersion::Current {
-            let migration = store_migration_from(current).context(CorruptedStoreSnafu {
+        while current != StoreFormatVersion::current() {
+            let migration = store_migration_from(&current).context(CorruptedStoreSnafu {
                 path: self.meta_path.clone(),
                 message: format!(
                     "missing store migration from version {} to {}",
-                    current.format_label(),
-                    STORE_FORMAT_VERSION
+                    current, STORE_FORMAT_VERSION
                 ),
             })?;
             tracing::info!(
                 store_path = %self.dir.display(),
                 migration = migration.name,
-                from_version = migration.from.format_label(),
-                to_version = migration.to.format_label(),
+                from_version = %migration.from,
+                to_version = %migration.to,
                 "running store migration"
             );
             (migration.run)(self)?;
             self.migrate_builtin_skills_for_store_schema(migration.builtin_skills)?;
-            self.persist_store_schema_version(migration.to, root_id)?;
+            self.persist_store_format_version(migration.to.into(), root_id)?;
             tracing::info!(
                 store_path = %self.dir.display(),
                 migration = migration.name,
-                from_version = migration.from.format_label(),
-                to_version = migration.to.format_label(),
+                from_version = %migration.from,
+                to_version = %migration.to,
                 "completed store migration"
             );
-            current = migration.to;
+            current = migration.to.into();
         }
 
         tracing::info!(
@@ -890,6 +875,10 @@ impl Persistence {
             write_jsonl_file(&self.queues_path, &[] as &[MessageQueueHistoryEntry])?;
         }
         self.migrate_skill_version_ids()?;
+        Ok(())
+    }
+
+    fn migrate_store_format_without_structural_changes(&self) -> Result<()> {
         Ok(())
     }
 
@@ -955,15 +944,15 @@ impl Persistence {
         Ok(())
     }
 
-    fn persist_store_schema_version(
+    fn persist_store_format_version(
         &self,
-        version: StoreSchemaVersion,
+        version: StoreFormatVersion,
         root_id: &str,
     ) -> Result<()> {
         write_json_file(
             &self.meta_path,
             &Meta {
-                version: version.meta_version(),
+                version,
                 root_id: root_id.to_owned(),
             },
         )
@@ -1215,18 +1204,21 @@ impl Persistence {
             );
         }
         let mut meta = read_json_file::<Meta>(&self.meta_path)?;
-        let schema_version = meta.version.schema_version().context(CorruptedStoreSnafu {
-            path: self.meta_path.clone(),
-            message: format!(
-                "unsupported store format version {}, expected {}",
-                meta.version, STORE_FORMAT_VERSION
-            ),
-        })?;
-        if schema_version != StoreSchemaVersion::Current {
+        if meta.version != StoreFormatVersion::current() {
+            ensure!(
+                store_migration_from(&meta.version).is_some(),
+                CorruptedStoreSnafu {
+                    path: self.meta_path.clone(),
+                    message: format!(
+                        "unsupported store format version {}, expected {}",
+                        meta.version, STORE_FORMAT_VERSION
+                    ),
+                }
+            );
             if self.access != StoreAccess::ReadWrite {
                 tracing::warn!(
                     store_path = %self.dir.display(),
-                    from_version = schema_version.format_label(),
+                    from_version = %meta.version,
                     to_version = STORE_FORMAT_VERSION,
                     "read-only store requires writable format migration"
                 );
@@ -1239,10 +1231,10 @@ impl Persistence {
                 }
                 .fail();
             }
-            self.migrate_store(schema_version, &meta.root_id)?;
+            self.migrate_store(meta.version.clone(), &meta.root_id)?;
             meta = read_json_file::<Meta>(&self.meta_path)?;
             ensure!(
-                meta.version.schema_version() == Some(StoreSchemaVersion::Current),
+                meta.version == StoreFormatVersion::current(),
                 CorruptedStoreSnafu {
                     path: self.meta_path.clone(),
                     message: format!(
@@ -1626,10 +1618,25 @@ fn message_queue_log_should_compact(
     log_len >= MESSAGE_QUEUE_COMPACT_MIN_LOG_ENTRIES && log_len > live_len.saturating_mul(2)
 }
 
-fn store_migration_from(from: StoreSchemaVersion) -> Option<&'static StoreMigration> {
+fn store_migration_from(from: &StoreFormatVersion) -> Option<&'static StoreMigration> {
     STORE_MIGRATIONS
         .iter()
-        .find(|migration| migration.from == from)
+        .find(|migration| store_format_versions_match(&migration.from, from))
+}
+
+fn store_format_versions_match(
+    expected: &StoreFormatVersion<&'static str>,
+    actual: &StoreFormatVersion,
+) -> bool {
+    match (expected, actual) {
+        (StoreFormatVersion::Legacy(expected), StoreFormatVersion::Legacy(actual)) => {
+            actual == expected
+        }
+        (StoreFormatVersion::Chronicle(expected), StoreFormatVersion::Chronicle(actual)) => {
+            actual == expected
+        }
+        _ => false,
+    }
 }
 
 fn open_store_lock(store_dir: &Path) -> Result<Arc<File>> {
@@ -2370,6 +2377,15 @@ impl JobStore for FsStore {
         Ok(created)
     }
 
+    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let created = temp.submit_job_with_id(job_id, branch, base)?;
+        self.persistence.persist_jobs(&temp)?;
+        state.jobs = temp.jobs;
+        Ok(created)
+    }
+
     fn get_job(&self, job_id: &str) -> Result<Job> {
         self.inner
             .read()
@@ -2422,6 +2438,14 @@ impl MessageQueueStore for FsStore {
             let _ = self.persistence.rewrite_message_queue_history(&state);
         }
         Ok(Some(item))
+    }
+
+    fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .peek_message(queue))
     }
 
     fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
