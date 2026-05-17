@@ -28,7 +28,6 @@ fn command_is_read_only(command: &Command) -> bool {
             &command.command,
             PresetSubcommand::List(_) | PresetSubcommand::Show(_)
         ),
-        Command::Mq(_) => false,
         Command::Prompt(command) => matches!(
             &command.command,
             Some(PromptSubcommand::Status(_)) | Some(PromptSubcommand::BranchStatus(_))

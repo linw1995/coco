@@ -16,7 +16,8 @@ use coco_llm::{
     ProviderRuntimeConfig, StepContext,
 };
 use coco_mem::{
-    PresetStore, ProcessShareableStore, ProviderProfile, SessionState, SkillStore, SkillVersionSpec,
+    MessageQueueStore, PresetStore, ProcessShareableStore, ProviderProfile, SessionState,
+    SkillStore, SkillVersionSpec,
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -1109,6 +1110,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
     assert!(text_output.contains("status: Queued"));
     assert!(text_output.contains("branch: main"));
+    assert_eq!(store.list_queue_messages("prompt.job").unwrap().len(), 1);
 
     let json_output = crate::app::runtime::run_with_services(
         Cli::try_parse_from([
@@ -1140,6 +1142,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(value["status"], "queued");
     assert_eq!(value["branch"], "json");
     assert!(value["job_id"].is_string());
+    assert_eq!(store.list_queue_messages("prompt.job").unwrap().len(), 2);
 }
 
 #[tokio::test]

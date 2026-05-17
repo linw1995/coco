@@ -5,7 +5,6 @@ use clap::{Parser, Subcommand};
 use crate::COCO_DAEMON_SOCKET_ENV;
 
 pub use daemon::{DaemonCommand, DaemonSubcommand};
-pub use mq::{MqCommand, MqSubcommand};
 pub use preset::{
     PresetCommand, PresetNameCommand, PresetRollbackCommand, PresetSetCommand, PresetSubcommand,
 };
@@ -30,7 +29,6 @@ pub use skill::{
 pub use types::{CliProvider, CliSessionRole, CliTool};
 
 mod daemon;
-mod mq;
 mod preset;
 mod prompt;
 mod session;
@@ -61,7 +59,6 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Preset(PresetCommand),
-    Mq(MqCommand),
     Prompt(PromptCommand),
     Session(SessionCommand),
     Skill(SkillCommand),

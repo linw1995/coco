@@ -1,5 +1,3 @@
-use std::fs;
-use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +18,7 @@ use tokio::sync::Notify;
 
 use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
+    prompt::PROMPT_JOB_QUEUE,
     run_forwarded_with_services,
     runtime::{ForwardedRuntimeInputs, RuntimeServices},
     session::resolve_session_config,
@@ -37,9 +36,9 @@ use crate::{
 const DEFAULT_SESSION_BRANCH: &str = "main";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
-const CRONJOB_TASK_QUEUE: &str = "cronjob.task";
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
-const MESSAGE_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
+const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
+const TELEGRAM_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const CHANNEL_BRANCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
@@ -317,7 +316,7 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let worker =
-        CronjobMessageQueueWorker::new(shared_store.clone(), shared_engine.as_ref().clone());
+        PromptJobMessageQueueWorker::new(shared_store.clone(), shared_engine.as_ref().clone());
     tokio::spawn(async move { worker.run().await })
 }
 
@@ -382,96 +381,25 @@ enum TelegramQueuePayloadError {
     Decode { source: serde_json::Error },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum CronjobRepeatPolicy {
-    Parallel,
-    Serial,
-    Skip,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
-struct QueuedCronjobTaskEvent {
-    task_id: String,
-    branch: String,
-    prompt: String,
-    repeat: CronjobRepeatPolicy,
-    data_dir: PathBuf,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct CronjobTaskState {
-    last_job_id: String,
-    branch: String,
+struct QueuedPromptJob {
+    job_id: String,
 }
 
 #[derive(Debug, Snafu)]
-enum CronjobQueuePayloadError {
-    #[snafu(display("Failed to decode cronjob queue payload: {source}"))]
-    DecodeCronjob { source: serde_json::Error },
-
-    #[snafu(display("Invalid cronjob task id {task_id:?}"))]
-    InvalidTaskId { task_id: String },
-
-    #[snafu(display("Invalid cronjob data directory {path:?}"))]
-    InvalidDataDir { path: PathBuf },
+enum PromptJobQueuePayloadError {
+    #[snafu(display("Failed to decode prompt job queue payload: {source}"))]
+    DecodePromptJob { source: serde_json::Error },
 }
 
-#[derive(Debug, Snafu)]
-enum CronjobTaskStateError {
-    #[snafu(display("Failed to create cronjob task state directory {path:?}: {source}"))]
-    CreateDirectory {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("Failed to read cronjob task state {path:?}: {source}"))]
-    Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("Failed to parse cronjob task state {path:?}: {source}"))]
-    Parse {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-
-    #[snafu(display("Failed to serialize cronjob task state {path:?}: {source}"))]
-    Serialize {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-
-    #[snafu(display("Failed to write cronjob task state {path:?}: {source}"))]
-    Write {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-}
-
-#[derive(Debug, Snafu)]
-enum CronjobTaskEventError {
-    #[snafu(display("Cronjob task engine operation failed: {source}"))]
-    Engine { source: coco_core::EngineError },
-
-    #[snafu(display("Failed to persist cronjob task state: {source}"))]
-    TaskState { source: CronjobTaskStateError },
-}
-
-struct CronjobMessageQueueWorker<B, S> {
+struct PromptJobMessageQueueWorker<B, S> {
     store: S,
     engine: ConversationEngine<B, S>,
-    notify: Arc<Notify>,
 }
 
-impl<B, S> CronjobMessageQueueWorker<B, S> {
+impl<B, S> PromptJobMessageQueueWorker<B, S> {
     fn new(store: S, engine: ConversationEngine<B, S>) -> Self {
-        Self {
-            store,
-            engine,
-            notify: Arc::new(Notify::new()),
-        }
+        Self { store, engine }
     }
 
     async fn run(self) -> Result<()>
@@ -481,10 +409,7 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
     {
         loop {
             if self.drain_once().await? == 0 {
-                tokio::select! {
-                    () = self.notify.notified() => {}
-                    () = tokio::time::sleep(MESSAGE_QUEUE_IDLE_DELAY) => {}
-                }
+                tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
             }
         }
     }
@@ -497,30 +422,28 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
         let mut handled = 0;
         while let Some(item) = self
             .store
-            .dequeue_message(CRONJOB_TASK_QUEUE)
+            .dequeue_message(PROMPT_JOB_QUEUE)
             .context(StoreSnafu)?
         {
             handled += 1;
-            // TODO: Dispatch cronjob events to per-task workers so one serial task cannot block
-            // unrelated queued tasks.
-            self.handle_item(item).await;
+            self.handle_item(item);
         }
         Ok(handled)
     }
 
-    async fn handle_item(&self, item: MessageQueueItem)
+    fn handle_item(&self, item: MessageQueueItem)
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        let event = match decode_cronjob_task_event(item.payload.clone()) {
-            Ok(event) => event,
+        let job = match decode_prompt_job_message(item.payload) {
+            Ok(job) => job,
             Err(error) => {
                 tracing::error!(
                     message_id = %item.message_id,
-                    queue = CRONJOB_TASK_QUEUE,
+                    queue = PROMPT_JOB_QUEUE,
                     error = %error,
-                    "discarded invalid cronjob queue message"
+                    "discarded invalid prompt job queue message"
                 );
                 return;
             }
@@ -528,124 +451,11 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
 
         tracing::info!(
             message_id = %item.message_id,
-            queue = CRONJOB_TASK_QUEUE,
-            task_id = %event.task_id,
-            branch = %event.branch,
-            repeat = ?event.repeat,
-            "handling queued cronjob task event"
+            queue = PROMPT_JOB_QUEUE,
+            job_id = %job.job_id,
+            "handling queued prompt job"
         );
-
-        if let Err(error) = self.handle_event(&event, &item).await {
-            tracing::error!(
-                message_id = %item.message_id,
-                queue = CRONJOB_TASK_QUEUE,
-                task_id = %event.task_id,
-                branch = %event.branch,
-                error = %error,
-                "queued cronjob task event failed"
-            );
-        }
-    }
-
-    async fn handle_event(
-        &self,
-        event: &QueuedCronjobTaskEvent,
-        item: &MessageQueueItem,
-    ) -> std::result::Result<(), CronjobTaskEventError>
-    where
-        B: CompletionBackend + 'static,
-        S: Store + Clone + Send + Sync + 'static,
-    {
-        if !self
-            .wait_for_previous_task_job(event, item)
-            .await
-            .context(EngineSnafu)?
-        {
-            return Ok(());
-        }
-
-        wait_for_branch_to_accept_prompt_job(&self.engine, &event.branch)
-            .await
-            .context(EngineSnafu)?;
-        let job = self
-            .engine
-            .submit_job(&event.branch, &event.prompt, vec![])
-            .await
-            .context(EngineSnafu)?;
-        write_cronjob_task_state(
-            &cronjob_task_state_path(event),
-            &CronjobTaskState {
-                last_job_id: job.job_id.clone(),
-                branch: job.branch.clone(),
-            },
-        )
-        .context(TaskStateSnafu)?;
-        spawn_prompt_job_driver(self.engine.clone(), job.job_id);
-        Ok(())
-    }
-
-    async fn wait_for_previous_task_job(
-        &self,
-        event: &QueuedCronjobTaskEvent,
-        item: &MessageQueueItem,
-    ) -> std::result::Result<bool, coco_core::EngineError>
-    where
-        B: CompletionBackend + 'static,
-        S: Store + Clone + Send + Sync + 'static,
-    {
-        if matches!(event.repeat, CronjobRepeatPolicy::Parallel) {
-            return Ok(true);
-        }
-
-        let state_path = cronjob_task_state_path(event);
-        let state = match read_cronjob_task_state(&state_path) {
-            Ok(Some(state)) => state,
-            Ok(None) => return Ok(true),
-            Err(error) => {
-                tracing::error!(
-                    task_id = %event.task_id,
-                    path = %state_path.display(),
-                    error = %error,
-                    "failed to read cronjob task state"
-                );
-                return Ok(false);
-            }
-        };
-
-        loop {
-            let snapshot = self.engine.get_job(&state.last_job_id)?;
-            if matches!(event.repeat, CronjobRepeatPolicy::Skip) {
-                if snapshot
-                    .finished_at
-                    .is_some_and(|finished_at| finished_at <= item.created_at)
-                {
-                    return Ok(true);
-                }
-                tracing::info!(
-                    task_id = %event.task_id,
-                    previous_job_id = %state.last_job_id,
-                    previous_job_status = ?snapshot.status,
-                    previous_job_finished_at = ?snapshot.finished_at,
-                    event_created_at = %item.created_at,
-                    "skipping cronjob task event because previous task job is still active"
-                );
-                return Ok(false);
-            }
-            if matches!(snapshot.status, JobStatus::Finished) {
-                return Ok(true);
-            }
-
-            tracing::info!(
-                task_id = %event.task_id,
-                previous_job_id = %state.last_job_id,
-                previous_job_status = ?snapshot.status,
-                "waiting for previous cronjob task job before submitting next event"
-            );
-            let snapshot = self.engine.drive_job(&state.last_job_id).await?;
-            if !matches!(snapshot.status, JobStatus::Finished) {
-                tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
-            }
-        }
+        spawn_queued_prompt_job_driver(self.engine.clone(), job.job_id);
     }
 }
 
@@ -721,7 +531,7 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
             if self.drain_once().await? == 0 {
                 tokio::select! {
                     () = self.notify.notified() => {}
-                    () = tokio::time::sleep(MESSAGE_QUEUE_IDLE_DELAY) => {}
+                    () = tokio::time::sleep(TELEGRAM_QUEUE_IDLE_DELAY) => {}
                 }
             }
         }
@@ -775,7 +585,9 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
             "handling queued telegram inbound message"
         );
 
-        if let Err(error) = wait_for_branch_to_accept_prompt_job(&self.engine, &self.branch).await {
+        if let Err(error) =
+            wait_for_branch_to_accept_channel_prompt(&self.engine, &self.branch).await
+        {
             tracing::error!(
                 message_id = %item.message_id,
                 queue = TELEGRAM_INBOUND_QUEUE,
@@ -812,7 +624,7 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
     }
 }
 
-async fn wait_for_branch_to_accept_prompt_job<B, S>(
+async fn wait_for_branch_to_accept_channel_prompt<B, S>(
     engine: &ConversationEngine<B, S>,
     branch: &str,
 ) -> std::result::Result<(), coco_core::EngineError>
@@ -834,7 +646,7 @@ where
             branch = %branch,
             active_job_id = %active_job.job_id,
             active_job_status = ?active_job.status,
-            "waiting for active branch prompt job before handling queued message"
+            "waiting for active branch prompt job before handling queued telegram message"
         );
 
         let snapshot = engine.drive_job(&active_job.job_id).await?;
@@ -872,91 +684,13 @@ fn decode_telegram_message(
     })
 }
 
-fn decode_cronjob_task_event(
+fn decode_prompt_job_message(
     payload: serde_json::Value,
-) -> std::result::Result<QueuedCronjobTaskEvent, CronjobQueuePayloadError> {
-    let event =
-        serde_json::from_value::<QueuedCronjobTaskEvent>(payload).context(DecodeCronjobSnafu)?;
-    ensure!(
-        is_valid_cronjob_task_id(&event.task_id),
-        InvalidTaskIdSnafu {
-            task_id: event.task_id.clone(),
-        }
-    );
-    ensure!(
-        is_safe_cronjob_data_dir(&event.data_dir),
-        InvalidDataDirSnafu {
-            path: event.data_dir.clone(),
-        }
-    );
-    Ok(event)
+) -> std::result::Result<QueuedPromptJob, PromptJobQueuePayloadError> {
+    serde_json::from_value(payload).context(DecodePromptJobSnafu)
 }
 
-fn cronjob_task_state_path(event: &QueuedCronjobTaskEvent) -> PathBuf {
-    event
-        .data_dir
-        .join("state")
-        .join(format!("{}.state.json", event.task_id))
-}
-
-fn is_valid_cronjob_task_id(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphanumeric() {
-        return false;
-    }
-    value.len() <= 128
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
-}
-
-fn is_safe_cronjob_data_dir(path: &Path) -> bool {
-    path.is_absolute()
-        && path.components().all(|component| {
-            matches!(
-                component,
-                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
-            )
-        })
-}
-
-fn read_cronjob_task_state(
-    path: &Path,
-) -> std::result::Result<Option<CronjobTaskState>, CronjobTaskStateError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(path).context(ReadSnafu {
-        path: path.to_path_buf(),
-    })?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .context(ParseSnafu {
-            path: path.to_path_buf(),
-        })
-}
-
-fn write_cronjob_task_state(
-    path: &Path,
-    state: &CronjobTaskState,
-) -> std::result::Result<(), CronjobTaskStateError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context(CreateDirectorySnafu {
-            path: parent.to_path_buf(),
-        })?;
-    }
-    let content = serde_json::to_string_pretty(state)
-        .map(|content| format!("{content}\n"))
-        .context(SerializeSnafu {
-            path: path.to_path_buf(),
-        })?;
-    fs::write(path, content).context(WriteSnafu {
-        path: path.to_path_buf(),
-    })
-}
-
-fn spawn_prompt_job_driver<B, S>(engine: ConversationEngine<B, S>, job_id: String)
+fn spawn_queued_prompt_job_driver<B, S>(engine: ConversationEngine<B, S>, job_id: String)
 where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
@@ -966,7 +700,7 @@ where
             tracing::error!(
                 job_id = %job_id,
                 error = %error,
-                "failed to drive queued cronjob prompt job"
+                "failed to drive queued prompt job"
             );
         }
     });
@@ -1212,11 +946,9 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        CRONJOB_TASK_QUEUE, CronjobMessageQueueWorker, CronjobRepeatPolicy, CronjobTaskState,
-        QueuedCronjobTaskEvent, TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher,
-        TelegramMessageQueueWorker, cronjob_task_state_path, decode_cronjob_task_event,
-        decode_telegram_message, encode_telegram_message, resolve_daemon_socket_path,
-        write_cronjob_task_state,
+        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
+        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_telegram_message,
+        encode_telegram_message, resolve_daemon_socket_path,
     };
 
     #[test]
@@ -1234,36 +966,6 @@ mod tests {
         let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
 
         assert_eq!(decoded, message);
-    }
-
-    #[test]
-    fn cronjob_queue_payload_rejects_path_traversal_task_id() {
-        let payload = json!({
-            "task_id": "../daily-review",
-            "branch": "main",
-            "prompt": "Review the work queue.",
-            "repeat": "skip",
-            "data_dir": "/tmp/coco-cronjob",
-        });
-
-        let error = decode_cronjob_task_event(payload).unwrap_err();
-
-        assert!(error.to_string().contains("Invalid cronjob task id"));
-    }
-
-    #[test]
-    fn cronjob_queue_payload_rejects_relative_data_dir() {
-        let payload = json!({
-            "task_id": "daily-review",
-            "branch": "main",
-            "prompt": "Review the work queue.",
-            "repeat": "skip",
-            "data_dir": "relative/data",
-        });
-
-        let error = decode_cronjob_task_event(payload).unwrap_err();
-
-        assert!(error.to_string().contains("Invalid cronjob data directory"));
     }
 
     #[tokio::test]
@@ -1355,8 +1057,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cronjob_queue_worker_submits_and_drives_prompt_job() {
-        let tempdir = tempfile::tempdir().unwrap();
+    async fn prompt_job_queue_worker_drives_queued_prompt_job() {
         let store = MemoryStore::new();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
@@ -1364,192 +1065,31 @@ mod tests {
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("main")).await.unwrap();
         let engine = ConversationEngine::new(llm);
-        let event = cronjob_event(tempdir.path(), CronjobRepeatPolicy::Serial);
-        store
-            .enqueue_message(CRONJOB_TASK_QUEUE, serde_json::to_value(&event).unwrap())
+        let job = engine
+            .submit_job("main", "queued work", vec![])
+            .await
             .unwrap();
-        let worker = CronjobMessageQueueWorker::new(store.clone(), engine.clone());
+        store
+            .enqueue_message(PROMPT_JOB_QUEUE, json!({ "job_id": job.job_id }))
+            .unwrap();
+        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
 
         assert_eq!(worker.drain_once().await.unwrap(), 1);
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
-        let state = read_cronjob_state_file(&cronjob_task_state_path(&event));
         release_first.notify_waiters();
         wait_until(Duration::from_secs(1), || {
             engine
-                .get_job(&state.last_job_id)
+                .get_job(&job.job_id)
                 .is_ok_and(|job| job.status == JobStatus::Finished)
         })
         .await;
 
-        assert_eq!(state.branch, "main");
         assert!(
             store
-                .list_queue_messages(CRONJOB_TASK_QUEUE)
+                .list_queue_messages(PROMPT_JOB_QUEUE)
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    #[tokio::test]
-    async fn cronjob_queue_worker_skip_policy_skips_active_previous_job() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
-        let backend = BlockingOnceBackend::default();
-        let calls = backend.calls.clone();
-        let llm = Arc::new(LlmService::new(store.clone(), backend));
-        llm.create_session(session_config("main")).await.unwrap();
-        let engine = ConversationEngine::new(llm);
-        let previous = engine
-            .submit_job("main", "previous work", vec![])
-            .await
-            .unwrap();
-        let event = cronjob_event(tempdir.path(), CronjobRepeatPolicy::Skip);
-        write_cronjob_task_state(
-            &cronjob_task_state_path(&event),
-            &CronjobTaskState {
-                last_job_id: previous.job_id.clone(),
-                branch: previous.branch.clone(),
-            },
-        )
-        .unwrap();
-        store
-            .enqueue_message(CRONJOB_TASK_QUEUE, serde_json::to_value(&event).unwrap())
-            .unwrap();
-        let worker = CronjobMessageQueueWorker::new(store.clone(), engine);
-
-        assert_eq!(worker.drain_once().await.unwrap(), 1);
-
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(
-            store
-                .list_queue_messages(CRONJOB_TASK_QUEUE)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn cronjob_queue_worker_skip_policy_uses_event_enqueue_time() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
-        let backend = BlockingOnceBackend::default();
-        let calls = backend.calls.clone();
-        let release_first = backend.release_first.clone();
-        let llm = Arc::new(LlmService::new(store.clone(), backend));
-        llm.create_session(session_config("main")).await.unwrap();
-        let engine = ConversationEngine::new(llm);
-        let previous = engine
-            .submit_job("main", "previous work", vec![])
-            .await
-            .unwrap();
-        let event = cronjob_event(tempdir.path(), CronjobRepeatPolicy::Skip);
-        write_cronjob_task_state(
-            &cronjob_task_state_path(&event),
-            &CronjobTaskState {
-                last_job_id: previous.job_id.clone(),
-                branch: previous.branch.clone(),
-            },
-        )
-        .unwrap();
-        store
-            .enqueue_message(CRONJOB_TASK_QUEUE, serde_json::to_value(&event).unwrap())
-            .unwrap();
-        let drive_engine = engine.clone();
-        let previous_job_id = previous.job_id.clone();
-        let drive_task =
-            tokio::spawn(async move { drive_engine.drive_job(&previous_job_id).await });
-        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
-        release_first.notify_waiters();
-        assert_eq!(
-            drive_task.await.unwrap().unwrap().status,
-            JobStatus::Finished
-        );
-        let worker = CronjobMessageQueueWorker::new(store.clone(), engine);
-
-        assert_eq!(worker.drain_once().await.unwrap(), 1);
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(
-            store
-                .list_queue_messages(CRONJOB_TASK_QUEUE)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn cronjob_queue_worker_propagates_state_write_failure() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
-        let backend = BlockingOnceBackend::default();
-        let calls = backend.calls.clone();
-        let llm = Arc::new(LlmService::new(store.clone(), backend));
-        llm.create_session(session_config("main")).await.unwrap();
-        let engine = ConversationEngine::new(llm);
-        let event = cronjob_event(tempdir.path(), CronjobRepeatPolicy::Serial);
-        let state_dir = tempdir.path().join("state");
-        std::fs::write(&state_dir, "not a directory").unwrap();
-        let item = store
-            .enqueue_message(CRONJOB_TASK_QUEUE, serde_json::to_value(&event).unwrap())
-            .unwrap();
-        let worker = CronjobMessageQueueWorker::new(store, engine);
-
-        let error = worker.handle_event(&event, &item).await.unwrap_err();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert!(
-            error
-                .to_string()
-                .contains("Failed to persist cronjob task state")
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn cronjob_queue_worker_parallel_policy_ignores_previous_task_job() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
-        let backend = BlockingOnceBackend::default();
-        let calls = backend.calls.clone();
-        let release_first = backend.release_first.clone();
-        let llm = Arc::new(LlmService::new(store.clone(), backend));
-        llm.create_session(session_config("main")).await.unwrap();
-        llm.create_session(session_config("other")).await.unwrap();
-        let engine = ConversationEngine::new(llm);
-        let previous = engine
-            .submit_job("other", "previous work", vec![])
-            .await
-            .unwrap();
-        let event = cronjob_event(tempdir.path(), CronjobRepeatPolicy::Parallel);
-        write_cronjob_task_state(
-            &cronjob_task_state_path(&event),
-            &CronjobTaskState {
-                last_job_id: previous.job_id.clone(),
-                branch: previous.branch.clone(),
-            },
-        )
-        .unwrap();
-        store
-            .enqueue_message(CRONJOB_TASK_QUEUE, serde_json::to_value(&event).unwrap())
-            .unwrap();
-        let worker = CronjobMessageQueueWorker::new(store, engine.clone());
-
-        assert_eq!(worker.drain_once().await.unwrap(), 1);
-        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
-        let state = read_cronjob_state_file(&cronjob_task_state_path(&event));
-        release_first.notify_waiters();
-        wait_until(Duration::from_secs(1), || {
-            engine
-                .get_job(&previous.job_id)
-                .is_ok_and(|job| job.status == JobStatus::Queued)
-        })
-        .await;
-        wait_until(Duration::from_secs(1), || {
-            engine
-                .get_job(&state.last_job_id)
-                .is_ok_and(|job| job.status == JobStatus::Finished)
-        })
-        .await;
     }
 
     #[derive(Debug, Clone, Default)]
@@ -1595,20 +1135,6 @@ mod tests {
             additional_params: None,
             enable_coco_shim: false,
         }
-    }
-
-    fn cronjob_event(base: &Path, repeat: CronjobRepeatPolicy) -> QueuedCronjobTaskEvent {
-        QueuedCronjobTaskEvent {
-            task_id: "daily-review".to_owned(),
-            branch: "main".to_owned(),
-            prompt: "Review the work queue.".to_owned(),
-            repeat,
-            data_dir: base.to_path_buf(),
-        }
-    }
-
-    fn read_cronjob_state_file(path: &Path) -> CronjobTaskState {
-        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
     async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {

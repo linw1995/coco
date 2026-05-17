@@ -46,7 +46,7 @@ const BUILTIN_COCO_ORCHESTRATOR_REVISION_ID: &str =
 const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
-    "c6267e807038a0d56bded6b62984c3109b03c001d5225f6f293337c95deaf760";
+    "67f9500962fa18d2900be76b773250c5ec41c4a23641ea5e43f1628724b9245c";
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
@@ -71,11 +71,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         role: SessionRole::Orchestrator,
         name: "cronjob",
         from_revision_ids: &[
-            // Last bundled cronjob revision before cron triggers moved through the MQ system.
+            // Last bundled cronjob revision before task runtime data moved under data_dir.
             "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e",
-            "2000ed2a56b02ae6bdbde862bba1e90e26e517eb872e72d08bb14b0f2effa8cc",
-            "48d83bd67727952932bf88f79bf3f5851941c650f17e8f010124ed38e06e15a1",
-            BUILTIN_CRONJOB_REVISION_ID,
         ],
         target_revision_id: BUILTIN_CRONJOB_REVISION_ID,
     },

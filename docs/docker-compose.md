@@ -246,10 +246,6 @@ Persistent cronjob paths live under `/data/skills/orchestrator/cronjob`:
 As long as `${COCO_DATA_DIR}` is persistent, cronjob config and state survive
 container rebuilds.
 
-Cron triggers are published into the persistent `cronjob.task` message queue.
-The long-lived daemon consumes that queue, submits the prompt job, drives it,
-and records the latest job id in the cronjob state directory.
-
 The Docker path uses direct `supercronic` crontab files. Current `supercronic`
 scheduling treats `CRON_TZ` as a file-wide timezone, so the cronjob skill
 groups managed tasks by schedule timezone and writes one file-level `CRON_TZ`

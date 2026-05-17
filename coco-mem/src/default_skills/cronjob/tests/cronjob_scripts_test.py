@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -502,11 +503,18 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertNotIn("echo injected", result.stdout)
         self.assertFalse((workspace / "install").exists())
 
-    def test_runner_skip_policy_enqueues_task_event(self) -> None:
+    def test_runner_skip_policy_does_not_submit_while_previous_job_is_active(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             fake_coco = write_fake_coco(workspace, status="running")
             task_file = write_task_file(workspace, fake_coco, repeat="skip")
+            state_file = workspace / "state" / "daily-review.state.json"
+            state_file.parent.mkdir(parents=True)
+            state_file.write_text(
+                '{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8"
+            )
 
             result = subprocess.run(
                 [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
@@ -518,17 +526,19 @@ class CronjobScriptTests(unittest.TestCase):
             calls = read_fake_coco_calls(workspace)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('"message_id": "message-new"', result.stdout)
-        self.assertEqual([call["kind"] for call in calls], ["enqueue"])
-        self.assertEqual(calls[0]["payload"]["repeat"], "skip")
-        self.assertEqual(calls[0]["payload"]["data_dir"], str(workspace.resolve()))
-        self.assertNotIn("state_dir", calls[0]["payload"])
+        self.assertIn("previous job job-old is running", result.stdout)
+        self.assertEqual([call["kind"] for call in calls], ["status"])
 
-    def test_runner_serial_policy_enqueues_task_event(self) -> None:
+    def test_runner_serial_policy_submits_after_previous_job_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             fake_coco = write_fake_coco(workspace, status="finished")
             task_file = write_task_file(workspace, fake_coco, repeat="serial")
+            state_file = workspace / "state" / "daily-review.state.json"
+            state_file.parent.mkdir(parents=True)
+            state_file.write_text(
+                '{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8"
+            )
 
             result = subprocess.run(
                 [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
@@ -538,11 +548,11 @@ class CronjobScriptTests(unittest.TestCase):
                 text=True,
             )
             calls = read_fake_coco_calls(workspace)
+            state = json.loads(state_file.read_text(encoding="utf-8"))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call["kind"] for call in calls], ["enqueue"])
-        self.assertEqual(calls[0]["payload"]["repeat"], "serial")
-        self.assertEqual(calls[0]["payload"]["data_dir"], str(workspace.resolve()))
+        self.assertEqual([call["kind"] for call in calls], ["status", "submit"])
+        self.assertEqual(state["last_job_id"], "job-new")
 
     def test_runner_infers_data_dir_for_existing_installed_task_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -568,10 +578,56 @@ class CronjobScriptTests(unittest.TestCase):
                 text=True,
             )
             calls = read_fake_coco_calls(workspace)
+            migrated_task = json.loads(task_file.read_text(encoding="utf-8"))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call["kind"] for call in calls], ["enqueue"])
-        self.assertEqual(calls[0]["payload"]["data_dir"], str(workspace.resolve()))
+        self.assertEqual([call["kind"] for call in calls], ["submit"])
+        self.assertEqual(migrated_task["data_dir"], str(workspace.resolve()))
+        self.assertNotIn("state_dir", migrated_task)
+
+    def test_runner_migrates_legacy_task_state_to_data_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fake_coco = write_fake_coco(workspace, status="finished")
+            task_file = workspace / "tasks" / "daily-review.json"
+            task_file.parent.mkdir(parents=True)
+            legacy_state_dir = workspace / "legacy-state"
+            legacy_state_file = legacy_state_dir / "daily-review.state.json"
+            legacy_state_file.parent.mkdir(parents=True)
+            legacy_state_file.write_text(
+                '{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8"
+            )
+            task = {
+                "id": "daily-review",
+                "branch": "main",
+                "prompt": "Review the work queue.",
+                "repeat": "serial",
+                "coco_bin": str(fake_coco),
+                "state_dir": str(legacy_state_dir),
+                "log_dir": str(workspace / "logs"),
+            }
+            task_file.write_text(json.dumps(task), encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            calls = read_fake_coco_calls(workspace)
+            migrated_task = json.loads(task_file.read_text(encoding="utf-8"))
+            migrated_state = json.loads(
+                (workspace / "state" / "daily-review.state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["kind"] for call in calls], ["status", "submit"])
+        self.assertEqual(migrated_task["data_dir"], str(workspace.resolve()))
+        self.assertNotIn("state_dir", migrated_task)
+        self.assertEqual(migrated_state["last_job_id"], "job-new")
 
     def test_runner_serial_policy_queues_when_state_is_locked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -622,10 +678,12 @@ class CronjobScriptTests(unittest.TestCase):
             calls = read_fake_coco_calls(workspace)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call["kind"] for call in calls], ["enqueue", "enqueue"])
+        self.assertEqual(
+            [call["kind"] for call in calls], ["submit", "status", "submit"]
+        )
         self.assertFalse(pending_file.exists())
 
-    def test_runner_parallel_policy_enqueues_without_state_locking(self) -> None:
+    def test_runner_parallel_policy_serializes_state_writes_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             fake_coco = write_fake_coco(workspace, status="finished")
@@ -636,25 +694,36 @@ class CronjobScriptTests(unittest.TestCase):
 
             with state_lock.open("a+", encoding="utf-8") as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                result = subprocess.run(
+                process = subprocess.Popen(
                     [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    check=False,
                 )
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            calls = read_fake_coco_calls(workspace)
+                try:
+                    wait_for_fake_coco_call(workspace, expected_count=1)
+                    self.assertIsNone(process.poll())
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                stdout, stderr = process.communicate(timeout=5)
+            state = json.loads(
+                (state_dir / "daily-review.state.json").read_text(encoding="utf-8")
+            )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('"message_id": "message-new"', result.stdout)
-        self.assertEqual([call["kind"] for call in calls], ["enqueue"])
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn('"job_id": "job-new"', stdout)
+        self.assertEqual(state["last_job_id"], "job-new")
 
-    def test_runner_fails_when_task_event_cannot_be_enqueued(self) -> None:
+    def test_runner_fails_closed_when_previous_job_status_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             fake_coco = write_fake_coco(workspace, status=None)
             task_file = write_task_file(workspace, fake_coco, repeat="skip")
+            state_file = workspace / "state" / "daily-review.state.json"
+            state_file.parent.mkdir(parents=True)
+            state_file.write_text(
+                '{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8"
+            )
 
             result = subprocess.run(
                 [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
@@ -663,9 +732,11 @@ class CronjobScriptTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            calls = read_fake_coco_calls(workspace)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("failed to enqueue cronjob task event", result.stderr)
+        self.assertIn("failed to resolve previous job job-old status", result.stderr)
+        self.assertEqual([call["kind"] for call in calls], ["status"])
 
 
 def run_add(
@@ -707,12 +778,11 @@ def run_add(
 def write_fake_coco(workspace: Path, *, status: str | None) -> Path:
     path = workspace / "fake-coco.py"
     calls_file = workspace / "coco-calls.jsonl"
-    enqueue_response = (
-        "queue = args[args.index('--queue') + 1]\n"
-        '                print(json.dumps({"message_id": "message-new", "queue": queue}))\n'
+    status_response = (
+        f"print(json.dumps({{'job': {{'status': {status!r}}}}}))\n"
         "                raise SystemExit(0)"
         if status is not None
-        else 'print("enqueue unavailable", file=sys.stderr)\n                raise SystemExit(1)'
+        else "print('status unavailable', file=sys.stderr)\n                raise SystemExit(1)"
     )
     path.write_text(
         textwrap.dedent(
@@ -724,12 +794,15 @@ def write_fake_coco(workspace: Path, *, status: str | None) -> Path:
 
             calls = Path({str(calls_file)!r})
             args = sys.argv[1:]
-            if args[:3] == ["mq", "enqueue", "--json"]:
-                payload = json.loads(args[args.index("--payload-json") + 1])
+            if args[:3] == ["prompt", "status", "--json"]:
                 with calls.open("a", encoding="utf-8") as handle:
-                    record = {{"kind": "enqueue", "args": args, "payload": payload}}
-                    handle.write(json.dumps(record) + "\\n")
-                {enqueue_response}
+                    handle.write(json.dumps({{"kind": "status", "args": args}}) + "\\n")
+                {status_response}
+            if args[:4] == ["prompt", "--async", "--json", "--branch"]:
+                with calls.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({{"kind": "submit", "args": args}}) + "\\n")
+                print(json.dumps({{"job_id": "job-new", "status": "queued", "branch": args[4]}}))
+                raise SystemExit(0)
             raise SystemExit(f"unexpected coco args: {{args}}")
             """
         ),
@@ -763,6 +836,15 @@ def read_fake_coco_calls(workspace: Path) -> list[dict[str, object]]:
         for line in calls_file.read_text(encoding="utf-8").splitlines()
         if line
     ]
+
+
+def wait_for_fake_coco_call(workspace: Path, *, expected_count: int) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if len(read_fake_coco_calls(workspace)) >= expected_count:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {expected_count} fake coco calls")
 
 
 if __name__ == "__main__":

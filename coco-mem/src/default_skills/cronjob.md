@@ -45,9 +45,9 @@ Rules:
   entrypoint derives `COCO_CRONTAB_DIR` from that persistent root and starts
   supervised `supercronic` processes, so mounting `/data` is enough to preserve
   schedules across container rebuilds.
-- The runner publishes each trigger to `coco mq enqueue --queue cronjob.task`.
-  The long-lived daemon consumes those task events, submits prompt jobs, drives
-  them, and records the latest prompt job id under the cronjob data directory.
+- The runner submits work with `coco prompt --async --json --branch <branch>
+  <prompt>` and records the latest prompt job id under the cronjob data
+  directory.
 - Use `--timezone <zone>` only when the cron implementation supports
   `CRON_TZ`. The `supercronic` path groups managed jobs into one crontab file
   per schedule timezone because `supercronic` treats `CRON_TZ` as file-wide.
