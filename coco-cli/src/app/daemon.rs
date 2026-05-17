@@ -395,10 +395,7 @@ struct QueuedCronjobTaskEvent {
     branch: String,
     prompt: String,
     repeat: CronjobRepeatPolicy,
-    #[serde(default)]
-    data_dir: Option<PathBuf>,
-    #[serde(default)]
-    state_dir: Option<PathBuf>,
+    data_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -411,9 +408,6 @@ struct CronjobTaskState {
 enum CronjobQueuePayloadError {
     #[snafu(display("Failed to decode cronjob queue payload: {source}"))]
     DecodeCronjob { source: serde_json::Error },
-
-    #[snafu(display("Cronjob queue payload is missing data_dir"))]
-    MissingDataDir,
 }
 
 #[derive(Debug, Snafu)]
@@ -874,22 +868,14 @@ fn decode_telegram_message(
 fn decode_cronjob_task_event(
     payload: serde_json::Value,
 ) -> std::result::Result<QueuedCronjobTaskEvent, CronjobQueuePayloadError> {
-    let event =
-        serde_json::from_value::<QueuedCronjobTaskEvent>(payload).context(DecodeCronjobSnafu)?;
-    if event.data_dir.is_none() && event.state_dir.is_none() {
-        return MissingDataDirSnafu.fail();
-    }
-    Ok(event)
+    serde_json::from_value(payload).context(DecodeCronjobSnafu)
 }
 
 fn cronjob_task_state_path(event: &QueuedCronjobTaskEvent) -> PathBuf {
-    let state_dir = event
+    event
         .data_dir
-        .as_ref()
-        .map(|data_dir| data_dir.join("state"))
-        .or_else(|| event.state_dir.clone())
-        .expect("decoded cronjob task event should include a state root");
-    state_dir.join(format!("{}.state.json", event.task_id))
+        .join("state")
+        .join(format!("{}.state.json", event.task_id))
 }
 
 fn read_cronjob_task_state(
@@ -1542,8 +1528,7 @@ mod tests {
             branch: "main".to_owned(),
             prompt: "Review the work queue.".to_owned(),
             repeat,
-            data_dir: Some(base.to_path_buf()),
-            state_dir: None,
+            data_dir: base.to_path_buf(),
         }
     }
 

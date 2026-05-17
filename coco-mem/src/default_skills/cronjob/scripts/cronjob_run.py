@@ -56,27 +56,20 @@ def parse_args() -> argparse.Namespace:
 
 def load_task(path: Path) -> dict[str, str]:
     task = json.loads(path.read_text(encoding="utf-8"))
-    required = {"id", "branch", "prompt", "repeat", "coco_bin"}
+    required = {"id", "branch", "prompt", "repeat", "coco_bin", "data_dir"}
     missing = sorted(required - task.keys())
     if missing:
         raise SystemExit(f"task file is missing required fields: {', '.join(missing)}")
-    if "data_dir" not in task and "state_dir" not in task:
-        raise SystemExit("task file is missing required fields: data_dir")
     if task["repeat"] not in {"parallel", "serial", "skip"}:
         raise SystemExit("repeat must be one of parallel, serial, or skip")
     return task
 
 
 def resolve_task_data_dir(task: dict[str, str], task_file: Path) -> Path:
-    if "data_dir" in task:
-        return Path(task["data_dir"]).expanduser().resolve()
-    state_dir = Path(task["state_dir"]).expanduser()
-    if not state_dir.is_absolute():
-        state_dir = task_file.parent / state_dir
-    state_dir = state_dir.resolve()
-    if state_dir.name == "state":
-        return state_dir.parent
-    return state_dir
+    data_dir = Path(task["data_dir"]).expanduser()
+    if not data_dir.is_absolute():
+        data_dir = task_file.parent / data_dir
+    return data_dir.resolve()
 
 
 class lock_for_policy:

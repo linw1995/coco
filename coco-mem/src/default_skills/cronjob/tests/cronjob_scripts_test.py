@@ -196,7 +196,7 @@ class CronjobScriptTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(task["data_dir"], str(persist_dir))
-        self.assertEqual(task["state_dir"], str(persist_dir / "state"))
+        self.assertNotIn("state_dir", task)
         self.assertEqual(task["log_dir"], str(persist_dir / "logs"))
 
     def test_add_crontab_dir_groups_direct_files_by_timezone(self) -> None:
@@ -654,8 +654,6 @@ def run_add(
         [
             "--install-dir",
             str(workspace / "install"),
-            "--state-dir",
-            str(workspace / "state"),
             "--log-dir",
             str(workspace / "logs"),
         ]
