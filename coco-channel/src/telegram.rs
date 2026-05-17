@@ -10,6 +10,7 @@ use crate::{ChannelRuntime, Error, InboundMessage, MessageHandler, Result};
 
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 30;
 const POLL_TIMEOUT_GRACE_SECS: u64 = 15;
+const CONNECT_TIMEOUT_SECS: u64 = 10;
 const TRANSPORT_RETRY_DELAY_SECS: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +144,8 @@ where
                 Err(error) if error.is_transport_failure() => {
                     tracing::warn!(
                         error = %error,
+                        transport_error_kind = ?transport_failure_kind(&error),
+                        transport_status = ?transport_failure_status(&error),
                         retry_delay_secs = TRANSPORT_RETRY_DELAY_SECS,
                         "telegram channel polling failed; retrying"
                     );
@@ -164,7 +167,10 @@ impl ReqwestTelegramTransport {
     pub fn new(token: impl Into<String>) -> Self {
         let token = token.into();
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+                .build()
+                .expect("telegram reqwest client config should be valid"),
             base_url: format!("https://api.telegram.org/bot{token}"),
         }
     }
@@ -225,6 +231,21 @@ fn request_timeout_for_poll(poll_timeout_secs: u64) -> Duration {
     Duration::from_secs(poll_timeout_secs.saturating_add(POLL_TIMEOUT_GRACE_SECS))
 }
 
+fn transport_failure_kind(error: &Error) -> Option<&'static str> {
+    match error {
+        Error::TelegramTransport { source } => Some(source.kind()),
+        Error::Transport { .. } => Some("transport"),
+        Error::Handler { .. } | Error::InvalidInput { .. } => None,
+    }
+}
+
+fn transport_failure_status(error: &Error) -> Option<u16> {
+    match error {
+        Error::TelegramTransport { source } => source.status_code(),
+        Error::Transport { .. } | Error::Handler { .. } | Error::InvalidInput { .. } => None,
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum TelegramError {
     #[snafu(display("Telegram API request failed: {source}"))]
@@ -238,6 +259,31 @@ pub enum TelegramError {
 
     #[snafu(display("Telegram API response is missing result"))]
     MissingResult,
+}
+
+impl TelegramError {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Request { source } if source.is_connect() && source.is_timeout() => {
+                "connect_timeout"
+            }
+            Self::Request { source } if source.is_timeout() => "timeout",
+            Self::Request { source } if source.is_connect() => "connect",
+            Self::Request { source } if source.is_status() => "status",
+            Self::Request { source } if source.is_decode() => "decode",
+            Self::Request { source } if source.is_body() => "body",
+            Self::Request { .. } => "request",
+            Self::Api { .. } => "api",
+            Self::MissingResult => "missing_result",
+        }
+    }
+
+    fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::Request { source } => source.status().map(|status| status.as_u16()),
+            Self::Api { .. } | Self::MissingResult => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -319,6 +365,7 @@ mod tests {
 
     use super::*;
     use crate::OutboundMessage;
+    use tokio::io::AsyncWriteExt;
 
     #[derive(Default)]
     struct FakeTransport {
@@ -509,6 +556,38 @@ mod tests {
 
         assert!(!message.contains(token));
         assert!(!message.contains("/bot"));
+    }
+
+    #[tokio::test]
+    async fn request_error_kind_preserves_status_without_url() {
+        let token = "123456:secret-token";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let source = reqwest::Client::new()
+            .post(format!("http://{address}/bot{token}/getUpdates"))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .unwrap_err();
+        assert!(source.url().unwrap().as_str().contains(token));
+
+        let error = Err::<(), _>(source).context(RequestSnafu).unwrap_err();
+
+        assert_eq!(error.kind(), "status");
+        assert_eq!(error.status_code(), Some(429));
+        assert!(!error.to_string().contains(token));
+
+        server.await.unwrap();
     }
 
     #[test]
