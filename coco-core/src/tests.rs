@@ -446,6 +446,7 @@ async fn llm_engine_branch_lock_waits_until_guard_drops() {
     let engine = ConversationEngine::new(llm);
 
     let guard = engine.lock_branch("main").await;
+    assert_eq!(engine.branch_lock_count(), 1);
     let started = Arc::new(Notify::new());
     let acquired = Arc::new(Notify::new());
     let waiter = tokio::spawn({
@@ -471,6 +472,7 @@ async fn llm_engine_branch_lock_waits_until_guard_drops() {
         .await
         .unwrap();
     waiter.await.unwrap();
+    assert_eq!(engine.branch_lock_count(), 0);
 }
 
 #[tokio::test]

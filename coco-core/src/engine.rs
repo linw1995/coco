@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, Node, NodeStore,
@@ -11,15 +15,16 @@ use coco_llm::{
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jiff::Timestamp;
 use serde::Serialize;
-use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::{BatchPromptResult, BranchPromptOutcome, BranchPromptRequest, EngineError};
 
 type JobResult = std::result::Result<String, EngineError>;
 type InflightJob = Shared<BoxFuture<'static, JobResult>>;
-type InflightJobTable = Arc<Mutex<HashMap<String, InflightJob>>>;
-type BranchLockTable = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+type InflightJobTable = Arc<AsyncMutex<HashMap<String, InflightJob>>>;
+type BranchLock = Arc<AsyncMutex<()>>;
+type BranchLockTable = Arc<StdMutex<HashMap<String, BranchLock>>>;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct JobStatusSnapshot {
@@ -57,7 +62,23 @@ impl<B, S> Clone for ConversationEngine<B, S> {
 }
 
 pub struct BranchLockGuard {
-    _guard: OwnedMutexGuard<()>,
+    branch: String,
+    lock: BranchLock,
+    locks: BranchLockTable,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for BranchLockGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let mut locks = self.locks.lock().expect("branch lock table poisoned");
+        if locks
+            .get(&self.branch)
+            .is_some_and(|lock| Arc::ptr_eq(lock, &self.lock) && Arc::strong_count(&self.lock) == 2)
+        {
+            locks.remove(&self.branch);
+        }
+    }
 }
 
 impl ConversationEngine<RigBackend, MemoryStore> {
@@ -70,8 +91,8 @@ impl<B, S> ConversationEngine<B, S> {
     pub fn new(service: Arc<LlmService<B, S>>) -> Self {
         Self {
             service,
-            inflight_jobs: Arc::new(Mutex::new(HashMap::new())),
-            branch_locks: Arc::new(Mutex::new(HashMap::new())),
+            inflight_jobs: Arc::new(AsyncMutex::new(HashMap::new())),
+            branch_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -83,16 +104,32 @@ impl<B, S> ConversationEngine<B, S> {
         self.service.runtime_store_path()
     }
 
+    #[cfg(test)]
+    pub(crate) fn branch_lock_count(&self) -> usize {
+        self.branch_locks
+            .lock()
+            .expect("branch lock table poisoned")
+            .len()
+    }
+
     pub async fn lock_branch(&self, branch: &str) -> BranchLockGuard {
+        let branch = branch.to_owned();
         let lock = {
-            let mut locks = self.branch_locks.lock().await;
+            let mut locks = self
+                .branch_locks
+                .lock()
+                .expect("branch lock table poisoned");
             locks
-                .entry(branch.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .entry(branch.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
                 .clone()
         };
+        let guard = lock.clone().lock_owned().await;
         BranchLockGuard {
-            _guard: lock.lock_owned().await,
+            branch,
+            lock,
+            locks: self.branch_locks.clone(),
+            guard: Some(guard),
         }
     }
 }
