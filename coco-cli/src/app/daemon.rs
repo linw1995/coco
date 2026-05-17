@@ -391,18 +391,6 @@ enum QueuedPromptJob {
     Request(Box<QueuedPromptRequest>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PromptJobQueueDrain {
-    handled: usize,
-    backoff: bool,
-}
-
-impl PromptJobQueueDrain {
-    fn should_sleep(self) -> bool {
-        self.handled == 0 || self.backoff
-    }
-}
-
 #[derive(Debug, Snafu)]
 enum PromptJobQueuePayloadError {
     #[snafu(display("Failed to decode prompt job queue payload: {source}"))]
@@ -425,35 +413,40 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         S: Store + Clone + Send + Sync + 'static,
     {
         loop {
-            if self.drain_once().await?.should_sleep() {
-                tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
-            }
+            self.drain_once().await?;
         }
     }
 
-    async fn drain_once(&self) -> Result<PromptJobQueueDrain>
+    async fn drain_once(&self) -> Result<()>
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        let mut handled = 0;
-        let mut backoff = false;
         while let Some(item) = self.peek_prompt_queue_head()? {
-            if !self.prompt_queue_item_is_ready(&item)? {
-                backoff = true;
-                break;
+            match decode_prompt_job_message(item.payload.clone()) {
+                Ok(QueuedPromptJob::Request(request)) => {
+                    if !self
+                        .handle_prompt_request_queue_head(&item.message_id, &request)
+                        .await?
+                    {
+                        tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
+                        return Ok(());
+                    }
+                }
+                Ok(QueuedPromptJob::Driver { .. }) | Err(_) => {
+                    let Some(item) = self
+                        .store
+                        .dequeue_message(PROMPT_JOB_QUEUE)
+                        .context(StoreSnafu)?
+                    else {
+                        continue;
+                    };
+                    self.handle_item(item).await;
+                }
             }
-            let Some(item) = self
-                .store
-                .dequeue_message(PROMPT_JOB_QUEUE)
-                .context(StoreSnafu)?
-            else {
-                break;
-            };
-            handled += 1;
-            self.handle_item(item).await;
         }
-        Ok(PromptJobQueueDrain { handled, backoff })
+        tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
+        Ok(())
     }
 
     fn peek_prompt_queue_head(&self) -> Result<Option<MessageQueueItem>>
@@ -468,32 +461,98 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .next())
     }
 
-    fn prompt_queue_item_is_ready(&self, item: &MessageQueueItem) -> Result<bool>
+    fn dequeue_prompt_queue_head_if_same(
+        &self,
+        expected_message_id: &str,
+    ) -> Result<Option<MessageQueueItem>>
+    where
+        S: Store,
+    {
+        let Some(item) = self.peek_prompt_queue_head()? else {
+            return Ok(None);
+        };
+        if item.message_id != expected_message_id {
+            return Ok(None);
+        }
+        self.store
+            .dequeue_message(PROMPT_JOB_QUEUE)
+            .context(StoreSnafu)
+    }
+
+    async fn handle_prompt_request_queue_head(
+        &self,
+        expected_message_id: &str,
+        request: &QueuedPromptRequest,
+    ) -> Result<bool>
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
+        let _guard = self.engine.lock_branch(&request.branch).await;
+        let Some(item) = self.peek_prompt_queue_head()? else {
+            return Ok(true);
+        };
+        if item.message_id != expected_message_id {
+            return Ok(true);
+        }
         let request = match decode_prompt_job_message(item.payload.clone()) {
             Ok(QueuedPromptJob::Request(request)) => request,
-            Ok(QueuedPromptJob::Driver { .. }) | Err(_) => return Ok(true),
+            Ok(QueuedPromptJob::Driver { .. }) | Err(_) => {
+                let Some(item) = self
+                    .store
+                    .dequeue_message(PROMPT_JOB_QUEUE)
+                    .context(StoreSnafu)?
+                else {
+                    return Ok(true);
+                };
+                self.handle_item(item).await;
+                return Ok(true);
+            }
         };
 
         match self.store.get_branch_head(&request.branch) {
             Ok(_) => {}
-            Err(coco_mem::StoreError::BranchNotFound { .. }) => return Ok(true),
+            Err(coco_mem::StoreError::BranchNotFound { .. }) => {
+                if self
+                    .dequeue_prompt_queue_head_if_same(expected_message_id)?
+                    .is_some()
+                {
+                    tracing::warn!(
+                        message_id = %item.message_id,
+                        queue = PROMPT_JOB_QUEUE,
+                        job_id = %request.job_id,
+                        branch = %request.branch,
+                        "discarded queued prompt job request for missing branch"
+                    );
+                }
+                return Ok(true);
+            }
             Err(error) => return Err(error).context(StoreSnafu),
         }
 
-        let jobs = self.engine.list_jobs().context(CoreEngineSnafu)?;
-        if jobs.contains_key(&request.job_id) {
+        if self
+            .engine
+            .prompt_job_exists(&request.job_id)
+            .context(CoreEngineSnafu)?
+        {
+            if self
+                .dequeue_prompt_queue_head_if_same(expected_message_id)?
+                .is_some()
+            {
+                tracing::warn!(
+                    message_id = %item.message_id,
+                    queue = PROMPT_JOB_QUEUE,
+                    job_id = %request.job_id,
+                    branch = %request.branch,
+                    "discarded duplicate queued prompt job request"
+                );
+            }
             return Ok(true);
         }
-        if let Some(active_job) = jobs
-            .into_values()
-            .filter(|job| {
-                job.branch == request.branch && !matches!(job.status, JobStatus::Finished)
-            })
-            .min_by_key(|job| job.created_at)
+        if let Some(active_job) = self
+            .engine
+            .active_branch_prompt_job(&request.branch)
+            .context(CoreEngineSnafu)?
         {
             tracing::info!(
                 message_id = %item.message_id,
@@ -504,9 +563,15 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 active_job_status = ?active_job.status,
                 "waiting to materialize queued prompt job request behind active branch job"
             );
-            spawn_queued_prompt_job_driver(self.engine.clone(), active_job.job_id);
+            if matches!(active_job.status, JobStatus::Queued) {
+                spawn_queued_prompt_job_driver(self.engine.clone(), active_job.job_id);
+            }
             return Ok(false);
         }
+        let Some(item) = self.dequeue_prompt_queue_head_if_same(expected_message_id)? else {
+            return Ok(true);
+        };
+        self.handle_item(item).await;
         Ok(true)
     }
 
@@ -787,7 +852,7 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     loop {
-        let active_job = active_branch_prompt_job(engine, branch)?;
+        let active_job = engine.active_branch_prompt_job(branch)?;
         let Some(active_job) = active_job else {
             return Ok(());
         };
@@ -804,21 +869,6 @@ where
             tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
         }
     }
-}
-
-fn active_branch_prompt_job<B, S>(
-    engine: &ConversationEngine<B, S>,
-    branch: &str,
-) -> std::result::Result<Option<coco_mem::Job>, coco_core::EngineError>
-where
-    B: CompletionBackend + 'static,
-    S: Store + Clone + Send + Sync + 'static,
-{
-    Ok(engine
-        .list_jobs()?
-        .into_values()
-        .filter(|job| job.branch == branch && !matches!(job.status, JobStatus::Finished))
-        .min_by_key(|job| job.created_at))
 }
 
 fn is_missing_branch_error(error: &crate::error::Error) -> bool {
@@ -1270,9 +1320,7 @@ mod tests {
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
 
-        let drain = worker.drain_once().await.unwrap();
-        assert_eq!(drain.handled, 1);
-        assert!(!drain.backoff);
+        worker.drain_once().await.unwrap();
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
         release_first.notify_waiters();
         wait_until(Duration::from_secs(1), || {
@@ -1321,9 +1369,7 @@ mod tests {
             )
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
-        let blocked_drain = worker.drain_once().await.unwrap();
-        assert_eq!(blocked_drain.handled, 0);
-        assert!(blocked_drain.backoff);
+        worker.drain_once().await.unwrap();
         assert!(engine.get_job("job-request").is_err());
         assert_eq!(
             store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
@@ -1333,9 +1379,7 @@ mod tests {
         release_first.notify_waiters();
         let active_snapshot = drive_task.await.unwrap().unwrap();
         assert_eq!(active_snapshot.status, JobStatus::Finished);
-        let submitted_drain = worker.drain_once().await.unwrap();
-        assert_eq!(submitted_drain.handled, 1);
-        assert!(!submitted_drain.backoff);
+        worker.drain_once().await.unwrap();
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
         wait_until(Duration::from_secs(1), || {
             engine
@@ -1367,10 +1411,8 @@ mod tests {
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
 
-        let drain = worker.drain_once().await.unwrap();
+        worker.drain_once().await.unwrap();
 
-        assert_eq!(drain.handled, 1);
-        assert!(!drain.backoff);
         assert!(engine.get_job("job-missing-branch").is_err());
         assert_eq!(
             store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
@@ -1405,10 +1447,8 @@ mod tests {
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(store.clone(), engine);
 
-        let drain = worker.drain_once().await.unwrap();
+        worker.drain_once().await.unwrap();
 
-        assert_eq!(drain.handled, 1);
-        assert!(!drain.backoff);
         assert!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
