@@ -585,50 +585,6 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertEqual(migrated_task["data_dir"], str(workspace.resolve()))
         self.assertNotIn("state_dir", migrated_task)
 
-    def test_runner_migrates_legacy_task_state_to_data_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            fake_coco = write_fake_coco(workspace, status="finished")
-            task_file = workspace / "tasks" / "daily-review.json"
-            task_file.parent.mkdir(parents=True)
-            legacy_state_dir = workspace / "legacy-state"
-            legacy_state_file = legacy_state_dir / "daily-review.state.json"
-            legacy_state_file.parent.mkdir(parents=True)
-            legacy_state_file.write_text(
-                '{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8"
-            )
-            task = {
-                "id": "daily-review",
-                "branch": "main",
-                "prompt": "Review the work queue.",
-                "repeat": "serial",
-                "coco_bin": str(fake_coco),
-                "state_dir": str(legacy_state_dir),
-                "log_dir": str(workspace / "logs"),
-            }
-            task_file.write_text(json.dumps(task), encoding="utf-8")
-
-            result = subprocess.run(
-                [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            calls = read_fake_coco_calls(workspace)
-            migrated_task = json.loads(task_file.read_text(encoding="utf-8"))
-            migrated_state = json.loads(
-                (workspace / "state" / "daily-review.state.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call["kind"] for call in calls], ["status", "submit"])
-        self.assertEqual(migrated_task["data_dir"], str(workspace.resolve()))
-        self.assertNotIn("state_dir", migrated_task)
-        self.assertEqual(migrated_state["last_job_id"], "job-new")
-
     def test_runner_serial_policy_queues_when_state_is_locked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)

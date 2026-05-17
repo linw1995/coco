@@ -439,14 +439,13 @@ async fn llm_engine_rejects_second_active_job_on_same_branch() {
 }
 
 #[tokio::test]
-async fn llm_engine_branch_lock_waits_until_guard_drops() {
+async fn llm_engine_branch_lock_uses_service_lock() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
-    let engine = ConversationEngine::new(llm);
+    let engine = ConversationEngine::new(llm.clone());
 
-    let guard = engine.lock_branch("main").await;
-    assert_eq!(engine.branch_lock_count(), 1);
+    let guard = llm.lock_branch_scope("main").await;
     let started = Arc::new(Notify::new());
     let acquired = Arc::new(Notify::new());
     let waiter = tokio::spawn({
@@ -472,7 +471,6 @@ async fn llm_engine_branch_lock_waits_until_guard_drops() {
         .await
         .unwrap();
     waiter.await.unwrap();
-    assert_eq!(engine.branch_lock_count(), 0);
 }
 
 #[tokio::test]

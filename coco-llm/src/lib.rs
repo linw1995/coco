@@ -879,8 +879,29 @@ pub trait CompletionBackend: Send + Sync {
     }
 }
 
-type BranchLockTable = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+type BranchLock = Arc<Mutex<()>>;
+type BranchLockTable = Arc<StdMutex<HashMap<String, BranchLock>>>;
 type WorkflowLock = Arc<Mutex<()>>;
+
+pub struct BranchLockGuard {
+    branch: String,
+    lock: BranchLock,
+    locks: BranchLockTable,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for BranchLockGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let mut locks = self.locks.lock().expect("branch lock table poisoned");
+        if locks
+            .get(&self.branch)
+            .is_some_and(|lock| Arc::ptr_eq(lock, &self.lock) && Arc::strong_count(&self.lock) == 2)
+        {
+            locks.remove(&self.branch);
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeCapabilities {
@@ -1037,7 +1058,7 @@ impl<B, S> LlmServiceBuilder<B, S> {
                 store_path: self.store_path,
                 unified_exec_sessions: unified_exec_tool::session_store(),
             },
-            branch_locks: Arc::new(Mutex::new(HashMap::new())),
+            branch_locks: Arc::new(StdMutex::new(HashMap::new())),
             workflow_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -1067,23 +1088,37 @@ impl<B, S> LlmService<B, S> {
         self.runtime.store_path.as_deref()
     }
 
-    async fn lock_branch(&self, branch: &str) -> OwnedMutexGuard<()> {
-        let branch_lock = {
-            let mut locks = self.branch_locks.lock().await;
+    pub async fn lock_branch_scope(&self, branch: &str) -> BranchLockGuard {
+        let branch = branch.to_owned();
+        let lock = {
+            let mut locks = self
+                .branch_locks
+                .lock()
+                .expect("branch lock table poisoned");
             locks
-                .entry(branch.to_owned())
+                .entry(branch.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
 
-        branch_lock.lock_owned().await
+        let guard = lock.clone().lock_owned().await;
+        BranchLockGuard {
+            branch,
+            lock,
+            locks: self.branch_locks.clone(),
+            guard: Some(guard),
+        }
+    }
+
+    async fn lock_branch(&self, branch: &str) -> BranchLockGuard {
+        self.lock_branch_scope(branch).await
     }
 
     async fn lock_workflow(&self) -> OwnedMutexGuard<()> {
         self.workflow_lock.clone().lock_owned().await
     }
 
-    async fn lock_branch_pair(&self, left: &str, right: &str) -> Vec<OwnedMutexGuard<()>> {
+    async fn lock_branch_pair(&self, left: &str, right: &str) -> Vec<BranchLockGuard> {
         let mut branches = vec![left.to_owned()];
         if left != right {
             branches.push(right.to_owned());

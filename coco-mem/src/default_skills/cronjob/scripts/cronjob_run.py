@@ -28,7 +28,6 @@ def main() -> int:
     lock_path = state_dir / f"{task_id}.lock"
     state_path = state_dir / f"{task_id}.state.json"
     pending_path = state_dir / f"{task_id}.pending"
-    migrate_legacy_state(task, args.task_file, state_path)
     persist_task_data_dir(task, args.task_file, data_dir)
     task["data_dir"] = str(data_dir)
     with lock_for_policy(lock_path, repeat) as acquired:
@@ -93,11 +92,10 @@ def infer_task_data_dir(task_file: Path) -> Path:
 def persist_task_data_dir(
     task: dict[str, str], task_file: Path, data_dir: Path
 ) -> None:
-    if task.get("data_dir") == str(data_dir) and "state_dir" not in task:
+    if task.get("data_dir") == str(data_dir):
         return
     migrated = dict(task)
     migrated["data_dir"] = str(data_dir)
-    migrated.pop("state_dir", None)
     tmp = task_file.with_suffix(task_file.suffix + ".tmp")
     tmp.write_text(
         json.dumps(migrated, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -225,22 +223,6 @@ def wait_for_previous_job(task: dict[str, str], state_path: Path) -> None:
             print(f"Skipping {task['id']}: previous job {job_id} is {status}.")
             raise SystemExit(0)
         time.sleep(30)
-
-
-def migrate_legacy_state(
-    task: dict[str, str], task_file: Path, state_path: Path
-) -> None:
-    legacy_state_dir_value = task.get("state_dir")
-    if not legacy_state_dir_value or state_path.exists():
-        return
-    legacy_state_dir = Path(legacy_state_dir_value).expanduser()
-    if not legacy_state_dir.is_absolute():
-        legacy_state_dir = task_file.parent / legacy_state_dir
-    legacy_state_path = legacy_state_dir.resolve() / f"{task['id']}.state.json"
-    if legacy_state_path == state_path or not legacy_state_path.exists():
-        return
-    state = json.loads(legacy_state_path.read_text(encoding="utf-8"))
-    write_state(state_path, state)
 
 
 def prompt_status(coco_bin: str, job_id: str) -> str | None:

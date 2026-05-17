@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{Arc, Mutex as StdMutex},
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, Node, NodeStore,
@@ -15,7 +11,7 @@ use coco_llm::{
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jiff::Timestamp;
 use serde::Serialize;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::{BatchPromptResult, BranchPromptOutcome, BranchPromptRequest, EngineError};
@@ -23,8 +19,7 @@ use crate::{BatchPromptResult, BranchPromptOutcome, BranchPromptRequest, EngineE
 type JobResult = std::result::Result<String, EngineError>;
 type InflightJob = Shared<BoxFuture<'static, JobResult>>;
 type InflightJobTable = Arc<AsyncMutex<HashMap<String, InflightJob>>>;
-type BranchLock = Arc<AsyncMutex<()>>;
-type BranchLockTable = Arc<StdMutex<HashMap<String, BranchLock>>>;
+pub type BranchLockGuard = coco_llm::BranchLockGuard;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct JobStatusSnapshot {
@@ -48,7 +43,6 @@ struct PromptReply {
 pub struct ConversationEngine<B = RigBackend, S = MemoryStore> {
     service: Arc<LlmService<B, S>>,
     inflight_jobs: InflightJobTable,
-    branch_locks: BranchLockTable,
 }
 
 impl<B, S> Clone for ConversationEngine<B, S> {
@@ -56,27 +50,6 @@ impl<B, S> Clone for ConversationEngine<B, S> {
         Self {
             service: self.service.clone(),
             inflight_jobs: self.inflight_jobs.clone(),
-            branch_locks: self.branch_locks.clone(),
-        }
-    }
-}
-
-pub struct BranchLockGuard {
-    branch: String,
-    lock: BranchLock,
-    locks: BranchLockTable,
-    guard: Option<OwnedMutexGuard<()>>,
-}
-
-impl Drop for BranchLockGuard {
-    fn drop(&mut self) {
-        drop(self.guard.take());
-        let mut locks = self.locks.lock().expect("branch lock table poisoned");
-        if locks
-            .get(&self.branch)
-            .is_some_and(|lock| Arc::ptr_eq(lock, &self.lock) && Arc::strong_count(&self.lock) == 2)
-        {
-            locks.remove(&self.branch);
         }
     }
 }
@@ -92,7 +65,6 @@ impl<B, S> ConversationEngine<B, S> {
         Self {
             service,
             inflight_jobs: Arc::new(AsyncMutex::new(HashMap::new())),
-            branch_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -104,33 +76,8 @@ impl<B, S> ConversationEngine<B, S> {
         self.service.runtime_store_path()
     }
 
-    #[cfg(test)]
-    pub(crate) fn branch_lock_count(&self) -> usize {
-        self.branch_locks
-            .lock()
-            .expect("branch lock table poisoned")
-            .len()
-    }
-
     pub async fn lock_branch(&self, branch: &str) -> BranchLockGuard {
-        let branch = branch.to_owned();
-        let lock = {
-            let mut locks = self
-                .branch_locks
-                .lock()
-                .expect("branch lock table poisoned");
-            locks
-                .entry(branch.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-        let guard = lock.clone().lock_owned().await;
-        BranchLockGuard {
-            branch,
-            lock,
-            locks: self.branch_locks.clone(),
-            guard: Some(guard),
-        }
+        self.service.lock_branch_scope(branch).await
     }
 }
 
@@ -335,12 +282,16 @@ where
         job_id: Option<&str>,
         branch: &str,
     ) -> std::result::Result<(), EngineError> {
-        if let Some(job_id) = job_id
-            && self.prompt_job_exists(job_id)?
-        {
-            return Err(EngineError::EngineFailed {
-                message: format!("Prompt job {job_id:?} already exists"),
-            });
+        if let Some(job_id) = job_id {
+            match self.service.store().get_job(job_id) {
+                Ok(_) => {
+                    return Err(EngineError::EngineFailed {
+                        message: format!("Prompt job {job_id:?} already exists"),
+                    });
+                }
+                Err(coco_llm::coco_mem::StoreError::PromptJobNotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         if let Some(active_job) = self.active_branch_prompt_job(branch)? {
             return Err(EngineError::EngineFailed {
@@ -356,14 +307,6 @@ where
     pub fn get_job(&self, job_id: &str) -> std::result::Result<JobStatusSnapshot, EngineError> {
         let job = self.service.store().get_job(job_id)?;
         self.build_job_status_snapshot(&job)
-    }
-
-    pub fn prompt_job_exists(&self, job_id: &str) -> std::result::Result<bool, EngineError> {
-        match self.service.store().get_job(job_id) {
-            Ok(_) => Ok(true),
-            Err(coco_llm::coco_mem::StoreError::PromptJobNotFound { .. }) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
     }
 
     pub fn active_branch_prompt_job(
