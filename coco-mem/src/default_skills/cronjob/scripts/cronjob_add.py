@@ -60,8 +60,8 @@ def main() -> int:
 
     install_dir = resolve_install_dir(args.install_dir)
     task_dir = install_dir / "tasks"
+    state_dir = resolve_state_dir(args.state_dir)
     log_dir = resolve_log_dir(args.log_dir)
-    data_dir = resolve_data_dir(install_dir, log_dir)
     task_path = task_dir / f"{task_id}.json"
     runner_path = install_dir / "cronjob_run.py"
 
@@ -84,7 +84,7 @@ def main() -> int:
 
     install_dir.mkdir(parents=True, exist_ok=True)
     task_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "state").mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     crontab_dir.mkdir(parents=True, exist_ok=True)
 
@@ -114,7 +114,7 @@ def main() -> int:
             "prompt": prompt,
             "repeat": args.repeat,
             "coco_bin": args.coco_bin,
-            "data_dir": str(data_dir),
+            "state_dir": str(state_dir),
             "log_dir": str(log_dir),
         },
     )
@@ -169,6 +169,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--install-dir", type=Path, help="Persistent runner install directory."
+    )
+    parser.add_argument(
+        "--state-dir", type=Path, help="Persistent task state directory."
     )
     parser.add_argument("--log-dir", type=Path, help="Cronjob log directory.")
     parser.add_argument(
@@ -458,6 +461,16 @@ def resolve_install_dir(value: Path | None) -> Path:
     return data_home / "coco" / "cronjob"
 
 
+def resolve_state_dir(value: Path | None) -> Path:
+    if value is not None:
+        return value.expanduser()
+    persist_dir = resolve_skill_persist_dir()
+    if persist_dir is not None:
+        return persist_dir / "state"
+    state_home = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+    return state_home / "coco" / "cronjob"
+
+
 def resolve_log_dir(value: Path | None) -> Path:
     if value is not None:
         return value.expanduser()
@@ -466,18 +479,6 @@ def resolve_log_dir(value: Path | None) -> Path:
         return persist_dir / "logs"
     state_home = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
     return state_home / "coco" / "logs" / "cronjob"
-
-
-def resolve_data_dir(install_dir: Path, log_dir: Path) -> Path:
-    if (
-        install_dir.name == "install"
-        and log_dir.name == "logs"
-        and install_dir.parent == log_dir.parent
-    ):
-        return install_dir.parent
-    if install_dir.name == "install":
-        return install_dir.parent
-    return install_dir
 
 
 def resolve_skill_persist_dir() -> Path | None:

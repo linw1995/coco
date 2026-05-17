@@ -196,8 +196,7 @@ class CronjobScriptTests(unittest.TestCase):
             task = json.loads(task_file.read_text(encoding="utf-8"))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(task["data_dir"], str(persist_dir))
-        self.assertNotIn("state_dir", task)
+        self.assertEqual(task["state_dir"], str(persist_dir / "state"))
         self.assertEqual(task["log_dir"], str(persist_dir / "logs"))
 
     def test_add_crontab_dir_groups_direct_files_by_timezone(self) -> None:
@@ -554,37 +553,6 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertEqual([call["kind"] for call in calls], ["status", "submit"])
         self.assertEqual(state["last_job_id"], "job-new")
 
-    def test_runner_infers_data_dir_for_existing_installed_task_file(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            fake_coco = write_fake_coco(workspace, status="finished")
-            task_file = workspace / "install" / "tasks" / "daily-review.json"
-            task_file.parent.mkdir(parents=True)
-            task = {
-                "id": "daily-review",
-                "branch": "main",
-                "prompt": "Review the work queue.",
-                "repeat": "serial",
-                "coco_bin": str(fake_coco),
-                "log_dir": str(workspace / "logs"),
-            }
-            task_file.write_text(json.dumps(task), encoding="utf-8")
-
-            result = subprocess.run(
-                [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            calls = read_fake_coco_calls(workspace)
-            migrated_task = json.loads(task_file.read_text(encoding="utf-8"))
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call["kind"] for call in calls], ["submit"])
-        self.assertEqual(migrated_task["data_dir"], str(workspace.resolve()))
-        self.assertNotIn("state_dir", migrated_task)
-
     def test_runner_serial_policy_queues_when_state_is_locked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -710,6 +678,8 @@ def run_add(
         [
             "--install-dir",
             str(workspace / "install"),
+            "--state-dir",
+            str(workspace / "state"),
             "--log-dir",
             str(workspace / "logs"),
         ]
@@ -775,7 +745,7 @@ def write_task_file(workspace: Path, fake_coco: Path, *, repeat: str) -> Path:
         "prompt": "Review the work queue.",
         "repeat": repeat,
         "coco_bin": str(fake_coco),
-        "data_dir": str(workspace),
+        "state_dir": str(workspace / "state"),
         "log_dir": str(workspace / "logs"),
     }
     path = workspace / "daily-review.json"

@@ -21,15 +21,12 @@ def main() -> int:
     task = load_task(args.task_file)
     task_id = task["id"]
     repeat = task["repeat"]
-    data_dir = resolve_task_data_dir(task, args.task_file)
-    state_dir = data_dir / "state"
+    state_dir = Path(task["state_dir"])
     state_dir.mkdir(parents=True, exist_ok=True)
 
     lock_path = state_dir / f"{task_id}.lock"
     state_path = state_dir / f"{task_id}.state.json"
     pending_path = state_dir / f"{task_id}.pending"
-    persist_task_data_dir(task, args.task_file, data_dir)
-    task["data_dir"] = str(data_dir)
     with lock_for_policy(lock_path, repeat) as acquired:
         if not acquired:
             if repeat == "serial":
@@ -63,44 +60,13 @@ def parse_args() -> argparse.Namespace:
 
 def load_task(path: Path) -> dict[str, str]:
     task = json.loads(path.read_text(encoding="utf-8"))
-    required = {"id", "branch", "prompt", "repeat", "coco_bin"}
+    required = {"id", "branch", "prompt", "repeat", "coco_bin", "state_dir"}
     missing = sorted(required - task.keys())
     if missing:
         raise SystemExit(f"task file is missing required fields: {', '.join(missing)}")
     if task["repeat"] not in {"parallel", "serial", "skip"}:
         raise SystemExit("repeat must be one of parallel, serial, or skip")
     return task
-
-
-def resolve_task_data_dir(task: dict[str, str], task_file: Path) -> Path:
-    data_dir = Path(task.get("data_dir") or infer_task_data_dir(task_file)).expanduser()
-    if not data_dir.is_absolute():
-        data_dir = task_file.parent / data_dir
-    return data_dir.resolve()
-
-
-def infer_task_data_dir(task_file: Path) -> Path:
-    task_dir = task_file.parent
-    if task_dir.name != "tasks":
-        raise SystemExit("task file is missing required fields: data_dir")
-    install_dir = task_dir.parent
-    if install_dir.name == "install":
-        return install_dir.parent
-    return install_dir
-
-
-def persist_task_data_dir(
-    task: dict[str, str], task_file: Path, data_dir: Path
-) -> None:
-    if task.get("data_dir") == str(data_dir):
-        return
-    migrated = dict(task)
-    migrated["data_dir"] = str(data_dir)
-    tmp = task_file.with_suffix(task_file.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(migrated, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    tmp.replace(task_file)
 
 
 class lock_for_policy:

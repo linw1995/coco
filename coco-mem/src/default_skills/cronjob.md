@@ -40,14 +40,13 @@ Rules:
     or running.
 - The add script is idempotent by task id. Re-running it updates the managed
   crontab block and task config instead of adding a duplicate entry.
-- By default, installed runner scripts, task config, task runtime data, logs,
-  and active crontab files are stored under `$COCO_SKILL_PERSIST_DIR`. The Docker
+- By default, installed runner scripts, task config, task state, logs, and
+  active crontab files are stored under `$COCO_SKILL_PERSIST_DIR`. The Docker
   entrypoint derives `COCO_CRONTAB_DIR` from that persistent root and starts
   supervised `supercronic` processes, so mounting `/data` is enough to preserve
   schedules across container rebuilds.
 - The runner submits work with `coco prompt --async --json --branch <branch>
-  <prompt>` and records the latest prompt job id under the cronjob data
-  directory.
+  <prompt>` and records the latest prompt job id in the task state file.
 - Use `--timezone <zone>` only when the cron implementation supports
   `CRON_TZ`. The `supercronic` path groups managed jobs into one crontab file
   per schedule timezone because `supercronic` treats `CRON_TZ` as file-wide.
