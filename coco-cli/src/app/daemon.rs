@@ -485,6 +485,8 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
             .context(StoreSnafu)?
         {
             handled += 1;
+            // TODO: Dispatch cronjob events to per-task workers so one serial task cannot block
+            // unrelated queued tasks.
             self.handle_item(item).await;
         }
         Ok(handled)
@@ -495,7 +497,7 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        let event = match decode_cronjob_task_event(item.payload) {
+        let event = match decode_cronjob_task_event(item.payload.clone()) {
             Ok(event) => event,
             Err(error) => {
                 tracing::error!(
@@ -517,7 +519,7 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
             "handling queued cronjob task event"
         );
 
-        if let Err(error) = self.handle_event(&event).await {
+        if let Err(error) = self.handle_event(&event, &item).await {
             tracing::error!(
                 message_id = %item.message_id,
                 queue = CRONJOB_TASK_QUEUE,
@@ -532,12 +534,13 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
     async fn handle_event(
         &self,
         event: &QueuedCronjobTaskEvent,
+        item: &MessageQueueItem,
     ) -> std::result::Result<(), coco_core::EngineError>
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        if !self.wait_for_previous_task_job(event).await? {
+        if !self.wait_for_previous_task_job(event, item).await? {
             return Ok(());
         }
 
@@ -568,6 +571,7 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
     async fn wait_for_previous_task_job(
         &self,
         event: &QueuedCronjobTaskEvent,
+        item: &MessageQueueItem,
     ) -> std::result::Result<bool, coco_core::EngineError>
     where
         B: CompletionBackend + 'static,
@@ -594,17 +598,25 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
 
         loop {
             let snapshot = self.engine.get_job(&state.last_job_id)?;
-            if matches!(snapshot.status, JobStatus::Finished) {
-                return Ok(true);
-            }
             if matches!(event.repeat, CronjobRepeatPolicy::Skip) {
+                if snapshot
+                    .finished_at
+                    .is_some_and(|finished_at| finished_at <= item.created_at)
+                {
+                    return Ok(true);
+                }
                 tracing::info!(
                     task_id = %event.task_id,
                     previous_job_id = %state.last_job_id,
                     previous_job_status = ?snapshot.status,
+                    previous_job_finished_at = ?snapshot.finished_at,
+                    event_created_at = %item.created_at,
                     "skipping cronjob task event because previous task job is still active"
                 );
                 return Ok(false);
+            }
+            if matches!(snapshot.status, JobStatus::Finished) {
+                return Ok(true);
             }
 
             tracing::info!(
@@ -1323,6 +1335,55 @@ mod tests {
         assert_eq!(worker.drain_once().await.unwrap(), 1);
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            store
+                .list_queue_messages(CRONJOB_TASK_QUEUE)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cronjob_queue_worker_skip_policy_uses_event_enqueue_time() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let calls = backend.calls.clone();
+        let release_first = backend.release_first.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let engine = ConversationEngine::new(llm);
+        let previous = engine
+            .submit_job("main", "previous work", vec![])
+            .await
+            .unwrap();
+        let event = cronjob_event(tempdir.path(), CronjobRepeatPolicy::Skip);
+        write_cronjob_task_state(
+            &cronjob_task_state_path(&event),
+            &CronjobTaskState {
+                last_job_id: previous.job_id.clone(),
+                branch: previous.branch.clone(),
+            },
+        )
+        .unwrap();
+        store
+            .enqueue_message(CRONJOB_TASK_QUEUE, serde_json::to_value(&event).unwrap())
+            .unwrap();
+        let drive_engine = engine.clone();
+        let previous_job_id = previous.job_id.clone();
+        let drive_task =
+            tokio::spawn(async move { drive_engine.drive_job(&previous_job_id).await });
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
+        release_first.notify_waiters();
+        assert_eq!(
+            drive_task.await.unwrap().unwrap().status,
+            JobStatus::Finished
+        );
+        let worker = CronjobMessageQueueWorker::new(store.clone(), engine);
+
+        assert_eq!(worker.drain_once().await.unwrap(), 1);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(
             store
                 .list_queue_messages(CRONJOB_TASK_QUEUE)
