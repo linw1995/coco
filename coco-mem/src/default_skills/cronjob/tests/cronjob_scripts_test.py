@@ -544,6 +544,35 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertEqual(calls[0]["payload"]["repeat"], "serial")
         self.assertEqual(calls[0]["payload"]["data_dir"], str(workspace.resolve()))
 
+    def test_runner_infers_data_dir_for_existing_installed_task_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fake_coco = write_fake_coco(workspace, status="finished")
+            task_file = workspace / "install" / "tasks" / "daily-review.json"
+            task_file.parent.mkdir(parents=True)
+            task = {
+                "id": "daily-review",
+                "branch": "main",
+                "prompt": "Review the work queue.",
+                "repeat": "serial",
+                "coco_bin": str(fake_coco),
+                "log_dir": str(workspace / "logs"),
+            }
+            task_file.write_text(json.dumps(task), encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            calls = read_fake_coco_calls(workspace)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["kind"] for call in calls], ["enqueue"])
+        self.assertEqual(calls[0]["payload"]["data_dir"], str(workspace.resolve()))
+
     def test_runner_serial_policy_queues_when_state_is_locked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
