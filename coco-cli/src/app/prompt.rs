@@ -112,12 +112,21 @@ where
             shared_store,
             engine,
             forwarded_runtime,
+            forwarded_runtime,
         )
         .await;
     }
 
     let engine = ConversationEngine::new(llm.clone());
-    run_prompt_command_with_engine(command, reader, shared_store, &engine, forwarded_runtime).await
+    run_prompt_command_with_engine(
+        command,
+        reader,
+        shared_store,
+        &engine,
+        forwarded_runtime,
+        false,
+    )
+    .await
 }
 
 async fn run_prompt_command_with_engine<B, R, S>(
@@ -126,6 +135,7 @@ async fn run_prompt_command_with_engine<B, R, S>(
     shared_store: &S,
     engine: &ConversationEngine<B, S>,
     forwarded_runtime: bool,
+    queue_forwarded_async: bool,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -133,7 +143,17 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     match command.command {
-        None => run_prompt_run(command.run, reader, shared_store, engine, forwarded_runtime).await,
+        None => {
+            run_prompt_run(
+                command.run,
+                reader,
+                shared_store,
+                engine,
+                forwarded_runtime,
+                queue_forwarded_async,
+            )
+            .await
+        }
         Some(PromptSubcommand::Status(command)) => {
             run_prompt_status(command, shared_store, engine).await
         }
@@ -166,6 +186,7 @@ async fn run_prompt_run<B, R, S>(
     shared_store: &S,
     engine: &ConversationEngine<B, S>,
     forwarded_runtime: bool,
+    queue_forwarded_async: bool,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -175,7 +196,7 @@ where
     let input = resolve_prompt_input(&command, reader)?;
     let session_patch = resolve_prompt_session_patch(&command);
     if command.asynchronous {
-        if forwarded_runtime {
+        if queue_forwarded_async {
             let job_id = next_prompt_job_id();
             let item = queue_prompt_job_request(
                 shared_store,
@@ -209,10 +230,14 @@ where
             )
             .await
             .context(CoreEngineSnafu)?;
-        let store_path = engine
-            .runtime_store_path()
-            .context(crate::error::StoreRuntimePathUnavailableSnafu)?;
-        ensure_job_driver(Some(store_path), &job.job_id).await?;
+        if forwarded_runtime {
+            spawn_in_process_prompt_job_driver((*engine).clone(), job.job_id.clone());
+        } else {
+            let store_path = engine
+                .runtime_store_path()
+                .context(crate::error::StoreRuntimePathUnavailableSnafu)?;
+            ensure_job_driver(Some(store_path), &job.job_id).await?;
+        }
         let view = JobQueuedView {
             job_id: job.job_id.clone(),
             status: JobStatus::Queued,
@@ -362,6 +387,22 @@ where
 async fn ensure_job_driver(store_path: Option<&Path>, job_id: &str) -> Result<()> {
     let store_path = store_path.context(crate::error::StoreRuntimePathUnavailableSnafu)?;
     spawn_prompt_worker(store_path, job_id).await
+}
+
+fn spawn_in_process_prompt_job_driver<B, S>(engine: ConversationEngine<B, S>, job_id: String)
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(error) = engine.drive_job(&job_id).await {
+            tracing::error!(
+                job_id = %job_id,
+                error = %error,
+                "failed to drive forwarded async prompt job"
+            );
+        }
+    });
 }
 
 fn queue_prompt_job_request(

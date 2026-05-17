@@ -1081,6 +1081,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("async done")]), ("json", &[Ok("json done")])]),
     );
+    let shared_engine = Arc::new(coco_core::ConversationEngine::new(llm.clone()));
 
     let text_output = crate::app::runtime::run_with_services(
         Cli::try_parse_from([
@@ -1099,7 +1100,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
             shared_store: &store,
             llm: &llm,
             provider_profiles: shared_test_provider_profiles(),
-            shared_engine: None,
+            shared_engine: Some(&shared_engine),
         },
         true,
     )
@@ -1134,7 +1135,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
             shared_store: &store,
             llm: &llm,
             provider_profiles: shared_test_provider_profiles(),
-            shared_engine: None,
+            shared_engine: Some(&shared_engine),
         },
         true,
     )
@@ -1163,7 +1164,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
             shared_store: &store,
             llm: &llm,
             provider_profiles: shared_test_provider_profiles(),
-            shared_engine: None,
+            shared_engine: Some(&shared_engine),
         },
         true,
     )
@@ -1176,6 +1177,74 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(value["branch"], "json");
     assert!(value["job_id"].is_string());
     assert_eq!(store.list_queue_messages("prompt.job").unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn forwarded_runtime_async_prompt_without_daemon_worker_drives_in_process() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let llm = llm_with_test_provider_config(
+        store.clone(),
+        FakeBackend::with_responses(&[("main", &[Ok("async done")])]),
+    );
+
+    let output = crate::app::runtime::run_with_services(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "prompt",
+            "--branch",
+            "main",
+            "--async",
+            "--json",
+            "hello",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
+            shared_engine: None,
+        },
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let value: Value = serde_json::from_str(&output).unwrap();
+    let job_id = value["job_id"].as_str().unwrap();
+    assert!(store.list_queue_messages("prompt.job").unwrap().is_empty());
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if store
+                .get_job(job_id)
+                .is_ok_and(|job| job.status == coco_mem::JobStatus::Finished)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
