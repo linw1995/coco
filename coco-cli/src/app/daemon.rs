@@ -443,6 +443,15 @@ enum CronjobTaskStateError {
     },
 }
 
+#[derive(Debug, Snafu)]
+enum CronjobTaskEventError {
+    #[snafu(display("Cronjob task engine operation failed: {source}"))]
+    Engine { source: coco_core::EngineError },
+
+    #[snafu(display("Failed to persist cronjob task state: {source}"))]
+    TaskState { source: CronjobTaskStateError },
+}
+
 struct CronjobMessageQueueWorker<B, S> {
     store: S,
     engine: ConversationEngine<B, S>,
@@ -535,35 +544,35 @@ impl<B, S> CronjobMessageQueueWorker<B, S> {
         &self,
         event: &QueuedCronjobTaskEvent,
         item: &MessageQueueItem,
-    ) -> std::result::Result<(), coco_core::EngineError>
+    ) -> std::result::Result<(), CronjobTaskEventError>
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        if !self.wait_for_previous_task_job(event, item).await? {
+        if !self
+            .wait_for_previous_task_job(event, item)
+            .await
+            .context(EngineSnafu)?
+        {
             return Ok(());
         }
 
-        wait_for_branch_to_accept_prompt_job(&self.engine, &event.branch).await?;
+        wait_for_branch_to_accept_prompt_job(&self.engine, &event.branch)
+            .await
+            .context(EngineSnafu)?;
         let job = self
             .engine
             .submit_job(&event.branch, &event.prompt, vec![])
-            .await?;
-        if let Err(error) = write_cronjob_task_state(
+            .await
+            .context(EngineSnafu)?;
+        write_cronjob_task_state(
             &cronjob_task_state_path(event),
             &CronjobTaskState {
                 last_job_id: job.job_id.clone(),
                 branch: job.branch.clone(),
             },
-        ) {
-            tracing::error!(
-                task_id = %event.task_id,
-                job_id = %job.job_id,
-                branch = %job.branch,
-                error = %error,
-                "failed to persist cronjob task state after prompt job submission"
-            );
-        }
+        )
+        .context(TaskStateSnafu)?;
         spawn_prompt_job_driver(self.engine.clone(), job.job_id);
         Ok(())
     }
@@ -1390,6 +1399,34 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn cronjob_queue_worker_propagates_state_write_failure() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let calls = backend.calls.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let engine = ConversationEngine::new(llm);
+        let mut event = cronjob_event(tempdir.path(), CronjobRepeatPolicy::Serial);
+        event.state_dir = tempdir.path().join("state");
+        std::fs::write(&event.state_dir, "not a directory").unwrap();
+        let item = store
+            .enqueue_message(CRONJOB_TASK_QUEUE, serde_json::to_value(&event).unwrap())
+            .unwrap();
+        let worker = CronjobMessageQueueWorker::new(store, engine);
+
+        let error = worker.handle_event(&event, &item).await.unwrap_err();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to persist cronjob task state")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
