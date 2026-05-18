@@ -37,13 +37,15 @@ use crate::{
 };
 
 const DEFAULT_SESSION_BRANCH: &str = "main";
-const BROTHER_DAWN_BRANCH: &str = "Brother Dawn";
-const BROTHER_DAY_BRANCH: &str = "Brother Day";
-const BROTHER_DUSK_BRANCH: &str = "Brother Dusk";
-const GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES: &[&str] =
-    &[BROTHER_DAWN_BRANCH, BROTHER_DAY_BRANCH, BROTHER_DUSK_BRANCH];
-const DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH: &str = BROTHER_DAY_BRANCH;
+const DAWN_BRANCH: &str = "Dawn";
+const DAY_BRANCH: &str = "Day";
+const DUSK_BRANCH: &str = "Dusk";
+const GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES: &[&str] = &[DAWN_BRANCH, DAY_BRANCH, DUSK_BRANCH];
+const DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH: &str = DAY_BRANCH;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
+const DAWN_SYSTEM_PROMPT: &str = "You are Dawn. Stand by as the newborn recovery successor.";
+const DAY_SYSTEM_PROMPT: &str = "You are Day. Administer recovery for failed branches.";
+const DUSK_SYSTEM_PROMPT: &str = "You are Dusk. Preserve archived recovery context.";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
@@ -151,7 +153,7 @@ fn default_session_create_command(branch: &str) -> SessionCreateCommand {
         branch: branch.to_owned(),
         role: CliSessionRole::Orchestrator,
         provider_profile: None,
-        system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
+        system_prompt: default_branch_system_prompt(branch).to_owned(),
         prompt: String::new(),
         temperature: None,
         max_tokens: Some(DEFAULT_MAX_TOKENS),
@@ -163,6 +165,15 @@ fn default_session_create_command(branch: &str) -> SessionCreateCommand {
         ],
         enable_coco_shim: true,
         disable_coco_shim: false,
+    }
+}
+
+fn default_branch_system_prompt(branch: &str) -> &'static str {
+    match branch {
+        DAWN_BRANCH => DAWN_SYSTEM_PROMPT,
+        DAY_BRANCH => DAY_SYSTEM_PROMPT,
+        DUSK_BRANCH => DUSK_SYSTEM_PROMPT,
+        _ => DEFAULT_SYSTEM_PROMPT,
     }
 }
 
@@ -416,7 +427,7 @@ Failure context:
 
 Required workflow:
 - Treat `failed_branch` as the branch being recovered and `recovery_branch` as the administrative control branch.
-- If `failed_branch` is Brother Day, Brother Day has already been promoted from Brother Dawn, Brother Dusk now archives the failed Brother Day head, and Brother Dawn has been reborn with a fresh session anchor before this prompt was appended.
+- If `failed_branch` is Day, Day has already been promoted from Dawn, Dusk now archives the failed Day head, and Dawn has been reborn with a fresh session anchor before this prompt was appended.
 - Inspect the failure context before taking action.
 - Use `coco skill run recovery --handoff <task>` when the branch needs a focused recovery workflow.
 - Use `coco skill run compact --handoff <task>` first when the failure looks caused by excessive or noisy context; compact work must happen on an isolated branch with a fresh session anchor, never directly on the failed branch.
@@ -641,13 +652,13 @@ impl<B, S> MessageQueueWorker<B, S> {
     where
         S: Store,
     {
-        let Some(dawn_head) = self.optional_branch_head(BROTHER_DAWN_BRANCH)? else {
+        let Some(dawn_head) = self.optional_branch_head(DAWN_BRANCH)? else {
             return Ok(false);
         };
-        let Some(day_head) = self.optional_branch_head(BROTHER_DAY_BRANCH)? else {
+        let Some(day_head) = self.optional_branch_head(DAY_BRANCH)? else {
             return Ok(false);
         };
-        let Some(dusk_head) = self.optional_branch_head(BROTHER_DUSK_BRANCH)? else {
+        let Some(dusk_head) = self.optional_branch_head(DUSK_BRANCH)? else {
             return Ok(false);
         };
         let Some(newborn_dawn_head) = self.newborn_dawn_head(&dawn_head)? else {
@@ -655,13 +666,13 @@ impl<B, S> MessageQueueWorker<B, S> {
         };
 
         self.store
-            .set_branch_head(BROTHER_DUSK_BRANCH, &dusk_head, &day_head)
+            .set_branch_head(DUSK_BRANCH, &dusk_head, &day_head)
             .context(StoreSnafu)?;
         self.store
-            .set_branch_head(BROTHER_DAY_BRANCH, &day_head, &dawn_head)
+            .set_branch_head(DAY_BRANCH, &day_head, &dawn_head)
             .context(StoreSnafu)?;
         self.store
-            .set_branch_head(BROTHER_DAWN_BRANCH, &dawn_head, &newborn_dawn_head)
+            .set_branch_head(DAWN_BRANCH, &dawn_head, &newborn_dawn_head)
             .context(StoreSnafu)?;
 
         Ok(true)
@@ -1566,11 +1577,13 @@ mod tests {
     use crate::app::{config::ProviderProfiles, prompt::QueuedPromptRequest};
 
     use super::{
-        DEFAULT_SESSION_BRANCH, GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES, MessageQueueWorker,
-        PROMPT_JOB_QUEUE, QueueDrain, SYSTEM_MESSAGE_QUEUE, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_system_message,
-        decode_telegram_message, encode_system_message, encode_telegram_message,
-        ensure_initial_session, resolve_daemon_socket_path,
+        DAWN_BRANCH, DAWN_SYSTEM_PROMPT, DAY_BRANCH, DAY_SYSTEM_PROMPT, DEFAULT_SESSION_BRANCH,
+        DEFAULT_SYSTEM_PROMPT, DUSK_BRANCH, DUSK_SYSTEM_PROMPT,
+        GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES, MessageQueueWorker, PROMPT_JOB_QUEUE, QueueDrain,
+        SYSTEM_MESSAGE_QUEUE, TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher,
+        TelegramMessageQueueWorker, decode_system_message, decode_telegram_message,
+        encode_system_message, encode_telegram_message, ensure_initial_session,
+        resolve_daemon_socket_path,
     };
 
     #[test]
@@ -1643,6 +1656,14 @@ mod tests {
                 })
                 .expect("initialized branch should have a session anchor");
             assert_eq!(session.role, SessionRole::Orchestrator);
+            let expected_system_prompt = match branch {
+                DEFAULT_SESSION_BRANCH => DEFAULT_SYSTEM_PROMPT,
+                DAWN_BRANCH => DAWN_SYSTEM_PROMPT,
+                DAY_BRANCH => DAY_SYSTEM_PROMPT,
+                DUSK_BRANCH => DUSK_SYSTEM_PROMPT,
+                _ => unreachable!("unexpected initialized branch"),
+            };
+            assert_eq!(session.system_prompt, expected_system_prompt);
         }
     }
 
@@ -1915,8 +1936,8 @@ mod tests {
 
         assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
 
-        let prompt = find_recovery_prompt(&store, "Brother Day");
-        assert!(prompt.contains("recovery_branch: Brother Day"));
+        let prompt = find_recovery_prompt(&store, DAY_BRANCH);
+        assert!(prompt.contains("recovery_branch: Day"));
         assert!(prompt.contains("failed_branch: main"));
         assert!(prompt.contains(&failure.execution_id));
     }
@@ -1928,15 +1949,15 @@ mod tests {
         create_test_dynasty_sessions(&llm).await;
         llm.create_session(session_config("main")).await.unwrap();
         let worker = MessageQueueWorker::new(store.clone(), ConversationEngine::new(llm.clone()));
-        let old_dawn_head = store.get_branch_head("Brother Dawn").unwrap();
-        let old_day_head = store.get_branch_head("Brother Day").unwrap();
-        let old_dusk_head = store.get_branch_head("Brother Dusk").unwrap();
+        let old_dawn_head = store.get_branch_head(DAWN_BRANCH).unwrap();
+        let old_day_head = store.get_branch_head(DAY_BRANCH).unwrap();
+        let old_dusk_head = store.get_branch_head(DUSK_BRANCH).unwrap();
 
         store
             .enqueue_message(
                 SYSTEM_MESSAGE_QUEUE,
                 encode_system_message(SystemMessage::LlmFailure(LlmFailureSystemMessage {
-                    branch: "Brother Day".to_owned(),
+                    branch: DAY_BRANCH.to_owned(),
                     execution_id: "execution-admin".to_owned(),
                     error_node_id: "failure-node".to_owned(),
                     retry_from_node_id: "retry-node".to_owned(),
@@ -1945,15 +1966,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
-        assert_eq!(store.get_branch_head("Brother Dusk").unwrap(), old_day_head);
+        assert_eq!(store.get_branch_head(DUSK_BRANCH).unwrap(), old_day_head);
         assert!(
             store
-                .ancestry("Brother Day")
+                .ancestry(DAY_BRANCH)
                 .unwrap()
                 .iter()
                 .any(|node| node.id == old_dawn_head)
         );
-        let new_dawn_head = store.get_branch_head("Brother Dawn").unwrap();
+        let new_dawn_head = store.get_branch_head(DAWN_BRANCH).unwrap();
         assert_ne!(new_dawn_head, old_dawn_head);
         assert_ne!(new_dawn_head, old_day_head);
         assert_ne!(new_dawn_head, old_dusk_head);
@@ -1970,10 +1991,10 @@ mod tests {
             },
             other => panic!("expected anchor node, got {other:?}"),
         }
-        let prompt = find_recovery_prompt(&store, "Brother Day");
-        assert!(prompt.contains("recovery_branch: Brother Day"));
-        assert!(prompt.contains("failed_branch: Brother Day"));
-        assert!(prompt.contains("Brother Dawn has been reborn"));
+        let prompt = find_recovery_prompt(&store, DAY_BRANCH);
+        assert!(prompt.contains("recovery_branch: Day"));
+        assert!(prompt.contains("failed_branch: Day"));
+        assert!(prompt.contains("Dawn has been reborn"));
 
         store
             .enqueue_message(
@@ -1988,7 +2009,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
-        let prompt = find_recovery_prompt(&store, "Brother Day");
+        let prompt = find_recovery_prompt(&store, DAY_BRANCH);
         assert!(prompt.contains("execution-next"));
     }
 
@@ -2060,7 +2081,7 @@ mod tests {
     where
         B: CompletionBackend + 'static,
     {
-        for branch in ["Brother Dawn", "Brother Dusk", "Brother Day"] {
+        for branch in [DAWN_BRANCH, DUSK_BRANCH, DAY_BRANCH] {
             llm.create_session(session_config(branch)).await.unwrap();
         }
     }
