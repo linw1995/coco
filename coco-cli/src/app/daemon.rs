@@ -506,21 +506,12 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .active_branch_prompt_job(&request.branch)
             .context(CoreEngineSnafu)?
         {
-            tracing::info!(
-                queue = PROMPT_JOB_QUEUE,
-                branch = %request.branch,
-                job_id = %request.job_id,
-                active_job_id = %active_job.job_id,
-                active_job_status = ?active_job.status,
-                "waiting to materialize queued prompt job request behind active branch job"
-            );
-            if matches!(active_job.status, JobStatus::Queued) {
-                spawn_queued_prompt_job_driver(self.engine.clone(), active_job.job_id);
-            }
-            return Ok(false);
+            self.wait_for_active_branch_job(item, request, active_job)
+                .await;
+            return Ok(true);
         }
 
-        let _guard = self.engine.lock_branch(&request.branch).await;
+        let guard = self.engine.lock_branch(&request.branch).await;
         let Some(item) = self.peek_prompt_queue_head()? else {
             return Ok(true);
         };
@@ -588,19 +579,10 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .active_branch_prompt_job(&request.branch)
             .context(CoreEngineSnafu)?
         {
-            tracing::info!(
-                message_id = %item.message_id,
-                queue = PROMPT_JOB_QUEUE,
-                branch = %request.branch,
-                job_id = %request.job_id,
-                active_job_id = %active_job.job_id,
-                active_job_status = ?active_job.status,
-                "waiting to materialize queued prompt job request behind active branch job"
-            );
-            if matches!(active_job.status, JobStatus::Queued) {
-                spawn_queued_prompt_job_driver(self.engine.clone(), active_job.job_id);
-            }
-            return Ok(false);
+            drop(guard);
+            self.wait_for_active_branch_job(&item, &request, active_job)
+                .await;
+            return Ok(true);
         }
         let Some(item) = self
             .store
@@ -611,6 +593,38 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         };
         self.handle_item(item).await;
         Ok(true)
+    }
+
+    async fn wait_for_active_branch_job(
+        &self,
+        item: &MessageQueueItem,
+        request: &QueuedPromptRequest,
+        active_job: coco_mem::Job,
+    ) where
+        B: CompletionBackend + 'static,
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        tracing::info!(
+            message_id = %item.message_id,
+            queue = PROMPT_JOB_QUEUE,
+            branch = %request.branch,
+            job_id = %request.job_id,
+            active_job_id = %active_job.job_id,
+            active_job_status = ?active_job.status,
+            "waiting to materialize queued prompt job request behind active branch job"
+        );
+
+        if let Err(error) = self.engine.drive_job(&active_job.job_id).await {
+            tracing::warn!(
+                message_id = %item.message_id,
+                queue = PROMPT_JOB_QUEUE,
+                branch = %request.branch,
+                job_id = %request.job_id,
+                active_job_id = %active_job.job_id,
+                error = %error,
+                "failed to wait for active branch prompt job before materializing queued request"
+            );
+        }
     }
 
     async fn handle_item(&self, item: MessageQueueItem)
@@ -1330,10 +1344,7 @@ mod tests {
             .submit_job("main", "active work", vec![])
             .await
             .unwrap();
-        let drive_engine = engine.clone();
         let active_job_id = active_job.job_id.clone();
-        let drive_task = tokio::spawn(async move { drive_engine.drive_job(&active_job_id).await });
-        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
 
         store
             .enqueue_message(
@@ -1348,17 +1359,21 @@ mod tests {
             )
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
-        worker.drain_once().await.unwrap();
+        let drain_task = tokio::spawn(async move { worker.drain_once().await });
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
         assert!(engine.get_job("job-request").is_err());
         assert_eq!(
             store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
             1
         );
+        assert!(!drain_task.is_finished());
 
         release_first.notify_waiters();
-        let active_snapshot = drive_task.await.unwrap().unwrap();
-        assert_eq!(active_snapshot.status, JobStatus::Finished);
-        worker.drain_once().await.unwrap();
+        drain_task.await.unwrap().unwrap();
+        assert_eq!(
+            engine.get_job(&active_job_id).unwrap().status,
+            JobStatus::Finished
+        );
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
         wait_until(Duration::from_secs(1), || {
             engine
