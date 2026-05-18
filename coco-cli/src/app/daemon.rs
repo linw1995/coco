@@ -39,6 +39,7 @@ use crate::{
 const DEFAULT_SESSION_BRANCH: &str = "main";
 const GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES: &[&str] =
     &["Brother Dawn", "Brother Day", "Brother Dusk"];
+const DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH: &str = "Brother Day";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
@@ -122,9 +123,13 @@ where
         return Ok(());
     }
 
-    for branch in std::iter::once(DEFAULT_SESSION_BRANCH)
-        .chain(GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES.iter().copied())
-    {
+    let initial_branches = [
+        DEFAULT_SESSION_BRANCH,
+        "Brother Dawn",
+        "Brother Dusk",
+        DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH,
+    ];
+    for branch in initial_branches {
         let config =
             resolve_session_config(default_session_create_command(branch), provider_profiles)?;
         tracing::info!(
@@ -393,31 +398,43 @@ fn decode_system_message(
     serde_json::from_value(payload).context(DecodeSystemSnafu)
 }
 
-fn llm_failure_recovery_prompt(message: &LlmFailureSystemMessage) -> String {
+fn llm_failure_recovery_prompt(message: &LlmFailureSystemMessage, recovery_branch: &str) -> String {
     format!(
         "\
-You are handling a CoCo system recovery event after an LLM completion failed.
+You are the active CoCo Genetic Dynasty recovery orchestrator.
 
 Failure context:
-- branch: {branch}
+- recovery_branch: {recovery_branch}
+- failed_branch: {branch}
 - execution_id: {execution_id}
 - error_node_id: {error_node_id}
 - retry_from_node_id: {retry_from_node_id}
 - error: {error}
 
 Required workflow:
-- Inspect the current branch and the failure context before taking action.
+- Treat `failed_branch` as the branch being recovered and `recovery_branch` as the administrative control branch.
+- If `failed_branch` is a Genetic Dynasty branch, you are the successor handling a dead or old orchestrator.
+- Inspect the failure context before taking action.
 - Use `coco skill run recovery --handoff <task>` when the branch needs a focused recovery workflow.
 - Use `coco skill run compact --handoff <task>` first when the failure looks caused by excessive or noisy context; compact work must happen on an isolated branch with a fresh session anchor, never directly on the failed branch.
 - Preserve the failed node for auditability and continue from the safest recoverable point.
 - Return a concise status with the chosen action and final branch state.
 ",
+        recovery_branch = recovery_branch,
         branch = message.branch,
         execution_id = message.execution_id,
         error_node_id = message.error_node_id,
         retry_from_node_id = message.retry_from_node_id,
         error = message.message,
     )
+}
+
+fn genetic_dynasty_successor(branch: &str) -> Option<&'static str> {
+    let index = GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES
+        .iter()
+        .position(|candidate| *candidate == branch)?;
+    let next = (index + 1) % GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES.len();
+    Some(GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES[next])
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -551,33 +568,36 @@ impl<B, S> MessageQueueWorker<B, S> {
             "handling queued llm failure system message"
         );
 
+        let recovery_branch = self.recovery_orchestrator_branch(&message.branch);
         if let Err(error) =
-            wait_for_branch_to_accept_channel_prompt(&self.engine, &message.branch).await
+            wait_for_branch_to_accept_channel_prompt(&self.engine, &recovery_branch).await
         {
             tracing::error!(
                 message_id = %item.message_id,
                 queue = SYSTEM_MESSAGE_QUEUE,
-                branch = %message.branch,
+                branch = %recovery_branch,
+                failed_branch = %message.branch,
                 error = %error,
-                "queued llm failure message failed while waiting for branch"
+                "queued llm failure message failed while waiting for recovery branch"
             );
             return;
         }
 
-        let prompt = llm_failure_recovery_prompt(&message);
+        let prompt = llm_failure_recovery_prompt(&message, &recovery_branch);
         let overrides = coco_llm::CompletionOverrides {
             suppress_failure_queue: true,
             ..Default::default()
         };
         match self
             .engine
-            .reply_with_overrides(&message.branch, &prompt, vec![], None, overrides)
+            .reply_with_overrides(&recovery_branch, &prompt, vec![], None, overrides)
             .await
         {
             Ok(response) => tracing::debug!(
                 message_id = %item.message_id,
                 queue = SYSTEM_MESSAGE_QUEUE,
-                branch = %message.branch,
+                branch = %recovery_branch,
+                failed_branch = %message.branch,
                 execution_id = %message.execution_id,
                 response_bytes = response.len(),
                 "handled queued llm failure system message"
@@ -585,11 +605,58 @@ impl<B, S> MessageQueueWorker<B, S> {
             Err(error) => tracing::error!(
                 message_id = %item.message_id,
                 queue = SYSTEM_MESSAGE_QUEUE,
-                branch = %message.branch,
+                branch = %recovery_branch,
+                failed_branch = %message.branch,
                 execution_id = %message.execution_id,
                 error = %error,
                 "queued llm failure system message failed"
             ),
+        }
+    }
+
+    fn recovery_orchestrator_branch(&self, failed_branch: &str) -> String
+    where
+        S: Store,
+    {
+        if let Some(successor) = genetic_dynasty_successor(failed_branch) {
+            return self
+                .existing_branch_or_default(successor, failed_branch)
+                .to_owned();
+        }
+
+        self.current_genetic_dynasty_orchestrator()
+            .unwrap_or_else(|| failed_branch.to_owned())
+    }
+
+    fn current_genetic_dynasty_orchestrator(&self) -> Option<String>
+    where
+        S: Store,
+    {
+        GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES
+            .iter()
+            .filter_map(|branch| {
+                let head = self.store.get_branch_head(branch).ok()?;
+                let node = self.store.get_node(&head).ok()?;
+                Some((node.created_at, (*branch).to_owned()))
+            })
+            .max_by_key(|(created_at, _)| *created_at)
+            .map(|(_, branch)| branch)
+            .or_else(|| {
+                self.store
+                    .get_branch_head(DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH)
+                    .ok()
+                    .map(|_| DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH.to_owned())
+            })
+    }
+
+    fn existing_branch_or_default<'a>(&self, branch: &'a str, fallback: &'a str) -> &'a str
+    where
+        S: Store,
+    {
+        if self.store.get_branch_head(branch).is_ok() {
+            branch
+        } else {
+            fallback
         }
     }
 
@@ -1743,23 +1810,85 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let ancestry = store.ancestry("main").unwrap();
-        let prompt = ancestry
-            .iter()
-            .find_map(|node| match &node.kind {
-                coco_mem::Kind::Anchor(anchor) => match &anchor.payload {
-                    AnchorPayload::Prompt(prompt) if prompt.prompt.contains("recovery event") => {
-                        Some(prompt.prompt.as_str())
-                    }
-                    _ => None,
-                },
-                _ => None,
-            })
-            .expect("system recovery prompt should be appended");
+        let prompt = find_recovery_prompt(&store, "main");
         assert!(prompt.contains("coco skill run recovery"));
         assert!(prompt.contains("coco skill run compact"));
         assert!(prompt.contains("fresh session anchor"));
+        assert!(prompt.contains("recovery_branch: main"));
+        assert!(prompt.contains("failed_branch: main"));
         assert!(prompt.contains(&failure.execution_id));
+    }
+
+    #[tokio::test]
+    async fn system_queue_routes_regular_failure_to_current_dynasty_admin() {
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(store.clone(), ImmediateBackend));
+        create_test_dynasty_sessions(&llm).await;
+        llm.create_session(session_config("main")).await.unwrap();
+        let failure = LlmFailureSystemMessage {
+            branch: "main".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            error_node_id: "failure-node".to_owned(),
+            retry_from_node_id: "retry-node".to_owned(),
+            message: "rate limited".to_owned(),
+        };
+        store
+            .enqueue_message(
+                SYSTEM_MESSAGE_QUEUE,
+                encode_system_message(SystemMessage::LlmFailure(failure.clone())),
+            )
+            .unwrap();
+        let worker = MessageQueueWorker::new(store.clone(), ConversationEngine::new(llm.clone()));
+
+        assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
+
+        let prompt = find_recovery_prompt(&store, "Brother Day");
+        assert!(prompt.contains("recovery_branch: Brother Day"));
+        assert!(prompt.contains("failed_branch: main"));
+        assert!(prompt.contains(&failure.execution_id));
+    }
+
+    #[tokio::test]
+    async fn system_queue_rotates_dynasty_admin_after_admin_failure() {
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(store.clone(), ImmediateBackend));
+        create_test_dynasty_sessions(&llm).await;
+        llm.create_session(session_config("main")).await.unwrap();
+        let worker = MessageQueueWorker::new(store.clone(), ConversationEngine::new(llm.clone()));
+
+        store
+            .enqueue_message(
+                SYSTEM_MESSAGE_QUEUE,
+                encode_system_message(SystemMessage::LlmFailure(LlmFailureSystemMessage {
+                    branch: "Brother Day".to_owned(),
+                    execution_id: "execution-admin".to_owned(),
+                    error_node_id: "failure-node".to_owned(),
+                    retry_from_node_id: "retry-node".to_owned(),
+                    message: "context length exceeded".to_owned(),
+                })),
+            )
+            .unwrap();
+        assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
+        let prompt = find_recovery_prompt(&store, "Brother Dusk");
+        assert!(prompt.contains("recovery_branch: Brother Dusk"));
+        assert!(prompt.contains("failed_branch: Brother Day"));
+        assert!(prompt.contains("dead or old orchestrator"));
+
+        store
+            .enqueue_message(
+                SYSTEM_MESSAGE_QUEUE,
+                encode_system_message(SystemMessage::LlmFailure(LlmFailureSystemMessage {
+                    branch: "main".to_owned(),
+                    execution_id: "execution-next".to_owned(),
+                    error_node_id: "failure-node-2".to_owned(),
+                    retry_from_node_id: "retry-node-2".to_owned(),
+                    message: "rate limited".to_owned(),
+                })),
+            )
+            .unwrap();
+        assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
+        let prompt = find_recovery_prompt(&store, "Brother Dusk");
+        assert!(prompt.contains("execution-next"));
     }
 
     #[derive(Debug, Clone, Default)]
@@ -1824,6 +1953,36 @@ mod tests {
             additional_params: None,
             enable_coco_shim: false,
         }
+    }
+
+    async fn create_test_dynasty_sessions<B>(llm: &Arc<LlmService<B, MemoryStore>>)
+    where
+        B: CompletionBackend + 'static,
+    {
+        for branch in ["Brother Dawn", "Brother Dusk", "Brother Day"] {
+            llm.create_session(session_config(branch)).await.unwrap();
+        }
+    }
+
+    fn find_recovery_prompt(store: &MemoryStore, branch: &str) -> String {
+        store
+            .ancestry(branch)
+            .unwrap()
+            .iter()
+            .find_map(|node| match &node.kind {
+                coco_mem::Kind::Anchor(anchor) => match &anchor.payload {
+                    AnchorPayload::Prompt(prompt)
+                        if prompt
+                            .prompt
+                            .contains("Genetic Dynasty recovery orchestrator") =>
+                    {
+                        Some(prompt.prompt.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("system recovery prompt should be appended")
     }
 
     async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
