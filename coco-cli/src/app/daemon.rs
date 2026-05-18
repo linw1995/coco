@@ -9,8 +9,8 @@ use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_c
 use coco_core::{ConversationEngine, CoreService, EngineError, FixedBranchResolver};
 use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
 use coco_mem::{
-    JobStatus, LlmFailureSystemMessage, MessageQueueItem, SYSTEM_MESSAGE_QUEUE, SessionRole, Store,
-    SystemMessage,
+    Anchor, AnchorPayload, JobStatus, Kind, LlmFailureSystemMessage, MessageQueueItem, NewNode,
+    Role, SYSTEM_MESSAGE_QUEUE, SessionAnchor, SessionRole, Store, SystemMessage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,9 +37,12 @@ use crate::{
 };
 
 const DEFAULT_SESSION_BRANCH: &str = "main";
+const BROTHER_DAWN_BRANCH: &str = "Brother Dawn";
+const BROTHER_DAY_BRANCH: &str = "Brother Day";
+const BROTHER_DUSK_BRANCH: &str = "Brother Dusk";
 const GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES: &[&str] =
-    &["Brother Dawn", "Brother Day", "Brother Dusk"];
-const DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH: &str = "Brother Day";
+    &[BROTHER_DAWN_BRANCH, BROTHER_DAY_BRANCH, BROTHER_DUSK_BRANCH];
+const DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH: &str = BROTHER_DAY_BRANCH;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
@@ -125,8 +128,8 @@ where
 
     let initial_branches = [
         DEFAULT_SESSION_BRANCH,
-        "Brother Dawn",
-        "Brother Dusk",
+        GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES[0],
+        GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES[2],
         DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH,
     ];
     for branch in initial_branches {
@@ -413,7 +416,7 @@ Failure context:
 
 Required workflow:
 - Treat `failed_branch` as the branch being recovered and `recovery_branch` as the administrative control branch.
-- If `failed_branch` is a Genetic Dynasty branch, you are the successor handling a dead or old orchestrator.
+- If `failed_branch` is Brother Day, Brother Day has already been promoted from Brother Dawn, Brother Dusk now archives the failed Brother Day head, and Brother Dawn has been reborn with a fresh session anchor before this prompt was appended.
 - Inspect the failure context before taking action.
 - Use `coco skill run recovery --handoff <task>` when the branch needs a focused recovery workflow.
 - Use `coco skill run compact --handoff <task>` first when the failure looks caused by excessive or noisy context; compact work must happen on an isolated branch with a fresh session anchor, never directly on the failed branch.
@@ -427,14 +430,6 @@ Required workflow:
         retry_from_node_id = message.retry_from_node_id,
         error = message.message,
     )
-}
-
-fn genetic_dynasty_successor(branch: &str) -> Option<&'static str> {
-    let index = GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES
-        .iter()
-        .position(|candidate| *candidate == branch)?;
-    let next = (index + 1) % GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES.len();
-    Some(GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES[next])
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -568,6 +563,34 @@ impl<B, S> MessageQueueWorker<B, S> {
             "handling queued llm failure system message"
         );
 
+        if message.branch == DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH {
+            match self.rotate_genetic_dynasty_heads() {
+                Ok(true) => tracing::info!(
+                    message_id = %item.message_id,
+                    queue = SYSTEM_MESSAGE_QUEUE,
+                    failed_branch = %message.branch,
+                    recovery_branch = DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH,
+                    "rotated genetic dynasty heads before recovery"
+                ),
+                Ok(false) => tracing::warn!(
+                    message_id = %item.message_id,
+                    queue = SYSTEM_MESSAGE_QUEUE,
+                    failed_branch = %message.branch,
+                    "skipped genetic dynasty head rotation because dynasty branches are incomplete"
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        message_id = %item.message_id,
+                        queue = SYSTEM_MESSAGE_QUEUE,
+                        failed_branch = %message.branch,
+                        error = %error,
+                        "failed to rotate genetic dynasty heads"
+                    );
+                    return;
+                }
+            }
+        }
+
         let recovery_branch = self.recovery_orchestrator_branch(&message.branch);
         if let Err(error) =
             wait_for_branch_to_accept_channel_prompt(&self.engine, &recovery_branch).await
@@ -614,49 +637,98 @@ impl<B, S> MessageQueueWorker<B, S> {
         }
     }
 
+    fn rotate_genetic_dynasty_heads(&self) -> Result<bool>
+    where
+        S: Store,
+    {
+        let Some(dawn_head) = self.optional_branch_head(BROTHER_DAWN_BRANCH)? else {
+            return Ok(false);
+        };
+        let Some(day_head) = self.optional_branch_head(BROTHER_DAY_BRANCH)? else {
+            return Ok(false);
+        };
+        let Some(dusk_head) = self.optional_branch_head(BROTHER_DUSK_BRANCH)? else {
+            return Ok(false);
+        };
+        let Some(newborn_dawn_head) = self.newborn_dawn_head(&dawn_head)? else {
+            return Ok(false);
+        };
+
+        self.store
+            .set_branch_head(BROTHER_DUSK_BRANCH, &dusk_head, &day_head)
+            .context(StoreSnafu)?;
+        self.store
+            .set_branch_head(BROTHER_DAY_BRANCH, &day_head, &dawn_head)
+            .context(StoreSnafu)?;
+        self.store
+            .set_branch_head(BROTHER_DAWN_BRANCH, &dawn_head, &newborn_dawn_head)
+            .context(StoreSnafu)?;
+
+        Ok(true)
+    }
+
+    fn newborn_dawn_head(&self, template_head: &str) -> Result<Option<String>>
+    where
+        S: Store,
+    {
+        let Some(mut anchor) = self.session_anchor_template(template_head)? else {
+            return Ok(None);
+        };
+        anchor.prompt.clear();
+        anchor.active_skill = None;
+
+        self.store
+            .append(NewNode {
+                parent: self.store.root_id(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(vec![], anchor)),
+            })
+            .map(Some)
+            .context(StoreSnafu)
+    }
+
+    fn session_anchor_template(&self, head_ref: &str) -> Result<Option<SessionAnchor>>
+    where
+        S: Store,
+    {
+        Ok(self
+            .store
+            .ancestry(head_ref)
+            .context(StoreSnafu)?
+            .into_iter()
+            .find_map(|node| match node.kind {
+                Kind::Anchor(anchor) => match anchor.payload {
+                    AnchorPayload::Session(session) => Some(*session),
+                    _ => None,
+                },
+                _ => None,
+            }))
+    }
+
+    fn optional_branch_head(&self, branch: &str) -> Result<Option<String>>
+    where
+        S: Store,
+    {
+        match self.store.get_branch_head(branch) {
+            Ok(head) => Ok(Some(head)),
+            Err(coco_mem::StoreError::BranchNotFound { .. }) => Ok(None),
+            Err(error) => Err(error).context(StoreSnafu),
+        }
+    }
+
     fn recovery_orchestrator_branch(&self, failed_branch: &str) -> String
     where
         S: Store,
     {
-        if let Some(successor) = genetic_dynasty_successor(failed_branch) {
-            return self
-                .existing_branch_or_default(successor, failed_branch)
-                .to_owned();
-        }
-
-        self.current_genetic_dynasty_orchestrator()
-            .unwrap_or_else(|| failed_branch.to_owned())
-    }
-
-    fn current_genetic_dynasty_orchestrator(&self) -> Option<String>
-    where
-        S: Store,
-    {
-        GENETIC_DYNASTY_ORCHESTRATOR_BRANCHES
-            .iter()
-            .filter_map(|branch| {
-                let head = self.store.get_branch_head(branch).ok()?;
-                let node = self.store.get_node(&head).ok()?;
-                Some((node.created_at, (*branch).to_owned()))
-            })
-            .max_by_key(|(created_at, _)| *created_at)
-            .map(|(_, branch)| branch)
-            .or_else(|| {
-                self.store
-                    .get_branch_head(DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH)
-                    .ok()
-                    .map(|_| DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH.to_owned())
-            })
-    }
-
-    fn existing_branch_or_default<'a>(&self, branch: &'a str, fallback: &'a str) -> &'a str
-    where
-        S: Store,
-    {
-        if self.store.get_branch_head(branch).is_ok() {
-            branch
+        if self
+            .store
+            .get_branch_head(DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH)
+            .is_ok()
+        {
+            DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH.to_owned()
         } else {
-            fallback
+            failed_branch.to_owned()
         }
     }
 
@@ -1484,8 +1556,9 @@ mod tests {
         SessionConfig, StepContext,
     };
     use coco_mem::{
-        AnchorPayload, JobStatus, LlmFailureSystemMessage, MemoryStore, MessageQueueStore,
-        NodeStore, ProviderProfile, SessionRole, SessionState, SessionStore, SystemMessage,
+        AnchorPayload, BranchStore, JobStatus, LlmFailureSystemMessage, MemoryStore,
+        MessageQueueStore, NodeStore, ProviderProfile, SessionRole, SessionState, SessionStore,
+        SystemMessage,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -1855,6 +1928,9 @@ mod tests {
         create_test_dynasty_sessions(&llm).await;
         llm.create_session(session_config("main")).await.unwrap();
         let worker = MessageQueueWorker::new(store.clone(), ConversationEngine::new(llm.clone()));
+        let old_dawn_head = store.get_branch_head("Brother Dawn").unwrap();
+        let old_day_head = store.get_branch_head("Brother Day").unwrap();
+        let old_dusk_head = store.get_branch_head("Brother Dusk").unwrap();
 
         store
             .enqueue_message(
@@ -1869,10 +1945,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
-        let prompt = find_recovery_prompt(&store, "Brother Dusk");
-        assert!(prompt.contains("recovery_branch: Brother Dusk"));
+        assert_eq!(store.get_branch_head("Brother Dusk").unwrap(), old_day_head);
+        assert!(
+            store
+                .ancestry("Brother Day")
+                .unwrap()
+                .iter()
+                .any(|node| node.id == old_dawn_head)
+        );
+        let new_dawn_head = store.get_branch_head("Brother Dawn").unwrap();
+        assert_ne!(new_dawn_head, old_dawn_head);
+        assert_ne!(new_dawn_head, old_day_head);
+        assert_ne!(new_dawn_head, old_dusk_head);
+        let new_dawn_node = store.get_node(&new_dawn_head).unwrap();
+        assert_eq!(new_dawn_node.parent, store.root_id());
+        match new_dawn_node.kind {
+            coco_mem::Kind::Anchor(anchor) => match anchor.payload {
+                AnchorPayload::Session(session) => {
+                    assert_eq!(session.role, SessionRole::Orchestrator);
+                    assert!(session.prompt.is_empty());
+                    assert!(session.active_skill.is_none());
+                }
+                other => panic!("expected session anchor, got {other:?}"),
+            },
+            other => panic!("expected anchor node, got {other:?}"),
+        }
+        let prompt = find_recovery_prompt(&store, "Brother Day");
+        assert!(prompt.contains("recovery_branch: Brother Day"));
         assert!(prompt.contains("failed_branch: Brother Day"));
-        assert!(prompt.contains("dead or old orchestrator"));
+        assert!(prompt.contains("Brother Dawn has been reborn"));
 
         store
             .enqueue_message(
@@ -1887,7 +1988,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
-        let prompt = find_recovery_prompt(&store, "Brother Dusk");
+        let prompt = find_recovery_prompt(&store, "Brother Day");
         assert!(prompt.contains("execution-next"));
     }
 
