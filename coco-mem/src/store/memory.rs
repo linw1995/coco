@@ -248,6 +248,13 @@ impl JobStore for MemoryStore {
             .submit_job(branch, base)
     }
 
+    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .submit_job_with_id(job_id, branch, base)
+    }
+
     fn get_job(&self, job_id: &str) -> Result<Job> {
         self.inner
             .read()
@@ -282,6 +289,14 @@ impl MessageQueueStore for MemoryStore {
             .write()
             .expect("store lock poisoned")
             .dequeue_message(queue))
+    }
+
+    fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .peek_message(queue))
     }
 
     fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {

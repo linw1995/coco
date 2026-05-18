@@ -1632,9 +1632,13 @@ where
         store.list_queue_messages("hooks").unwrap(),
         vec![first.clone(), second.clone(),]
     );
+    assert_eq!(store.peek_message("hooks").unwrap(), Some(first.clone()));
+    assert_eq!(store.peek_message("missing").unwrap(), None);
     assert_eq!(store.dequeue_message("hooks").unwrap(), Some(first));
+    assert_eq!(store.peek_message("hooks").unwrap(), Some(second.clone()));
     assert_eq!(store.dequeue_message("hooks").unwrap(), Some(second));
     assert_eq!(store.dequeue_message("hooks").unwrap(), None);
+    assert_eq!(store.peek_message("hooks").unwrap(), None);
     assert!(store.list_queue_messages("hooks").unwrap().is_empty());
 }
 
@@ -2319,7 +2323,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["version"], "2026-05-16");
+    assert_eq!(meta["version"], "2026-05-17");
 }
 
 #[test]
@@ -2542,7 +2546,7 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated["version"], "2026-05-16");
+    assert_eq!(migrated["version"], "2026-05-17");
     let migrated_skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]

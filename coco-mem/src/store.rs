@@ -127,10 +127,15 @@ pub trait SkillStore {
 
 /// Prompt job storage API.
 pub trait JobStore {
-    /// Creates a new single-task prompt job record.
+    /// Creates a new single-task prompt job record with a generated id.
     ///
     /// Rejects the request when the branch already has an unfinished prompt job.
     fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job>;
+
+    /// Creates a new single-task prompt job record with a caller-provided id.
+    ///
+    /// Rejects the request when the branch already has an unfinished prompt job.
+    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job>;
 
     /// Returns a persisted prompt job.
     fn get_job(&self, job_id: &str) -> StoreResult<Job>;
@@ -158,6 +163,9 @@ pub trait MessageQueueStore {
 
     /// Removes and returns the oldest message in a named queue.
     fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
+
+    /// Returns the oldest message in a named queue without removing it.
+    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
 
     /// Returns all persisted messages for a named queue in dequeue order.
     fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;

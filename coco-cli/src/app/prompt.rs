@@ -11,8 +11,9 @@ use coco_llm::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, CompletionBackend, LlmService,
     SessionConfigPatch,
 };
-use coco_mem::{AnchorPayload, JobStore, Kind, MergeParent, NodeStore, Store};
-use serde::Serialize;
+use coco_mem::{AnchorPayload, JobStore, Kind, MergeParent, MessageQueueItem, NodeStore, Store};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use snafu::prelude::*;
 use tokio::process::Command;
 
@@ -24,9 +25,11 @@ use crate::{
     },
     error::{
         CoreEngineSnafu, EmptyPromptSnafu, ReadStdinSnafu, ResolveCurrentExeSnafu,
-        SpawnPromptWorkerSnafu,
+        SpawnPromptWorkerSnafu, StoreSnafu,
     },
 };
+
+pub(crate) const PROMPT_JOB_QUEUE: &str = "prompt.job";
 
 #[derive(Debug, Serialize)]
 struct JobQueuedView {
@@ -46,6 +49,38 @@ struct PromptJobStatusView {
 struct PromptBaseNodeView {
     node_id: String,
     kind: &'static str,
+    prompt: String,
+    merge_parents: Vec<MergeParent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct QueuedPromptRequest {
+    pub job_id: String,
+    pub branch: String,
+    pub prompt: String,
+    pub merge_parents: Vec<MergeParent>,
+    pub session_patch: Option<SessionConfigPatch>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueuedPromptRequestStatusView {
+    job: QueuedPromptRequestJobView,
+    request: QueuedPromptRequestDetailsView,
+}
+
+#[derive(Debug, Serialize)]
+struct QueuedPromptRequestJobView {
+    job_id: String,
+    created_at: String,
+    finished_at: Option<String>,
+    branch: String,
+    base: String,
+    status: JobStatus,
+    head: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QueuedPromptRequestDetailsView {
     prompt: String,
     merge_parents: Vec<MergeParent>,
 }
@@ -77,12 +112,21 @@ where
             shared_store,
             engine,
             forwarded_runtime,
+            forwarded_runtime,
         )
         .await;
     }
 
     let engine = ConversationEngine::new(llm.clone());
-    run_prompt_command_with_engine(command, reader, shared_store, &engine, forwarded_runtime).await
+    run_prompt_command_with_engine(
+        command,
+        reader,
+        shared_store,
+        &engine,
+        forwarded_runtime,
+        false,
+    )
+    .await
 }
 
 async fn run_prompt_command_with_engine<B, R, S>(
@@ -91,6 +135,7 @@ async fn run_prompt_command_with_engine<B, R, S>(
     shared_store: &S,
     engine: &ConversationEngine<B, S>,
     forwarded_runtime: bool,
+    queue_forwarded_async: bool,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -98,7 +143,17 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     match command.command {
-        None => run_prompt_run(command.run, reader, engine, forwarded_runtime).await,
+        None => {
+            run_prompt_run(
+                command.run,
+                reader,
+                shared_store,
+                engine,
+                forwarded_runtime,
+                queue_forwarded_async,
+            )
+            .await
+        }
         Some(PromptSubcommand::Status(command)) => {
             run_prompt_status(command, shared_store, engine).await
         }
@@ -128,8 +183,10 @@ where
 async fn run_prompt_run<B, R, S>(
     command: PromptRunCommand,
     reader: &mut R,
+    shared_store: &S,
     engine: &ConversationEngine<B, S>,
     forwarded_runtime: bool,
+    queue_forwarded_async: bool,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -139,6 +196,31 @@ where
     let input = resolve_prompt_input(&command, reader)?;
     let session_patch = resolve_prompt_session_patch(&command);
     if command.asynchronous {
+        if queue_forwarded_async {
+            let job_id = next_prompt_job_id();
+            let item = queue_prompt_job_request(
+                shared_store,
+                QueuedPromptRequest {
+                    job_id: job_id.clone(),
+                    branch: command.branch.clone(),
+                    prompt: input,
+                    merge_parents: command.merge_parents,
+                    session_patch,
+                },
+            )?;
+            let view = JobQueuedView {
+                job_id,
+                status: JobStatus::Queued,
+                created_at: item.created_at.to_string(),
+                branch: command.branch,
+            };
+            return Ok(Some(if command.json {
+                render_json(view)
+            } else {
+                render_job_queued_text(&view)
+            }));
+        }
+
         let job = engine
             .submit_job_with_session_patch(
                 &command.branch,
@@ -148,22 +230,14 @@ where
             )
             .await
             .context(CoreEngineSnafu)?;
-        let store_path = if forwarded_runtime {
-            None
+        if forwarded_runtime {
+            spawn_in_process_prompt_job_driver((*engine).clone(), job.job_id.clone());
         } else {
-            Some(
-                engine
-                    .runtime_store_path()
-                    .context(crate::error::StoreRuntimePathUnavailableSnafu)?,
-            )
-        };
-        ensure_job_driver(
-            store_path,
-            &job.job_id,
-            (*engine).clone(),
-            forwarded_runtime,
-        )
-        .await?;
+            let store_path = engine
+                .runtime_store_path()
+                .context(crate::error::StoreRuntimePathUnavailableSnafu)?;
+            ensure_job_driver(Some(store_path), &job.job_id).await?;
+        }
         let view = JobQueuedView {
             job_id: job.job_id.clone(),
             status: JobStatus::Queued,
@@ -245,7 +319,19 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let snapshot = engine.get_job(&command.job).context(CoreEngineSnafu)?;
+    let snapshot = match engine.get_job(&command.job) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            if let Some(view) = load_queued_prompt_request_status(shared_store, &command.job)? {
+                return Ok(Some(if command.json {
+                    render_json(view)
+                } else {
+                    render_queued_prompt_request_status_text(&view)
+                }));
+            }
+            return Err(error).context(CoreEngineSnafu);
+        }
+    };
     let prompt_details =
         load_prompt_anchor_details(shared_store, &command.job).context(CoreEngineSnafu)?;
     let view = build_job_status_view(snapshot, prompt_details);
@@ -298,26 +384,34 @@ where
     Ok(None)
 }
 
-async fn ensure_job_driver<B, S>(
-    store_path: Option<&Path>,
-    job_id: &str,
-    engine: ConversationEngine<B, S>,
-    forwarded_runtime: bool,
-) -> Result<()>
+async fn ensure_job_driver(store_path: Option<&Path>, job_id: &str) -> Result<()> {
+    let store_path = store_path.context(crate::error::StoreRuntimePathUnavailableSnafu)?;
+    spawn_prompt_worker(store_path, job_id).await
+}
+
+fn spawn_in_process_prompt_job_driver<B, S>(engine: ConversationEngine<B, S>, job_id: String)
 where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    if forwarded_runtime {
-        let job_id = job_id.to_owned();
-        tokio::spawn(async move {
-            let _ = engine.drive_job(&job_id).await;
-        });
-        return Ok(());
-    }
+    tokio::spawn(async move {
+        if let Err(error) = engine.drive_job(&job_id).await {
+            tracing::error!(
+                job_id = %job_id,
+                error = %error,
+                "failed to drive forwarded async prompt job"
+            );
+        }
+    });
+}
 
-    let store_path = store_path.context(crate::error::StoreRuntimePathUnavailableSnafu)?;
-    spawn_prompt_worker(store_path, job_id).await
+fn queue_prompt_job_request(
+    store: &impl Store,
+    request: QueuedPromptRequest,
+) -> Result<MessageQueueItem> {
+    store
+        .enqueue_message(PROMPT_JOB_QUEUE, json!(request))
+        .context(StoreSnafu)
 }
 
 async fn spawn_prompt_worker(store_path: &Path, job_id: &str) -> Result<()> {
@@ -409,6 +503,31 @@ fn render_prompt_status_text(view: &PromptJobStatusView) -> String {
     )
 }
 
+fn render_queued_prompt_request_status_text(view: &QueuedPromptRequestStatusView) -> String {
+    format!(
+        "{}\nprompt: {}\nmerge_parents: {}",
+        render_queued_prompt_request_job_text(&view.job),
+        view.request.prompt,
+        render_merge_parents(&view.request.merge_parents)
+    )
+}
+
+fn render_queued_prompt_request_job_text(snapshot: &QueuedPromptRequestJobView) -> String {
+    format!(
+        "job_id: {}\nstatus: {:?}\nbranch: {}\nbase: {}\nhead: {}\ncreated_at: {}\nfinished_at: {}",
+        snapshot.job_id,
+        snapshot.status,
+        snapshot.branch,
+        snapshot.base,
+        snapshot.head,
+        snapshot.created_at,
+        snapshot
+            .finished_at
+            .clone()
+            .unwrap_or_else(|| "null".to_owned())
+    )
+}
+
 fn render_job_status_snapshot_text(snapshot: &JobStatusSnapshot) -> String {
     format!(
         "job_id: {}\nstatus: {:?}\nbranch: {}\nbase: {}\nhead: {}\ncreated_at: {}\nfinished_at: {}",
@@ -423,6 +542,46 @@ fn render_job_status_snapshot_text(snapshot: &JobStatusSnapshot) -> String {
             .map(|finished_at| finished_at.to_string())
             .unwrap_or_else(|| "null".to_owned())
     )
+}
+
+fn load_queued_prompt_request_status(
+    store: &impl Store,
+    job_id: &str,
+) -> Result<Option<QueuedPromptRequestStatusView>> {
+    let items = store
+        .list_queue_messages(PROMPT_JOB_QUEUE)
+        .context(StoreSnafu)?;
+    let Some((item, request)) = items.into_iter().find_map(|item| {
+        serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
+            .ok()
+            .filter(|request| request.job_id == job_id)
+            .map(|request| (item, request))
+    }) else {
+        return Ok(None);
+    };
+    let head = store
+        .get_branch_head(&request.branch)
+        .context(StoreSnafu)?
+        .to_owned();
+    Ok(Some(QueuedPromptRequestStatusView {
+        job: QueuedPromptRequestJobView {
+            job_id: request.job_id,
+            created_at: item.created_at.to_string(),
+            finished_at: None,
+            branch: request.branch,
+            base: head.clone(),
+            status: JobStatus::Queued,
+            head,
+        },
+        request: QueuedPromptRequestDetailsView {
+            prompt: request.prompt,
+            merge_parents: request.merge_parents,
+        },
+    }))
+}
+
+fn next_prompt_job_id() -> String {
+    format!("job-{}", nanoid::nanoid!())
 }
 
 fn render_merge_parents(parents: &[MergeParent]) -> String {
