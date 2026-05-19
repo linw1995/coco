@@ -509,7 +509,9 @@ impl<B, S> MessageQueueWorker<B, S> {
 
         Ok(if prompt_jobs.made_progress() || system.made_progress() {
             QueueDrain::Progress
-        } else if matches!(prompt_jobs, QueueDrain::Blocked) {
+        } else if matches!(prompt_jobs, QueueDrain::Blocked)
+            || matches!(system, QueueDrain::Blocked)
+        {
             QueueDrain::Blocked
         } else {
             QueueDrain::Idle
@@ -528,7 +530,13 @@ impl<B, S> MessageQueueWorker<B, S> {
             .context(StoreSnafu)?
         {
             handled += 1;
-            self.handle_system_item(item).await;
+            if !self.handle_system_item(item).await {
+                return Ok(if handled > 1 {
+                    QueueDrain::Progress
+                } else {
+                    QueueDrain::Blocked
+                });
+            }
         }
         Ok(if handled > 0 {
             QueueDrain::Progress
@@ -537,7 +545,7 @@ impl<B, S> MessageQueueWorker<B, S> {
         })
     }
 
-    async fn handle_system_item(&self, item: MessageQueueItem)
+    async fn handle_system_item(&self, item: MessageQueueItem) -> bool
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
@@ -551,7 +559,7 @@ impl<B, S> MessageQueueWorker<B, S> {
                     error = %error,
                     "discarded invalid system queue message"
                 );
-                return;
+                return true;
             }
         };
 
@@ -560,7 +568,11 @@ impl<B, S> MessageQueueWorker<B, S> {
         }
     }
 
-    async fn handle_llm_failure(&self, item: MessageQueueItem, message: LlmFailureSystemMessage)
+    async fn handle_llm_failure(
+        &self,
+        item: MessageQueueItem,
+        message: LlmFailureSystemMessage,
+    ) -> bool
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
@@ -585,7 +597,7 @@ impl<B, S> MessageQueueWorker<B, S> {
                     retry_from_node_id = %message.retry_from_node_id,
                     "stopped recursive recovery for failed recovery prompt"
                 );
-                return;
+                return true;
             }
             Ok(false) => {}
             Err(error) => {
@@ -598,7 +610,7 @@ impl<B, S> MessageQueueWorker<B, S> {
                     error = %error,
                     "failed to inspect llm failure retry point"
                 );
-                return;
+                return true;
             }
         }
 
@@ -625,7 +637,7 @@ impl<B, S> MessageQueueWorker<B, S> {
                         error = %error,
                         "failed to rotate genetic dynasty heads"
                     );
-                    return;
+                    return true;
                 }
             }
         }
@@ -642,7 +654,8 @@ impl<B, S> MessageQueueWorker<B, S> {
                 error = %error,
                 "queued llm failure message failed while waiting for recovery branch"
             );
-            return;
+            self.requeue_blocked_system_item(&item);
+            return false;
         }
 
         let prompt = llm_failure_recovery_prompt(&message, &recovery_branch);
@@ -664,6 +677,30 @@ impl<B, S> MessageQueueWorker<B, S> {
                 execution_id = %message.execution_id,
                 error = %error,
                 "queued llm failure system message failed"
+            ),
+        }
+        true
+    }
+
+    fn requeue_blocked_system_item(&self, item: &MessageQueueItem)
+    where
+        S: Store,
+    {
+        match self
+            .store
+            .enqueue_message(SYSTEM_MESSAGE_QUEUE, item.payload.clone())
+        {
+            Ok(requeued) => tracing::warn!(
+                old_message_id = %item.message_id,
+                new_message_id = %requeued.message_id,
+                queue = SYSTEM_MESSAGE_QUEUE,
+                "requeued blocked system message"
+            ),
+            Err(error) => tracing::error!(
+                message_id = %item.message_id,
+                queue = SYSTEM_MESSAGE_QUEUE,
+                error = %error,
+                "failed to requeue blocked system message"
             ),
         }
     }
@@ -2084,6 +2121,43 @@ mod tests {
         );
         let prompt = find_recovery_prompt(&store, DAY_BRANCH);
         assert!(prompt.contains("execution-original"));
+    }
+
+    #[tokio::test]
+    async fn system_queue_requeues_blocked_system_items() {
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(store.clone(), ImmediateBackend));
+        let worker = MessageQueueWorker::new(store.clone(), ConversationEngine::new(llm.clone()));
+
+        store
+            .enqueue_message(
+                SYSTEM_MESSAGE_QUEUE,
+                encode_system_message(SystemMessage::LlmFailure(LlmFailureSystemMessage {
+                    branch: "main".to_owned(),
+                    execution_id: "execution-original".to_owned(),
+                    error_node_id: "failure-node".to_owned(),
+                    retry_from_node_id: "retry-node".to_owned(),
+                    message: "provider outage".to_owned(),
+                })),
+            )
+            .unwrap();
+        let item = store
+            .dequeue_message(SYSTEM_MESSAGE_QUEUE)
+            .unwrap()
+            .expect("system item should exist");
+
+        worker.requeue_blocked_system_item(&item);
+
+        let queued = store.list_queue_messages(SYSTEM_MESSAGE_QUEUE).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(queued.iter().any(|item| {
+            matches!(
+                decode_system_message(item.payload.clone()).unwrap(),
+                SystemMessage::LlmFailure(message)
+                    if message.branch == "main"
+                        && message.execution_id == "execution-original"
+            )
+        }));
     }
 
     #[derive(Debug, Clone, Default)]
