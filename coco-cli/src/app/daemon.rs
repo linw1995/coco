@@ -777,18 +777,25 @@ impl<B, S> MessageQueueWorker<B, S> {
     where
         S: Store,
     {
-        Ok(self
-            .store
-            .ancestry(head_ref)
-            .context(StoreSnafu)?
-            .into_iter()
-            .find_map(|node| match node.kind {
-                Kind::Anchor(anchor) => match anchor.payload {
-                    AnchorPayload::Session(session) => Some(*session),
-                    _ => None,
-                },
-                _ => None,
-            }))
+        let mut patches = Vec::new();
+        for node in self.store.ancestry(head_ref).context(StoreSnafu)? {
+            let Kind::Anchor(anchor) = node.kind else {
+                continue;
+            };
+
+            if let Some(session) = anchor.as_session() {
+                let effective = patches
+                    .iter()
+                    .rev()
+                    .fold(session.clone(), |session, patch| session.apply_patch(patch));
+                return Ok(Some(effective));
+            }
+            if let Some(patch) = anchor.as_session_patch() {
+                patches.push(patch.clone());
+            }
+        }
+
+        Ok(None)
     }
 
     fn optional_branch_head(&self, branch: &str) -> Result<Option<String>>
@@ -1641,9 +1648,9 @@ mod tests {
         SessionConfig, StepContext,
     };
     use coco_mem::{
-        AnchorPayload, BranchStore, JobStatus, LlmFailureSystemMessage, MemoryStore,
-        MessageQueueStore, NodeStore, ProviderProfile, SessionRole, SessionState, SessionStore,
-        SystemMessage,
+        Anchor, AnchorPayload, BranchStore, JobStatus, LlmFailureSystemMessage, MemoryStore,
+        MessageQueueStore, NewNode, NodeStore, ProviderProfile, Role, SessionAnchorPatch,
+        SessionRole, SessionState, SessionStore, SystemMessage,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -2085,6 +2092,70 @@ mod tests {
         assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
         let prompt = find_recovery_prompt(&store, DAY_BRANCH);
         assert!(prompt.contains("execution-next"));
+    }
+
+    #[tokio::test]
+    async fn system_queue_rotation_preserves_rebased_dawn_config() {
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(store.clone(), ImmediateBackend));
+        create_test_dynasty_sessions(&llm).await;
+        llm.create_session(session_config("main")).await.unwrap();
+        let worker = MessageQueueWorker::new(store.clone(), ConversationEngine::new(llm.clone()));
+        let old_dawn_head = store.get_branch_head(DAWN_BRANCH).unwrap();
+        let dawn_patch_id = store
+            .append(NewNode {
+                parent: old_dawn_head.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: coco_mem::Kind::Anchor(Anchor::session_patch(
+                    vec![],
+                    SessionAnchorPatch {
+                        model: Some("gpt-4.1".to_owned()),
+                        system_prompt: Some("You are rebased Dawn.".to_owned()),
+                        temperature: Some(Some(0.2)),
+                        max_tokens: Some(Some(12_000)),
+                        enable_coco_shim: Some(true),
+                        ..Default::default()
+                    },
+                )),
+            })
+            .unwrap();
+        store
+            .set_branch_head(DAWN_BRANCH, &old_dawn_head, &dawn_patch_id)
+            .unwrap();
+
+        store
+            .enqueue_message(
+                SYSTEM_MESSAGE_QUEUE,
+                encode_system_message(SystemMessage::LlmFailure(LlmFailureSystemMessage {
+                    branch: DAY_BRANCH.to_owned(),
+                    execution_id: "execution-admin".to_owned(),
+                    error_node_id: "failure-node".to_owned(),
+                    retry_from_node_id: "retry-node".to_owned(),
+                    message: "context length exceeded".to_owned(),
+                })),
+            )
+            .unwrap();
+
+        assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
+
+        let new_dawn_head = store.get_branch_head(DAWN_BRANCH).unwrap();
+        let new_dawn_node = store.get_node(&new_dawn_head).unwrap();
+        match new_dawn_node.kind {
+            coco_mem::Kind::Anchor(anchor) => match anchor.payload {
+                AnchorPayload::Session(session) => {
+                    assert_eq!(session.model, "gpt-4.1");
+                    assert_eq!(session.system_prompt, "You are rebased Dawn.");
+                    assert_eq!(session.temperature, Some(0.2));
+                    assert_eq!(session.max_tokens, Some(12_000));
+                    assert!(session.enable_coco_shim);
+                    assert!(session.prompt.is_empty());
+                    assert!(session.active_skill.is_none());
+                }
+                other => panic!("expected session anchor, got {other:?}"),
+            },
+            other => panic!("expected anchor node, got {other:?}"),
+        }
     }
 
     #[tokio::test]
