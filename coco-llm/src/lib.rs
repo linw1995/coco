@@ -221,7 +221,6 @@ pub struct CompletionOverrides {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
-    pub suppress_failure_queue: bool,
 }
 
 fn completion_origin_kind(origin: &CompletionOrigin) -> &'static str {
@@ -1494,15 +1493,13 @@ where
                             &original_head,
                             &retry_from_node_id,
                         )?;
-                        if !request.overrides.suppress_failure_queue {
-                            self.enqueue_llm_failure_system_message(
-                                &resolved.branch,
-                                &execution_id,
-                                &error_node_id,
-                                &retry_from_node_id,
-                                &message,
-                            );
-                        }
+                        self.enqueue_llm_failure_system_message(
+                            &resolved.branch,
+                            &execution_id,
+                            &error_node_id,
+                            &retry_from_node_id,
+                            &message,
+                        );
                         tracing::warn!(
                             branch = %resolved.branch,
                             execution_id = %execution_id,
@@ -1541,15 +1538,13 @@ where
                     )?,
                 };
                 self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
-                if !request.overrides.suppress_failure_queue {
-                    self.enqueue_llm_failure_system_message(
-                        &resolved.branch,
-                        &execution_id,
-                        &error_node_id,
-                        &retry_from_node_id,
-                        &source.to_string(),
-                    );
-                }
+                self.enqueue_llm_failure_system_message(
+                    &resolved.branch,
+                    &execution_id,
+                    &error_node_id,
+                    &retry_from_node_id,
+                    &source.to_string(),
+                );
                 tracing::error!(
                     branch = %resolved.branch,
                     execution_id = %execution_id,
@@ -2380,7 +2375,6 @@ impl<B, S> LlmService<B, S> {
             temperature,
             max_tokens,
             additional_params,
-            suppress_failure_queue: _,
         } = request.overrides;
         let provider = provider.unwrap_or(session.config.provider);
         let uses_session_provider = provider == session.config.provider;

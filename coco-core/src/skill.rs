@@ -373,10 +373,7 @@ where
                 branch: child_branch.clone(),
                 origin: CompletionOrigin::BranchHead,
                 input: CompletionInput::Continue,
-                overrides: CompletionOverrides {
-                    suppress_failure_queue: true,
-                    ..Default::default()
-                },
+                overrides: CompletionOverrides::default(),
                 active_skill_runtime: runtime.context.clone(),
             })
             .await;

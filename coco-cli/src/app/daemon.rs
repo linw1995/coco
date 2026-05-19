@@ -618,15 +618,7 @@ impl<B, S> MessageQueueWorker<B, S> {
         }
 
         let prompt = llm_failure_recovery_prompt(&message, &recovery_branch);
-        let overrides = coco_llm::CompletionOverrides {
-            suppress_failure_queue: true,
-            ..Default::default()
-        };
-        match self
-            .engine
-            .reply_with_overrides(&recovery_branch, &prompt, vec![], None, overrides)
-            .await
-        {
+        match self.engine.reply(&recovery_branch, &prompt).await {
             Ok(response) => tracing::debug!(
                 message_id = %item.message_id,
                 queue = SYSTEM_MESSAGE_QUEUE,
