@@ -1792,7 +1792,7 @@ fn apply_job_status_changed(
         }
     );
     ensure!(
-        valid_job_status_transition(expected, updated.status),
+        expected.can_transition_to(updated.status),
         CorruptedStoreSnafu {
             path: path.to_owned(),
             message: format!(
@@ -1836,13 +1836,6 @@ fn job_identity_matches(left: &Job, right: &Job) -> bool {
         && left.created_at == right.created_at
         && left.branch == right.branch
         && left.base == right.base
-}
-
-fn valid_job_status_transition(current: JobStatus, next: JobStatus) -> bool {
-    matches!(
-        (current, next),
-        (JobStatus::Queued, JobStatus::Running) | (JobStatus::Running, JobStatus::Finished)
-    )
 }
 
 fn job_log_should_compact(log_len: usize) -> bool {

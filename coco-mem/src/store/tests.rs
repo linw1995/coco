@@ -1563,6 +1563,26 @@ where
     assert_eq!(store.get_job(&job.job_id).unwrap(), finished);
 }
 
+fn assert_set_job_status_rejects_invalid_transition<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    let err = store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Finished)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::PromptJobInvalidStatusTransition { job_id, current, next }
+            if job_id == job.job_id && current == "Queued" && next == "Finished"
+    ));
+}
+
 fn assert_submit_job_rejects_second_active_job_on_same_branch<F>()
 where
     F: TestStoreFactory,
@@ -2216,6 +2236,11 @@ macro_rules! define_common_store_tests {
             #[test]
             fn finished_job_round_trip() {
                 assert_finished_job_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn set_job_status_rejects_invalid_transition() {
+                assert_set_job_status_rejects_invalid_transition::<$factory>();
             }
 
             #[test]

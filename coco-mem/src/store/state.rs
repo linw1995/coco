@@ -10,9 +10,10 @@ use crate::error::{
     DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSkillNameSnafu,
     MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, MultipleShadowParentsSnafu,
     NotFoundSnafu, ParentNotFoundSnafu, PresetNotFoundSnafu, PresetVersionNotFoundSnafu,
-    PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu, PromptJobMovedSnafu,
-    PromptJobNotFoundSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu,
-    SkillNotFoundSnafu, SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
+    PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
+    PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
+    RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu,
+    SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
 };
 use crate::{
     Anchor, AnchorPayload, Job, JobStatus, Kind, MessageQueueItem, NewNode, Node, PauseReason,
@@ -512,6 +513,14 @@ impl StoreState {
                 job_id: job_id.to_owned(),
                 expected: format!("{expected:?}"),
                 actual: format!("{:?}", job.status),
+            }
+        );
+        ensure!(
+            job.status.can_transition_to(next),
+            PromptJobInvalidStatusTransitionSnafu {
+                job_id: job_id.to_owned(),
+                current: format!("{:?}", job.status),
+                next: format!("{next:?}"),
             }
         );
         job.status = next;
