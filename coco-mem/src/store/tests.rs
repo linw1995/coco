@@ -1563,6 +1563,26 @@ where
     assert_eq!(store.get_job(&job.job_id).unwrap(), finished);
 }
 
+fn assert_set_job_status_rejects_invalid_transition<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    let err = store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Finished)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::PromptJobInvalidStatusTransition { job_id, current, next }
+            if job_id == job.job_id && current == "Queued" && next == "Finished"
+    ));
+}
+
 fn assert_submit_job_rejects_second_active_job_on_same_branch<F>()
 where
     F: TestStoreFactory,
@@ -2229,6 +2249,11 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
+            fn set_job_status_rejects_invalid_transition() {
+                assert_set_job_status_rejects_invalid_transition::<$factory>();
+            }
+
+            #[test]
             fn submit_job_rejects_second_active_job_on_same_branch() {
                 assert_submit_job_rejects_second_active_job_on_same_branch::<$factory>();
             }
@@ -2312,6 +2337,8 @@ fn open_creates_jsonl_store_directory_with_root_node() {
     assert!(path.join("presets.json").is_file());
     assert!(path.join("skills.json").is_file());
     assert!(path.join("branches").is_dir());
+    assert!(path.join("jobs.json").is_file());
+    assert!(path.join("jobs.jsonl").is_file());
     assert!(path.join("preset-history").is_dir());
     assert!(path.join("skill-history").is_dir());
     assert!(path.join("skill-history/shared").is_dir());
@@ -2536,6 +2563,8 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
         serde_json::to_string_pretty(&meta).unwrap(),
     )
     .unwrap();
+    fs::write(path.join("jobs.json"), "{}").unwrap();
+    fs::remove_file(path.join("jobs.jsonl")).unwrap();
     let mut skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     skills["orchestrator"]["coco-orchestrator"]
@@ -2719,20 +2748,301 @@ fn open_defaults_missing_job_finished_at() {
     store.fork("main", &root_id).unwrap();
     let job = submit_prompt_job(&store, "main", "hello");
 
-    let jobs_path = path.join("jobs.json");
-    let mut jobs: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&fs::read_to_string(&jobs_path).unwrap()).unwrap();
-    let entry = jobs
-        .get_mut(&job.job_id)
-        .and_then(serde_json::Value::as_object_mut)
-        .unwrap();
-    entry.remove("finished_at");
-    fs::write(&jobs_path, serde_json::to_vec_pretty(&jobs).unwrap()).unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[0]["job"]
+        .as_object_mut()
+        .unwrap()
+        .remove("finished_at");
+    write_jsonl_values(&history_path, &history);
 
     let reopened = FsStore::open(&path).unwrap();
     let reopened_job = reopened.get_job(&job.job_id).unwrap();
 
     assert!(reopened_job.finished_at.is_none());
+}
+
+#[test]
+fn fs_jobs_are_recorded_in_wal_after_snapshot() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("draft", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    let second = submit_prompt_job(&store, "draft", "world");
+
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("jobs.json")).unwrap()).unwrap();
+    assert_eq!(snapshot.as_object().unwrap().len(), 0);
+
+    store
+        .set_job_status(&first.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+
+    let history = read_jsonl_values(&path.join("jobs.jsonl"));
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0]["op"], "submitted");
+    assert_eq!(history[0]["job"]["job_id"], first.job_id);
+    assert_eq!(history[1]["op"], "submitted");
+    assert_eq!(history[1]["job"]["job_id"], second.job_id);
+    assert_eq!(history[2]["op"], "status_changed");
+    assert_eq!(history[2]["job_id"], first.job_id);
+    assert_eq!(history[2]["expected"], "queued");
+    assert_eq!(history[2]["updated"]["status"], "running");
+
+    let reopened = FsStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.get_job(&first.job_id).unwrap().status,
+        JobStatus::Running
+    );
+    assert_eq!(reopened.get_job(&second.job_id).unwrap(), second);
+}
+
+#[test]
+fn open_migrates_legacy_jobs_json_to_snapshot_with_empty_wal() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    let mut legacy_jobs = serde_json::Map::new();
+    legacy_jobs.insert(job.job_id.clone(), serde_json::to_value(&job).unwrap());
+    fs::write(
+        path.join("jobs.json"),
+        serde_json::to_vec_pretty(&serde_json::Value::Object(legacy_jobs)).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(path.join("jobs.jsonl")).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!("2026-05-17");
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert!(path.join("jobs.json").is_file());
+    assert!(read_jsonl_values(&path.join("jobs.jsonl")).is_empty());
+    assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
+    let migrated_meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(migrated_meta["version"], "2026-05-19");
+}
+
+#[test]
+fn open_compacts_job_wal_into_snapshot() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    for index in 0..64 {
+        let branch = format!("branch-{index}");
+        store.fork(&branch, &root_id).unwrap();
+        submit_prompt_job(&store, &branch, "hello");
+    }
+    drop(store);
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("jobs.json")).unwrap()).unwrap();
+    assert_eq!(snapshot.as_object().unwrap().len(), 64);
+    assert!(read_jsonl_values(&path.join("jobs.jsonl")).is_empty());
+    assert_eq!(reopened.list_jobs().unwrap().len(), 64);
+}
+
+#[test]
+fn open_recovers_interrupted_job_compaction() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    let jobs = store.list_jobs().unwrap();
+    fs::write(
+        path.join("jobs.compaction.json"),
+        serde_json::to_vec_pretty(&jobs).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        path.join("jobs.json"),
+        serde_json::to_vec_pretty(&jobs).unwrap(),
+    )
+    .unwrap();
+    drop(store);
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
+    assert!(read_jsonl_values(&path.join("jobs.jsonl")).is_empty());
+    assert!(!path.join("jobs.compaction.json").exists());
+}
+
+#[test]
+fn open_rejects_job_snapshot_key_mismatch() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    fs::write(path.join("jobs.jsonl"), "").unwrap();
+    fs::write(
+        path.join("jobs.json"),
+        serde_json::to_vec_pretty(&json!({ "other-job": job })).unwrap(),
+    )
+    .unwrap();
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_snapshot_with_multiple_active_jobs_on_branch() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    let mut second = first.clone();
+    second.job_id = "manual-second-job".to_owned();
+    fs::write(path.join("jobs.jsonl"), "").unwrap();
+    fs::write(
+        path.join("jobs.json"),
+        serde_json::to_vec_pretty(&json!({
+            first.job_id.clone(): first,
+            second.job_id.clone(): second,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_duplicate_job_wal_submission() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    submit_prompt_job(&store, "main", "hello");
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history.push(history[0].clone());
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_submission_when_branch_already_active() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    let mut second = first.clone();
+    second.job_id = "manual-second-job".to_owned();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history.push(json!({
+        "op": "submitted",
+        "job": second,
+    }));
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_status_change_with_mismatched_expected_status() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["expected"] = json!("running");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_status_change_that_modifies_identity() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["updated"]["branch"] = json!("other-branch");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_invalid_status_transition() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["updated"]["status"] = json!("finished");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_unfinished_status_with_finished_at() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["updated"]["finished_at"] = history[0]["job"]["created_at"].clone();
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
 }
 
 #[test]
@@ -2973,6 +3283,8 @@ fn store_migration_adds_missing_builtin_skill() {
         serde_json::to_string_pretty(&meta).unwrap(),
     )
     .unwrap();
+    fs::write(path.join("jobs.json"), "{}").unwrap();
+    fs::remove_file(path.join("jobs.jsonl")).unwrap();
 
     let reopened = FsStore::open(&path).unwrap();
 

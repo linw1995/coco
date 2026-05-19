@@ -71,6 +71,13 @@ pub enum StoreError {
         actual: String,
     },
 
+    #[snafu(display("Prompt job {job_id:?} cannot move from {current:?} to {next:?}"))]
+    PromptJobInvalidStatusTransition {
+        job_id: String,
+        current: String,
+        next: String,
+    },
+
     #[snafu(display("Branch {branch:?} already has an active prompt job {job_id:?}"))]
     PromptJobActiveOnBranch { branch: String, job_id: String },
 

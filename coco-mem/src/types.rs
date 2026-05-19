@@ -116,6 +116,15 @@ pub enum JobStatus {
     Finished,
 }
 
+impl JobStatus {
+    pub fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Queued, Self::Running) | (Self::Running, Self::Finished)
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRole {

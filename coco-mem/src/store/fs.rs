@@ -34,6 +34,8 @@ const NODES_FILE_NAME: &str = "nodes.jsonl";
 const SESSIONS_FILE_NAME: &str = "sessions.json";
 const PRESETS_FILE_NAME: &str = "presets.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
+const JOB_HISTORY_FILE_NAME: &str = "jobs.jsonl";
+const JOB_COMPACTION_FILE_NAME: &str = "jobs.compaction.json";
 const QUEUES_FILE_NAME: &str = "queues.jsonl";
 const SKILLS_FILE_NAME: &str = "skills.json";
 const PRESET_HISTORY_DIR_NAME: &str = "preset-history";
@@ -57,6 +59,7 @@ const BUILTIN_TELEGRAM_REVISION_ID: &str =
     "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c";
 const BRANCHES_DIR_NAME: &str = "branches";
 const LOCK_FILE_NAME: &str = "store.lock";
+const JOB_COMPACT_MIN_LOG_ENTRIES: usize = 64;
 const MESSAGE_QUEUE_COMPACT_MIN_LOG_ENTRIES: usize = 64;
 const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
@@ -104,9 +107,9 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
 ];
 const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
-        name: "main-to-2026-05-19",
+        name: "main-to-2026-05-17",
         from: StoreFormatVersion::Legacy(LEGACY_STORE_FORMAT_VERSION),
-        to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle("2026-05-17"),
         run: Persistence::migrate_main_store_to_chronicle_format,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
     },
@@ -118,8 +121,15 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
     },
     StoreMigration {
-        name: "2026-05-17-to-2026-05-19",
+        name: "2026-05-17-to-2026-05-18",
         from: StoreFormatVersion::Chronicle("2026-05-17"),
+        to: StoreFormatVersion::Chronicle("2026-05-18"),
+        run: Persistence::migrate_jobs_to_wal,
+        builtin_skills: &[],
+    },
+    StoreMigration {
+        name: "2026-05-18-to-2026-05-19",
+        from: StoreFormatVersion::Chronicle("2026-05-18"),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
@@ -142,6 +152,8 @@ pub struct Persistence {
     sessions_path: PathBuf,
     presets_path: PathBuf,
     jobs_path: PathBuf,
+    job_history_path: PathBuf,
+    job_compaction_path: PathBuf,
     queues_path: PathBuf,
     skills_path: PathBuf,
     preset_history_dir: PathBuf,
@@ -215,6 +227,19 @@ struct PresetHistoryEntry {
 enum MessageQueueHistoryEntry {
     Enqueued { item: MessageQueueItem },
     Dequeued { queue: String, message_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum JobHistoryEntry {
+    Submitted {
+        job: Job,
+    },
+    StatusChanged {
+        job_id: String,
+        expected: JobStatus,
+        updated: Job,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -789,6 +814,8 @@ impl Persistence {
             sessions_path: path.join(SESSIONS_FILE_NAME),
             presets_path: path.join(PRESETS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
+            job_history_path: path.join(JOB_HISTORY_FILE_NAME),
+            job_compaction_path: path.join(JOB_COMPACTION_FILE_NAME),
             queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             preset_history_dir: path.join(PRESET_HISTORY_DIR_NAME),
@@ -819,6 +846,8 @@ impl Persistence {
             sessions_path: path.join(SESSIONS_FILE_NAME),
             presets_path: path.join(PRESETS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
+            job_history_path: path.join(JOB_HISTORY_FILE_NAME),
+            job_compaction_path: path.join(JOB_COMPACTION_FILE_NAME),
             queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             preset_history_dir: path.join(PRESET_HISTORY_DIR_NAME),
@@ -902,6 +931,18 @@ impl Persistence {
     }
 
     fn migrate_store_format_without_structural_changes(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn migrate_jobs_to_wal(&self) -> Result<()> {
+        if !self.job_history_path.exists() {
+            tracing::info!(
+                store_path = %self.dir.display(),
+                path = %self.job_history_path.display(),
+                "creating missing prompt job WAL during store migration"
+            );
+            write_jsonl_file(&self.job_history_path, &[] as &[JobHistoryEntry])?;
+        }
         Ok(())
     }
 
@@ -1169,6 +1210,7 @@ impl Persistence {
             &HashMap::<String, PersistedPresetRecord>::new(),
         )?;
         write_json_file(&self.jobs_path, &HashMap::<String, Job>::new())?;
+        write_jsonl_file(&self.job_history_path, &[] as &[JobHistoryEntry])?;
         write_jsonl_file(&self.queues_path, &[] as &[MessageQueueHistoryEntry])?;
         write_json_file(
             &self.skills_path,
@@ -1205,7 +1247,7 @@ impl Persistence {
             self.jobs_path.is_file(),
             CorruptedStoreSnafu {
                 path: self.jobs_path.clone(),
-                message: "missing jobs metadata file".to_owned(),
+                message: "missing jobs snapshot file".to_owned(),
             }
         );
         ensure!(
@@ -1362,7 +1404,11 @@ impl Persistence {
         let presets = load_preset_history_records(self)?;
         validate_preset_snapshots(&preset_snapshots, &presets)?;
         store.presets = presets;
-        store.jobs = read_json_file::<HashMap<String, Job>>(&self.jobs_path)?;
+        self.recover_job_compaction()?;
+        let job_log_len = self.load_jobs(&mut store)?;
+        if self.access == StoreAccess::ReadWrite && job_log_should_compact(job_log_len) {
+            self.rewrite_jobs(&store)?;
+        }
         let (message_queues, message_queue_log_len) = self.load_message_queues()?;
         store.message_queues = message_queues;
         if self.access == StoreAccess::ReadWrite
@@ -1408,9 +1454,52 @@ impl Persistence {
         )
     }
 
-    pub fn persist_jobs(&self, state: &StoreState) -> Result<()> {
+    fn append_job_history_entry(&self, entry: &JobHistoryEntry) -> Result<()> {
         self.ensure_writable()?;
-        write_json_file(&self.jobs_path, &state.jobs)
+        append_jsonl_record_create(&self.job_history_path, entry)
+    }
+
+    fn load_jobs(&self, state: &mut StoreState) -> Result<usize> {
+        let snapshot = read_job_snapshots(&self.jobs_path)?;
+        validate_job_snapshots(&self.jobs_path, state, &snapshot)?;
+        state.jobs = snapshot;
+        let entries = read_jsonl_file::<JobHistoryEntry>(&self.job_history_path)?;
+        let len = entries.len();
+        for entry in entries {
+            apply_job_history_entry(&self.job_history_path, state, entry)?;
+        }
+        Ok(len)
+    }
+
+    fn rewrite_jobs(&self, state: &StoreState) -> Result<()> {
+        self.ensure_writable()?;
+        write_json_file(&self.job_compaction_path, &state.jobs)?;
+        write_json_file(&self.jobs_path, &state.jobs)?;
+        write_jsonl_file(&self.job_history_path, &[] as &[JobHistoryEntry])?;
+        fs::remove_file(&self.job_compaction_path).context(WriteStoreDirectorySnafu {
+            path: self.job_compaction_path.clone(),
+        })?;
+        Ok(())
+    }
+
+    fn recover_job_compaction(&self) -> Result<()> {
+        if !self.job_compaction_path.exists() {
+            return Ok(());
+        }
+        ensure!(
+            self.access == StoreAccess::ReadWrite,
+            CorruptedStoreSnafu {
+                path: self.job_compaction_path.clone(),
+                message: "job compaction requires writable recovery".to_owned(),
+            }
+        );
+        let jobs = read_job_snapshots(&self.job_compaction_path)?;
+        write_json_file(&self.jobs_path, &jobs)?;
+        write_jsonl_file(&self.job_history_path, &[] as &[JobHistoryEntry])?;
+        fs::remove_file(&self.job_compaction_path).context(WriteStoreDirectorySnafu {
+            path: self.job_compaction_path.clone(),
+        })?;
+        Ok(())
     }
 
     fn load_message_queues(&self) -> Result<(HashMap<String, Vec<MessageQueueItem>>, usize)> {
@@ -1583,6 +1672,197 @@ fn persisted_preset_records(
         .iter()
         .map(|(name, record)| (name.clone(), PersistedPresetRecord::from_record(record)))
         .collect()
+}
+
+fn read_job_snapshots(path: &Path) -> Result<HashMap<String, Job>> {
+    let snapshots = read_json_file::<HashMap<String, Job>>(path)?;
+    for (job_id, job) in &snapshots {
+        ensure!(
+            job.job_id == *job_id,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "job snapshot key {:?} mismatches record id {:?}",
+                    job_id, job.job_id
+                ),
+            }
+        );
+    }
+    Ok(snapshots)
+}
+
+fn validate_job_snapshots(
+    path: &Path,
+    state: &StoreState,
+    jobs: &HashMap<String, Job>,
+) -> Result<()> {
+    let mut active_by_branch = HashMap::<String, String>::new();
+    for job in jobs.values() {
+        validate_job_refs(path, state, job)?;
+        if matches!(job.status, JobStatus::Finished) {
+            continue;
+        }
+        if let Some(existing_job_id) =
+            active_by_branch.insert(job.branch.clone(), job.job_id.clone())
+        {
+            return CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "branch {:?} has multiple active prompt jobs {:?} and {:?}",
+                    job.branch, existing_job_id, job.job_id
+                ),
+            }
+            .fail();
+        }
+    }
+    Ok(())
+}
+
+fn apply_job_history_entry(
+    path: &Path,
+    state: &mut StoreState,
+    entry: JobHistoryEntry,
+) -> Result<()> {
+    match entry {
+        JobHistoryEntry::Submitted { job } => apply_submitted_job(path, state, job),
+        JobHistoryEntry::StatusChanged {
+            job_id,
+            expected,
+            updated,
+        } => apply_job_status_changed(path, state, job_id, expected, updated),
+    }
+}
+
+fn apply_submitted_job(path: &Path, state: &mut StoreState, job: Job) -> Result<()> {
+    ensure!(
+        matches!(job.status, JobStatus::Queued),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "submitted job {:?} has invalid status {:?}",
+                job.job_id, job.status
+            ),
+        }
+    );
+    ensure!(
+        job.finished_at.is_none(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("submitted job {:?} has finished_at", job.job_id),
+        }
+    );
+    validate_job_refs(path, state, &job)?;
+    ensure!(
+        !state.jobs.contains_key(&job.job_id),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("duplicate job record for {:?}", job.job_id),
+        }
+    );
+    ensure!(
+        state.jobs.values().all(|existing| {
+            existing.branch != job.branch || matches!(existing.status, JobStatus::Finished)
+        }),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("branch {:?} already has an active prompt job", job.branch),
+        }
+    );
+    state.jobs.insert(job.job_id.clone(), job);
+    Ok(())
+}
+
+fn apply_job_status_changed(
+    path: &Path,
+    state: &mut StoreState,
+    job_id: String,
+    expected: JobStatus,
+    updated: Job,
+) -> Result<()> {
+    ensure!(
+        updated.job_id == job_id,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "status change key {:?} mismatches updated job id {:?}",
+                job_id, updated.job_id
+            ),
+        }
+    );
+    let current = state
+        .jobs
+        .get(&job_id)
+        .cloned()
+        .context(CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("status change references missing job {job_id:?}"),
+        })?;
+    ensure!(
+        current.status == expected,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "job {:?} status change expected {:?}, found {:?}",
+                job_id, expected, current.status
+            ),
+        }
+    );
+    ensure!(
+        job_identity_matches(&current, &updated),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("job {:?} status change modifies immutable fields", job_id),
+        }
+    );
+    ensure!(
+        expected.can_transition_to(updated.status),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "invalid job {:?} status transition {:?} -> {:?}",
+                job_id, expected, updated.status
+            ),
+        }
+    );
+    ensure!(
+        matches!(updated.status, JobStatus::Finished) || updated.finished_at.is_none(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "unfinished job {:?} status change includes finished_at",
+                job_id
+            ),
+        }
+    );
+    state.jobs.insert(job_id, updated);
+    Ok(())
+}
+
+fn validate_job_refs(path: &Path, state: &StoreState, job: &Job) -> Result<()> {
+    map_job_validation_error(path, state.get_branch_head(&job.branch))?;
+    map_job_validation_error(path, state.get_node(&job.base))?;
+    Ok(())
+}
+
+fn map_job_validation_error<T>(path: &Path, result: Result<T>) -> Result<T> {
+    result.map_err(|source| match source {
+        StoreError::CorruptedStore { .. } => source,
+        _ => StoreError::CorruptedStore {
+            path: path.to_owned(),
+            message: source.to_string(),
+        },
+    })
+}
+
+fn job_identity_matches(left: &Job, right: &Job) -> bool {
+    left.job_id == right.job_id
+        && left.created_at == right.created_at
+        && left.branch == right.branch
+        && left.base == right.base
+}
+
+fn job_log_should_compact(log_len: usize) -> bool {
+    log_len >= JOB_COMPACT_MIN_LOG_ENTRIES
 }
 
 fn message_queues_from_history(
@@ -2395,7 +2675,10 @@ impl JobStore for FsStore {
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let created = temp.submit_job(branch, base)?;
-        self.persistence.persist_jobs(&temp)?;
+        self.persistence
+            .append_job_history_entry(&JobHistoryEntry::Submitted {
+                job: created.clone(),
+            })?;
         state.jobs = temp.jobs;
         Ok(created)
     }
@@ -2404,7 +2687,10 @@ impl JobStore for FsStore {
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let created = temp.submit_job_with_id(job_id, branch, base)?;
-        self.persistence.persist_jobs(&temp)?;
+        self.persistence
+            .append_job_history_entry(&JobHistoryEntry::Submitted {
+                job: created.clone(),
+            })?;
         state.jobs = temp.jobs;
         Ok(created)
     }
@@ -2424,7 +2710,12 @@ impl JobStore for FsStore {
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let updated = temp.set_job_status(job_id, expected, next)?;
-        self.persistence.persist_jobs(&temp)?;
+        self.persistence
+            .append_job_history_entry(&JobHistoryEntry::StatusChanged {
+                job_id: job_id.to_owned(),
+                expected,
+                updated: updated.clone(),
+            })?;
         state.jobs = temp.jobs;
         Ok(updated)
     }
