@@ -1,12 +1,13 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
-    BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, Node, NodeStore,
-    PromptAttachment, SessionStore, SkillStore,
+    BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, MessageQueueStore, Node,
+    NodeStore, PromptAttachment, SessionStore, SkillStore,
 };
 use coco_llm::{
-    CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
-    LlmService, RigBackend, SessionConfigPatch,
+    BackendError, BackendFailureContext, CompletionBackend, CompletionInput, CompletionOrigin,
+    CompletionOverrides, CompletionRequest, Error as LlmError, LlmService, RigBackend,
+    SessionConfigPatch,
 };
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jiff::Timestamp;
@@ -20,6 +21,9 @@ type JobResult = std::result::Result<String, EngineError>;
 type InflightJob = Shared<BoxFuture<'static, JobResult>>;
 type InflightJobTable = Arc<AsyncMutex<HashMap<String, InflightJob>>>;
 pub type BranchLockGuard = coco_llm::BranchLockGuard;
+pub const SYSTEM_EVENT_QUEUE: &str = "mq-system";
+const LLM_BACKEND_FAILURE_RECOVERY_REQUESTED: &str = "llm.backend_failure.recovery_requested";
+const SYSTEM_EVENT_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct JobStatusSnapshot {
@@ -43,6 +47,26 @@ struct PromptReply {
 pub struct ConversationEngine<B = RigBackend, S = MemoryStore> {
     service: Arc<LlmService<B, S>>,
     inflight_jobs: InflightJobTable,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SystemEventEnvelope<T> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    version: u64,
+    dedupe_key: String,
+    data: T,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LlmBackendFailureRecoveryRequested {
+    job_id: String,
+    branch: String,
+    base_node_id: String,
+    execution_id: String,
+    error_node_id: String,
+    retry_from_node_id: String,
+    message: String,
 }
 
 impl<B, S> Clone for ConversationEngine<B, S> {
@@ -89,6 +113,7 @@ where
         + SessionStore
         + JobStore
         + SkillStore
+        + MessageQueueStore
         + Clone
         + Send
         + Sync
@@ -542,7 +567,50 @@ where
             active_skill_runtime: None,
         };
 
-        let _ = self.service.run(request).await?;
+        match self.service.run(request).await {
+            Ok(_) => Ok(()),
+            Err(source) => self.handle_completion_error(job, source),
+        }
+    }
+
+    fn handle_completion_error(
+        &self,
+        job: &Job,
+        source: LlmError,
+    ) -> std::result::Result<(), EngineError> {
+        if let LlmError::Backend {
+            source: backend_source,
+            context,
+        } = &source
+        {
+            self.enqueue_backend_failure_recovery_event(job, backend_source, context)?;
+        }
+        Err(source.into())
+    }
+
+    fn enqueue_backend_failure_recovery_event(
+        &self,
+        job: &Job,
+        source: &BackendError,
+        context: &BackendFailureContext,
+    ) -> std::result::Result<(), EngineError> {
+        let event = backend_failure_recovery_event(job, source, context);
+        let item = self.service.store().enqueue_message(
+            SYSTEM_EVENT_QUEUE,
+            serde_json::to_value(&event).expect("system event payload should serialize"),
+        )?;
+        tracing::warn!(
+            job_id = %job.job_id,
+            branch = %job.branch,
+            message_id = %item.message_id,
+            queue = SYSTEM_EVENT_QUEUE,
+            dedupe_key = %event.dedupe_key,
+            execution_id = %context.execution_id,
+            error_node_id = %context.error_node_id,
+            retry_from_node_id = %context.retry_from_node_id,
+            error = %source,
+            "queued backend failure recovery request"
+        );
         Ok(())
     }
 
@@ -655,6 +723,27 @@ fn completion_input_kind(input: &CompletionInput) -> &'static str {
     match input {
         CompletionInput::Continue => "continue",
         CompletionInput::Prompt { .. } => "prompt",
+    }
+}
+
+fn backend_failure_recovery_event(
+    job: &Job,
+    source: &BackendError,
+    context: &BackendFailureContext,
+) -> SystemEventEnvelope<LlmBackendFailureRecoveryRequested> {
+    SystemEventEnvelope {
+        event_type: LLM_BACKEND_FAILURE_RECOVERY_REQUESTED,
+        version: SYSTEM_EVENT_VERSION,
+        dedupe_key: format!("llm.backend_failure:{}", context.error_node_id),
+        data: LlmBackendFailureRecoveryRequested {
+            job_id: job.job_id.clone(),
+            branch: job.branch.clone(),
+            base_node_id: job.base.clone(),
+            execution_id: context.execution_id.clone(),
+            error_node_id: context.error_node_id.clone(),
+            retry_from_node_id: context.retry_from_node_id.clone(),
+            message: source.to_string(),
+        },
     }
 }
 

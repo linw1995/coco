@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
     Anchor, BackendMetadata, BranchStore, ExecutionMetadata, JobStatus, JobStore, Kind,
-    MemoryStore, NewNode, NodeStore, PromptAnchor, ProviderMetadata, Role, SessionRole,
-    SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillScript, SkillStore,
+    MemoryStore, MessageQueueStore, NewNode, NodeStore, PromptAnchor, ProviderMetadata, Role,
+    SessionRole, SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillScript, SkillStore,
     SkillVersionSpec, ToolResult, ToolUse,
 };
 use coco_llm::{
@@ -19,6 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
 
+use crate::engine::SYSTEM_EVENT_QUEUE;
 use crate::{
     BatchPromptRequest, BranchPromptRequest, BranchPromptStatus, BranchResolveError,
     BranchResolver, ChannelKind, ConversationEngine, CoreService, EngineError, Error,
@@ -622,6 +623,23 @@ async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
 
     assert_eq!(snapshot.status, JobStatus::Finished);
     assert_eq!(snapshot.branch, "main");
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].queue, SYSTEM_EVENT_QUEUE);
+    let payload = &events[0].payload;
+    assert_eq!(payload["type"], "llm.backend_failure.recovery_requested");
+    assert_eq!(payload["version"], 1);
+    assert_eq!(payload["data"]["job_id"], job.job_id);
+    assert_eq!(payload["data"]["branch"], "main");
+    assert_eq!(payload["data"]["base_node_id"], job.base);
+    assert_eq!(payload["data"]["message"], "backend failed");
+    let error_node_id = payload["data"]["error_node_id"]
+        .as_str()
+        .expect("event should include error node id");
+    assert_eq!(
+        payload["dedupe_key"],
+        format!("llm.backend_failure:{error_node_id}")
+    );
 }
 
 #[tokio::test]
@@ -640,7 +658,7 @@ async fn llm_engine_maps_missing_session_error() {
 async fn llm_engine_reply_surfaces_backend_failure_message() {
     let store = MemoryStore::new();
     let backend = AlwaysFailBackend::new();
-    let llm = Arc::new(LlmService::new(store, backend));
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
 
@@ -654,6 +672,12 @@ async fn llm_engine_reply_surfaces_backend_failure_message() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].payload["type"],
+        "llm.backend_failure.recovery_requested"
+    );
 }
 
 #[tokio::test]
