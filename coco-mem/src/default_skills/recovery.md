@@ -9,7 +9,7 @@ tool failure, broken branch state, or provider/runtime interruption.
 
 ```bash
 coco session get --json --branch "$COCO_BRANCH"
-coco session graph --branch "$COCO_BRANCH"
+coco session graph
 ```
 
 1. Identify the smallest recoverable point:

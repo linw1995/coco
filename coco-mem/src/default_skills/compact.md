@@ -11,7 +11,7 @@ summarized into an actionable checkpoint.
 
 ```bash
 coco session get --json --branch "$COCO_BRANCH"
-coco session graph --branch "$COCO_BRANCH"
+coco session graph
 ```
 
 1. Create an isolated compact branch with a fresh session anchor before

@@ -46,6 +46,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DAWN_SYSTEM_PROMPT: &str = "You are Dawn. Stand by as the newborn recovery successor.";
 const DAY_SYSTEM_PROMPT: &str = "You are Day. Administer recovery for failed branches.";
 const DUSK_SYSTEM_PROMPT: &str = "You are Dusk. Preserve archived recovery context.";
+const RECOVERY_PROMPT_MARKER: &str = "Genetic Dynasty recovery orchestrator";
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
@@ -574,6 +575,33 @@ impl<B, S> MessageQueueWorker<B, S> {
             "handling queued llm failure system message"
         );
 
+        match self.is_recovery_prompt_failure(&message) {
+            Ok(true) => {
+                tracing::warn!(
+                    message_id = %item.message_id,
+                    queue = SYSTEM_MESSAGE_QUEUE,
+                    branch = %message.branch,
+                    execution_id = %message.execution_id,
+                    retry_from_node_id = %message.retry_from_node_id,
+                    "stopped recursive recovery for failed recovery prompt"
+                );
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    message_id = %item.message_id,
+                    queue = SYSTEM_MESSAGE_QUEUE,
+                    branch = %message.branch,
+                    execution_id = %message.execution_id,
+                    retry_from_node_id = %message.retry_from_node_id,
+                    error = %error,
+                    "failed to inspect llm failure retry point"
+                );
+                return;
+            }
+        }
+
         if message.branch == DEFAULT_GENETIC_DYNASTY_ORCHESTRATOR_BRANCH {
             match self.rotate_genetic_dynasty_heads() {
                 Ok(true) => tracing::info!(
@@ -637,6 +665,23 @@ impl<B, S> MessageQueueWorker<B, S> {
                 error = %error,
                 "queued llm failure system message failed"
             ),
+        }
+    }
+
+    fn is_recovery_prompt_failure(&self, message: &LlmFailureSystemMessage) -> Result<bool>
+    where
+        S: Store,
+    {
+        match self.store.get_node(&message.retry_from_node_id) {
+            Ok(node) => Ok(match node.kind {
+                Kind::Anchor(anchor) => match anchor.payload {
+                    AnchorPayload::Prompt(prompt) => prompt.prompt.contains(RECOVERY_PROMPT_MARKER),
+                    _ => false,
+                },
+                _ => false,
+            }),
+            Err(coco_mem::StoreError::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error).context(StoreSnafu),
         }
     }
 
@@ -2005,6 +2050,42 @@ mod tests {
         assert!(prompt.contains("execution-next"));
     }
 
+    #[tokio::test]
+    async fn system_queue_stops_recursive_recovery_prompt_failures() {
+        let store = MemoryStore::new();
+        let backend = FailingBackend::default();
+        let calls = backend.calls.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        create_test_dynasty_sessions(&llm).await;
+        llm.create_session(session_config("main")).await.unwrap();
+        let worker = MessageQueueWorker::new(store.clone(), ConversationEngine::new(llm.clone()));
+
+        store
+            .enqueue_message(
+                SYSTEM_MESSAGE_QUEUE,
+                encode_system_message(SystemMessage::LlmFailure(LlmFailureSystemMessage {
+                    branch: "main".to_owned(),
+                    execution_id: "execution-original".to_owned(),
+                    error_node_id: "failure-node".to_owned(),
+                    retry_from_node_id: "retry-node".to_owned(),
+                    message: "provider outage".to_owned(),
+                })),
+            )
+            .unwrap();
+
+        assert_eq!(worker.drain_once().await.unwrap(), QueueDrain::Progress);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            store
+                .list_queue_messages(SYSTEM_MESSAGE_QUEUE)
+                .unwrap()
+                .is_empty()
+        );
+        let prompt = find_recovery_prompt(&store, DAY_BRANCH);
+        assert!(prompt.contains("execution-original"));
+    }
+
     #[derive(Debug, Clone, Default)]
     struct BlockingOnceBackend {
         calls: Arc<AtomicUsize>,
@@ -2013,6 +2094,11 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct ImmediateBackend;
+
+    #[derive(Debug, Clone, Default)]
+    struct FailingBackend {
+        calls: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
     impl CompletionBackend for ImmediateBackend {
@@ -2047,6 +2133,19 @@ mod tests {
                 tool_calls: vec![],
                 final_text: Some("done".to_owned()),
                 trace_persisted: false,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CompletionBackend for FailingBackend {
+        async fn step(
+            &self,
+            _ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(BackendError::Failed {
+                message: "backend failed".to_owned(),
             })
         }
     }
