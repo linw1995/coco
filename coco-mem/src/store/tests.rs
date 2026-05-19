@@ -2821,6 +2821,33 @@ fn open_compacts_job_wal_into_snapshot() {
 }
 
 #[test]
+fn open_recovers_interrupted_job_compaction() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    let jobs = store.list_jobs().unwrap();
+    fs::write(
+        path.join("jobs.compaction.json"),
+        serde_json::to_vec_pretty(&jobs).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        path.join("jobs.json"),
+        serde_json::to_vec_pretty(&jobs).unwrap(),
+    )
+    .unwrap();
+    drop(store);
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
+    assert!(read_jsonl_values(&path.join("jobs.jsonl")).is_empty());
+    assert!(!path.join("jobs.compaction.json").exists());
+}
+
+#[test]
 fn open_rejects_job_snapshot_key_mismatch() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();

@@ -35,6 +35,7 @@ const SESSIONS_FILE_NAME: &str = "sessions.json";
 const PRESETS_FILE_NAME: &str = "presets.json";
 const JOBS_FILE_NAME: &str = "jobs.json";
 const JOB_HISTORY_FILE_NAME: &str = "jobs.jsonl";
+const JOB_COMPACTION_FILE_NAME: &str = "jobs.compaction.json";
 const QUEUES_FILE_NAME: &str = "queues.jsonl";
 const SKILLS_FILE_NAME: &str = "skills.json";
 const PRESET_HISTORY_DIR_NAME: &str = "preset-history";
@@ -129,6 +130,7 @@ pub struct Persistence {
     presets_path: PathBuf,
     jobs_path: PathBuf,
     job_history_path: PathBuf,
+    job_compaction_path: PathBuf,
     queues_path: PathBuf,
     skills_path: PathBuf,
     preset_history_dir: PathBuf,
@@ -790,6 +792,7 @@ impl Persistence {
             presets_path: path.join(PRESETS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
             job_history_path: path.join(JOB_HISTORY_FILE_NAME),
+            job_compaction_path: path.join(JOB_COMPACTION_FILE_NAME),
             queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             preset_history_dir: path.join(PRESET_HISTORY_DIR_NAME),
@@ -821,6 +824,7 @@ impl Persistence {
             presets_path: path.join(PRESETS_FILE_NAME),
             jobs_path: path.join(JOBS_FILE_NAME),
             job_history_path: path.join(JOB_HISTORY_FILE_NAME),
+            job_compaction_path: path.join(JOB_COMPACTION_FILE_NAME),
             queues_path: path.join(QUEUES_FILE_NAME),
             skills_path: path.join(SKILLS_FILE_NAME),
             preset_history_dir: path.join(PRESET_HISTORY_DIR_NAME),
@@ -1377,6 +1381,7 @@ impl Persistence {
         let presets = load_preset_history_records(self)?;
         validate_preset_snapshots(&preset_snapshots, &presets)?;
         store.presets = presets;
+        self.recover_job_compaction()?;
         let job_log_len = self.load_jobs(&mut store)?;
         if self.access == StoreAccess::ReadWrite && job_log_should_compact(job_log_len) {
             self.rewrite_jobs(&store)?;
@@ -1445,8 +1450,32 @@ impl Persistence {
 
     fn rewrite_jobs(&self, state: &StoreState) -> Result<()> {
         self.ensure_writable()?;
+        write_json_file(&self.job_compaction_path, &state.jobs)?;
         write_json_file(&self.jobs_path, &state.jobs)?;
         write_jsonl_file(&self.job_history_path, &[] as &[JobHistoryEntry])?;
+        fs::remove_file(&self.job_compaction_path).context(WriteStoreDirectorySnafu {
+            path: self.job_compaction_path.clone(),
+        })?;
+        Ok(())
+    }
+
+    fn recover_job_compaction(&self) -> Result<()> {
+        if !self.job_compaction_path.exists() {
+            return Ok(());
+        }
+        ensure!(
+            self.access == StoreAccess::ReadWrite,
+            CorruptedStoreSnafu {
+                path: self.job_compaction_path.clone(),
+                message: "job compaction requires writable recovery".to_owned(),
+            }
+        );
+        let jobs = read_job_snapshots(&self.job_compaction_path)?;
+        write_json_file(&self.jobs_path, &jobs)?;
+        write_jsonl_file(&self.job_history_path, &[] as &[JobHistoryEntry])?;
+        fs::remove_file(&self.job_compaction_path).context(WriteStoreDirectorySnafu {
+            path: self.job_compaction_path.clone(),
+        })?;
         Ok(())
     }
 
