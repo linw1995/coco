@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -91,13 +91,73 @@ where
     where
         H: MessageHandler,
     {
-        let response = self
-            .transport
-            .get_updates(GetUpdatesRequest {
-                offset: self.offset,
-                timeout_secs: self.poll_timeout_secs,
-            })
-            .await?;
+        let response = self.get_updates().await?;
+        self.handle_updates(handler, response).await
+    }
+
+    async fn run_once_with_poll_logging<H>(&mut self, handler: &H) -> Result<usize>
+    where
+        H: MessageHandler,
+    {
+        let response = self.get_updates_with_logging().await?;
+        self.handle_updates(handler, response).await
+    }
+
+    async fn get_updates(&self) -> Result<GetUpdatesResponse> {
+        self.transport.get_updates(self.get_updates_request()).await
+    }
+
+    async fn get_updates_with_logging(&self) -> Result<GetUpdatesResponse> {
+        let request = self.get_updates_request();
+        let poll_offset = request.offset;
+        let poll_timeout_secs = request.timeout_secs;
+        let request_timeout_secs = request_timeout_for_poll(poll_timeout_secs).as_secs();
+        let started = Instant::now();
+
+        match self.transport.get_updates(request).await {
+            Ok(response) => {
+                tracing::debug!(
+                    poll_offset = ?poll_offset,
+                    poll_timeout_secs,
+                    request_timeout_secs,
+                    elapsed_ms = elapsed_ms(started),
+                    update_count = response.updates.len(),
+                    "telegram channel polling completed"
+                );
+                Ok(response)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    transport_error_kind = ?transport_failure_kind(&error),
+                    transport_status = ?transport_failure_status(&error),
+                    poll_offset = ?poll_offset,
+                    poll_timeout_secs,
+                    request_timeout_secs,
+                    elapsed_ms = elapsed_ms(started),
+                    retry_delay_secs = TRANSPORT_RETRY_DELAY_SECS,
+                    "telegram channel polling failed; retrying"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn get_updates_request(&self) -> GetUpdatesRequest {
+        GetUpdatesRequest {
+            offset: self.offset,
+            timeout_secs: self.poll_timeout_secs,
+        }
+    }
+
+    async fn handle_updates<H>(
+        &mut self,
+        handler: &H,
+        response: GetUpdatesResponse,
+    ) -> Result<usize>
+    where
+        H: MessageHandler,
+    {
         let mut handled = 0;
 
         for update in response.updates {
@@ -139,16 +199,9 @@ where
         H: MessageHandler,
     {
         loop {
-            match self.run_once(handler).await {
+            match self.run_once_with_poll_logging(handler).await {
                 Ok(_) => {}
                 Err(error) if error.is_transport_failure() => {
-                    tracing::warn!(
-                        error = %error,
-                        transport_error_kind = ?transport_failure_kind(&error),
-                        transport_status = ?transport_failure_status(&error),
-                        retry_delay_secs = TRANSPORT_RETRY_DELAY_SECS,
-                        "telegram channel polling failed; retrying"
-                    );
                     self.sleep_after_transport_error().await;
                 }
                 Err(error) => return Err(error),
@@ -229,6 +282,10 @@ impl ReqwestTelegramTransport {
 
 fn request_timeout_for_poll(poll_timeout_secs: u64) -> Duration {
     Duration::from_secs(poll_timeout_secs.saturating_add(POLL_TIMEOUT_GRACE_SECS))
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn transport_failure_kind(error: &Error) -> Option<&'static str> {

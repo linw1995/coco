@@ -27,6 +27,7 @@ in
           cocoDockerEntrypoint
           bash
           coreutils
+          curl
           nono
           supercronic
           uv
