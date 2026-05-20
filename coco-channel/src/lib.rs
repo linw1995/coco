@@ -11,12 +11,10 @@ pub use message::{
 pub use runtime::{ChannelRuntime, MessageHandler};
 
 #[cfg(test)]
-mod test_logging {
-    #[ctor::ctor(unsafe)]
-    fn init() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
-            .with_test_writer()
-            .try_init();
-    }
+#[ctor::ctor(unsafe)]
+fn init_test_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+        .with_test_writer()
+        .try_init();
 }
