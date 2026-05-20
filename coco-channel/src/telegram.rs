@@ -461,6 +461,15 @@ mod tests {
         }
     }
 
+    struct InvalidInputTransport;
+
+    #[async_trait]
+    impl TelegramTransport for InvalidInputTransport {
+        async fn get_updates(&self, _request: GetUpdatesRequest) -> Result<GetUpdatesResponse> {
+            Err(Error::invalid_input("invalid poll request"))
+        }
+    }
+
     #[async_trait]
     impl TelegramTransport for FakeTransport {
         async fn get_updates(&self, request: GetUpdatesRequest) -> Result<GetUpdatesResponse> {
@@ -590,6 +599,16 @@ mod tests {
 
         assert!(!task.is_finished());
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_returns_non_transport_poll_errors() {
+        let channel = TelegramChannel::new(InvalidInputTransport, 30, BTreeSet::new());
+        let handler = RecordingHandler::default();
+
+        let result = channel.run(&handler).await;
+
+        assert!(matches!(result, Err(Error::InvalidInput { .. })));
     }
 
     #[tokio::test]
