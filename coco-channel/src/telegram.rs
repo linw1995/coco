@@ -126,7 +126,7 @@ where
                 );
                 Ok(response)
             }
-            Err(error) => {
+            Err(error) if error.is_transport_failure() => {
                 tracing::warn!(
                     error = %error,
                     transport_error_kind = ?transport_failure_kind(&error),
@@ -137,6 +137,19 @@ where
                     elapsed_ms = elapsed_ms(started),
                     retry_delay_secs = TRANSPORT_RETRY_DELAY_SECS,
                     "telegram channel polling failed; retrying"
+                );
+                Err(error)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    transport_error_kind = ?transport_failure_kind(&error),
+                    transport_status = ?transport_failure_status(&error),
+                    poll_offset = ?poll_offset,
+                    poll_timeout_secs,
+                    request_timeout_secs,
+                    elapsed_ms = elapsed_ms(started),
+                    "telegram channel polling failed"
                 );
                 Err(error)
             }
