@@ -2014,17 +2014,27 @@ where
     let cronjob = store
         .get_skill(SessionRole::Orchestrator, "cronjob")
         .unwrap();
+    let recovery = store
+        .get_skill(SessionRole::Orchestrator, "recovery")
+        .unwrap();
+    let compact = store
+        .get_skill(SessionRole::Orchestrator, "compact")
+        .unwrap();
     let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
     let telegram = store.get_skill(SessionRole::Runner, "telegram").unwrap();
 
     assert_eq!(orchestrator.current_version, 1);
     assert_eq!(new_skill.current_version, 1);
     assert_eq!(cronjob.current_version, 1);
+    assert_eq!(recovery.current_version, 1);
+    assert_eq!(compact.current_version, 1);
     assert_eq!(telegram.current_version, 1);
     assert_eq!(runner.current_version, 1);
     assert!(orchestrator.current().unwrap().enable_coco_shim);
     assert!(new_skill.current().unwrap().enable_coco_shim);
     assert!(cronjob.current().unwrap().enable_coco_shim);
+    assert!(recovery.current().unwrap().enable_coco_shim);
+    assert!(compact.current().unwrap().enable_coco_shim);
     assert!(telegram.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
     assert_eq!(cronjob.current().unwrap().scripts.len(), 3);

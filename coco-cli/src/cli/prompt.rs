@@ -51,6 +51,7 @@ pub enum PromptSubcommand {
     Status(PromptStatusCommand),
     #[command(name = "branch-status")]
     BranchStatus(PromptBranchStatusCommand),
+    Recover(PromptRecoverCommand),
     #[command(hide = true)]
     Worker(PromptWorkerCommand),
 }
@@ -71,6 +72,21 @@ pub struct PromptBranchStatusCommand {
 
     #[arg(long)]
     pub branch: Option<String>,
+
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PromptRecoverCommand {
+    #[arg(long)]
+    pub job: String,
+
+    #[arg(long)]
+    pub expected_work_branch: String,
+
+    #[arg(long)]
+    pub work_branch: String,
 
     #[arg(long)]
     pub json: bool,

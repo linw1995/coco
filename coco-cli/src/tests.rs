@@ -1422,6 +1422,71 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
 }
 
 #[tokio::test]
+async fn prompt_recover_moves_job_work_branch() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let root_id = store.root_id();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    let output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "prompt",
+            "recover",
+            "--job",
+            &job.job_id,
+            "--expected-work-branch",
+            "main",
+            "--work-branch",
+            "recovery",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let value: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["job_id"], job.job_id);
+    assert_eq!(value["branch"], "main");
+    assert_eq!(value["work_branch"], "recovery");
+    let store = open_store(&store_path).unwrap();
+    assert_eq!(store.get_job(&job.job_id).unwrap().work_branch, "recovery");
+
+    let branch_output = run_with_backend(
+        prompt_branch_status_cli(store_path.clone(), &job.job_id, Some("recovery")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let branch_value: Value = serde_json::from_str(&branch_output).unwrap();
+    assert_eq!(branch_value["branch"], "main");
+    assert_eq!(branch_value["work_branch"], "recovery");
+}
+
+#[tokio::test]
 async fn prompt_status_json_preserves_shadow_parent_kind() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
@@ -5914,6 +5979,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
 
     let states = store.list_session_states().unwrap();
     assert_eq!(states.get("main"), Some(&SessionState::Active));
+    assert_eq!(states.get("day"), Some(&SessionState::Active));
 
     let head = store.get_branch_head("main").unwrap();
     let node = store.get_node(&head).unwrap();
@@ -5940,10 +6006,38 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
         vec!["exec_command", "write_stdin", "search_skill", "load_image"]
     );
 
+    let day_head = store.get_branch_head("day").unwrap();
+    let day_node = store.get_node(&day_head).unwrap();
+    let Kind::Anchor(day_anchor) = day_node.kind else {
+        panic!("expected day session anchor");
+    };
+    let AnchorPayload::Session(day_session) = day_anchor.payload else {
+        panic!("expected day session anchor payload");
+    };
+    assert_eq!(day_session.role, SessionRole::Orchestrator);
+    assert_eq!(
+        day_session.provider_profile.as_deref(),
+        Some("openai-codex")
+    );
+    assert_eq!(day_session.model, "gpt-5.4");
+    assert!(day_session.system_prompt.contains("CoCo Day"));
+    assert!(day_session.system_prompt.contains("system events"));
+    assert_eq!(day_session.max_tokens, Some(32_000));
+    assert!(day_session.enable_coco_shim);
+    assert_eq!(
+        day_session
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["exec_command", "write_stdin", "search_skill"]
+    );
+
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
     assert_eq!(store.get_branch_head("main").unwrap(), head);
+    assert_eq!(store.get_branch_head("day").unwrap(), day_head);
 }
 
 #[test]

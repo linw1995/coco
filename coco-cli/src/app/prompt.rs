@@ -160,6 +160,7 @@ where
         Some(PromptSubcommand::BranchStatus(command)) => {
             run_prompt_branch_status(command, engine).await
         }
+        Some(PromptSubcommand::Recover(command)) => run_prompt_recover(command, engine).await,
         Some(PromptSubcommand::Worker(command)) => run_prompt_worker(command, engine).await,
     }
 }
@@ -354,7 +355,7 @@ where
     if command
         .branch
         .as_ref()
-        .is_none_or(|branch| branch == &snapshot.branch)
+        .is_none_or(|branch| branch == &snapshot.branch || branch == &snapshot.work_branch)
     {
         return Ok(Some(if command.json {
             render_json(snapshot)
@@ -366,6 +367,28 @@ where
         render_json(Vec::<JobStatusSnapshot>::new())
     } else {
         "No matching prompt job.".to_owned()
+    }))
+}
+
+async fn run_prompt_recover<B, S>(
+    command: crate::cli::PromptRecoverCommand,
+    engine: &ConversationEngine<B, S>,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let snapshot = engine
+        .set_job_work_branch(
+            &command.job,
+            &command.expected_work_branch,
+            &command.work_branch,
+        )
+        .context(CoreEngineSnafu)?;
+    Ok(Some(if command.json {
+        render_json(snapshot)
+    } else {
+        render_job_status_snapshot_text(&snapshot)
     }))
 }
 
@@ -405,7 +428,7 @@ where
     });
 }
 
-fn queue_prompt_job_request(
+pub(crate) fn queue_prompt_job_request(
     store: &impl Store,
     request: QueuedPromptRequest,
 ) -> Result<MessageQueueItem> {
@@ -530,10 +553,11 @@ fn render_queued_prompt_request_job_text(snapshot: &QueuedPromptRequestJobView) 
 
 fn render_job_status_snapshot_text(snapshot: &JobStatusSnapshot) -> String {
     format!(
-        "job_id: {}\nstatus: {:?}\nbranch: {}\nbase: {}\nhead: {}\ncreated_at: {}\nfinished_at: {}",
+        "job_id: {}\nstatus: {:?}\nbranch: {}\nwork_branch: {}\nbase: {}\nhead: {}\ncreated_at: {}\nfinished_at: {}",
         snapshot.job_id,
         snapshot.status,
         snapshot.branch,
+        snapshot.work_branch,
         snapshot.base,
         snapshot.head,
         snapshot.created_at,
@@ -580,7 +604,7 @@ fn load_queued_prompt_request_status(
     }))
 }
 
-fn next_prompt_job_id() -> String {
+pub(crate) fn next_prompt_job_id() -> String {
     format!("job-{}", nanoid::nanoid!())
 }
 

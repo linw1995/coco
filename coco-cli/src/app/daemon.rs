@@ -8,9 +8,14 @@ use coco_channel::{
 };
 use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
-use coco_core::{ConversationEngine, CoreService, EngineError, FixedBranchResolver};
-use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::{JobStatus, MessageQueueItem, SessionRole, Store};
+use coco_core::{
+    ConversationEngine, CoreService, EngineError, FixedBranchResolver, SYSTEM_EVENT_QUEUE,
+};
+use coco_llm::{
+    CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService, Provider,
+    SessionConfig,
+};
+use coco_mem::{AnchorPayload, JobStatus, Kind, MessageQueueItem, SessionRole, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
@@ -20,7 +25,7 @@ use tokio::sync::Notify;
 
 use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
-    prompt::{PROMPT_JOB_QUEUE, QueuedPromptRequest},
+    prompt::{PROMPT_JOB_QUEUE, QueuedPromptRequest, queue_prompt_job_request},
     run_forwarded_with_services,
     runtime::{ForwardedRuntimeInputs, RuntimeServices},
     session::resolve_session_config,
@@ -36,7 +41,14 @@ use crate::{
 };
 
 const DEFAULT_SESSION_BRANCH: &str = "main";
+const BUILTIN_DAY_BRANCH: &str = "day";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
+const DAY_SYSTEM_PROMPT: &str = r#"You are CoCo Day, the built-in system event branch.
+
+Your only job is to consume CoCo system events and turn them into concrete recovery work.
+When you receive an LLM backend failure recovery event, inspect the event payload, use the `recovery` skill, and operate through the injected `coco` command. Prefer deterministic branch names, keep the original prompt job as the unit of work, and report the final job status.
+
+Use the `compact` skill when a target branch has accumulated enough anchors or history that future recovery is likely to exceed context budget."#;
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
@@ -111,23 +123,118 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    if !shared_store
+    if shared_store
         .list_session_states()
         .context(StoreSnafu)?
         .is_empty()
     {
-        return Ok(());
+        let config = resolve_session_config(default_session_create_command(), provider_profiles)?;
+        tracing::info!(
+            branch = %config.branch,
+            max_tokens = config.max_tokens,
+            tool_count = config.tools.len(),
+            "creating default session on empty store"
+        );
+        llm.create_session(config).await.context(LlmSnafu)?;
     }
 
-    let config = resolve_session_config(default_session_create_command(), provider_profiles)?;
+    ensure_builtin_day_session(shared_store, llm, provider_profiles).await?;
+    Ok(())
+}
+
+async fn ensure_builtin_day_session<B, S>(
+    shared_store: &S,
+    llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
+) -> Result<()>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    match shared_store.get_branch_head(BUILTIN_DAY_BRANCH) {
+        Ok(_) => return Ok(()),
+        Err(StoreError::BranchNotFound { .. }) => {}
+        Err(source) => return Err(source).context(StoreSnafu),
+    }
+
+    let config = match resolve_session_config(day_session_create_command(), provider_profiles) {
+        Ok(config) => config,
+        Err(error) => {
+            let Some(config) = derive_day_session_config(shared_store)? else {
+                return Err(error);
+            };
+            config
+        }
+    };
     tracing::info!(
         branch = %config.branch,
         max_tokens = config.max_tokens,
         tool_count = config.tools.len(),
-        "creating default session on empty store"
+        "creating builtin day session"
     );
     llm.create_session(config).await.context(LlmSnafu)?;
     Ok(())
+}
+
+fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
+    let mut branches = store
+        .list_session_states()
+        .context(StoreSnafu)?
+        .into_keys()
+        .filter(|branch| branch != BUILTIN_DAY_BRANCH)
+        .collect::<Vec<_>>();
+    branches.sort();
+    if let Some(index) = branches
+        .iter()
+        .position(|branch| branch == DEFAULT_SESSION_BRANCH)
+    {
+        branches.swap(0, index);
+    }
+
+    for branch in branches {
+        let head = store.get_branch_head(&branch).context(StoreSnafu)?;
+        let ancestry = store.ancestry(&head).context(StoreSnafu)?;
+        let Some(session_anchor) = ancestry.into_iter().rev().find_map(|node| {
+            let Kind::Anchor(anchor) = &node.kind else {
+                return None;
+            };
+            let AnchorPayload::Session(session) = &anchor.payload else {
+                return None;
+            };
+            Some(session.clone())
+        }) else {
+            continue;
+        };
+        let provider = session_anchor
+            .provider
+            .as_deref()
+            .and_then(|provider| Provider::parse(provider).ok())
+            .unwrap_or(Provider::OpenAi);
+        return Ok(Some(SessionConfig {
+            branch: BUILTIN_DAY_BRANCH.to_owned(),
+            merge_parents: vec![],
+            provider_profile: session_anchor.provider_profile,
+            provider,
+            model: session_anchor.model,
+            role: SessionRole::Orchestrator,
+            system_prompt: DAY_SYSTEM_PROMPT.to_owned(),
+            prompt: String::new(),
+            tools: default_builtin_day_tools(),
+            temperature: session_anchor.temperature,
+            max_tokens: session_anchor.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
+            additional_params: session_anchor.additional_params,
+            enable_coco_shim: true,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn default_builtin_day_tools() -> Vec<coco_mem::Tool> {
+    ["exec_command", "write_stdin", "search_skill"]
+        .into_iter()
+        .map(|name| coco_llm::builtin_tool_definition(name).expect("builtin day tool should exist"))
+        .collect()
 }
 
 fn default_session_create_command() -> SessionCreateCommand {
@@ -145,6 +252,26 @@ fn default_session_create_command() -> SessionCreateCommand {
             CliTool::WriteStdin,
             CliTool::SearchSkill,
             CliTool::LoadImage,
+        ],
+        enable_coco_shim: true,
+        disable_coco_shim: false,
+    }
+}
+
+fn day_session_create_command() -> SessionCreateCommand {
+    SessionCreateCommand {
+        branch: BUILTIN_DAY_BRANCH.to_owned(),
+        role: CliSessionRole::Orchestrator,
+        provider_profile: None,
+        system_prompt: DAY_SYSTEM_PROMPT.to_owned(),
+        prompt: String::new(),
+        temperature: None,
+        max_tokens: Some(DEFAULT_MAX_TOKENS),
+        additional_params: None,
+        tools: vec![
+            CliTool::ExecCommand,
+            CliTool::WriteStdin,
+            CliTool::SearchSkill,
         ],
         enable_coco_shim: true,
         disable_coco_shim: false,
@@ -318,9 +445,13 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let worker =
+    let prompt_worker =
         PromptJobMessageQueueWorker::new(shared_store.clone(), shared_engine.as_ref().clone());
-    tokio::spawn(async move { worker.run().await })
+    let system_event_worker = SystemEventMessageQueueWorker::new(shared_store.clone());
+    tokio::spawn(async move {
+        tokio::try_join!(prompt_worker.run(), system_event_worker.run())?;
+        Ok(())
+    })
 }
 
 fn start_channel_task<B, S>(
@@ -399,6 +530,137 @@ enum TelegramQueuePayloadError {
 enum PromptJobQueuePayloadError {
     #[snafu(display("Failed to decode prompt job queue payload: {source}"))]
     DecodePromptJob { source: serde_json::Error },
+}
+
+#[derive(Debug, Snafu)]
+enum SystemEventQueuePayloadError {
+    #[snafu(display("Failed to decode system event queue payload: {source}"))]
+    DecodeSystemEvent { source: serde_json::Error },
+
+    #[snafu(display("Unsupported system event {event_type:?} version {version}"))]
+    UnsupportedEvent { event_type: String, version: u64 },
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemEventEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    version: u64,
+    data: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmBackendFailureRecoveryRequested {
+    job_id: String,
+    root_branch: String,
+    work_branch: String,
+    failed_branch: String,
+    base_node_id: String,
+    execution_id: String,
+    error_node_id: String,
+    retry_from_node_id: String,
+    message: String,
+}
+
+#[derive(Debug)]
+enum SystemEvent {
+    LlmBackendFailureRecoveryRequested(LlmBackendFailureRecoveryRequested),
+}
+
+struct SystemEventMessageQueueWorker<S> {
+    store: S,
+}
+
+impl<S> SystemEventMessageQueueWorker<S> {
+    fn new(store: S) -> Self {
+        Self { store }
+    }
+
+    async fn run(self) -> Result<()>
+    where
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        loop {
+            if self.drain_once().await? == 0 {
+                tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
+            }
+        }
+    }
+
+    async fn drain_once(&self) -> Result<usize>
+    where
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        let mut handled = 0;
+        while let Some(item) = self
+            .store
+            .peek_message(SYSTEM_EVENT_QUEUE)
+            .context(StoreSnafu)?
+        {
+            match decode_system_event_message(item.payload.clone()) {
+                Ok(event) => {
+                    if !self.queue_day_prompt_for_event(&item, event)? {
+                        return Ok(handled);
+                    }
+                    self.store
+                        .dequeue_message(SYSTEM_EVENT_QUEUE)
+                        .context(StoreSnafu)?;
+                }
+                Err(error) => {
+                    self.store
+                        .dequeue_message(SYSTEM_EVENT_QUEUE)
+                        .context(StoreSnafu)?;
+                    tracing::error!(
+                        message_id = %item.message_id,
+                        queue = SYSTEM_EVENT_QUEUE,
+                        error = %error,
+                        "discarded invalid system event queue message"
+                    );
+                }
+            }
+            handled += 1;
+        }
+        Ok(handled)
+    }
+
+    fn queue_day_prompt_for_event(
+        &self,
+        item: &MessageQueueItem,
+        event: SystemEvent,
+    ) -> Result<bool>
+    where
+        S: Store,
+    {
+        match self.store.get_branch_head(BUILTIN_DAY_BRANCH) {
+            Ok(_) => {}
+            Err(StoreError::BranchNotFound { .. }) => {
+                tracing::warn!(
+                    message_id = %item.message_id,
+                    queue = SYSTEM_EVENT_QUEUE,
+                    branch = BUILTIN_DAY_BRANCH,
+                    "kept system event because builtin day branch is missing"
+                );
+                return Ok(false);
+            }
+            Err(source) => return Err(source).context(StoreSnafu),
+        }
+
+        let request = QueuedPromptRequest {
+            job_id: format!("job-{}", item.message_id),
+            branch: BUILTIN_DAY_BRANCH.to_owned(),
+            prompt: render_system_event_prompt(&event),
+            merge_parents: vec![],
+            session_patch: None,
+        };
+        queue_prompt_job_request(&self.store, request)?;
+        tracing::info!(
+            message_id = %item.message_id,
+            queue = SYSTEM_EVENT_QUEUE,
+            branch = BUILTIN_DAY_BRANCH,
+            "queued system event prompt on builtin day branch"
+        );
+        Ok(true)
+    }
 }
 
 struct PromptJobMessageQueueWorker<B, S> {
@@ -1018,6 +1280,54 @@ fn decode_prompt_job_message(
     serde_json::from_value(payload).context(DecodePromptJobSnafu)
 }
 
+fn decode_system_event_message(
+    payload: serde_json::Value,
+) -> std::result::Result<SystemEvent, SystemEventQueuePayloadError> {
+    let envelope =
+        serde_json::from_value::<SystemEventEnvelope>(payload).context(DecodeSystemEventSnafu)?;
+    match (envelope.event_type.as_str(), envelope.version) {
+        ("llm.backend_failure.recovery_requested", 1) => {
+            let event = serde_json::from_value::<LlmBackendFailureRecoveryRequested>(envelope.data)
+                .context(DecodeSystemEventSnafu)?;
+            Ok(SystemEvent::LlmBackendFailureRecoveryRequested(event))
+        }
+        _ => UnsupportedEventSnafu {
+            event_type: envelope.event_type,
+            version: envelope.version,
+        }
+        .fail(),
+    }
+}
+
+fn render_system_event_prompt(event: &SystemEvent) -> String {
+    match event {
+        SystemEvent::LlmBackendFailureRecoveryRequested(event) => format!(
+            "Handle this LLM backend failure recovery event.\n\n\
+             Use the `recovery` skill through `coco skill run recovery --handoff ...` or follow that skill directly. \
+             Keep job {job_id:?} as the unit of work, recover failed branch {failed_branch:?}, and restore root branch {root_branch:?}.\n\n\
+             Event fields:\n\
+             - job_id: {job_id}\n\
+             - root_branch: {root_branch}\n\
+             - work_branch: {work_branch}\n\
+             - failed_branch: {failed_branch}\n\
+             - base_node_id: {base_node_id}\n\
+             - execution_id: {execution_id}\n\
+             - error_node_id: {error_node_id}\n\
+             - retry_from_node_id: {retry_from_node_id}\n\
+             - message: {message}",
+            job_id = event.job_id,
+            root_branch = event.root_branch,
+            work_branch = event.work_branch,
+            failed_branch = event.failed_branch,
+            base_node_id = event.base_node_id,
+            execution_id = event.execution_id,
+            error_node_id = event.error_node_id,
+            retry_from_node_id = event.retry_from_node_id,
+            message = event.message,
+        ),
+    }
+}
+
 fn spawn_queued_prompt_job_driver<B, S>(engine: ConversationEngine<B, S>, job_id: String)
 where
     B: CompletionBackend + 'static,
@@ -1276,9 +1586,10 @@ mod tests {
     use crate::app::prompt::QueuedPromptRequest;
 
     use super::{
-        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_telegram_message,
-        encode_telegram_message, resolve_daemon_socket_path,
+        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, SYSTEM_EVENT_QUEUE,
+        SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher,
+        TelegramMessageQueueWorker, decode_telegram_message, encode_telegram_message,
+        resolve_daemon_socket_path,
     };
 
     #[test]
@@ -1526,6 +1837,54 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn system_event_queue_worker_materializes_day_prompt_request() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("day")).await.unwrap();
+        let item = store
+            .enqueue_message(
+                SYSTEM_EVENT_QUEUE,
+                json!({
+                    "type": "llm.backend_failure.recovery_requested",
+                    "version": 1,
+                    "dedupe_key": "llm.backend_failure:error-node",
+                    "data": {
+                        "job_id": "job-failed",
+                        "root_branch": "main",
+                        "work_branch": "main",
+                        "failed_branch": "main",
+                        "base_node_id": "base-node",
+                        "execution_id": "execution-1",
+                        "error_node_id": "error-node",
+                        "retry_from_node_id": "retry-node",
+                        "message": "backend failed"
+                    }
+                }),
+            )
+            .unwrap();
+        let worker = SystemEventMessageQueueWorker::new(store.clone());
+
+        assert_eq!(worker.drain_once().await.unwrap(), 1);
+
+        assert!(
+            store
+                .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .unwrap()
+                .is_empty()
+        );
+        let prompt_items = store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap();
+        assert_eq!(prompt_items.len(), 1);
+        let request: QueuedPromptRequest =
+            serde_json::from_value(prompt_items[0].payload.clone()).unwrap();
+        assert_eq!(request.job_id, format!("job-{}", item.message_id));
+        assert_eq!(request.branch, "day");
+        assert!(request.prompt.contains("job-failed"));
+        assert!(request.prompt.contains("retry-node"));
+        assert!(request.prompt.contains("recovery"));
     }
 
     #[derive(Debug, Clone, Default)]

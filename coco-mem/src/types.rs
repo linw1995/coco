@@ -490,6 +490,34 @@ pub fn default_skill_groups() -> SkillGroups {
             },
         ),
     );
+    groups.orchestrator.insert(
+        "recovery".to_owned(),
+        SkillRecord::new(
+            "recovery",
+            SkillVersionSpec {
+                description:
+                    "Recover failed CoCo prompt jobs by moving their work branch and driving them."
+                        .to_owned(),
+                body: include_str!("default_skills/recovery.md").trim().to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        ),
+    );
+    groups.orchestrator.insert(
+        "compact".to_owned(),
+        SkillRecord::new(
+            "compact",
+            SkillVersionSpec {
+                description:
+                    "Summarize and compact branch anchors to reduce future context length."
+                        .to_owned(),
+                body: include_str!("default_skills/compact.md").trim().to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        ),
+    );
     groups.runner.insert(
         "coco-runner".to_owned(),
         SkillRecord::new(
