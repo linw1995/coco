@@ -140,6 +140,8 @@ pub struct Job {
     #[serde(default)]
     pub finished_at: Option<Timestamp>,
     pub branch: String,
+    #[serde(default)]
+    pub work_branch: String,
     /// The node where this job starts execution.
     ///
     /// For prompt-based jobs this is the detached prompt anchor. For resume-style
@@ -893,13 +895,21 @@ impl Job {
         branch: impl Into<String>,
         base: impl Into<String>,
     ) -> Self {
+        let branch = branch.into();
         Self {
             job_id: job_id.into(),
             created_at: Timestamp::now(),
             finished_at: None,
-            branch: branch.into(),
+            work_branch: branch.clone(),
+            branch,
             base: base.into(),
             status: JobStatus::Queued,
+        }
+    }
+
+    pub fn normalize_work_branch(&mut self) {
+        if self.work_branch.is_empty() {
+            self.work_branch = self.branch.clone();
         }
     }
 }

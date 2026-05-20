@@ -1646,6 +1646,69 @@ where
     assert_eq!(store.get_job(&job.job_id).unwrap(), finished);
 }
 
+fn assert_job_work_branch_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    assert_eq!(job.work_branch, "main");
+    let updated = store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+
+    assert_eq!(updated.branch, "main");
+    assert_eq!(updated.work_branch, "recovery");
+    assert_eq!(store.get_job(&job.job_id).unwrap().work_branch, "recovery");
+}
+
+fn assert_set_job_work_branch_rejects_stale_expected_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    let err = store
+        .set_job_work_branch(&job.job_id, "stale", "recovery")
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::PromptJobMoved { job_id, expected, actual }
+            if job_id == job.job_id && expected == "stale" && actual == "main"
+    ));
+}
+
+fn assert_submit_job_rejects_active_work_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_work_branch(&first.job_id, "main", "recovery")
+        .unwrap();
+
+    let err = store.submit_job("recovery", &root_id).unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::PromptJobActiveOnBranch { branch, job_id }
+            if branch == "recovery" && job_id == first.job_id
+    ));
+}
+
 fn assert_set_job_status_rejects_invalid_transition<F>()
 where
     F: TestStoreFactory,
@@ -2349,6 +2412,21 @@ macro_rules! define_common_store_tests {
             #[test]
             fn finished_job_round_trip() {
                 assert_finished_job_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn job_work_branch_round_trip() {
+                assert_job_work_branch_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn set_job_work_branch_rejects_stale_expected_branch() {
+                assert_set_job_work_branch_rejects_stale_expected_branch::<$factory>();
+            }
+
+            #[test]
+            fn submit_job_rejects_active_work_branch() {
+                assert_submit_job_rejects_active_work_branch::<$factory>();
             }
 
             #[test]

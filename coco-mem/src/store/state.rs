@@ -389,7 +389,7 @@ impl StoreState {
         if let Some(active_job) = self
             .jobs
             .values()
-            .find(|job| job.branch == branch && !matches!(job.status, JobStatus::Finished))
+            .find(|job| job_uses_active_branch(job, branch))
         {
             return PromptJobActiveOnBranchSnafu {
                 branch: branch.to_owned(),
@@ -494,16 +494,26 @@ impl StoreState {
     }
 
     pub fn get_job(&self, job_id: &str) -> Result<Job> {
-        self.jobs
+        let mut job = self
+            .jobs
             .get(job_id)
             .cloned()
             .context(PromptJobNotFoundSnafu {
                 job_id: job_id.to_owned(),
-            })
+            })?;
+        job.normalize_work_branch();
+        Ok(job)
     }
 
     pub fn list_jobs(&self) -> HashMap<String, Job> {
-        self.jobs.clone()
+        self.jobs
+            .iter()
+            .map(|(job_id, job)| {
+                let mut job = job.clone();
+                job.normalize_work_branch();
+                (job_id.clone(), job)
+            })
+            .collect()
     }
 
     pub fn set_job_status(
@@ -536,6 +546,49 @@ impl StoreState {
             JobStatus::Finished => Some(Timestamp::now()),
             _ => None,
         };
+        Ok(job.clone())
+    }
+
+    pub fn set_job_work_branch(
+        &mut self,
+        job_id: &str,
+        expected_work_branch: &str,
+        next_work_branch: &str,
+    ) -> Result<Job> {
+        self.get_branch_head(next_work_branch)?;
+        let existing_active_job = self
+            .jobs
+            .values()
+            .find(|job| job.job_id != job_id && job_uses_active_branch(job, next_work_branch));
+        if let Some(active_job) = existing_active_job {
+            return PromptJobActiveOnBranchSnafu {
+                branch: next_work_branch.to_owned(),
+                job_id: active_job.job_id.clone(),
+            }
+            .fail();
+        }
+
+        let job = self.jobs.get_mut(job_id).context(PromptJobNotFoundSnafu {
+            job_id: job_id.to_owned(),
+        })?;
+        job.normalize_work_branch();
+        ensure!(
+            !matches!(job.status, JobStatus::Finished),
+            PromptJobInvalidStatusTransitionSnafu {
+                job_id: job_id.to_owned(),
+                current: format!("{:?}", job.status),
+                next: "work_branch_changed".to_owned(),
+            }
+        );
+        ensure!(
+            job.work_branch == expected_work_branch,
+            PromptJobMovedSnafu {
+                job_id: job_id.to_owned(),
+                expected: expected_work_branch.to_owned(),
+                actual: job.work_branch.clone(),
+            }
+        );
+        job.work_branch = next_work_branch.to_owned();
         Ok(job.clone())
     }
 
@@ -935,6 +988,18 @@ impl StoreState {
         );
         self.validate_ref_on_branch(branch, node_id)
     }
+}
+
+fn job_uses_active_branch(job: &Job, branch: &str) -> bool {
+    if matches!(job.status, JobStatus::Finished) {
+        return false;
+    }
+    let work_branch = if job.work_branch.is_empty() {
+        job.branch.as_str()
+    } else {
+        job.work_branch.as_str()
+    };
+    job.branch == branch || work_branch == branch
 }
 
 fn is_node_id(reference: &str) -> bool {

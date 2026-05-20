@@ -244,6 +244,11 @@ enum JobHistoryEntry {
         expected: JobStatus,
         updated: Job,
     },
+    WorkBranchChanged {
+        job_id: String,
+        expected_work_branch: String,
+        updated: Job,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1679,8 +1684,9 @@ fn persisted_preset_records(
 }
 
 fn read_job_snapshots(path: &Path) -> Result<HashMap<String, Job>> {
-    let snapshots = read_json_file::<HashMap<String, Job>>(path)?;
-    for (job_id, job) in &snapshots {
+    let mut snapshots = read_json_file::<HashMap<String, Job>>(path)?;
+    for (job_id, job) in &mut snapshots {
+        job.normalize_work_branch();
         ensure!(
             job.job_id == *job_id,
             CorruptedStoreSnafu {
@@ -1701,22 +1707,26 @@ fn validate_job_snapshots(
     jobs: &HashMap<String, Job>,
 ) -> Result<()> {
     let mut active_by_branch = HashMap::<String, String>::new();
-    for job in jobs.values() {
-        validate_job_refs(path, state, job)?;
+    for raw_job in jobs.values() {
+        let mut job = raw_job.clone();
+        job.normalize_work_branch();
+        validate_job_refs(path, state, &job)?;
         if matches!(job.status, JobStatus::Finished) {
             continue;
         }
-        if let Some(existing_job_id) =
-            active_by_branch.insert(job.branch.clone(), job.job_id.clone())
-        {
-            return CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!(
-                    "branch {:?} has multiple active prompt jobs {:?} and {:?}",
-                    job.branch, existing_job_id, job.job_id
-                ),
+        for branch in active_job_branches(&job) {
+            if let Some(existing_job_id) =
+                active_by_branch.insert(branch.to_owned(), job.job_id.clone())
+            {
+                return CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "branch {:?} has multiple active prompt jobs {:?} and {:?}",
+                        branch, existing_job_id, job.job_id
+                    ),
+                }
+                .fail();
             }
-            .fail();
         }
     }
     Ok(())
@@ -1734,10 +1744,16 @@ fn apply_job_history_entry(
             expected,
             updated,
         } => apply_job_status_changed(path, state, job_id, expected, updated),
+        JobHistoryEntry::WorkBranchChanged {
+            job_id,
+            expected_work_branch,
+            updated,
+        } => apply_job_work_branch_changed(path, state, job_id, expected_work_branch, updated),
     }
 }
 
-fn apply_submitted_job(path: &Path, state: &mut StoreState, job: Job) -> Result<()> {
+fn apply_submitted_job(path: &Path, state: &mut StoreState, mut job: Job) -> Result<()> {
+    job.normalize_work_branch();
     ensure!(
         matches!(job.status, JobStatus::Queued),
         CorruptedStoreSnafu {
@@ -1764,9 +1780,10 @@ fn apply_submitted_job(path: &Path, state: &mut StoreState, job: Job) -> Result<
         }
     );
     ensure!(
-        state.jobs.values().all(|existing| {
-            existing.branch != job.branch || matches!(existing.status, JobStatus::Finished)
-        }),
+        state
+            .jobs
+            .values()
+            .all(|existing| !jobs_share_active_branch(existing, &job)),
         CorruptedStoreSnafu {
             path: path.to_owned(),
             message: format!("branch {:?} already has an active prompt job", job.branch),
@@ -1781,8 +1798,9 @@ fn apply_job_status_changed(
     state: &mut StoreState,
     job_id: String,
     expected: JobStatus,
-    updated: Job,
+    mut updated: Job,
 ) -> Result<()> {
+    updated.normalize_work_branch();
     ensure!(
         updated.job_id == job_id,
         CorruptedStoreSnafu {
@@ -1842,8 +1860,92 @@ fn apply_job_status_changed(
     Ok(())
 }
 
+fn apply_job_work_branch_changed(
+    path: &Path,
+    state: &mut StoreState,
+    job_id: String,
+    expected_work_branch: String,
+    mut updated: Job,
+) -> Result<()> {
+    updated.normalize_work_branch();
+    ensure!(
+        updated.job_id == job_id,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "work branch change key {:?} mismatches updated job id {:?}",
+                job_id, updated.job_id
+            ),
+        }
+    );
+    let mut current = state
+        .jobs
+        .get(&job_id)
+        .cloned()
+        .context(CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("work branch change references missing job {job_id:?}"),
+        })?;
+    current.normalize_work_branch();
+    ensure!(
+        current.work_branch == expected_work_branch,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "job {:?} work branch change expected {:?}, found {:?}",
+                job_id, expected_work_branch, current.work_branch
+            ),
+        }
+    );
+    ensure!(
+        job_identity_matches(&current, &updated),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "job {:?} work branch change modifies immutable fields",
+                job_id
+            ),
+        }
+    );
+    ensure!(
+        current.status == updated.status && current.finished_at == updated.finished_at,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "job {:?} work branch change modifies lifecycle fields",
+                job_id
+            ),
+        }
+    );
+    ensure!(
+        !matches!(updated.status, JobStatus::Finished),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("finished job {:?} changes work branch", job_id),
+        }
+    );
+    validate_job_refs(path, state, &updated)?;
+    ensure!(
+        state
+            .jobs
+            .values()
+            .filter(|existing| existing.job_id != job_id)
+            .all(|existing| !jobs_share_active_branch(existing, &updated)),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "branch {:?} already has an active prompt job",
+                updated.work_branch
+            ),
+        }
+    );
+    state.jobs.insert(job_id, updated);
+    Ok(())
+}
+
 fn validate_job_refs(path: &Path, state: &StoreState, job: &Job) -> Result<()> {
     map_job_validation_error(path, state.get_branch_head(&job.branch))?;
+    map_job_validation_error(path, state.get_branch_head(&job.work_branch))?;
     map_job_validation_error(path, state.get_node(&job.base))?;
     Ok(())
 }
@@ -1863,6 +1965,29 @@ fn job_identity_matches(left: &Job, right: &Job) -> bool {
         && left.created_at == right.created_at
         && left.branch == right.branch
         && left.base == right.base
+}
+
+fn jobs_share_active_branch(left: &Job, right: &Job) -> bool {
+    if matches!(left.status, JobStatus::Finished) || matches!(right.status, JobStatus::Finished) {
+        return false;
+    }
+    let right_branches = active_job_branches(right);
+    active_job_branches(left)
+        .into_iter()
+        .any(|left_branch| right_branches.contains(&left_branch))
+}
+
+fn active_job_branches(job: &Job) -> Vec<&str> {
+    let work_branch = if job.work_branch.is_empty() {
+        job.branch.as_str()
+    } else {
+        job.work_branch.as_str()
+    };
+    if job.branch == work_branch {
+        vec![job.branch.as_str()]
+    } else {
+        vec![job.branch.as_str(), work_branch]
+    }
 }
 
 fn job_log_should_compact(log_len: usize) -> bool {
@@ -2746,6 +2871,25 @@ impl JobStore for FsStore {
             .append_job_history_entry(&JobHistoryEntry::StatusChanged {
                 job_id: job_id.to_owned(),
                 expected,
+                updated: updated.clone(),
+            })?;
+        state.jobs = temp.jobs;
+        Ok(updated)
+    }
+
+    fn set_job_work_branch(
+        &self,
+        job_id: &str,
+        expected_work_branch: &str,
+        next_work_branch: &str,
+    ) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.set_job_work_branch(job_id, expected_work_branch, next_work_branch)?;
+        self.persistence
+            .append_job_history_entry(&JobHistoryEntry::WorkBranchChanged {
+                job_id: job_id.to_owned(),
+                expected_work_branch: expected_work_branch.to_owned(),
                 updated: updated.clone(),
             })?;
         state.jobs = temp.jobs;
