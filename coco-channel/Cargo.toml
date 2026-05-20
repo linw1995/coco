@@ -37,3 +37,6 @@ tracing = { workspace = true, optional = true }
 [dev-dependencies]
 # Test runtime.
 tokio.workspace = true
+
+# Test logging.
+tracing-subscriber.workspace = true
