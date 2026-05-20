@@ -431,7 +431,7 @@ pub struct TelegramUser {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::{Mutex, Once};
+    use std::sync::Mutex;
 
     use super::*;
     use crate::OutboundMessage;
@@ -591,8 +591,6 @@ mod tests {
 
     #[tokio::test]
     async fn run_retries_transport_failures_instead_of_exiting() {
-        enable_test_logging();
-
         let channel = TelegramChannel::new(FailingTransport, 30, BTreeSet::new());
         let handler = RecordingHandler::default();
 
@@ -605,8 +603,6 @@ mod tests {
 
     #[tokio::test]
     async fn run_returns_non_transport_poll_errors() {
-        enable_test_logging();
-
         let channel = TelegramChannel::new(InvalidInputTransport, 30, BTreeSet::new());
         let handler = RecordingHandler::default();
 
@@ -617,8 +613,6 @@ mod tests {
 
     #[tokio::test]
     async fn run_still_returns_handler_failures() {
-        enable_test_logging();
-
         let channel = TelegramChannel::new(
             FakeTransport::with_updates(vec![text_update(100, 42, 7, "hello")]),
             30,
@@ -693,16 +687,6 @@ mod tests {
             request_timeout_for_poll(u64::MAX),
             Duration::from_secs(u64::MAX)
         );
-    }
-
-    fn enable_test_logging() {
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let _ = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::DEBUG)
-                .with_test_writer()
-                .try_init();
-        });
     }
 
     fn text_update(update_id: i64, chat_id: i64, user_id: i64, text: &str) -> TelegramUpdate {
