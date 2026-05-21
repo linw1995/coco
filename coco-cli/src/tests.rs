@@ -2878,6 +2878,140 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
 }
 
 #[tokio::test]
+async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nodes() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+            for branch in ["alpha", "beta", "gamma"] {
+                run_with_backend(
+                    session_fork_cli(store_path.clone(), branch, Some("main")),
+                    &mut Cursor::new(""),
+                    FakeBackend::with_responses(&[]),
+                )
+                .await
+                .unwrap();
+            }
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_id = store.get_branch_head("main").unwrap();
+    let shared_anchor_id = append_prompt_anchor(&store, &session_id, "shared anchor", &[]);
+    let shared_hidden_id = append_text_node(&store, &shared_anchor_id, "shared hidden text");
+
+    let alpha_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "alpha anchor", &[]);
+    let alpha_hidden_id = append_text_node(&store, &alpha_anchor_id, "alpha hidden text");
+    store
+        .set_branch_head("alpha", &session_id, &alpha_hidden_id)
+        .unwrap();
+
+    let beta_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "beta anchor", &[]);
+    let beta_hidden_id = append_text_node(&store, &beta_anchor_id, "beta hidden text");
+    store
+        .set_branch_head("beta", &session_id, &beta_hidden_id)
+        .unwrap();
+
+    let gamma_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "gamma anchor", &[]);
+    let gamma_hidden_id = append_text_node(&store, &gamma_anchor_id, "gamma hidden text");
+    store
+        .set_branch_head("gamma", &session_id, &gamma_hidden_id)
+        .unwrap();
+
+    let merge_anchor_id = append_prompt_anchor(
+        &store,
+        &alpha_hidden_id,
+        "merge fanin anchor",
+        &[&beta_hidden_id, &gamma_hidden_id],
+    );
+    store
+        .set_branch_head("main", &session_id, &merge_anchor_id)
+        .unwrap();
+
+    let output = run_with_backend(
+        session_graph_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let short_id = |id: &str| id.chars().take(8).collect::<String>();
+    let created_at = |id: &str| store.get_node(id).unwrap().created_at.to_string();
+    let expected_output = formatdoc!(
+        "
+        * {merge_id} prompt {merge_created_at} [main] merge fanin anchor merge=[{beta_id},{gamma_id}]
+        |\\--
+        | | * {gamma_id} prompt {gamma_created_at} [gamma] gamma anchor
+        | * | {beta_id} prompt {beta_created_at} [beta] beta anchor
+        | |
+        * | {alpha_id} prompt {alpha_created_at} [alpha] alpha anchor
+        |
+        * {shared_id} prompt {shared_created_at} shared anchor
+        * {session_id} session {session_created_at} You are helpful.
+        ",
+        merge_id = short_id(&merge_anchor_id),
+        merge_created_at = created_at(&merge_anchor_id),
+        beta_id = short_id(&beta_anchor_id),
+        beta_created_at = created_at(&beta_anchor_id),
+        gamma_id = short_id(&gamma_anchor_id),
+        gamma_created_at = created_at(&gamma_anchor_id),
+        alpha_id = short_id(&alpha_anchor_id),
+        alpha_created_at = created_at(&alpha_anchor_id),
+        shared_id = short_id(&shared_anchor_id),
+        shared_created_at = created_at(&shared_anchor_id),
+        session_id = short_id(&session_id),
+        session_created_at = created_at(&session_id),
+    )
+    .strip_suffix('\n')
+    .expect("formatdoc output should end with one newline")
+    .to_owned();
+    assert_eq!(output, expected_output);
+
+    let json_output = run_with_backend(
+        session_graph_json_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let entries = serde_json::from_str::<Vec<Value>>(&json_output).unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|entry| graph_entry_kind(entry) == "Anchor")
+    );
+    let merge_entry = graph_entry_by_node_id(&entries, &merge_anchor_id);
+    assert_eq!(merge_entry["primary_parent"], alpha_anchor_id);
+    assert_eq!(
+        merge_entry["merge_parents"],
+        json!([
+            {"kind": "merge", "node_id": beta_anchor_id},
+            {"kind": "merge", "node_id": gamma_anchor_id},
+        ])
+    );
+    for (branch, anchor_id) in [
+        ("alpha", &alpha_anchor_id),
+        ("beta", &beta_anchor_id),
+        ("gamma", &gamma_anchor_id),
+    ] {
+        let entry = graph_entry_by_node_id(&entries, anchor_id);
+        assert!(graph_entry_has_label(entry, branch));
+        assert_eq!(entry["primary_parent"], shared_anchor_id);
+    }
+}
+
+#[tokio::test]
 async fn session_graph_and_show_render_skill_result_anchor() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
