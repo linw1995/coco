@@ -890,16 +890,32 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             "waiting to materialize queued prompt job request behind active branch job"
         );
 
-        if let Err(error) = self.engine.drive_job(&active_job.job_id).await {
-            tracing::warn!(
-                message_id = %item.message_id,
-                queue = PROMPT_JOB_QUEUE,
-                branch = %request.branch,
-                job_id = %request.job_id,
-                active_job_id = %active_job.job_id,
-                error = %error,
-                "failed to wait for active branch prompt job before materializing queued request"
-            );
+        match self.engine.drive_job(&active_job.job_id).await {
+            Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => {}
+            Ok(snapshot) => {
+                tracing::info!(
+                    message_id = %item.message_id,
+                    queue = PROMPT_JOB_QUEUE,
+                    branch = %request.branch,
+                    job_id = %request.job_id,
+                    active_job_id = %active_job.job_id,
+                    active_job_status = ?snapshot.status,
+                    "active branch prompt job still blocks queued request"
+                );
+                tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    message_id = %item.message_id,
+                    queue = PROMPT_JOB_QUEUE,
+                    branch = %request.branch,
+                    job_id = %request.job_id,
+                    active_job_id = %active_job.job_id,
+                    error = %error,
+                    "failed to wait for active branch prompt job before materializing queued request"
+                );
+                tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
+            }
         }
     }
 
@@ -1772,6 +1788,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_job_queue_worker_backs_off_when_active_job_waits_for_recovery() {
+        let store = MemoryStore::new();
+        let backend = FailingBackend::default();
+        let calls = backend.calls.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let engine = ConversationEngine::new(llm);
+        let active_job = engine
+            .submit_job("main", "active work", vec![])
+            .await
+            .unwrap();
+        let active_job_id = active_job.job_id.clone();
+
+        store
+            .enqueue_message(
+                PROMPT_JOB_QUEUE,
+                json!(QueuedPromptRequest {
+                    job_id: "job-request".to_owned(),
+                    branch: "main".to_owned(),
+                    prompt: "queued work".to_owned(),
+                    merge_parents: vec![],
+                    session_patch: None,
+                }),
+            )
+            .unwrap();
+        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
+
+        let result = tokio::time::timeout(Duration::from_millis(100), worker.drain_once()).await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.get_job(&active_job_id).unwrap().status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn prompt_job_queue_worker_discards_prompt_request_for_missing_branch() {
         let store = MemoryStore::new();
         let backend = BlockingOnceBackend::default();
@@ -1894,6 +1952,11 @@ mod tests {
         release_first: Arc<Notify>,
     }
 
+    #[derive(Debug, Clone, Default)]
+    struct FailingBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl CompletionBackend for BlockingOnceBackend {
         async fn step(
@@ -1911,6 +1974,19 @@ mod tests {
                 tool_calls: vec![],
                 final_text: Some("done".to_owned()),
                 trace_persisted: false,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CompletionBackend for FailingBackend {
+        async fn step(
+            &self,
+            _ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(BackendError::Failed {
+                message: "recoverable backend outage".to_owned(),
             })
         }
     }

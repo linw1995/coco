@@ -952,8 +952,10 @@ description: "External skill."
                 .collect::<Vec<_>>(),
             vec![
                 "coco-orchestrator",
+                "compact",
                 "cronjob",
                 "new-skill",
+                "recovery",
                 "coco-runner",
                 "telegram"
             ]
