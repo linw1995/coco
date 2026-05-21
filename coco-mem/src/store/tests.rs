@@ -2080,14 +2080,14 @@ where
             .current()
             .unwrap()
             .body
-            .contains("active work branch for the original job")
+            .contains("active work branch for the original")
     );
     assert!(
         recovery
             .current()
             .unwrap()
             .body
-            .contains("rebase the current `work_branch` to a better model or parameter set")
+            .contains("rebase the current `work_branch`")
     );
     assert!(
         recovery

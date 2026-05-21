@@ -556,7 +556,7 @@ where
         let store = self.service.store();
         let last_node = find_job_last_node(store, job)?;
 
-        if let Some(last_node) = last_node.as_ref() {
+        let retry_from_failure = if let Some(last_node) = last_node.as_ref() {
             match &last_node.kind {
                 Kind::Text(_) => {
                     tracing::info!(
@@ -574,18 +574,25 @@ where
                         branch = %job.branch,
                         work_branch = %job.work_branch,
                         head = %last_node.id,
-                        "prompt job already has terminal failure node"
+                        retry_from_node_id = %last_node.parent,
+                        "retrying prompt job from before terminal failure node"
                     );
-                    return Ok(JobRunOutcome::RecoveryQueued);
+                    Some(last_node.parent.clone())
                 }
-                _ => {}
+                _ => None,
             }
-        }
+        } else {
+            None
+        };
 
-        let origin = CompletionOrigin::Reference(match last_node {
-            Some(last_node) => last_node.id,
-            None => job.base.clone(),
-        });
+        let origin_node_id = match retry_from_failure {
+            Some(retry_from_failure) => retry_from_failure,
+            None => match last_node {
+                Some(last_node) => last_node.id,
+                None => job.base.clone(),
+            },
+        };
+        let origin = CompletionOrigin::Reference(origin_node_id);
         let origin_node = match &origin {
             CompletionOrigin::BranchHead => "<branch-head>",
             CompletionOrigin::Reference(node_id) => node_id.as_str(),
