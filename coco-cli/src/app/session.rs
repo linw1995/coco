@@ -118,7 +118,7 @@ struct GraphNodeEntry {
     labels: Vec<GraphBranchLabel>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionGraphMode {
     Anchors,
     All,
@@ -582,19 +582,32 @@ fn build_session_graph_entries(
 
     let mut visible_node_ids = BTreeSet::new();
     let mut visible_nodes = HashMap::new();
+    let mut visible_node_scopes = HashMap::<String, BTreeSet<String>>::new();
     let mut labels_by_node = HashMap::<String, Vec<GraphBranchLabel>>::new();
 
     for (branch, state) in branches {
         let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
+        let mut scope_node_ids = initial_graph_scope(store, &head_id, mode)?;
+        let mut branch_visible_node_ids = BTreeSet::new();
         collect_visible_graph_nodes(
             store,
             &head_id,
+            &mut scope_node_ids,
             mode,
             &mut visible_node_ids,
             &mut visible_nodes,
+            &mut branch_visible_node_ids,
         )?;
+        for node_id in branch_visible_node_ids {
+            visible_node_scopes
+                .entry(node_id)
+                .or_default()
+                .extend(scope_node_ids.iter().cloned());
+        }
 
-        if let Some(label_node_id) = resolve_visible_parent(store, &visible_node_ids, &head_id)? {
+        if let Some(label_node_id) =
+            resolve_visible_parent(store, &visible_node_ids, &scope_node_ids, &head_id)?
+        {
             labels_by_node
                 .entry(label_node_id)
                 .or_default()
@@ -605,8 +618,13 @@ fn build_session_graph_entries(
     let mut entries = visible_nodes
         .into_values()
         .map(|node| {
-            let primary_parent =
-                resolve_visible_parent(store, &visible_node_ids, node.parent.as_str())?;
+            let scope_node_ids = visible_node_scopes.remove(&node.id).unwrap_or_default();
+            let primary_parent = resolve_visible_parent(
+                store,
+                &visible_node_ids,
+                &scope_node_ids,
+                node.parent.as_str(),
+            )?;
             let merge_parents = match &node.kind {
                 Kind::Anchor(anchor) => {
                     let mut parents = Vec::new();
@@ -614,6 +632,7 @@ fn build_session_graph_entries(
                         let Some(parent_id) = resolve_visible_parent(
                             store,
                             &visible_node_ids,
+                            &scope_node_ids,
                             merge_parent.node_id(),
                         )?
                         else {
@@ -751,9 +770,11 @@ fn compare_graph_entries_desc(left: &GraphNodeEntry, right: &GraphNodeEntry) -> 
 fn collect_visible_graph_nodes(
     store: &impl NodeStore,
     head_id: &str,
+    scope_node_ids: &mut BTreeSet<String>,
     mode: SessionGraphMode,
     visible_node_ids: &mut BTreeSet<String>,
     visible_nodes: &mut HashMap<String, Node>,
+    branch_visible_node_ids: &mut BTreeSet<String>,
 ) -> Result<()> {
     let mut pending = vec![head_id.to_owned()];
     let mut visited = BTreeSet::new();
@@ -762,32 +783,104 @@ fn collect_visible_graph_nodes(
         if node_id.is_empty() || !visited.insert(node_id.clone()) {
             continue;
         }
+        if !scope_node_ids.contains(&node_id) {
+            continue;
+        }
 
         let node = store.get_node(&node_id).context(StoreSnafu)?;
         if node.is_root() {
             continue;
         }
 
-        pending.push(node.parent.clone());
+        if mode == SessionGraphMode::All || !is_provider_context_start(&node) {
+            push_scoped_graph_node(scope_node_ids, &mut pending, node.parent.clone());
+        }
         if let Kind::Anchor(anchor) = &node.kind {
-            pending.extend(
-                anchor
-                    .merge_parents()
-                    .iter()
-                    .map(|parent| parent.node_id().to_owned()),
-            );
+            for merge_parent in anchor.merge_parents() {
+                push_scoped_graph_node(
+                    scope_node_ids,
+                    &mut pending,
+                    merge_parent.node_id().to_owned(),
+                );
+            }
         }
         if node.kind.as_tool_uses().is_some() {
-            collect_visible_skill_invocation_subtrees(store, &node.id, &mut pending)?;
+            collect_visible_skill_invocation_subtrees(
+                store,
+                &node.id,
+                scope_node_ids,
+                &mut pending,
+            )?;
         }
 
         if is_visible_graph_node(&node, mode) {
             visible_node_ids.insert(node.id.clone());
+            branch_visible_node_ids.insert(node.id.clone());
             visible_nodes.insert(node.id.clone(), node);
         }
     }
 
     Ok(())
+}
+
+fn initial_graph_scope(
+    store: &impl NodeStore,
+    head_id: &str,
+    mode: SessionGraphMode,
+) -> Result<BTreeSet<String>> {
+    match mode {
+        SessionGraphMode::Anchors => collect_provider_context_node_ids(store, head_id),
+        SessionGraphMode::All => Ok(BTreeSet::from([head_id.to_owned()])),
+    }
+}
+
+fn push_scoped_graph_node(
+    scope_node_ids: &mut BTreeSet<String>,
+    pending: &mut Vec<String>,
+    node_id: String,
+) {
+    if node_id.is_empty() {
+        return;
+    }
+
+    scope_node_ids.insert(node_id.clone());
+    pending.push(node_id);
+}
+
+fn collect_provider_context_node_ids(
+    store: &impl NodeStore,
+    head_id: &str,
+) -> Result<BTreeSet<String>> {
+    let mut node_ids = BTreeSet::new();
+
+    for node in store.ancestry(head_id).context(StoreSnafu)? {
+        if node.is_root() {
+            break;
+        }
+
+        let is_context_start = is_provider_context_start(&node);
+        node_ids.insert(node.id);
+        if is_context_start {
+            break;
+        }
+    }
+
+    Ok(node_ids)
+}
+
+fn is_provider_context_start(node: &Node) -> bool {
+    matches!(
+        &node.kind,
+        Kind::Anchor(anchor)
+            if anchor.as_session().is_some_and(is_context_start_session)
+    )
+}
+
+fn is_context_start_session(session: &SessionAnchor) -> bool {
+    session
+        .active_skill
+        .as_ref()
+        .is_none_or(|active_skill| active_skill.handoff.is_some())
 }
 
 fn is_visible_graph_node(node: &Node, mode: SessionGraphMode) -> bool {
@@ -800,6 +893,7 @@ fn is_visible_graph_node(node: &Node, mode: SessionGraphMode) -> bool {
 fn collect_visible_skill_invocation_subtrees(
     store: &impl NodeStore,
     parent_id: &str,
+    scope_node_ids: &mut BTreeSet<String>,
     pending: &mut Vec<String>,
 ) -> Result<()> {
     let mut descendants = store
@@ -818,7 +912,7 @@ fn collect_visible_skill_invocation_subtrees(
             continue;
         }
 
-        pending.push(node_id.clone());
+        push_scoped_graph_node(scope_node_ids, pending, node_id.clone());
         for child in store.list_children(&node_id).context(StoreSnafu)? {
             descendants.push(child.id);
         }
@@ -870,6 +964,7 @@ fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Nod
 fn resolve_visible_parent(
     store: &impl NodeStore,
     visible_node_ids: &BTreeSet<String>,
+    scope_node_ids: &BTreeSet<String>,
     start_id: &str,
 ) -> Result<Option<String>> {
     if start_id.is_empty() {
@@ -879,6 +974,9 @@ fn resolve_visible_parent(
     let mut current_id = start_id.to_owned();
     let mut visited = BTreeSet::new();
     while !current_id.is_empty() && visited.insert(current_id.clone()) {
+        if !scope_node_ids.contains(&current_id) {
+            return Ok(None);
+        }
         if visible_node_ids.contains(&current_id) {
             return Ok(Some(current_id));
         }
