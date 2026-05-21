@@ -824,6 +824,52 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
 }
 
 #[tokio::test]
+async fn llm_engine_finishes_job_when_recovery_restore_fails() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[
+        (
+            "main",
+            &[Err(BackendError::Failed {
+                message: "main failed".to_owned(),
+            })],
+        ),
+        ("recovery-b", &[Ok("recovered by b")]),
+    ]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+    let failed = engine.drive_job(&job.job_id).await.unwrap();
+    let event = store
+        .list_queue_messages(SYSTEM_EVENT_QUEUE)
+        .unwrap()
+        .pop()
+        .expect("recovery event should exist");
+    let retry_from = event.payload["data"]["retry_from_node_id"]
+        .as_str()
+        .expect("event should include retry node");
+
+    engine.service().fork("recovery-b", retry_from).unwrap();
+    engine
+        .set_job_work_branch(&job.job_id, &failed.work_branch, "recovery-b")
+        .unwrap();
+    store.delete_branch("main").unwrap();
+
+    let recovered = engine.drive_job(&job.job_id).await.unwrap();
+
+    assert_eq!(recovered.status, JobStatus::Finished);
+    assert_eq!(recovered.branch, "main");
+    assert_eq!(recovered.work_branch, "recovery-b");
+    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+    assert!(
+        engine
+            .active_branch_prompt_job("recovery-b")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn llm_engine_maps_missing_session_error() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[]);

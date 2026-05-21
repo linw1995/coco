@@ -523,7 +523,13 @@ where
             self.ensure_job_has_exclusive_branch_access(&job)?;
             match self.resume_or_run_job(&job, merge_parents).await {
                 Ok(JobRunOutcome::Completed) => {
-                    job = self.restore_root_branch_after_recovery(&job)?;
+                    job = match self.restore_root_branch_after_recovery(&job) {
+                        Ok(job) => job,
+                        Err(error) => {
+                            self.finish_job(&job).await?;
+                            return Err(error);
+                        }
+                    };
                     self.finish_job(&job).await?;
                 }
                 Ok(JobRunOutcome::RecoveryQueued) => {
