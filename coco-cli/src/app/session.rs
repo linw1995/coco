@@ -1041,6 +1041,15 @@ fn render_graph_connector_row(
         chars[current_pos] = '|';
     }
 
+    let right_targets = target_cols
+        .iter()
+        .filter(|target_col| **target_col > current_col)
+        .count();
+    let left_targets = target_cols
+        .iter()
+        .filter(|target_col| **target_col < current_col)
+        .count();
+
     if let (Some(active_col), Some(next_col)) = (active_primary_parent_col, next_primary_parent_col)
         && active_col != next_col
     {
@@ -1061,21 +1070,29 @@ fn render_graph_connector_row(
             continue;
         }
 
-        let connector_pos = if target_pos < current_pos {
+        let spread_right = target_col > current_col && right_targets > 1;
+        let spread_left = target_col < current_col && left_targets > 1;
+        let connector_pos = if spread_right {
+            target_pos - 1
+        } else if spread_left {
+            target_pos + 1
+        } else if target_pos < current_pos {
             current_pos - 1
         } else {
             current_pos + 1
         };
         chars[connector_pos] = if target_pos < current_pos { '/' } else { '\\' };
 
-        let range = if target_pos < current_pos {
-            (target_pos + 1)..connector_pos
-        } else {
-            (connector_pos + 1)..target_pos
-        };
-        for idx in range {
-            if chars[idx] == ' ' {
-                chars[idx] = '-';
+        if !spread_right && !spread_left {
+            let range = if target_pos < current_pos {
+                (target_pos + 1)..connector_pos
+            } else {
+                (connector_pos + 1)..target_pos
+            };
+            for idx in range {
+                if chars[idx] == ' ' {
+                    chars[idx] = '-';
+                }
             }
         }
     }

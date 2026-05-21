@@ -2950,7 +2950,7 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
     let expected_output = formatdoc!(
         "
         * {merge_id} prompt {merge_created_at} [main] merge fanin anchor merge=[{beta_id},{gamma_id}]
-        |\\--
+        |\\ \\
         | | * {gamma_id} prompt {gamma_created_at} [gamma] gamma anchor
         | * | {beta_id} prompt {beta_created_at} [beta] beta anchor
         | |/
