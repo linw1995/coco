@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use coco_channel::{
@@ -21,7 +22,7 @@ use serde_json::json;
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 
 use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
@@ -54,6 +55,7 @@ const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const TELEGRAM_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const CHANNEL_BRANCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const ACTIVE_JOB_REDRIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
@@ -666,11 +668,16 @@ impl<S> SystemEventMessageQueueWorker<S> {
 struct PromptJobMessageQueueWorker<B, S> {
     store: S,
     engine: ConversationEngine<B, S>,
+    active_job_drives: Mutex<HashMap<String, Instant>>,
 }
 
 impl<B, S> PromptJobMessageQueueWorker<B, S> {
     fn new(store: S, engine: ConversationEngine<B, S>) -> Self {
-        Self { store, engine }
+        Self {
+            store,
+            engine,
+            active_job_drives: Mutex::new(HashMap::new()),
+        }
     }
 
     async fn run(self) -> Result<()>
@@ -891,7 +898,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             "waiting to materialize queued prompt job request behind active branch job"
         );
 
-        if matches!(active_job.status, JobStatus::Running) {
+        if !self.should_drive_active_job(&active_job).await {
             tracing::info!(
                 message_id = %item.message_id,
                 queue = PROMPT_JOB_QUEUE,
@@ -899,7 +906,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 job_id = %request.job_id,
                 active_job_id = %active_job.job_id,
                 active_job_status = ?active_job.status,
-                "active branch prompt job is already running; queued request will wait passively"
+                "active branch prompt job was driven recently; queued request will wait"
             );
             return false;
         }
@@ -931,6 +938,11 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 false
             }
         }
+    }
+
+    async fn should_drive_active_job(&self, active_job: &coco_mem::Job) -> bool {
+        let mut active_job_drives = self.active_job_drives.lock().await;
+        should_drive_active_job_with_backoff(&mut active_job_drives, active_job)
     }
 
     async fn handle_item(&self, item: MessageQueueItem)
@@ -1196,6 +1208,7 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
+    let mut active_job_drives = HashMap::new();
     loop {
         let active_job = engine.active_branch_prompt_job(branch)?;
         let Some(active_job) = active_job else {
@@ -1209,7 +1222,7 @@ where
             "waiting for active branch prompt job before handling queued telegram message"
         );
 
-        if matches!(active_job.status, JobStatus::Running) {
+        if !should_drive_active_job_with_backoff(&mut active_job_drives, &active_job) {
             tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
             continue;
         }
@@ -1219,6 +1232,22 @@ where
             tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
         }
     }
+}
+
+fn should_drive_active_job_with_backoff(
+    active_job_drives: &mut HashMap<String, Instant>,
+    active_job: &coco_mem::Job,
+) -> bool {
+    if matches!(active_job.status, JobStatus::Running)
+        && active_job_drives
+            .get(&active_job.job_id)
+            .is_some_and(|last_drive| last_drive.elapsed() < ACTIVE_JOB_REDRIVE_INTERVAL)
+    {
+        return false;
+    }
+
+    active_job_drives.insert(active_job.job_id.clone(), Instant::now());
+    true
 }
 
 fn is_missing_branch_error(error: &crate::error::Error) -> bool {
@@ -1615,7 +1644,7 @@ mod tests {
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
         SessionConfig, StepContext,
     };
-    use coco_mem::{JobStatus, JobStore, MemoryStore, MessageQueueStore, SessionRole};
+    use coco_mem::{JobStatus, MemoryStore, MessageQueueStore, SessionRole};
     use serde_json::json;
     use tokio::sync::Notify;
 
@@ -1849,7 +1878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_job_queue_worker_does_not_redrive_running_active_job() {
+    async fn prompt_job_queue_worker_throttles_running_active_job_redrive() {
         let store = MemoryStore::new();
         let backend = FailingBackend::default();
         let calls = backend.calls.clone();
@@ -1860,28 +1889,40 @@ mod tests {
             .submit_job("main", "active work", vec![])
             .await
             .unwrap();
+        let active_job_id = active_job.job_id.clone();
+        let request = QueuedPromptRequest {
+            job_id: "job-request".to_owned(),
+            branch: "main".to_owned(),
+            prompt: "queued work".to_owned(),
+            merge_parents: vec![],
+            session_patch: None,
+        };
         store
-            .set_job_status(&active_job.job_id, JobStatus::Queued, JobStatus::Running)
+            .enqueue_message(PROMPT_JOB_QUEUE, json!(request.clone()))
             .unwrap();
+        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
 
-        store
-            .enqueue_message(
-                PROMPT_JOB_QUEUE,
-                json!(QueuedPromptRequest {
-                    job_id: "job-request".to_owned(),
-                    branch: "main".to_owned(),
-                    prompt: "queued work".to_owned(),
-                    merge_parents: vec![],
-                    session_patch: None,
-                }),
-            )
-            .unwrap();
-        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine);
+        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        assert!(
+            !worker
+                .handle_prompt_request_queue_head(&item, &request)
+                .await
+                .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.get_job(&active_job_id).unwrap().status,
+            JobStatus::Running
+        );
 
-        let result = tokio::time::timeout(Duration::from_millis(100), worker.drain_once()).await;
-
-        assert!(result.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        assert!(
+            !worker
+                .handle_prompt_request_queue_head(&item, &request)
+                .await
+                .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
             1
