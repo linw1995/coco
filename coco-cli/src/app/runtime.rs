@@ -440,9 +440,7 @@ fn apply_forwarded_shadow_parent(cli: &mut Cli, shadow_parent: String) {
             Some(PromptSubcommand::Worker(command)) => command
                 .merge_parents
                 .push(MergeParent::shadow(shadow_parent)),
-            Some(PromptSubcommand::Status(_))
-            | Some(PromptSubcommand::BranchStatus(_))
-            | Some(PromptSubcommand::Recover(_)) => {}
+            Some(PromptSubcommand::Status(_)) | Some(PromptSubcommand::BranchStatus(_)) => {}
         }
     }
 }

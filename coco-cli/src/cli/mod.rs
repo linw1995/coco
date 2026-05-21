@@ -9,8 +9,8 @@ pub use preset::{
     PresetCommand, PresetNameCommand, PresetRollbackCommand, PresetSetCommand, PresetSubcommand,
 };
 pub use prompt::{
-    PromptBranchStatusCommand, PromptCommand, PromptRecoverCommand, PromptRunCommand,
-    PromptStatusCommand, PromptSubcommand, PromptWorkerCommand,
+    PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
+    PromptSubcommand, PromptWorkerCommand,
 };
 pub use session::{SessionBranchCommand, SessionGraphCommand, SessionShowCommand};
 #[cfg(test)]

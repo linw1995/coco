@@ -495,9 +495,8 @@ pub fn default_skill_groups() -> SkillGroups {
         SkillRecord::new(
             "recovery",
             SkillVersionSpec {
-                description:
-                    "Recover failed CoCo prompt jobs by moving their work branch and driving them."
-                        .to_owned(),
+                description: "Recover the active work branch after an LLM backend failure."
+                    .to_owned(),
                 body: include_str!("default_skills/recovery.md").trim().to_owned(),
                 scripts: Vec::new(),
                 enable_coco_shim: true,
@@ -510,7 +509,7 @@ pub fn default_skill_groups() -> SkillGroups {
             "compact",
             SkillVersionSpec {
                 description:
-                    "Summarize and compact branch anchors to reduce future context length."
+                    "Compact a branch by summarizing the latest provider context into a handoff."
                         .to_owned(),
                 body: include_str!("default_skills/compact.md").trim().to_owned(),
                 scripts: Vec::new(),

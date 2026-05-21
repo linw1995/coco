@@ -160,7 +160,6 @@ where
         Some(PromptSubcommand::BranchStatus(command)) => {
             run_prompt_branch_status(command, engine).await
         }
-        Some(PromptSubcommand::Recover(command)) => run_prompt_recover(command, engine).await,
         Some(PromptSubcommand::Worker(command)) => run_prompt_worker(command, engine).await,
     }
 }
@@ -367,28 +366,6 @@ where
         render_json(Vec::<JobStatusSnapshot>::new())
     } else {
         "No matching prompt job.".to_owned()
-    }))
-}
-
-async fn run_prompt_recover<B, S>(
-    command: crate::cli::PromptRecoverCommand,
-    engine: &ConversationEngine<B, S>,
-) -> Result<Option<String>>
-where
-    B: CompletionBackend + 'static,
-    S: Store + Clone + Send + Sync + 'static,
-{
-    let snapshot = engine
-        .set_job_work_branch(
-            &command.job,
-            &command.expected_work_branch,
-            &command.work_branch,
-        )
-        .context(CoreEngineSnafu)?;
-    Ok(Some(if command.json {
-        render_json(snapshot)
-    } else {
-        render_job_status_snapshot_text(&snapshot)
     }))
 }
 

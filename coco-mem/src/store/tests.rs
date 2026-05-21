@@ -2076,6 +2076,41 @@ where
     );
     assert!(new_skill.current().unwrap().body.contains("coco skill add"));
     assert!(
+        recovery
+            .current()
+            .unwrap()
+            .body
+            .contains("active work branch for the original job")
+    );
+    assert!(
+        recovery
+            .current()
+            .unwrap()
+            .body
+            .contains("rebase the current `work_branch` to a better model or parameter set")
+    );
+    assert!(
+        recovery
+            .current()
+            .unwrap()
+            .body
+            .contains("fork a deterministic scratch")
+    );
+    assert!(
+        compact
+            .current()
+            .unwrap()
+            .body
+            .contains("coco session handoff --branch <branch>")
+    );
+    assert!(
+        compact
+            .current()
+            .unwrap()
+            .body
+            .contains("Do not use `session rebase` for compaction")
+    );
+    assert!(
         cronjob
             .current()
             .unwrap()

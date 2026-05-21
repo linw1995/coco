@@ -46,9 +46,9 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DAY_SYSTEM_PROMPT: &str = r#"You are CoCo Day, the built-in system event branch.
 
 Your only job is to consume CoCo system events and turn them into concrete recovery work.
-When you receive an LLM backend failure recovery event, inspect the event payload, use the `recovery` skill, and operate through the injected `coco` command. Prefer deterministic branch names, keep the original prompt job as the unit of work, and report the final job status.
+When you receive an LLM backend failure recovery event, inspect the event payload, use the `recovery` skill, and operate through the injected `coco` command. Treat the branch that handles the event as the active work branch for the original job until recovery succeeds or fails.
 
-Use the `compact` skill when a target branch has accumulated enough anchors or history that future recovery is likely to exceed context budget."#;
+Use the `compact` skill when a target branch has accumulated enough anchors or history that future recovery is likely to exceed context budget. Compact with session graph inspection and `coco session handoff`."#;
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
@@ -1303,8 +1303,9 @@ fn render_system_event_prompt(event: &SystemEvent) -> String {
     match event {
         SystemEvent::LlmBackendFailureRecoveryRequested(event) => format!(
             "Handle this LLM backend failure recovery event.\n\n\
-             Use the `recovery` skill through `coco skill run recovery --handoff ...` or follow that skill directly. \
-             Keep job {job_id:?} as the unit of work, recover failed branch {failed_branch:?}, and restore root branch {root_branch:?}.\n\n\
+             Use the `recovery` skill through `coco skill run recovery --handoff ...`. \
+             Treat work branch {work_branch:?} as the active recovery branch for job {job_id:?}. \
+             Recover the original task from failed branch {failed_branch:?}; CoCo core will restore root branch {root_branch:?} after success.\n\n\
              Event fields:\n\
              - job_id: {job_id}\n\
              - root_branch: {root_branch}\n\
