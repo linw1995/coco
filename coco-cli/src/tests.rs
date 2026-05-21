@@ -328,7 +328,23 @@ fn session_graph_cli(store_path: std::path::PathBuf) -> Cli {
         daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
-            command: SessionSubcommand::Graph(SessionGraphCommand { json: false }),
+            command: SessionSubcommand::Graph(SessionGraphCommand {
+                json: false,
+                all: false,
+            }),
+        }),
+    }
+}
+
+fn session_graph_all_cli(store_path: std::path::PathBuf) -> Cli {
+    Cli {
+        daemon_socket: None,
+        store_path,
+        command: Command::Session(SessionCommand {
+            command: SessionSubcommand::Graph(SessionGraphCommand {
+                json: false,
+                all: true,
+            }),
         }),
     }
 }
@@ -338,9 +354,56 @@ fn session_graph_json_cli(store_path: std::path::PathBuf) -> Cli {
         daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
-            command: SessionSubcommand::Graph(SessionGraphCommand { json: true }),
+            command: SessionSubcommand::Graph(SessionGraphCommand {
+                json: true,
+                all: false,
+            }),
         }),
     }
+}
+
+fn session_graph_all_json_cli(store_path: std::path::PathBuf) -> Cli {
+    Cli {
+        daemon_socket: None,
+        store_path,
+        command: Command::Session(SessionCommand {
+            command: SessionSubcommand::Graph(SessionGraphCommand {
+                json: true,
+                all: true,
+            }),
+        }),
+    }
+}
+
+fn graph_entry_kind(entry: &Value) -> &str {
+    entry["node"]["kind"]
+        .as_object()
+        .expect("graph entry node kind should be an object")
+        .keys()
+        .next()
+        .expect("graph entry node kind should have a variant")
+        .as_str()
+}
+
+fn graph_anchor_payload_kind(entry: &Value) -> Option<&str> {
+    entry["node"]["kind"]["Anchor"]["payload"]
+        .as_object()
+        .and_then(|payload| payload.keys().next().map(String::as_str))
+}
+
+fn graph_entry_has_label(entry: &Value, branch: &str) -> bool {
+    entry["labels"]
+        .as_array()
+        .expect("graph entry labels should be an array")
+        .iter()
+        .any(|label| label["branch"] == branch)
+}
+
+fn graph_entry_by_node_id<'a>(entries: &'a [Value], node_id: &str) -> &'a Value {
+    entries
+        .iter()
+        .find(|entry| entry["node"]["id"] == node_id)
+        .expect("expected graph entry for node id")
 }
 
 fn session_show_cli(store_path: std::path::PathBuf, reference: &str, json: bool) -> Cli {
@@ -1873,7 +1936,7 @@ async fn session_graph_shows_branch_labels_on_head_node() {
     .unwrap();
 
     let output = run_with_backend(
-        session_graph_cli(store_path),
+        session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -1881,8 +1944,33 @@ async fn session_graph_shows_branch_labels_on_head_node() {
     .unwrap()
     .unwrap();
 
-    assert!(output.contains("[draft, main] assistant reply"));
+    assert!(output.contains("[draft, main] hello world"));
+    assert!(!output.contains("assistant reply"));
     assert!(output.contains("* "));
+
+    let json_output = run_with_backend(
+        session_graph_json_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let entries = serde_json::from_str::<Vec<Value>>(&json_output).unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|entry| graph_entry_kind(entry) == "Anchor")
+    );
+    let labeled_entry = entries
+        .iter()
+        .find(|entry| graph_entry_has_label(entry, "draft") && graph_entry_has_label(entry, "main"))
+        .expect("expected both branch labels on the visible prompt anchor");
+    assert_eq!(graph_anchor_payload_kind(labeled_entry), Some("Prompt"));
+    assert_eq!(
+        labeled_entry["node"]["kind"]["Anchor"]["payload"]["Prompt"]["prompt"],
+        "hello world"
+    );
 }
 
 #[tokio::test]
@@ -2503,7 +2591,7 @@ async fn session_graph_renders_global_dag_with_non_anchor_merge_parent() {
     .unwrap();
 
     let output = run_with_backend(
-        session_graph_cli(store_path),
+        session_graph_all_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -2619,7 +2707,63 @@ async fn session_graph_shows_tool_and_failure_nodes() {
         .unwrap();
 
     let output = run_with_backend(
-        session_graph_cli(store_path),
+        session_graph_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains("session"));
+    assert!(output.contains("[main]"));
+    assert!(!output.contains("tool_use"));
+    assert!(!output.contains("tool_result"));
+    assert!(!output.contains("command failed"));
+
+    let json_output = run_with_backend(
+        session_graph_json_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let entries = serde_json::from_str::<Vec<Value>>(&json_output).unwrap();
+    assert_eq!(entries.len(), 1);
+    let session_entry = graph_entry_by_node_id(&entries, &session_head);
+    assert_eq!(graph_entry_kind(session_entry), "Anchor");
+    assert!(graph_entry_has_label(session_entry, "main"));
+    assert_eq!(session_entry["primary_parent"], Value::Null);
+
+    let json_output = run_with_backend(
+        session_graph_all_json_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let entries = serde_json::from_str::<Vec<Value>>(&json_output).unwrap();
+    assert_eq!(
+        graph_entry_kind(graph_entry_by_node_id(&entries, &session_head)),
+        "Anchor"
+    );
+    assert_eq!(
+        graph_entry_kind(graph_entry_by_node_id(&entries, &tool_use_id)),
+        "ToolUse"
+    );
+    assert_eq!(
+        graph_entry_kind(graph_entry_by_node_id(&entries, &tool_result_id)),
+        "ToolResult"
+    );
+    assert_eq!(
+        graph_entry_kind(graph_entry_by_node_id(&entries, &failure_id)),
+        "Failure"
+    );
+
+    let output = run_with_backend(
+        session_graph_all_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -2667,7 +2811,7 @@ async fn session_graph_and_show_render_skill_result_anchor() {
         .unwrap();
 
     let graph_output = run_with_backend(
-        session_graph_cli(store_path.clone()),
+        session_graph_all_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -2743,7 +2887,7 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
         .unwrap();
 
     let graph_output = run_with_backend(
-        session_graph_cli(store_path.clone()),
+        session_graph_all_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -2987,10 +3131,44 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
     .await
     .unwrap()
     .unwrap();
+    assert!(graph_text.contains("prompt"));
+    assert!(!graph_text.contains("shadow=["));
+    assert!(!graph_text.contains("exec_command"));
+
+    let graph_json = run_with_backend(
+        session_graph_json_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let graph_entries = serde_json::from_str::<Vec<Value>>(&graph_json).unwrap();
+    assert!(
+        graph_entries
+            .iter()
+            .all(|entry| graph_entry_kind(entry) == "Anchor")
+    );
+    let shadow_anchor_entry = graph_entry_by_node_id(&graph_entries, &shadow_anchor_id);
+    assert_eq!(
+        graph_anchor_payload_kind(shadow_anchor_entry),
+        Some("Prompt")
+    );
+    assert_eq!(shadow_anchor_entry["primary_parent"], session_id);
+    assert_eq!(shadow_anchor_entry["merge_parents"], json!([]));
+
+    let graph_text = run_with_backend(
+        session_graph_all_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(graph_text.contains("shadow=["));
 
     let graph_json = run_with_backend(
-        session_graph_json_cli(store_path),
+        session_graph_all_json_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -3055,6 +3233,21 @@ async fn session_show_resolves_short_node_prefix_after_source_branch_delete() {
     assert!(output.contains(&format!("ref: {prefix}")));
     assert!(output.contains(&format!("resolved_id: {draft_node_id}")));
     assert!(output.contains("deleted branch node"));
+}
+
+#[test]
+fn session_graph_parses_all_flag() {
+    let cli = Cli::try_parse_from(["coco-cli", "session", "graph", "--all", "--json"]).unwrap();
+
+    let Command::Session(command) = cli.command else {
+        panic!("expected session command");
+    };
+    let SessionSubcommand::Graph(command) = command.command else {
+        panic!("expected graph command");
+    };
+
+    assert!(command.all);
+    assert!(command.json);
 }
 
 #[tokio::test]

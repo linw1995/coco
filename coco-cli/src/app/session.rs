@@ -113,6 +113,12 @@ struct GraphNodeEntry {
     labels: Vec<GraphBranchLabel>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SessionGraphMode {
+    Anchors,
+    All,
+}
+
 #[derive(Debug)]
 struct GraphTransition {
     next_columns: Vec<String>,
@@ -199,7 +205,12 @@ where
             }))
         }
         SessionSubcommand::Graph(command) => {
-            let entries = build_session_graph_entries(store)?;
+            let mode = if command.all {
+                SessionGraphMode::All
+            } else {
+                SessionGraphMode::Anchors
+            };
+            let entries = build_session_graph_entries(store, mode)?;
             Ok(Some(if command.json {
                 render_json(entries)
             } else {
@@ -535,6 +546,7 @@ fn render_session_state_text(state: &SessionState) -> String {
 
 fn build_session_graph_entries(
     store: &(impl BranchStore + NodeStore + SessionStore),
+    mode: SessionGraphMode,
 ) -> Result<Vec<GraphNodeEntry>> {
     let states = store.list_session_states().context(StoreSnafu)?;
     if states.is_empty() {
@@ -550,24 +562,36 @@ fn build_session_graph_entries(
 
     for (branch, state) in branches {
         let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
-        collect_visible_graph_nodes(store, &head_id, &mut visible_node_ids, &mut visible_nodes)?;
+        collect_visible_graph_nodes(
+            store,
+            &head_id,
+            mode,
+            &mut visible_node_ids,
+            &mut visible_nodes,
+        )?;
 
-        labels_by_node
-            .entry(head_id)
-            .or_default()
-            .push(GraphBranchLabel { branch, state });
+        if let Some(label_node_id) = resolve_visible_parent(store, &visible_node_ids, &head_id)? {
+            labels_by_node
+                .entry(label_node_id)
+                .or_default()
+                .push(GraphBranchLabel { branch, state });
+        }
     }
 
     let mut entries = visible_nodes
         .into_values()
         .map(|node| {
-            let primary_parent = resolve_visible_parent(&visible_node_ids, node.parent.as_str());
+            let primary_parent =
+                resolve_visible_parent(store, &visible_node_ids, node.parent.as_str())?;
             let merge_parents = match &node.kind {
                 Kind::Anchor(anchor) => {
                     let mut parents = Vec::new();
                     for merge_parent in anchor.merge_parents() {
-                        let Some(parent_id) =
-                            resolve_visible_parent(&visible_node_ids, merge_parent.node_id())
+                        let Some(parent_id) = resolve_visible_parent(
+                            store,
+                            &visible_node_ids,
+                            merge_parent.node_id(),
+                        )?
                         else {
                             continue;
                         };
@@ -703,6 +727,7 @@ fn compare_graph_entries_desc(left: &GraphNodeEntry, right: &GraphNodeEntry) -> 
 fn collect_visible_graph_nodes(
     store: &impl NodeStore,
     head_id: &str,
+    mode: SessionGraphMode,
     visible_node_ids: &mut BTreeSet<String>,
     visible_nodes: &mut HashMap<String, Node>,
 ) -> Result<()> {
@@ -732,11 +757,20 @@ fn collect_visible_graph_nodes(
             collect_visible_skill_invocation_subtrees(store, &node.id, &mut pending)?;
         }
 
-        visible_node_ids.insert(node.id.clone());
-        visible_nodes.insert(node.id.clone(), node);
+        if is_visible_graph_node(&node, mode) {
+            visible_node_ids.insert(node.id.clone());
+            visible_nodes.insert(node.id.clone(), node);
+        }
     }
 
     Ok(())
+}
+
+fn is_visible_graph_node(node: &Node, mode: SessionGraphMode) -> bool {
+    match mode {
+        SessionGraphMode::Anchors => matches!(&node.kind, Kind::Anchor(_)),
+        SessionGraphMode::All => true,
+    }
 }
 
 fn collect_visible_skill_invocation_subtrees(
@@ -809,16 +843,30 @@ fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Nod
     }
 }
 
-fn resolve_visible_parent(visible_node_ids: &BTreeSet<String>, start_id: &str) -> Option<String> {
+fn resolve_visible_parent(
+    store: &impl NodeStore,
+    visible_node_ids: &BTreeSet<String>,
+    start_id: &str,
+) -> Result<Option<String>> {
     if start_id.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    if visible_node_ids.contains(start_id) {
-        Some(start_id.to_owned())
-    } else {
-        None
+    let mut current_id = start_id.to_owned();
+    let mut visited = BTreeSet::new();
+    while !current_id.is_empty() && visited.insert(current_id.clone()) {
+        if visible_node_ids.contains(&current_id) {
+            return Ok(Some(current_id));
+        }
+
+        let node = store.get_node(&current_id).context(StoreSnafu)?;
+        if node.is_root() {
+            return Ok(None);
+        }
+        current_id = node.parent;
     }
+
+    Ok(None)
 }
 
 fn visible_merge_parent(parent: &MergeParent, node_id: String) -> MergeParent {
