@@ -98,6 +98,9 @@ pub struct SessionBranchCommand {
 pub struct SessionGraphCommand {
     #[arg(long)]
     pub json: bool,
+
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]

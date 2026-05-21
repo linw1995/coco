@@ -118,6 +118,12 @@ struct GraphNodeEntry {
     labels: Vec<GraphBranchLabel>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SessionGraphMode {
+    Anchors,
+    All,
+}
+
 #[derive(Debug)]
 struct GraphTransition {
     next_columns: Vec<String>,
@@ -204,7 +210,12 @@ where
             }))
         }
         SessionSubcommand::Graph(command) => {
-            let entries = build_session_graph_entries(store)?;
+            let mode = if command.all {
+                SessionGraphMode::All
+            } else {
+                SessionGraphMode::Anchors
+            };
+            let entries = build_session_graph_entries(store, mode)?;
             Ok(Some(if command.json {
                 render_json(entries)
             } else {
@@ -559,6 +570,7 @@ fn render_session_state_text(state: &SessionState) -> String {
 
 fn build_session_graph_entries(
     store: &(impl BranchStore + NodeStore + SessionStore),
+    mode: SessionGraphMode,
 ) -> Result<Vec<GraphNodeEntry>> {
     let states = store.list_session_states().context(StoreSnafu)?;
     if states.is_empty() {
@@ -574,24 +586,36 @@ fn build_session_graph_entries(
 
     for (branch, state) in branches {
         let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
-        collect_visible_graph_nodes(store, &head_id, &mut visible_node_ids, &mut visible_nodes)?;
+        collect_visible_graph_nodes(
+            store,
+            &head_id,
+            mode,
+            &mut visible_node_ids,
+            &mut visible_nodes,
+        )?;
 
-        labels_by_node
-            .entry(head_id)
-            .or_default()
-            .push(GraphBranchLabel { branch, state });
+        if let Some(label_node_id) = resolve_visible_parent(store, &visible_node_ids, &head_id)? {
+            labels_by_node
+                .entry(label_node_id)
+                .or_default()
+                .push(GraphBranchLabel { branch, state });
+        }
     }
 
     let mut entries = visible_nodes
         .into_values()
         .map(|node| {
-            let primary_parent = resolve_visible_parent(&visible_node_ids, node.parent.as_str());
+            let primary_parent =
+                resolve_visible_parent(store, &visible_node_ids, node.parent.as_str())?;
             let merge_parents = match &node.kind {
                 Kind::Anchor(anchor) => {
                     let mut parents = Vec::new();
                     for merge_parent in anchor.merge_parents() {
-                        let Some(parent_id) =
-                            resolve_visible_parent(&visible_node_ids, merge_parent.node_id())
+                        let Some(parent_id) = resolve_visible_parent(
+                            store,
+                            &visible_node_ids,
+                            merge_parent.node_id(),
+                        )?
                         else {
                             continue;
                         };
@@ -727,6 +751,7 @@ fn compare_graph_entries_desc(left: &GraphNodeEntry, right: &GraphNodeEntry) -> 
 fn collect_visible_graph_nodes(
     store: &impl NodeStore,
     head_id: &str,
+    mode: SessionGraphMode,
     visible_node_ids: &mut BTreeSet<String>,
     visible_nodes: &mut HashMap<String, Node>,
 ) -> Result<()> {
@@ -756,11 +781,20 @@ fn collect_visible_graph_nodes(
             collect_visible_skill_invocation_subtrees(store, &node.id, &mut pending)?;
         }
 
-        visible_node_ids.insert(node.id.clone());
-        visible_nodes.insert(node.id.clone(), node);
+        if is_visible_graph_node(&node, mode) {
+            visible_node_ids.insert(node.id.clone());
+            visible_nodes.insert(node.id.clone(), node);
+        }
     }
 
     Ok(())
+}
+
+fn is_visible_graph_node(node: &Node, mode: SessionGraphMode) -> bool {
+    match mode {
+        SessionGraphMode::Anchors => matches!(&node.kind, Kind::Anchor(_)),
+        SessionGraphMode::All => true,
+    }
 }
 
 fn collect_visible_skill_invocation_subtrees(
@@ -833,16 +867,30 @@ fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Nod
     }
 }
 
-fn resolve_visible_parent(visible_node_ids: &BTreeSet<String>, start_id: &str) -> Option<String> {
+fn resolve_visible_parent(
+    store: &impl NodeStore,
+    visible_node_ids: &BTreeSet<String>,
+    start_id: &str,
+) -> Result<Option<String>> {
     if start_id.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    if visible_node_ids.contains(start_id) {
-        Some(start_id.to_owned())
-    } else {
-        None
+    let mut current_id = start_id.to_owned();
+    let mut visited = BTreeSet::new();
+    while !current_id.is_empty() && visited.insert(current_id.clone()) {
+        if visible_node_ids.contains(&current_id) {
+            return Ok(Some(current_id));
+        }
+
+        let node = store.get_node(&current_id).context(StoreSnafu)?;
+        if node.is_root() {
+            return Ok(None);
+        }
+        current_id = node.parent;
     }
+
+    Ok(None)
 }
 
 fn visible_merge_parent(parent: &MergeParent, node_id: String) -> MergeParent {
@@ -958,11 +1006,18 @@ fn render_graph_connector_row(
     current_col: usize,
     entry: &GraphNodeEntry,
 ) -> Option<String> {
-    let primary_parent_col = entry.primary_parent.as_ref().and_then(|node_id| {
+    let active_primary_parent_col = entry.primary_parent.as_ref().and_then(|node_id| {
+        active_columns
+            .iter()
+            .position(|candidate| candidate == node_id)
+            .filter(|index| *index != current_col)
+    });
+    let next_primary_parent_col = entry.primary_parent.as_ref().and_then(|node_id| {
         next_columns
             .iter()
             .position(|candidate| candidate == node_id)
     });
+    let primary_parent_col = next_primary_parent_col;
     let merge_parent_cols = entry
         .merge_parents
         .iter()
@@ -1010,6 +1065,28 @@ fn render_graph_connector_row(
         chars[current_pos] = '|';
     }
 
+    let right_targets = target_cols
+        .iter()
+        .filter(|target_col| **target_col > current_col)
+        .count();
+    let left_targets = target_cols
+        .iter()
+        .filter(|target_col| **target_col < current_col)
+        .count();
+
+    if let (Some(active_col), Some(next_col)) = (active_primary_parent_col, next_primary_parent_col)
+        && active_col != next_col
+    {
+        let connector_pos = if next_col < active_col {
+            next_col * 2 + 1
+        } else {
+            active_col * 2 + 1
+        };
+        if connector_pos < chars.len() {
+            chars[connector_pos] = if next_col < active_col { '/' } else { '\\' };
+        }
+    }
+
     for target_col in target_cols {
         let target_pos = target_col * 2;
         if target_pos == current_pos {
@@ -1017,21 +1094,29 @@ fn render_graph_connector_row(
             continue;
         }
 
-        let connector_pos = if target_pos < current_pos {
+        let spread_right = target_col > current_col && right_targets > 1;
+        let spread_left = target_col < current_col && left_targets > 1;
+        let connector_pos = if spread_right {
+            target_pos - 1
+        } else if spread_left {
+            target_pos + 1
+        } else if target_pos < current_pos {
             current_pos - 1
         } else {
             current_pos + 1
         };
         chars[connector_pos] = if target_pos < current_pos { '/' } else { '\\' };
 
-        let range = if target_pos < current_pos {
-            (target_pos + 1)..connector_pos
-        } else {
-            (connector_pos + 1)..target_pos
-        };
-        for idx in range {
-            if chars[idx] == ' ' {
-                chars[idx] = '-';
+        if !spread_right && !spread_left {
+            let range = if target_pos < current_pos {
+                (target_pos + 1)..connector_pos
+            } else {
+                (connector_pos + 1)..target_pos
+            };
+            for idx in range {
+                if chars[idx] == ' ' {
+                    chars[idx] = '-';
+                }
             }
         }
     }
@@ -1519,10 +1604,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{GraphNodeEntry, render_graph_connector_row};
-    use coco_mem::{Kind, Role};
+    use coco_mem::{Kind, MergeParent, Role};
     use serde_json::json;
 
-    fn graph_entry(node_id: &str, primary_parent: Option<&str>) -> GraphNodeEntry {
+    fn graph_entry(
+        node_id: &str,
+        primary_parent: Option<&str>,
+        merge_parents: &[&str],
+    ) -> GraphNodeEntry {
         GraphNodeEntry {
             node: serde_json::from_value(json!({
                 "id": node_id,
@@ -1534,7 +1623,10 @@ mod tests {
             }))
             .expect("graph test node should deserialize"),
             primary_parent: primary_parent.map(str::to_owned),
-            merge_parents: Vec::new(),
+            merge_parents: merge_parents
+                .iter()
+                .map(|node_id| MergeParent::merge(*node_id))
+                .collect(),
             labels: Vec::new(),
         }
     }
@@ -1543,9 +1635,50 @@ mod tests {
     fn graph_connector_row_places_left_diagonal_between_columns() {
         let active_columns = vec!["left".to_owned(), "current".to_owned()];
         let next_columns = vec!["left".to_owned()];
-        let entry = graph_entry("current", Some("left"));
+        let entry = graph_entry("current", Some("left"), &[]);
 
         let connector_row = render_graph_connector_row(&active_columns, &next_columns, 1, &entry);
+
+        assert_eq!(connector_row.as_deref(), Some("|/"));
+    }
+
+    #[test]
+    fn graph_connector_row_spreads_multiple_right_targets_without_horizontal_fill() {
+        let active_columns = vec!["current".to_owned()];
+        let next_columns = vec![
+            "parent".to_owned(),
+            "right_one".to_owned(),
+            "right_two".to_owned(),
+        ];
+        let entry = graph_entry("current", Some("parent"), &["right_one", "right_two"]);
+
+        let connector_row = render_graph_connector_row(&active_columns, &next_columns, 0, &entry);
+
+        assert_eq!(connector_row.as_deref(), Some("|\\ \\"));
+    }
+
+    #[test]
+    fn graph_connector_row_spreads_multiple_left_targets_without_horizontal_fill() {
+        let active_columns = vec![
+            "left_two".to_owned(),
+            "left_one".to_owned(),
+            "current".to_owned(),
+        ];
+        let next_columns = vec!["left_two".to_owned(), "left_one".to_owned()];
+        let entry = graph_entry("current", Some("left_one"), &["left_two"]);
+
+        let connector_row = render_graph_connector_row(&active_columns, &next_columns, 2, &entry);
+
+        assert_eq!(connector_row.as_deref(), Some("|/|/"));
+    }
+
+    #[test]
+    fn graph_connector_row_shows_parent_column_shift_after_fanin() {
+        let active_columns = vec!["current".to_owned(), "parent".to_owned()];
+        let next_columns = vec!["parent".to_owned()];
+        let entry = graph_entry("current", Some("parent"), &[]);
+
+        let connector_row = render_graph_connector_row(&active_columns, &next_columns, 0, &entry);
 
         assert_eq!(connector_row.as_deref(), Some("|/"));
     }

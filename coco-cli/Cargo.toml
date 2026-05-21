@@ -40,4 +40,5 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # Test fixtures.
+indoc = "2.0.6"
 tempfile = "3.23.0"
