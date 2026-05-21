@@ -714,6 +714,24 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
 }
 
 #[tokio::test]
+async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+    let job_id = job.job_id.clone();
+
+    store.delete_branch("main").unwrap();
+    let error = engine.drive_job(&job_id).await.unwrap_err();
+
+    assert!(matches!(error, EngineError::SessionMissing { branch } if branch == "main"));
+    assert_eq!(store.get_job(&job_id).unwrap().status, JobStatus::Finished);
+    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+}
+
+#[tokio::test]
 async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root_branch() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[

@@ -521,18 +521,22 @@ where
 
         if matches!(job.status, JobStatus::Running) {
             self.ensure_job_has_exclusive_branch_access(&job)?;
-            match self.resume_or_run_job(&job, merge_parents).await? {
-                JobRunOutcome::Completed => {
+            match self.resume_or_run_job(&job, merge_parents).await {
+                Ok(JobRunOutcome::Completed) => {
                     job = self.restore_root_branch_after_recovery(&job)?;
                     self.finish_job(&job).await?;
                 }
-                JobRunOutcome::RecoveryQueued => {
+                Ok(JobRunOutcome::RecoveryQueued) => {
                     tracing::info!(
                         job_id = %job.job_id,
                         branch = %job.branch,
                         work_branch = %job.work_branch,
                         "prompt job is waiting for recovery"
                     );
+                }
+                Err(error) => {
+                    self.finish_job(&job).await?;
+                    return Err(error);
                 }
             }
         }
