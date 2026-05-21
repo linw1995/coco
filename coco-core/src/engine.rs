@@ -263,6 +263,12 @@ where
             .await?;
         let snapshot = self.drive_job_for_prompt(&job.job_id).await?;
         let job = self.service.store().get_job(&job.job_id)?;
+        if !matches!(snapshot.status, JobStatus::Finished) {
+            self.finish_job(&job).await?;
+            return Err(EngineError::EngineFailed {
+                message: format!("prompt job {:?} is waiting for recovery", job.job_id),
+            });
+        }
         build_prompt_reply(self.service.store(), &job, &snapshot)
     }
 

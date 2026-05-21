@@ -905,6 +905,7 @@ async fn llm_engine_reply_surfaces_backend_failure_message() {
         events[0].payload["type"],
         "llm.backend_failure.recovery_requested"
     );
+    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
 }
 
 #[tokio::test]
