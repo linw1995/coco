@@ -891,6 +891,19 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             "waiting to materialize queued prompt job request behind active branch job"
         );
 
+        if matches!(active_job.status, JobStatus::Running) {
+            tracing::info!(
+                message_id = %item.message_id,
+                queue = PROMPT_JOB_QUEUE,
+                branch = %request.branch,
+                job_id = %request.job_id,
+                active_job_id = %active_job.job_id,
+                active_job_status = ?active_job.status,
+                "active branch prompt job is already running; queued request will wait passively"
+            );
+            return false;
+        }
+
         match self.engine.drive_job(&active_job.job_id).await {
             Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => true,
             Ok(snapshot) => {
@@ -1195,6 +1208,11 @@ where
             active_job_status = ?active_job.status,
             "waiting for active branch prompt job before handling queued telegram message"
         );
+
+        if matches!(active_job.status, JobStatus::Running) {
+            tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
+            continue;
+        }
 
         let snapshot = engine.drive_job(&active_job.job_id).await?;
         if !matches!(snapshot.status, JobStatus::Finished) {
@@ -1597,7 +1615,7 @@ mod tests {
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
         SessionConfig, StepContext,
     };
-    use coco_mem::{JobStatus, MemoryStore, MessageQueueStore, SessionRole};
+    use coco_mem::{JobStatus, JobStore, MemoryStore, MessageQueueStore, SessionRole};
     use serde_json::json;
     use tokio::sync::Notify;
 
@@ -1824,6 +1842,46 @@ mod tests {
             engine.get_job(&active_job_id).unwrap().status,
             JobStatus::Running
         );
+        assert_eq!(
+            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_job_queue_worker_does_not_redrive_running_active_job() {
+        let store = MemoryStore::new();
+        let backend = FailingBackend::default();
+        let calls = backend.calls.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let engine = ConversationEngine::new(llm);
+        let active_job = engine
+            .submit_job("main", "active work", vec![])
+            .await
+            .unwrap();
+        store
+            .set_job_status(&active_job.job_id, JobStatus::Queued, JobStatus::Running)
+            .unwrap();
+
+        store
+            .enqueue_message(
+                PROMPT_JOB_QUEUE,
+                json!(QueuedPromptRequest {
+                    job_id: "job-request".to_owned(),
+                    branch: "main".to_owned(),
+                    prompt: "queued work".to_owned(),
+                    merge_parents: vec![],
+                    session_patch: None,
+                }),
+            )
+            .unwrap();
+        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine);
+
+        let result = tokio::time::timeout(Duration::from_millis(100), worker.drain_once()).await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
             1
