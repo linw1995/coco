@@ -2836,7 +2836,7 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
         |\\
         | * {draft_id} prompt {draft_created_at} [draft] draft anchor
         * | {main_id} prompt {main_created_at} main anchor
-        |
+        |/
         * {session_id} session {session_created_at} You are helpful.
         ",
         merge_id = short_id(&merge_anchor_id),
@@ -2953,9 +2953,9 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
         |\\--
         | | * {gamma_id} prompt {gamma_created_at} [gamma] gamma anchor
         | * | {beta_id} prompt {beta_created_at} [beta] beta anchor
-        | |
+        | |/
         * | {alpha_id} prompt {alpha_created_at} [alpha] alpha anchor
-        |
+        |/
         * {shared_id} prompt {shared_created_at} shared anchor
         * {session_id} session {session_created_at} You are helpful.
         ",

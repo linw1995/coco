@@ -982,11 +982,18 @@ fn render_graph_connector_row(
     current_col: usize,
     entry: &GraphNodeEntry,
 ) -> Option<String> {
-    let primary_parent_col = entry.primary_parent.as_ref().and_then(|node_id| {
+    let active_primary_parent_col = entry.primary_parent.as_ref().and_then(|node_id| {
+        active_columns
+            .iter()
+            .position(|candidate| candidate == node_id)
+            .filter(|index| *index != current_col)
+    });
+    let next_primary_parent_col = entry.primary_parent.as_ref().and_then(|node_id| {
         next_columns
             .iter()
             .position(|candidate| candidate == node_id)
     });
+    let primary_parent_col = next_primary_parent_col;
     let merge_parent_cols = entry
         .merge_parents
         .iter()
@@ -1032,6 +1039,19 @@ fn render_graph_connector_row(
     let current_pos = current_col * 2;
     if target_cols.contains(&current_col) {
         chars[current_pos] = '|';
+    }
+
+    if let (Some(active_col), Some(next_col)) = (active_primary_parent_col, next_primary_parent_col)
+        && active_col != next_col
+    {
+        let connector_pos = if next_col < active_col {
+            next_col * 2 + 1
+        } else {
+            active_col * 2 + 1
+        };
+        if connector_pos < chars.len() {
+            chars[connector_pos] = if next_col < active_col { '/' } else { '\\' };
+        }
     }
 
     for target_col in target_cols {
