@@ -1160,6 +1160,24 @@ where
         );
         Ok(anchor_id)
     }
+
+    pub async fn handoff_session(&self, branch: &str, patch: SessionConfigPatch) -> Result<String> {
+        let _guard = self.lock_branch(branch).await;
+        let has_tool_patch = patch.tools.is_some();
+        let has_model_patch = patch.model.is_some();
+        let anchor_id = self
+            .store
+            .handoff_session(branch, &patch)
+            .context(MemorySnafu)?;
+        tracing::info!(
+            branch = %branch,
+            anchor_id = %anchor_id,
+            has_tool_patch,
+            has_model_patch,
+            "handed off session"
+        );
+        Ok(anchor_id)
+    }
 }
 
 impl<B, S> LlmService<B, S>
@@ -5233,6 +5251,42 @@ mod tests {
                 (Role::User, "Conversation start.".to_owned()),
                 (Role::User, "round one".to_owned()),
                 (Role::LLM, "first".to_owned()),
+                (Role::User, "round two".to_owned()),
+                (Role::LLM, "second".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_session_resets_provider_history() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[("main", &[Ok("first"), Ok("second")])]);
+        let service = LlmService::new(store, backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        service
+            .prompt(prompt_request("main", "round one"))
+            .await
+            .unwrap();
+        let anchor_id = service
+            .handoff_session("main", SessionConfigPatch::default())
+            .await
+            .unwrap();
+        let result = service
+            .prompt(prompt_request("main", "round two"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "second");
+        let session = service.resolve_session("main").unwrap();
+        assert_ne!(session.anchor_id, anchor_id);
+        assert_eq!(
+            text_messages_from_provider_history(&session.provider_history),
+            vec![
+                (Role::User, "Conversation start.".to_owned()),
                 (Role::User, "round two".to_owned()),
                 (Role::LLM, "second".to_owned()),
             ]

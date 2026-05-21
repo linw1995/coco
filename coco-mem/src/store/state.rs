@@ -43,6 +43,14 @@ pub struct RebasePlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct HandoffPlan {
+    pub branch: String,
+    pub expected_old_head: String,
+    pub new_head: String,
+    pub node: Node,
+}
+
+#[derive(Debug, Clone)]
 pub struct ForkPlan {
     pub head_id: String,
 }
@@ -579,6 +587,49 @@ impl StoreState {
         patch: &SessionAnchorPatch,
     ) -> Result<RebasePlan> {
         self.plan_rebase_session_with(name, |session_anchor| session_anchor.apply_patch(patch))
+    }
+
+    pub fn plan_handoff_session(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+    ) -> Result<HandoffPlan> {
+        let branch = name.to_owned();
+        let expected_old_head = self.get_branch_head(name)?.to_owned();
+        let session_node_id = self
+            .session_chain_ids(name)?
+            .into_iter()
+            .last()
+            .expect("session chain should not be empty");
+        let session_node = self.nodes.get(&session_node_id).context(NotFoundSnafu {
+            id: session_node_id,
+        })?;
+        let session_anchor = match &session_node.kind {
+            Kind::Anchor(anchor) => anchor
+                .as_session()
+                .expect("session chain should end with session anchor"),
+            _ => unreachable!("session chain should end with anchor"),
+        }
+        .clone();
+        let handoff_session_anchor = session_anchor.apply_patch(patch);
+        let node = self.plan_append_node(NewNode {
+            parent: expected_old_head.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(vec![], handoff_session_anchor)),
+        })?;
+        let new_head = node.id.clone();
+
+        let mut temp = self.clone();
+        temp.insert_existing_node(node.clone())?;
+        temp.apply_set_branch_head(branch.clone(), &expected_old_head, new_head.clone())?;
+
+        Ok(HandoffPlan {
+            branch,
+            expected_old_head,
+            new_head,
+            node,
+        })
     }
 
     fn plan_rebase_session_with(

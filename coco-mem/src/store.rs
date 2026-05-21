@@ -72,6 +72,9 @@ pub trait SessionStore {
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+
+    /// Appends a new full session anchor to reset provider context for a branch.
+    fn handoff_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
 }
 
 /// Preset storage API.

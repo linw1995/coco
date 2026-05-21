@@ -394,6 +394,31 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
     }
 }
 
+fn session_handoff_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli {
+    Cli {
+        daemon_socket: None,
+        store_path,
+        command: Command::Session(SessionCommand {
+            command: SessionSubcommand::Handoff(SessionRebaseCommand {
+                branch: branch.unwrap_or("main").to_owned(),
+                preset: None,
+                provider_profile: None,
+                role: None,
+                provider: None,
+                model: Some("claude-sonnet-4-20250514".to_owned()),
+                system_prompt: Some("You are precise.".to_owned()),
+                temperature: None,
+                clear_temperature: false,
+                max_tokens: Some(256),
+                clear_max_tokens: false,
+                tools: vec![],
+                clear_tools: false,
+                json: true,
+            }),
+        }),
+    }
+}
+
 fn session_reopen_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> Cli {
     Cli {
         daemon_socket: None,
@@ -2048,6 +2073,82 @@ async fn session_rebase_updates_visible_session_config() {
     assert_eq!(value["anchor"]["temperature"], Value::Null);
     assert_eq!(value["anchor"]["max_tokens"], json!(256));
     assert_eq!(value["anchor"]["tools"], json!([]));
+}
+
+#[tokio::test]
+async fn session_handoff_appends_inherited_session_anchor() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+    run_with_backend(
+        prompt_cli(store_path.clone(), Some("main"), &["round one"]),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[("main", &[Ok("first")])]),
+    )
+    .await
+    .unwrap();
+    let original_head = open_store(&store_path)
+        .unwrap()
+        .get_branch_head("main")
+        .unwrap();
+
+    let text_output = run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "handoff",
+            "--branch",
+            "main",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
+    assert!(text_output.starts_with("head: "));
+
+    let output = run_with_backend(
+        session_handoff_cli(store_path.clone(), Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let value: Value = serde_json::from_str(&output).unwrap();
+    let head = value["head"].as_str().unwrap();
+    assert_ne!(value["head"], json!(original_head));
+
+    let store = open_store(&store_path).unwrap();
+    let ancestry = store.ancestry("main").unwrap();
+    assert_eq!(ancestry[0].id, head);
+    let Kind::Anchor(anchor) = &ancestry[0].kind else {
+        panic!("expected session anchor");
+    };
+    let session = anchor.as_session().expect("expected session anchor");
+    assert_eq!(session.provider_profile.as_deref(), Some("openai-codex"));
+    assert_eq!(session.provider, None);
+    assert_eq!(session.model, "claude-sonnet-4-20250514");
+    assert_eq!(session.system_prompt, "You are precise.");
+    assert_eq!(session.temperature, Some(0.2));
+    assert_eq!(session.max_tokens, Some(256));
 }
 
 #[tokio::test]
