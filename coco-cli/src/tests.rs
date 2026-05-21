@@ -19,6 +19,7 @@ use coco_mem::{
     MessageQueueStore, PresetStore, ProcessShareableStore, ProviderProfile, SessionState,
     SkillStore, SkillVersionSpec,
 };
+use indoc::formatdoc;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2827,19 +2828,30 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
     .unwrap()
     .unwrap();
 
-    assert!(output.contains("merge anchor merge=["));
-    assert!(output.contains("draft anchor"));
-    assert!(output.contains("main anchor"));
-    assert!(!output.contains("main hidden text"));
-    assert!(!output.contains("draft hidden text"));
-    let connector_lines = output
-        .lines()
-        .filter(|line| line.contains('\\') || line.contains('/'))
-        .collect::<Vec<_>>();
-    assert!(
-        connector_lines.contains(&"|\\"),
-        "expected anchor-only graph to connect compressed merge parents, got:\n{output}"
-    );
+    let short_id = |id: &str| id.chars().take(8).collect::<String>();
+    let created_at = |id: &str| store.get_node(id).unwrap().created_at.to_string();
+    let expected_output = formatdoc!(
+        "
+        * {merge_id} prompt {merge_created_at} [main] merge anchor merge=[{draft_id}]
+        |\\
+        | * {draft_id} prompt {draft_created_at} [draft] draft anchor
+        * | {main_id} prompt {main_created_at} main anchor
+        |
+        * {session_id} session {session_created_at} You are helpful.
+        ",
+        merge_id = short_id(&merge_anchor_id),
+        merge_created_at = created_at(&merge_anchor_id),
+        draft_id = short_id(&draft_anchor_id),
+        draft_created_at = created_at(&draft_anchor_id),
+        main_id = short_id(&main_anchor_id),
+        main_created_at = created_at(&main_anchor_id),
+        session_id = short_id(&session_id),
+        session_created_at = created_at(&session_id),
+    )
+    .strip_suffix('\n')
+    .expect("formatdoc output should end with one newline")
+    .to_owned();
+    assert_eq!(output, expected_output);
 
     let json_output = run_with_backend(
         session_graph_json_cli(store_path),
