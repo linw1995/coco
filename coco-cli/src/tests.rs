@@ -2879,6 +2879,123 @@ async fn session_graph_shows_tool_and_failure_nodes() {
 }
 
 #[tokio::test]
+async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_graph() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let original_session_id = store.get_branch_head("main").unwrap();
+    let old_prompt_id = append_prompt_anchor(&store, &original_session_id, "old prompt", &[]);
+    let old_text_id = append_text_node(&store, &old_prompt_id, "old text");
+    let new_session_id = append_session_anchor(&store, &old_text_id, "Fresh provider context.");
+    let new_prompt_id = append_prompt_anchor(&store, &new_session_id, "new prompt", &[]);
+    let new_text_id = append_text_node(&store, &new_prompt_id, "new text");
+    store
+        .set_branch_head("main", &original_session_id, &new_text_id)
+        .unwrap();
+
+    let output = run_with_backend(
+        session_graph_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let short_id = |id: &str| id.chars().take(8).collect::<String>();
+    let created_at = |id: &str| store.get_node(id).unwrap().created_at.to_string();
+    let expected_output = formatdoc!(
+        "
+        * {new_prompt_id} prompt {new_prompt_created_at} [main] new prompt
+        * {new_session_id} session {new_session_created_at} Fresh provider context.
+        ",
+        new_prompt_id = short_id(&new_prompt_id),
+        new_prompt_created_at = created_at(&new_prompt_id),
+        new_session_id = short_id(&new_session_id),
+        new_session_created_at = created_at(&new_session_id),
+    )
+    .strip_suffix('\n')
+    .expect("formatdoc output should end with one newline")
+    .to_owned();
+    assert_eq!(output, expected_output);
+
+    let all_output = run_with_backend(
+        session_graph_all_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let expected_all_output = formatdoc!(
+        "
+        * {new_text_id} text {new_text_created_at} [main] new text
+        * {new_prompt_id} prompt {new_prompt_created_at} new prompt
+        * {new_session_id} session {new_session_created_at} Fresh provider context.
+        * {old_text_id} text {old_text_created_at} old text
+        * {old_prompt_id} prompt {old_prompt_created_at} old prompt
+        * {original_session_id} session {original_session_created_at} You are helpful.
+        ",
+        new_text_id = short_id(&new_text_id),
+        new_text_created_at = created_at(&new_text_id),
+        new_prompt_id = short_id(&new_prompt_id),
+        new_prompt_created_at = created_at(&new_prompt_id),
+        new_session_id = short_id(&new_session_id),
+        new_session_created_at = created_at(&new_session_id),
+        old_text_id = short_id(&old_text_id),
+        old_text_created_at = created_at(&old_text_id),
+        old_prompt_id = short_id(&old_prompt_id),
+        old_prompt_created_at = created_at(&old_prompt_id),
+        original_session_id = short_id(&original_session_id),
+        original_session_created_at = created_at(&original_session_id),
+    )
+    .strip_suffix('\n')
+    .expect("formatdoc output should end with one newline")
+    .to_owned();
+    assert_eq!(all_output, expected_all_output);
+
+    let json_output = run_with_backend(
+        session_graph_all_json_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let entries = serde_json::from_str::<Vec<Value>>(&json_output).unwrap();
+    let node_ids = entries
+        .iter()
+        .map(|entry| entry["node"]["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        node_ids,
+        vec![
+            new_text_id,
+            new_prompt_id,
+            new_session_id,
+            old_text_id,
+            old_prompt_id,
+            original_session_id,
+        ]
+    );
+}
+
+#[tokio::test]
 async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
