@@ -5983,17 +5983,17 @@ async fn daemon_startup_replaces_invalid_builtin_day_branch() {
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
+    let main_head = store.get_branch_head("main").unwrap();
     store.delete_branch("day").unwrap();
-    let root_id = store.root_id();
-    store.fork("day", &root_id).unwrap();
-    assert_eq!(store.get_branch_head("day").unwrap(), root_id);
+    store.fork("day", &main_head).unwrap();
+    assert_eq!(store.get_branch_head("day").unwrap(), main_head);
 
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
 
     let day_head = store.get_branch_head("day").unwrap();
-    assert_ne!(day_head, root_id);
+    assert_ne!(day_head, main_head);
     let day_node = store.get_node(&day_head).unwrap();
     let Kind::Anchor(day_anchor) = day_node.kind else {
         panic!("expected day session anchor");

@@ -205,15 +205,32 @@ fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
     }
 
     let ancestry = store.ancestry(&head).context(StoreSnafu)?;
-    Ok(ancestry.into_iter().any(|node| {
-        matches!(
-            node.kind,
-            Kind::Anchor(Anchor {
-                payload: AnchorPayload::Session(_),
-                ..
-            })
-        )
-    }))
+    let Some(session) = ancestry.into_iter().find_map(|node| {
+        let Kind::Anchor(Anchor {
+            payload: AnchorPayload::Session(session),
+            ..
+        }) = node.kind
+        else {
+            return None;
+        };
+        Some(session)
+    }) else {
+        return Ok(false);
+    };
+
+    let expected_tools = default_builtin_day_tools()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    let actual_tools = session
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    Ok(session.role == SessionRole::Orchestrator
+        && session.system_prompt == DAY_SYSTEM_PROMPT
+        && session.enable_coco_shim
+        && actual_tools == expected_tools)
 }
 
 fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
