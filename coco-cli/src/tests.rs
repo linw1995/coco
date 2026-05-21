@@ -2777,6 +2777,95 @@ async fn session_graph_shows_tool_and_failure_nodes() {
 }
 
 #[tokio::test]
+async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+            run_with_backend(
+                session_fork_cli(store_path.clone(), "draft", Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let store = open_store(&store_path).unwrap();
+    let session_id = store.get_branch_head("main").unwrap();
+    let main_anchor_id = append_prompt_anchor(&store, &session_id, "main anchor", &[]);
+    let main_hidden_id = append_text_node(&store, &main_anchor_id, "main hidden text");
+    store
+        .set_branch_head("main", &session_id, &main_hidden_id)
+        .unwrap();
+    let draft_anchor_id = append_prompt_anchor(&store, &session_id, "draft anchor", &[]);
+    let draft_hidden_id = append_text_node(&store, &draft_anchor_id, "draft hidden text");
+    store
+        .set_branch_head("draft", &session_id, &draft_hidden_id)
+        .unwrap();
+    let merge_anchor_id =
+        append_prompt_anchor(&store, &main_hidden_id, "merge anchor", &[&draft_hidden_id]);
+    store
+        .set_branch_head("main", &main_hidden_id, &merge_anchor_id)
+        .unwrap();
+
+    let output = run_with_backend(
+        session_graph_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains("merge anchor merge=["));
+    assert!(output.contains("draft anchor"));
+    assert!(output.contains("main anchor"));
+    assert!(!output.contains("main hidden text"));
+    assert!(!output.contains("draft hidden text"));
+    let connector_lines = output
+        .lines()
+        .filter(|line| line.contains('\\') || line.contains('/'))
+        .collect::<Vec<_>>();
+    assert!(
+        connector_lines.contains(&"|\\"),
+        "expected anchor-only graph to connect compressed merge parents, got:\n{output}"
+    );
+
+    let json_output = run_with_backend(
+        session_graph_json_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let entries = serde_json::from_str::<Vec<Value>>(&json_output).unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|entry| graph_entry_kind(entry) == "Anchor")
+    );
+    let merge_entry = graph_entry_by_node_id(&entries, &merge_anchor_id);
+    assert_eq!(merge_entry["primary_parent"], main_anchor_id);
+    assert_eq!(
+        merge_entry["merge_parents"],
+        json!([{"kind": "merge", "node_id": draft_anchor_id}])
+    );
+    let draft_entry = graph_entry_by_node_id(&entries, &draft_anchor_id);
+    assert!(graph_entry_has_label(draft_entry, "draft"));
+}
+
+#[tokio::test]
 async fn session_graph_and_show_render_skill_result_anchor() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
