@@ -877,23 +877,10 @@ fn is_provider_context_start(node: &Node) -> bool {
 }
 
 fn is_context_start_session(session: &SessionAnchor) -> bool {
-    !is_skill_execution_prompt(&session.prompt)
-        || session
-            .active_skill
-            .as_ref()
-            .is_some_and(|active_skill| active_skill.handoff.is_some())
-}
-
-fn is_skill_execution_prompt(prompt: &str) -> bool {
-    current_skill_name_from_prompt(prompt).is_some()
-}
-
-fn current_skill_name_from_prompt(prompt: &str) -> Option<String> {
-    prompt
-        .strip_prefix("You are executing the skill `")
-        .and_then(|rest| rest.split_once('`'))
-        .map(|(name, _)| name.to_owned())
-        .filter(|name| !name.is_empty())
+    session
+        .active_skill
+        .as_ref()
+        .is_none_or(|active_skill| active_skill.handoff.is_some())
 }
 
 fn is_visible_graph_node(node: &Node, mode: SessionGraphMode) -> bool {

@@ -2899,7 +2899,8 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
     let original_session_id = store.get_branch_head("main").unwrap();
     let old_prompt_id = append_prompt_anchor(&store, &original_session_id, "old prompt", &[]);
     let old_text_id = append_text_node(&store, &old_prompt_id, "old text");
-    let new_session_id = append_session_anchor(&store, &old_text_id, "Fresh provider context.");
+    let new_session_id =
+        append_session_anchor(&store, &old_text_id, "You are executing the skill `docs`.");
     let new_prompt_id = append_prompt_anchor(&store, &new_session_id, "new prompt", &[]);
     let new_text_id = append_text_node(&store, &new_prompt_id, "new text");
     store
@@ -2920,7 +2921,7 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
     let expected_output = formatdoc!(
         "
         * {new_prompt_id} prompt {new_prompt_created_at} [main] new prompt
-        * {new_session_id} session {new_session_created_at} Fresh provider context.
+        * {new_session_id} session {new_session_created_at} You are executing the skill `docs`.
         ",
         new_prompt_id = short_id(&new_prompt_id),
         new_prompt_created_at = created_at(&new_prompt_id),
@@ -2945,7 +2946,7 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
         "
         * {new_text_id} text {new_text_created_at} [main] new text
         * {new_prompt_id} prompt {new_prompt_created_at} new prompt
-        * {new_session_id} session {new_session_created_at} Fresh provider context.
+        * {new_session_id} session {new_session_created_at} You are executing the skill `docs`.
         * {old_text_id} text {old_text_created_at} old text
         * {old_prompt_id} prompt {old_prompt_created_at} old prompt
         * {original_session_id} session {original_session_created_at} You are helpful.
