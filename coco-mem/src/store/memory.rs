@@ -147,6 +147,14 @@ impl SessionStore for MemoryStore {
         state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
         Ok(plan.new_head)
     }
+
+    fn handoff_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let plan = state.plan_handoff_session(name, patch)?;
+        state.insert_existing_node(plan.node)?;
+        state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
+        Ok(plan.new_head)
+    }
 }
 
 impl PresetStore for MemoryStore {

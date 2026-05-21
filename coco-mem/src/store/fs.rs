@@ -2471,6 +2471,12 @@ impl SessionStore for FsStore {
         let plan = state.plan_rebase_session(name, patch)?;
         apply_rebase_plan(&mut state, &self.persistence, plan)
     }
+
+    fn handoff_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let plan = state.plan_handoff_session(name, patch)?;
+        apply_handoff_plan(&mut state, &self.persistence, plan)
+    }
 }
 
 fn apply_rebase_plan(
@@ -2497,6 +2503,28 @@ fn apply_rebase_plan(
     for node in plan.nodes {
         state.insert_existing_node(node)?;
     }
+    state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
+    Ok(plan.new_head)
+}
+
+fn apply_handoff_plan(
+    state: &mut StoreState,
+    persistence: &Persistence,
+    plan: super::state::HandoffPlan,
+) -> Result<String> {
+    let mut persisted_state = state.clone();
+    persisted_state.insert_existing_node(plan.node.clone())?;
+    persisted_state.apply_set_branch_head(
+        plan.branch.clone(),
+        &plan.expected_old_head,
+        plan.new_head.clone(),
+    )?;
+
+    persistence.append_node(&plan.node)?;
+    persistence.rewrite_branch_view(&plan.branch, &plan.new_head, &persisted_state)?;
+    persistence.persist_sessions(&persisted_state)?;
+
+    state.insert_existing_node(plan.node)?;
     state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
     Ok(plan.new_head)
 }

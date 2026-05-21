@@ -418,6 +418,7 @@ fn apply_forwarded_defaults(
             SessionSubcommand::Show(_) => {}
             SessionSubcommand::Delete(command) => command.branch = branch,
             SessionSubcommand::Rebase(command) => command.branch = branch,
+            SessionSubcommand::Handoff(command) => command.branch = branch,
             SessionSubcommand::Reopen(command) => command.branch = branch,
             SessionSubcommand::Pr(command) => command.branch = branch,
             SessionSubcommand::Close(command) => command.branch = branch,

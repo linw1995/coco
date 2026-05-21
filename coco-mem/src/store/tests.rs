@@ -1515,6 +1515,86 @@ where
     assert_eq!(ancestry[2].id, root_id);
 }
 
+fn assert_handoff_session_appends_session_anchor_after_current_head<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    store.fork("main", &child_id).unwrap();
+
+    let new_head = store
+        .handoff_session("main", &SessionAnchorPatch::default())
+        .unwrap();
+
+    assert_ne!(new_head, child_id);
+    let ancestry = store.ancestry("main").unwrap();
+    assert_eq!(ancestry[0].id, new_head);
+    assert_eq!(ancestry[0].parent, child_id);
+    let Kind::Anchor(anchor) = &ancestry[0].kind else {
+        panic!("expected session anchor");
+    };
+    let session = anchor.as_session().expect("expected session anchor");
+    assert_eq!(session.provider.as_deref(), Some("openai"));
+    assert_eq!(session.model, "gpt-5.4");
+    assert_eq!(session.system_prompt, "system");
+    assert_eq!(ancestry[1].id, child_id);
+    assert_eq!(ancestry[2].id, session_id);
+    assert_eq!(ancestry[3].id, root_id);
+}
+
+fn assert_handoff_session_requires_visible_session_anchor<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+
+    let err = store
+        .handoff_session("main", &SessionAnchorPatch::default())
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::MissingSessionAnchor { branch } if branch == "main"
+    ));
+}
+
+fn assert_handoff_session_applies_session_patch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("main", &session_id).unwrap();
+
+    let new_head = store
+        .handoff_session(
+            "main",
+            &SessionAnchorPatch {
+                model: Some("claude-sonnet-4-20250514".to_owned()),
+                system_prompt: Some("You are strict.".to_owned()),
+                max_tokens: Some(Some(256)),
+                ..SessionAnchorPatch::default()
+            },
+        )
+        .unwrap();
+
+    let node = store.get_node(&new_head).unwrap();
+    let Kind::Anchor(anchor) = &node.kind else {
+        panic!("expected session anchor");
+    };
+    let session = anchor.as_session().expect("expected session anchor");
+    assert_eq!(session.provider.as_deref(), Some("openai"));
+    assert_eq!(session.model, "claude-sonnet-4-20250514");
+    assert_eq!(session.system_prompt, "You are strict.");
+    assert_eq!(session.max_tokens, Some(256));
+}
+
 fn assert_job_round_trip<F>()
 where
     F: TestStoreFactory,
@@ -2201,6 +2281,21 @@ macro_rules! define_common_store_tests {
             #[test]
             fn rebase_session_preserves_created_at_across_rewritten_chain() {
                 assert_rebase_session_preserves_created_at_across_rewritten_chain::<$factory>();
+            }
+
+            #[test]
+            fn handoff_session_appends_session_anchor_after_current_head() {
+                assert_handoff_session_appends_session_anchor_after_current_head::<$factory>();
+            }
+
+            #[test]
+            fn handoff_session_requires_visible_session_anchor() {
+                assert_handoff_session_requires_visible_session_anchor::<$factory>();
+            }
+
+            #[test]
+            fn handoff_session_applies_session_patch() {
+                assert_handoff_session_applies_session_patch::<$factory>();
             }
 
             #[test]

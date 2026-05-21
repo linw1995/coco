@@ -59,6 +59,11 @@ struct SessionRebaseResult {
     head_id: String,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+struct SessionHandoffResult {
+    head: String,
+}
+
 #[derive(Debug, PartialEq)]
 struct ResolvedSessionRebase {
     patch: SessionConfigPatch,
@@ -237,6 +242,21 @@ where
                 render_json(result)
             } else {
                 render_session_rebase_text(&result)
+            }))
+        }
+        SessionSubcommand::Handoff(command) => {
+            let branch = command.branch.clone();
+            let json = command.json;
+            let handoff = resolve_session_rebase(command, store, provider_profiles)?;
+            let head = llm
+                .handoff_session(&branch, handoff.patch)
+                .await
+                .context(LlmSnafu)?;
+            let result = SessionHandoffResult { head };
+            Ok(Some(if json {
+                render_json(result)
+            } else {
+                render_session_handoff_text(&result)
             }))
         }
         SessionSubcommand::Reopen(command) => {
@@ -471,6 +491,10 @@ fn render_session_delete_text(result: &SessionDeleteResult) -> String {
 
 fn render_session_rebase_text(result: &SessionRebaseResult) -> String {
     format!("branch: {}\nhead_id: {}", result.branch, result.head_id)
+}
+
+fn render_session_handoff_text(result: &SessionHandoffResult) -> String {
+    format!("head: {}", result.head)
 }
 
 fn render_session_mutation_text(result: &SessionMutationResult) -> String {

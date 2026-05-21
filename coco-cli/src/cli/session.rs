@@ -18,6 +18,8 @@ pub enum SessionSubcommand {
     Show(SessionShowCommand),
     Delete(SessionBranchCommand),
     Rebase(SessionRebaseCommand),
+    #[command(name = "handoff")]
+    Handoff(SessionRebaseCommand),
     #[command(name = "reopen")]
     Reopen(SessionBranchCommand),
     #[command(name = "pr")]
