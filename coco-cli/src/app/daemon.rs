@@ -782,9 +782,9 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .active_branch_prompt_job(&request.branch)
             .context(CoreEngineSnafu)?
         {
-            self.wait_for_active_branch_job(item, request, active_job)
-                .await;
-            return Ok(true);
+            return Ok(self
+                .wait_for_active_branch_job(item, request, active_job)
+                .await);
         }
 
         let guard = self.engine.lock_branch(&request.branch).await;
@@ -856,9 +856,9 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .context(CoreEngineSnafu)?
         {
             drop(guard);
-            self.wait_for_active_branch_job(&item, &request, active_job)
-                .await;
-            return Ok(true);
+            return Ok(self
+                .wait_for_active_branch_job(&item, &request, active_job)
+                .await);
         }
         let Some(item) = self
             .store
@@ -876,7 +876,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
         active_job: coco_mem::Job,
-    ) where
+    ) -> bool
+    where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
@@ -891,7 +892,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         );
 
         match self.engine.drive_job(&active_job.job_id).await {
-            Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => {}
+            Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => true,
             Ok(snapshot) => {
                 tracing::info!(
                     message_id = %item.message_id,
@@ -902,7 +903,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     active_job_status = ?snapshot.status,
                     "active branch prompt job still blocks queued request"
                 );
-                tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
+                false
             }
             Err(error) => {
                 tracing::warn!(
@@ -914,7 +915,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     error = %error,
                     "failed to wait for active branch prompt job before materializing queued request"
                 );
-                tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
+                false
             }
         }
     }

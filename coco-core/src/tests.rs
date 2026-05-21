@@ -677,6 +677,43 @@ async fn llm_engine_retries_job_from_before_failure_node() {
 }
 
 #[tokio::test]
+async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_event() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[(
+        "main",
+        &[Err(BackendError::Failed {
+            message: "backend still failed".to_owned(),
+        })],
+    )]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+    let current_head = store.get_branch_head("main").unwrap();
+    let failure_id = store
+        .append(NewNode {
+            parent: job.base.clone(),
+            role: Role::System,
+            metadata: BackendMetadata::builder().build(),
+            kind: Kind::Failure("transient backend outage".to_owned()),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &current_head, &failure_id)
+        .unwrap();
+
+    let snapshot = engine.drive_job(&job.job_id).await.unwrap();
+
+    assert_eq!(snapshot.status, JobStatus::Running);
+    assert!(
+        store
+            .list_queue_messages(SYSTEM_EVENT_QUEUE)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root_branch() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[

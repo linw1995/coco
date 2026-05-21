@@ -585,6 +585,7 @@ where
             None
         };
 
+        let is_retrying_failure = retry_from_failure.is_some();
         let origin_node_id = match retry_from_failure {
             Some(retry_from_failure) => retry_from_failure,
             None => match last_node {
@@ -625,7 +626,7 @@ where
 
         match self.service.run(request).await {
             Ok(_) => Ok(JobRunOutcome::Completed),
-            Err(source) => self.handle_completion_error(job, source),
+            Err(source) => self.handle_completion_error(job, source, !is_retrying_failure),
         }
     }
 
@@ -633,13 +634,27 @@ where
         &self,
         job: &Job,
         source: LlmError,
+        queue_recovery_event: bool,
     ) -> std::result::Result<JobRunOutcome, EngineError> {
         if let LlmError::Backend {
             source: backend_source,
             context,
         } = &source
         {
-            self.enqueue_backend_failure_recovery_event(job, backend_source, context)?;
+            if queue_recovery_event {
+                self.enqueue_backend_failure_recovery_event(job, backend_source, context)?;
+            } else {
+                tracing::warn!(
+                    job_id = %job.job_id,
+                    branch = %job.branch,
+                    work_branch = %job.work_branch,
+                    execution_id = %context.execution_id,
+                    error_node_id = %context.error_node_id,
+                    retry_from_node_id = %context.retry_from_node_id,
+                    error = %backend_source,
+                    "suppressed duplicate backend failure recovery request while retrying failed job"
+                );
+            }
             return Ok(JobRunOutcome::RecoveryQueued);
         }
         Err(source.into())
