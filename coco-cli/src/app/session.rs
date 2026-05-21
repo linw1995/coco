@@ -1580,10 +1580,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{GraphNodeEntry, render_graph_connector_row};
-    use coco_mem::{Kind, Role};
+    use coco_mem::{Kind, MergeParent, Role};
     use serde_json::json;
 
-    fn graph_entry(node_id: &str, primary_parent: Option<&str>) -> GraphNodeEntry {
+    fn graph_entry(
+        node_id: &str,
+        primary_parent: Option<&str>,
+        merge_parents: &[&str],
+    ) -> GraphNodeEntry {
         GraphNodeEntry {
             node: serde_json::from_value(json!({
                 "id": node_id,
@@ -1595,7 +1599,10 @@ mod tests {
             }))
             .expect("graph test node should deserialize"),
             primary_parent: primary_parent.map(str::to_owned),
-            merge_parents: Vec::new(),
+            merge_parents: merge_parents
+                .iter()
+                .map(|node_id| MergeParent::merge(*node_id))
+                .collect(),
             labels: Vec::new(),
         }
     }
@@ -1604,9 +1611,50 @@ mod tests {
     fn graph_connector_row_places_left_diagonal_between_columns() {
         let active_columns = vec!["left".to_owned(), "current".to_owned()];
         let next_columns = vec!["left".to_owned()];
-        let entry = graph_entry("current", Some("left"));
+        let entry = graph_entry("current", Some("left"), &[]);
 
         let connector_row = render_graph_connector_row(&active_columns, &next_columns, 1, &entry);
+
+        assert_eq!(connector_row.as_deref(), Some("|/"));
+    }
+
+    #[test]
+    fn graph_connector_row_spreads_multiple_right_targets_without_horizontal_fill() {
+        let active_columns = vec!["current".to_owned()];
+        let next_columns = vec![
+            "parent".to_owned(),
+            "right_one".to_owned(),
+            "right_two".to_owned(),
+        ];
+        let entry = graph_entry("current", Some("parent"), &["right_one", "right_two"]);
+
+        let connector_row = render_graph_connector_row(&active_columns, &next_columns, 0, &entry);
+
+        assert_eq!(connector_row.as_deref(), Some("|\\ \\"));
+    }
+
+    #[test]
+    fn graph_connector_row_spreads_multiple_left_targets_without_horizontal_fill() {
+        let active_columns = vec![
+            "left_two".to_owned(),
+            "left_one".to_owned(),
+            "current".to_owned(),
+        ];
+        let next_columns = vec!["left_two".to_owned(), "left_one".to_owned()];
+        let entry = graph_entry("current", Some("left_one"), &["left_two"]);
+
+        let connector_row = render_graph_connector_row(&active_columns, &next_columns, 2, &entry);
+
+        assert_eq!(connector_row.as_deref(), Some("|/|/"));
+    }
+
+    #[test]
+    fn graph_connector_row_shows_parent_column_shift_after_fanin() {
+        let active_columns = vec!["current".to_owned(), "parent".to_owned()];
+        let next_columns = vec!["parent".to_owned()];
+        let entry = graph_entry("current", Some("parent"), &[]);
+
+        let connector_row = render_graph_connector_row(&active_columns, &next_columns, 0, &entry);
 
         assert_eq!(connector_row.as_deref(), Some("|/"));
     }
