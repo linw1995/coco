@@ -5975,6 +5975,37 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
     assert_eq!(store.get_branch_head("day").unwrap(), day_head);
 }
 
+#[tokio::test]
+async fn daemon_startup_replaces_invalid_builtin_day_branch() {
+    let (_tempdir, store_path) = temp_store_path();
+    let store = open_store(&store_path).unwrap();
+    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
+    ensure_initial_session(&store, &llm, shared_test_provider_profiles())
+        .await
+        .unwrap();
+    store.delete_branch("day").unwrap();
+    let root_id = store.root_id();
+    store.fork("day", &root_id).unwrap();
+    assert_eq!(store.get_branch_head("day").unwrap(), root_id);
+
+    ensure_initial_session(&store, &llm, shared_test_provider_profiles())
+        .await
+        .unwrap();
+
+    let day_head = store.get_branch_head("day").unwrap();
+    assert_ne!(day_head, root_id);
+    let day_node = store.get_node(&day_head).unwrap();
+    let Kind::Anchor(day_anchor) = day_node.kind else {
+        panic!("expected day session anchor");
+    };
+    let AnchorPayload::Session(day_session) = day_anchor.payload else {
+        panic!("expected day session anchor payload");
+    };
+    assert_eq!(day_session.role, SessionRole::Orchestrator);
+    assert!(day_session.system_prompt.contains("CoCo Day"));
+    assert!(day_session.enable_coco_shim);
+}
+
 #[test]
 fn daemon_serve_enables_console_by_default() {
     let cli = Cli::parse_from(["coco", "daemon", "serve"]);

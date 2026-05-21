@@ -16,7 +16,9 @@ use coco_llm::{
     CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService, Provider,
     SessionConfig,
 };
-use coco_mem::{AnchorPayload, JobStatus, Kind, MessageQueueItem, SessionRole, Store, StoreError};
+use coco_mem::{
+    Anchor, AnchorPayload, JobStatus, Kind, MessageQueueItem, SessionRole, Store, StoreError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
@@ -153,8 +155,20 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
+    if builtin_day_session_is_valid(shared_store)? {
+        return Ok(());
+    }
+
     match shared_store.get_branch_head(BUILTIN_DAY_BRANCH) {
-        Ok(_) => return Ok(()),
+        Ok(_) => {
+            tracing::warn!(
+                branch = BUILTIN_DAY_BRANCH,
+                "replacing invalid builtin day session"
+            );
+            shared_store
+                .delete_branch(BUILTIN_DAY_BRANCH)
+                .context(StoreSnafu)?;
+        }
         Err(StoreError::BranchNotFound { .. }) => {}
         Err(source) => return Err(source).context(StoreSnafu),
     }
@@ -176,6 +190,30 @@ where
     );
     llm.create_session(config).await.context(LlmSnafu)?;
     Ok(())
+}
+
+fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
+    let head = match store.get_branch_head(BUILTIN_DAY_BRANCH) {
+        Ok(head) => head,
+        Err(StoreError::BranchNotFound { .. }) => return Ok(false),
+        Err(source) => return Err(source).context(StoreSnafu),
+    };
+    match store.get_session_state(BUILTIN_DAY_BRANCH) {
+        Ok(_) => {}
+        Err(StoreError::BranchNotFound { .. }) => return Ok(false),
+        Err(source) => return Err(source).context(StoreSnafu),
+    }
+
+    let ancestry = store.ancestry(&head).context(StoreSnafu)?;
+    Ok(ancestry.into_iter().any(|node| {
+        matches!(
+            node.kind,
+            Kind::Anchor(Anchor {
+                payload: AnchorPayload::Session(_),
+                ..
+            })
+        )
+    }))
 }
 
 fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
