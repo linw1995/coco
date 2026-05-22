@@ -1288,15 +1288,19 @@ fn should_drive_active_job_with_backoff(
     active_job_drives: &mut HashMap<String, Instant>,
     active_job: &coco_mem::Job,
 ) -> bool {
+    let now = Instant::now();
+    active_job_drives
+        .retain(|_, last_drive| now.duration_since(*last_drive) < ACTIVE_JOB_REDRIVE_INTERVAL);
+
     if matches!(active_job.status, JobStatus::Running)
         && active_job_drives
             .get(&active_job.job_id)
-            .is_some_and(|last_drive| last_drive.elapsed() < ACTIVE_JOB_REDRIVE_INTERVAL)
+            .is_some_and(|last_drive| now.duration_since(*last_drive) < ACTIVE_JOB_REDRIVE_INTERVAL)
     {
         return false;
     }
 
-    active_job_drives.insert(active_job.job_id.clone(), Instant::now());
+    active_job_drives.insert(active_job.job_id.clone(), now);
     true
 }
 
@@ -1716,6 +1720,7 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
@@ -1731,7 +1736,8 @@ mod tests {
         SessionConfig, StepContext,
     };
     use coco_mem::{
-        JobStatus, MemoryStore, MessageQueueStore, SessionAnchorPatch, SessionRole, SessionStore,
+        Job, JobStatus, MemoryStore, MessageQueueStore, SessionAnchorPatch, SessionRole,
+        SessionStore,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -2164,6 +2170,25 @@ mod tests {
 
         assert_eq!(config.model, "new-model");
         assert_eq!(config.max_tokens, Some(12_345));
+    }
+
+    #[test]
+    fn active_job_drive_backoff_prunes_expired_entries() {
+        let mut active_job = Job::new("job-active", "main", "base");
+        active_job.status = JobStatus::Running;
+        let stale_job_id = "job-stale".to_owned();
+        let mut active_job_drives = HashMap::from([(
+            stale_job_id.clone(),
+            Instant::now() - super::ACTIVE_JOB_REDRIVE_INTERVAL,
+        )]);
+
+        assert!(super::should_drive_active_job_with_backoff(
+            &mut active_job_drives,
+            &active_job,
+        ));
+
+        assert!(!active_job_drives.contains_key(&stale_job_id));
+        assert!(active_job_drives.contains_key(&active_job.job_id));
     }
 
     #[derive(Debug, Clone, Default)]
