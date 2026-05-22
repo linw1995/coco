@@ -495,7 +495,7 @@ pub fn default_skill_groups() -> SkillGroups {
         SkillRecord::new(
             "recovery",
             SkillVersionSpec {
-                description: "Recover the active work branch after an LLM backend failure."
+                description: "Recover an LLM backend failure from the built-in day branch."
                     .to_owned(),
                 body: include_str!("default_skills/recovery.md").trim().to_owned(),
                 scripts: Vec::new(),

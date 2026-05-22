@@ -51,8 +51,12 @@ const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
     "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e";
-const BUILTIN_RECOVERY_REVISION_ID: &str =
+const BUILTIN_RECOVERY_PREVIOUS_REVISION_ID: &str =
     "843b2016652dce5f8c6557ff72b0fecb24a68a03bafc8a8df1e72d903d376f81";
+const BUILTIN_RECOVERY_DAY_BRANCH_DRAFT_REVISION_ID: &str =
+    "9eac48e119c8ad4ee49aa58858007cafa4339453465e00631fd262eacb1ceb9b";
+const BUILTIN_RECOVERY_REVISION_ID: &str =
+    "a14ff2fcfeb14ffb5487b2dfeeb595e87b14b557e7b2c779e7d38c61f521a249";
 const BUILTIN_COMPACT_REVISION_ID: &str =
     "3abb36a6333215088666cb168fef445430d19e19e19232e9e703286e3be3b9c6";
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
@@ -89,7 +93,11 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "recovery",
-        from_revision_ids: &[BUILTIN_RECOVERY_REVISION_ID],
+        from_revision_ids: &[
+            BUILTIN_RECOVERY_PREVIOUS_REVISION_ID,
+            BUILTIN_RECOVERY_DAY_BRANCH_DRAFT_REVISION_ID,
+            BUILTIN_RECOVERY_REVISION_ID,
+        ],
         target_revision_id: BUILTIN_RECOVERY_REVISION_ID,
     },
     BuiltinSkillMigration {

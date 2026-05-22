@@ -2080,22 +2080,16 @@ where
             .current()
             .unwrap()
             .body
-            .contains("active work branch for the original")
+            .contains("Use this orchestrator skill from the built-in `day` branch")
     );
     assert!(
         recovery
             .current()
             .unwrap()
             .body
-            .contains("rebase the current `work_branch`")
+            .contains("Do not create another recovery branch")
     );
-    assert!(
-        recovery
-            .current()
-            .unwrap()
-            .body
-            .contains("fork a deterministic scratch")
-    );
+    assert!(recovery.current().unwrap().body.contains("Do not fork a"));
     assert!(
         compact
             .current()

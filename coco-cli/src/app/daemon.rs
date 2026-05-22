@@ -49,7 +49,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DAY_SYSTEM_PROMPT: &str = r#"You are CoCo Day, the built-in system event branch.
 
 Your only job is to consume CoCo system events and turn them into concrete recovery work.
-When you receive an LLM backend failure recovery event, inspect the event payload, use the `recovery` skill, and operate through the injected `coco` command. Treat the branch that handles the event as the active work branch for the original job until recovery succeeds or fails.
+When you receive an LLM backend failure recovery event, inspect the event payload and run the `recovery` skill from this `day` branch through the injected `coco` command. The failed `work_branch` in the event is the target to inspect or repair, not the branch executing recovery. Do not create or select another recovery branch.
 
 Use the `compact` skill when a target branch has accumulated enough anchors or history that future recovery is likely to exceed context budget. Compact with session graph inspection and `coco session handoff`."#;
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
@@ -1417,9 +1417,9 @@ fn render_system_event_prompt(event: &SystemEvent) -> String {
     match event {
         SystemEvent::LlmBackendFailureRecoveryRequested(event) => format!(
             "Handle this LLM backend failure recovery event.\n\n\
-             Use the `recovery` skill through `coco skill run recovery --handoff ...`. \
-             Treat work branch {work_branch:?} as the active recovery branch for job {job_id:?}. \
-             Recover the original task from failed branch {failed_branch:?}; CoCo core will restore root branch {root_branch:?} after success.\n\n\
+             Run `coco skill run recovery --handoff ...` from the `day` branch and pass the event fields below as the handoff. \
+             Treat work branch {work_branch:?} as the failed target branch for job {job_id:?}, not as the branch executing recovery. \
+             Do not fork or create another recovery branch; recover the original task through `day` and produce a normal successful answer.\n\n\
              Event fields:\n\
              - job_id: {job_id}\n\
              - root_branch: {root_branch}\n\
@@ -2129,7 +2129,10 @@ mod tests {
         assert_eq!(request.branch, "day");
         assert!(request.prompt.contains("job-failed"));
         assert!(request.prompt.contains("retry-node"));
-        assert!(request.prompt.contains("recovery"));
+        assert!(request.prompt.contains("coco skill run recovery"));
+        assert!(request.prompt.contains("from the `day` branch"));
+        assert!(request.prompt.contains("Do not fork"));
+        assert!(!request.prompt.contains("active recovery branch"));
     }
 
     #[derive(Debug, Clone, Default)]
