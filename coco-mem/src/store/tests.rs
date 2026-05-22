@@ -3286,6 +3286,168 @@ fn open_rejects_job_wal_unfinished_status_with_finished_at() {
 }
 
 #[test]
+fn open_replays_job_wal_work_branch_change() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    let updated = store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+    drop(store);
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.get_job(&job.job_id).unwrap(), updated);
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_for_missing_job() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let mut updated = submit_prompt_job(&store, "main", "hello");
+    updated.work_branch = "recovery".to_owned();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history.push(json!({
+        "op": "work_branch_changed",
+        "job_id": "missing-job",
+        "expected_work_branch": "main",
+        "updated": updated,
+    }));
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_with_mismatched_expected_branch() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["expected_work_branch"] = json!("stale");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_that_modifies_identity() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["updated"]["branch"] = json!("other");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_that_modifies_lifecycle() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["updated"]["status"] = json!("running");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_for_finished_job() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    let finished = store
+        .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+        .unwrap();
+    let mut updated = finished.clone();
+    updated.work_branch = "recovery".to_owned();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history.push(json!({
+        "op": "work_branch_changed",
+        "job_id": job.job_id,
+        "expected_work_branch": "main",
+        "updated": updated,
+    }));
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_when_branch_already_active() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("other", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    submit_prompt_job(&store, "other", "existing");
+    let mut updated = first.clone();
+    updated.work_branch = "other".to_owned();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history.push(json!({
+        "op": "work_branch_changed",
+        "job_id": first.job_id,
+        "expected_work_branch": "main",
+        "updated": updated,
+    }));
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
 fn open_replays_paused_merged_state_with_base_handoff_anchor() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
