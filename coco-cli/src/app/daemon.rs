@@ -251,7 +251,7 @@ fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>
     for branch in branches {
         let head = store.get_branch_head(&branch).context(StoreSnafu)?;
         let ancestry = store.ancestry(&head).context(StoreSnafu)?;
-        let Some(session_anchor) = ancestry.into_iter().rev().find_map(|node| {
+        let Some(session_anchor) = ancestry.into_iter().find_map(|node| {
             let Kind::Anchor(anchor) = &node.kind else {
                 return None;
             };
@@ -1730,7 +1730,9 @@ mod tests {
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
         SessionConfig, StepContext,
     };
-    use coco_mem::{JobStatus, MemoryStore, MessageQueueStore, SessionRole};
+    use coco_mem::{
+        JobStatus, MemoryStore, MessageQueueStore, SessionAnchorPatch, SessionRole, SessionStore,
+    };
     use serde_json::json;
     use tokio::sync::Notify;
 
@@ -2133,6 +2135,35 @@ mod tests {
         assert!(request.prompt.contains("from the `day` branch"));
         assert!(request.prompt.contains("Do not fork"));
         assert!(!request.prompt.contains("active recovery branch"));
+    }
+
+    #[tokio::test]
+    async fn derive_day_session_config_uses_latest_session_anchor() {
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(
+            store.clone(),
+            BlockingOnceBackend::default(),
+        ));
+        let mut config = session_config("main");
+        config.model = "old-model".to_owned();
+        llm.create_session(config).await.unwrap();
+        store
+            .handoff_session(
+                "main",
+                &SessionAnchorPatch {
+                    model: Some("new-model".to_owned()),
+                    max_tokens: Some(Some(12_345)),
+                    ..SessionAnchorPatch::default()
+                },
+            )
+            .unwrap();
+
+        let config = super::derive_day_session_config(&store)
+            .unwrap()
+            .expect("day config should be derived");
+
+        assert_eq!(config.model, "new-model");
+        assert_eq!(config.max_tokens, Some(12_345));
     }
 
     #[derive(Debug, Clone, Default)]
