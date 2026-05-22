@@ -1204,12 +1204,10 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert!(text_output.contains("branch: main"));
     let queued_messages = store.list_queue_messages("prompt.job").unwrap();
     assert_eq!(queued_messages.len(), 1);
-    assert_eq!(queued_messages[0].payload["kind"], "prompt");
-    let queued_request = &queued_messages[0].payload["payload"];
-    let text_job_id = queued_request["job_id"].as_str().unwrap();
+    let text_job_id = queued_messages[0].payload["job_id"].as_str().unwrap();
     assert!(store.get_job(text_job_id).is_err());
-    assert_eq!(queued_request["branch"], "main");
-    assert_eq!(queued_request["prompt"], "hello");
+    assert_eq!(queued_messages[0].payload["branch"], "main");
+    assert_eq!(queued_messages[0].payload["prompt"], "hello");
 
     let pending_status_output = crate::app::runtime::run_with_services(
         Cli::try_parse_from([
