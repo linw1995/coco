@@ -28,7 +28,10 @@ use tokio::sync::{Mutex, Notify};
 
 use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
-    prompt::{PROMPT_JOB_QUEUE, QueuedPromptRequest, queue_prompt_job_request},
+    prompt::{
+        BuiltinEventHandler, PROMPT_JOB_QUEUE, QueuedBranchWork, QueuedPromptRequest,
+        QueuedSystemEventBranchWork, decode_queued_branch_work, queue_branch_work_request,
+    },
     run_forwarded_with_services,
     runtime::{ForwardedRuntimeInputs, RuntimeServices},
     session::resolve_session_config,
@@ -655,8 +658,8 @@ impl<S> SystemEventMessageQueueWorker<S> {
             .context(StoreSnafu)?
         {
             match decode_system_event_message(item.payload.clone()) {
-                Ok(event) => {
-                    if !self.queue_day_prompt_for_event(&item, event)? {
+                Ok(_) => {
+                    if !self.queue_day_work_for_event(&item, item.payload.clone())? {
                         return Ok(handled);
                     }
                     self.store
@@ -680,10 +683,10 @@ impl<S> SystemEventMessageQueueWorker<S> {
         Ok(handled)
     }
 
-    fn queue_day_prompt_for_event(
+    fn queue_day_work_for_event(
         &self,
         item: &MessageQueueItem,
-        event: SystemEvent,
+        event_payload: serde_json::Value,
     ) -> Result<bool>
     where
         S: Store,
@@ -702,19 +705,18 @@ impl<S> SystemEventMessageQueueWorker<S> {
             Err(source) => return Err(source).context(StoreSnafu),
         }
 
-        let request = QueuedPromptRequest {
+        let request = QueuedBranchWork::SystemEvent(QueuedSystemEventBranchWork {
             job_id: format!("job-{}", item.message_id),
             branch: BUILTIN_DAY_BRANCH.to_owned(),
-            prompt: render_system_event_prompt(&event),
-            merge_parents: vec![],
-            session_patch: None,
-        };
-        queue_prompt_job_request(&self.store, request)?;
+            handler: BuiltinEventHandler::Day,
+            event: event_payload,
+        });
+        queue_branch_work_request(&self.store, request)?;
         tracing::info!(
             message_id = %item.message_id,
             queue = SYSTEM_EVENT_QUEUE,
             branch = BUILTIN_DAY_BRANCH,
-            "queued system event prompt on builtin day branch"
+            "queued system event branch work on builtin day branch"
         );
         Ok(true)
     }
@@ -789,13 +791,13 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
     async fn handle_prompt_request_queue_head(
         &self,
         item: &MessageQueueItem,
-        request: &QueuedPromptRequest,
+        request: &QueuedBranchWork,
     ) -> Result<bool>
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        match self.store.get_branch_head(&request.branch) {
+        match self.store.get_branch_head(request.branch()) {
             Ok(_) => {}
             Err(coco_mem::StoreError::BranchNotFound { .. }) => {
                 if self
@@ -807,8 +809,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     tracing::warn!(
                         message_id = %item.message_id,
                         queue = PROMPT_JOB_QUEUE,
-                        job_id = %request.job_id,
-                        branch = %request.branch,
+                        job_id = %request.job_id(),
+                        branch = %request.branch(),
                         "discarded queued prompt job request for missing branch"
                     );
                 }
@@ -817,7 +819,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             Err(error) => return Err(error).context(StoreSnafu),
         }
 
-        match self.store.get_job(&request.job_id) {
+        match self.store.get_job(request.job_id()) {
             Ok(_) => {
                 if self
                     .store
@@ -828,8 +830,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     tracing::warn!(
                         message_id = %item.message_id,
                         queue = PROMPT_JOB_QUEUE,
-                        job_id = %request.job_id,
-                        branch = %request.branch,
+                        job_id = %request.job_id(),
+                        branch = %request.branch(),
                         "discarded duplicate queued prompt job request"
                     );
                 }
@@ -841,7 +843,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
 
         if let Some(active_job) = self
             .engine
-            .active_branch_prompt_job(&request.branch)
+            .active_branch_prompt_job(request.branch())
             .context(CoreEngineSnafu)?
         {
             return Ok(self
@@ -849,7 +851,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 .await);
         }
 
-        let guard = self.engine.lock_branch(&request.branch).await;
+        let guard = self.engine.lock_branch(request.branch()).await;
         let Some(item) = self.peek_prompt_queue_head()? else {
             return Ok(true);
         };
@@ -868,7 +870,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             }
         };
 
-        match self.store.get_branch_head(&request.branch) {
+        match self.store.get_branch_head(request.branch()) {
             Ok(_) => {}
             Err(coco_mem::StoreError::BranchNotFound { .. }) => {
                 if self
@@ -880,8 +882,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     tracing::warn!(
                         message_id = %item.message_id,
                         queue = PROMPT_JOB_QUEUE,
-                        job_id = %request.job_id,
-                        branch = %request.branch,
+                        job_id = %request.job_id(),
+                        branch = %request.branch(),
                         "discarded queued prompt job request for missing branch"
                     );
                 }
@@ -890,7 +892,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             Err(error) => return Err(error).context(StoreSnafu),
         }
 
-        match self.store.get_job(&request.job_id) {
+        match self.store.get_job(request.job_id()) {
             Ok(_) => {
                 if self
                     .store
@@ -901,8 +903,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     tracing::warn!(
                         message_id = %item.message_id,
                         queue = PROMPT_JOB_QUEUE,
-                        job_id = %request.job_id,
-                        branch = %request.branch,
+                        job_id = %request.job_id(),
+                        branch = %request.branch(),
                         "discarded duplicate queued prompt job request"
                     );
                 }
@@ -914,7 +916,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
 
         if let Some(active_job) = self
             .engine
-            .active_branch_prompt_job(&request.branch)
+            .active_branch_prompt_job(request.branch())
             .context(CoreEngineSnafu)?
         {
             drop(guard);
@@ -936,7 +938,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
     async fn wait_for_active_branch_job(
         &self,
         item: &MessageQueueItem,
-        request: &QueuedPromptRequest,
+        request: &QueuedBranchWork,
         active_job: coco_mem::Job,
     ) -> bool
     where
@@ -946,8 +948,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         tracing::info!(
             message_id = %item.message_id,
             queue = PROMPT_JOB_QUEUE,
-            branch = %request.branch,
-            job_id = %request.job_id,
+            branch = %request.branch(),
+            job_id = %request.job_id(),
             active_job_id = %active_job.job_id,
             active_job_status = ?active_job.status,
             "waiting to materialize queued prompt job request behind active branch job"
@@ -957,8 +959,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             tracing::info!(
                 message_id = %item.message_id,
                 queue = PROMPT_JOB_QUEUE,
-                branch = %request.branch,
-                job_id = %request.job_id,
+                branch = %request.branch(),
+                job_id = %request.job_id(),
                 active_job_id = %active_job.job_id,
                 active_job_status = ?active_job.status,
                 "active branch prompt job was driven recently; queued request will wait"
@@ -972,8 +974,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 tracing::info!(
                     message_id = %item.message_id,
                     queue = PROMPT_JOB_QUEUE,
-                    branch = %request.branch,
-                    job_id = %request.job_id,
+                    branch = %request.branch(),
+                    job_id = %request.job_id(),
                     active_job_id = %active_job.job_id,
                     active_job_status = ?snapshot.status,
                     "active branch prompt job still blocks queued request"
@@ -984,8 +986,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 tracing::warn!(
                     message_id = %item.message_id,
                     queue = PROMPT_JOB_QUEUE,
-                    branch = %request.branch,
-                    job_id = %request.job_id,
+                    branch = %request.branch(),
+                    job_id = %request.job_id(),
                     active_job_id = %active_job.job_id,
                     error = %error,
                     "failed to wait for active branch prompt job before materializing queued request"
@@ -1005,8 +1007,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        let job = match decode_prompt_job_message(item.payload) {
-            Ok(job) => job,
+        let work = match decode_prompt_job_message(item.payload) {
+            Ok(work) => work,
             Err(error) => {
                 tracing::error!(
                     message_id = %item.message_id,
@@ -1021,14 +1023,14 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         tracing::info!(
             message_id = %item.message_id,
             queue = PROMPT_JOB_QUEUE,
-            job_id = %job.job_id,
-            branch = %job.branch,
-            "handling queued prompt job request"
+            job_id = %work.job_id(),
+            branch = %work.branch(),
+            "handling queued branch work request"
         );
-        self.handle_prompt_request(&item.message_id, job).await;
+        self.handle_prompt_request(&item.message_id, work).await;
     }
 
-    async fn handle_prompt_request(&self, message_id: &str, request: QueuedPromptRequest)
+    async fn handle_prompt_request(&self, message_id: &str, request: QueuedBranchWork)
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
@@ -1038,8 +1040,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 tracing::warn!(
                     message_id = %message_id,
                     queue = PROMPT_JOB_QUEUE,
-                    job_id = %request.job_id,
-                    branch = %request.branch,
+                    job_id = %request.job_id(),
+                    branch = %request.branch(),
                     error = %error,
                     "discarded queued prompt job request for missing branch"
                 );
@@ -1050,8 +1052,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 tracing::warn!(
                     message_id = %message_id,
                     queue = PROMPT_JOB_QUEUE,
-                    job_id = %request.job_id,
-                    branch = %request.branch,
+                    job_id = %request.job_id(),
+                    branch = %request.branch(),
                     error = %error,
                     "discarded duplicate queued prompt job request"
                 );
@@ -1061,19 +1063,20 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             tracing::warn!(
                 message_id = %message_id,
                 queue = PROMPT_JOB_QUEUE,
-                job_id = %request.job_id,
-                branch = %request.branch,
+                job_id = %request.job_id(),
+                branch = %request.branch(),
                 error = %error,
                 "discarded queued prompt job request after submission failure"
             );
         }
     }
 
-    async fn try_handle_prompt_request(&self, request: &QueuedPromptRequest) -> Result<()>
+    async fn try_handle_prompt_request(&self, request: &QueuedBranchWork) -> Result<()>
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
+        let request = materialize_branch_work(request)?;
         let job = self
             .engine
             .submit_job_with_id_and_session_patch(
@@ -1395,8 +1398,8 @@ fn decode_telegram_message(
 
 fn decode_prompt_job_message(
     payload: serde_json::Value,
-) -> std::result::Result<QueuedPromptRequest, PromptJobQueuePayloadError> {
-    serde_json::from_value(payload).context(DecodePromptJobSnafu)
+) -> std::result::Result<QueuedBranchWork, PromptJobQueuePayloadError> {
+    decode_queued_branch_work(payload).context(DecodePromptJobSnafu)
 }
 
 fn decode_system_event_message(
@@ -1445,6 +1448,28 @@ fn render_system_event_prompt(event: &SystemEvent) -> String {
             retry_from_node_id = event.retry_from_node_id,
             message = event.message,
         ),
+    }
+}
+
+fn materialize_branch_work(request: &QueuedBranchWork) -> Result<QueuedPromptRequest> {
+    match request {
+        QueuedBranchWork::Prompt(request) => Ok((**request).clone()),
+        QueuedBranchWork::SystemEvent(request) => match request.handler {
+            BuiltinEventHandler::Day => {
+                let event = decode_system_event_message(request.event.clone())
+                    .map_err(|error| EngineError::EngineFailed {
+                        message: format!("failed to materialize queued system event: {error}"),
+                    })
+                    .context(CoreEngineSnafu)?;
+                Ok(QueuedPromptRequest {
+                    job_id: request.job_id.clone(),
+                    branch: request.branch.clone(),
+                    prompt: render_system_event_prompt(&event),
+                    merge_parents: vec![],
+                    session_patch: None,
+                })
+            }
+        },
     }
 }
 
@@ -1699,11 +1724,15 @@ mod tests {
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
         SessionConfig, StepContext,
     };
-    use coco_mem::{JobStatus, MemoryStore, MessageQueueStore, SessionRole};
+    use coco_mem::{
+        JobStatus, JobStore, Kind, MemoryStore, MessageQueueStore, NodeStore, SessionRole,
+    };
     use serde_json::json;
     use tokio::sync::Notify;
 
-    use crate::app::prompt::QueuedPromptRequest;
+    use crate::app::prompt::{
+        BuiltinEventHandler, QueuedBranchWork, QueuedPromptRequest, QueuedSystemEventBranchWork,
+    };
 
     use super::{
         PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, SYSTEM_EVENT_QUEUE,
@@ -1945,13 +1974,13 @@ mod tests {
             .await
             .unwrap();
         let active_job_id = active_job.job_id.clone();
-        let request = QueuedPromptRequest {
+        let request = QueuedBranchWork::Prompt(Box::new(QueuedPromptRequest {
             job_id: "job-request".to_owned(),
             branch: "main".to_owned(),
             prompt: "queued work".to_owned(),
             merge_parents: vec![],
             session_patch: None,
-        };
+        }));
         store
             .enqueue_message(PROMPT_JOB_QUEUE, json!(request.clone()))
             .unwrap();
@@ -2054,7 +2083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_event_queue_worker_materializes_day_prompt_request() {
+    async fn system_event_queue_worker_queues_day_branch_work() {
         let store = MemoryStore::new();
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -2092,13 +2121,61 @@ mod tests {
         );
         let prompt_items = store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap();
         assert_eq!(prompt_items.len(), 1);
-        let request: QueuedPromptRequest =
+        let request: QueuedBranchWork =
             serde_json::from_value(prompt_items[0].payload.clone()).unwrap();
+        let QueuedBranchWork::SystemEvent(request) = request else {
+            panic!("expected system event branch work");
+        };
         assert_eq!(request.job_id, format!("job-{}", item.message_id));
         assert_eq!(request.branch, "day");
-        assert!(request.prompt.contains("job-failed"));
-        assert!(request.prompt.contains("retry-node"));
-        assert!(request.prompt.contains("recovery"));
+        assert_eq!(request.handler, BuiltinEventHandler::Day);
+        assert_eq!(request.event["data"]["job_id"], "job-failed");
+        assert_eq!(request.event["data"]["retry_from_node_id"], "retry-node");
+    }
+
+    #[tokio::test]
+    async fn prompt_job_queue_worker_materializes_system_event_prompt_when_submitting() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("day")).await.unwrap();
+        let request = QueuedBranchWork::SystemEvent(QueuedSystemEventBranchWork {
+            job_id: "job-system-event".to_owned(),
+            branch: "day".to_owned(),
+            handler: BuiltinEventHandler::Day,
+            event: json!({
+                "type": "llm.backend_failure.recovery_requested",
+                "version": 1,
+                "dedupe_key": "llm.backend_failure:error-node",
+                "data": {
+                    "job_id": "job-failed",
+                    "root_branch": "main",
+                    "work_branch": "main",
+                    "failed_branch": "main",
+                    "base_node_id": "base-node",
+                    "execution_id": "execution-1",
+                    "error_node_id": "error-node",
+                    "retry_from_node_id": "retry-node",
+                    "message": "backend failed"
+                }
+            }),
+        });
+        store
+            .enqueue_message(PROMPT_JOB_QUEUE, json!(request))
+            .unwrap();
+        let worker = PromptJobMessageQueueWorker::new(store.clone(), ConversationEngine::new(llm));
+
+        worker.drain_once().await.unwrap();
+
+        let job = store.get_job("job-system-event").unwrap();
+        let prompt_node = store.get_node(&job.base).unwrap();
+        let Kind::Anchor(anchor) = prompt_node.kind else {
+            panic!("expected prompt anchor");
+        };
+        let prompt = &anchor.as_prompt().expect("expected prompt anchor").prompt;
+        assert!(prompt.contains("job-failed"));
+        assert!(prompt.contains("retry-node"));
+        assert!(prompt.contains("recovery"));
     }
 
     #[derive(Debug, Clone, Default)]

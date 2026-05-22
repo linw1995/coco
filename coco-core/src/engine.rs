@@ -21,7 +21,7 @@ type JobResult = std::result::Result<String, EngineError>;
 type InflightJob = Shared<BoxFuture<'static, JobResult>>;
 type InflightJobTable = Arc<AsyncMutex<HashMap<String, InflightJob>>>;
 pub type BranchLockGuard = coco_llm::BranchLockGuard;
-pub const SYSTEM_EVENT_QUEUE: &str = "mq-system";
+pub const SYSTEM_EVENT_QUEUE: &str = "system";
 const LLM_BACKEND_FAILURE_RECOVERY_REQUESTED: &str = "llm.backend_failure.recovery_requested";
 const SYSTEM_EVENT_VERSION: u64 = 1;
 

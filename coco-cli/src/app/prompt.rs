@@ -13,7 +13,7 @@ use coco_llm::{
 };
 use coco_mem::{AnchorPayload, JobStore, Kind, MergeParent, MessageQueueItem, NodeStore, Store};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use snafu::prelude::*;
 use tokio::process::Command;
 
@@ -60,6 +60,43 @@ pub(crate) struct QueuedPromptRequest {
     pub prompt: String,
     pub merge_parents: Vec<MergeParent>,
     pub session_patch: Option<SessionConfigPatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub(crate) enum QueuedBranchWork {
+    Prompt(Box<QueuedPromptRequest>),
+    SystemEvent(QueuedSystemEventBranchWork),
+}
+
+impl QueuedBranchWork {
+    pub(crate) fn job_id(&self) -> &str {
+        match self {
+            Self::Prompt(request) => &request.job_id,
+            Self::SystemEvent(request) => &request.job_id,
+        }
+    }
+
+    pub(crate) fn branch(&self) -> &str {
+        match self {
+            Self::Prompt(request) => &request.branch,
+            Self::SystemEvent(request) => &request.branch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct QueuedSystemEventBranchWork {
+    pub job_id: String,
+    pub branch: String,
+    pub handler: BuiltinEventHandler,
+    pub event: Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BuiltinEventHandler {
+    Day,
 }
 
 #[derive(Debug, Serialize)]
@@ -409,9 +446,25 @@ pub(crate) fn queue_prompt_job_request(
     store: &impl Store,
     request: QueuedPromptRequest,
 ) -> Result<MessageQueueItem> {
+    queue_branch_work_request(store, QueuedBranchWork::Prompt(Box::new(request)))
+}
+
+pub(crate) fn queue_branch_work_request(
+    store: &impl Store,
+    request: QueuedBranchWork,
+) -> Result<MessageQueueItem> {
     store
         .enqueue_message(PROMPT_JOB_QUEUE, json!(request))
         .context(StoreSnafu)
+}
+
+pub(crate) fn decode_queued_branch_work(payload: Value) -> serde_json::Result<QueuedBranchWork> {
+    match serde_json::from_value::<QueuedBranchWork>(payload.clone()) {
+        Ok(request) => Ok(request),
+        Err(_) => serde_json::from_value::<QueuedPromptRequest>(payload)
+            .map(Box::new)
+            .map(QueuedBranchWork::Prompt),
+    }
 }
 
 async fn spawn_prompt_worker(store_path: &Path, job_id: &str) -> Result<()> {
@@ -553,32 +606,44 @@ fn load_queued_prompt_request_status(
         .list_queue_messages(PROMPT_JOB_QUEUE)
         .context(StoreSnafu)?;
     let Some((item, request)) = items.into_iter().find_map(|item| {
-        serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
+        decode_queued_branch_work(item.payload.clone())
             .ok()
-            .filter(|request| request.job_id == job_id)
+            .filter(|request| request.job_id() == job_id)
             .map(|request| (item, request))
     }) else {
         return Ok(None);
     };
     let head = store
-        .get_branch_head(&request.branch)
+        .get_branch_head(request.branch())
         .context(StoreSnafu)?
         .to_owned();
+    let request_details = queued_branch_work_details(&request);
     Ok(Some(QueuedPromptRequestStatusView {
         job: QueuedPromptRequestJobView {
-            job_id: request.job_id,
+            job_id: request.job_id().to_owned(),
             created_at: item.created_at.to_string(),
             finished_at: None,
-            branch: request.branch,
+            branch: request.branch().to_owned(),
             base: head.clone(),
             status: JobStatus::Queued,
             head,
         },
-        request: QueuedPromptRequestDetailsView {
-            prompt: request.prompt,
-            merge_parents: request.merge_parents,
-        },
+        request: request_details,
     }))
+}
+
+fn queued_branch_work_details(request: &QueuedBranchWork) -> QueuedPromptRequestDetailsView {
+    match request {
+        QueuedBranchWork::Prompt(request) => QueuedPromptRequestDetailsView {
+            prompt: request.prompt.clone(),
+            merge_parents: request.merge_parents.clone(),
+        },
+        QueuedBranchWork::SystemEvent(_) => QueuedPromptRequestDetailsView {
+            prompt: "System event prompt will be materialized when the branch work runs."
+                .to_owned(),
+            merge_parents: vec![],
+        },
+    }
 }
 
 pub(crate) fn next_prompt_job_id() -> String {
