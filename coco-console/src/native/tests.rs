@@ -298,6 +298,45 @@ fn graph_snapshot_contains_store_entities() {
         }
         _ => panic!("expected skills collection"),
     }
+    let branches =
+        crate::graph::build_entity_collection(&store, GraphEntityKind::Branches).unwrap();
+    match branches {
+        GraphEntityCollection::Branches(branches) => {
+            assert_eq!(branches.len(), 1);
+            assert_eq!(branches[0].name, "main");
+            assert_eq!(branches[0].head_id, session);
+        }
+        _ => panic!("expected branches collection"),
+    }
+    let sessions =
+        crate::graph::build_entity_collection(&store, GraphEntityKind::Sessions).unwrap();
+    match sessions {
+        GraphEntityCollection::Sessions(sessions) => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].branch, "main");
+            assert_eq!(sessions[0].state, "Active");
+        }
+        _ => panic!("expected sessions collection"),
+    }
+    let presets = crate::graph::build_entity_collection(&store, GraphEntityKind::Presets).unwrap();
+    match presets {
+        GraphEntityCollection::Presets(presets) => {
+            assert_eq!(presets.len(), 1);
+            assert_eq!(presets[0].name, "default");
+            assert_eq!(presets[0].prompt, "Prompt");
+            assert_eq!(presets[0].system_prompt, "System prompt");
+        }
+        _ => panic!("expected presets collection"),
+    }
+    let jobs = crate::graph::build_entity_collection(&store, GraphEntityKind::Jobs).unwrap();
+    match jobs {
+        GraphEntityCollection::Jobs(jobs) => {
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].branch, "main");
+            assert_eq!(jobs[0].status, "Queued");
+        }
+        _ => panic!("expected jobs collection"),
+    }
     let queues = crate::graph::build_entity_collection(&store, GraphEntityKind::Queues).unwrap();
     match queues {
         GraphEntityCollection::Queues(queues) => {
@@ -458,6 +497,32 @@ fn query_values_are_percent_decoded() {
         super::server::parse_query_value("id=a+b", "id"),
         Some("a b".to_owned())
     );
+}
+
+#[test]
+fn entity_kind_parser_accepts_known_sections() {
+    assert_eq!(
+        GraphEntityKind::parse("branches"),
+        Some(GraphEntityKind::Branches)
+    );
+    assert_eq!(
+        GraphEntityKind::parse("sessions"),
+        Some(GraphEntityKind::Sessions)
+    );
+    assert_eq!(
+        GraphEntityKind::parse("presets"),
+        Some(GraphEntityKind::Presets)
+    );
+    assert_eq!(
+        GraphEntityKind::parse("skills"),
+        Some(GraphEntityKind::Skills)
+    );
+    assert_eq!(GraphEntityKind::parse("jobs"), Some(GraphEntityKind::Jobs));
+    assert_eq!(
+        GraphEntityKind::parse("queues"),
+        Some(GraphEntityKind::Queues)
+    );
+    assert_eq!(GraphEntityKind::parse("nodes"), None);
 }
 
 #[tokio::test]
