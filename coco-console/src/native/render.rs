@@ -4,8 +4,8 @@ use leptos::prelude::*;
 
 use crate::graph::{GraphNode, GraphSnapshot, css_token};
 use crate::layout::{
-    GraphLane, GraphLayout, GraphLayoutEdge, GraphLayoutEdgeKind, GraphNodeOccurrence, Point,
-    layout_graph, line_points, routed_elbow_points,
+    GraphLane, GraphLayout, GraphLayoutEdge, GraphLayoutEdgeKind, GraphNodeOccurrence, RenderPoint,
+    layout_graph, line_points, line_render_points, routed_elbow_points, routed_elbow_render_points,
 };
 
 const GRAPH_CULL_EDGE_MARGIN: i32 = 180;
@@ -270,11 +270,15 @@ fn GraphLaneLabel<'a>(lane: &'a GraphLane) -> impl IntoView {
 #[component]
 fn GraphEdgeView<'a>(edge: &'a GraphLayoutEdge) -> AnyView {
     let marker = edge_marker(edge.kind);
-    let bounds = edge_bounds(edge.source, edge.target);
 
     match edge.kind {
         GraphLayoutEdgeKind::PrimaryParent => {
             let (x1, y1, x2, y2) = line_points(edge.source, edge.target, edge.target_port_offset);
+            let bounds = edge_bounds(line_render_points(
+                edge.source,
+                edge.target,
+                edge.target_port_offset,
+            ));
             view! {
                 <line
                     class="edge primary-parent graph-item"
@@ -298,6 +302,12 @@ fn GraphEdgeView<'a>(edge: &'a GraphLayoutEdge) -> AnyView {
                 edge.route_slot,
                 edge.target_port_offset,
             );
+            let bounds = edge_bounds(routed_elbow_render_points(
+                edge.source,
+                edge.target,
+                edge.route_slot,
+                edge.target_port_offset,
+            ));
             let class = match edge.kind {
                 GraphLayoutEdgeKind::Fork => "edge fork graph-item",
                 GraphLayoutEdgeKind::MergeParent => "edge merge-parent graph-item",
@@ -530,16 +540,32 @@ fn edge_marker(kind: GraphLayoutEdgeKind) -> &'static str {
     }
 }
 
-fn edge_bounds(source: Point, target: Point) -> GraphItemBounds {
-    let min_x = source.x.min(target.x) - GRAPH_CULL_EDGE_MARGIN;
-    let min_y = source.y.min(target.y) - GRAPH_CULL_EDGE_MARGIN;
-    let max_x = source.x.max(target.x) + GRAPH_CULL_EDGE_MARGIN;
-    let max_y = source.y.max(target.y) + GRAPH_CULL_EDGE_MARGIN;
+fn edge_bounds(points: impl IntoIterator<Item = RenderPoint>) -> GraphItemBounds {
+    let mut points = points.into_iter();
+    let Some(first) = points.next() else {
+        return GraphItemBounds {
+            min_x: "0".to_owned(),
+            min_y: "0".to_owned(),
+            max_x: "0".to_owned(),
+            max_y: "0".to_owned(),
+        };
+    };
+    let (min_x, min_y, max_x, max_y) = points.fold(
+        (first.x, first.y, first.x, first.y),
+        |(min_x, min_y, max_x, max_y), point| {
+            (
+                min_x.min(point.x),
+                min_y.min(point.y),
+                max_x.max(point.x),
+                max_y.max(point.y),
+            )
+        },
+    );
 
     GraphItemBounds {
-        min_x: min_x.to_string(),
-        min_y: min_y.to_string(),
-        max_x: max_x.to_string(),
-        max_y: max_y.to_string(),
+        min_x: format!("{:.1}", min_x - f64::from(GRAPH_CULL_EDGE_MARGIN)),
+        min_y: format!("{:.1}", min_y - f64::from(GRAPH_CULL_EDGE_MARGIN)),
+        max_x: format!("{:.1}", max_x + f64::from(GRAPH_CULL_EDGE_MARGIN)),
+        max_y: format!("{:.1}", max_y + f64::from(GRAPH_CULL_EDGE_MARGIN)),
     }
 }

@@ -15,7 +15,8 @@ use crate::graph::{
 };
 use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LANE_HEIGHT, GRAPH_LEFT_X, GRAPH_TOP_Y,
-    GraphLayoutEdgeKind, Point, layout_graph, routed_elbow_points,
+    GraphLayoutEdgeKind, Point, layout_graph, line_render_points, routed_elbow_points,
+    routed_elbow_render_points,
 };
 use crate::render::{render_fragment, render_index_page, render_snapshot_page};
 use crate::{
@@ -410,11 +411,33 @@ fn routed_edges_use_inter_lane_corridors() {
 
     let first_route = routed_elbow_points(source, target, 0, 0.0);
     let second_route = routed_elbow_points(source, target, 1, 0.0);
+    let shifted_route = routed_elbow_render_points(source, target, 0, EDGE_TARGET_PORT_STEP);
 
     assert!(first_route.contains("190.0,160.0 258.0,160.0"));
     assert!(!first_route.contains("190.0,90.0 258.0,90.0"));
     assert!(!first_route.contains("190.0,230.0 258.0,230.0"));
     assert!(second_route.contains("190.0,148.0 258.0,148.0"));
+    assert_eq!(
+        shifted_route.last().unwrap().y,
+        f64::from(target.y) + EDGE_TARGET_PORT_STEP
+    );
+}
+
+#[test]
+fn rendered_edge_points_include_target_port_offsets() {
+    let source = Point {
+        x: GRAPH_LEFT_X,
+        y: GRAPH_TOP_Y,
+    };
+    let target = Point {
+        x: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH,
+        y: GRAPH_TOP_Y,
+    };
+
+    let base = line_render_points(source, target, 0.0);
+    let shifted = line_render_points(source, target, EDGE_TARGET_PORT_STEP);
+
+    assert!(shifted[1].y > base[1].y);
 }
 
 #[test]

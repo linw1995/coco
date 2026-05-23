@@ -21,6 +21,12 @@ pub struct Point {
     pub y: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
 #[derive(Debug)]
 pub struct GraphLayout {
     pub lanes: Vec<GraphLane>,
@@ -85,41 +91,50 @@ pub fn line_points(
     target: Point,
     target_port_offset: f64,
 ) -> (String, String, String, String) {
-    let (start_x, start_y, end_x, end_y) = line_point_values(source, target, target_port_offset);
+    let [start, end] = line_render_points(source, target, target_port_offset);
     (
-        format!("{start_x:.1}"),
-        format!("{start_y:.1}"),
-        format!("{end_x:.1}"),
-        format!("{end_y:.1}"),
+        format!("{:.1}", start.x),
+        format!("{:.1}", start.y),
+        format!("{:.1}", end.x),
+        format!("{:.1}", end.y),
     )
 }
 
-fn line_point_values(
+pub fn line_render_points(
     source: Point,
     target: Point,
     target_port_offset: f64,
-) -> (f64, f64, f64, f64) {
+) -> [RenderPoint; 2] {
     let dx = f64::from(target.x - source.x);
     let target_y = f64::from(target.y) + target_port_offset;
     let dy = target_y - f64::from(source.y);
     let distance = (dx * dx + dy * dy).sqrt();
     if distance <= NODE_RADIUS * 2.0 {
-        return (
-            f64::from(source.x),
-            f64::from(source.y),
-            f64::from(target.x),
-            target_y,
-        );
+        return [
+            RenderPoint {
+                x: f64::from(source.x),
+                y: f64::from(source.y),
+            },
+            RenderPoint {
+                x: f64::from(target.x),
+                y: target_y,
+            },
+        ];
     }
 
     let ux = dx / distance;
     let uy = dy / distance;
-    let start_x = f64::from(source.x) + ux * (NODE_RADIUS + 2.0);
-    let start_y = f64::from(source.y) + uy * (NODE_RADIUS + 2.0);
-    let end_x = f64::from(target.x) - ux * (NODE_RADIUS + 8.0);
-    let end_y = target_y - uy * (NODE_RADIUS + 8.0);
 
-    (start_x, start_y, end_x, end_y)
+    [
+        RenderPoint {
+            x: f64::from(source.x) + ux * (NODE_RADIUS + 2.0),
+            y: f64::from(source.y) + uy * (NODE_RADIUS + 2.0),
+        },
+        RenderPoint {
+            x: f64::from(target.x) - ux * (NODE_RADIUS + 8.0),
+            y: target_y - uy * (NODE_RADIUS + 8.0),
+        },
+    ]
 }
 
 pub fn routed_elbow_points(
@@ -128,6 +143,19 @@ pub fn routed_elbow_points(
     route_slot: i32,
     target_port_offset: f64,
 ) -> String {
+    routed_elbow_render_points(source, target, route_slot, target_port_offset)
+        .iter()
+        .map(|point| format!("{:.1},{:.1}", point.x, point.y))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn routed_elbow_render_points(
+    source: Point,
+    target: Point,
+    route_slot: i32,
+    target_port_offset: f64,
+) -> [RenderPoint; 6] {
     let start_x = f64::from(source.x) + NODE_RADIUS + 2.0;
     let start_y = f64::from(source.y);
     let end_x = if target.x > source.x {
@@ -140,9 +168,29 @@ pub fn routed_elbow_points(
     let approach_x = (end_x - EDGE_TARGET_APPROACH).max(exit_x + EDGE_TARGET_APPROACH);
     let corridor_y = edge_corridor_y(source.y, target.y, route_slot);
 
-    format!(
-        "{start_x:.1},{start_y:.1} {exit_x:.1},{start_y:.1} {exit_x:.1},{corridor_y:.1} {approach_x:.1},{corridor_y:.1} {approach_x:.1},{end_y:.1} {end_x:.1},{end_y:.1}"
-    )
+    [
+        RenderPoint {
+            x: start_x,
+            y: start_y,
+        },
+        RenderPoint {
+            x: exit_x,
+            y: start_y,
+        },
+        RenderPoint {
+            x: exit_x,
+            y: corridor_y,
+        },
+        RenderPoint {
+            x: approach_x,
+            y: corridor_y,
+        },
+        RenderPoint {
+            x: approach_x,
+            y: end_y,
+        },
+        RenderPoint { x: end_x, y: end_y },
+    ]
 }
 
 fn edge_corridor_y(source_y: i32, target_y: i32, route_slot: i32) -> f64 {
