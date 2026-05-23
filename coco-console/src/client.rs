@@ -562,10 +562,10 @@ fn update_graph_visibility(document: &Document) -> Result<(), JsValue> {
         return Ok(());
     }
 
-    items.set_attribute("data-graph-items-pending", &key)?;
     let Some(window) = web_sys::window() else {
         return Ok(());
     };
+    items.set_attribute("data-graph-items-pending", &key)?;
     let load_document = document.clone();
     spawn_local(async move {
         if let Err(error) =
@@ -588,7 +588,13 @@ async fn load_graph_items(
 ) -> Result<(), JsValue> {
     let url =
         format!("/api/graph-items?left={left:.0}&top={top:.0}&right={right:.0}&bottom={bottom:.0}");
-    let fragment = fetch_text(window, &url).await?;
+    let fragment = match fetch_text(window, &url).await {
+        Ok(fragment) => fragment,
+        Err(error) => {
+            let _ = clear_graph_items_pending(document, &key);
+            return Err(error);
+        }
+    };
     let Some(items) = scroll_element(document, ".graph-items") else {
         return Ok(());
     };
@@ -599,8 +605,17 @@ async fn load_graph_items(
     items.set_inner_html(&fragment);
     items.set_attribute("data-graph-items-key", &key)?;
     items.remove_attribute("data-graph-items-pending")?;
-    let selected = selected_node_id(window, document)?;
-    update_node_selection(document, selected.as_deref())
+    update_node_detail_from_hash(window, document)
+}
+
+fn clear_graph_items_pending(document: &Document, key: &str) -> Result<(), JsValue> {
+    let Some(items) = scroll_element(document, ".graph-items") else {
+        return Ok(());
+    };
+    if items.get_attribute("data-graph-items-pending").as_deref() == Some(key) {
+        items.remove_attribute("data-graph-items-pending")?;
+    }
+    Ok(())
 }
 
 struct MinimapContentRect {
