@@ -52,8 +52,6 @@ const BUILTIN_CRONJOB_REVISION_ID: &str =
     "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e";
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22";
-const BUILTIN_TELEGRAM_PRE_ATTACHMENT_DOWNLOAD_REVISION_ID: &str =
-    "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
     "fe5361a23cc71e2253b9d7867604cf1994db8fb6273dcae2ba2088a48c827e3c";
 const BRANCHES_DIR_NAME: &str = "branches";
@@ -89,7 +87,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         role: SessionRole::Runner,
         name: "telegram",
         from_revision_ids: &[
-            BUILTIN_TELEGRAM_PRE_ATTACHMENT_DOWNLOAD_REVISION_ID,
+            // Telegram default before the attachment download script was added.
+            "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c",
             BUILTIN_TELEGRAM_REVISION_ID,
         ],
         target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
