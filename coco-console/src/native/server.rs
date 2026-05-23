@@ -12,6 +12,7 @@ use crate::error::{
 };
 use crate::graph::{
     GraphEntityKind, build_entity_collection, build_graph_snapshot, build_node_detail,
+    node_target_id,
 };
 use crate::publisher::ConsolePublisher;
 use crate::render::{GraphViewport, render_fragment, render_graph_items, render_index_page};
@@ -155,15 +156,19 @@ where
             Err(error) => write_error(&mut stream, error).await,
         },
         "/api/node" => {
-            let Some(id) = request.query_value("id") else {
-                return write_response(
-                    &mut stream,
-                    400,
-                    "Bad Request",
-                    "text/plain; charset=utf-8",
-                    b"missing node id",
-                )
-                .await;
+            let id = match request.node_id(&state.store, state.publisher.current_version()) {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    return write_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        "text/plain; charset=utf-8",
+                        b"missing node id",
+                    )
+                    .await;
+                }
+                Err(error) => return write_error(&mut stream, error).await,
             };
             match build_node_detail(&state.store, &id) {
                 Ok(node) => write_json_response(&mut stream, &node).await,
@@ -252,6 +257,24 @@ struct HttpRequest {
 impl HttpRequest {
     fn query_value(&self, key: &str) -> Option<String> {
         parse_query_value(&self.query, key)
+    }
+
+    fn node_id<S>(&self, store: &S, version: u64) -> Result<Option<String>>
+    where
+        S: Store,
+    {
+        if let Some(id) = self.query_value("id") {
+            return Ok(Some(id));
+        }
+        let Some(target) = self.query_value("target") else {
+            return Ok(None);
+        };
+        let snapshot = build_graph_snapshot(store, version)?;
+        Ok(snapshot
+            .nodes
+            .into_iter()
+            .find(|node| node_target_id(&node.id) == target)
+            .map(|node| node.id))
     }
 
     fn graph_viewport(&self) -> Option<GraphViewport> {

@@ -101,6 +101,12 @@ struct ClientQueueMessage {
     payload: String,
 }
 
+#[derive(Clone)]
+struct SelectedNode {
+    target: String,
+    id: Option<String>,
+}
+
 #[wasm_bindgen(start)]
 pub fn start() {
     spawn_local(async {
@@ -1021,19 +1027,25 @@ fn format_state_value(value: &Value) -> String {
 }
 
 fn update_node_detail_from_hash(window: &Window, document: &Document) -> Result<(), JsValue> {
-    let selected = selected_node_id(window, document)?;
-    update_node_selection(document, selected.as_deref())?;
+    let selected = selected_node(window, document)?;
+    update_node_selection(
+        document,
+        selected.as_ref().and_then(|node| node.id.as_deref()),
+    )?;
 
-    let Some(node_id) = selected else {
+    let Some(selected) = selected else {
         hide_node_detail(document)?;
         return Ok(());
     };
 
-    show_node_detail_loading(document, &node_id)?;
+    show_node_detail_loading(
+        document,
+        selected.id.as_deref().unwrap_or(selected.target.as_str()),
+    )?;
     let detail_window = window.clone();
     let detail_document = document.clone();
     spawn_local(async move {
-        if let Err(error) = load_node_detail(&detail_window, &detail_document, node_id).await {
+        if let Err(error) = load_node_detail(&detail_window, &detail_document, selected).await {
             web_sys::console::error_1(&error);
         }
     });
@@ -1041,11 +1053,21 @@ fn update_node_detail_from_hash(window: &Window, document: &Document) -> Result<
     Ok(())
 }
 
-fn selected_node_id(window: &Window, document: &Document) -> Result<Option<String>, JsValue> {
+fn selected_node(window: &Window, document: &Document) -> Result<Option<SelectedNode>, JsValue> {
     let hash = window.location().hash().unwrap_or_default();
     let Some(target) = hash.strip_prefix('#').filter(|target| !target.is_empty()) else {
         return Ok(None);
     };
+    Ok(Some(SelectedNode {
+        target: target.to_owned(),
+        id: rendered_node_id_for_target(document, target)?,
+    }))
+}
+
+fn rendered_node_id_for_target(
+    document: &Document,
+    target: &str,
+) -> Result<Option<String>, JsValue> {
     let links = document.query_selector_all(".node-link")?;
     for index in 0..links.length() {
         let Some(link) = links.item(index) else {
@@ -1113,12 +1135,20 @@ fn show_node_detail_loading(document: &Document, node_id: &str) -> Result<(), Js
 async fn load_node_detail(
     window: &Window,
     document: &Document,
-    node_id: String,
+    selected: SelectedNode,
 ) -> Result<(), JsValue> {
-    let response = fetch_text(window, &format!("/api/node?id={}", query_encode(&node_id))).await?;
+    let query = match selected.id.as_deref() {
+        Some(id) => format!("id={}", query_encode(id)),
+        None => format!("target={}", query_encode(&selected.target)),
+    };
+    let response = fetch_text(window, &format!("/api/node?{query}")).await?;
     let node = serde_json::from_str::<ClientGraphNode>(&response)
         .map_err(|error| JsValue::from_str(&format!("failed to parse node detail: {error}")))?;
-    if selected_node_id(window, document)?.as_deref() != Some(node.id.as_str()) {
+    let Some(current) = selected_node(window, document)? else {
+        return Ok(());
+    };
+    if current.id.as_deref() != Some(node.id.as_str()) && current.target != node_target_id(&node.id)
+    {
         return Ok(());
     }
     render_node_detail(document, &node)
@@ -1139,6 +1169,23 @@ fn query_encode(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn node_target_id(node_id: &str) -> String {
+    format!("detail-{}", css_token(node_id))
+}
+
+fn css_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn render_node_detail(document: &Document, node: &ClientGraphNode) -> Result<(), JsValue> {

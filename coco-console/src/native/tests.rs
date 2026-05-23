@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::config::ConsoleConfig;
 use crate::graph::{
     GraphBranch, GraphEdge, GraphEdgeKind, GraphEntityCollection, GraphEntityCounts,
-    GraphEntityKind, GraphNode,
+    GraphEntityKind, GraphNode, node_target_id,
 };
 use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LANE_HEIGHT, GRAPH_LEFT_X, GRAPH_TOP_Y,
@@ -613,6 +613,17 @@ async fn server_serves_entity_and_node_details_on_demand() {
     let node: serde_json::Value = serde_json::from_str(response_body(&node)).unwrap();
     assert_eq!(node["id"], detail);
     assert_eq!(node["content"], "load this node only");
+
+    let node_by_target = http_get(
+        addr,
+        &format!("/api/node?target={}", node_target_id(&detail)),
+    )
+    .await;
+    assert_eq!(response_status(&node_by_target), 200);
+    let node_by_target: serde_json::Value =
+        serde_json::from_str(response_body(&node_by_target)).unwrap();
+    assert_eq!(node_by_target["id"], detail);
+    assert_eq!(node_by_target["content"], "load this node only");
 
     let graph_items = http_get(
         addr,
