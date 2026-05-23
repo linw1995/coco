@@ -1961,7 +1961,7 @@ where
     assert!(telegram.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
     assert_eq!(cronjob.current().unwrap().scripts.len(), 3);
-    assert_eq!(telegram.current().unwrap().scripts.len(), 2);
+    assert_eq!(telegram.current().unwrap().scripts.len(), 3);
     assert!(
         cronjob
             .current()
@@ -1969,6 +1969,14 @@ where
             .scripts
             .iter()
             .any(|script| script.path == "scripts/cronjob_crontab.py")
+    );
+    assert!(
+        telegram
+            .current()
+            .unwrap()
+            .scripts
+            .iter()
+            .any(|script| script.path == "scripts/telegram_download.py")
     );
     assert!(
         orchestrator

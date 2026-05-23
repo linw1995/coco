@@ -354,7 +354,7 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
     assert!(prompt.contains("height=960"));
     assert!(prompt.contains("file_size=200000"));
     assert!(prompt.contains("No text caption was provided."));
-    assert!(prompt.contains("COCO_TELEGRAM_BOT_TOKEN"));
+    assert!(prompt.contains("telegram_download.py"));
 }
 
 #[tokio::test]
