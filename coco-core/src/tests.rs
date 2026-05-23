@@ -632,7 +632,7 @@ async fn llm_engine_reply_rejects_intermediate_text_without_terminal_response() 
 }
 
 #[tokio::test]
-async fn core_service_rejects_empty_message_text() {
+async fn core_service_rejects_empty_message_content() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
@@ -646,7 +646,9 @@ async fn core_service_rejects_empty_message_text() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, Error::InvalidInput { message } if message == "message text is empty"));
+    assert!(
+        matches!(error, Error::InvalidInput { message } if message == "message content is empty")
+    );
 }
 
 #[tokio::test]
