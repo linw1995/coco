@@ -545,11 +545,20 @@ fn selected_node_id(window: &Window, document: &Document) -> Result<Option<Strin
     let Some(target) = hash.strip_prefix('#').filter(|target| !target.is_empty()) else {
         return Ok(None);
     };
-    let Some(link) = document.query_selector(&format!("[data-node-target=\"{target}\"]"))? else {
-        return Ok(None);
-    };
+    let links = document.query_selector_all(".node-link")?;
+    for index in 0..links.length() {
+        let Some(link) = links.item(index) else {
+            continue;
+        };
+        let Ok(link) = link.dyn_into::<Element>() else {
+            continue;
+        };
+        if link.get_attribute("data-node-target").as_deref() == Some(target) {
+            return Ok(link.get_attribute("data-node-id"));
+        }
+    }
 
-    Ok(link.get_attribute("data-node-id"))
+    Ok(None)
 }
 
 fn update_node_selection(
