@@ -51,12 +51,6 @@ const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
     "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e";
-const BUILTIN_RECOVERY_PREVIOUS_REVISION_ID: &str =
-    "843b2016652dce5f8c6557ff72b0fecb24a68a03bafc8a8df1e72d903d376f81";
-const BUILTIN_RECOVERY_DAY_BRANCH_DRAFT_REVISION_ID: &str =
-    "9eac48e119c8ad4ee49aa58858007cafa4339453465e00631fd262eacb1ceb9b";
-const BUILTIN_RECOVERY_DAY_WORKER_REVISION_ID: &str =
-    "a14ff2fcfeb14ffb5487b2dfeeb595e87b14b557e7b2c779e7d38c61f521a249";
 const BUILTIN_RECOVERY_REVISION_ID: &str =
     "6bf4094ad2dd2f9932cfc8d13a0f4a6b7adc9fe293e1ea6bc9f995d9c880a3f8";
 const BUILTIN_COMPACT_REVISION_ID: &str =
@@ -73,59 +67,43 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "coco-orchestrator",
-        from_revision_ids: &[
-            // Before the orchestrator runner prompt included load_image.
-            "cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438",
-            BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
-        ],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "new-skill",
-        from_revision_ids: &[BUILTIN_NEW_SKILL_REVISION_ID],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_NEW_SKILL_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "cronjob",
-        from_revision_ids: &[BUILTIN_CRONJOB_REVISION_ID],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_CRONJOB_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "recovery",
-        from_revision_ids: &[
-            BUILTIN_RECOVERY_PREVIOUS_REVISION_ID,
-            BUILTIN_RECOVERY_DAY_BRANCH_DRAFT_REVISION_ID,
-            BUILTIN_RECOVERY_DAY_WORKER_REVISION_ID,
-            BUILTIN_RECOVERY_REVISION_ID,
-        ],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_RECOVERY_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "compact",
-        from_revision_ids: &[BUILTIN_COMPACT_REVISION_ID],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_COMPACT_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Runner,
         name: "coco-runner",
-        from_revision_ids: &[BUILTIN_COCO_RUNNER_REVISION_ID],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_COCO_RUNNER_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Runner,
         name: "telegram",
-        from_revision_ids: &[
-            // Telegram default before the attachment download script was added.
-            "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c",
-            // Telegram default before downloads were directed into the workspace.
-            "fe5361a23cc71e2253b9d7867604cf1994db8fb6273dcae2ba2088a48c827e3c",
-            // Telegram default before the download script defaulted into the workspace.
-            "a86a9cb4ec5d5b8f6284970aa7c9feb53ddfbe7d1b984e9210dda7d1801edfd1",
-        ],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
     },
 ];
@@ -1684,7 +1662,7 @@ fn builtin_skill_migration_action(
     let Some(current) = record.current() else {
         return BuiltinSkillMigrationAction::Unchanged;
     };
-    if skill_version_matches(current, target) {
+    if current.id == target.id {
         return BuiltinSkillMigrationAction::Unchanged;
     }
     if migration.from_revision_ids.contains(&current.id.as_str()) {
@@ -1692,13 +1670,6 @@ fn builtin_skill_migration_action(
     } else {
         BuiltinSkillMigrationAction::SkipUserModified
     }
-}
-
-fn skill_version_matches(left: &SkillVersion, right: &SkillVersion) -> bool {
-    left.description == right.description
-        && left.body == right.body
-        && left.scripts == right.scripts
-        && left.enable_coco_shim == right.enable_coco_shim
 }
 
 fn persisted_preset_records(
