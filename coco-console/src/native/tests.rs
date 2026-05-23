@@ -175,11 +175,11 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
     ));
 
     let html = render_snapshot_page(&snapshot);
-    assert!(html.contains("href=\"#detail-"));
     assert!(html.contains("class=\"graph-control"));
     assert!(html.contains("data-zoom-action=\"in\""));
-    assert!(html.contains("data-graph-x="));
-    assert!(html.contains("data-graph-min-x="));
+    assert!(html.contains("class=\"graph-items\""));
+    assert!(!html.contains("class=\"node-link graph-item\""));
+    assert!(!html.contains("data-graph-min-x="));
     assert!(html.contains("class=\"node-details node-detail-panel\""));
     assert!(html.contains("class=\"entity-nav\""));
     assert!(html.contains("id=\"branches\""));
@@ -187,6 +187,7 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
     assert!(html.contains("class=\"minimap\""));
     assert!(html.contains("preserveAspectRatio=\"xMidYMid meet\""));
     assert!(html.contains("class=\"minimap-viewport\""));
+    assert!(!html.contains("class=\"minimap-node\""));
     assert!(html.contains("data-graph-width="));
     assert!(!html.contains("/?node="));
 }
@@ -597,7 +598,9 @@ async fn server_serves_entity_and_node_details_on_demand() {
     let index = http_get(addr, "/").await;
     assert_eq!(response_status(&index), 200);
     assert!(response_body(&index).contains("data-entity-kind=\"skills\""));
+    assert!(response_body(&index).contains("class=\"graph-items\""));
     assert!(!response_body(&index).contains("Server demo skill"));
+    assert!(!response_body(&index).contains("class=\"node-link graph-item\""));
 
     let graph = http_get(addr, "/api/graph").await;
     assert_eq!(response_status(&graph), 200);
@@ -610,6 +613,25 @@ async fn server_serves_entity_and_node_details_on_demand() {
     let node: serde_json::Value = serde_json::from_str(response_body(&node)).unwrap();
     assert_eq!(node["id"], detail);
     assert_eq!(node["content"], "load this node only");
+
+    let graph_items = http_get(
+        addr,
+        "/api/graph-items?left=-100&top=-100&right=700&bottom=400",
+    )
+    .await;
+    assert_eq!(response_status(&graph_items), 200);
+    assert!(response_body(&graph_items).contains("class=\"node-link graph-item\""));
+    assert!(response_body(&graph_items).contains("data-graph-min-x="));
+
+    let empty_graph_items = http_get(
+        addr,
+        "/api/graph-items?left=10000&top=10000&right=10100&bottom=10100",
+    )
+    .await;
+    assert_eq!(response_status(&empty_graph_items), 200);
+    assert!(!response_body(&empty_graph_items).contains("class=\"node-link graph-item\""));
+    let bad_graph_items = http_get(addr, "/api/graph-items?left=5&top=0&right=1&bottom=2").await;
+    assert_eq!(response_status(&bad_graph_items), 400);
 
     let skills = http_get(addr, "/api/entities?kind=skills").await;
     assert_eq!(response_status(&skills), 200);

@@ -23,6 +23,19 @@ pub fn render_fragment(snapshot: &GraphSnapshot) -> String {
     view! { <ConsoleRoot snapshot=snapshot /> }.to_html()
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct GraphViewport {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+
+pub fn render_graph_items(snapshot: &GraphSnapshot, viewport: GraphViewport) -> String {
+    let layout = layout_graph(snapshot);
+    view! { <GraphItems snapshot=snapshot layout=&layout viewport=Some(viewport) /> }.to_html()
+}
+
 fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> String {
     let rendered = view! { <ConsoleDocument snapshot=snapshot include_client=include_client /> };
 
@@ -85,7 +98,7 @@ fn ConsoleContent<'a>(snapshot: &'a GraphSnapshot) -> impl IntoView {
             <main class="entity-workspace">
                 <section id="nodes" class="entity-section graph-entity">
                     <EntitySectionHeader title="Nodes" count=snapshot.nodes.len() />
-                    <GraphPanel snapshot=snapshot layout=layout.as_ref() />
+                    <GraphPanel layout=layout.as_ref() />
                 </section>
                 <LazyEntitySection id="branches" title="Branches" kind="branches" count=snapshot.entity_counts.branches />
                 <LazyEntitySection id="sessions" title="Sessions" kind="sessions" count=snapshot.entity_counts.sessions />
@@ -159,7 +172,7 @@ fn LazyEntitySection(
 }
 
 #[component]
-fn GraphPanel<'a>(snapshot: &'a GraphSnapshot, layout: Option<&'a GraphLayout>) -> AnyView {
+fn GraphPanel<'a>(layout: Option<&'a GraphLayout>) -> AnyView {
     let Some(layout) = layout else {
         return view! {
             <div class="graph-shell">
@@ -175,7 +188,7 @@ fn GraphPanel<'a>(snapshot: &'a GraphSnapshot, layout: Option<&'a GraphLayout>) 
         <div class="graph-shell">
             <GraphToolbar />
             <div class="graph-wrap">
-                <GraphSvg snapshot=snapshot layout=layout />
+                <GraphSvg layout=layout />
             </div>
             <Minimap layout=layout />
         </div>
@@ -195,27 +208,11 @@ fn GraphToolbar() -> impl IntoView {
 }
 
 #[component]
-fn GraphSvg<'a>(snapshot: &'a GraphSnapshot, layout: &'a GraphLayout) -> impl IntoView {
+fn GraphSvg<'a>(layout: &'a GraphLayout) -> impl IntoView {
     let lanes = layout
         .lanes
         .iter()
         .map(|lane| view! { <GraphLaneLabel lane=lane /> })
-        .collect::<Vec<_>>();
-    let edges = graph_edges(layout)
-        .map(|edge| view! { <GraphEdgeView edge=edge /> })
-        .collect::<Vec<_>>();
-    let nodes_by_id = snapshot
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect::<HashMap<_, _>>();
-    let nodes = layout
-        .occurrences
-        .iter()
-        .filter_map(|occurrence| {
-            let node = nodes_by_id.get(occurrence.node_id.as_str())?;
-            Some(view! { <GraphNodeView node=*node occurrence=occurrence /> })
-        })
         .collect::<Vec<_>>();
     let view_box = format!("0 0 {} {}", layout.width, layout.height);
     let width = layout.width.to_string();
@@ -236,10 +233,39 @@ fn GraphSvg<'a>(snapshot: &'a GraphSnapshot, layout: &'a GraphLayout) -> impl In
             <GraphMarkers />
             <rect class="graph-bg" width=width.clone() height=height.clone() />
             {lanes}
-            {edges}
-            {nodes}
+            <g class="graph-items" data-graph-items-key=""></g>
         </svg>
     }
+}
+
+#[component]
+fn GraphItems<'a>(
+    snapshot: &'a GraphSnapshot,
+    layout: &'a GraphLayout,
+    viewport: Option<GraphViewport>,
+) -> impl IntoView {
+    let nodes_by_id = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    let edges = graph_edges(layout)
+        .filter(|edge| viewport.is_none_or(|viewport| edge_intersects_viewport(edge, viewport)))
+        .map(|edge| view! { <GraphEdgeView edge=edge /> })
+        .collect::<Vec<_>>();
+    let nodes = layout
+        .occurrences
+        .iter()
+        .filter(|occurrence| {
+            viewport.is_none_or(|viewport| point_intersects_viewport(occurrence.point, viewport))
+        })
+        .filter_map(|occurrence| {
+            let node = nodes_by_id.get(occurrence.node_id.as_str())?;
+            Some(view! { <GraphNodeView node=*node occurrence=occurrence /> })
+        })
+        .collect::<Vec<_>>();
+
+    view! { <g class="graph-items-fragment">{edges}{nodes}</g> }
 }
 
 #[component]
@@ -372,14 +398,6 @@ fn GraphNodeView<'a>(node: &'a GraphNode, occurrence: &'a GraphNodeOccurrence) -
 
 #[component]
 fn Minimap<'a>(layout: &'a GraphLayout) -> impl IntoView {
-    let edges = graph_edges(layout)
-        .map(|edge| view! { <MinimapEdge edge=edge /> })
-        .collect::<Vec<_>>();
-    let nodes = layout
-        .occurrences
-        .iter()
-        .map(|occurrence| view! { <MinimapNode occurrence=occurrence /> })
-        .collect::<Vec<_>>();
     let view_box = format!("0 0 {} {}", layout.width, layout.height);
     let graph_width = layout.width.to_string();
     let graph_height = layout.height.to_string();
@@ -395,44 +413,9 @@ fn Minimap<'a>(layout: &'a GraphLayout) -> impl IntoView {
             data-graph-height=graph_height
         >
             <rect class="minimap-bg" x="0" y="0" width=layout.width.to_string() height=layout.height.to_string() />
-            {edges}
-            {nodes}
             <rect class="minimap-viewport" x="0" y="0" width="0" height="0" rx="18" />
         </svg>
     }
-}
-
-#[component]
-fn MinimapEdge<'a>(edge: &'a GraphLayoutEdge) -> AnyView {
-    match edge.kind {
-        GraphLayoutEdgeKind::PrimaryParent => {
-            let (x1, y1, x2, y2) = line_points(edge.source, edge.target, edge.target_port_offset);
-            view! { <line class="minimap-edge primary-parent" x1=x1 y1=y1 x2=x2 y2=y2 /> }
-                .into_any()
-        }
-        GraphLayoutEdgeKind::Fork | GraphLayoutEdgeKind::MergeParent => {
-            let points = routed_elbow_points(
-                edge.source,
-                edge.target,
-                edge.route_slot,
-                edge.target_port_offset,
-            );
-            let class = match edge.kind {
-                GraphLayoutEdgeKind::Fork => "minimap-edge fork",
-                GraphLayoutEdgeKind::MergeParent => "minimap-edge merge-parent",
-                GraphLayoutEdgeKind::PrimaryParent => unreachable!(),
-            };
-            view! { <polyline class=class points=points /> }.into_any()
-        }
-    }
-}
-
-#[component]
-fn MinimapNode<'a>(occurrence: &'a GraphNodeOccurrence) -> impl IntoView {
-    let x = occurrence.point.x.to_string();
-    let y = occurrence.point.y.to_string();
-
-    view! { <circle class="minimap-node" cx=x cy=y r="26" /> }
 }
 
 #[component]
@@ -541,13 +524,32 @@ fn edge_marker(kind: GraphLayoutEdgeKind) -> &'static str {
 }
 
 fn edge_bounds(points: impl IntoIterator<Item = RenderPoint>) -> GraphItemBounds {
+    let bounds = edge_render_bounds(points);
+
+    GraphItemBounds {
+        min_x: format!("{:.1}", bounds.min_x),
+        min_y: format!("{:.1}", bounds.min_y),
+        max_x: format!("{:.1}", bounds.max_x),
+        max_y: format!("{:.1}", bounds.max_y),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GraphRenderBounds {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+fn edge_render_bounds(points: impl IntoIterator<Item = RenderPoint>) -> GraphRenderBounds {
     let mut points = points.into_iter();
     let Some(first) = points.next() else {
-        return GraphItemBounds {
-            min_x: "0".to_owned(),
-            min_y: "0".to_owned(),
-            max_x: "0".to_owned(),
-            max_y: "0".to_owned(),
+        return GraphRenderBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 0.0,
+            max_y: 0.0,
         };
     };
     let (min_x, min_y, max_x, max_y) = points.fold(
@@ -562,10 +564,40 @@ fn edge_bounds(points: impl IntoIterator<Item = RenderPoint>) -> GraphItemBounds
         },
     );
 
-    GraphItemBounds {
-        min_x: format!("{:.1}", min_x - f64::from(GRAPH_CULL_EDGE_MARGIN)),
-        min_y: format!("{:.1}", min_y - f64::from(GRAPH_CULL_EDGE_MARGIN)),
-        max_x: format!("{:.1}", max_x + f64::from(GRAPH_CULL_EDGE_MARGIN)),
-        max_y: format!("{:.1}", max_y + f64::from(GRAPH_CULL_EDGE_MARGIN)),
+    GraphRenderBounds {
+        min_x: min_x - f64::from(GRAPH_CULL_EDGE_MARGIN),
+        min_y: min_y - f64::from(GRAPH_CULL_EDGE_MARGIN),
+        max_x: max_x + f64::from(GRAPH_CULL_EDGE_MARGIN),
+        max_y: max_y + f64::from(GRAPH_CULL_EDGE_MARGIN),
     }
+}
+
+fn edge_intersects_viewport(edge: &GraphLayoutEdge, viewport: GraphViewport) -> bool {
+    let bounds = match edge.kind {
+        GraphLayoutEdgeKind::PrimaryParent => edge_render_bounds(line_render_points(
+            edge.source,
+            edge.target,
+            edge.target_port_offset,
+        )),
+        GraphLayoutEdgeKind::Fork | GraphLayoutEdgeKind::MergeParent => {
+            edge_render_bounds(routed_elbow_render_points(
+                edge.source,
+                edge.target,
+                edge.route_slot,
+                edge.target_port_offset,
+            ))
+        }
+    };
+
+    bounds.max_x >= viewport.left
+        && bounds.min_x <= viewport.right
+        && bounds.max_y >= viewport.top
+        && bounds.min_y <= viewport.bottom
+}
+
+fn point_intersects_viewport(point: crate::layout::Point, viewport: GraphViewport) -> bool {
+    let x = f64::from(point.x);
+    let y = f64::from(point.y);
+
+    x >= viewport.left && x <= viewport.right && y >= viewport.top && y <= viewport.bottom
 }

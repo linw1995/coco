@@ -14,7 +14,7 @@ use crate::graph::{
     GraphEntityKind, build_entity_collection, build_graph_snapshot, build_node_detail,
 };
 use crate::publisher::ConsolePublisher;
-use crate::render::{render_fragment, render_index_page};
+use crate::render::{GraphViewport, render_fragment, render_graph_items, render_index_page};
 use crate::{Error, Result};
 
 const REQUEST_HEADER_LIMIT: usize = 16 * 1024;
@@ -189,6 +189,32 @@ where
                 Err(error) => write_error(&mut stream, error).await,
             }
         }
+        "/api/graph-items" => {
+            let Some(viewport) = request.graph_viewport() else {
+                return write_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    "text/plain; charset=utf-8",
+                    b"invalid graph viewport",
+                )
+                .await;
+            };
+            match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+                Ok(snapshot) => {
+                    let body = render_graph_items(&snapshot, viewport);
+                    write_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        "image/svg+xml; charset=utf-8",
+                        body.as_bytes(),
+                    )
+                    .await
+                }
+                Err(error) => write_error(&mut stream, error).await,
+            }
+        }
         "/fragment" => write_fragment(&mut stream, state, request.version).await,
         "/events" => write_event_stream(stream, state.publisher).await,
         "/pkg/coco_console.js" => {
@@ -226,6 +252,19 @@ struct HttpRequest {
 impl HttpRequest {
     fn query_value(&self, key: &str) -> Option<String> {
         parse_query_value(&self.query, key)
+    }
+
+    fn graph_viewport(&self) -> Option<GraphViewport> {
+        let left = self.query_value("left")?.parse().ok()?;
+        let top = self.query_value("top")?.parse().ok()?;
+        let right = self.query_value("right")?.parse().ok()?;
+        let bottom = self.query_value("bottom")?.parse().ok()?;
+        (left <= right && top <= bottom).then_some(GraphViewport {
+            left,
+            top,
+            right,
+            bottom,
+        })
     }
 }
 

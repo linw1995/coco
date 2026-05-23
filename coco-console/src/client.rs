@@ -546,50 +546,61 @@ fn update_graph_visibility(document: &Document) -> Result<(), JsValue> {
     let Some(graph) = scroll_element(document, ".graph-wrap") else {
         return Ok(());
     };
+    let Some(items) = scroll_element(document, ".graph-items") else {
+        return Ok(());
+    };
     let zoom = graph_zoom(document);
     let left = f64::from(graph.scroll_left()) / zoom - CULL_PADDING;
     let top = f64::from(graph.scroll_top()) / zoom - CULL_PADDING;
     let right = left + f64::from(graph.client_width()) / zoom + CULL_PADDING * 2.0;
     let bottom = top + f64::from(graph.client_height()) / zoom + CULL_PADDING * 2.0;
+    let key = format!("{left:.0}:{top:.0}:{right:.0}:{bottom:.0}");
 
-    let items = document.query_selector_all(".graph-item")?;
-    for index in 0..items.length() {
-        let Some(item) = items.item(index) else {
-            continue;
-        };
-        let Ok(item) = item.dyn_into::<Element>() else {
-            continue;
-        };
-        let visible = graph_item_intersects(&item, left, top, right, bottom);
-        if visible {
-            item.class_list().remove_1("is-culled")?;
-        } else {
-            item.class_list().add_1("is-culled")?;
-        }
+    if items.get_attribute("data-graph-items-key").as_deref() == Some(key.as_str())
+        || items.get_attribute("data-graph-items-pending").as_deref() == Some(key.as_str())
+    {
+        return Ok(());
     }
 
+    items.set_attribute("data-graph-items-pending", &key)?;
+    let Some(window) = web_sys::window() else {
+        return Ok(());
+    };
+    let load_document = document.clone();
+    spawn_local(async move {
+        if let Err(error) =
+            load_graph_items(&window, &load_document, left, top, right, bottom, key).await
+        {
+            web_sys::console::error_1(&error);
+        }
+    });
     Ok(())
 }
 
-fn graph_item_intersects(item: &Element, left: f64, top: f64, right: f64, bottom: f64) -> bool {
-    if let (Some(x), Some(y)) = (data_f64(item, "graph-x"), data_f64(item, "graph-y")) {
-        return x >= left && x <= right && y >= top && y <= bottom;
+async fn load_graph_items(
+    window: &Window,
+    document: &Document,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    key: String,
+) -> Result<(), JsValue> {
+    let url =
+        format!("/api/graph-items?left={left:.0}&top={top:.0}&right={right:.0}&bottom={bottom:.0}");
+    let fragment = fetch_text(window, &url).await?;
+    let Some(items) = scroll_element(document, ".graph-items") else {
+        return Ok(());
+    };
+    if items.get_attribute("data-graph-items-pending").as_deref() != Some(key.as_str()) {
+        return Ok(());
     }
 
-    let Some(min_x) = data_f64(item, "graph-min-x") else {
-        return true;
-    };
-    let Some(min_y) = data_f64(item, "graph-min-y") else {
-        return true;
-    };
-    let Some(max_x) = data_f64(item, "graph-max-x") else {
-        return true;
-    };
-    let Some(max_y) = data_f64(item, "graph-max-y") else {
-        return true;
-    };
-
-    max_x >= left && min_x <= right && max_y >= top && min_y <= bottom
+    items.set_inner_html(&fragment);
+    items.set_attribute("data-graph-items-key", &key)?;
+    items.remove_attribute("data-graph-items-pending")?;
+    let selected = selected_node_id(window, document)?;
+    update_node_selection(document, selected.as_deref())
 }
 
 struct MinimapContentRect {
