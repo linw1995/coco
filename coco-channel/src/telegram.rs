@@ -518,6 +518,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn from_config_builds_reqwest_transport() {
+        let mut allowed_chat_ids = BTreeSet::new();
+        allowed_chat_ids.insert("42".to_owned());
+        let config = TelegramChannelConfig {
+            token: "123456:secret-token".to_owned(),
+            poll_timeout_secs: 30,
+            allowed_chat_ids: allowed_chat_ids.clone(),
+        };
+
+        let channel = TelegramChannel::from_config(config).unwrap();
+
+        assert_eq!(channel.poll_timeout_secs, 30);
+        assert_eq!(channel.allowed_chat_ids, allowed_chat_ids);
+        assert_eq!(channel.offset(), None);
+    }
+
     #[tokio::test]
     async fn run_once_maps_text_update_without_sending_reply() {
         let transport = FakeTransport::with_updates(vec![text_update(100, 42, 7, "hello")]);
