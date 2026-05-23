@@ -1961,7 +1961,7 @@ where
     assert!(telegram.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
     assert_eq!(cronjob.current().unwrap().scripts.len(), 3);
-    assert_eq!(telegram.current().unwrap().scripts.len(), 2);
+    assert_eq!(telegram.current().unwrap().scripts.len(), 3);
     assert!(
         cronjob
             .current()
@@ -1969,6 +1969,14 @@ where
             .scripts
             .iter()
             .any(|script| script.path == "scripts/cronjob_crontab.py")
+    );
+    assert!(
+        telegram
+            .current()
+            .unwrap()
+            .scripts
+            .iter()
+            .any(|script| script.path == "scripts/telegram_download.py")
     );
     assert!(
         orchestrator
@@ -2445,7 +2453,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["version"], "2026-05-18");
+    assert_eq!(meta["version"], "2026-05-23");
 }
 
 #[test]
@@ -2670,7 +2678,7 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated["version"], "2026-05-18");
+    assert_eq!(migrated["version"], "2026-05-23");
     let migrated_skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
@@ -2916,7 +2924,7 @@ fn open_migrates_legacy_jobs_json_to_snapshot_with_empty_wal() {
     assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-18");
+    assert_eq!(migrated_meta["version"], "2026-05-23");
 }
 
 #[test]

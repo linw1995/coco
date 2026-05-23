@@ -27,7 +27,8 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-18";
+const STORE_FORMAT_VERSION: &str = "2026-05-23";
+const PREVIOUS_STORE_FORMAT_VERSION: &str = "2026-05-18";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -52,7 +53,7 @@ const BUILTIN_CRONJOB_REVISION_ID: &str =
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
-    "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c";
+    "fe5361a23cc71e2253b9d7867604cf1994db8fb6273dcae2ba2088a48c827e3c";
 const BRANCHES_DIR_NAME: &str = "branches";
 const LOCK_FILE_NAME: &str = "store.lock";
 const JOB_COMPACT_MIN_LOG_ENTRIES: usize = 64;
@@ -85,7 +86,11 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Runner,
         name: "telegram",
-        from_revision_ids: &[BUILTIN_TELEGRAM_REVISION_ID],
+        from_revision_ids: &[
+            // Telegram default before the attachment download script was added.
+            "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c",
+            BUILTIN_TELEGRAM_REVISION_ID,
+        ],
         target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
     },
 ];
@@ -107,9 +112,16 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-17-to-2026-05-18",
         from: StoreFormatVersion::Chronicle("2026-05-17"),
-        to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
         run: Persistence::migrate_jobs_to_wal,
         builtin_skills: &[],
+    },
+    StoreMigration {
+        name: "2026-05-18-to-2026-05-23",
+        from: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
     },
 ];
 

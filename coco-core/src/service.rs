@@ -132,14 +132,14 @@ fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
         Required response policy:
         - Treat the incoming message as the user's actual request, not as text to acknowledge.
         - Complete the requested work using any needed tools or skills before sending the final Telegram reply.
-        - Use the `telegram` skill only for Telegram delivery; do not delegate the user task itself to the `telegram` skill.
+        - Use the `telegram` skill only for Telegram delivery and attachment downloads; do not delegate the user task itself to the `telegram` skill.
         - If the work is long-running, you may send one progress update through the `telegram` skill, then continue working.
         - Call `coco skill run telegram --handoff <reply task>` through `exec_command` for the final user-facing reply only after the reply content is ready to send.
         - Use the target chat_id and reply_to_message_id above for the first Telegram message; if you send no progress update, the final reply is that first message.
         - Do not use the `telegram` skill merely to acknowledge the request unless the incoming message only asks for acknowledgement.
         - Do not finish after an acknowledgement-only Telegram reply unless the incoming message only asked for acknowledgement.
         - Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.
-        - If the request depends on an image attachment, inspect it before responding. Resolve Telegram file_id values with getFile using COCO_TELEGRAM_BOT_TOKEN, then download the returned file_path from the Telegram file API.
+        - If the request depends on an image attachment, inspect it before responding. Use the `telegram` skill's `telegram_download.py` script with the attachment file_id to download inbound images.
         - After the final Telegram skill call completes, return a local completion note. If you handled multiple distinct tasks, include a concise multi-task summary in that final text that lists each task and its outcome.
 
         Incoming image attachments:

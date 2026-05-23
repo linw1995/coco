@@ -14,6 +14,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SEND_SCRIPT = ROOT / "scripts" / "telegram_send.py"
 EDIT_SCRIPT = ROOT / "scripts" / "telegram_edit.py"
+DOWNLOAD_SCRIPT = ROOT / "scripts" / "telegram_download.py"
 
 
 def load_script(path: Path):
@@ -151,6 +152,90 @@ class TelegramEditScriptTests(unittest.TestCase):
         )
         self.assertEqual(
             json.loads(stdout.getvalue()), {"chat_id": 100, "message_id": 42}
+        )
+
+
+class TelegramDownloadScriptTests(unittest.TestCase):
+    def test_default_output_path_uses_telegram_file_name(self) -> None:
+        module = load_script(DOWNLOAD_SCRIPT)
+
+        self.assertEqual(
+            module.default_output_path("photos/file_123.jpg", "/tmp/downloads"),
+            Path("/tmp/downloads/file_123.jpg"),
+        )
+
+    def test_default_output_path_rejects_missing_file_name(self) -> None:
+        module = load_script(DOWNLOAD_SCRIPT)
+
+        with self.assertRaisesRegex(SystemExit, "does not contain a file name"):
+            module.default_output_path("", "/tmp/downloads")
+
+    def test_main_downloads_file_without_network(self) -> None:
+        module = load_script(DOWNLOAD_SCRIPT)
+        calls = []
+
+        def fake_post_api(token: str, method: str, payload: dict) -> dict:
+            calls.append({"token": token, "method": method, "payload": payload})
+            return {
+                "file_id": payload["file_id"],
+                "file_unique_id": "unique-id",
+                "file_path": "photos/file_123.jpg",
+                "file_size": 1234,
+            }
+
+        def fake_download_file(token: str, file_path: str, output_path: Path) -> int:
+            calls.append(
+                {
+                    "token": token,
+                    "file_path": file_path,
+                    "output_path": str(output_path),
+                }
+            )
+            return 4321
+
+        argv = [
+            "telegram_download.py",
+            "--file-id",
+            "file-id",
+            "--output",
+            "/tmp/inbound.jpg",
+            "--token",
+            "test-token",
+        ]
+        stdout = io.StringIO()
+
+        with mock.patch.object(sys, "argv", argv):
+            with mock.patch.object(module, "post_api", fake_post_api):
+                with mock.patch.object(module, "download_file", fake_download_file):
+                    with contextlib.redirect_stdout(stdout):
+                        result = module.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "token": "test-token",
+                    "method": "getFile",
+                    "payload": {"file_id": "file-id"},
+                },
+                {
+                    "token": "test-token",
+                    "file_path": "photos/file_123.jpg",
+                    "output_path": "/tmp/inbound.jpg",
+                },
+            ],
+        )
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "file_id": "file-id",
+                "file_unique_id": "unique-id",
+                "telegram_file_path": "photos/file_123.jpg",
+                "output_path": "/tmp/inbound.jpg",
+                "bytes": 4321,
+                "file_size": 1234,
+            },
         )
 
 

@@ -510,7 +510,7 @@ pub fn default_skill_groups() -> SkillGroups {
             "telegram",
             SkillVersionSpec {
                 description:
-                    "Send, reply to, and edit Telegram messages through the Telegram Bot API."
+                    "Send, reply to, edit, and download Telegram messages through the Telegram Bot API."
                         .to_owned(),
                 body: include_str!("default_skills/telegram.md").trim().to_owned(),
                 scripts: vec![
@@ -523,6 +523,13 @@ pub fn default_skill_groups() -> SkillGroups {
                         path: "scripts/telegram_edit.py".to_owned(),
                         content: include_str!("default_skills/telegram/scripts/telegram_edit.py")
                             .to_owned(),
+                    },
+                    SkillScript {
+                        path: "scripts/telegram_download.py".to_owned(),
+                        content: include_str!(
+                            "default_skills/telegram/scripts/telegram_download.py"
+                        )
+                        .to_owned(),
                     },
                 ],
                 enable_coco_shim: true,
