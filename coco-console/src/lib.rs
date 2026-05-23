@@ -15,8 +15,10 @@ mod native {
     pub use config::{ConsoleConfig, default_console_addr};
     pub use error::{Error, Result};
     pub use graph::{
-        GraphBranch, GraphEdge, GraphEdgeKind, GraphJob, GraphNode, GraphPreset, GraphQueue,
-        GraphQueueMessage, GraphSession, GraphSkill, GraphSnapshot, build_graph_snapshot,
+        GraphBranch, GraphEdge, GraphEdgeKind, GraphEntityCollection, GraphEntityCounts,
+        GraphEntityKind, GraphJob, GraphNode, GraphPreset, GraphQueue, GraphQueueMessage,
+        GraphSession, GraphSkill, GraphSnapshot, build_entity_collection, build_graph_snapshot,
+        build_node_detail,
     };
     pub use publisher::ConsolePublisher;
     pub use server::{ConsoleServerHandle, start_console_server};
@@ -29,8 +31,9 @@ mod native {
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
     ConsoleConfig, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error, GraphBranch,
-    GraphEdge, GraphEdgeKind, GraphJob, GraphNode, GraphPreset, GraphQueue, GraphQueueMessage,
-    GraphSession, GraphSkill, GraphSnapshot, Result, build_graph_snapshot, default_console_addr,
+    GraphEdge, GraphEdgeKind, GraphEntityCollection, GraphEntityCounts, GraphEntityKind, GraphJob,
+    GraphNode, GraphPreset, GraphQueue, GraphQueueMessage, GraphSession, GraphSkill, GraphSnapshot,
+    Result, build_entity_collection, build_graph_snapshot, build_node_detail, default_console_addr,
     start_console_server,
 };
 #[cfg(not(target_arch = "wasm32"))]

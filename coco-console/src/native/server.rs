@@ -1,4 +1,5 @@
 use coco_mem::Store;
+use serde::Serialize;
 use snafu::prelude::*;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -9,7 +10,9 @@ use crate::config::ConsoleConfig;
 use crate::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
 };
-use crate::graph::build_graph_snapshot;
+use crate::graph::{
+    GraphEntityKind, build_entity_collection, build_graph_snapshot, build_node_detail,
+};
 use crate::publisher::ConsolePublisher;
 use crate::render::{render_fragment, render_index_page};
 use crate::{Error, Result};
@@ -148,24 +151,44 @@ where
         }
         "/api/graph" => match build_graph_snapshot(&state.store, state.publisher.current_version())
         {
-            Ok(snapshot) => match serde_json::to_vec(&snapshot) {
-                Ok(body) => {
-                    write_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        "application/json; charset=utf-8",
-                        &body,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    write_plain_error(&mut stream, format!("failed to serialize graph: {error}"))
-                        .await
-                }
-            },
+            Ok(snapshot) => write_json_response(&mut stream, &snapshot).await,
             Err(error) => write_error(&mut stream, error).await,
         },
+        "/api/node" => {
+            let Some(id) = request.query_value("id") else {
+                return write_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    "text/plain; charset=utf-8",
+                    b"missing node id",
+                )
+                .await;
+            };
+            match build_node_detail(&state.store, &id) {
+                Ok(node) => write_json_response(&mut stream, &node).await,
+                Err(error) => write_error(&mut stream, error).await,
+            }
+        }
+        "/api/entities" => {
+            let Some(kind) = request
+                .query_value("kind")
+                .and_then(|value| GraphEntityKind::parse(&value))
+            else {
+                return write_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    "text/plain; charset=utf-8",
+                    b"unknown entity kind",
+                )
+                .await;
+            };
+            match build_entity_collection(&state.store, kind) {
+                Ok(collection) => write_json_response(&mut stream, &collection).await,
+                Err(error) => write_error(&mut stream, error).await,
+            }
+        }
         "/fragment" => write_fragment(&mut stream, state, request.version).await,
         "/events" => write_event_stream(stream, state.publisher).await,
         "/pkg/coco_console.js" => {
@@ -196,7 +219,14 @@ where
 struct HttpRequest {
     method: String,
     path: String,
+    query: String,
     version: Option<u64>,
+}
+
+impl HttpRequest {
+    fn query_value(&self, key: &str) -> Option<String> {
+        parse_query_value(&self.query, key)
+    }
 }
 
 async fn read_request(stream: &mut tokio::net::TcpStream) -> io::Result<Option<HttpRequest>> {
@@ -231,15 +261,75 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> io::Result<Option<H
     Ok(Some(HttpRequest {
         method: method.to_owned(),
         path: path.to_owned(),
+        query: query.to_owned(),
         version: parse_version_query(query),
     }))
 }
 
 fn parse_version_query(query: &str) -> Option<u64> {
+    parse_query_value(query, "version").and_then(|value| value.parse().ok())
+}
+
+pub(super) fn parse_query_value(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|part| {
         let (key, value) = part.split_once('=')?;
-        (key == "version").then(|| value.parse().ok()).flatten()
+        (key == name).then(|| percent_decode_query_value(value))
     })
+}
+
+fn percent_decode_query_value(value: &str) -> String {
+    let mut decoded = Vec::new();
+    let bytes = value.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let high = hex_value(bytes[index + 1]);
+                let low = hex_value(bytes[index + 2]);
+                if let (Some(high), Some(low)) = (high, low) {
+                    decoded.push((high << 4) | low);
+                    index += 3;
+                } else {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+async fn write_json_response(
+    stream: &mut tokio::net::TcpStream,
+    value: &impl Serialize,
+) -> io::Result<()> {
+    match serde_json::to_vec(value) {
+        Ok(body) => {
+            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await
+        }
+        Err(error) => {
+            write_plain_error(stream, format!("failed to serialize response: {error}")).await
+        }
+    }
 }
 
 async fn write_response(

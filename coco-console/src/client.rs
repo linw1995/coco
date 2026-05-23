@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use serde::Deserialize;
+use serde_json::Value;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Document, Element, MouseEvent, Response, Window};
@@ -14,11 +15,6 @@ const ZOOM_STEP: f64 = 1.2;
 const CULL_PADDING: f64 = 520.0;
 
 #[derive(Debug, Deserialize)]
-struct ClientGraphSnapshot {
-    nodes: Vec<ClientGraphNode>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ClientGraphNode {
     id: String,
     kind: String,
@@ -26,6 +22,83 @@ struct ClientGraphNode {
     created_at: String,
     content: String,
     labels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", content = "items", rename_all = "snake_case")]
+enum ClientEntityCollection {
+    Branches(Vec<ClientBranch>),
+    Sessions(Vec<ClientSession>),
+    Presets(Vec<ClientPreset>),
+    Skills(Vec<ClientSkill>),
+    Jobs(Vec<ClientJob>),
+    Queues(Vec<ClientQueue>),
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientBranch {
+    name: String,
+    head_id: String,
+    state: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientSession {
+    branch: String,
+    head_id: String,
+    state: String,
+    target_branch: Option<String>,
+    base_head_id: Option<String>,
+    pause_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientPreset {
+    name: String,
+    current_version: u64,
+    version_count: usize,
+    role: String,
+    provider_profile: String,
+    model: String,
+    tool_count: usize,
+    prompt: String,
+    system_prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientSkill {
+    role: String,
+    name: String,
+    current_version: u64,
+    version_count: usize,
+    revision_id: String,
+    description: String,
+    script_count: usize,
+    enable_coco_shim: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientJob {
+    job_id: String,
+    created_at: String,
+    finished_at: Option<String>,
+    branch: String,
+    base: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientQueue {
+    name: String,
+    message_count: usize,
+    messages: Vec<ClientQueueMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientQueueMessage {
+    message_id: String,
+    created_at: String,
+    payload: String,
 }
 
 #[wasm_bindgen(start)]
@@ -45,10 +118,11 @@ async fn run() -> Result<(), JsValue> {
     install_resize_listener(&window, document.clone())?;
     install_hash_listener(&window, document.clone())?;
     install_graph_interactions(&window, &document)?;
+    install_entity_navigation(&window, &document)?;
     if let Some(state) = ScrollState::load(&window) {
         state.restore(&document);
     }
-    update_node_detail_from_hash(&window, &document)?;
+    update_hash_state(&window, &document)?;
     update_graph_viewport_state(&document)?;
 
     loop {
@@ -60,9 +134,10 @@ async fn run() -> Result<(), JsValue> {
         let fragment = fetch_text(&window, &format!("/fragment?version={version}")).await?;
         replace_root(&document, &fragment)?;
         install_graph_interactions(&window, &document)?;
+        install_entity_navigation(&window, &document)?;
         mark_new_nodes(&document, &known_nodes)?;
         scroll.restore(&document);
-        update_node_detail_from_hash(&window, &document)?;
+        update_hash_state(&window, &document)?;
         update_graph_viewport_state(&document)?;
         scroll.save(&window);
     }
@@ -165,10 +240,49 @@ fn install_resize_listener(window: &Window, document: Document) -> Result<(), Js
 fn install_hash_listener(window: &Window, document: Document) -> Result<(), JsValue> {
     let window_for_listener = window.clone();
     let closure = Closure::<dyn FnMut()>::new(move || {
-        let _ = update_node_detail_from_hash(&window_for_listener, &document);
+        let _ = update_hash_state(&window_for_listener, &document);
     });
     window.add_event_listener_with_callback("hashchange", closure.as_ref().unchecked_ref())?;
     closure.forget();
+    Ok(())
+}
+
+fn install_entity_navigation(window: &Window, document: &Document) -> Result<(), JsValue> {
+    let links = document.query_selector_all(".entity-nav-link")?;
+    for index in 0..links.length() {
+        let Some(link) = links.item(index) else {
+            continue;
+        };
+        let Ok(link) = link.dyn_into::<Element>() else {
+            continue;
+        };
+        let Some(href) = link.get_attribute("href") else {
+            continue;
+        };
+        let Some(section_id) = href.strip_prefix('#') else {
+            continue;
+        };
+        let Some(kind) = entity_kind_for_section(document, section_id) else {
+            continue;
+        };
+
+        let nav_window = window.clone();
+        let nav_document = document.clone();
+        let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |_| {
+            let load_window = nav_window.clone();
+            let load_document = nav_document.clone();
+            let load_kind = kind.clone();
+            spawn_local(async move {
+                if let Err(error) =
+                    load_entity_section(&load_window, &load_document, &load_kind).await
+                {
+                    web_sys::console::error_1(&error);
+                }
+            });
+        });
+        link.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
     Ok(())
 }
 
@@ -519,6 +633,367 @@ fn clamp_scroll(value: f64, content_size: i32, viewport_size: i32) -> i32 {
     value.round().clamp(0.0, f64::from(max_scroll)) as i32
 }
 
+fn update_hash_state(window: &Window, document: &Document) -> Result<(), JsValue> {
+    update_node_detail_from_hash(window, document)?;
+    load_entity_from_hash(window, document)
+}
+
+fn load_entity_from_hash(window: &Window, document: &Document) -> Result<(), JsValue> {
+    let hash = window.location().hash().unwrap_or_default();
+    let Some(section_id) = hash.strip_prefix('#').filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(kind) = entity_kind_for_section(document, section_id) else {
+        return Ok(());
+    };
+
+    let load_window = window.clone();
+    let load_document = document.clone();
+    spawn_local(async move {
+        if let Err(error) = load_entity_section(&load_window, &load_document, &kind).await {
+            web_sys::console::error_1(&error);
+        }
+    });
+    Ok(())
+}
+
+fn entity_kind_for_section(document: &Document, section_id: &str) -> Option<String> {
+    document
+        .get_element_by_id(section_id)?
+        .get_attribute("data-entity-kind")
+}
+
+async fn load_entity_section(
+    window: &Window,
+    document: &Document,
+    kind: &str,
+) -> Result<(), JsValue> {
+    let Some(body) = entity_section_body(document, kind)? else {
+        return Ok(());
+    };
+    match body.get_attribute("data-entity-state").as_deref() {
+        Some("loaded") | Some("loading") => return Ok(()),
+        _ => {}
+    }
+
+    set_entity_status(&body, "loading", "Loading...")?;
+    let result = async {
+        let response = fetch_text(window, &format!("/api/entities?kind={kind}")).await?;
+        serde_json::from_str::<ClientEntityCollection>(&response)
+            .map_err(|error| JsValue::from_str(&format!("failed to parse entity records: {error}")))
+    }
+    .await;
+
+    match result {
+        Ok(collection) => render_entity_collection(document, &body, collection),
+        Err(error) => {
+            set_entity_status(&body, "error", "Failed to load records.")?;
+            Err(error)
+        }
+    }
+}
+
+fn entity_section_body(document: &Document, kind: &str) -> Result<Option<Element>, JsValue> {
+    document.query_selector(&format!(
+        ".entity-section-body[data-entity-kind=\"{kind}\"]"
+    ))
+}
+
+fn set_entity_status(body: &Element, state: &str, message: &str) -> Result<(), JsValue> {
+    body.set_attribute("data-entity-state", state)?;
+    body.set_text_content(None);
+    let Some(document) = body.owner_document() else {
+        return Ok(());
+    };
+    append_text_element(&document, body, "p", "entity-placeholder", message)?;
+    Ok(())
+}
+
+fn render_entity_collection(
+    document: &Document,
+    body: &Element,
+    collection: ClientEntityCollection,
+) -> Result<(), JsValue> {
+    body.set_text_content(None);
+    body.set_attribute("data-entity-state", "loaded")?;
+
+    match collection {
+        ClientEntityCollection::Branches(items) => {
+            render_entity_list(document, body, items, render_branch_item)
+        }
+        ClientEntityCollection::Sessions(items) => {
+            render_entity_list(document, body, items, render_session_item)
+        }
+        ClientEntityCollection::Presets(items) => {
+            render_entity_list(document, body, items, render_preset_item)
+        }
+        ClientEntityCollection::Skills(items) => {
+            render_entity_list(document, body, items, render_skill_item)
+        }
+        ClientEntityCollection::Jobs(items) => {
+            render_entity_list(document, body, items, render_job_item)
+        }
+        ClientEntityCollection::Queues(items) => {
+            render_entity_list(document, body, items, render_queue_item)
+        }
+    }
+}
+
+fn render_entity_list<T>(
+    document: &Document,
+    body: &Element,
+    items: Vec<T>,
+    render_item: fn(&Document, &Element, T) -> Result<(), JsValue>,
+) -> Result<(), JsValue> {
+    if items.is_empty() {
+        append_text_element(document, body, "p", "entity-placeholder", "No records.")?;
+        return Ok(());
+    }
+
+    let list = document.create_element("ul")?;
+    list.set_class_name("entity-list");
+    for item in items {
+        render_item(document, &list, item)?;
+    }
+    body.append_child(&list)?;
+    Ok(())
+}
+
+fn render_branch_item(
+    document: &Document,
+    list: &Element,
+    branch: ClientBranch,
+) -> Result<(), JsValue> {
+    let item = document.create_element("li")?;
+    item.set_class_name("branch");
+    append_text_element(document, &item, "strong", "", &branch.name)?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format!("head {}", shorten_id(&branch.head_id)),
+    )?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format_state_value(&branch.state),
+    )?;
+    list.append_child(&item)?;
+    Ok(())
+}
+
+fn render_session_item(
+    document: &Document,
+    list: &Element,
+    session: ClientSession,
+) -> Result<(), JsValue> {
+    let item = document.create_element("li")?;
+    item.set_class_name("entity-card");
+    append_text_element(document, &item, "strong", "", &session.branch)?;
+    append_text_element(document, &item, "span", "", &session.state)?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format!("head {}", shorten_id(&session.head_id)),
+    )?;
+    if let Some(target) = session.target_branch {
+        append_text_element(document, &item, "span", "", &format!("target {target}"))?;
+    }
+    if let Some(base) = session.base_head_id {
+        append_text_element(
+            document,
+            &item,
+            "span",
+            "",
+            &format!("base {}", shorten_id(&base)),
+        )?;
+    }
+    if let Some(reason) = session.pause_reason {
+        append_text_element(document, &item, "span", "", &reason)?;
+    }
+    list.append_child(&item)?;
+    Ok(())
+}
+
+fn render_preset_item(
+    document: &Document,
+    list: &Element,
+    preset: ClientPreset,
+) -> Result<(), JsValue> {
+    let item = document.create_element("li")?;
+    item.set_class_name("entity-card");
+    append_text_element(document, &item, "strong", "", &preset.name)?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format!(
+            "v{} / {} versions",
+            preset.current_version, preset.version_count
+        ),
+    )?;
+    append_text_element(document, &item, "span", "", &preset.role)?;
+    append_text_element(document, &item, "span", "", &preset.provider_profile)?;
+    append_text_element(document, &item, "span", "", &preset.model)?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format!("{} tools", preset.tool_count),
+    )?;
+    append_text_element(document, &item, "p", "", &preset.prompt)?;
+    append_text_element(document, &item, "p", "", &preset.system_prompt)?;
+    list.append_child(&item)?;
+    Ok(())
+}
+
+fn render_skill_item(
+    document: &Document,
+    list: &Element,
+    skill: ClientSkill,
+) -> Result<(), JsValue> {
+    let item = document.create_element("li")?;
+    item.set_class_name("entity-card");
+    append_text_element(document, &item, "strong", "", &skill.name)?;
+    append_text_element(document, &item, "span", "", &skill.role)?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format!(
+            "v{} / {} versions",
+            skill.current_version, skill.version_count
+        ),
+    )?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format!("revision {}", shorten_id(&skill.revision_id)),
+    )?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format!("{} scripts", skill.script_count),
+    )?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        if skill.enable_coco_shim {
+            "shim enabled"
+        } else {
+            "shim disabled"
+        },
+    )?;
+    append_text_element(document, &item, "p", "", &skill.description)?;
+    list.append_child(&item)?;
+    Ok(())
+}
+
+fn render_job_item(document: &Document, list: &Element, job: ClientJob) -> Result<(), JsValue> {
+    let item = document.create_element("li")?;
+    item.set_class_name("entity-card");
+    append_text_element(document, &item, "strong", "", &shorten_id(&job.job_id))?;
+    append_text_element(document, &item, "span", "", &job.status)?;
+    append_text_element(document, &item, "span", "", &job.branch)?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format!("base {}", shorten_id(&job.base)),
+    )?;
+    append_text_element(document, &item, "span", "", &job.created_at)?;
+    if let Some(finished_at) = job.finished_at {
+        append_text_element(
+            document,
+            &item,
+            "span",
+            "",
+            &format!("finished {finished_at}"),
+        )?;
+    }
+    list.append_child(&item)?;
+    Ok(())
+}
+
+fn render_queue_item(
+    document: &Document,
+    list: &Element,
+    queue: ClientQueue,
+) -> Result<(), JsValue> {
+    let item = document.create_element("li")?;
+    item.set_class_name("entity-card");
+    append_text_element(document, &item, "strong", "", &queue.name)?;
+    append_text_element(
+        document,
+        &item,
+        "span",
+        "",
+        &format!("{} messages", queue.message_count),
+    )?;
+
+    let messages = document.create_element("ul")?;
+    messages.set_class_name("queue-message-list");
+    for message in queue.messages {
+        let message_item = document.create_element("li")?;
+        append_text_element(
+            document,
+            &message_item,
+            "strong",
+            "",
+            &shorten_id(&message.message_id),
+        )?;
+        append_text_element(document, &message_item, "span", "", &message.created_at)?;
+        append_text_element(document, &message_item, "pre", "", &message.payload)?;
+        messages.append_child(&message_item)?;
+    }
+    item.append_child(&messages)?;
+    list.append_child(&item)?;
+    Ok(())
+}
+
+fn append_text_element(
+    document: &Document,
+    parent: &Element,
+    tag: &str,
+    class_name: &str,
+    text: &str,
+) -> Result<Element, JsValue> {
+    let child = document.create_element(tag)?;
+    if !class_name.is_empty() {
+        child.set_class_name(class_name);
+    }
+    child.set_text_content(Some(text));
+    parent.append_child(&child)?;
+    Ok(child)
+}
+
+fn format_state_value(value: &Value) -> String {
+    match value {
+        Value::String(raw) => raw.clone(),
+        Value::Object(fields) if fields.len() == 1 => fields
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| value.to_string()),
+        _ => value.to_string(),
+    }
+}
+
 fn update_node_detail_from_hash(window: &Window, document: &Document) -> Result<(), JsValue> {
     let selected = selected_node_id(window, document)?;
     update_node_selection(document, selected.as_deref())?;
@@ -614,16 +1089,30 @@ async fn load_node_detail(
     document: &Document,
     node_id: String,
 ) -> Result<(), JsValue> {
-    let response = fetch_text(window, "/api/graph").await?;
-    let snapshot = serde_json::from_str::<ClientGraphSnapshot>(&response)
-        .map_err(|error| JsValue::from_str(&format!("failed to parse graph snapshot: {error}")))?;
-    let Some(node) = snapshot.nodes.into_iter().find(|node| node.id == node_id) else {
-        return Ok(());
-    };
+    let response = fetch_text(window, &format!("/api/node?id={}", query_encode(&node_id))).await?;
+    let node = serde_json::from_str::<ClientGraphNode>(&response)
+        .map_err(|error| JsValue::from_str(&format!("failed to parse node detail: {error}")))?;
     if selected_node_id(window, document)?.as_deref() != Some(node.id.as_str()) {
         return Ok(());
     }
     render_node_detail(document, &node)
+}
+
+fn shorten_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn query_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn render_node_detail(document: &Document, node: &ClientGraphNode) -> Result<(), JsValue> {

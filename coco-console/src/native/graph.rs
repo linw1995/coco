@@ -19,11 +19,53 @@ pub struct GraphSnapshot {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub branches: Vec<GraphBranch>,
-    pub sessions: Vec<GraphSession>,
-    pub presets: Vec<GraphPreset>,
-    pub skills: Vec<GraphSkill>,
-    pub jobs: Vec<GraphJob>,
-    pub queues: Vec<GraphQueue>,
+    pub entity_counts: GraphEntityCounts,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct GraphEntityCounts {
+    pub nodes: usize,
+    pub branches: usize,
+    pub sessions: usize,
+    pub presets: usize,
+    pub skills: usize,
+    pub jobs: usize,
+    pub queues: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphEntityKind {
+    Branches,
+    Sessions,
+    Presets,
+    Skills,
+    Jobs,
+    Queues,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(tag = "kind", content = "items", rename_all = "snake_case")]
+pub enum GraphEntityCollection {
+    Branches(Vec<GraphBranch>),
+    Sessions(Vec<GraphSession>),
+    Presets(Vec<GraphPreset>),
+    Skills(Vec<GraphSkill>),
+    Jobs(Vec<GraphJob>),
+    Queues(Vec<GraphQueue>),
+}
+
+impl GraphEntityKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "branches" => Some(Self::Branches),
+            "sessions" => Some(Self::Sessions),
+            "presets" => Some(Self::Presets),
+            "skills" => Some(Self::Skills),
+            "jobs" => Some(Self::Jobs),
+            "queues" => Some(Self::Queues),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -247,11 +289,7 @@ pub fn build_graph_snapshot(
         });
     }
 
-    let sessions = build_sessions(&graph_branches);
-    let presets = build_presets(store)?;
-    let skills = build_skills(store)?;
-    let jobs = build_jobs(store)?;
-    let queues = build_queues(store)?;
+    let entity_counts = build_entity_counts(store, nodes.len(), graph_branches.len())?;
 
     Ok(GraphSnapshot {
         version,
@@ -259,12 +297,104 @@ pub fn build_graph_snapshot(
         nodes,
         edges,
         branches: graph_branches,
-        sessions,
-        presets,
-        skills,
-        jobs,
-        queues,
+        entity_counts,
     })
+}
+
+pub fn build_node_detail(
+    store: &(impl BranchStore + NodeStore + SessionStore),
+    id: &str,
+) -> Result<GraphNode> {
+    let node = store.get_node(id).context(StoreSnafu)?;
+    let states = store.list_session_states().context(StoreSnafu)?;
+    let mut labels = Vec::new();
+    for (branch, state) in states {
+        let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
+        if head_id == node.id {
+            labels.push(GraphBranchLabel { branch, state });
+        }
+    }
+
+    Ok(GraphNode {
+        id: node.id.clone(),
+        short_id: shorten_id(&node.id),
+        kind: graph_kind_name(&node).to_owned(),
+        role: format!("{:?}", node.role),
+        created_at: node.created_at.to_string(),
+        created_at_ns: node.created_at.as_nanosecond(),
+        content: render_node_content(&node),
+        summary: summarize_node(&node),
+        labels: render_graph_labels(&labels),
+    })
+}
+
+pub fn build_entity_collection(
+    store: &(impl BranchStore + JobStore + MessageQueueStore + PresetStore + SessionStore + SkillStore),
+    kind: GraphEntityKind,
+) -> Result<GraphEntityCollection> {
+    let branches = match kind {
+        GraphEntityKind::Branches | GraphEntityKind::Sessions => Some(build_branches(store)?),
+        GraphEntityKind::Presets
+        | GraphEntityKind::Skills
+        | GraphEntityKind::Jobs
+        | GraphEntityKind::Queues => None,
+    };
+
+    Ok(match kind {
+        GraphEntityKind::Branches => GraphEntityCollection::Branches(branches.unwrap()),
+        GraphEntityKind::Sessions => {
+            GraphEntityCollection::Sessions(build_sessions(branches.as_deref().unwrap_or_default()))
+        }
+        GraphEntityKind::Presets => GraphEntityCollection::Presets(build_presets(store)?),
+        GraphEntityKind::Skills => GraphEntityCollection::Skills(build_skills(store)?),
+        GraphEntityKind::Jobs => GraphEntityCollection::Jobs(build_jobs(store)?),
+        GraphEntityKind::Queues => GraphEntityCollection::Queues(build_queues(store)?),
+    })
+}
+
+fn build_entity_counts(
+    store: &(impl JobStore + MessageQueueStore + PresetStore + SkillStore),
+    nodes: usize,
+    branches: usize,
+) -> Result<GraphEntityCounts> {
+    let preset_count = store.list_preset_records().context(StoreSnafu)?.len();
+    let skill_count = [SessionRole::Orchestrator, SessionRole::Runner]
+        .into_iter()
+        .try_fold(0usize, |count, role| {
+            store
+                .list_skills(role)
+                .context(StoreSnafu)
+                .map(|skills| count + skills.len())
+        })?;
+    let job_count = store.list_jobs().context(StoreSnafu)?.len();
+    let queue_count = store.list_message_queues().context(StoreSnafu)?.len();
+
+    Ok(GraphEntityCounts {
+        nodes,
+        branches,
+        sessions: branches,
+        presets: preset_count,
+        skills: skill_count,
+        jobs: job_count,
+        queues: queue_count,
+    })
+}
+
+fn build_branches(store: &(impl BranchStore + SessionStore)) -> Result<Vec<GraphBranch>> {
+    let states = store.list_session_states().context(StoreSnafu)?;
+    let mut branches = states.into_iter().collect::<Vec<_>>();
+    branches.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    branches
+        .into_iter()
+        .map(|(branch, state)| {
+            Ok(GraphBranch {
+                head_id: store.get_branch_head(&branch).context(StoreSnafu)?,
+                name: branch,
+                state,
+            })
+        })
+        .collect()
 }
 
 fn build_sessions(branches: &[GraphBranch]) -> Vec<GraphSession> {

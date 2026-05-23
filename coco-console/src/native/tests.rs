@@ -5,7 +5,10 @@ use coco_mem::{
 };
 use serde_json::json;
 
-use crate::graph::{GraphBranch, GraphEdge, GraphEdgeKind, GraphNode};
+use crate::graph::{
+    GraphBranch, GraphEdge, GraphEdgeKind, GraphEntityCollection, GraphEntityCounts,
+    GraphEntityKind, GraphNode,
+};
 use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LANE_HEIGHT, GRAPH_LEFT_X, GRAPH_TOP_Y,
     GraphLayoutEdgeKind, Point, layout_graph, routed_elbow_points,
@@ -51,11 +54,15 @@ fn empty_snapshot() -> GraphSnapshot {
         nodes: Vec::new(),
         edges: Vec::new(),
         branches: Vec::new(),
-        sessions: Vec::new(),
-        presets: Vec::new(),
-        skills: Vec::new(),
-        jobs: Vec::new(),
-        queues: Vec::new(),
+        entity_counts: GraphEntityCounts {
+            nodes: 0,
+            branches: 0,
+            sessions: 0,
+            presets: 0,
+            skills: 0,
+            jobs: 0,
+            queues: 0,
+        },
     }
 }
 
@@ -272,20 +279,36 @@ fn graph_snapshot_contains_store_entities() {
 
     let snapshot = build_graph_snapshot(&store, 9).unwrap();
 
-    assert_eq!(snapshot.sessions.len(), 1);
-    assert_eq!(snapshot.presets.len(), 1);
-    assert!(snapshot.skills.iter().any(|skill| skill.name == "demo"));
-    assert_eq!(snapshot.jobs.len(), 1);
-    assert_eq!(snapshot.queues.len(), 1);
-    assert_eq!(snapshot.queues[0].message_count, 1);
+    assert_eq!(snapshot.entity_counts.sessions, 1);
+    assert_eq!(snapshot.entity_counts.presets, 1);
+    assert!(snapshot.entity_counts.skills >= 1);
+    assert_eq!(snapshot.entity_counts.jobs, 1);
+    assert_eq!(snapshot.entity_counts.queues, 1);
+
+    let skills = crate::graph::build_entity_collection(&store, GraphEntityKind::Skills).unwrap();
+    match skills {
+        GraphEntityCollection::Skills(skills) => {
+            assert!(skills.iter().any(|skill| skill.name == "demo"));
+        }
+        _ => panic!("expected skills collection"),
+    }
+    let queues = crate::graph::build_entity_collection(&store, GraphEntityKind::Queues).unwrap();
+    match queues {
+        GraphEntityCollection::Queues(queues) => {
+            assert_eq!(queues.len(), 1);
+            assert_eq!(queues[0].message_count, 1);
+        }
+        _ => panic!("expected queues collection"),
+    }
 
     let html = render_snapshot_page(&snapshot);
     assert!(html.contains("href=\"#presets\""));
     assert!(html.contains("href=\"#skills\""));
     assert!(html.contains("href=\"#jobs\""));
     assert!(html.contains("href=\"#queues\""));
-    assert!(html.contains("Demo skill"));
-    assert!(html.contains("hooks"));
+    assert!(html.contains("data-entity-kind=\"skills\""));
+    assert!(!html.contains("Demo skill"));
+    assert!(!html.contains("hooks"));
 }
 
 #[test]
@@ -309,11 +332,15 @@ fn layout_expands_empty_columns_from_event_order() {
             head_id: "merged".to_owned(),
             state: SessionState::Active,
         }],
-        sessions: Vec::new(),
-        presets: Vec::new(),
-        skills: Vec::new(),
-        jobs: Vec::new(),
-        queues: Vec::new(),
+        entity_counts: GraphEntityCounts {
+            nodes: 4,
+            branches: 1,
+            sessions: 1,
+            presets: 0,
+            skills: 0,
+            jobs: 0,
+            queues: 0,
+        },
     };
 
     let layout = layout_graph(&snapshot);
@@ -412,5 +439,17 @@ fn request_parser_extracts_path_without_query() {
     assert_eq!(
         parts.next().and_then(|target| target.split('?').next()),
         Some("/api/graph")
+    );
+}
+
+#[test]
+fn query_values_are_percent_decoded() {
+    assert_eq!(
+        super::server::parse_query_value("id=a%2Fb%20c&kind=skills", "id"),
+        Some("a/b c".to_owned())
+    );
+    assert_eq!(
+        super::server::parse_query_value("id=a+b", "id"),
+        Some("a b".to_owned())
     );
 }
