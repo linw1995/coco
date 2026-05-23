@@ -211,6 +211,7 @@ const SESSION_POLL_INTERVAL_MS: u64 = 25;
 const COCO_DAEMON_SOCKET_ENV: &str = "COCO_DAEMON_SOCKET";
 const COCO_EXEC_SANDBOX_ENV: &str = "COCO_EXEC_SANDBOX";
 const COCO_EXEC_WORKSPACE_ENV: &str = "COCO_EXEC_WORKSPACE";
+const COCO_LOG_DIR_ENV: &str = "COCO_LOG_DIR";
 const UV_CACHE_DIR_ENV: &str = "UV_CACHE_DIR";
 const UV_PYTHON_INSTALL_DIR_ENV: &str = "UV_PYTHON_INSTALL_DIR";
 const TMPDIR_ENV: &str = "TMPDIR";
@@ -660,6 +661,7 @@ struct CocoCommandPathInjection {
     root_dir: PathBuf,
     path_entries: Vec<PathBuf>,
     extra_allow_paths: Vec<PathBuf>,
+    log_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -870,6 +872,8 @@ fn prepare_coco_command_path_injection(
     let root_dir = next_runtime_socket_dir(&runtime_root);
     let bin_dir = root_dir.join("bin");
     std::fs::create_dir_all(&bin_dir).context(CreateCocoCommandShimDirSnafu)?;
+    let log_dir = root_dir.join("logs");
+    std::fs::create_dir_all(&log_dir).context(CreateCocoCommandShimDirSnafu)?;
 
     let current_exe = resolve_coco_cli_executable()?;
     let alias_path = bin_dir.join("coco");
@@ -877,7 +881,7 @@ fn prepare_coco_command_path_injection(
         path: alias_path.clone(),
     })?;
 
-    let mut extra_allow_paths = vec![bin_dir.clone()];
+    let mut extra_allow_paths = vec![bin_dir.clone(), log_dir.clone()];
     if matches!(mode, CocoCommandShimMode::Enabled)
         && let Some(parent) = current_exe.parent()
         && !path_is_within_workspace(parent, workspace_root)
@@ -902,6 +906,7 @@ fn prepare_coco_command_path_injection(
         root_dir,
         path_entries: path_entries_with_source(&extra_path_entries, source_path_env),
         extra_allow_paths,
+        log_dir,
     })
 }
 
@@ -1572,6 +1577,7 @@ async fn execute_command(
         .env_remove(COCO_STORE_PATH_ENV)
         .env_remove(COCO_CLI_RUNTIME_SOCKET_ENV)
         .env_remove(COCO_PARENT_TOOL_USE_ID_ENV)
+        .env_remove(COCO_LOG_DIR_ENV)
         .env_remove(COCO_SKILL_NAME_ENV)
         .env_remove(COCO_SKILL_DIR_ENV)
         .env_remove(COCO_SKILL_PERSIST_DIR_ENV)
@@ -1580,6 +1586,7 @@ async fn execute_command(
         .env_remove(COCO_COMMAND_SHIM_MODE_ENV);
     if let Some(coco_command) = &coco_command {
         command.env("PATH", join_path_entries(coco_command.path_entries.clone()));
+        command.env(COCO_LOG_DIR_ENV, &coco_command.log_dir);
         if request.context.enable_coco_shim {
             command
                 .env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch)
@@ -1713,6 +1720,7 @@ async fn execute_pty_command(
     command.env_remove(COCO_STORE_PATH_ENV);
     command.env_remove(COCO_CLI_RUNTIME_SOCKET_ENV);
     command.env_remove(COCO_PARENT_TOOL_USE_ID_ENV);
+    command.env_remove(COCO_LOG_DIR_ENV);
     command.env_remove(COCO_SKILL_NAME_ENV);
     command.env_remove(COCO_SKILL_DIR_ENV);
     command.env_remove(COCO_SKILL_PERSIST_DIR_ENV);
@@ -1721,6 +1729,7 @@ async fn execute_pty_command(
     command.env_remove(COCO_COMMAND_SHIM_MODE_ENV);
     if let Some(coco_command) = &coco_command {
         command.env("PATH", join_path_entries(coco_command.path_entries.clone()));
+        command.env(COCO_LOG_DIR_ENV, &coco_command.log_dir);
         if request.context.enable_coco_shim {
             command.env(COCO_SESSION_BRANCH_ENV, &request.context.session_branch);
             command.env(COCO_SESSION_ROLE_ENV, request.context.session_role.as_str());
@@ -2736,6 +2745,7 @@ mod tests {
             root_dir: shim_root.path().to_path_buf(),
             path_entries: vec![shim_bin.clone(), rest.path().to_path_buf()],
             extra_allow_paths: Vec::new(),
+            log_dir: shim_root.path().join("logs"),
         };
         let dirs = SkillUvRuntimeDirs {
             env_vars: Vec::new(),
@@ -2782,6 +2792,63 @@ mod tests {
 
         assert!(output.contains("exit_status: 0"));
         assert!(output.contains("/bin/coco"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_runtime_sets_coco_log_dir_for_injected_alias() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            test_context_with_shim(false),
+        );
+
+        let output = crate::with_process_env_async(
+            &[
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("off"))),
+                ("XDG_RUNTIME_DIR", Some(runtime_root.path().as_os_str())),
+                (COCO_LOG_DIR_ENV, Some(OsStr::new("/stale/coco/logs"))),
+            ],
+            || async {
+                runtime
+                    .call(format!(
+                        r#"{{"cmd":"printf '%s' \"$COCO_LOG_DIR\"","workdir":"{}","shell":"bash"}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        let expected_root = runtime_root.path().join("coco").display().to_string();
+        assert!(output.contains("exit_status: 0"));
+        assert!(output.contains(&expected_root));
+        assert!(output.contains("/logs"));
+        assert!(!output.contains("/stale/coco/logs"));
+    }
+
+    #[tokio::test]
+    async fn coco_command_path_injection_allows_runtime_log_dir() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+
+        let injection = crate::with_process_env_async(
+            &[("XDG_RUNTIME_DIR", Some(runtime_root.path().as_os_str()))],
+            || async {
+                prepare_coco_command_path_injection(
+                    workspace.path(),
+                    CocoCommandShimMode::Disabled,
+                    false,
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(injection.log_dir.is_dir());
+        assert!(injection.extra_allow_paths.contains(&injection.log_dir));
     }
 
     #[tokio::test]
