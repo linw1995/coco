@@ -1,10 +1,14 @@
+use std::net::SocketAddr;
+
 use coco_mem::{
     Anchor, BranchStore, JobStore, Kind, MemoryStore, MergeParent, MessageQueueStore, NewNode,
     NodeStore, Preset, PresetStore, Role, SessionAnchor, SessionRole, SessionState, SkillStore,
     SkillVersionSpec, Tool,
 };
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::config::ConsoleConfig;
 use crate::graph::{
     GraphBranch, GraphEdge, GraphEdgeKind, GraphEntityCollection, GraphEntityCounts,
     GraphEntityKind, GraphNode,
@@ -14,7 +18,9 @@ use crate::layout::{
     GraphLayoutEdgeKind, Point, layout_graph, routed_elbow_points,
 };
 use crate::render::{render_fragment, render_index_page, render_snapshot_page};
-use crate::{ConsolePublisher, ConsoleStore, GraphSnapshot, build_graph_snapshot};
+use crate::{
+    ConsolePublisher, ConsoleStore, GraphSnapshot, build_graph_snapshot, start_console_server,
+};
 
 fn session_anchor() -> SessionAnchor {
     SessionAnchor {
@@ -452,4 +458,106 @@ fn query_values_are_percent_decoded() {
         super::server::parse_query_value("id=a+b", "id"),
         Some("a b".to_owned())
     );
+}
+
+#[tokio::test]
+async fn server_serves_entity_and_node_details_on_demand() {
+    let publisher = ConsolePublisher::new();
+    let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &session).unwrap();
+    let detail = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("load this node only".to_owned()),
+        })
+        .unwrap();
+    store.set_branch_head("main", &session, &detail).unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "server-demo",
+            SkillVersionSpec {
+                description: "Server demo skill".to_owned(),
+                body: "Run server demo".to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        )
+        .unwrap();
+
+    let handle = start_console_server(
+        ConsoleConfig {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        },
+        store,
+        publisher,
+    )
+    .unwrap();
+    let addr = handle.addr();
+
+    let index = http_get(addr, "/").await;
+    assert_eq!(response_status(&index), 200);
+    assert!(response_body(&index).contains("data-entity-kind=\"skills\""));
+    assert!(!response_body(&index).contains("Server demo skill"));
+
+    let graph = http_get(addr, "/api/graph").await;
+    assert_eq!(response_status(&graph), 200);
+    let graph: serde_json::Value = serde_json::from_str(response_body(&graph)).unwrap();
+    assert!(graph["entity_counts"]["skills"].as_u64().unwrap() >= 1);
+    assert!(graph.get("skills").is_none());
+
+    let node = http_get(addr, &format!("/api/node?id={detail}")).await;
+    assert_eq!(response_status(&node), 200);
+    let node: serde_json::Value = serde_json::from_str(response_body(&node)).unwrap();
+    assert_eq!(node["id"], detail);
+    assert_eq!(node["content"], "load this node only");
+
+    let skills = http_get(addr, "/api/entities?kind=skills").await;
+    assert_eq!(response_status(&skills), 200);
+    let skills: serde_json::Value = serde_json::from_str(response_body(&skills)).unwrap();
+    assert_eq!(skills["kind"], "skills");
+    assert!(skills["items"].as_array().unwrap().iter().any(|skill| {
+        skill["name"] == "server-demo" && skill["description"] == "Server demo skill"
+    }));
+
+    let bad_kind = http_get(addr, "/api/entities?kind=unknown").await;
+    assert_eq!(response_status(&bad_kind), 400);
+    let missing_node = http_get(addr, "/api/node").await;
+    assert_eq!(response_status(&missing_node), 400);
+
+    handle.shutdown().await.unwrap();
+}
+
+async fn http_get(addr: SocketAddr, target: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET {target} HTTP/1.1\r\nhost: localhost\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    String::from_utf8(response).unwrap()
+}
+
+fn response_status(response: &str) -> u16 {
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .unwrap()
+}
+
+fn response_body(response: &str) -> &str {
+    response.split_once("\r\n\r\n").unwrap().1
 }
