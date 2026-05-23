@@ -235,6 +235,9 @@ impl ReqwestTelegramTransport {
         Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+                // Keep Telegram long polling on HTTP/1.1. HTTP/2 is not required by the
+                // Bot API and has known stability issues around cancelled keep-alive streams.
+                .http1_only()
                 .build()
                 .expect("telegram reqwest client config should be valid"),
             base_url: format!("https://api.telegram.org/bot{token}"),
@@ -513,6 +516,23 @@ mod tests {
         async fn handle(&self, _message: InboundMessage) -> Result<OutboundMessage> {
             Err(Error::handler(std::io::Error::other("handler failed")))
         }
+    }
+
+    #[test]
+    fn from_config_builds_reqwest_transport() {
+        let mut allowed_chat_ids = BTreeSet::new();
+        allowed_chat_ids.insert("42".to_owned());
+        let config = TelegramChannelConfig {
+            token: "123456:secret-token".to_owned(),
+            poll_timeout_secs: 30,
+            allowed_chat_ids: allowed_chat_ids.clone(),
+        };
+
+        let channel = TelegramChannel::from_config(config).unwrap();
+
+        assert_eq!(channel.poll_timeout_secs, 30);
+        assert_eq!(channel.allowed_chat_ids, allowed_chat_ids);
+        assert_eq!(channel.offset(), None);
     }
 
     #[tokio::test]
