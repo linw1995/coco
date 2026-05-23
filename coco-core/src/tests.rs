@@ -22,7 +22,7 @@ use tokio::time::{Duration, sleep};
 use crate::{
     BatchPromptRequest, BranchPromptRequest, BranchPromptStatus, BranchResolveError,
     BranchResolver, ChannelKind, ConversationEngine, CoreService, EngineError, Error,
-    FixedBranchResolver, InboundMessage,
+    FixedBranchResolver, InboundMessage, TelegramImageAttachment,
 };
 
 type FakeResponseQueue =
@@ -312,6 +312,49 @@ async fn core_service_telegram_prompt_requires_completing_request_before_reply()
     assert!(prompt.contains("include a concise multi-task summary"));
     assert!(prompt.contains("chat_id: chat-1"));
     assert!(prompt.contains("reply_to_message_id: message-1"));
+}
+
+#[tokio::test]
+async fn core_service_telegram_prompt_includes_image_attachments() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let service = CoreService::new(
+        FixedBranchResolver::new("main"),
+        ConversationEngine::new(llm),
+    );
+
+    service
+        .handle_message(InboundMessage::telegram_with_message_id_and_images(
+            "chat-1",
+            "user-1",
+            "message-1",
+            "",
+            vec![TelegramImageAttachment::from_parts(
+                "file-id",
+                Some("unique-id".to_owned()),
+                Some(1280),
+                Some(960),
+                Some(200_000),
+            )],
+        ))
+        .await
+        .unwrap();
+
+    let ancestry = store.ancestry("main").unwrap();
+    let prompt = match &ancestry[1].kind {
+        Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
+        _ => panic!("expected prompt anchor"),
+    };
+    assert!(prompt.contains("Incoming image attachments:"));
+    assert!(prompt.contains("file_id=file-id"));
+    assert!(prompt.contains("file_unique_id=unique-id"));
+    assert!(prompt.contains("width=1280"));
+    assert!(prompt.contains("height=960"));
+    assert!(prompt.contains("file_size=200000"));
+    assert!(prompt.contains("No text caption was provided."));
+    assert!(prompt.contains("COCO_TELEGRAM_BOT_TOKEN"));
 }
 
 #[tokio::test]

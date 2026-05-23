@@ -5,7 +5,9 @@ mod resolver;
 mod service;
 mod skill;
 
-pub use coco_channel::{ChannelKind, InboundMessage, OutboundMessage, TelegramInboundMessage};
+pub use coco_channel::{
+    ChannelKind, InboundMessage, OutboundMessage, TelegramImageAttachment, TelegramInboundMessage,
+};
 pub use coco_llm::coco_mem::JobStatus;
 pub use engine::{BranchLockGuard, ConversationEngine, JobStatusSnapshot};
 pub use error::{BranchResolveError, EngineError, Error};

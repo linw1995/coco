@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
 use crate::error::TelegramTransportSnafu;
-use crate::{ChannelRuntime, Error, InboundMessage, MessageHandler, Result};
+use crate::{
+    ChannelRuntime, Error, InboundMessage, MessageHandler, Result, TelegramImageAttachment,
+    TelegramInboundMessage,
+};
 
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 30;
 const POLL_TIMEOUT_GRACE_SECS: u64 = 15;
@@ -397,18 +400,29 @@ pub struct TelegramUpdate {
 impl TelegramUpdate {
     pub fn to_inbound_message(&self) -> Option<InboundMessage> {
         let message = self.message.as_ref()?;
-        let text = message.text.as_ref()?;
+        let text = message
+            .text
+            .as_deref()
+            .or(message.caption.as_deref())
+            .unwrap_or_default();
+        let image_attachments = message.image_attachments();
+        if text.is_empty() && image_attachments.is_empty() {
+            return None;
+        }
         let sender_id = message
             .from
             .as_ref()
             .map(|user| user.id.to_string())
             .unwrap_or_else(|| message.chat.id.to_string());
 
-        Some(InboundMessage::telegram_with_message_id(
-            message.chat.id.to_string(),
-            sender_id,
-            message.message_id.to_string(),
-            text.clone(),
+        Some(InboundMessage::Telegram(
+            TelegramInboundMessage::with_message_id_and_images(
+                message.chat.id.to_string(),
+                sender_id,
+                message.message_id.to_string(),
+                text.to_owned(),
+                image_attachments,
+            ),
         ))
     }
 }
@@ -419,6 +433,42 @@ pub struct TelegramMessage {
     pub chat: TelegramChat,
     pub from: Option<TelegramUser>,
     pub text: Option<String>,
+    pub caption: Option<String>,
+    #[serde(default)]
+    pub photo: Vec<TelegramPhotoSize>,
+}
+
+impl TelegramMessage {
+    fn image_attachments(&self) -> Vec<TelegramImageAttachment> {
+        self.photo
+            .iter()
+            .max_by_key(|photo| {
+                (
+                    u64::from(photo.width) * u64::from(photo.height),
+                    photo.file_size.unwrap_or(0),
+                )
+            })
+            .map(|photo| {
+                TelegramImageAttachment::from_parts(
+                    photo.file_id.clone(),
+                    Some(photo.file_unique_id.clone()),
+                    Some(photo.width),
+                    Some(photo.height),
+                    photo.file_size,
+                )
+            })
+            .into_iter()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct TelegramPhotoSize {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub file_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -562,6 +612,8 @@ mod tests {
                 chat: TelegramChat { id: 42 },
                 from: Some(TelegramUser { id: 7 }),
                 text: None,
+                caption: None,
+                photo: Vec::new(),
             }),
         }]);
         let mut channel = TelegramChannel::new(transport, 30, BTreeSet::new());
@@ -598,6 +650,8 @@ mod tests {
                 chat: TelegramChat { id: -42 },
                 from: None,
                 text: Some("hello".to_owned()),
+                caption: None,
+                photo: Vec::new(),
             }),
         };
 
@@ -607,6 +661,47 @@ mod tests {
         assert_eq!(message.sender_id(), "-42");
         assert_eq!(message.source_message_id(), Some("1000"));
         assert_eq!(message.text(), "hello");
+    }
+
+    #[tokio::test]
+    async fn run_once_maps_photo_update_without_text() {
+        let transport = FakeTransport::with_updates(vec![photo_update(100, 42, 7, None)]);
+        let mut channel = TelegramChannel::new(transport, 30, BTreeSet::new());
+        let handler = RecordingHandler::default();
+
+        let handled = channel.run_once(&handler).await.unwrap();
+
+        assert_eq!(handled, 1);
+        assert_eq!(channel.offset(), Some(101));
+        let messages = handler.messages();
+        assert_eq!(messages.len(), 1);
+        let InboundMessage::Telegram(message) = &messages[0] else {
+            panic!("expected telegram inbound message");
+        };
+        assert_eq!(message.chat_id(), "42");
+        assert_eq!(message.sender_id(), "7");
+        assert_eq!(message.source_message_id(), Some("1000"));
+        assert_eq!(message.text(), "");
+        assert_eq!(message.image_attachments().len(), 1);
+        let image = &message.image_attachments()[0];
+        assert_eq!(image.file_id(), "large-file-id");
+        assert_eq!(image.file_unique_id(), Some("large-unique-id"));
+        assert_eq!(image.width(), Some(1280));
+        assert_eq!(image.height(), Some(960));
+        assert_eq!(image.file_size(), Some(200_000));
+    }
+
+    #[test]
+    fn update_maps_photo_caption_as_text() {
+        let update = photo_update(100, 42, 7, Some("what is in this image?"));
+
+        let message = update.to_inbound_message().unwrap();
+
+        assert_eq!(message.text(), "what is in this image?");
+        let InboundMessage::Telegram(message) = message else {
+            panic!("expected telegram inbound message");
+        };
+        assert_eq!(message.image_attachments().len(), 1);
     }
 
     #[tokio::test]
@@ -717,6 +812,42 @@ mod tests {
                 chat: TelegramChat { id: chat_id },
                 from: Some(TelegramUser { id: user_id }),
                 text: Some(text.to_owned()),
+                caption: None,
+                photo: Vec::new(),
+            }),
+        }
+    }
+
+    fn photo_update(
+        update_id: i64,
+        chat_id: i64,
+        user_id: i64,
+        caption: Option<&str>,
+    ) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id,
+            message: Some(TelegramMessage {
+                message_id: 1000,
+                chat: TelegramChat { id: chat_id },
+                from: Some(TelegramUser { id: user_id }),
+                text: None,
+                caption: caption.map(str::to_owned),
+                photo: vec![
+                    TelegramPhotoSize {
+                        file_id: "small-file-id".to_owned(),
+                        file_unique_id: "small-unique-id".to_owned(),
+                        width: 320,
+                        height: 240,
+                        file_size: Some(20_000),
+                    },
+                    TelegramPhotoSize {
+                        file_id: "large-file-id".to_owned(),
+                        file_unique_id: "large-unique-id".to_owned(),
+                        width: 1280,
+                        height: 960,
+                        file_size: Some(200_000),
+                    },
+                ],
             }),
         }
     }

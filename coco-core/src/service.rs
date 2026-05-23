@@ -40,9 +40,9 @@ where
     pub async fn handle_message(&self, message: InboundMessage) -> Result<OutboundMessage> {
         let text = message.text().trim();
         ensure!(
-            !text.is_empty(),
+            !text.is_empty() || message.has_image_attachments(),
             InvalidInputSnafu {
-                message: "message text is empty".to_owned(),
+                message: "message content is empty".to_owned(),
             }
         );
 
@@ -114,6 +114,12 @@ fn channel_prompt(message: &InboundMessage, text: &str) -> String {
 
 fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
     let reply_to_message_id = message.source_message_id().unwrap_or("unknown");
+    let image_context = telegram_image_context(message);
+    let incoming_text = if text.is_empty() {
+        "No text caption was provided."
+    } else {
+        text
+    };
 
     formatdoc!(
         "
@@ -133,11 +139,50 @@ fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
         - Do not use the `telegram` skill merely to acknowledge the request unless the incoming message only asks for acknowledgement.
         - Do not finish after an acknowledgement-only Telegram reply unless the incoming message only asked for acknowledgement.
         - Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.
+        - If the request depends on an image attachment, inspect it before responding. Resolve Telegram file_id values with getFile using COCO_TELEGRAM_BOT_TOKEN, then download the returned file_path from the Telegram file API.
         - After the final Telegram skill call completes, return a local completion note. If you handled multiple distinct tasks, include a concise multi-task summary in that final text that lists each task and its outcome.
 
+        Incoming image attachments:
+        {image_context}
+
         Incoming message:
-        {text}
+        {incoming_text}
         ",
         chat_id = message.chat_id(),
+        image_context = image_context,
+        incoming_text = incoming_text,
     )
+}
+
+fn telegram_image_context(message: &TelegramInboundMessage) -> String {
+    if message.image_attachments().is_empty() {
+        return "None.".to_owned();
+    }
+
+    message
+        .image_attachments()
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            format!(
+                "- image {index}: file_id={file_id}, file_unique_id={file_unique_id}, width={width}, height={height}, file_size={file_size}",
+                index = index + 1,
+                file_id = image.file_id(),
+                file_unique_id = image.file_unique_id().unwrap_or("unknown"),
+                width = image
+                    .width()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                height = image
+                    .height()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                file_size = image
+                    .file_size()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

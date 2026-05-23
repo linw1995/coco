@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use coco_channel::{ChannelRuntime, InboundMessage, MessageHandler, OutboundMessage};
+use coco_channel::{
+    ChannelRuntime, InboundMessage, MessageHandler, OutboundMessage, TelegramImageAttachment,
+};
 use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
 use coco_core::{ConversationEngine, CoreService, EngineError, FixedBranchResolver};
@@ -373,6 +375,17 @@ struct QueuedTelegramMessage {
     sender_id: String,
     source_message_id: Option<String>,
     text: String,
+    #[serde(default)]
+    image_attachments: Vec<QueuedTelegramImageAttachment>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct QueuedTelegramImageAttachment {
+    file_id: String,
+    file_unique_id: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    file_size: Option<u64>,
 }
 
 #[derive(Debug, Snafu)]
@@ -939,6 +952,19 @@ fn encode_telegram_message(message: &InboundMessage) -> serde_json::Value {
         "sender_id": message.sender_id(),
         "source_message_id": message.source_message_id(),
         "text": message.text(),
+        "image_attachments": message
+            .image_attachments()
+            .iter()
+            .map(|image| {
+                json!({
+                    "file_id": image.file_id(),
+                    "file_unique_id": image.file_unique_id(),
+                    "width": image.width(),
+                    "height": image.height(),
+                    "file_size": image.file_size(),
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -946,12 +972,40 @@ fn decode_telegram_message(
     payload: serde_json::Value,
 ) -> std::result::Result<InboundMessage, TelegramQueuePayloadError> {
     let message = serde_json::from_value::<QueuedTelegramMessage>(payload).context(DecodeSnafu)?;
+    let image_attachments = message
+        .image_attachments
+        .into_iter()
+        .map(|image| {
+            TelegramImageAttachment::from_parts(
+                image.file_id,
+                image.file_unique_id,
+                image.width,
+                image.height,
+                image.file_size,
+            )
+        })
+        .collect::<Vec<_>>();
     Ok(match message.source_message_id {
+        Some(source_message_id) if !image_attachments.is_empty() => {
+            InboundMessage::telegram_with_message_id_and_images(
+                message.chat_id,
+                message.sender_id,
+                source_message_id,
+                message.text,
+                image_attachments,
+            )
+        }
         Some(source_message_id) => InboundMessage::telegram_with_message_id(
             message.chat_id,
             message.sender_id,
             source_message_id,
             message.text,
+        ),
+        None if !image_attachments.is_empty() => InboundMessage::telegram_with_images(
+            message.chat_id,
+            message.sender_id,
+            message.text,
+            image_attachments,
         ),
         None => InboundMessage::telegram(message.chat_id, message.sender_id, message.text),
     })
@@ -1208,7 +1262,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
-    use coco_channel::{InboundMessage, MessageHandler};
+    use coco_channel::{InboundMessage, MessageHandler, TelegramImageAttachment};
     use coco_core::ConversationEngine;
     use coco_llm::{
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
@@ -1237,6 +1291,27 @@ mod tests {
     fn telegram_queue_payload_round_trips_inbound_message() {
         let message =
             InboundMessage::telegram_with_message_id("chat-1", "sender-1", "message-1", "hello");
+
+        let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn telegram_queue_payload_round_trips_image_attachments() {
+        let message = InboundMessage::telegram_with_message_id_and_images(
+            "chat-1",
+            "sender-1",
+            "message-1",
+            "",
+            vec![TelegramImageAttachment::from_parts(
+                "file-id",
+                Some("unique-id".to_owned()),
+                Some(1280),
+                Some(960),
+                Some(200_000),
+            )],
+        );
 
         let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
 
