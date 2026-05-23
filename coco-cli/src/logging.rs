@@ -184,6 +184,29 @@ mod tests {
     }
 
     #[test]
+    fn resolve_log_dir_falls_back_to_home() {
+        let home = tempfile::tempdir().unwrap();
+
+        let resolved = with_env(
+            &[
+                (COCO_LOG_DIR_ENV, None),
+                ("XDG_STATE_HOME", None),
+                ("HOME", Some(home.path().as_os_str())),
+            ],
+            resolve_log_dir,
+        );
+
+        assert_eq!(
+            resolved,
+            home.path()
+                .join(".local")
+                .join("state")
+                .join("coco")
+                .join("logs")
+        );
+    }
+
+    #[test]
     fn build_file_writer_returns_writer_for_writable_directory() {
         let log_dir = tempfile::tempdir().unwrap();
 
@@ -208,5 +231,35 @@ mod tests {
         with_env(&[(COCO_LOG_DIR_ENV, Some(path.path().as_os_str()))], || {
             let _ = init_tracing();
         });
+    }
+
+    #[test]
+    fn init_tracing_attempts_file_logging_when_available() {
+        let log_dir = tempfile::tempdir().unwrap();
+
+        with_env(
+            &[(COCO_LOG_DIR_ENV, Some(log_dir.path().as_os_str()))],
+            || {
+                let _ = init_tracing();
+            },
+        );
+    }
+
+    #[test]
+    fn init_tracing_reports_global_subscriber_errors() {
+        let log_dir = tempfile::tempdir().unwrap();
+
+        let error = with_env(
+            &[(COCO_LOG_DIR_ENV, Some(log_dir.path().as_os_str()))],
+            || init_tracing().err().or_else(|| init_tracing().err()),
+        )
+        .expect("reinitializing tracing should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to initialize tracing subscriber")
+        );
+        assert!(StdError::source(&error).is_some());
     }
 }
