@@ -235,6 +235,9 @@ impl ReqwestTelegramTransport {
         Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+                // Keep Telegram long polling on HTTP/1.1. HTTP/2 is not required by the
+                // Bot API and has known stability issues around cancelled keep-alive streams.
+                .http1_only()
                 .build()
                 .expect("telegram reqwest client config should be valid"),
             base_url: format!("https://api.telegram.org/bot{token}"),
