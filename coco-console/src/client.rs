@@ -1055,7 +1055,10 @@ fn update_node_detail_from_hash(window: &Window, document: &Document) -> Result<
 
 fn selected_node(window: &Window, document: &Document) -> Result<Option<SelectedNode>, JsValue> {
     let hash = window.location().hash().unwrap_or_default();
-    let Some(target) = hash.strip_prefix('#').filter(|target| !target.is_empty()) else {
+    let Some(target) = hash
+        .strip_prefix('#')
+        .filter(|target| target.starts_with("detail-"))
+    else {
         return Ok(None);
     };
     Ok(Some(SelectedNode {
