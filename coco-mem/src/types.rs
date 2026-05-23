@@ -555,9 +555,6 @@ pub enum PromptAttachment {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptImageAttachment {
     pub id: String,
-    pub source: PromptImageSource,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_unique_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -566,14 +563,6 @@ pub struct PromptImageAttachment {
     pub file_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PromptImageSource {
-    TelegramFile { file_id: String },
-    LocalPath { path: String },
-    Url { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

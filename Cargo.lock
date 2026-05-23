@@ -431,7 +431,6 @@ dependencies = [
  "mime_guess",
  "nanoid 0.5.0",
  "portable-pty",
- "reqwest",
  "rig-core",
  "serde",
  "serde_json",

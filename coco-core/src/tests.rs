@@ -369,12 +369,7 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
     assert_eq!(image.width, Some(1280));
     assert_eq!(image.height, Some(960));
     assert_eq!(image.file_size, Some(200_000));
-    assert_eq!(image.file_unique_id.as_deref(), Some("unique-id"));
-    assert!(matches!(
-        &image.source,
-        coco_llm::coco_mem::PromptImageSource::TelegramFile { file_id }
-            if file_id == "file-id"
-    ));
+    assert_eq!(image.media_type, None);
 }
 
 #[tokio::test]

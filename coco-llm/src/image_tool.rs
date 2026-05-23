@@ -7,8 +7,6 @@ use snafu::prelude::*;
 
 use crate::ToolInvocationContext;
 
-const DEFAULT_TELEGRAM_TOKEN_ENV: &str = "COCO_TELEGRAM_BOT_TOKEN";
-
 #[derive(Debug, Clone)]
 pub(crate) struct ImageToolRuntime {
     definition: Tool,
@@ -43,21 +41,6 @@ pub enum ImageToolError {
 
     #[snafu(display("image media type {media_type:?} is not supported"))]
     UnsupportedMediaType { media_type: String },
-
-    #[snafu(display("telegram token is missing; set {env}"))]
-    MissingTelegramToken { env: &'static str },
-
-    #[snafu(display("telegram getFile request failed: {source}"))]
-    TelegramGetFile { source: reqwest::Error },
-
-    #[snafu(display("telegram getFile returned an error: {description}"))]
-    TelegramGetFileApi { description: String },
-
-    #[snafu(display("telegram getFile response did not include file_path"))]
-    MissingTelegramFilePath,
-
-    #[snafu(display("telegram file download failed: {source}"))]
-    TelegramDownload { source: reqwest::Error },
 }
 
 impl From<ImageToolError> for rig::tool::ToolError {
@@ -70,7 +53,6 @@ impl From<ImageToolError> for rig::tool::ToolError {
 #[serde(rename_all = "snake_case")]
 pub enum ImageSourceKind {
     LocalPath,
-    TelegramFile,
     Url,
 }
 
@@ -78,21 +60,8 @@ pub enum ImageSourceKind {
 struct LoadImageArgs {
     source: ImageSourceKind,
     path: Option<String>,
-    file_id: Option<String>,
     url: Option<String>,
     media_type: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TelegramApiResponse<T> {
-    ok: bool,
-    result: Option<T>,
-    description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TelegramFile {
-    file_path: Option<String>,
 }
 
 pub(crate) fn load_runtime(definition: Tool, workspace_root: PathBuf) -> ImageToolRuntime {
@@ -193,56 +162,6 @@ async fn load_url_image(args: LoadImageArgs) -> Result<String, ImageToolError> {
     image_json(url, media_type)
 }
 
-async fn load_telegram_image(args: LoadImageArgs) -> Result<String, ImageToolError> {
-    let file_id = args.file_id.context(MissingFieldSnafu {
-        source_kind: args.source,
-        field: "file_id",
-    })?;
-    let token = std::env::var(DEFAULT_TELEGRAM_TOKEN_ENV).map_err(|_| {
-        MissingTelegramTokenSnafu {
-            env: DEFAULT_TELEGRAM_TOKEN_ENV,
-        }
-        .build()
-    })?;
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("https://api.telegram.org/bot{token}/getFile"))
-        .json(&serde_json::json!({ "file_id": file_id }))
-        .send()
-        .await
-        .context(TelegramGetFileSnafu)?
-        .error_for_status()
-        .context(TelegramGetFileSnafu)?
-        .json::<TelegramApiResponse<TelegramFile>>()
-        .await
-        .context(TelegramGetFileSnafu)?;
-    ensure!(
-        response.ok,
-        TelegramGetFileApiSnafu {
-            description: response.description.unwrap_or_else(|| "unknown".to_owned()),
-        }
-    );
-    let file_path = response
-        .result
-        .and_then(|file| file.file_path)
-        .context(MissingTelegramFilePathSnafu)?;
-    let media_type = guess_media_type(Path::new(&file_path), args.media_type)?;
-    let bytes = client
-        .get(format!(
-            "https://api.telegram.org/file/bot{token}/{}",
-            file_path
-        ))
-        .send()
-        .await
-        .context(TelegramDownloadSnafu)?
-        .error_for_status()
-        .context(TelegramDownloadSnafu)?
-        .bytes()
-        .await
-        .context(TelegramDownloadSnafu)?;
-    image_json(BASE64_STANDARD.encode(bytes), media_type)
-}
-
 impl ImageToolRuntime {
     pub fn tool_definition(&self) -> rig::completion::ToolDefinition {
         rig::completion::ToolDefinition {
@@ -261,7 +180,6 @@ impl ImageToolRuntime {
         let workspace_root = self.workspace_root.clone();
         Ok(match args.source {
             ImageSourceKind::LocalPath => load_local_image(args, workspace_root).await?,
-            ImageSourceKind::TelegramFile => load_telegram_image(args).await?,
             ImageSourceKind::Url => load_url_image(args).await?,
         })
     }

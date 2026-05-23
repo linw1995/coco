@@ -1,7 +1,7 @@
 use coco_llm::CompletionBackend;
 use coco_llm::coco_mem::{
-    BranchStore, JobStore, NodeStore, PromptAttachment, PromptImageAttachment, PromptImageSource,
-    SessionStore, SkillStore,
+    BranchStore, JobStore, NodeStore, PromptAttachment, PromptImageAttachment, SessionStore,
+    SkillStore,
 };
 use indoc::formatdoc;
 use snafu::prelude::*;
@@ -154,7 +154,7 @@ fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> ChannelPromp
         - Do not use the `telegram` skill merely to acknowledge the request unless the incoming message only asks for acknowledgement.
         - Do not finish after an acknowledgement-only Telegram reply unless the incoming message only asked for acknowledgement.
         - Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.
-        - If the request depends on an image attachment, inspect it before responding. Prefer the `load_image` tool with `source=\"telegram_file\"` and the attachment file_id so the image is added to model context. Use the `telegram` skill's `telegram_download.py` script only when you need a local file copy.
+        - If the request depends on an image attachment, inspect it before responding. Use the `telegram` skill's `telegram_download.py` script with the attachment file_id to download the image into the workspace, then use `load_image` with `source=\"local_path\"` and the downloaded path so the image is added to model context.
         - After the final Telegram skill call completes, return a local completion note. If you handled multiple distinct tasks, include a concise multi-task summary in that final text that lists each task and its outcome.
 
         Incoming image attachments:
@@ -181,10 +181,6 @@ fn telegram_prompt_attachments(message: &TelegramInboundMessage) -> Vec<PromptAt
         .map(|(index, image)| {
             PromptAttachment::Image(PromptImageAttachment {
                 id: format!("telegram-image-{}", index + 1),
-                source: PromptImageSource::TelegramFile {
-                    file_id: image.file_id().to_owned(),
-                },
-                file_unique_id: image.file_unique_id().map(str::to_owned),
                 width: image.width(),
                 height: image.height(),
                 file_size: image.file_size(),
