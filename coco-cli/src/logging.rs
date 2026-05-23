@@ -119,3 +119,94 @@ fn default_log_dir() -> PathBuf {
         .join("coco")
         .join("logs")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::sync::{Mutex, OnceLock};
+
+    use super::*;
+
+    fn with_env<T>(entries: &[(&str, Option<&OsStr>)], run: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let previous: Vec<_> = entries
+            .iter()
+            .map(|(name, _)| ((*name).to_owned(), std::env::var_os(name)))
+            .collect();
+
+        for (name, value) in entries {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+
+        let output = run();
+
+        for (name, value) in previous {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+
+        output
+    }
+
+    #[test]
+    fn resolve_log_dir_prefers_explicit_env() {
+        let log_dir = tempfile::tempdir().unwrap();
+
+        let resolved = with_env(
+            &[(COCO_LOG_DIR_ENV, Some(log_dir.path().as_os_str()))],
+            resolve_log_dir,
+        );
+
+        assert_eq!(resolved, log_dir.path());
+    }
+
+    #[test]
+    fn resolve_log_dir_falls_back_to_xdg_state_home() {
+        let state_home = tempfile::tempdir().unwrap();
+
+        let resolved = with_env(
+            &[
+                (COCO_LOG_DIR_ENV, None),
+                ("XDG_STATE_HOME", Some(state_home.path().as_os_str())),
+                ("HOME", None),
+            ],
+            resolve_log_dir,
+        );
+
+        assert_eq!(resolved, state_home.path().join("coco").join("logs"));
+    }
+
+    #[test]
+    fn build_file_writer_returns_writer_for_writable_directory() {
+        let log_dir = tempfile::tempdir().unwrap();
+
+        let writer = build_file_writer(log_dir.path());
+
+        assert!(writer.is_some());
+    }
+
+    #[test]
+    fn build_file_writer_returns_none_when_log_dir_cannot_be_created() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+
+        let writer = build_file_writer(path.path());
+
+        assert!(writer.is_none());
+    }
+
+    #[test]
+    fn init_tracing_does_not_panic_when_file_logging_is_unavailable() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+
+        with_env(&[(COCO_LOG_DIR_ENV, Some(path.path().as_os_str()))], || {
+            let _ = init_tracing();
+        });
+    }
+}
