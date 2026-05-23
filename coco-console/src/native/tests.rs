@@ -184,6 +184,7 @@ fn graph_snapshot_contains_shadow_parent_edges() {
                 vec![MergeParent::shadow(shadow_parent.clone())],
                 coco_mem::PromptAnchor {
                     prompt: String::new(),
+                    attachments: vec![],
                 },
             )),
         })

@@ -1,5 +1,8 @@
 use coco_llm::CompletionBackend;
-use coco_llm::coco_mem::{BranchStore, JobStore, NodeStore, SessionStore, SkillStore};
+use coco_llm::coco_mem::{
+    BranchStore, JobStore, NodeStore, PromptAttachment, PromptImageAttachment, PromptImageSource,
+    SessionStore, SkillStore,
+};
 use indoc::formatdoc;
 use snafu::prelude::*;
 use std::collections::HashSet;
@@ -55,7 +58,11 @@ where
             })?;
 
         let prompt = channel_prompt(&message, text);
-        match self.engine.reply(&branch, &prompt).await {
+        match self
+            .engine
+            .reply_with_attachments(&branch, &prompt.text, prompt.attachments)
+            .await
+        {
             Ok(text) => Ok(OutboundMessage { text }),
             Err(EngineError::SessionMissing { branch }) => Err(Error::MissingSession { branch }),
             Err(source @ EngineError::EngineFailed { .. }) => {
@@ -105,14 +112,22 @@ where
     }
 }
 
-fn channel_prompt(message: &InboundMessage, text: &str) -> String {
+struct ChannelPrompt {
+    text: String,
+    attachments: Vec<PromptAttachment>,
+}
+
+fn channel_prompt(message: &InboundMessage, text: &str) -> ChannelPrompt {
     match message {
         InboundMessage::Telegram(telegram) => telegram_prompt(telegram, text),
-        InboundMessage::Cli(_) => text.to_owned(),
+        InboundMessage::Cli(_) => ChannelPrompt {
+            text: text.to_owned(),
+            attachments: vec![],
+        },
     }
 }
 
-fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
+fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> ChannelPrompt {
     let reply_to_message_id = message.source_message_id().unwrap_or("unknown");
     let image_context = telegram_image_context(message);
     let incoming_text = if text.is_empty() {
@@ -121,7 +136,7 @@ fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
         text
     };
 
-    formatdoc!(
+    let text = formatdoc!(
         "
         You are handling an inbound Telegram message.
 
@@ -139,7 +154,7 @@ fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
         - Do not use the `telegram` skill merely to acknowledge the request unless the incoming message only asks for acknowledgement.
         - Do not finish after an acknowledgement-only Telegram reply unless the incoming message only asked for acknowledgement.
         - Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.
-        - If the request depends on an image attachment, inspect it before responding. Use the `telegram` skill's `telegram_download.py` script with the attachment file_id to download inbound images.
+        - If the request depends on an image attachment, inspect it before responding. Prefer the `load_image` tool with `source=\"telegram_file\"` and the attachment file_id so the image is added to model context. Use the `telegram` skill's `telegram_download.py` script only when you need a local file copy.
         - After the final Telegram skill call completes, return a local completion note. If you handled multiple distinct tasks, include a concise multi-task summary in that final text that lists each task and its outcome.
 
         Incoming image attachments:
@@ -151,7 +166,32 @@ fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
         chat_id = message.chat_id(),
         image_context = image_context,
         incoming_text = incoming_text,
-    )
+    );
+    ChannelPrompt {
+        text,
+        attachments: telegram_prompt_attachments(message),
+    }
+}
+
+fn telegram_prompt_attachments(message: &TelegramInboundMessage) -> Vec<PromptAttachment> {
+    message
+        .image_attachments()
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            PromptAttachment::Image(PromptImageAttachment {
+                id: format!("telegram-image-{}", index + 1),
+                source: PromptImageSource::TelegramFile {
+                    file_id: image.file_id().to_owned(),
+                },
+                file_unique_id: image.file_unique_id().map(str::to_owned),
+                width: image.width(),
+                height: image.height(),
+                file_size: image.file_size(),
+                media_type: None,
+            })
+        })
+        .collect()
 }
 
 fn telegram_image_context(message: &TelegramInboundMessage) -> String {

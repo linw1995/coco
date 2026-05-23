@@ -110,6 +110,7 @@ fn make_prompt_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
                 .collect(),
             PromptAnchor {
                 prompt: "merge prompt".to_owned(),
+                attachments: vec![],
             },
         )),
     }
@@ -129,6 +130,7 @@ where
                 vec![],
                 PromptAnchor {
                     prompt: prompt.to_owned(),
+                    attachments: vec![],
                 },
             )),
         })
@@ -391,6 +393,7 @@ where
                 ],
                 PromptAnchor {
                     prompt: "shadow prompt".to_owned(),
+                    attachments: vec![],
                 },
             )),
         })
@@ -1682,6 +1685,7 @@ where
                 vec![],
                 PromptAnchor {
                     prompt: "world".to_owned(),
+                    attachments: vec![],
                 },
             )),
         })
@@ -1986,11 +1990,9 @@ where
             .contains("fork from the node before the `SkillInvocation`")
     );
     assert!(
-        orchestrator
-            .current()
-            .unwrap()
-            .body
-            .contains("--tool exec_command --tool write_stdin --tool search_skill")
+        orchestrator.current().unwrap().body.contains(
+            "--tool exec_command --tool write_stdin --tool search_skill --tool load_image"
+        )
     );
     assert!(
         orchestrator

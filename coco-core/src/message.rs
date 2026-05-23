@@ -1,9 +1,10 @@
-use coco_llm::coco_mem::MergeParent;
+use coco_llm::coco_mem::{MergeParent, PromptAttachment};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchPromptRequest {
     pub branch: String,
     pub prompt: String,
+    pub attachments: Vec<PromptAttachment>,
     pub merge_parents: Vec<MergeParent>,
 }
 

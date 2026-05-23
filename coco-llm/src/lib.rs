@@ -1,3 +1,4 @@
+mod image_tool;
 mod runtime_bridge;
 mod skill;
 mod skill_tool;
@@ -16,9 +17,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MemoryStore,
-    MergeParent, NewNode, NodeMetadata, NodeStore, PauseReason, PromptAnchor, ProviderMetadata,
-    Role, SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord, SkillResultAnchor,
-    SkillStore, StoreError, Tool, ToolResult, ToolUse,
+    MergeParent, NewNode, NodeMetadata, NodeStore, PauseReason, PromptAnchor, PromptAttachment,
+    ProviderMetadata, Role, SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord,
+    SkillResultAnchor, SkillStore, StoreError, Tool, ToolResult, ToolUse,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -152,6 +153,7 @@ pub struct SessionConfig {
 pub struct PromptRequest {
     pub branch: String,
     pub prompt: String,
+    pub attachments: Vec<PromptAttachment>,
     pub merge_parents: Vec<MergeParent>,
     pub session_patch: Option<SessionConfigPatch>,
 }
@@ -208,6 +210,7 @@ pub enum CompletionInput {
     Continue,
     Prompt {
         text: String,
+        attachments: Vec<PromptAttachment>,
         merge_parents: Vec<MergeParent>,
         session_patch: Option<Box<SessionConfigPatch>>,
     },
@@ -1333,6 +1336,7 @@ where
             origin: CompletionOrigin::BranchHead,
             input: CompletionInput::Prompt {
                 text: request.prompt,
+                attachments: request.attachments,
                 merge_parents: request.merge_parents,
                 session_patch: request.session_patch.map(Box::new),
             },
@@ -1371,11 +1375,13 @@ where
             CompletionInput::Continue => reference_id.clone(),
             CompletionInput::Prompt {
                 text,
+                attachments,
                 merge_parents,
                 session_patch,
             } => self.append_prompt_anchor_to_parent_with_session_patch(
                 &reference_id,
                 text,
+                attachments,
                 merge_parents,
                 session_patch.as_deref(),
             )?,
@@ -1611,6 +1617,7 @@ where
         &self,
         branch: &str,
         prompt: &str,
+        attachments: &[PromptAttachment],
         merge_parents: &[MergeParent],
         session_patch: Option<&SessionConfigPatch>,
     ) -> Result<String> {
@@ -1618,6 +1625,7 @@ where
         self.append_prompt_anchor_to_parent_with_session_patch(
             &parent_id,
             prompt,
+            attachments,
             merge_parents,
             session_patch,
         )
@@ -1636,7 +1644,7 @@ where
     ) -> Result<String> {
         let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
         let anchor_id =
-            self.append_prompt_anchor_to_parent(&original_head, prompt, merge_parents)?;
+            self.append_prompt_anchor_to_parent(&original_head, prompt, &[], merge_parents)?;
         self.store
             .set_branch_head(branch, &original_head, &anchor_id)
             .context(MemorySnafu)?;
@@ -1653,6 +1661,7 @@ where
         &self,
         parent_id: &str,
         prompt: &str,
+        attachments: &[PromptAttachment],
         merge_parents: &[MergeParent],
         session_patch: Option<&SessionConfigPatch>,
     ) -> Result<String> {
@@ -1670,7 +1679,7 @@ where
             }
             None => parent_id.to_owned(),
         };
-        self.append_prompt_anchor_to_parent(&prompt_parent_id, prompt, merge_parents)
+        self.append_prompt_anchor_to_parent(&prompt_parent_id, prompt, attachments, merge_parents)
     }
 }
 
@@ -1682,6 +1691,7 @@ where
         &self,
         parent_id: &str,
         prompt: &str,
+        attachments: &[PromptAttachment],
         merge_parents: &[MergeParent],
     ) -> Result<String> {
         let mut normalized_parents = Vec::new();
@@ -1704,6 +1714,7 @@ where
                     normalized_parents,
                     PromptAnchor {
                         prompt: prompt.to_owned(),
+                        attachments: attachments.to_vec(),
                     },
                 )),
             })
@@ -2454,6 +2465,7 @@ struct RuntimeToolSet {
 enum RuntimeTool {
     UnifiedExec(unified_exec_tool::UnifiedExecToolRuntime),
     SearchSkill(skill_tool::SkillToolRuntime),
+    LoadImage(image_tool::ImageToolRuntime),
 }
 
 impl RuntimeTool {
@@ -2461,6 +2473,7 @@ impl RuntimeTool {
         match self {
             Self::UnifiedExec(tool) => tool.tool_definition(),
             Self::SearchSkill(tool) => tool.tool_definition(),
+            Self::LoadImage(tool) => tool.tool_definition(),
         }
     }
 
@@ -2472,6 +2485,7 @@ impl RuntimeTool {
         match self {
             Self::UnifiedExec(tool) => tool.execute(args, invocation).await,
             Self::SearchSkill(tool) => tool.execute(args, invocation).await,
+            Self::LoadImage(tool) => tool.execute(args, invocation).await,
         }
     }
 }
@@ -2526,9 +2540,13 @@ fn build_runtime_tools(
                 workspace_root.clone(),
                 session.tool_runtime_env.clone(),
             )),
+            "load_image" => RuntimeTool::LoadImage(image_tool::load_runtime(
+                tool.clone(),
+                workspace_root.clone(),
+            )),
             other => {
                 return Err(BackendError::failed(format!(
-                    "unsupported tool {other:?}; only \"exec_command\", \"write_stdin\", and \"search_skill\" are implemented"
+                    "unsupported tool {other:?}; only \"exec_command\", \"write_stdin\", \"search_skill\", and \"load_image\" are implemented"
                 )));
             }
         };
@@ -3121,9 +3139,7 @@ impl ProviderHistoryBuilder {
             self.flush_tool_results();
         }
         self.tool_result_execution_id = execution_id;
-        let content = rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
-            output.to_owned(),
-        ));
+        let content = rig::completion::message::ToolResultContent::from_tool_output(output);
         let call_id = node_metadata.and_then(|metadata| metadata.call_id.clone());
         self.tool_results
             .push(rig_tool_result_content(id.to_owned(), call_id, content));
@@ -3500,9 +3516,7 @@ impl CompletionRunner {
             tool_result: rig_tool_result_content(
                 tool_call.id,
                 call_id,
-                rig::OneOrMany::one(rig::completion::message::ToolResultContent::text(
-                    provider_output,
-                )),
+                rig::completion::message::ToolResultContent::from_tool_output(provider_output),
             ),
         })
     }
@@ -4278,6 +4292,7 @@ mod tests {
         PromptRequest {
             branch: branch.to_owned(),
             prompt: prompt.to_owned(),
+            attachments: vec![],
             merge_parents: vec![],
             session_patch: None,
         }
@@ -5311,6 +5326,7 @@ mod tests {
                     vec![],
                     PromptAnchor {
                         prompt: "Delegate twice.".to_owned(),
+                        attachments: vec![],
                     },
                 )),
             })
@@ -5501,6 +5517,7 @@ mod tests {
             .prompt(PromptRequest {
                 branch: "main".to_owned(),
                 prompt: "merge them".to_owned(),
+                attachments: vec![],
                 merge_parents: vec![MergeParent::merge(draft_head)],
                 session_patch: None,
             })
@@ -5552,6 +5569,7 @@ mod tests {
             .prompt(PromptRequest {
                 branch: "main".to_owned(),
                 prompt: "keep this".to_owned(),
+                attachments: vec![],
                 merge_parents: vec![],
                 session_patch: None,
             })
@@ -5565,6 +5583,7 @@ mod tests {
             .prompt(PromptRequest {
                 branch: "runner".to_owned(),
                 prompt: "run date".to_owned(),
+                attachments: vec![],
                 merge_parents: vec![],
                 session_patch: Some(SessionConfigPatch {
                     role: Some(SessionRole::Runner),
@@ -5780,6 +5799,7 @@ mod tests {
                 origin: CompletionOrigin::Reference(session.anchor_id.clone()),
                 input: CompletionInput::Prompt {
                     text: "resume from base".to_owned(),
+                    attachments: vec![],
                     merge_parents: vec![],
                     session_patch: None,
                 },
@@ -5860,6 +5880,7 @@ mod tests {
                     vec![],
                     PromptAnchor {
                         prompt: "review".to_owned(),
+                        attachments: vec![],
                     },
                 )),
             })
@@ -5954,6 +5975,7 @@ mod tests {
                     vec![],
                     PromptAnchor {
                         prompt: "base feedback".to_owned(),
+                        attachments: vec![],
                     },
                 )),
             })
@@ -6013,6 +6035,7 @@ mod tests {
                     vec![],
                     PromptAnchor {
                         prompt: "new review".to_owned(),
+                        attachments: vec![],
                     },
                 )),
             })
@@ -6725,6 +6748,60 @@ mod tests {
                         if tool_result.id == "tool-call-legacy"
                             && tool_result.call_id.as_deref() == Some("call-legacy")
             )
+        ));
+    }
+
+    #[test]
+    fn rig_messages_from_nodes_restores_image_tool_result_content() {
+        let messages = rig_messages_from_nodes(&[
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), Some("call-image")),
+                Kind::tool_use(ToolUse {
+                    id: "tool-call-image".to_owned(),
+                    name: "load_image".to_owned(),
+                    input: serde_json::json!({
+                        "source": "local_path",
+                        "path": "image.png",
+                    }),
+                }),
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), Some("call-image")),
+                Kind::tool_result(ToolResult {
+                    id: "tool-call-image".to_owned(),
+                    output: serde_json::json!({
+                        "type": "image",
+                        "data": "aW1hZ2U=",
+                        "mimeType": "image/png",
+                    })
+                    .to_string(),
+                }),
+            ),
+        ]);
+
+        assert!(matches!(
+            &messages[1],
+            rig::completion::message::Message::User { content }
+                if matches!(
+                    content.first_ref(),
+                    rig::completion::message::UserContent::ToolResult(tool_result)
+                        if tool_result.id == "tool-call-image"
+                            && tool_result.call_id.as_deref() == Some("call-image")
+                            && matches!(
+                                tool_result.content.first_ref(),
+                                rig::completion::message::ToolResultContent::Image(image)
+                                    if image.data
+                                        == rig::completion::message::DocumentSourceKind::Base64(
+                                            "aW1hZ2U=".to_owned()
+                                        )
+                                        && image.media_type
+                                            == Some(
+                                                rig::completion::message::ImageMediaType::PNG
+                                            )
+                            )
+                )
         ));
     }
 

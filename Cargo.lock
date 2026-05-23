@@ -424,11 +424,14 @@ name = "coco-llm"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "coco-mem",
  "futures",
  "indoc",
+ "mime_guess",
  "nanoid 0.5.0",
  "portable-pty",
+ "reqwest",
  "rig-core",
  "serde",
  "serde_json",

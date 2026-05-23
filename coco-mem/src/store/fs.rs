@@ -44,8 +44,10 @@ const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
 const SHARED_SKILL_HISTORY_DIR_NAME: &str = "shared";
 const ORCHESTRATOR_SKILL_HISTORY_DIR_NAME: &str = "orchestrator";
 const RUNNER_SKILL_HISTORY_DIR_NAME: &str = "runner";
-const BUILTIN_COCO_ORCHESTRATOR_REVISION_ID: &str =
+const BUILTIN_COCO_ORCHESTRATOR_PRE_LOAD_IMAGE_REVISION_ID: &str =
     "cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438";
+const BUILTIN_COCO_ORCHESTRATOR_REVISION_ID: &str =
+    "79a81ed8e48dc4bac77d8d87ad5566d3b25c1aa1c6fd63cf89aec1efbc0ea6b9";
 const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
@@ -62,7 +64,10 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "coco-orchestrator",
-        from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+        from_revision_ids: &[
+            BUILTIN_COCO_ORCHESTRATOR_PRE_LOAD_IMAGE_REVISION_ID,
+            BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
+        ],
         target_revision_id: BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
     },
     BuiltinSkillMigration {

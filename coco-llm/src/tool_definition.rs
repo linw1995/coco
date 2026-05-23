@@ -86,6 +86,38 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                 "additionalProperties": false
             }),
         }),
+        "load_image" => Some(Tool {
+            name: "load_image".to_owned(),
+            description: "Load an image into model context only when the task depends on visual content. Supports local workspace paths, Telegram file_id values, and remote image URLs.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["local_path", "telegram_file", "url"],
+                        "description": "Where to load the image from."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Local image path for source=local_path. Relative paths resolve under the configured workspace."
+                    },
+                    "file_id": {
+                        "type": "string",
+                        "description": "Telegram file_id for source=telegram_file."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Remote image URL for source=url."
+                    },
+                    "media_type": {
+                        "type": "string",
+                        "description": "Optional image MIME type such as image/jpeg or image/png. Required for source=url."
+                    }
+                },
+                "required": ["source"],
+                "additionalProperties": false
+            }),
+        }),
         _ => None,
     }
 }
