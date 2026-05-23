@@ -40,6 +40,16 @@ pub struct TelegramInboundMessage {
     sender_id: String,
     source_message_id: Option<String>,
     text: String,
+    image_attachments: Vec<TelegramImageAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramImageAttachment {
+    file_id: String,
+    file_unique_id: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    file_size: Option<u64>,
 }
 
 impl InboundMessage {
@@ -63,6 +73,20 @@ impl InboundMessage {
         ))
     }
 
+    pub fn telegram_with_images(
+        conversation_id: impl Into<String>,
+        sender_id: impl Into<String>,
+        text: impl Into<String>,
+        image_attachments: Vec<TelegramImageAttachment>,
+    ) -> Self {
+        Self::Telegram(TelegramInboundMessage::new_with_images(
+            conversation_id,
+            sender_id,
+            text,
+            image_attachments,
+        ))
+    }
+
     pub fn telegram_with_message_id(
         conversation_id: impl Into<String>,
         sender_id: impl Into<String>,
@@ -74,6 +98,22 @@ impl InboundMessage {
             sender_id,
             source_message_id,
             text,
+        ))
+    }
+
+    pub fn telegram_with_message_id_and_images(
+        conversation_id: impl Into<String>,
+        sender_id: impl Into<String>,
+        source_message_id: impl Into<String>,
+        text: impl Into<String>,
+        image_attachments: Vec<TelegramImageAttachment>,
+    ) -> Self {
+        Self::Telegram(TelegramInboundMessage::with_message_id_and_images(
+            conversation_id,
+            sender_id,
+            source_message_id,
+            text,
+            image_attachments,
         ))
     }
 
@@ -118,6 +158,13 @@ impl InboundMessage {
             Self::Telegram(message) => message.into_text(),
         }
     }
+
+    pub fn has_image_attachments(&self) -> bool {
+        match self {
+            Self::Cli(_) => false,
+            Self::Telegram(message) => message.has_image_attachments(),
+        }
+    }
 }
 
 impl ChannelInboundMessage {
@@ -156,7 +203,16 @@ impl TelegramInboundMessage {
         sender_id: impl Into<String>,
         text: impl Into<String>,
     ) -> Self {
-        Self::from_parts(chat_id, sender_id, None, text)
+        Self::from_parts(chat_id, sender_id, None, text, Vec::new())
+    }
+
+    pub fn new_with_images(
+        chat_id: impl Into<String>,
+        sender_id: impl Into<String>,
+        text: impl Into<String>,
+        image_attachments: Vec<TelegramImageAttachment>,
+    ) -> Self {
+        Self::from_parts(chat_id, sender_id, None, text, image_attachments)
     }
 
     pub fn with_message_id(
@@ -165,7 +221,29 @@ impl TelegramInboundMessage {
         source_message_id: impl Into<String>,
         text: impl Into<String>,
     ) -> Self {
-        Self::from_parts(chat_id, sender_id, Some(source_message_id.into()), text)
+        Self::from_parts(
+            chat_id,
+            sender_id,
+            Some(source_message_id.into()),
+            text,
+            Vec::new(),
+        )
+    }
+
+    pub fn with_message_id_and_images(
+        chat_id: impl Into<String>,
+        sender_id: impl Into<String>,
+        source_message_id: impl Into<String>,
+        text: impl Into<String>,
+        image_attachments: Vec<TelegramImageAttachment>,
+    ) -> Self {
+        Self::from_parts(
+            chat_id,
+            sender_id,
+            Some(source_message_id.into()),
+            text,
+            image_attachments,
+        )
     }
 
     pub fn chat_id(&self) -> &str {
@@ -188,18 +266,66 @@ impl TelegramInboundMessage {
         self.text
     }
 
+    pub fn image_attachments(&self) -> &[TelegramImageAttachment] {
+        &self.image_attachments
+    }
+
+    pub fn has_image_attachments(&self) -> bool {
+        !self.image_attachments.is_empty()
+    }
+
     fn from_parts(
         chat_id: impl Into<String>,
         sender_id: impl Into<String>,
         source_message_id: Option<String>,
         text: impl Into<String>,
+        image_attachments: Vec<TelegramImageAttachment>,
     ) -> Self {
         Self {
             chat_id: chat_id.into(),
             sender_id: sender_id.into(),
             source_message_id,
             text: text.into(),
+            image_attachments,
         }
+    }
+}
+
+impl TelegramImageAttachment {
+    pub fn from_parts(
+        file_id: impl Into<String>,
+        file_unique_id: Option<String>,
+        width: Option<u32>,
+        height: Option<u32>,
+        file_size: Option<u64>,
+    ) -> Self {
+        Self {
+            file_id: file_id.into(),
+            file_unique_id,
+            width,
+            height,
+            file_size,
+        }
+    }
+
+    pub fn file_id(&self) -> &str {
+        self.file_id.as_str()
+    }
+
+    pub fn file_unique_id(&self) -> Option<&str> {
+        self.file_unique_id.as_deref()
+    }
+
+    pub fn width(&self) -> Option<u32> {
+        self.width
+    }
+
+    pub fn height(&self) -> Option<u32> {
+        self.height
+    }
+
+    pub fn file_size(&self) -> Option<u64> {
+        self.file_size
     }
 }
 
