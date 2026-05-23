@@ -87,8 +87,10 @@ def main() -> int:
     if not file_path:
         raise SystemExit("Telegram API did not return file_path for this file_id.")
 
-    output_path = Path(args.output) if args.output else default_output_path(
-        file_path, args.output_dir
+    output_path = (
+        Path(args.output)
+        if args.output
+        else default_output_path(file_path, args.output_dir)
     )
     bytes_written = download_file(token, file_path, output_path)
 
