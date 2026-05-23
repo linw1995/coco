@@ -210,6 +210,36 @@ impl CompletionBackend for MissingFinalTextBackend {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ModelGateBackend {
+    calls: Arc<AsyncMutex<Vec<String>>>,
+    accepted_model: String,
+}
+
+impl ModelGateBackend {
+    fn new(accepted_model: &str) -> Self {
+        Self {
+            calls: Arc::new(AsyncMutex::new(Vec::new())),
+            accepted_model: accepted_model.to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl CompletionBackend for ModelGateBackend {
+    async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
+        let model = ctx.session.config.model.clone();
+        self.calls.lock().await.push(model.clone());
+        if model == self.accepted_model {
+            Ok(FakeBackend::finished_turn("recovered"))
+        } else {
+            Err(BackendError::Failed {
+                message: format!("model {model} failed"),
+            })
+        }
+    }
+}
+
 #[async_trait]
 impl CompletionBackend for BlockingBackend {
     async fn step(&self, _ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
@@ -673,6 +703,45 @@ async fn llm_engine_retries_job_from_before_failure_node() {
     assert_eq!(
         store.get_node(&recovered.head).unwrap().kind,
         Kind::Text("recovered".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session() {
+    let store = MemoryStore::new();
+    let backend = ModelGateBackend::new("good-model");
+    let calls = backend.calls.clone();
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let mut config = session_config("main");
+    config.model = "bad-model".to_owned();
+    llm.create_session(config).await.unwrap();
+    let engine = ConversationEngine::new(llm.clone());
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+
+    let failed = engine.drive_job(&job.job_id).await.unwrap();
+    assert_eq!(failed.status, JobStatus::Running);
+    assert_eq!(failed.head, job.base);
+
+    llm.rebase_session(
+        "main",
+        SessionConfigPatch {
+            model: Some("good-model".to_owned()),
+            ..SessionConfigPatch::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovered = engine.drive_job(&job.job_id).await.unwrap();
+
+    assert_eq!(recovered.status, JobStatus::Finished);
+    assert_eq!(
+        store.get_node(&recovered.head).unwrap().kind,
+        Kind::Text("recovered".to_owned())
+    );
+    assert_eq!(
+        calls.lock().await.as_slice(),
+        ["bad-model".to_owned(), "good-model".to_owned()]
     );
 }
 

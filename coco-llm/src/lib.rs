@@ -202,6 +202,7 @@ pub enum CompletionOrigin {
     #[default]
     BranchHead,
     Reference(String),
+    ReferenceWithBranchSession(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -229,6 +230,7 @@ fn completion_origin_kind(origin: &CompletionOrigin) -> &'static str {
     match origin {
         CompletionOrigin::BranchHead => "branch_head",
         CompletionOrigin::Reference(_) => "reference",
+        CompletionOrigin::ReferenceWithBranchSession(_) => "reference_with_branch_session",
     }
 }
 
@@ -1369,7 +1371,10 @@ where
             .context(MemorySnafu)?;
         let reference_id = match &request.origin {
             CompletionOrigin::BranchHead => original_head.clone(),
-            CompletionOrigin::Reference(reference) => self.resolve_reference_id(reference)?,
+            CompletionOrigin::Reference(reference)
+            | CompletionOrigin::ReferenceWithBranchSession(reference) => {
+                self.resolve_reference_id(reference)?
+            }
         };
         let retry_from_node_id = match &request.input {
             CompletionInput::Continue => reference_id.clone(),
@@ -1386,8 +1391,17 @@ where
                 session_patch.as_deref(),
             )?,
         };
-        let mut session =
-            self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?;
+        let mut session = match &request.origin {
+            CompletionOrigin::ReferenceWithBranchSession(_) => self
+                .resolve_session_from_reference_with_branch_session(
+                    &request.branch,
+                    &retry_from_node_id,
+                    &original_head,
+                )?,
+            CompletionOrigin::BranchHead | CompletionOrigin::Reference(_) => {
+                self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?
+            }
+        };
         if request.active_skill_runtime.is_some() {
             session.tool_runtime_env.active_skill = request.active_skill_runtime.clone();
         }
@@ -1578,6 +1592,19 @@ where
         reference: &str,
     ) -> Result<ResolvedSession> {
         let context = self.resolve_context(reference)?;
+        self.session_from_context(branch, context)
+    }
+
+    fn resolve_session_from_reference_with_branch_session(
+        &self,
+        branch: &str,
+        reference: &str,
+        branch_head: &str,
+    ) -> Result<ResolvedSession> {
+        let mut context = self.resolve_context(reference)?;
+        let branch_context = self.resolve_context(branch_head)?;
+        context.active_anchor_id = branch_context.active_anchor_id;
+        context.session_anchor = branch_context.session_anchor;
         self.session_from_context(branch, context)
     }
 }
@@ -5913,6 +5940,68 @@ mod tests {
 
         let resumed_node = store.get_node(&resumed.response_node_id).unwrap();
         assert_eq!(resumed_node.parent, first.response_node_id);
+    }
+
+    #[tokio::test]
+    async fn run_can_retry_reference_with_latest_branch_session() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[(
+            "main",
+            &[Err(BackendError::failed("rate limited")), Ok("recovered")],
+        )]);
+        let calls = backend.calls.clone();
+        let service = LlmService::new(store.clone(), backend);
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let err = service
+            .prompt(prompt_request("main", "retry prompt"))
+            .await
+            .unwrap_err();
+        let retry_from_node_id = match err {
+            Error::Backend { context, .. } => context.retry_from_node_id,
+            other => panic!("expected backend error, got {other:?}"),
+        };
+        let rebased_head = service
+            .rebase_session(
+                "main",
+                SessionConfigPatch {
+                    model: Some("gpt-5.4".to_owned()),
+                    ..session_patch()
+                },
+            )
+            .await
+            .unwrap();
+
+        let recovered = service
+            .run(CompletionRequest {
+                branch: "main".to_owned(),
+                origin: CompletionOrigin::ReferenceWithBranchSession(retry_from_node_id.clone()),
+                input: CompletionInput::Continue,
+                overrides: CompletionOverrides::default(),
+                active_skill_runtime: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.text, "recovered");
+        let recovered_node = store.get_node(&recovered.response_node_id).unwrap();
+        assert_eq!(recovered_node.parent, retry_from_node_id);
+
+        let calls = calls.lock().await;
+        let retry = calls.last().expect("expected retry backend call");
+        assert_eq!(retry.0.anchor_id, rebased_head);
+        assert_eq!(retry.0.config.model, "gpt-5.4");
+        assert_eq!(retry.1.model, "gpt-5.4");
+        assert_eq!(
+            text_messages_from_provider_history(&retry.0.provider_history),
+            vec![
+                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "retry prompt".to_owned()),
+            ]
+        );
     }
 
     #[tokio::test]

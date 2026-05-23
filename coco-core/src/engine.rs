@@ -602,17 +602,22 @@ where
         };
 
         let is_retrying_failure = retry_from_failure.is_some();
-        let origin_node_id = match retry_from_failure {
-            Some(retry_from_failure) => retry_from_failure,
+        let (origin_node_id, use_branch_session) = match retry_from_failure {
+            Some(retry_from_failure) => (retry_from_failure, true),
             None => match last_node {
-                Some(last_node) => last_node.id,
-                None => job.base.clone(),
+                Some(last_node) => (last_node.id, false),
+                None => (job.base.clone(), true),
             },
         };
-        let origin = CompletionOrigin::Reference(origin_node_id);
+        let origin = if use_branch_session {
+            CompletionOrigin::ReferenceWithBranchSession(origin_node_id)
+        } else {
+            CompletionOrigin::Reference(origin_node_id)
+        };
         let origin_node = match &origin {
             CompletionOrigin::BranchHead => "<branch-head>",
             CompletionOrigin::Reference(node_id) => node_id.as_str(),
+            CompletionOrigin::ReferenceWithBranchSession(node_id) => node_id.as_str(),
         };
         let input = if merge_parents.is_empty() {
             CompletionInput::Continue

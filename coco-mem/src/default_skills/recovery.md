@@ -31,8 +31,10 @@ Useful commands:
 ```bash
 coco prompt status --json --job <job-id>
 coco prompt branch-status --job <job-id> --branch <branch>
+coco prompt worker --job <job-id>
 coco session get --json --branch <branch>
 coco session show --json <ref>
+coco session rebase --branch <branch> --provider-profile <profile>
 coco session handoff --branch <branch> --system-prompt "<recovered context>"
 coco session rebase --branch <branch> --model <model>
 coco session rebase --branch <branch> --temperature <temperature>
@@ -58,9 +60,12 @@ Rules:
 - If the branch context is too noisy or too large, compact it with `coco session
   handoff` before retrying. Preserve only the durable state needed to finish the
   original task.
+- After repairing the target branch, run `coco prompt worker --job <job-id>` to
+  retry the original job. Then run `coco prompt status --json --job <job-id>` and
+  verify that the original job is `finished` before declaring recovery success.
 - If the failed branch is not salvageable in place, rebuild the answer from
   `day` using the graph state and available `coco` commands. Do not fork a
   scratch branch.
 - Keep the output shaped like a normal successful answer for the original job.
   Do not ask a supervisor to run follow-up commands.
-- If recovery succeeds, return the recovered result from `day`.
+- If recovery succeeds, return the recovered result from the original job.

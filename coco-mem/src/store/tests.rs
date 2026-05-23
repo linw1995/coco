@@ -2089,6 +2089,13 @@ where
             .body
             .contains("Do not create another recovery branch")
     );
+    assert!(
+        recovery
+            .current()
+            .unwrap()
+            .body
+            .contains("coco prompt worker --job <job-id>")
+    );
     assert!(recovery.current().unwrap().body.contains("Do not fork a"));
     assert!(
         compact
