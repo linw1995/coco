@@ -3,7 +3,11 @@ set -euxo pipefail
 
 export RUST_LOG="${RUST_LOG:-debug}"
 export CARGO_INCREMENTAL=0
-export RUSTFLAGS="-Cinstrument-coverage -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code"
+coverage_rustflags=("-Cinstrument-coverage" "-Ccodegen-units=1" "-Copt-level=0")
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  coverage_rustflags+=("-Clink-dead-code")
+fi
+export RUSTFLAGS="${coverage_rustflags[*]}"
 workspace_root="$(pwd -P)"
 export CARGO_TARGET_DIR="${workspace_root}/target/coverage"
 export LLVM_PROFILE_FILE="${CARGO_TARGET_DIR}/data/coco-%p-%m.profraw"
@@ -32,8 +36,15 @@ tail -n 1 "${CARGO_TARGET_DIR}/result/markdown.md"
 
 echo "Generating CRAP metric report..."
 
+crap_args=(
+  --workspace
+  --lcov "${CARGO_TARGET_DIR}/result/lcov.info"
+  --exclude "build.rs"
+  --exclude "src/client.rs"
+)
+
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-  cargo-crap --workspace --lcov "${CARGO_TARGET_DIR}/result/lcov.info" --format github
+  cargo-crap "${crap_args[@]}" --format github
 fi
 
-cargo-crap --workspace --lcov "${CARGO_TARGET_DIR}/result/lcov.info" --format markdown --output "${CARGO_TARGET_DIR}/result/crap.md"
+cargo-crap "${crap_args[@]}" --format markdown --output "${CARGO_TARGET_DIR}/result/crap.md"

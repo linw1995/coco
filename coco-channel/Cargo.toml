@@ -35,9 +35,6 @@ snafu.workspace = true
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Test initialization.
-ctor.workspace = true
-
 # Test runtime.
 tokio.workspace = true
 
