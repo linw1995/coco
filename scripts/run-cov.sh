@@ -3,11 +3,7 @@ set -euxo pipefail
 
 export RUST_LOG="${RUST_LOG:-debug}"
 export CARGO_INCREMENTAL=0
-coverage_rustflags=("-Cinstrument-coverage" "-Ccodegen-units=1" "-Copt-level=0")
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  coverage_rustflags+=("-Clink-dead-code")
-fi
-export RUSTFLAGS="${coverage_rustflags[*]}"
+export RUSTFLAGS="-Cinstrument-coverage -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code"
 workspace_root="$(pwd -P)"
 export CARGO_TARGET_DIR="${workspace_root}/target/coverage"
 export LLVM_PROFILE_FILE="${CARGO_TARGET_DIR}/data/coco-%p-%m.profraw"
