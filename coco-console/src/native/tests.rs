@@ -178,8 +178,8 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
     assert!(html.contains("class=\"graph-control"));
     assert!(html.contains("data-zoom-action=\"in\""));
     assert!(html.contains("class=\"graph-items\""));
-    assert!(!html.contains("class=\"node-link graph-item\""));
-    assert!(!html.contains("data-graph-min-x="));
+    assert!(html.contains("class=\"node-link graph-item\""));
+    assert!(html.contains("data-graph-min-x="));
     assert!(html.contains("class=\"node-details node-detail-panel\""));
     assert!(html.contains("class=\"entity-nav\""));
     assert!(html.contains("id=\"branches\""));
@@ -600,7 +600,7 @@ async fn server_serves_entity_and_node_details_on_demand() {
     assert!(response_body(&index).contains("data-entity-kind=\"skills\""));
     assert!(response_body(&index).contains("class=\"graph-items\""));
     assert!(!response_body(&index).contains("Server demo skill"));
-    assert!(!response_body(&index).contains("class=\"node-link graph-item\""));
+    assert!(response_body(&index).contains("class=\"node-link graph-item\""));
 
     let graph = http_get(addr, "/api/graph").await;
     assert_eq!(response_status(&graph), 200);

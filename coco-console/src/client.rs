@@ -13,6 +13,8 @@ const MIN_ZOOM: f64 = 0.35;
 const MAX_ZOOM: f64 = 1.25;
 const ZOOM_STEP: f64 = 1.2;
 const CULL_PADDING: f64 = 520.0;
+const DEFAULT_GRAPH_VIEWPORT_WIDTH: f64 = 1280.0;
+const DEFAULT_GRAPH_VIEWPORT_HEIGHT: f64 = 720.0;
 
 #[derive(Debug, Deserialize)]
 struct ClientGraphNode {
@@ -556,10 +558,20 @@ fn update_graph_visibility(document: &Document) -> Result<(), JsValue> {
         return Ok(());
     };
     let zoom = graph_zoom(document);
+    let viewport_width = if graph.client_width() > 0 {
+        f64::from(graph.client_width())
+    } else {
+        DEFAULT_GRAPH_VIEWPORT_WIDTH
+    };
+    let viewport_height = if graph.client_height() > 0 {
+        f64::from(graph.client_height())
+    } else {
+        DEFAULT_GRAPH_VIEWPORT_HEIGHT
+    };
     let left = f64::from(graph.scroll_left()) / zoom - CULL_PADDING;
     let top = f64::from(graph.scroll_top()) / zoom - CULL_PADDING;
-    let right = left + f64::from(graph.client_width()) / zoom + CULL_PADDING * 2.0;
-    let bottom = top + f64::from(graph.client_height()) / zoom + CULL_PADDING * 2.0;
+    let right = left + viewport_width / zoom + CULL_PADDING * 2.0;
+    let bottom = top + viewport_height / zoom + CULL_PADDING * 2.0;
     let key = format!("{left:.0}:{top:.0}:{right:.0}:{bottom:.0}");
 
     if items.get_attribute("data-graph-items-key").as_deref() == Some(key.as_str())

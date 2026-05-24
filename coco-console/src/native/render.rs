@@ -9,6 +9,9 @@ use crate::layout::{
 };
 
 const GRAPH_CULL_EDGE_MARGIN: i32 = 180;
+const INITIAL_GRAPH_VIEWPORT_PADDING: f64 = 520.0;
+const INITIAL_GRAPH_VIEWPORT_WIDTH: f64 = 1280.0;
+const INITIAL_GRAPH_VIEWPORT_HEIGHT: f64 = 720.0;
 
 pub fn render_index_page(snapshot: &GraphSnapshot) -> String {
     render_snapshot_document(snapshot, true)
@@ -34,6 +37,15 @@ pub struct GraphViewport {
 pub fn render_graph_items(snapshot: &GraphSnapshot, viewport: GraphViewport) -> String {
     let layout = layout_graph(snapshot);
     view! { <GraphItems snapshot=snapshot layout=&layout viewport=Some(viewport) /> }.to_html()
+}
+
+fn initial_graph_viewport() -> GraphViewport {
+    GraphViewport {
+        left: -INITIAL_GRAPH_VIEWPORT_PADDING,
+        top: -INITIAL_GRAPH_VIEWPORT_PADDING,
+        right: INITIAL_GRAPH_VIEWPORT_WIDTH + INITIAL_GRAPH_VIEWPORT_PADDING,
+        bottom: INITIAL_GRAPH_VIEWPORT_HEIGHT + INITIAL_GRAPH_VIEWPORT_PADDING,
+    }
 }
 
 fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> String {
@@ -98,7 +110,7 @@ fn ConsoleContent<'a>(snapshot: &'a GraphSnapshot) -> impl IntoView {
             <main class="entity-workspace">
                 <section id="nodes" class="entity-section graph-entity">
                     <EntitySectionHeader title="Nodes" count=snapshot.nodes.len() />
-                    <GraphPanel layout=layout.as_ref() />
+                    <GraphPanel snapshot=snapshot layout=layout.as_ref() />
                 </section>
                 <LazyEntitySection id="branches" title="Branches" kind="branches" count=snapshot.entity_counts.branches />
                 <LazyEntitySection id="sessions" title="Sessions" kind="sessions" count=snapshot.entity_counts.sessions />
@@ -172,7 +184,7 @@ fn LazyEntitySection(
 }
 
 #[component]
-fn GraphPanel<'a>(layout: Option<&'a GraphLayout>) -> AnyView {
+fn GraphPanel<'a>(snapshot: &'a GraphSnapshot, layout: Option<&'a GraphLayout>) -> AnyView {
     let Some(layout) = layout else {
         return view! {
             <div class="graph-shell">
@@ -188,7 +200,7 @@ fn GraphPanel<'a>(layout: Option<&'a GraphLayout>) -> AnyView {
         <div class="graph-shell">
             <GraphToolbar />
             <div class="graph-wrap">
-                <GraphSvg layout=layout />
+                <GraphSvg snapshot=snapshot layout=layout />
             </div>
             <Minimap layout=layout />
         </div>
@@ -208,7 +220,7 @@ fn GraphToolbar() -> impl IntoView {
 }
 
 #[component]
-fn GraphSvg<'a>(layout: &'a GraphLayout) -> impl IntoView {
+fn GraphSvg<'a>(snapshot: &'a GraphSnapshot, layout: &'a GraphLayout) -> impl IntoView {
     let lanes = layout
         .lanes
         .iter()
@@ -233,7 +245,9 @@ fn GraphSvg<'a>(layout: &'a GraphLayout) -> impl IntoView {
             <GraphMarkers />
             <rect class="graph-bg" width=width.clone() height=height.clone() />
             {lanes}
-            <g class="graph-items" data-graph-items-key=""></g>
+            <g class="graph-items" data-graph-items-key="">
+                <GraphItems snapshot=snapshot layout=layout viewport=Some(initial_graph_viewport()) />
+            </g>
         </svg>
     }
 }
