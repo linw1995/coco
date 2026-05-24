@@ -218,12 +218,16 @@ mod tests {
         crate::builtin_tool_definition("load_image").expect("builtin tool should exist")
     }
 
+    fn runtime(workspace_root: impl Into<PathBuf>) -> ImageToolRuntime {
+        load_runtime(load_image_tool_definition(), workspace_root.into())
+    }
+
     #[tokio::test]
     async fn local_image_returns_rig_image_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.png");
         tokio::fs::write(&path, b"not-a-real-png").await.unwrap();
-        let runtime = load_runtime(load_image_tool_definition(), dir.path().to_path_buf());
+        let runtime = runtime(dir.path());
 
         let output = runtime
             .execute(
@@ -247,7 +251,7 @@ mod tests {
     async fn local_image_rejects_paths_outside_workspace() {
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
-        let runtime = load_runtime(load_image_tool_definition(), workspace.path().to_path_buf());
+        let runtime = runtime(workspace.path());
 
         let error = runtime
             .execute(
@@ -265,8 +269,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_image_requires_path() {
+        let runtime = runtime(".");
+
+        let error = runtime
+            .execute(
+                json!({
+                    "source": "local_path"
+                })
+                .to_string(),
+                ToolInvocationContext::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("requires path"));
+    }
+
+    #[tokio::test]
+    async fn local_image_rejects_unknown_media_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        tokio::fs::write(&path, b"image").await.unwrap();
+        let runtime = runtime(dir.path());
+
+        let error = runtime
+            .execute(
+                json!({
+                    "source": "local_path",
+                    "path": "image.bin"
+                })
+                .to_string(),
+                ToolInvocationContext::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn local_image_accepts_explicit_media_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        tokio::fs::write(&path, b"jpeg-data").await.unwrap();
+        let runtime = runtime(dir.path());
+
+        let output = runtime
+            .execute(
+                json!({
+                    "source": "local_path",
+                    "path": "image.bin",
+                    "media_type": "image/jpeg"
+                })
+                .to_string(),
+                ToolInvocationContext::default(),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(value["mimeType"], "image/jpeg");
+        assert_eq!(value["data"], BASE64_STANDARD.encode(b"jpeg-data"));
+    }
+
+    #[tokio::test]
+    async fn local_image_reports_missing_path() {
+        let runtime = runtime(".");
+
+        let error = runtime
+            .execute(
+                json!({
+                    "source": "local_path",
+                    "path": "missing.png"
+                })
+                .to_string(),
+                ToolInvocationContext::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unable to resolve local image path")
+        );
+    }
+
+    #[tokio::test]
+    async fn url_image_returns_rig_image_json() {
+        let runtime = runtime(".");
+
+        let output = runtime
+            .execute(
+                json!({
+                    "source": "url",
+                    "url": "https://example.com/image.webp",
+                    "media_type": "image/webp"
+                })
+                .to_string(),
+                ToolInvocationContext::default(),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(value["type"], "image");
+        assert_eq!(value["mimeType"], "image/webp");
+        assert_eq!(value["data"], "https://example.com/image.webp");
+    }
+
+    #[tokio::test]
+    async fn url_image_requires_url() {
+        let runtime = runtime(".");
+
+        let error = runtime
+            .execute(
+                json!({
+                    "source": "url",
+                    "media_type": "image/png"
+                })
+                .to_string(),
+                ToolInvocationContext::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("requires url"));
+    }
+
+    #[tokio::test]
     async fn url_image_requires_media_type() {
-        let runtime = load_runtime(load_image_tool_definition(), PathBuf::from("."));
+        let runtime = runtime(".");
 
         let error = runtime
             .execute(
@@ -281,5 +415,49 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("media_type"));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_is_rejected() {
+        let runtime = runtime(".");
+
+        let error = runtime
+            .execute("{".to_owned(), ToolInvocationContext::default())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("valid JSON"));
+    }
+
+    #[tokio::test]
+    async fn tool_definition_matches_builtin_definition() {
+        let runtime = runtime(".");
+        let definition = runtime.tool_definition();
+
+        assert_eq!(definition.name, "load_image");
+        assert_eq!(definition.parameters["required"], json!(["source"]));
+    }
+
+    #[tokio::test]
+    async fn tool_dyn_call_executes_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.gif");
+        tokio::fs::write(&path, b"gif").await.unwrap();
+        let runtime = runtime(dir.path());
+
+        let output = rig::tool::ToolDyn::call(
+            &runtime,
+            json!({
+                "source": "local_path",
+                "path": "tiny.gif"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(rig::tool::ToolDyn::name(&runtime), "load_image");
+        assert_eq!(value["mimeType"], "image/gif");
     }
 }

@@ -4057,6 +4057,27 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct ToolDefinitionRecorder {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl CompletionBackend for ToolDefinitionRecorder {
+        async fn step(
+            &self,
+            ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            self.calls.lock().await.push(
+                ctx.tool_definitions
+                    .iter()
+                    .map(|definition| definition.name.clone())
+                    .collect(),
+            );
+            Ok(BackendTurn::finished("done".to_owned()))
+        }
+    }
+
     #[derive(Clone)]
     struct StreamingBackend {
         calls: RecordedCalls,
@@ -6515,6 +6536,25 @@ mod tests {
             "exec_command"
         ));
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "done"));
+    }
+
+    #[tokio::test]
+    async fn prompt_exposes_load_image_tool_definition_to_backend() {
+        let store = MemoryStore::new();
+        let backend = ToolDefinitionRecorder::default();
+        let calls = backend.calls.clone();
+        let service = LlmService::new(store.clone(), backend);
+        let mut config = session_config("main");
+        config.tools = vec![builtin_tool_definition("load_image").unwrap()];
+        service.create_session(config).await.unwrap();
+
+        service
+            .prompt(prompt_request("main", "inspect image"))
+            .await
+            .unwrap();
+
+        let calls = calls.lock().await;
+        assert_eq!(calls.as_slice(), &[vec!["load_image".to_owned()]]);
     }
 
     #[tokio::test]
