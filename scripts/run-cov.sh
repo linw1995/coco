@@ -29,3 +29,11 @@ grcov "${CARGO_TARGET_DIR}/data" \
 
 cp "${CARGO_TARGET_DIR}/result/lcov" "${CARGO_TARGET_DIR}/result/lcov.info"
 tail -n 1 "${CARGO_TARGET_DIR}/result/markdown.md"
+
+echo "Generating CRAP metric report..."
+
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  cargo-crap --workspace --lcov "${CARGO_TARGET_DIR}/result/lcov.info" --format github
+fi
+
+cargo-crap --workspace --lcov "${CARGO_TARGET_DIR}/result/lcov.info" --format markdown --output "${CARGO_TARGET_DIR}/result/crap.md"
