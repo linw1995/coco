@@ -7,6 +7,8 @@ use snafu::prelude::*;
 
 use crate::ToolInvocationContext;
 
+const MAX_LOCAL_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ImageToolRuntime {
     definition: Tool,
@@ -31,6 +33,13 @@ pub enum ImageToolError {
     ReadLocalImage {
         path: PathBuf,
         source: std::io::Error,
+    },
+
+    #[snafu(display("local image {path:?} is {size} bytes, which exceeds the {limit} byte limit"))]
+    LocalImageTooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u64,
     },
 
     #[snafu(display("unable to resolve local image path {path:?}: {source}"))]
@@ -144,6 +153,19 @@ async fn load_local_image(
     })?;
     let resolved = resolve_local_path(&workspace_root, &path)?;
     let media_type = guess_media_type(&resolved, args.media_type)?;
+    let metadata = tokio::fs::metadata(&resolved)
+        .await
+        .context(ReadLocalImageSnafu {
+            path: resolved.clone(),
+        })?;
+    ensure!(
+        metadata.len() <= MAX_LOCAL_IMAGE_BYTES,
+        LocalImageTooLargeSnafu {
+            path: resolved.clone(),
+            size: metadata.len(),
+            limit: MAX_LOCAL_IMAGE_BYTES,
+        }
+    );
     let bytes = tokio::fs::read(&resolved)
         .await
         .context(ReadLocalImageSnafu { path: resolved })?;
@@ -354,6 +376,29 @@ mod tests {
                 .to_string()
                 .contains("unable to resolve local image path")
         );
+    }
+
+    #[tokio::test]
+    async fn local_image_rejects_files_over_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.png");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        file.set_len(MAX_LOCAL_IMAGE_BYTES + 1).await.unwrap();
+        let runtime = runtime(dir.path());
+
+        let error = runtime
+            .execute(
+                json!({
+                    "source": "local_path",
+                    "path": "large.png"
+                })
+                .to_string(),
+                ToolInvocationContext::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds"));
     }
 
     #[tokio::test]
