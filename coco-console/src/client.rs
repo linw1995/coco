@@ -1050,9 +1050,14 @@ fn update_node_detail_from_hash(window: &Window, document: &Document) -> Result<
         return Ok(());
     };
 
+    if node_detail_is_current(document, &selected)? {
+        return Ok(());
+    }
+
     show_node_detail_loading(
         document,
         selected.id.as_deref().unwrap_or(selected.target.as_str()),
+        &selected,
     )?;
     let detail_window = window.clone();
     let detail_document = document.clone();
@@ -1126,11 +1131,34 @@ fn hide_node_detail(document: &Document) -> Result<(), JsValue> {
     }
     if let Some(panel) = scroll_element(document, ".node-detail-panel") {
         panel.set_attribute("hidden", "true")?;
+        panel.remove_attribute("data-node-detail-target")?;
+        panel.remove_attribute("data-node-detail-id")?;
     }
     Ok(())
 }
 
-fn show_node_detail_loading(document: &Document, node_id: &str) -> Result<(), JsValue> {
+fn node_detail_is_current(document: &Document, selected: &SelectedNode) -> Result<bool, JsValue> {
+    let Some(panel) = scroll_element(document, ".node-detail-panel") else {
+        return Ok(false);
+    };
+    if panel.has_attribute("hidden") {
+        return Ok(false);
+    }
+
+    let target_matches =
+        panel.get_attribute("data-node-detail-target").as_deref() == Some(selected.target.as_str());
+    let id_matches = selected
+        .id
+        .as_deref()
+        .is_some_and(|id| panel.get_attribute("data-node-detail-id").as_deref() == Some(id));
+    Ok(target_matches || id_matches)
+}
+
+fn show_node_detail_loading(
+    document: &Document,
+    node_id: &str,
+    selected: &SelectedNode,
+) -> Result<(), JsValue> {
     let Some(panel) = scroll_element(document, ".node-detail-panel") else {
         return Ok(());
     };
@@ -1138,6 +1166,12 @@ fn show_node_detail_loading(document: &Document, node_id: &str) -> Result<(), Js
         side.class_list().add_1("has-selection")?;
     }
     panel.remove_attribute("hidden")?;
+    panel.set_attribute("data-node-detail-target", &selected.target)?;
+    if let Some(id) = selected.id.as_deref() {
+        panel.set_attribute("data-node-detail-id", id)?;
+    } else {
+        panel.remove_attribute("data-node-detail-id")?;
+    }
     set_node_detail_field(&panel, "id", node_id)?;
     set_node_detail_field(&panel, "kind", "")?;
     set_node_detail_field(&panel, "role", "")?;
@@ -1213,6 +1247,8 @@ fn render_node_detail(document: &Document, node: &ClientGraphNode) -> Result<(),
         node.labels.join(", ")
     };
 
+    panel.set_attribute("data-node-detail-target", &node_target_id(&node.id))?;
+    panel.set_attribute("data-node-detail-id", &node.id)?;
     set_node_detail_field(&panel, "id", &node.id)?;
     set_node_detail_field(&panel, "kind", &node.kind)?;
     set_node_detail_field(&panel, "role", &node.role)?;
