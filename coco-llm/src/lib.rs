@@ -3798,14 +3798,7 @@ fn resolve_base_url(
         return resolve_custom_base_url(provider, custom_base_url);
     }
 
-    Ok(
-        resolve_env_value("COCO_BASE_URL").or_else(|| match provider {
-            Provider::OpenAi => resolve_env_value("OPENAI_BASE_URL"),
-            Provider::Anthropic => None,
-            Provider::ChatGpt => resolve_env_value("CHATGPT_API_BASE")
-                .or_else(|| resolve_env_value("OPENAI_CHATGPT_API_BASE")),
-        }),
-    )
+    Ok(None)
 }
 
 fn resolve_custom_base_url(
@@ -5077,23 +5070,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_base_url_reads_chatgpt_specific_env() {
+    async fn resolve_base_url_ignores_legacy_env_fallbacks() {
         with_process_env_async(
             &[
-                ("COCO_BASE_URL", None),
+                (
+                    "COCO_BASE_URL",
+                    Some(OsStr::new("https://coco.example.test")),
+                ),
+                (
+                    "OPENAI_BASE_URL",
+                    Some(OsStr::new("https://openai.example.test")),
+                ),
                 (
                     "CHATGPT_API_BASE",
                     Some(OsStr::new("https://chatgpt.example.test")),
                 ),
-                ("OPENAI_CHATGPT_API_BASE", None),
+                (
+                    "OPENAI_CHATGPT_API_BASE",
+                    Some(OsStr::new("https://openai-chatgpt.example.test")),
+                ),
             ],
             || async {
-                assert_eq!(
-                    resolve_base_url(Provider::ChatGpt, None)
-                        .unwrap()
-                        .as_deref(),
-                    Some("https://chatgpt.example.test")
-                );
+                assert_eq!(resolve_base_url(Provider::OpenAi, None).unwrap(), None);
+                assert_eq!(resolve_base_url(Provider::ChatGpt, None).unwrap(), None);
+                assert_eq!(resolve_base_url(Provider::Anthropic, None).unwrap(), None);
             },
         )
         .await;
