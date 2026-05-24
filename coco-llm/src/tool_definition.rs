@@ -110,20 +110,7 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                         "description": "Optional image MIME type such as image/jpeg or image/png. Required for source=url."
                     }
                 },
-                "oneOf": [
-                    {
-                        "properties": {
-                            "source": { "const": "local_path" }
-                        },
-                        "required": ["source", "path"]
-                    },
-                    {
-                        "properties": {
-                            "source": { "const": "url" }
-                        },
-                        "required": ["source", "url", "media_type"]
-                    }
-                ],
+                "required": ["source"],
                 "additionalProperties": false
             }),
         }),
