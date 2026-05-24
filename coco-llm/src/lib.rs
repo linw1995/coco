@@ -3798,15 +3798,14 @@ fn resolve_base_url(
         return resolve_custom_base_url(provider, custom_base_url);
     }
 
-    Ok(std::env::var("COCO_BASE_URL")
-        .ok()
-        .or_else(|| match provider {
-            Provider::OpenAi => std::env::var("OPENAI_BASE_URL").ok(),
+    Ok(
+        resolve_env_value("COCO_BASE_URL").or_else(|| match provider {
+            Provider::OpenAi => resolve_env_value("OPENAI_BASE_URL"),
             Provider::Anthropic => None,
-            Provider::ChatGpt => std::env::var("CHATGPT_API_BASE")
-                .ok()
-                .or_else(|| std::env::var("OPENAI_CHATGPT_API_BASE").ok()),
-        }))
+            Provider::ChatGpt => resolve_env_value("CHATGPT_API_BASE")
+                .or_else(|| resolve_env_value("OPENAI_CHATGPT_API_BASE")),
+        }),
+    )
 }
 
 fn resolve_custom_base_url(
@@ -3824,7 +3823,7 @@ fn resolve_custom_base_url(
         ))
     })?;
 
-    std::env::var(env).map(Some).map_err(|_| {
+    resolve_env_value(env).map(Some).ok_or_else(|| {
         BackendError::failed(format!(
             "missing base URL for provider {} in environment variable {}",
             provider.as_str(),
@@ -5143,6 +5142,26 @@ mod tests {
                 "missing base URL for provider anthropic in environment variable COCO_WORK_ANTHROPIC_BASE_URL"
             );
         })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_base_url_treats_empty_profile_env_reference_as_missing() {
+        with_process_env_async(
+            &[("COCO_WORK_ANTHROPIC_BASE_URL", Some(OsStr::new("  ")))],
+            || async {
+                let error = resolve_base_url(
+                    Provider::Anthropic,
+                    Some("${COCO_WORK_ANTHROPIC_BASE_URL}"),
+                )
+                .unwrap_err();
+
+                assert_eq!(
+                    error.to_string(),
+                    "missing base URL for provider anthropic in environment variable COCO_WORK_ANTHROPIC_BASE_URL"
+                );
+            },
+        )
         .await;
     }
 
