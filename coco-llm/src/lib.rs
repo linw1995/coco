@@ -2533,38 +2533,40 @@ fn build_runtime_tools(
     let mut tools = HashMap::with_capacity(session.config.tools.len());
 
     for tool in &session.config.tools {
-        let runtime_tool = match tool.name.as_str() {
+        let definition = builtin_tool_definition(&tool.name).ok_or_else(|| {
+            BackendError::failed(format!(
+                "unsupported tool {:?}; only \"exec_command\", \"write_stdin\", \"search_skill\", and \"load_image\" are implemented",
+                tool.name
+            ))
+        })?;
+        let runtime_tool = match definition.name.as_str() {
             "exec_command" => RuntimeTool::UnifiedExec(unified_exec_tool::runtime_with_sessions(
-                tool.clone(),
+                definition.clone(),
                 workspace_root.clone(),
                 session.tool_runtime_env.clone(),
                 unified_exec_tool::UnifiedExecToolKind::ExecCommand,
                 exec_sessions.clone(),
             )),
             "write_stdin" => RuntimeTool::UnifiedExec(unified_exec_tool::runtime_with_sessions(
-                tool.clone(),
+                definition.clone(),
                 workspace_root.clone(),
                 session.tool_runtime_env.clone(),
                 unified_exec_tool::UnifiedExecToolKind::WriteStdin,
                 exec_sessions.clone(),
             )),
             "search_skill" => RuntimeTool::SearchSkill(skill_tool::search_runtime(
-                tool.clone(),
+                definition.clone(),
                 workspace_root.clone(),
                 session.tool_runtime_env.clone(),
             )),
             "load_image" => RuntimeTool::LoadImage(image_tool::load_runtime(
-                tool.clone(),
+                definition.clone(),
                 workspace_root.clone(),
             )),
-            other => {
-                return Err(BackendError::failed(format!(
-                    "unsupported tool {other:?}; only \"exec_command\", \"write_stdin\", \"search_skill\", and \"load_image\" are implemented"
-                )));
-            }
+            other => unreachable!("built-in tool definition returned unsupported tool {other:?}"),
         };
         definitions.push(runtime_tool.definition());
-        tools.insert(tool.name.clone(), runtime_tool);
+        tools.insert(definition.name.clone(), runtime_tool);
     }
 
     Ok(RuntimeToolSet { definitions, tools })
@@ -4087,6 +4089,22 @@ mod tests {
                     .map(|definition| definition.name.clone())
                     .collect(),
             );
+            Ok(BackendTurn::finished("done".to_owned()))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ToolSchemaRecorder {
+        calls: Arc<Mutex<Vec<Vec<CompletionToolDefinition>>>>,
+    }
+
+    #[async_trait]
+    impl CompletionBackend for ToolSchemaRecorder {
+        async fn step(
+            &self,
+            ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            self.calls.lock().await.push(ctx.tool_definitions.to_vec());
             Ok(BackendTurn::finished("done".to_owned()))
         }
     }
@@ -6568,6 +6586,55 @@ mod tests {
 
         let calls = calls.lock().await;
         assert_eq!(calls.as_slice(), &[vec!["load_image".to_owned()]]);
+    }
+
+    #[tokio::test]
+    async fn prompt_refreshes_builtin_tool_definition_from_stale_session_anchor() {
+        let store = MemoryStore::new();
+        let backend = ToolSchemaRecorder::default();
+        let calls = backend.calls.clone();
+        let service = LlmService::new(store.clone(), backend);
+        let mut config = session_config("main");
+        let mut stale_load_image = builtin_tool_definition("load_image").unwrap();
+        stale_load_image.input_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": { "const": "local_path" }
+            },
+            "oneOf": [
+                {
+                    "properties": {
+                        "source": { "const": "local_path" }
+                    },
+                    "required": ["source", "path"]
+                }
+            ]
+        });
+        config.tools = vec![stale_load_image];
+        service.create_session(config).await.unwrap();
+
+        service
+            .prompt(prompt_request("main", "inspect image"))
+            .await
+            .unwrap();
+
+        let calls = calls.lock().await;
+        let [definitions] = calls.as_slice() else {
+            panic!("expected one backend call");
+        };
+        let [definition] = definitions.as_slice() else {
+            panic!("expected one tool definition");
+        };
+        assert_eq!(definition.name, "load_image");
+        assert_eq!(
+            definition.parameters["properties"]["source"]["type"],
+            "string"
+        );
+        assert_eq!(
+            definition.parameters["required"],
+            serde_json::json!(["source"])
+        );
+        assert!(definition.parameters["oneOf"].is_null());
     }
 
     #[tokio::test]
