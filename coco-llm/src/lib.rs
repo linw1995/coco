@@ -2647,6 +2647,41 @@ fn tool_result_message(
     }
 }
 
+fn tool_result_context_from_output(
+    id: impl Into<String>,
+    call_id: Option<String>,
+    output: impl Into<String>,
+) -> Vec<rig::completion::message::UserContent> {
+    let parsed = rig::completion::message::ToolResultContent::from_tool_output(output);
+    let mut tool_result_contents = Vec::new();
+    let mut context_contents = Vec::new();
+
+    for content in parsed {
+        match content {
+            rig::completion::message::ToolResultContent::Text(text) => {
+                tool_result_contents.push(rig::completion::message::ToolResultContent::Text(text));
+            }
+            rig::completion::message::ToolResultContent::Image(image) => {
+                context_contents.push(rig::completion::message::UserContent::Image(image));
+            }
+        }
+    }
+
+    if tool_result_contents.is_empty() {
+        tool_result_contents.push(rig::completion::message::ToolResultContent::text(
+            "Image loaded into model context.",
+        ));
+    }
+
+    let mut contents = vec![rig_tool_result_content(
+        id,
+        call_id,
+        rig::OneOrMany::many(tool_result_contents).expect("tool result content is non-empty"),
+    )];
+    contents.extend(context_contents);
+    contents
+}
+
 fn rig_tool_call_content(
     id: impl Into<String>,
     call_id: Option<String>,
@@ -3041,7 +3076,7 @@ struct ProviderHistoryBuilder {
     assistant_contents: Vec<rig::completion::message::AssistantContent>,
     assistant_execution_id: Option<String>,
     last_tool_calls: HashMap<String, PendingToolCall>,
-    tool_results: Vec<rig::completion::message::UserContent>,
+    tool_result_groups: Vec<PendingToolResultGroup>,
     tool_result_execution_id: Option<String>,
 }
 
@@ -3049,6 +3084,13 @@ struct ProviderHistoryBuilder {
 struct PendingToolCall {
     order: usize,
     call_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolResultGroup {
+    order: usize,
+    completed_tool_id: Option<String>,
+    contents: Vec<rig::completion::message::UserContent>,
 }
 
 fn node_metadata_first(metadata: Option<&NodeMetadata>) -> Option<&BackendMetadata> {
@@ -3148,14 +3190,21 @@ impl ProviderHistoryBuilder {
     ) {
         self.flush_assistant_contents();
         let execution_id = node_metadata.and_then(|metadata| metadata.execution_id.clone());
-        if !self.tool_results.is_empty() && self.tool_result_execution_id != execution_id {
+        if !self.tool_result_groups.is_empty() && self.tool_result_execution_id != execution_id {
             self.flush_tool_results();
         }
         self.tool_result_execution_id = execution_id;
-        let content = rig::completion::message::ToolResultContent::from_tool_output(output);
         let call_id = node_metadata.and_then(|metadata| metadata.call_id.clone());
-        self.tool_results
-            .push(rig_tool_result_content(id.to_owned(), call_id, content));
+        let order = self
+            .last_tool_calls
+            .get(id)
+            .map(|tool_call| tool_call.order)
+            .unwrap_or(usize::MAX);
+        self.tool_result_groups.push(PendingToolResultGroup {
+            order,
+            completed_tool_id: Some(id.to_owned()),
+            contents: tool_result_context_from_output(id.to_owned(), call_id, output),
+        });
     }
 
     fn finish(mut self) -> Vec<rig::completion::message::Message> {
@@ -3192,23 +3241,14 @@ impl ProviderHistoryBuilder {
     }
 
     fn flush_tool_results(&mut self) {
-        if self.tool_results.is_empty() && self.last_tool_calls.is_empty() {
+        if self.tool_result_groups.is_empty() && self.last_tool_calls.is_empty() {
             return;
         }
 
         let completed_tool_ids = self
-            .tool_results
+            .tool_result_groups
             .iter()
-            .filter_map(|content| match content {
-                rig::completion::message::UserContent::ToolResult(tool_result) => {
-                    Some(tool_result.id.as_str())
-                }
-                rig::completion::message::UserContent::Text(_)
-                | rig::completion::message::UserContent::Image(_)
-                | rig::completion::message::UserContent::Audio(_)
-                | rig::completion::message::UserContent::Video(_)
-                | rig::completion::message::UserContent::Document(_) => None,
-            })
+            .filter_map(|group| group.completed_tool_id.as_deref())
             .collect::<std::collections::HashSet<_>>();
         let mut missing_tool_calls = self
             .last_tool_calls
@@ -3222,28 +3262,24 @@ impl ProviderHistoryBuilder {
                     "Tool call {id:?} did not produce a result before recovery; treating it as failed."
                 ),
             ));
-            self.tool_results.push(rig_tool_result_content(
-                id.clone(),
-                tool_call.call_id.clone(),
-                content,
-            ));
+            self.tool_result_groups.push(PendingToolResultGroup {
+                order: tool_call.order,
+                completed_tool_id: Some(id.clone()),
+                contents: vec![rig_tool_result_content(
+                    id.clone(),
+                    tool_call.call_id.clone(),
+                    content,
+                )],
+            });
         }
 
-        self.tool_results.sort_by_key(|content| match content {
-            rig::completion::message::UserContent::ToolResult(tool_result) => self
-                .last_tool_calls
-                .get(&tool_result.id)
-                .map(|tool_call| tool_call.order)
-                .unwrap_or(usize::MAX),
-            rig::completion::message::UserContent::Text(_)
-            | rig::completion::message::UserContent::Image(_)
-            | rig::completion::message::UserContent::Audio(_)
-            | rig::completion::message::UserContent::Video(_)
-            | rig::completion::message::UserContent::Document(_) => usize::MAX,
-        });
+        self.tool_result_groups.sort_by_key(|group| group.order);
+        let tool_results = std::mem::take(&mut self.tool_result_groups)
+            .into_iter()
+            .flat_map(|group| group.contents)
+            .collect::<Vec<_>>();
         self.messages.push(rig::completion::message::Message::User {
-            content: rig::OneOrMany::many(std::mem::take(&mut self.tool_results))
-                .expect("tool result buffer is non-empty"),
+            content: rig::OneOrMany::many(tool_results).expect("tool result buffer is non-empty"),
         });
         self.tool_result_execution_id = None;
         self.last_tool_calls.clear();
@@ -3345,7 +3381,7 @@ struct ToolCallInvocation {
 struct ToolCallExecution {
     index: usize,
     event: BackendEvent,
-    tool_result: rig::completion::message::UserContent,
+    tool_results: Vec<rig::completion::message::UserContent>,
 }
 
 enum RunControl {
@@ -3526,11 +3562,7 @@ impl CompletionRunner {
         Ok(ToolCallExecution {
             index,
             event,
-            tool_result: rig_tool_result_content(
-                tool_call.id,
-                call_id,
-                rig::completion::message::ToolResultContent::from_tool_output(provider_output),
-            ),
+            tool_results: tool_result_context_from_output(tool_call.id, call_id, provider_output),
         })
     }
 
@@ -3601,7 +3633,7 @@ impl CompletionRunner {
         completed.sort_by_key(|execution| execution.index);
         for execution in completed {
             next_events.push(execution.event);
-            tool_results.push(execution.tool_result);
+            tool_results.extend(execution.tool_results);
         }
         if let Some(source) = error {
             return Err(source);
@@ -6872,7 +6904,7 @@ mod tests {
     }
 
     #[test]
-    fn rig_messages_from_nodes_restores_image_tool_result_content() {
+    fn rig_messages_from_nodes_restores_image_as_user_context() {
         let messages = rig_messages_from_nodes(&[
             context_node(
                 Role::LLM,
@@ -6904,24 +6936,120 @@ mod tests {
         assert!(matches!(
             &messages[1],
             rig::completion::message::Message::User { content }
-                if matches!(
-                    content.first_ref(),
-                    rig::completion::message::UserContent::ToolResult(tool_result)
-                        if tool_result.id == "tool-call-image"
-                            && tool_result.call_id.as_deref() == Some("call-image")
-                            && matches!(
-                                tool_result.content.first_ref(),
-                                rig::completion::message::ToolResultContent::Image(image)
-                                    if image.data
-                                        == rig::completion::message::DocumentSourceKind::Base64(
-                                            "aW1hZ2U=".to_owned()
-                                        )
-                                        && image.media_type
-                                            == Some(
-                                                rig::completion::message::ImageMediaType::PNG
-                                            )
-                            )
-                )
+                if {
+                    let items = content.iter().collect::<Vec<_>>();
+                    items.len() == 2
+                        && matches!(
+                            items[0],
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.id == "tool-call-image"
+                                    && tool_result.call_id.as_deref() == Some("call-image")
+                                    && matches!(
+                                        tool_result.content.first_ref(),
+                                        rig::completion::message::ToolResultContent::Text(text)
+                                            if text.text == "Image loaded into model context."
+                                    )
+                        )
+                        && matches!(
+                            items[1],
+                            rig::completion::message::UserContent::Image(image)
+                                if image.data
+                                    == rig::completion::message::DocumentSourceKind::Base64(
+                                        "aW1hZ2U=".to_owned()
+                                    )
+                                    && image.media_type
+                                        == Some(rig::completion::message::ImageMediaType::PNG)
+                        )
+                }
+        ));
+    }
+
+    #[test]
+    fn rig_messages_from_nodes_keeps_images_adjacent_to_tool_results() {
+        let messages = rig_messages_from_nodes(&[
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), Some("call-image-2")),
+                Kind::tool_use(ToolUse {
+                    id: "tool-call-image-2".to_owned(),
+                    name: "load_image".to_owned(),
+                    input: serde_json::json!({
+                        "source": "local_path",
+                        "path": "second.png",
+                    }),
+                }),
+            ),
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), Some("call-image-1")),
+                Kind::tool_use(ToolUse {
+                    id: "tool-call-image-1".to_owned(),
+                    name: "load_image".to_owned(),
+                    input: serde_json::json!({
+                        "source": "local_path",
+                        "path": "first.png",
+                    }),
+                }),
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), Some("call-image-1")),
+                Kind::tool_result(ToolResult {
+                    id: "tool-call-image-1".to_owned(),
+                    output: serde_json::json!({
+                        "type": "image",
+                        "data": "Zmlyc3Q=",
+                        "mimeType": "image/png",
+                    })
+                    .to_string(),
+                }),
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), Some("call-image-2")),
+                Kind::tool_result(ToolResult {
+                    id: "tool-call-image-2".to_owned(),
+                    output: serde_json::json!({
+                        "type": "image",
+                        "data": "c2Vjb25k",
+                        "mimeType": "image/png",
+                    })
+                    .to_string(),
+                }),
+            ),
+        ]);
+
+        let rig::completion::message::Message::User { content } = &messages[1] else {
+            panic!("expected tool result message");
+        };
+        let items = content.iter().collect::<Vec<_>>();
+
+        assert_eq!(items.len(), 4);
+        assert!(matches!(
+            items[0],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-image-2"
+        ));
+        assert!(matches!(
+            items[1],
+            rig::completion::message::UserContent::Image(image)
+                if image.data
+                    == rig::completion::message::DocumentSourceKind::Base64(
+                        "c2Vjb25k".to_owned()
+                    )
+        ));
+        assert!(matches!(
+            items[2],
+            rig::completion::message::UserContent::ToolResult(tool_result)
+                if tool_result.id == "tool-call-image-1"
+        ));
+        assert!(matches!(
+            items[3],
+            rig::completion::message::UserContent::Image(image)
+                if image.data
+                    == rig::completion::message::DocumentSourceKind::Base64(
+                        "Zmlyc3Q=".to_owned()
+                    )
         ));
     }
 
