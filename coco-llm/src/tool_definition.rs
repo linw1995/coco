@@ -113,13 +113,13 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                 "oneOf": [
                     {
                         "properties": {
-                            "source": { "const": "local_path" }
+                            "source": { "type": "string", "const": "local_path" }
                         },
                         "required": ["source", "path"]
                     },
                     {
                         "properties": {
-                            "source": { "const": "url" }
+                            "source": { "type": "string", "const": "url" }
                         },
                         "required": ["source", "url", "media_type"]
                     }
