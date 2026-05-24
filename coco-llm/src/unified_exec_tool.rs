@@ -1584,6 +1584,7 @@ async fn execute_command(
         .env_remove(UV_CACHE_DIR_ENV)
         .env_remove(UV_PYTHON_INSTALL_DIR_ENV)
         .env_remove(COCO_COMMAND_SHIM_MODE_ENV);
+    command.env(COCO_EXEC_WORKSPACE_ENV, &request.workspace_root);
     if let Some(coco_command) = &coco_command {
         command.env("PATH", join_path_entries(coco_command.path_entries.clone()));
         command.env(COCO_LOG_DIR_ENV, &coco_command.log_dir);
@@ -1714,6 +1715,7 @@ async fn execute_pty_command(
     let mut command = CommandBuilder::new(execution.program.as_os_str());
     command.args(execution.args.iter().map(OsString::as_os_str));
     command.cwd(&request.workdir);
+    command.env(COCO_EXEC_WORKSPACE_ENV, &request.workspace_root);
     command.env_remove(COCO_DAEMON_SOCKET_ENV);
     command.env_remove(COCO_SESSION_BRANCH_ENV);
     command.env_remove(COCO_SESSION_ROLE_ENV);
@@ -3083,12 +3085,16 @@ mod tests {
                     COCO_SKILL_PERSIST_DIR_ENV,
                     Some(OsStr::new("/tmp/stale-skill-persist")),
                 ),
+                (
+                    COCO_EXEC_WORKSPACE_ENV,
+                    Some(OsStr::new("/tmp/stale-workspace")),
+                ),
                 ("COCO_EXEC_SANDBOX", Some(OsStr::new("off"))),
             ],
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s' \"$COCO_BRANCH\" \"$COCO_SESSION_ROLE\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\" \"${{COCO_PARENT_TOOL_USE_ID:-}}\" \"${{COCO_SKILL_PERSIST_DIR:-}}\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s' \"$COCO_BRANCH\" \"$COCO_SESSION_ROLE\" \"${{COCO_STORE_PATH:-}}\" \"${{COCO_CLI_RUNTIME_SOCKET:-}}\" \"${{COCO_PARENT_TOOL_USE_ID:-}}\" \"${{COCO_SKILL_PERSIST_DIR:-}}\" \"$COCO_EXEC_WORKSPACE\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -3097,7 +3103,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(output.contains("stdout:\ndraft|runner||||"));
+        let workspace_root = workspace.path().canonicalize().unwrap();
+        let expected = format!("stdout:\ndraft|runner|||||{}", workspace_root.display());
+        assert!(output.contains(&expected), "{output}");
     }
 
     #[tokio::test]

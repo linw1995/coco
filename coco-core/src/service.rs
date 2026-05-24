@@ -1,5 +1,7 @@
 use coco_llm::CompletionBackend;
-use coco_llm::coco_mem::{BranchStore, JobStore, NodeStore, SessionStore, SkillStore};
+use coco_llm::coco_mem::{
+    BranchStore, JobStore, NodeStore, PromptAttachment, SessionStore, SkillStore,
+};
 use indoc::formatdoc;
 use snafu::prelude::*;
 use std::collections::HashSet;
@@ -54,14 +56,25 @@ where
                 conversation_id: message.conversation_id().to_owned(),
             })?;
 
-        let prompt = channel_prompt(&message, text);
-        match self.engine.reply(&branch, &prompt).await {
-            Ok(text) => Ok(OutboundMessage { text }),
-            Err(EngineError::SessionMissing { branch }) => Err(Error::MissingSession { branch }),
-            Err(source @ EngineError::EngineFailed { .. }) => {
-                let branch = branch.clone();
-                Err(Error::ConversationFailed { branch, source })
+        let supports_load_image = match self
+            .engine
+            .service()
+            .session_supports_tool(&branch, "load_image")
+        {
+            Ok(supports_load_image) => supports_load_image,
+            Err(source) => {
+                return Err(error_from_engine_failure(branch, EngineError::from(source)));
             }
+        };
+
+        let prompt = channel_prompt(&message, text, supports_load_image);
+        match self
+            .engine
+            .reply_with_attachments(&branch, &prompt.text, prompt.attachments)
+            .await
+        {
+            Ok(text) => Ok(OutboundMessage { text }),
+            Err(source) => Err(error_from_engine_failure(branch, source)),
         }
     }
 
@@ -105,23 +118,47 @@ where
     }
 }
 
-fn channel_prompt(message: &InboundMessage, text: &str) -> String {
-    match message {
-        InboundMessage::Telegram(telegram) => telegram_prompt(telegram, text),
-        InboundMessage::Cli(_) => text.to_owned(),
+struct ChannelPrompt {
+    text: String,
+    attachments: Vec<PromptAttachment>,
+}
+
+fn error_from_engine_failure(branch: String, source: EngineError) -> Error {
+    match source {
+        EngineError::SessionMissing { branch } => Error::MissingSession { branch },
+        source @ EngineError::EngineFailed { .. } => Error::ConversationFailed { branch, source },
     }
 }
 
-fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
+fn channel_prompt(
+    message: &InboundMessage,
+    text: &str,
+    supports_load_image: bool,
+) -> ChannelPrompt {
+    match message {
+        InboundMessage::Telegram(telegram) => telegram_prompt(telegram, text, supports_load_image),
+        InboundMessage::Cli(_) => ChannelPrompt {
+            text: text.to_owned(),
+            attachments: vec![],
+        },
+    }
+}
+
+fn telegram_prompt(
+    message: &TelegramInboundMessage,
+    text: &str,
+    supports_load_image: bool,
+) -> ChannelPrompt {
     let reply_to_message_id = message.source_message_id().unwrap_or("unknown");
     let image_context = telegram_image_context(message);
+    let image_policy = telegram_image_policy(supports_load_image);
     let incoming_text = if text.is_empty() {
         "No text caption was provided."
     } else {
         text
     };
 
-    formatdoc!(
+    let text = formatdoc!(
         "
         You are handling an inbound Telegram message.
 
@@ -139,7 +176,7 @@ fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
         - Do not use the `telegram` skill merely to acknowledge the request unless the incoming message only asks for acknowledgement.
         - Do not finish after an acknowledgement-only Telegram reply unless the incoming message only asked for acknowledgement.
         - Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.
-        - If the request depends on an image attachment, inspect it before responding. Use the `telegram` skill's `telegram_download.py` script with the attachment file_id to download inbound images.
+        - {image_policy}
         - After the final Telegram skill call completes, return a local completion note. If you handled multiple distinct tasks, include a concise multi-task summary in that final text that lists each task and its outcome.
 
         Incoming image attachments:
@@ -150,8 +187,21 @@ fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> String {
         ",
         chat_id = message.chat_id(),
         image_context = image_context,
+        image_policy = image_policy,
         incoming_text = incoming_text,
-    )
+    );
+    ChannelPrompt {
+        text,
+        attachments: vec![],
+    }
+}
+
+fn telegram_image_policy(supports_load_image: bool) -> &'static str {
+    if supports_load_image {
+        "If the request depends on an image attachment, inspect it before responding. Use the `telegram` skill's `telegram_download.py` script with the attachment file_id to download the image into the workspace, then use `load_image` with `source=\"local_path\"` and the downloaded path so the image is added to model context."
+    } else {
+        "If the request depends on an image attachment, use the `telegram` skill's `telegram_download.py` script with the attachment file_id to download the image into the workspace, then inspect the downloaded file only with tools available in this session. If no available tool can inspect it, explain that limitation in the final Telegram reply."
+    }
 }
 
 fn telegram_image_context(message: &TelegramInboundMessage) -> String {

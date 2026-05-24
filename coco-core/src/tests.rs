@@ -248,6 +248,7 @@ fn submit_prompt_job(store: &MemoryStore, branch: &str, prompt: &str) -> coco_ll
                 vec![],
                 PromptAnchor {
                     prompt: prompt.to_owned(),
+                    attachments: vec![],
                 },
             )),
         })
@@ -319,7 +320,9 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
-    llm.create_session(session_config("main")).await.unwrap();
+    let mut config = session_config("main");
+    config.tools = vec![builtin_tool_definition("load_image").unwrap()];
+    llm.create_session(config).await.unwrap();
     let service = CoreService::new(
         FixedBranchResolver::new("main"),
         ConversationEngine::new(llm),
@@ -354,7 +357,49 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
     assert!(prompt.contains("height=960"));
     assert!(prompt.contains("file_size=200000"));
     assert!(prompt.contains("No text caption was provided."));
+    assert!(prompt.contains("load_image"));
     assert!(prompt.contains("telegram_download.py"));
+
+    let attachments = &match &ancestry[1].kind {
+        Kind::Anchor(anchor) => anchor.as_prompt().expect("expected prompt anchor"),
+        _ => panic!("expected prompt anchor"),
+    }
+    .attachments;
+    assert!(attachments.is_empty());
+}
+
+#[tokio::test]
+async fn core_service_telegram_prompt_omits_load_image_when_tool_is_unavailable() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let service = CoreService::new(
+        FixedBranchResolver::new("main"),
+        ConversationEngine::new(llm),
+    );
+
+    service
+        .handle_message(InboundMessage::telegram_with_message_id_and_images(
+            "chat-1",
+            "user-1",
+            "message-1",
+            "Describe this image.",
+            vec![TelegramImageAttachment::from_parts(
+                "file-id", None, None, None, None,
+            )],
+        ))
+        .await
+        .unwrap();
+
+    let ancestry = store.ancestry("main").unwrap();
+    let prompt = match &ancestry[1].kind {
+        Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
+        _ => panic!("expected prompt anchor"),
+    };
+    assert!(prompt.contains("telegram_download.py"));
+    assert!(prompt.contains("tools available in this session"));
+    assert!(!prompt.contains("load_image"));
 }
 
 #[tokio::test]
@@ -672,11 +717,13 @@ async fn core_service_handles_batch_prompt_across_multiple_branches() {
                 BranchPromptRequest {
                     branch: "main".to_owned(),
                     prompt: "hello".to_owned(),
+                    attachments: vec![],
                     merge_parents: vec![],
                 },
                 BranchPromptRequest {
                     branch: "draft".to_owned(),
                     prompt: "world".to_owned(),
+                    attachments: vec![],
                     merge_parents: vec![],
                 },
             ],
@@ -714,11 +761,13 @@ async fn core_service_batch_prompt_reports_per_branch_failures() {
                 BranchPromptRequest {
                     branch: "main".to_owned(),
                     prompt: "hello".to_owned(),
+                    attachments: vec![],
                     merge_parents: vec![],
                 },
                 BranchPromptRequest {
                     branch: "missing".to_owned(),
                     prompt: "world".to_owned(),
+                    attachments: vec![],
                     merge_parents: vec![],
                 },
             ],
@@ -752,11 +801,13 @@ async fn core_service_batch_prompt_rejects_duplicate_branch() {
                 BranchPromptRequest {
                     branch: "main".to_owned(),
                     prompt: "hello".to_owned(),
+                    attachments: vec![],
                     merge_parents: vec![],
                 },
                 BranchPromptRequest {
                     branch: "main".to_owned(),
                     prompt: "world".to_owned(),
+                    attachments: vec![],
                     merge_parents: vec![],
                 },
             ],
@@ -877,6 +928,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
                 vec![],
                 PromptAnchor {
                     prompt: caller_task.to_owned(),
+                    attachments: vec![],
                 },
             )),
         })

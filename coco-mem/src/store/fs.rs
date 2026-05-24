@@ -27,8 +27,9 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-23";
-const PREVIOUS_STORE_FORMAT_VERSION: &str = "2026-05-18";
+const STORE_FORMAT_VERSION: &str = "2026-05-24";
+const PREVIOUS_STORE_FORMAT_VERSION: &str = "2026-05-23";
+const JOB_WAL_STORE_FORMAT_VERSION: &str = "2026-05-18";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -45,7 +46,7 @@ const SHARED_SKILL_HISTORY_DIR_NAME: &str = "shared";
 const ORCHESTRATOR_SKILL_HISTORY_DIR_NAME: &str = "orchestrator";
 const RUNNER_SKILL_HISTORY_DIR_NAME: &str = "runner";
 const BUILTIN_COCO_ORCHESTRATOR_REVISION_ID: &str =
-    "cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438";
+    "79a81ed8e48dc4bac77d8d87ad5566d3b25c1aa1c6fd63cf89aec1efbc0ea6b9";
 const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
@@ -53,7 +54,7 @@ const BUILTIN_CRONJOB_REVISION_ID: &str =
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
-    "fe5361a23cc71e2253b9d7867604cf1994db8fb6273dcae2ba2088a48c827e3c";
+    "1b3f4dcf9b56400edb41ba960e6743b2e938ee58800e5dbb7fc02b11a8d432a0";
 const BRANCHES_DIR_NAME: &str = "branches";
 const LOCK_FILE_NAME: &str = "store.lock";
 const JOB_COMPACT_MIN_LOG_ENTRIES: usize = 64;
@@ -62,7 +63,11 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "coco-orchestrator",
-        from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+        from_revision_ids: &[
+            // Before the orchestrator runner prompt included load_image.
+            "cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438",
+            BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
+        ],
         target_revision_id: BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
     },
     BuiltinSkillMigration {
@@ -89,7 +94,10 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         from_revision_ids: &[
             // Telegram default before the attachment download script was added.
             "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c",
-            BUILTIN_TELEGRAM_REVISION_ID,
+            // Telegram default before downloads were directed into the workspace.
+            "fe5361a23cc71e2253b9d7867604cf1994db8fb6273dcae2ba2088a48c827e3c",
+            // Telegram default before the download script defaulted into the workspace.
+            "a86a9cb4ec5d5b8f6284970aa7c9feb53ddfbe7d1b984e9210dda7d1801edfd1",
         ],
         target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
     },
@@ -112,12 +120,19 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-17-to-2026-05-18",
         from: StoreFormatVersion::Chronicle("2026-05-17"),
-        to: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle(JOB_WAL_STORE_FORMAT_VERSION),
         run: Persistence::migrate_jobs_to_wal,
         builtin_skills: &[],
     },
     StoreMigration {
         name: "2026-05-18-to-2026-05-23",
+        from: StoreFormatVersion::Chronicle(JOB_WAL_STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-23-to-2026-05-24",
         from: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,

@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, Node, NodeStore,
-    SessionStore, SkillStore,
+    PromptAttachment, SessionStore, SkillStore,
 };
 use coco_llm::{
     CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
@@ -102,13 +102,23 @@ where
         self.reply_with_merge_parents(branch, prompt, vec![]).await
     }
 
+    pub async fn reply_with_attachments(
+        &self,
+        branch: &str,
+        prompt: &str,
+        attachments: Vec<PromptAttachment>,
+    ) -> std::result::Result<String, EngineError> {
+        self.reply_with_prompt_options(branch, prompt, attachments, vec![], None)
+            .await
+    }
+
     pub async fn reply_with_merge_parents(
         &self,
         branch: &str,
         prompt: &str,
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<String, EngineError> {
-        self.reply_with_session_patch(branch, prompt, merge_parents, None)
+        self.reply_with_prompt_options(branch, prompt, vec![], merge_parents, None)
             .await
     }
 
@@ -119,8 +129,20 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<String, EngineError> {
+        self.reply_with_prompt_options(branch, prompt, vec![], merge_parents, session_patch)
+            .await
+    }
+
+    async fn reply_with_prompt_options(
+        &self,
+        branch: &str,
+        prompt: &str,
+        attachments: Vec<PromptAttachment>,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionConfigPatch>,
+    ) -> std::result::Result<String, EngineError> {
         Ok(self
-            .run_prompt_job(branch, prompt, merge_parents, session_patch)
+            .run_prompt_job(branch, prompt, attachments, merge_parents, session_patch)
             .await?
             .text)
     }
@@ -149,7 +171,13 @@ where
                     .expect("batch prompt semaphore should stay open");
                 let branch = item.branch;
                 match engine
-                    .run_prompt_job(&branch, &item.prompt, item.merge_parents, None)
+                    .run_prompt_job(
+                        &branch,
+                        &item.prompt,
+                        item.attachments,
+                        item.merge_parents,
+                        None,
+                    )
                     .await
                 {
                     Ok(result) => (
@@ -186,11 +214,18 @@ where
         &self,
         branch: &str,
         prompt: &str,
+        attachments: Vec<PromptAttachment>,
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<PromptReply, EngineError> {
         let job = self
-            .submit_job_with_session_patch(branch, prompt, merge_parents, session_patch)
+            .submit_job_with_attachments_and_session_patch(
+                branch,
+                prompt,
+                attachments,
+                merge_parents,
+                session_patch,
+            )
             .await?;
         let snapshot = self.drive_job_for_prompt(&job.job_id).await?;
         let job = self.service.store().get_job(&job.job_id)?;
@@ -214,10 +249,30 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<Job, EngineError> {
-        self.submit_job_with_optional_id_and_session_patch(
+        self.submit_job_with_optional_id_attachments_and_session_patch(
             None,
             branch,
             prompt,
+            vec![],
+            merge_parents,
+            session_patch,
+        )
+        .await
+    }
+
+    pub async fn submit_job_with_attachments_and_session_patch(
+        &self,
+        branch: &str,
+        prompt: &str,
+        attachments: Vec<PromptAttachment>,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionConfigPatch>,
+    ) -> std::result::Result<Job, EngineError> {
+        self.submit_job_with_optional_id_attachments_and_session_patch(
+            None,
+            branch,
+            prompt,
+            attachments,
             merge_parents,
             session_patch,
         )
@@ -232,21 +287,23 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<Job, EngineError> {
-        self.submit_job_with_optional_id_and_session_patch(
+        self.submit_job_with_optional_id_attachments_and_session_patch(
             Some(job_id),
             branch,
             prompt,
+            vec![],
             merge_parents,
             session_patch,
         )
         .await
     }
 
-    async fn submit_job_with_optional_id_and_session_patch(
+    async fn submit_job_with_optional_id_attachments_and_session_patch(
         &self,
         job_id: Option<&str>,
         branch: &str,
         prompt: &str,
+        attachments: Vec<PromptAttachment>,
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<Job, EngineError> {
@@ -256,6 +313,7 @@ where
         let base = self.service.append_prompt_job_base(
             branch,
             prompt,
+            &attachments,
             &merge_parents,
             session_patch.as_ref(),
         )?;
@@ -464,6 +522,7 @@ where
         } else {
             CompletionInput::Prompt {
                 text: String::new(),
+                attachments: vec![],
                 merge_parents,
                 session_patch: None,
             }

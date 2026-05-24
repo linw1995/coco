@@ -75,6 +75,7 @@ where
                 vec![],
                 PromptAnchor {
                     prompt: prompt.to_owned(),
+                    attachments: vec![],
                 },
             )),
         })
@@ -701,6 +702,7 @@ fn append_prompt_anchor(
                     .collect(),
                 PromptAnchor {
                     prompt: prompt.to_owned(),
+                    attachments: vec![],
                 },
             )),
         })
@@ -1448,6 +1450,7 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
                 vec![MergeParent::shadow(shadow_parent.clone())],
                 PromptAnchor {
                     prompt: "hello".to_owned(),
+                    attachments: vec![],
                 },
             )),
         })
@@ -3545,6 +3548,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
                 vec![MergeParent::shadow(shadow_parent.clone())],
                 PromptAnchor {
                     prompt: String::new(),
+                    attachments: vec![],
                 },
             )),
         })
@@ -5933,7 +5937,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["exec_command", "write_stdin", "search_skill"]
+        vec!["exec_command", "write_stdin", "search_skill", "load_image"]
     );
 
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
@@ -6101,7 +6105,10 @@ fn resolve_session_config_reads_tools_from_env() {
             &[
                 ("COCO_PROVIDER", "openai"),
                 ("COCO_MODEL", "gpt-4.1-mini"),
-                ("COCO_TOOLS", "exec_command,write_stdin,search_skill"),
+                (
+                    "COCO_TOOLS",
+                    "exec_command,write_stdin,search_skill,load_image",
+                ),
             ],
             || async {
                 resolve_session_config(SessionCreateCommand {
@@ -6127,7 +6134,7 @@ fn resolve_session_config_reads_tools_from_env() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["exec_command", "write_stdin", "search_skill"]
+        vec!["exec_command", "write_stdin", "search_skill", "load_image"]
     );
     assert!(config.enable_coco_shim);
 }

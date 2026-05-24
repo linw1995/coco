@@ -86,6 +86,47 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                 "additionalProperties": false
             }),
         }),
+        "load_image" => Some(Tool {
+            name: "load_image".to_owned(),
+            description: "Load an image into model context only when the task depends on visual content. Supports local workspace paths and remote image URLs.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["local_path", "url"],
+                        "description": "Where to load the image from."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Local image path for source=local_path. Relative paths resolve under the configured workspace."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Remote image URL for source=url."
+                    },
+                    "media_type": {
+                        "type": "string",
+                        "description": "Optional image MIME type such as image/jpeg or image/png. Required for source=url."
+                    }
+                },
+                "oneOf": [
+                    {
+                        "properties": {
+                            "source": { "const": "local_path" }
+                        },
+                        "required": ["source", "path"]
+                    },
+                    {
+                        "properties": {
+                            "source": { "const": "url" }
+                        },
+                        "required": ["source", "url", "media_type"]
+                    }
+                ],
+                "additionalProperties": false
+            }),
+        }),
         _ => None,
     }
 }
