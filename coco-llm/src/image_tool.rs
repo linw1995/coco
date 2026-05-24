@@ -480,24 +480,8 @@ mod tests {
         let definition = runtime.tool_definition();
 
         assert_eq!(definition.name, "load_image");
-        assert!(definition.parameters["required"].is_null());
-        assert_eq!(
-            definition.parameters["oneOf"],
-            json!([
-                {
-                    "properties": {
-                        "source": { "type": "string", "const": "local_path" }
-                    },
-                    "required": ["source", "path"]
-                },
-                {
-                    "properties": {
-                        "source": { "type": "string", "const": "url" }
-                    },
-                    "required": ["source", "url", "media_type"]
-                }
-            ])
-        );
+        assert_eq!(definition.parameters["required"], json!(["source"]));
+        assert!(definition.parameters["oneOf"].is_null());
     }
 
     #[tokio::test]
