@@ -1061,8 +1061,14 @@ fn update_node_detail_from_hash(window: &Window, document: &Document) -> Result<
     )?;
     let detail_window = window.clone();
     let detail_document = document.clone();
+    let pending = selected.clone();
     spawn_local(async move {
         if let Err(error) = load_node_detail(&detail_window, &detail_document, selected).await {
+            if let Err(render_error) =
+                show_node_detail_error(&detail_window, &detail_document, &pending)
+            {
+                web_sys::console::error_1(&render_error);
+            }
             web_sys::console::error_1(&error);
         }
     });
@@ -1178,6 +1184,33 @@ fn show_node_detail_loading(
     set_node_detail_field(&panel, "created_at", "")?;
     set_node_detail_field(&panel, "labels", "")?;
     set_node_detail_field(&panel, "content", "Loading...")?;
+    Ok(())
+}
+
+fn show_node_detail_error(
+    window: &Window,
+    document: &Document,
+    selected: &SelectedNode,
+) -> Result<(), JsValue> {
+    if selected_node(window, document)?
+        .as_ref()
+        .map(|current| current.target.as_str())
+        != Some(selected.target.as_str())
+    {
+        return Ok(());
+    }
+    let Some(panel) = scroll_element(document, ".node-detail-panel") else {
+        return Ok(());
+    };
+    if panel.get_attribute("data-node-detail-target").as_deref() != Some(selected.target.as_str()) {
+        return Ok(());
+    }
+
+    set_node_detail_field(&panel, "kind", "")?;
+    set_node_detail_field(&panel, "role", "")?;
+    set_node_detail_field(&panel, "created_at", "")?;
+    set_node_detail_field(&panel, "labels", "")?;
+    set_node_detail_field(&panel, "content", "Unable to load node detail.")?;
     Ok(())
 }
 
