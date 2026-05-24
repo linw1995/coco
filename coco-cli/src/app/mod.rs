@@ -208,18 +208,43 @@ fn resolve_provider_runtime_configs(
             let provider = coco_llm::Provider::parse(&profile.provider).context(LlmSnafu)?;
             let additional_params = coco_llm::provider_profile_additional_params(&profile);
             let secrets = resolve_provider_secrets(&name, profile.secrets)?;
+            let base_url = resolve_provider_base_url(&name, profile.base_url)?;
             Ok((
                 name,
                 ProviderRuntimeConfig {
                     provider,
                     secrets,
-                    base_url: profile.base_url,
+                    base_url,
                     default_model: profile.default_model,
                     additional_params,
                 },
             ))
         })
         .collect()
+}
+
+fn resolve_provider_base_url(profile: &str, base_url: Option<String>) -> Result<Option<String>> {
+    let Some(base_url) = base_url else {
+        return Ok(None);
+    };
+
+    if !base_url.starts_with("${") {
+        return Ok(Some(base_url));
+    }
+
+    let env = parse_env_placeholder(&base_url).ok_or_else(|| {
+        crate::Error::InvalidProviderBaseUrlReference {
+            profile: profile.to_owned(),
+            value: base_url.clone(),
+        }
+    })?;
+
+    std::env::var(env)
+        .map(Some)
+        .context(crate::error::ReadProviderBaseUrlEnvSnafu {
+            profile: profile.to_owned(),
+            name: env.to_owned(),
+        })
 }
 
 fn resolve_provider_secrets(
@@ -274,4 +299,71 @@ pub fn resolve_session_config(command: SessionCreateCommand) -> Result<SessionCo
     );
     let provider_profiles = config::ProviderProfiles::from_profiles(profiles);
     session::resolve_session_config(command, &provider_profiles)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    use std::sync::{Mutex, OnceLock};
+
+    use super::*;
+
+    fn with_env_var<T>(name: &str, value: Option<&str>, run: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let previous = std::env::var(name).ok();
+
+        set_env_var(name, value);
+        let output = catch_unwind(AssertUnwindSafe(run));
+        set_env_var(name, previous.as_deref());
+
+        match output {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+
+    fn set_env_var(name: &str, value: Option<&str>) {
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var(name, value);
+            },
+            None => unsafe {
+                std::env::remove_var(name);
+            },
+        }
+    }
+
+    #[test]
+    fn provider_base_url_resolves_env_placeholder() {
+        with_env_var(
+            "COCO_WORK_ANTHROPIC_BASE_URL",
+            Some("https://anthropic.example.test"),
+            || {
+                let base_url = resolve_provider_base_url(
+                    "work-anthropic",
+                    Some("${COCO_WORK_ANTHROPIC_BASE_URL}".to_owned()),
+                )
+                .unwrap();
+
+                assert_eq!(base_url.as_deref(), Some("https://anthropic.example.test"));
+            },
+        );
+    }
+
+    #[test]
+    fn provider_base_url_reports_missing_env_placeholder() {
+        with_env_var("COCO_WORK_ANTHROPIC_BASE_URL", None, || {
+            let error = resolve_provider_base_url(
+                "work-anthropic",
+                Some("${COCO_WORK_ANTHROPIC_BASE_URL}".to_owned()),
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("COCO_WORK_ANTHROPIC_BASE_URL"));
+            assert!(error.contains("work-anthropic"));
+        });
+    }
 }
