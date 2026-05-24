@@ -1,7 +1,6 @@
 use coco_llm::CompletionBackend;
 use coco_llm::coco_mem::{
-    BranchStore, JobStore, NodeStore, PromptAttachment, PromptImageAttachment, SessionStore,
-    SkillStore,
+    BranchStore, JobStore, NodeStore, PromptAttachment, SessionStore, SkillStore,
 };
 use indoc::formatdoc;
 use snafu::prelude::*;
@@ -169,25 +168,8 @@ fn telegram_prompt(message: &TelegramInboundMessage, text: &str) -> ChannelPromp
     );
     ChannelPrompt {
         text,
-        attachments: telegram_prompt_attachments(message),
+        attachments: vec![],
     }
-}
-
-fn telegram_prompt_attachments(message: &TelegramInboundMessage) -> Vec<PromptAttachment> {
-    message
-        .image_attachments()
-        .iter()
-        .enumerate()
-        .map(|(index, image)| {
-            PromptAttachment::Image(PromptImageAttachment {
-                id: format!("telegram-image-{}", index + 1),
-                width: image.width(),
-                height: image.height(),
-                file_size: image.file_size(),
-                media_type: None,
-            })
-        })
-        .collect()
 }
 
 fn telegram_image_context(message: &TelegramInboundMessage) -> String {
