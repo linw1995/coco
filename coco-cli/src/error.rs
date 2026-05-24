@@ -41,18 +41,6 @@ pub enum Error {
         value: String,
     },
 
-    #[snafu(display("Invalid provider base_url reference {value:?} for profile {profile:?}"))]
-    InvalidProviderBaseUrlReference { profile: String, value: String },
-
-    #[snafu(display(
-        "Failed to read provider base_url env var {name:?} for profile {profile:?}: {source}"
-    ))]
-    ReadProviderBaseUrlEnv {
-        profile: String,
-        name: String,
-        source: std::env::VarError,
-    },
-
     #[snafu(display("Invalid channel secret reference {value:?} for channel {channel:?}"))]
     InvalidChannelSecretReference { channel: String, value: String },
 

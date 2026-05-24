@@ -3790,18 +3790,54 @@ fn resolve_env_value(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-fn resolve_base_url(provider: Provider, custom_base_url: Option<&str>) -> Option<String> {
-    custom_base_url.map(str::to_owned).or_else(|| {
-        std::env::var("COCO_BASE_URL")
-            .ok()
-            .or_else(|| match provider {
-                Provider::OpenAi => std::env::var("OPENAI_BASE_URL").ok(),
-                Provider::Anthropic => None,
-                Provider::ChatGpt => std::env::var("CHATGPT_API_BASE")
-                    .ok()
-                    .or_else(|| std::env::var("OPENAI_CHATGPT_API_BASE").ok()),
-            })
+fn resolve_base_url(
+    provider: Provider,
+    custom_base_url: Option<&str>,
+) -> std::result::Result<Option<String>, BackendError> {
+    if let Some(custom_base_url) = custom_base_url {
+        return resolve_custom_base_url(provider, custom_base_url);
+    }
+
+    Ok(std::env::var("COCO_BASE_URL")
+        .ok()
+        .or_else(|| match provider {
+            Provider::OpenAi => std::env::var("OPENAI_BASE_URL").ok(),
+            Provider::Anthropic => None,
+            Provider::ChatGpt => std::env::var("CHATGPT_API_BASE")
+                .ok()
+                .or_else(|| std::env::var("OPENAI_CHATGPT_API_BASE").ok()),
+        }))
+}
+
+fn resolve_custom_base_url(
+    provider: Provider,
+    custom_base_url: &str,
+) -> std::result::Result<Option<String>, BackendError> {
+    if !custom_base_url.starts_with("${") {
+        return Ok(Some(custom_base_url.to_owned()));
+    }
+
+    let env = parse_env_placeholder(custom_base_url).ok_or_else(|| {
+        BackendError::failed(format!(
+            "invalid base URL environment reference {custom_base_url:?} for provider {}",
+            provider.as_str()
+        ))
+    })?;
+
+    std::env::var(env).map(Some).map_err(|_| {
+        BackendError::failed(format!(
+            "missing base URL for provider {} in environment variable {}",
+            provider.as_str(),
+            env
+        ))
     })
+}
+
+fn parse_env_placeholder(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .filter(|value| !value.is_empty())
 }
 
 #[async_trait]
@@ -3819,7 +3855,7 @@ impl CompletionBackend for RigBackend {
                 )?;
                 let mut builder = openai::Client::builder().api_key(&api_key);
                 if let Some(base_url) =
-                    resolve_base_url(ctx.request.provider, ctx.request.base_url.as_deref())
+                    resolve_base_url(ctx.request.provider, ctx.request.base_url.as_deref())?
                 {
                     builder = builder.base_url(&base_url);
                 }
@@ -3836,7 +3872,7 @@ impl CompletionBackend for RigBackend {
                 )?;
                 let mut builder = anthropic::Client::builder().api_key(api_key);
                 if let Some(base_url) =
-                    resolve_base_url(ctx.request.provider, ctx.request.base_url.as_deref())
+                    resolve_base_url(ctx.request.provider, ctx.request.base_url.as_deref())?
                 {
                     builder = builder.base_url(&base_url);
                 }
@@ -3849,7 +3885,7 @@ impl CompletionBackend for RigBackend {
                 let mut builder =
                     chatgpt::Client::builder().api_key(resolve_chatgpt_auth(&ctx.request.secrets)?);
                 if let Some(base_url) =
-                    resolve_base_url(ctx.request.provider, ctx.request.base_url.as_deref())
+                    resolve_base_url(ctx.request.provider, ctx.request.base_url.as_deref())?
                 {
                     builder = builder.base_url(base_url);
                 }
@@ -5054,7 +5090,9 @@ mod tests {
             ],
             || async {
                 assert_eq!(
-                    resolve_base_url(Provider::ChatGpt, None).as_deref(),
+                    resolve_base_url(Provider::ChatGpt, None)
+                        .unwrap()
+                        .as_deref(),
                     Some("https://chatgpt.example.test")
                 );
             },
@@ -5065,9 +5103,47 @@ mod tests {
     #[test]
     fn resolve_base_url_prefers_profile_base_url() {
         assert_eq!(
-            resolve_base_url(Provider::OpenAi, Some("https://profile.example.test")).as_deref(),
+            resolve_base_url(Provider::OpenAi, Some("https://profile.example.test"))
+                .unwrap()
+                .as_deref(),
             Some("https://profile.example.test")
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_base_url_reads_profile_env_reference() {
+        with_process_env_async(
+            &[(
+                "COCO_WORK_ANTHROPIC_BASE_URL",
+                Some(OsStr::new("https://anthropic.example.test")),
+            )],
+            || async {
+                assert_eq!(
+                    resolve_base_url(Provider::Anthropic, Some("${COCO_WORK_ANTHROPIC_BASE_URL}"))
+                        .unwrap()
+                        .as_deref(),
+                    Some("https://anthropic.example.test")
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_base_url_reports_missing_profile_env_reference() {
+        with_process_env_async(&[("COCO_WORK_ANTHROPIC_BASE_URL", None)], || async {
+            let error = resolve_base_url(
+                Provider::Anthropic,
+                Some("${COCO_WORK_ANTHROPIC_BASE_URL}"),
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                "missing base URL for provider anthropic in environment variable COCO_WORK_ANTHROPIC_BASE_URL"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
