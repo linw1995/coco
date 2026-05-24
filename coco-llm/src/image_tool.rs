@@ -435,7 +435,7 @@ mod tests {
         let definition = runtime.tool_definition();
 
         assert_eq!(definition.name, "load_image");
-        assert_eq!(definition.parameters["required"], json!(["source"]));
+        assert!(definition.parameters["required"].is_null());
         assert_eq!(
             definition.parameters["oneOf"],
             json!([
