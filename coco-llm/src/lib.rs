@@ -2152,6 +2152,19 @@ impl<B, S> LlmService<B, S>
 where
     S: NodeStore,
 {
+    pub fn session_supports_tool(
+        &self,
+        branch: &str,
+        tool_name: &str,
+    ) -> std::result::Result<bool, Error> {
+        let context = self.resolve_context(branch)?;
+        Ok(context
+            .session_anchor
+            .tools
+            .iter()
+            .any(|tool| tool.name == tool_name))
+    }
+
     fn resolve_context(&self, reference: &str) -> Result<ResolvedContext> {
         let mut ordered = Vec::new();
         for node in self.store.ancestry(reference).context(MemorySnafu)? {

@@ -320,7 +320,9 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
-    llm.create_session(session_config("main")).await.unwrap();
+    let mut config = session_config("main");
+    config.tools = vec![builtin_tool_definition("load_image").unwrap()];
+    llm.create_session(config).await.unwrap();
     let service = CoreService::new(
         FixedBranchResolver::new("main"),
         ConversationEngine::new(llm),
@@ -364,6 +366,40 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
     }
     .attachments;
     assert!(attachments.is_empty());
+}
+
+#[tokio::test]
+async fn core_service_telegram_prompt_omits_load_image_when_tool_is_unavailable() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let service = CoreService::new(
+        FixedBranchResolver::new("main"),
+        ConversationEngine::new(llm),
+    );
+
+    service
+        .handle_message(InboundMessage::telegram_with_message_id_and_images(
+            "chat-1",
+            "user-1",
+            "message-1",
+            "Describe this image.",
+            vec![TelegramImageAttachment::from_parts(
+                "file-id", None, None, None, None,
+            )],
+        ))
+        .await
+        .unwrap();
+
+    let ancestry = store.ancestry("main").unwrap();
+    let prompt = match &ancestry[1].kind {
+        Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
+        _ => panic!("expected prompt anchor"),
+    };
+    assert!(prompt.contains("telegram_download.py"));
+    assert!(prompt.contains("tools available in this session"));
+    assert!(!prompt.contains("load_image"));
 }
 
 #[tokio::test]

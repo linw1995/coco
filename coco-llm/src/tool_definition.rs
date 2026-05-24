@@ -111,6 +111,20 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
                     }
                 },
                 "required": ["source"],
+                "oneOf": [
+                    {
+                        "properties": {
+                            "source": { "const": "local_path" }
+                        },
+                        "required": ["source", "path"]
+                    },
+                    {
+                        "properties": {
+                            "source": { "const": "url" }
+                        },
+                        "required": ["source", "url", "media_type"]
+                    }
+                ],
                 "additionalProperties": false
             }),
         }),

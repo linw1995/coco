@@ -436,6 +436,23 @@ mod tests {
 
         assert_eq!(definition.name, "load_image");
         assert_eq!(definition.parameters["required"], json!(["source"]));
+        assert_eq!(
+            definition.parameters["oneOf"],
+            json!([
+                {
+                    "properties": {
+                        "source": { "const": "local_path" }
+                    },
+                    "required": ["source", "path"]
+                },
+                {
+                    "properties": {
+                        "source": { "const": "url" }
+                    },
+                    "required": ["source", "url", "media_type"]
+                }
+            ])
+        );
     }
 
     #[tokio::test]
