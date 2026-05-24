@@ -33,7 +33,10 @@ Collect these before execution:
 
 ## Command Templates
 
-Paths are relative to this skill directory.
+Script paths use `COCO_SKILL_DIR`. Run commands from the current workspace so
+relative output paths remain loadable by follow-up tools. `telegram_download.py`
+defaults to `COCO_EXEC_WORKSPACE/telegram-downloads` when `--output` and
+`--output-dir` are omitted.
 
 ```bash
 # Send a simple text message.
@@ -68,8 +71,7 @@ uv run --script "$COCO_SKILL_DIR/scripts/telegram_edit.py" \
 
 # Download an inbound image attachment by file_id.
 uv run --script "$COCO_SKILL_DIR/scripts/telegram_download.py" \
-  --file-id "<file_id>" \
-  --output-dir "./telegram-downloads"
+  --file-id "<file_id>"
 ```
 
 ## Script Interface Reference

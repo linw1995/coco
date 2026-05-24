@@ -2021,7 +2021,7 @@ where
             .current()
             .unwrap()
             .body
-            .contains("--output-dir \"./telegram-downloads\"")
+            .contains("COCO_EXEC_WORKSPACE/telegram-downloads")
     );
     assert!(!telegram.current().unwrap().body.contains("/tmp/telegram"));
 }

@@ -54,7 +54,7 @@ const BUILTIN_CRONJOB_REVISION_ID: &str =
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
-    "a86a9cb4ec5d5b8f6284970aa7c9feb53ddfbe7d1b984e9210dda7d1801edfd1";
+    "1b3f4dcf9b56400edb41ba960e6743b2e938ee58800e5dbb7fc02b11a8d432a0";
 const BRANCHES_DIR_NAME: &str = "branches";
 const LOCK_FILE_NAME: &str = "store.lock";
 const JOB_COMPACT_MIN_LOG_ENTRIES: usize = 64;
@@ -96,6 +96,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
             "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c",
             // Telegram default before downloads were directed into the workspace.
             "fe5361a23cc71e2253b9d7867604cf1994db8fb6273dcae2ba2088a48c827e3c",
+            // Telegram default before the download script defaulted into the workspace.
+            "a86a9cb4ec5d5b8f6284970aa7c9feb53ddfbe7d1b984e9210dda7d1801edfd1",
         ],
         target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
     },

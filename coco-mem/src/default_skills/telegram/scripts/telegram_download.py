@@ -9,6 +9,8 @@ import urllib.request
 from pathlib import Path
 
 TOKEN_ENV_NAMES = ("COCO_TELEGRAM_BOT_TOKEN",)
+WORKSPACE_ENV_NAME = "COCO_EXEC_WORKSPACE"
+DEFAULT_OUTPUT_DIR_NAME = "telegram-downloads"
 
 
 def resolve_token(explicit_token: str | None) -> str:
@@ -46,7 +48,14 @@ def post_api(token: str, method: str, payload: dict) -> dict:
     return body["result"]
 
 
-def default_output_path(file_path: str, output_dir: str) -> Path:
+def default_output_dir() -> Path:
+    workspace = os.environ.get(WORKSPACE_ENV_NAME)
+    if workspace:
+        return Path(workspace) / DEFAULT_OUTPUT_DIR_NAME
+    return Path(DEFAULT_OUTPUT_DIR_NAME)
+
+
+def default_output_path(file_path: str, output_dir: str | Path) -> Path:
     name = Path(file_path).name
     if not name:
         raise SystemExit("Telegram file path does not contain a file name.")
@@ -77,7 +86,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Download a Telegram file by file_id.")
     parser.add_argument("--file-id", required=True)
     parser.add_argument("--output", "-o")
-    parser.add_argument("--output-dir", default=".")
+    parser.add_argument("--output-dir")
     parser.add_argument("--token", "-t")
     args = parser.parse_args()
 
@@ -90,7 +99,7 @@ def main() -> int:
     output_path = (
         Path(args.output)
         if args.output
-        else default_output_path(file_path, args.output_dir)
+        else default_output_path(file_path, args.output_dir or default_output_dir())
     )
     bytes_written = download_file(token, file_path, output_path)
 

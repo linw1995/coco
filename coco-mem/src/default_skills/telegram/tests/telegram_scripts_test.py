@@ -160,15 +160,24 @@ class TelegramDownloadScriptTests(unittest.TestCase):
         module = load_script(DOWNLOAD_SCRIPT)
 
         self.assertEqual(
-            module.default_output_path("photos/file_123.jpg", "/tmp/downloads"),
-            Path("/tmp/downloads/file_123.jpg"),
+            module.default_output_path("photos/file_123.jpg", "telegram-downloads"),
+            Path("telegram-downloads/file_123.jpg"),
         )
+
+    def test_default_output_dir_prefers_exec_workspace(self) -> None:
+        module = load_script(DOWNLOAD_SCRIPT)
+
+        with mock.patch.dict(os.environ, {"COCO_EXEC_WORKSPACE": "/workspace"}):
+            self.assertEqual(
+                module.default_output_dir(),
+                Path("/workspace/telegram-downloads"),
+            )
 
     def test_default_output_path_rejects_missing_file_name(self) -> None:
         module = load_script(DOWNLOAD_SCRIPT)
 
         with self.assertRaisesRegex(SystemExit, "does not contain a file name"):
-            module.default_output_path("", "/tmp/downloads")
+            module.default_output_path("", "telegram-downloads")
 
     def test_main_downloads_file_without_network(self) -> None:
         module = load_script(DOWNLOAD_SCRIPT)
@@ -198,7 +207,7 @@ class TelegramDownloadScriptTests(unittest.TestCase):
             "--file-id",
             "file-id",
             "--output",
-            "/tmp/inbound.jpg",
+            "telegram-downloads/inbound.jpg",
             "--token",
             "test-token",
         ]
@@ -222,7 +231,7 @@ class TelegramDownloadScriptTests(unittest.TestCase):
                 {
                     "token": "test-token",
                     "file_path": "photos/file_123.jpg",
-                    "output_path": "/tmp/inbound.jpg",
+                    "output_path": "telegram-downloads/inbound.jpg",
                 },
             ],
         )
@@ -232,7 +241,7 @@ class TelegramDownloadScriptTests(unittest.TestCase):
                 "file_id": "file-id",
                 "file_unique_id": "unique-id",
                 "telegram_file_path": "photos/file_123.jpg",
-                "output_path": "/tmp/inbound.jpg",
+                "output_path": "telegram-downloads/inbound.jpg",
                 "bytes": 4321,
                 "file_size": 1234,
             },
