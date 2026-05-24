@@ -27,8 +27,9 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-23";
-const PREVIOUS_STORE_FORMAT_VERSION: &str = "2026-05-18";
+const STORE_FORMAT_VERSION: &str = "2026-05-24";
+const PREVIOUS_STORE_FORMAT_VERSION: &str = "2026-05-23";
+const JOB_WAL_STORE_FORMAT_VERSION: &str = "2026-05-18";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -116,12 +117,19 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-17-to-2026-05-18",
         from: StoreFormatVersion::Chronicle("2026-05-17"),
-        to: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle(JOB_WAL_STORE_FORMAT_VERSION),
         run: Persistence::migrate_jobs_to_wal,
         builtin_skills: &[],
     },
     StoreMigration {
         name: "2026-05-18-to-2026-05-23",
+        from: StoreFormatVersion::Chronicle(JOB_WAL_STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-23-to-2026-05-24",
         from: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
