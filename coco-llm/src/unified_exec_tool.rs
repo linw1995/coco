@@ -2917,7 +2917,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf 'sandboxed'","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf 'sandboxed'","workdir":"{}","shell":"bash","yield_time_ms":5000}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -2926,7 +2926,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(output.contains("exit_status: 0"));
+        assert!(output.contains("exit_status: 0"), "{output}");
         let args = std::fs::read_to_string(&observed_args).unwrap();
         let expected_workspace = workspace.path().display().to_string();
         assert!(args.contains("run"));
@@ -3004,7 +3004,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$(command -v uv)\" \"$HOME\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_BIN_HOME\" \"$XDG_STATE_HOME\" \"${{PATH%%:*}}\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$(command -v uv)\" \"$HOME\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_BIN_HOME\" \"$XDG_STATE_HOME\" \"${{PATH%%:*}}\"","workdir":"{}","shell":"bash","yield_time_ms":5000}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -3013,7 +3013,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(output.contains("exit_status: 0"));
+        assert!(output.contains("exit_status: 0"), "{output}");
         assert!(output.contains("uv|"));
         assert!(output.contains("/.cache/coco/tmp"));
         assert!(output.contains("/.cache/uv"));
@@ -3290,7 +3290,7 @@ mod tests {
 
         let session_id = parse_session_id(&first);
         let mut retained = String::new();
-        for _ in 0..100 {
+        for _ in 0..500 {
             let store = sessions.inner.lock().await;
             let session = store.sessions.get(&session_id).unwrap();
             let stdout = session.stdout.lock().await;
