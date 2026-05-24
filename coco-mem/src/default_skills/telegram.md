@@ -28,7 +28,8 @@ Collect these before execution:
 5. Avoid emitting HTML tags in message content; use Markdown-style plain text.
 6. If an inbound Telegram prompt includes image attachment metadata, use
    `file_id` with `telegram_download.py` before answering image-dependent
-   requests.
+   requests. Download attachments into the current workspace so downstream
+   tools can load the saved files.
 
 ## Command Templates
 
@@ -68,7 +69,7 @@ uv run --script "$COCO_SKILL_DIR/scripts/telegram_edit.py" \
 # Download an inbound image attachment by file_id.
 uv run --script "$COCO_SKILL_DIR/scripts/telegram_download.py" \
   --file-id "<file_id>" \
-  --output "/tmp/telegram-inbound-image.jpg"
+  --output-dir "./telegram-downloads"
 ```
 
 ## Script Interface Reference

@@ -2016,6 +2016,14 @@ where
             .body
             .contains("reply_to_message_id")
     );
+    assert!(
+        telegram
+            .current()
+            .unwrap()
+            .body
+            .contains("--output-dir \"./telegram-downloads\"")
+    );
+    assert!(!telegram.current().unwrap().body.contains("/tmp/telegram"));
 }
 
 macro_rules! define_common_store_tests {
