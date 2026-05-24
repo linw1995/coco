@@ -44,6 +44,31 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  crap:
+    needs:
+      - test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+        with:
+          cache-key-name: test
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: coverage
+          path: target/coverage/result/
+
+      - name: Run CRAP metric check
+        run: nix develop --command bash scripts/run-crap.sh
+
+      - name: Upload CRAP metric artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: crap
+          path: target/coverage/result/crap.md
+
   builtin-skill-scripts:
     needs:
       - lint

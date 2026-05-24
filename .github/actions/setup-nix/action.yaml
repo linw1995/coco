@@ -1,5 +1,10 @@
 name: "Setup Nix Environment"
 description: "Install Nix and restore caches used by flake builds."
+inputs:
+  cache-key-name:
+    description: "Cache key namespace. Defaults to the current GitHub job name."
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -13,7 +18,7 @@ runs:
       uses: nix-community/cache-nix-action@v6
       with:
         # Cache crane's nix build dependency artifacts by Cargo.lock and flake inputs.
-        primary-key: nix-store-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'flake.nix', 'flake.lock', 'nix/**/*.nix') }}
+        primary-key: nix-store-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-key-name || github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'flake.nix', 'flake.lock', 'nix/**/*.nix') }}
         gc-max-store-size-linux: 15G
 
     - name: Cache Cargo dependencies
@@ -23,9 +28,9 @@ runs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+        key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-key-name || github.job }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
         restore-keys: |
-          cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          cargo-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-key-name || github.job }}-
 
     - name: Setup nix develop env
       shell: bash
