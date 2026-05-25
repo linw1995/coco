@@ -182,3 +182,25 @@ fn json_value_kind(value: &serde_json::Value) -> &'static str {
         .find_map(|(matches, kind)| matches(value).then_some(*kind))
         .expect("serde_json::Value variants should be covered")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::json_value_kind;
+    use serde_json::json;
+
+    #[test]
+    fn json_value_kind_names_all_value_variants() {
+        let cases = [
+            (serde_json::Value::Null, "null"),
+            (json!(true), "boolean"),
+            (json!(1), "number"),
+            (json!("text"), "string"),
+            (json!([]), "array"),
+            (json!({}), "object"),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(json_value_kind(&value), expected);
+        }
+    }
+}
