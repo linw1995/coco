@@ -3,17 +3,6 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-type JsonValueKindCheck = fn(&serde_json::Value) -> bool;
-
-const JSON_VALUE_KIND_CHECKS: &[(JsonValueKindCheck, &str)] = &[
-    (serde_json::Value::is_null, "null"),
-    (serde_json::Value::is_boolean, "boolean"),
-    (serde_json::Value::is_number, "number"),
-    (serde_json::Value::is_string, "string"),
-    (serde_json::Value::is_array, "array"),
-    (serde_json::Value::is_object, "object"),
-];
-
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
@@ -177,10 +166,39 @@ impl fmt::Display for JsonValueKind<'_> {
 }
 
 fn json_value_kind(value: &serde_json::Value) -> &'static str {
-    JSON_VALUE_KIND_CHECKS
-        .iter()
-        .find_map(|(matches, kind)| matches(value).then_some(*kind))
-        .expect("serde_json::Value variants should be covered")
+    if value.is_null() {
+        "null"
+    } else {
+        non_null_json_value_kind(value)
+    }
+}
+
+fn non_null_json_value_kind(value: &serde_json::Value) -> &'static str {
+    if value.is_boolean() {
+        "boolean"
+    } else {
+        scalar_json_value_kind(value)
+    }
+}
+
+fn scalar_json_value_kind(value: &serde_json::Value) -> &'static str {
+    if value.is_number() {
+        "number"
+    } else {
+        string_or_container_json_value_kind(value)
+    }
+}
+
+fn string_or_container_json_value_kind(value: &serde_json::Value) -> &'static str {
+    if value.is_string() {
+        "string"
+    } else {
+        container_json_value_kind(value)
+    }
+}
+
+fn container_json_value_kind(value: &serde_json::Value) -> &'static str {
+    if value.is_array() { "array" } else { "object" }
 }
 
 #[cfg(test)]
