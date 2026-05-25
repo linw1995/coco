@@ -37,7 +37,6 @@ crap_allow_args=(
   --allow "LlmService::run_locked"
   --allow "start_coco_cli_runtime_server"
   --allow "render_node_show_text"
-  --allow "render_graph_connector_row"
 )
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
