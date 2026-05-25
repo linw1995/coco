@@ -29,6 +29,7 @@ type VersionMap<V> = BTreeMap<u64, V>;
 
 const STORE_FORMAT_VERSION: &str = "2026-05-24";
 const PREVIOUS_STORE_FORMAT_VERSION: &str = "2026-05-23";
+const RECOVERY_STORE_FORMAT_VERSION: &str = "2026-05-21";
 const JOB_WAL_STORE_FORMAT_VERSION: &str = "2026-05-18";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
@@ -130,8 +131,15 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
         builtin_skills: &[],
     },
     StoreMigration {
-        name: "2026-05-18-to-2026-05-23",
+        name: "2026-05-18-to-2026-05-21",
         from: StoreFormatVersion::Chronicle(JOB_WAL_STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle(RECOVERY_STORE_FORMAT_VERSION),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-21-to-2026-05-23",
+        from: StoreFormatVersion::Chronicle(RECOVERY_STORE_FORMAT_VERSION),
         to: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,

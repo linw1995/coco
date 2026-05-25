@@ -3082,6 +3082,26 @@ fn open_migrates_previous_store_format_version_to_current() {
 }
 
 #[test]
+fn open_migrates_recovery_store_format_version_to_current() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!("2026-05-21");
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    FsStore::open(&path).unwrap();
+
+    let migrated_meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(migrated_meta["version"], "2026-05-24");
+}
+
+#[test]
 fn open_compacts_job_wal_into_snapshot() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
