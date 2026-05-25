@@ -125,6 +125,7 @@ async fn run() -> Result<(), JsValue> {
     install_scroll_persistence(&window, document.clone())?;
     install_resize_listener(&window, document.clone())?;
     install_hash_listener(&window, document.clone())?;
+    install_graph_scroll_listener(document.clone())?;
     install_graph_interactions(&window, &document)?;
     install_entity_navigation(&window, &document)?;
     if let Some(state) = ScrollState::load(&window) {
@@ -251,6 +252,20 @@ fn install_hash_listener(window: &Window, document: Document) -> Result<(), JsVa
         let _ = update_hash_state(&window_for_listener, &document);
     });
     window.add_event_listener_with_callback("hashchange", closure.as_ref().unchecked_ref())?;
+    closure.forget();
+    Ok(())
+}
+
+fn install_graph_scroll_listener(document: Document) -> Result<(), JsValue> {
+    let scroll_document = document.clone();
+    let closure = Closure::<dyn FnMut()>::new(move || {
+        let _ = update_graph_viewport_state(&scroll_document);
+    });
+    document.add_event_listener_with_callback_and_bool(
+        "scroll",
+        closure.as_ref().unchecked_ref(),
+        true,
+    )?;
     closure.forget();
     Ok(())
 }
@@ -547,7 +562,7 @@ fn scroll_graph_from_minimap(document: &Document, event: &MouseEvent) -> Result<
         graph.scroll_height(),
         graph.client_height(),
     ));
-    update_minimap_viewport(document)
+    update_graph_viewport_state(document)
 }
 
 fn update_graph_visibility(document: &Document) -> Result<(), JsValue> {
