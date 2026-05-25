@@ -1104,32 +1104,8 @@ fn render_graph_connector_row(
     current_col: usize,
     entry: &GraphNodeEntry,
 ) -> Option<String> {
-    let active_primary_parent_col = entry.primary_parent.as_ref().and_then(|node_id| {
-        active_columns
-            .iter()
-            .position(|candidate| candidate == node_id)
-            .filter(|index| *index != current_col)
-    });
-    let next_primary_parent_col = entry.primary_parent.as_ref().and_then(|node_id| {
-        next_columns
-            .iter()
-            .position(|candidate| candidate == node_id)
-    });
-    let primary_parent_col = next_primary_parent_col;
-    let merge_parent_cols = entry
-        .merge_parents
-        .iter()
-        .filter_map(|parent| {
-            next_columns
-                .iter()
-                .position(|candidate| candidate == parent.node_id())
-        })
-        .collect::<Vec<_>>();
-
-    let should_render = !merge_parent_cols.is_empty()
-        || primary_parent_col != Some(current_col)
-        || active_columns.len() != next_columns.len();
-    if !should_render {
+    let targets = GraphConnectorTargets::new(active_columns, next_columns, current_col, entry);
+    if !targets.should_render(active_columns, next_columns, current_col) {
         return None;
     }
 
@@ -1139,88 +1115,201 @@ fn render_graph_connector_row(
     }
 
     let mut chars = vec![' '; width * 2 - 1];
-    for col in 0..width {
-        if col == current_col {
-            continue;
+    seed_continuing_graph_columns(&mut chars, active_columns, next_columns, current_col);
+    targets.draw_primary_parent_shift(&mut chars);
+    targets.draw(&mut chars, current_col);
+
+    let connector_row = chars.into_iter().collect::<String>();
+    Some(connector_row.trim_end().to_owned())
+}
+
+struct GraphConnectorTargets {
+    active_primary_parent_col: Option<usize>,
+    next_primary_parent_col: Option<usize>,
+    target_cols: Vec<usize>,
+}
+
+impl GraphConnectorTargets {
+    fn new(
+        active_columns: &[String],
+        next_columns: &[String],
+        current_col: usize,
+        entry: &GraphNodeEntry,
+    ) -> Self {
+        let active_primary_parent_col = entry
+            .primary_parent
+            .as_ref()
+            .and_then(|node_id| column_index(active_columns, node_id))
+            .filter(|index| *index != current_col);
+        let next_primary_parent_col = entry
+            .primary_parent
+            .as_ref()
+            .and_then(|node_id| column_index(next_columns, node_id));
+        let mut target_cols = next_primary_parent_col.into_iter().collect::<Vec<_>>();
+        target_cols.extend(
+            entry
+                .merge_parents
+                .iter()
+                .filter_map(|parent| column_index(next_columns, parent.node_id())),
+        );
+
+        Self {
+            active_primary_parent_col,
+            next_primary_parent_col,
+            target_cols,
         }
-        if active_columns.get(col).is_some() && next_columns.get(col).is_some() {
-            chars[col * 2] = '|';
-        }
     }
 
-    let mut target_cols = Vec::new();
-    if let Some(primary_parent_col) = primary_parent_col {
-        target_cols.push(primary_parent_col);
-    }
-    target_cols.extend(merge_parent_cols);
-
-    if target_cols.is_empty() {
-        return None;
-    }
-
-    let current_pos = current_col * 2;
-    if target_cols.contains(&current_col) {
-        chars[current_pos] = '|';
+    fn should_render(
+        &self,
+        active_columns: &[String],
+        next_columns: &[String],
+        current_col: usize,
+    ) -> bool {
+        !self.target_cols.is_empty()
+            && (self.has_merge_parent_targets()
+                || self.next_primary_parent_col != Some(current_col)
+                || active_columns.len() != next_columns.len())
     }
 
-    let right_targets = target_cols
-        .iter()
-        .filter(|target_col| **target_col > current_col)
-        .count();
-    let left_targets = target_cols
-        .iter()
-        .filter(|target_col| **target_col < current_col)
-        .count();
+    fn has_merge_parent_targets(&self) -> bool {
+        self.target_cols.len() > usize::from(self.next_primary_parent_col.is_some())
+    }
 
-    if let (Some(active_col), Some(next_col)) = (active_primary_parent_col, next_primary_parent_col)
-        && active_col != next_col
-    {
-        let connector_pos = if next_col < active_col {
-            next_col * 2 + 1
-        } else {
-            active_col * 2 + 1
+    fn draw_primary_parent_shift(&self, chars: &mut [char]) {
+        let (Some(active_col), Some(next_col)) =
+            (self.active_primary_parent_col, self.next_primary_parent_col)
+        else {
+            return;
         };
+        if active_col == next_col {
+            return;
+        }
+
+        let connector_pos = active_col.min(next_col) * 2 + 1;
         if connector_pos < chars.len() {
             chars[connector_pos] = if next_col < active_col { '/' } else { '\\' };
         }
     }
 
-    for target_col in target_cols {
-        let target_pos = target_col * 2;
-        if target_pos == current_pos {
+    fn draw(&self, chars: &mut [char], current_col: usize) {
+        let current_pos = current_col * 2;
+        if self.target_cols.contains(&current_col) {
             chars[current_pos] = '|';
-            continue;
         }
 
-        let spread_right = target_col > current_col && right_targets > 1;
-        let spread_left = target_col < current_col && left_targets > 1;
-        let connector_pos = if spread_right {
+        let spread_counts = GraphConnectorSpreadCounts::new(&self.target_cols, current_col);
+        for target_col in &self.target_cols {
+            draw_graph_connector_target(chars, *target_col, current_col, spread_counts);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GraphConnectorSpreadCounts {
+    right: usize,
+    left: usize,
+}
+
+impl GraphConnectorSpreadCounts {
+    fn new(target_cols: &[usize], current_col: usize) -> Self {
+        Self {
+            right: target_cols
+                .iter()
+                .filter(|target_col| **target_col > current_col)
+                .count(),
+            left: target_cols
+                .iter()
+                .filter(|target_col| **target_col < current_col)
+                .count(),
+        }
+    }
+
+    fn spread_for(self, target_col: usize, current_col: usize) -> GraphConnectorSpread {
+        GraphConnectorSpread {
+            right: target_col > current_col && self.right > 1,
+            left: target_col < current_col && self.left > 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GraphConnectorSpread {
+    right: bool,
+    left: bool,
+}
+
+impl GraphConnectorSpread {
+    fn is_spread(self) -> bool {
+        self.right || self.left
+    }
+
+    fn connector_pos(self, target_pos: usize, current_pos: usize) -> usize {
+        if self.right {
             target_pos - 1
-        } else if spread_left {
+        } else if self.left {
             target_pos + 1
         } else if target_pos < current_pos {
             current_pos - 1
         } else {
             current_pos + 1
-        };
-        chars[connector_pos] = if target_pos < current_pos { '/' } else { '\\' };
-
-        if !spread_right && !spread_left {
-            let range = if target_pos < current_pos {
-                (target_pos + 1)..connector_pos
-            } else {
-                (connector_pos + 1)..target_pos
-            };
-            for idx in range {
-                if chars[idx] == ' ' {
-                    chars[idx] = '-';
-                }
-            }
         }
     }
+}
 
-    let connector_row = chars.into_iter().collect::<String>();
-    Some(connector_row.trim_end().to_owned())
+fn column_index(columns: &[String], node_id: &str) -> Option<usize> {
+    columns.iter().position(|candidate| candidate == node_id)
+}
+
+fn seed_continuing_graph_columns(
+    chars: &mut [char],
+    active_columns: &[String],
+    next_columns: &[String],
+    current_col: usize,
+) {
+    active_columns
+        .iter()
+        .zip(next_columns)
+        .enumerate()
+        .filter(|(col, _)| *col != current_col)
+        .for_each(|(col, _)| chars[col * 2] = '|');
+}
+
+fn draw_graph_connector_target(
+    chars: &mut [char],
+    target_col: usize,
+    current_col: usize,
+    spread_counts: GraphConnectorSpreadCounts,
+) {
+    let current_pos = current_col * 2;
+    let target_pos = target_col * 2;
+    if target_pos == current_pos {
+        chars[current_pos] = '|';
+        return;
+    }
+
+    let spread = spread_counts.spread_for(target_col, current_col);
+    let connector_pos = spread.connector_pos(target_pos, current_pos);
+    chars[connector_pos] = if target_pos < current_pos { '/' } else { '\\' };
+    draw_graph_horizontal_connector(chars, target_pos, connector_pos, spread);
+}
+
+fn draw_graph_horizontal_connector(
+    chars: &mut [char],
+    target_pos: usize,
+    connector_pos: usize,
+    spread: GraphConnectorSpread,
+) {
+    if spread.is_spread() {
+        return;
+    }
+
+    let start = target_pos.min(connector_pos) + 1;
+    let end = target_pos.max(connector_pos);
+    chars[start..end]
+        .iter_mut()
+        .filter(|ch| **ch == ' ')
+        .for_each(|ch| *ch = '-');
 }
 
 fn render_graph_summary(entry: &GraphNodeEntry) -> String {
