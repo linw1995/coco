@@ -9,7 +9,7 @@ pub use coco_channel::{
     ChannelKind, InboundMessage, OutboundMessage, TelegramImageAttachment, TelegramInboundMessage,
 };
 pub use coco_llm::coco_mem::JobStatus;
-pub use engine::{BranchLockGuard, ConversationEngine, JobStatusSnapshot};
+pub use engine::{BranchLockGuard, ConversationEngine, JobStatusSnapshot, SYSTEM_EVENT_QUEUE};
 pub use error::{BranchResolveError, EngineError, Error};
 pub use message::{
     BatchPromptRequest, BatchPromptResult, BranchPromptFailure, BranchPromptOutcome,

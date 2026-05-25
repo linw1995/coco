@@ -140,6 +140,8 @@ pub struct Job {
     #[serde(default)]
     pub finished_at: Option<Timestamp>,
     pub branch: String,
+    #[serde(default)]
+    pub work_branch: String,
     /// The node where this job starts execution.
     ///
     /// For prompt-based jobs this is the detached prompt anchor. For resume-style
@@ -484,6 +486,33 @@ pub fn default_skill_groups() -> SkillGroups {
                             .to_owned(),
                     },
                 ],
+                enable_coco_shim: true,
+            },
+        ),
+    );
+    groups.orchestrator.insert(
+        "recovery".to_owned(),
+        SkillRecord::new(
+            "recovery",
+            SkillVersionSpec {
+                description: "Recover an LLM backend failure from the built-in day branch."
+                    .to_owned(),
+                body: include_str!("default_skills/recovery.md").trim().to_owned(),
+                scripts: Vec::new(),
+                enable_coco_shim: true,
+            },
+        ),
+    );
+    groups.orchestrator.insert(
+        "compact".to_owned(),
+        SkillRecord::new(
+            "compact",
+            SkillVersionSpec {
+                description:
+                    "Compact a branch by summarizing the latest provider context into a handoff."
+                        .to_owned(),
+                body: include_str!("default_skills/compact.md").trim().to_owned(),
+                scripts: Vec::new(),
                 enable_coco_shim: true,
             },
         ),
@@ -893,13 +922,21 @@ impl Job {
         branch: impl Into<String>,
         base: impl Into<String>,
     ) -> Self {
+        let branch = branch.into();
         Self {
             job_id: job_id.into(),
             created_at: Timestamp::now(),
             finished_at: None,
-            branch: branch.into(),
+            work_branch: branch.clone(),
+            branch,
             base: base.into(),
             status: JobStatus::Queued,
+        }
+    }
+
+    pub fn normalize_work_branch(&mut self) {
+        if self.work_branch.is_empty() {
+            self.work_branch = self.branch.clone();
         }
     }
 }

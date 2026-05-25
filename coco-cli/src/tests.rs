@@ -5914,6 +5914,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
 
     let states = store.list_session_states().unwrap();
     assert_eq!(states.get("main"), Some(&SessionState::Active));
+    assert_eq!(states.get("day"), Some(&SessionState::Active));
 
     let head = store.get_branch_head("main").unwrap();
     let node = store.get_node(&head).unwrap();
@@ -5940,10 +5941,69 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
         vec!["exec_command", "write_stdin", "search_skill", "load_image"]
     );
 
+    let day_head = store.get_branch_head("day").unwrap();
+    let day_node = store.get_node(&day_head).unwrap();
+    let Kind::Anchor(day_anchor) = day_node.kind else {
+        panic!("expected day session anchor");
+    };
+    let AnchorPayload::Session(day_session) = day_anchor.payload else {
+        panic!("expected day session anchor payload");
+    };
+    assert_eq!(day_session.role, SessionRole::Orchestrator);
+    assert_eq!(
+        day_session.provider_profile.as_deref(),
+        Some("openai-codex")
+    );
+    assert_eq!(day_session.model, "gpt-5.4");
+    assert!(day_session.system_prompt.contains("CoCo Day"));
+    assert!(day_session.system_prompt.contains("system events"));
+    assert_eq!(day_session.max_tokens, Some(32_000));
+    assert!(day_session.enable_coco_shim);
+    assert_eq!(
+        day_session
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["exec_command", "write_stdin", "search_skill"]
+    );
+
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
     assert_eq!(store.get_branch_head("main").unwrap(), head);
+    assert_eq!(store.get_branch_head("day").unwrap(), day_head);
+}
+
+#[tokio::test]
+async fn daemon_startup_replaces_invalid_builtin_day_branch() {
+    let (_tempdir, store_path) = temp_store_path();
+    let store = open_store(&store_path).unwrap();
+    let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
+    ensure_initial_session(&store, &llm, shared_test_provider_profiles())
+        .await
+        .unwrap();
+    let main_head = store.get_branch_head("main").unwrap();
+    store.delete_branch("day").unwrap();
+    store.fork("day", &main_head).unwrap();
+    assert_eq!(store.get_branch_head("day").unwrap(), main_head);
+
+    ensure_initial_session(&store, &llm, shared_test_provider_profiles())
+        .await
+        .unwrap();
+
+    let day_head = store.get_branch_head("day").unwrap();
+    assert_ne!(day_head, main_head);
+    let day_node = store.get_node(&day_head).unwrap();
+    let Kind::Anchor(day_anchor) = day_node.kind else {
+        panic!("expected day session anchor");
+    };
+    let AnchorPayload::Session(day_session) = day_anchor.payload else {
+        panic!("expected day session anchor payload");
+    };
+    assert_eq!(day_session.role, SessionRole::Orchestrator);
+    assert!(day_session.system_prompt.contains("CoCo Day"));
+    assert!(day_session.enable_coco_shim);
 }
 
 #[test]

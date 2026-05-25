@@ -1,6 +1,6 @@
 use coco_llm::CompletionBackend;
 use coco_llm::coco_mem::{
-    BranchStore, JobStore, NodeStore, PromptAttachment, SessionStore, SkillStore,
+    BranchStore, JobStore, MessageQueueStore, NodeStore, PromptAttachment, SessionStore, SkillStore,
 };
 use indoc::formatdoc;
 use snafu::prelude::*;
@@ -34,6 +34,7 @@ where
         + SessionStore
         + JobStore
         + SkillStore
+        + MessageQueueStore
         + Clone
         + Send
         + Sync

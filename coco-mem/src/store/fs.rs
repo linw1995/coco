@@ -27,9 +27,7 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-24";
-const PREVIOUS_STORE_FORMAT_VERSION: &str = "2026-05-23";
-const JOB_WAL_STORE_FORMAT_VERSION: &str = "2026-05-18";
+const STORE_FORMAT_VERSION: &str = "2026-05-25";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -51,6 +49,10 @@ const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
     "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e";
+const BUILTIN_RECOVERY_REVISION_ID: &str =
+    "6bf4094ad2dd2f9932cfc8d13a0f4a6b7adc9fe293e1ea6bc9f995d9c880a3f8";
+const BUILTIN_COMPACT_REVISION_ID: &str =
+    "3abb36a6333215088666cb168fef445430d19e19e19232e9e703286e3be3b9c6";
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
@@ -66,26 +68,37 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         from_revision_ids: &[
             // Before the orchestrator runner prompt included load_image.
             "cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438",
-            BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
         ],
         target_revision_id: BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "new-skill",
-        from_revision_ids: &[BUILTIN_NEW_SKILL_REVISION_ID],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_NEW_SKILL_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "cronjob",
-        from_revision_ids: &[BUILTIN_CRONJOB_REVISION_ID],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_CRONJOB_REVISION_ID,
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "recovery",
+        from_revision_ids: &[],
+        target_revision_id: BUILTIN_RECOVERY_REVISION_ID,
+    },
+    BuiltinSkillMigration {
+        role: SessionRole::Orchestrator,
+        name: "compact",
+        from_revision_ids: &[],
+        target_revision_id: BUILTIN_COMPACT_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Runner,
         name: "coco-runner",
-        from_revision_ids: &[BUILTIN_COCO_RUNNER_REVISION_ID],
+        from_revision_ids: &[],
         target_revision_id: BUILTIN_COCO_RUNNER_REVISION_ID,
     },
     BuiltinSkillMigration {
@@ -120,20 +133,37 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-17-to-2026-05-18",
         from: StoreFormatVersion::Chronicle("2026-05-17"),
-        to: StoreFormatVersion::Chronicle(JOB_WAL_STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle("2026-05-18"),
         run: Persistence::migrate_jobs_to_wal,
         builtin_skills: &[],
     },
     StoreMigration {
-        name: "2026-05-18-to-2026-05-23",
-        from: StoreFormatVersion::Chronicle(JOB_WAL_STORE_FORMAT_VERSION),
-        to: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
+        name: "2026-05-18-to-2026-05-21",
+        from: StoreFormatVersion::Chronicle("2026-05-18"),
+        // PR #79 first introduced recovery/compact builtin skills at this version.
+        to: StoreFormatVersion::Chronicle("2026-05-21"),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-21-to-2026-05-23",
+        from: StoreFormatVersion::Chronicle("2026-05-21"),
+        // origin/main advanced to this version for console store entity views.
+        to: StoreFormatVersion::Chronicle("2026-05-23"),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
     },
     StoreMigration {
         name: "2026-05-23-to-2026-05-24",
-        from: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
+        from: StoreFormatVersion::Chronicle("2026-05-23"),
+        // origin/main advanced to this version before PR #79 was rebased.
+        to: StoreFormatVersion::Chronicle("2026-05-24"),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-24-to-2026-05-25",
+        from: StoreFormatVersion::Chronicle("2026-05-24"),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
@@ -242,6 +272,11 @@ enum JobHistoryEntry {
     StatusChanged {
         job_id: String,
         expected: JobStatus,
+        updated: Job,
+    },
+    WorkBranchChanged {
+        job_id: String,
+        expected_work_branch: String,
         updated: Job,
     },
 }
@@ -1652,7 +1687,7 @@ fn builtin_skill_migration_action(
     let Some(current) = record.current() else {
         return BuiltinSkillMigrationAction::Unchanged;
     };
-    if skill_version_matches(current, target) {
+    if current.id == target.id {
         return BuiltinSkillMigrationAction::Unchanged;
     }
     if migration.from_revision_ids.contains(&current.id.as_str()) {
@@ -1660,13 +1695,6 @@ fn builtin_skill_migration_action(
     } else {
         BuiltinSkillMigrationAction::SkipUserModified
     }
-}
-
-fn skill_version_matches(left: &SkillVersion, right: &SkillVersion) -> bool {
-    left.description == right.description
-        && left.body == right.body
-        && left.scripts == right.scripts
-        && left.enable_coco_shim == right.enable_coco_shim
 }
 
 fn persisted_preset_records(
@@ -1679,8 +1707,9 @@ fn persisted_preset_records(
 }
 
 fn read_job_snapshots(path: &Path) -> Result<HashMap<String, Job>> {
-    let snapshots = read_json_file::<HashMap<String, Job>>(path)?;
-    for (job_id, job) in &snapshots {
+    let mut snapshots = read_json_file::<HashMap<String, Job>>(path)?;
+    for (job_id, job) in &mut snapshots {
+        job.normalize_work_branch();
         ensure!(
             job.job_id == *job_id,
             CorruptedStoreSnafu {
@@ -1701,22 +1730,26 @@ fn validate_job_snapshots(
     jobs: &HashMap<String, Job>,
 ) -> Result<()> {
     let mut active_by_branch = HashMap::<String, String>::new();
-    for job in jobs.values() {
-        validate_job_refs(path, state, job)?;
+    for raw_job in jobs.values() {
+        let mut job = raw_job.clone();
+        job.normalize_work_branch();
+        validate_job_refs(path, state, &job)?;
         if matches!(job.status, JobStatus::Finished) {
             continue;
         }
-        if let Some(existing_job_id) =
-            active_by_branch.insert(job.branch.clone(), job.job_id.clone())
-        {
-            return CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!(
-                    "branch {:?} has multiple active prompt jobs {:?} and {:?}",
-                    job.branch, existing_job_id, job.job_id
-                ),
+        for branch in active_job_branches(&job) {
+            if let Some(existing_job_id) =
+                active_by_branch.insert(branch.to_owned(), job.job_id.clone())
+            {
+                return CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "branch {:?} has multiple active prompt jobs {:?} and {:?}",
+                        branch, existing_job_id, job.job_id
+                    ),
+                }
+                .fail();
             }
-            .fail();
         }
     }
     Ok(())
@@ -1734,10 +1767,16 @@ fn apply_job_history_entry(
             expected,
             updated,
         } => apply_job_status_changed(path, state, job_id, expected, updated),
+        JobHistoryEntry::WorkBranchChanged {
+            job_id,
+            expected_work_branch,
+            updated,
+        } => apply_job_work_branch_changed(path, state, job_id, expected_work_branch, updated),
     }
 }
 
-fn apply_submitted_job(path: &Path, state: &mut StoreState, job: Job) -> Result<()> {
+fn apply_submitted_job(path: &Path, state: &mut StoreState, mut job: Job) -> Result<()> {
+    job.normalize_work_branch();
     ensure!(
         matches!(job.status, JobStatus::Queued),
         CorruptedStoreSnafu {
@@ -1764,9 +1803,10 @@ fn apply_submitted_job(path: &Path, state: &mut StoreState, job: Job) -> Result<
         }
     );
     ensure!(
-        state.jobs.values().all(|existing| {
-            existing.branch != job.branch || matches!(existing.status, JobStatus::Finished)
-        }),
+        state
+            .jobs
+            .values()
+            .all(|existing| !jobs_share_active_branch(existing, &job)),
         CorruptedStoreSnafu {
             path: path.to_owned(),
             message: format!("branch {:?} already has an active prompt job", job.branch),
@@ -1781,8 +1821,9 @@ fn apply_job_status_changed(
     state: &mut StoreState,
     job_id: String,
     expected: JobStatus,
-    updated: Job,
+    mut updated: Job,
 ) -> Result<()> {
+    updated.normalize_work_branch();
     ensure!(
         updated.job_id == job_id,
         CorruptedStoreSnafu {
@@ -1842,8 +1883,92 @@ fn apply_job_status_changed(
     Ok(())
 }
 
+fn apply_job_work_branch_changed(
+    path: &Path,
+    state: &mut StoreState,
+    job_id: String,
+    expected_work_branch: String,
+    mut updated: Job,
+) -> Result<()> {
+    updated.normalize_work_branch();
+    ensure!(
+        updated.job_id == job_id,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "work branch change key {:?} mismatches updated job id {:?}",
+                job_id, updated.job_id
+            ),
+        }
+    );
+    let mut current = state
+        .jobs
+        .get(&job_id)
+        .cloned()
+        .context(CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("work branch change references missing job {job_id:?}"),
+        })?;
+    current.normalize_work_branch();
+    ensure!(
+        current.work_branch == expected_work_branch,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "job {:?} work branch change expected {:?}, found {:?}",
+                job_id, expected_work_branch, current.work_branch
+            ),
+        }
+    );
+    ensure!(
+        job_identity_matches(&current, &updated),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "job {:?} work branch change modifies immutable fields",
+                job_id
+            ),
+        }
+    );
+    ensure!(
+        current.status == updated.status && current.finished_at == updated.finished_at,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "job {:?} work branch change modifies lifecycle fields",
+                job_id
+            ),
+        }
+    );
+    ensure!(
+        !matches!(updated.status, JobStatus::Finished),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("finished job {:?} changes work branch", job_id),
+        }
+    );
+    validate_job_refs(path, state, &updated)?;
+    ensure!(
+        state
+            .jobs
+            .values()
+            .filter(|existing| existing.job_id != job_id)
+            .all(|existing| !jobs_share_active_branch(existing, &updated)),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "branch {:?} already has an active prompt job",
+                updated.work_branch
+            ),
+        }
+    );
+    state.jobs.insert(job_id, updated);
+    Ok(())
+}
+
 fn validate_job_refs(path: &Path, state: &StoreState, job: &Job) -> Result<()> {
     map_job_validation_error(path, state.get_branch_head(&job.branch))?;
+    map_job_validation_error(path, state.get_branch_head(&job.work_branch))?;
     map_job_validation_error(path, state.get_node(&job.base))?;
     Ok(())
 }
@@ -1863,6 +1988,29 @@ fn job_identity_matches(left: &Job, right: &Job) -> bool {
         && left.created_at == right.created_at
         && left.branch == right.branch
         && left.base == right.base
+}
+
+fn jobs_share_active_branch(left: &Job, right: &Job) -> bool {
+    if matches!(left.status, JobStatus::Finished) || matches!(right.status, JobStatus::Finished) {
+        return false;
+    }
+    let right_branches = active_job_branches(right);
+    active_job_branches(left)
+        .into_iter()
+        .any(|left_branch| right_branches.contains(&left_branch))
+}
+
+fn active_job_branches(job: &Job) -> Vec<&str> {
+    let work_branch = if job.work_branch.is_empty() {
+        job.branch.as_str()
+    } else {
+        job.work_branch.as_str()
+    };
+    if job.branch == work_branch {
+        vec![job.branch.as_str()]
+    } else {
+        vec![job.branch.as_str(), work_branch]
+    }
 }
 
 fn job_log_should_compact(log_len: usize) -> bool {
@@ -2751,6 +2899,25 @@ impl JobStore for FsStore {
         state.jobs = temp.jobs;
         Ok(updated)
     }
+
+    fn set_job_work_branch(
+        &self,
+        job_id: &str,
+        expected_work_branch: &str,
+        next_work_branch: &str,
+    ) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.set_job_work_branch(job_id, expected_work_branch, next_work_branch)?;
+        self.persistence
+            .append_job_history_entry(&JobHistoryEntry::WorkBranchChanged {
+                job_id: job_id.to_owned(),
+                expected_work_branch: expected_work_branch.to_owned(),
+                updated: updated.clone(),
+            })?;
+        state.jobs = temp.jobs;
+        Ok(updated)
+    }
 }
 
 impl MessageQueueStore for FsStore {
@@ -3146,7 +3313,7 @@ where
 #[cfg(test)]
 mod builtin_skill_migration_tests {
     use super::{
-        BUILTIN_COCO_ORCHESTRATOR_REVISION_ID, BuiltinSkillMigration, BuiltinSkillMigrationAction,
+        BUILTIN_SKILL_MIGRATIONS, BuiltinSkillMigration, BuiltinSkillMigrationAction,
         STORE_MIGRATIONS, SessionRole, SkillVersion, SkillVersionSpec,
         builtin_skill_migration_action, default_skill_groups,
     };
@@ -3175,6 +3342,46 @@ mod builtin_skill_migration_tests {
     }
 
     #[test]
+    fn builtin_skill_migrations_keep_known_source_revisions() {
+        let orchestrator = builtin_migration(SessionRole::Orchestrator, "coco-orchestrator");
+        assert!(
+            orchestrator
+                .from_revision_ids
+                .contains(&"cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438")
+        );
+
+        let telegram = builtin_migration(SessionRole::Runner, "telegram");
+        assert!(
+            telegram
+                .from_revision_ids
+                .contains(&"8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c")
+        );
+        assert!(
+            telegram
+                .from_revision_ids
+                .contains(&"fe5361a23cc71e2253b9d7867604cf1994db8fb6273dcae2ba2088a48c827e3c")
+        );
+        assert!(
+            telegram
+                .from_revision_ids
+                .contains(&"a86a9cb4ec5d5b8f6284970aa7c9feb53ddfbe7d1b984e9210dda7d1801edfd1")
+        );
+    }
+
+    #[test]
+    fn builtin_skill_migration_sources_exclude_current_targets() {
+        for migration in BUILTIN_SKILL_MIGRATIONS {
+            assert!(
+                !migration
+                    .from_revision_ids
+                    .contains(&migration.target_revision_id),
+                "builtin migration sources should only list old default revisions for {}",
+                migration.name
+            );
+        }
+    }
+
+    #[test]
     fn updates_known_builtin_revision_to_new_target() {
         let defaults = default_skill_groups();
         let record = defaults
@@ -3195,7 +3402,10 @@ mod builtin_skill_migration_tests {
         let migration = BuiltinSkillMigration {
             role: SessionRole::Orchestrator,
             name: "coco-orchestrator",
-            from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+            from_revision_ids: &[
+                // Current default in this test before the synthetic target update.
+                "79a81ed8e48dc4bac77d8d87ad5566d3b25c1aa1c6fd63cf89aec1efbc0ea6b9",
+            ],
             target_revision_id: "new-target-revision",
         };
         assert_eq!(
@@ -3238,5 +3448,12 @@ mod builtin_skill_migration_tests {
             builtin_skill_migration_action(&migration, &record, &target),
             BuiltinSkillMigrationAction::SkipUserModified
         );
+    }
+
+    fn builtin_migration(role: SessionRole, name: &str) -> &'static BuiltinSkillMigration {
+        BUILTIN_SKILL_MIGRATIONS
+            .iter()
+            .find(|migration| migration.role == role && migration.name == name)
+            .expect("builtin migration should exist")
     }
 }

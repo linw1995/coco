@@ -1646,6 +1646,69 @@ where
     assert_eq!(store.get_job(&job.job_id).unwrap(), finished);
 }
 
+fn assert_job_work_branch_round_trip<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    assert_eq!(job.work_branch, "main");
+    let updated = store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+
+    assert_eq!(updated.branch, "main");
+    assert_eq!(updated.work_branch, "recovery");
+    assert_eq!(store.get_job(&job.job_id).unwrap().work_branch, "recovery");
+}
+
+fn assert_set_job_work_branch_rejects_stale_expected_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+
+    let err = store
+        .set_job_work_branch(&job.job_id, "stale", "recovery")
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::PromptJobMoved { job_id, expected, actual }
+            if job_id == job.job_id && expected == "stale" && actual == "main"
+    ));
+}
+
+fn assert_submit_job_rejects_active_work_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_work_branch(&first.job_id, "main", "recovery")
+        .unwrap();
+
+    let err = store.submit_job("recovery", &root_id).unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::PromptJobActiveOnBranch { branch, job_id }
+            if branch == "recovery" && job_id == first.job_id
+    ));
+}
+
 fn assert_set_job_status_rejects_invalid_transition<F>()
 where
     F: TestStoreFactory,
@@ -1951,17 +2014,27 @@ where
     let cronjob = store
         .get_skill(SessionRole::Orchestrator, "cronjob")
         .unwrap();
+    let recovery = store
+        .get_skill(SessionRole::Orchestrator, "recovery")
+        .unwrap();
+    let compact = store
+        .get_skill(SessionRole::Orchestrator, "compact")
+        .unwrap();
     let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
     let telegram = store.get_skill(SessionRole::Runner, "telegram").unwrap();
 
     assert_eq!(orchestrator.current_version, 1);
     assert_eq!(new_skill.current_version, 1);
     assert_eq!(cronjob.current_version, 1);
+    assert_eq!(recovery.current_version, 1);
+    assert_eq!(compact.current_version, 1);
     assert_eq!(telegram.current_version, 1);
     assert_eq!(runner.current_version, 1);
     assert!(orchestrator.current().unwrap().enable_coco_shim);
     assert!(new_skill.current().unwrap().enable_coco_shim);
     assert!(cronjob.current().unwrap().enable_coco_shim);
+    assert!(recovery.current().unwrap().enable_coco_shim);
+    assert!(compact.current().unwrap().enable_coco_shim);
     assert!(telegram.current().unwrap().enable_coco_shim);
     assert!(runner.current().unwrap().enable_coco_shim);
     assert_eq!(cronjob.current().unwrap().scripts.len(), 3);
@@ -2002,6 +2075,42 @@ where
             .contains("--enable-coco-shim")
     );
     assert!(new_skill.current().unwrap().body.contains("coco skill add"));
+    assert!(
+        recovery
+            .current()
+            .unwrap()
+            .body
+            .contains("Use this orchestrator skill from the built-in `day` branch")
+    );
+    assert!(
+        recovery
+            .current()
+            .unwrap()
+            .body
+            .contains("Do not create another recovery branch")
+    );
+    assert!(
+        recovery
+            .current()
+            .unwrap()
+            .body
+            .contains("coco prompt worker --job <job-id>")
+    );
+    assert!(recovery.current().unwrap().body.contains("Do not fork a"));
+    assert!(
+        compact
+            .current()
+            .unwrap()
+            .body
+            .contains("coco session handoff --branch <branch>")
+    );
+    assert!(
+        compact
+            .current()
+            .unwrap()
+            .body
+            .contains("Do not use `session rebase` for compaction")
+    );
     assert!(
         cronjob
             .current()
@@ -2352,6 +2461,21 @@ macro_rules! define_common_store_tests {
             }
 
             #[test]
+            fn job_work_branch_round_trip() {
+                assert_job_work_branch_round_trip::<$factory>();
+            }
+
+            #[test]
+            fn set_job_work_branch_rejects_stale_expected_branch() {
+                assert_set_job_work_branch_rejects_stale_expected_branch::<$factory>();
+            }
+
+            #[test]
+            fn submit_job_rejects_active_work_branch() {
+                assert_submit_job_rejects_active_work_branch::<$factory>();
+            }
+
+            #[test]
             fn set_job_status_rejects_invalid_transition() {
                 assert_set_job_status_rejects_invalid_transition::<$factory>();
             }
@@ -2463,7 +2587,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["version"], "2026-05-24");
+    assert_eq!(meta["version"], "2026-05-25");
 }
 
 #[test]
@@ -2688,7 +2812,7 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated["version"], "2026-05-24");
+    assert_eq!(migrated["version"], "2026-05-25");
     let migrated_skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
@@ -2934,11 +3058,31 @@ fn open_migrates_legacy_jobs_json_to_snapshot_with_empty_wal() {
     assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-24");
+    assert_eq!(migrated_meta["version"], "2026-05-25");
 }
 
 #[test]
 fn open_migrates_previous_store_format_version_to_current() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!("2026-05-24");
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    FsStore::open(&path).unwrap();
+
+    let migrated_meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(migrated_meta["version"], "2026-05-25");
+}
+
+#[test]
+fn open_migrates_console_store_format_version_to_current() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
     let mut meta: serde_json::Value =
@@ -2954,7 +3098,27 @@ fn open_migrates_previous_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-24");
+    assert_eq!(migrated_meta["version"], "2026-05-25");
+}
+
+#[test]
+fn open_migrates_recovery_store_format_version_to_current() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!("2026-05-21");
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    FsStore::open(&path).unwrap();
+
+    let migrated_meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(migrated_meta["version"], "2026-05-25");
 }
 
 #[test]
@@ -3161,6 +3325,168 @@ fn open_rejects_job_wal_unfinished_status_with_finished_at() {
     let history_path = path.join("jobs.jsonl");
     let mut history = read_jsonl_values(&history_path);
     history[1]["updated"]["finished_at"] = history[0]["job"]["created_at"].clone();
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_replays_job_wal_work_branch_change() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    let updated = store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+    drop(store);
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(reopened.get_job(&job.job_id).unwrap(), updated);
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_for_missing_job() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let mut updated = submit_prompt_job(&store, "main", "hello");
+    updated.work_branch = "recovery".to_owned();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history.push(json!({
+        "op": "work_branch_changed",
+        "job_id": "missing-job",
+        "expected_work_branch": "main",
+        "updated": updated,
+    }));
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_with_mismatched_expected_branch() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["expected_work_branch"] = json!("stale");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_that_modifies_identity() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["updated"]["branch"] = json!("other");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_that_modifies_lifecycle() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_work_branch(&job.job_id, "main", "recovery")
+        .unwrap();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history[1]["updated"]["status"] = json!("running");
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_for_finished_job() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("recovery", &root_id).unwrap();
+    let job = submit_prompt_job(&store, "main", "hello");
+    store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .unwrap();
+    let finished = store
+        .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+        .unwrap();
+    let mut updated = finished.clone();
+    updated.work_branch = "recovery".to_owned();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history.push(json!({
+        "op": "work_branch_changed",
+        "job_id": job.job_id,
+        "expected_work_branch": "main",
+        "updated": updated,
+    }));
+    write_jsonl_values(&history_path, &history);
+
+    let err = FsStore::open(&path).unwrap_err();
+
+    assert!(matches!(err, Error::CorruptedStore { .. }));
+}
+
+#[test]
+fn open_rejects_job_wal_work_branch_change_when_branch_already_active() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+    store.fork("other", &root_id).unwrap();
+    let first = submit_prompt_job(&store, "main", "hello");
+    submit_prompt_job(&store, "other", "existing");
+    let mut updated = first.clone();
+    updated.work_branch = "other".to_owned();
+    let history_path = path.join("jobs.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    history.push(json!({
+        "op": "work_branch_changed",
+        "job_id": first.job_id,
+        "expected_work_branch": "main",
+        "updated": updated,
+    }));
     write_jsonl_values(&history_path, &history);
 
     let err = FsStore::open(&path).unwrap_err();

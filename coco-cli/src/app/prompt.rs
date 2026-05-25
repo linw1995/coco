@@ -354,7 +354,7 @@ where
     if command
         .branch
         .as_ref()
-        .is_none_or(|branch| branch == &snapshot.branch)
+        .is_none_or(|branch| branch == &snapshot.branch || branch == &snapshot.work_branch)
     {
         return Ok(Some(if command.json {
             render_json(snapshot)
@@ -405,7 +405,7 @@ where
     });
 }
 
-fn queue_prompt_job_request(
+pub(crate) fn queue_prompt_job_request(
     store: &impl Store,
     request: QueuedPromptRequest,
 ) -> Result<MessageQueueItem> {
@@ -530,10 +530,11 @@ fn render_queued_prompt_request_job_text(snapshot: &QueuedPromptRequestJobView) 
 
 fn render_job_status_snapshot_text(snapshot: &JobStatusSnapshot) -> String {
     format!(
-        "job_id: {}\nstatus: {:?}\nbranch: {}\nbase: {}\nhead: {}\ncreated_at: {}\nfinished_at: {}",
+        "job_id: {}\nstatus: {:?}\nbranch: {}\nwork_branch: {}\nbase: {}\nhead: {}\ncreated_at: {}\nfinished_at: {}",
         snapshot.job_id,
         snapshot.status,
         snapshot.branch,
+        snapshot.work_branch,
         snapshot.base,
         snapshot.head,
         snapshot.created_at,
@@ -565,22 +566,22 @@ fn load_queued_prompt_request_status(
         .to_owned();
     Ok(Some(QueuedPromptRequestStatusView {
         job: QueuedPromptRequestJobView {
-            job_id: request.job_id,
+            job_id: request.job_id.clone(),
             created_at: item.created_at.to_string(),
             finished_at: None,
-            branch: request.branch,
+            branch: request.branch.clone(),
             base: head.clone(),
             status: JobStatus::Queued,
             head,
         },
         request: QueuedPromptRequestDetailsView {
-            prompt: request.prompt,
-            merge_parents: request.merge_parents,
+            prompt: request.prompt.clone(),
+            merge_parents: request.merge_parents.clone(),
         },
     }))
 }
 
-fn next_prompt_job_id() -> String {
+pub(crate) fn next_prompt_job_id() -> String {
     format!("job-{}", nanoid::nanoid!())
 }
 

@@ -1,12 +1,13 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
-    BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, Node, NodeStore,
-    PromptAttachment, SessionStore, SkillStore,
+    BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, MessageQueueStore, Node,
+    NodeStore, PromptAttachment, SessionStore, SkillStore,
 };
 use coco_llm::{
-    CompletionBackend, CompletionInput, CompletionOrigin, CompletionOverrides, CompletionRequest,
-    LlmService, RigBackend, SessionConfigPatch,
+    BackendError, BackendFailureContext, CompletionBackend, CompletionInput, CompletionOrigin,
+    CompletionOverrides, CompletionRequest, Error as LlmError, LlmService, RigBackend,
+    SessionConfigPatch,
 };
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jiff::Timestamp;
@@ -20,6 +21,9 @@ type JobResult = std::result::Result<String, EngineError>;
 type InflightJob = Shared<BoxFuture<'static, JobResult>>;
 type InflightJobTable = Arc<AsyncMutex<HashMap<String, InflightJob>>>;
 pub type BranchLockGuard = coco_llm::BranchLockGuard;
+pub const SYSTEM_EVENT_QUEUE: &str = "system";
+const LLM_BACKEND_FAILURE_RECOVERY_REQUESTED: &str = "llm.backend_failure.recovery_requested";
+const SYSTEM_EVENT_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct JobStatusSnapshot {
@@ -27,6 +31,7 @@ pub struct JobStatusSnapshot {
     pub created_at: Timestamp,
     pub finished_at: Option<Timestamp>,
     pub branch: String,
+    pub work_branch: String,
     pub base: String,
     pub status: JobStatus,
     pub head: String,
@@ -43,6 +48,34 @@ struct PromptReply {
 pub struct ConversationEngine<B = RigBackend, S = MemoryStore> {
     service: Arc<LlmService<B, S>>,
     inflight_jobs: InflightJobTable,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SystemEventEnvelope<T> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    version: u64,
+    dedupe_key: String,
+    data: T,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LlmBackendFailureRecoveryRequested {
+    job_id: String,
+    root_branch: String,
+    work_branch: String,
+    failed_branch: String,
+    base_node_id: String,
+    execution_id: String,
+    error_node_id: String,
+    retry_from_node_id: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JobRunOutcome {
+    Completed,
+    RecoveryQueued,
 }
 
 impl<B, S> Clone for ConversationEngine<B, S> {
@@ -89,6 +122,7 @@ where
         + SessionStore
         + JobStore
         + SkillStore
+        + MessageQueueStore
         + Clone
         + Send
         + Sync
@@ -229,6 +263,12 @@ where
             .await?;
         let snapshot = self.drive_job_for_prompt(&job.job_id).await?;
         let job = self.service.store().get_job(&job.job_id)?;
+        if !matches!(snapshot.status, JobStatus::Finished) {
+            self.finish_job(&job).await?;
+            return Err(EngineError::EngineFailed {
+                message: format!("prompt job {:?} is waiting for recovery", job.job_id),
+            });
+        }
         build_prompt_reply(self.service.store(), &job, &snapshot)
     }
 
@@ -367,6 +407,20 @@ where
         self.build_job_status_snapshot(&job)
     }
 
+    pub fn set_job_work_branch(
+        &self,
+        job_id: &str,
+        expected_work_branch: &str,
+        next_work_branch: &str,
+    ) -> std::result::Result<JobStatusSnapshot, EngineError> {
+        let job = self.service.store().set_job_work_branch(
+            job_id,
+            expected_work_branch,
+            next_work_branch,
+        )?;
+        self.build_job_status_snapshot(&job)
+    }
+
     pub fn active_branch_prompt_job(
         &self,
         branch: &str,
@@ -450,6 +504,7 @@ where
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
+            work_branch = %job.work_branch,
             base = %job.base,
             status = ?job.status,
             merge_parent_count = merge_parents.len(),
@@ -465,24 +520,44 @@ where
             tracing::info!(
                 job_id = %job.job_id,
                 branch = %job.branch,
+                work_branch = %job.work_branch,
                 "prompt job started"
             );
         }
 
         if matches!(job.status, JobStatus::Running) {
             self.ensure_job_has_exclusive_branch_access(&job)?;
-            // Prompt jobs must reach a terminal finished state even when execution fails so they
-            // remain recoverable and auditable. The caller decides whether to surface the
-            // execution error or only inspect the persisted snapshot afterwards.
-            let run_result = self.resume_or_run_job(&job, merge_parents).await;
-            self.finish_job(&job).await?;
-            run_result?;
+            match self.resume_or_run_job(&job, merge_parents).await {
+                Ok(JobRunOutcome::Completed) => {
+                    job = match self.restore_root_branch_after_recovery(&job) {
+                        Ok(job) => job,
+                        Err(error) => {
+                            self.finish_job(&job).await?;
+                            return Err(error);
+                        }
+                    };
+                    self.finish_job(&job).await?;
+                }
+                Ok(JobRunOutcome::RecoveryQueued) => {
+                    tracing::info!(
+                        job_id = %job.job_id,
+                        branch = %job.branch,
+                        work_branch = %job.work_branch,
+                        "prompt job is waiting for recovery"
+                    );
+                }
+                Err(error) => {
+                    self.finish_job(&job).await?;
+                    return Err(error);
+                }
+            }
         }
 
         let head = self.job_head(&job)?;
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
+            work_branch = %job.work_branch,
             head = %head,
             "prompt job drive completed"
         );
@@ -493,29 +568,56 @@ where
         &self,
         job: &Job,
         merge_parents: Vec<MergeParent>,
-    ) -> std::result::Result<(), EngineError> {
+    ) -> std::result::Result<JobRunOutcome, EngineError> {
         let store = self.service.store();
         let last_node = find_job_last_node(store, job)?;
 
-        if let Some(last_node) = last_node.as_ref()
-            && is_terminal_job_last_node(last_node)
-        {
-            tracing::info!(
-                job_id = %job.job_id,
-                branch = %job.branch,
-                head = %last_node.id,
-                "prompt job already has terminal node"
-            );
-            return Ok(());
-        }
+        let retry_from_failure = if let Some(last_node) = last_node.as_ref() {
+            match &last_node.kind {
+                Kind::Text(_) => {
+                    tracing::info!(
+                        job_id = %job.job_id,
+                        branch = %job.branch,
+                        work_branch = %job.work_branch,
+                        head = %last_node.id,
+                        "prompt job already has terminal response node"
+                    );
+                    return Ok(JobRunOutcome::Completed);
+                }
+                Kind::Failure(_) => {
+                    tracing::info!(
+                        job_id = %job.job_id,
+                        branch = %job.branch,
+                        work_branch = %job.work_branch,
+                        head = %last_node.id,
+                        retry_from_node_id = %last_node.parent,
+                        "retrying prompt job from before terminal failure node"
+                    );
+                    Some(last_node.parent.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
-        let origin = CompletionOrigin::Reference(match last_node {
-            Some(last_node) => last_node.id,
-            None => job.base.clone(),
-        });
+        let is_retrying_failure = retry_from_failure.is_some();
+        let (origin_node_id, use_branch_session) = match retry_from_failure {
+            Some(retry_from_failure) => (retry_from_failure, true),
+            None => match last_node {
+                Some(last_node) => (last_node.id, false),
+                None => (job.base.clone(), true),
+            },
+        };
+        let origin = if use_branch_session {
+            CompletionOrigin::ReferenceWithBranchSession(origin_node_id)
+        } else {
+            CompletionOrigin::Reference(origin_node_id)
+        };
         let origin_node = match &origin {
             CompletionOrigin::BranchHead => "<branch-head>",
             CompletionOrigin::Reference(node_id) => node_id.as_str(),
+            CompletionOrigin::ReferenceWithBranchSession(node_id) => node_id.as_str(),
         };
         let input = if merge_parents.is_empty() {
             CompletionInput::Continue
@@ -530,20 +632,108 @@ where
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
+            work_branch = %job.work_branch,
             origin = %origin_node,
             input = completion_input_kind(&input),
             "running prompt job completion"
         );
         let request = CompletionRequest {
-            branch: job.branch.clone(),
+            branch: job.work_branch.clone(),
             origin,
             input,
             overrides: CompletionOverrides::default(),
             active_skill_runtime: None,
         };
 
-        let _ = self.service.run(request).await?;
+        match self.service.run(request).await {
+            Ok(_) => Ok(JobRunOutcome::Completed),
+            Err(source) => self.handle_completion_error(job, source, !is_retrying_failure),
+        }
+    }
+
+    fn handle_completion_error(
+        &self,
+        job: &Job,
+        source: LlmError,
+        queue_recovery_event: bool,
+    ) -> std::result::Result<JobRunOutcome, EngineError> {
+        if let LlmError::Backend {
+            source: backend_source,
+            context,
+        } = &source
+        {
+            if queue_recovery_event {
+                self.enqueue_backend_failure_recovery_event(job, backend_source, context)?;
+            } else {
+                tracing::warn!(
+                    job_id = %job.job_id,
+                    branch = %job.branch,
+                    work_branch = %job.work_branch,
+                    execution_id = %context.execution_id,
+                    error_node_id = %context.error_node_id,
+                    retry_from_node_id = %context.retry_from_node_id,
+                    error = %backend_source,
+                    "suppressed duplicate backend failure recovery request while retrying failed job"
+                );
+            }
+            return Ok(JobRunOutcome::RecoveryQueued);
+        }
+        Err(source.into())
+    }
+
+    fn enqueue_backend_failure_recovery_event(
+        &self,
+        job: &Job,
+        source: &BackendError,
+        context: &BackendFailureContext,
+    ) -> std::result::Result<(), EngineError> {
+        let event = backend_failure_recovery_event(job, source, context);
+        let item = self.service.store().enqueue_message(
+            SYSTEM_EVENT_QUEUE,
+            serde_json::to_value(&event).expect("system event payload should serialize"),
+        )?;
+        tracing::warn!(
+            job_id = %job.job_id,
+            branch = %job.branch,
+            work_branch = %job.work_branch,
+            message_id = %item.message_id,
+            queue = SYSTEM_EVENT_QUEUE,
+            dedupe_key = %event.dedupe_key,
+            execution_id = %context.execution_id,
+            error_node_id = %context.error_node_id,
+            retry_from_node_id = %context.retry_from_node_id,
+            error = %source,
+            "queued backend failure recovery request"
+        );
         Ok(())
+    }
+
+    fn restore_root_branch_after_recovery(
+        &self,
+        job: &Job,
+    ) -> std::result::Result<Job, EngineError> {
+        if job.work_branch == job.branch {
+            return Ok(job.clone());
+        }
+
+        let restored_from_work_branch = job.work_branch.clone();
+        let response_head = self.job_head(job)?;
+        let root_head = self.service.store().get_branch_head(&job.branch)?;
+        self.service
+            .store()
+            .set_branch_head(&job.branch, &root_head, &response_head)?;
+        let job =
+            self.service
+                .store()
+                .set_job_work_branch(&job.job_id, &job.work_branch, &job.branch)?;
+        tracing::info!(
+            job_id = %job.job_id,
+            branch = %job.branch,
+            restored_from_work_branch = %restored_from_work_branch,
+            head = %response_head,
+            "restored prompt job root branch from recovery branch"
+        );
+        Ok(job)
     }
 
     async fn finish_job(&self, job: &Job) -> std::result::Result<(), EngineError> {
@@ -574,6 +764,7 @@ where
             created_at: job.created_at,
             finished_at: job.finished_at,
             branch: job.branch.clone(),
+            work_branch: job.work_branch.clone(),
             base: job.base.clone(),
             status: job.status,
             head,
@@ -590,10 +781,11 @@ where
         job: &Job,
     ) -> std::result::Result<(), EngineError> {
         if let Some(active_job) =
-            self.active_branch_prompt_job_excluding(&job.branch, Some(&job.job_id))?
+            self.active_branch_prompt_job_excluding(&job.work_branch, Some(&job.job_id))?
         {
             tracing::warn!(
                 branch = %job.branch,
+                work_branch = %job.work_branch,
                 active_job_id = %active_job.job_id,
                 job_id = %job.job_id,
                 "prompt job conflicts with another active job"
@@ -601,7 +793,7 @@ where
             return Err(EngineError::EngineFailed {
                 message: format!(
                     "branch {:?} already has conflicting active prompt jobs {:?} and {:?}",
-                    job.branch, active_job.job_id, job.job_id
+                    job.work_branch, active_job.job_id, job.job_id
                 ),
             });
         }
@@ -619,7 +811,7 @@ where
             .list_jobs()?
             .into_values()
             .filter(|job| {
-                job.branch == branch
+                (job.branch == branch || job.work_branch == branch)
                     && !matches!(job.status, JobStatus::Finished)
                     && excluded_job_id != Some(job.job_id.as_str())
             })
@@ -658,11 +850,34 @@ fn completion_input_kind(input: &CompletionInput) -> &'static str {
     }
 }
 
+fn backend_failure_recovery_event(
+    job: &Job,
+    source: &BackendError,
+    context: &BackendFailureContext,
+) -> SystemEventEnvelope<LlmBackendFailureRecoveryRequested> {
+    SystemEventEnvelope {
+        event_type: LLM_BACKEND_FAILURE_RECOVERY_REQUESTED,
+        version: SYSTEM_EVENT_VERSION,
+        dedupe_key: format!("llm.backend_failure:{}", context.error_node_id),
+        data: LlmBackendFailureRecoveryRequested {
+            job_id: job.job_id.clone(),
+            root_branch: job.branch.clone(),
+            work_branch: job.work_branch.clone(),
+            failed_branch: job.work_branch.clone(),
+            base_node_id: job.base.clone(),
+            execution_id: context.execution_id.clone(),
+            error_node_id: context.error_node_id.clone(),
+            retry_from_node_id: context.retry_from_node_id.clone(),
+            message: source.to_string(),
+        },
+    }
+}
+
 fn find_job_last_node<S>(store: &S, job: &Job) -> std::result::Result<Option<Node>, EngineError>
 where
     S: NodeStore,
 {
-    let path = match store.log(&job.base, &job.branch) {
+    let path = match store.log(&job.base, &job.work_branch) {
         Ok(path) => path,
         Err(coco_llm::coco_mem::StoreError::RefsNotConnected { .. }) => return Ok(None),
         Err(source) => return Err(source.into()),
@@ -679,10 +894,6 @@ where
     Ok(Some(last_node))
 }
 
-fn is_terminal_job_last_node(node: &Node) -> bool {
-    matches!(&node.kind, Kind::Text(_) | Kind::Failure(_))
-}
-
 fn build_prompt_reply<S>(
     store: &S,
     job: &Job,
@@ -691,6 +902,12 @@ fn build_prompt_reply<S>(
 where
     S: NodeStore,
 {
+    if !matches!(snapshot.status, JobStatus::Finished) {
+        return Err(EngineError::EngineFailed {
+            message: format!("prompt job {:?} is waiting for recovery", job.job_id),
+        });
+    }
+
     let response_node = store.get_node(&snapshot.head)?;
     let execution_id = response_node
         .metadata

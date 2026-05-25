@@ -218,6 +218,19 @@ where
     ) -> StoreResult<Job> {
         self.notify_if_ok(self.inner.set_job_status(job_id, expected, next))
     }
+
+    fn set_job_work_branch(
+        &self,
+        job_id: &str,
+        expected_work_branch: &str,
+        next_work_branch: &str,
+    ) -> StoreResult<Job> {
+        self.notify_if_ok(self.inner.set_job_work_branch(
+            job_id,
+            expected_work_branch,
+            next_work_branch,
+        ))
+    }
 }
 
 impl<S> MessageQueueStore for ConsoleStore<S>

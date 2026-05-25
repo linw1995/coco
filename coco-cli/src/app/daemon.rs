@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use coco_channel::{
@@ -8,19 +9,26 @@ use coco_channel::{
 };
 use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
-use coco_core::{ConversationEngine, CoreService, EngineError, FixedBranchResolver};
-use coco_llm::{CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService};
-use coco_mem::{JobStatus, MessageQueueItem, SessionRole, Store};
+use coco_core::{
+    ConversationEngine, CoreService, EngineError, FixedBranchResolver, SYSTEM_EVENT_QUEUE,
+};
+use coco_llm::{
+    CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService, Provider,
+    SessionConfig,
+};
+use coco_mem::{
+    Anchor, AnchorPayload, JobStatus, Kind, MessageQueueItem, SessionRole, Store, StoreError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 
 use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
-    prompt::{PROMPT_JOB_QUEUE, QueuedPromptRequest},
+    prompt::{PROMPT_JOB_QUEUE, QueuedPromptRequest, queue_prompt_job_request},
     run_forwarded_with_services,
     runtime::{ForwardedRuntimeInputs, RuntimeServices},
     session::resolve_session_config,
@@ -36,12 +44,20 @@ use crate::{
 };
 
 const DEFAULT_SESSION_BRANCH: &str = "main";
+const BUILTIN_DAY_BRANCH: &str = "day";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
+const DAY_SYSTEM_PROMPT: &str = r#"You are CoCo Day, the built-in system event branch.
+
+Your only job is to consume CoCo system events and turn them into concrete recovery work.
+When you receive an LLM backend failure recovery event, inspect the event payload and run the `recovery` skill from this `day` branch through the injected `coco` command. The failed `work_branch` in the event is the target to inspect or repair, not the branch executing recovery. Do not create or select another recovery branch.
+
+Use the `compact` skill when a target branch has accumulated enough anchors or history that future recovery is likely to exceed context budget. Compact with session graph inspection and `coco session handoff`."#;
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const TELEGRAM_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const CHANNEL_BRANCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const ACTIVE_JOB_REDRIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
@@ -111,23 +127,171 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    if !shared_store
+    if shared_store
         .list_session_states()
         .context(StoreSnafu)?
         .is_empty()
     {
+        let config = resolve_session_config(default_session_create_command(), provider_profiles)?;
+        tracing::info!(
+            branch = %config.branch,
+            max_tokens = config.max_tokens,
+            tool_count = config.tools.len(),
+            "creating default session on empty store"
+        );
+        llm.create_session(config).await.context(LlmSnafu)?;
+    }
+
+    ensure_builtin_day_session(shared_store, llm, provider_profiles).await?;
+    Ok(())
+}
+
+async fn ensure_builtin_day_session<B, S>(
+    shared_store: &S,
+    llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
+) -> Result<()>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    if builtin_day_session_is_valid(shared_store)? {
         return Ok(());
     }
 
-    let config = resolve_session_config(default_session_create_command(), provider_profiles)?;
+    match shared_store.get_branch_head(BUILTIN_DAY_BRANCH) {
+        Ok(_) => {
+            tracing::warn!(
+                branch = BUILTIN_DAY_BRANCH,
+                "replacing invalid builtin day session"
+            );
+            shared_store
+                .delete_branch(BUILTIN_DAY_BRANCH)
+                .context(StoreSnafu)?;
+        }
+        Err(StoreError::BranchNotFound { .. }) => {}
+        Err(source) => return Err(source).context(StoreSnafu),
+    }
+
+    let config = match resolve_session_config(day_session_create_command(), provider_profiles) {
+        Ok(config) => config,
+        Err(error) => {
+            let Some(config) = derive_day_session_config(shared_store)? else {
+                return Err(error);
+            };
+            config
+        }
+    };
     tracing::info!(
         branch = %config.branch,
         max_tokens = config.max_tokens,
         tool_count = config.tools.len(),
-        "creating default session on empty store"
+        "creating builtin day session"
     );
     llm.create_session(config).await.context(LlmSnafu)?;
     Ok(())
+}
+
+fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
+    let head = match store.get_branch_head(BUILTIN_DAY_BRANCH) {
+        Ok(head) => head,
+        Err(StoreError::BranchNotFound { .. }) => return Ok(false),
+        Err(source) => return Err(source).context(StoreSnafu),
+    };
+    match store.get_session_state(BUILTIN_DAY_BRANCH) {
+        Ok(_) => {}
+        Err(StoreError::BranchNotFound { .. }) => return Ok(false),
+        Err(source) => return Err(source).context(StoreSnafu),
+    }
+
+    let ancestry = store.ancestry(&head).context(StoreSnafu)?;
+    let Some(session) = ancestry.into_iter().find_map(|node| {
+        let Kind::Anchor(Anchor {
+            payload: AnchorPayload::Session(session),
+            ..
+        }) = node.kind
+        else {
+            return None;
+        };
+        Some(session)
+    }) else {
+        return Ok(false);
+    };
+
+    let expected_tools = default_builtin_day_tools()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    let actual_tools = session
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    Ok(session.role == SessionRole::Orchestrator
+        && session.system_prompt == DAY_SYSTEM_PROMPT
+        && session.enable_coco_shim
+        && actual_tools == expected_tools)
+}
+
+fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
+    let mut branches = store
+        .list_session_states()
+        .context(StoreSnafu)?
+        .into_keys()
+        .filter(|branch| branch != BUILTIN_DAY_BRANCH)
+        .collect::<Vec<_>>();
+    branches.sort();
+    if let Some(index) = branches
+        .iter()
+        .position(|branch| branch == DEFAULT_SESSION_BRANCH)
+    {
+        branches.swap(0, index);
+    }
+
+    for branch in branches {
+        let head = store.get_branch_head(&branch).context(StoreSnafu)?;
+        let ancestry = store.ancestry(&head).context(StoreSnafu)?;
+        let Some(session_anchor) = ancestry.into_iter().find_map(|node| {
+            let Kind::Anchor(anchor) = &node.kind else {
+                return None;
+            };
+            let AnchorPayload::Session(session) = &anchor.payload else {
+                return None;
+            };
+            Some(session.clone())
+        }) else {
+            continue;
+        };
+        let provider = session_anchor
+            .provider
+            .as_deref()
+            .and_then(|provider| Provider::parse(provider).ok())
+            .unwrap_or(Provider::OpenAi);
+        return Ok(Some(SessionConfig {
+            branch: BUILTIN_DAY_BRANCH.to_owned(),
+            merge_parents: vec![],
+            provider_profile: session_anchor.provider_profile,
+            provider,
+            model: session_anchor.model,
+            role: SessionRole::Orchestrator,
+            system_prompt: DAY_SYSTEM_PROMPT.to_owned(),
+            prompt: String::new(),
+            tools: default_builtin_day_tools(),
+            temperature: session_anchor.temperature,
+            max_tokens: session_anchor.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
+            additional_params: session_anchor.additional_params,
+            enable_coco_shim: true,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn default_builtin_day_tools() -> Vec<coco_mem::Tool> {
+    ["exec_command", "write_stdin", "search_skill"]
+        .into_iter()
+        .map(|name| coco_llm::builtin_tool_definition(name).expect("builtin day tool should exist"))
+        .collect()
 }
 
 fn default_session_create_command() -> SessionCreateCommand {
@@ -145,6 +309,26 @@ fn default_session_create_command() -> SessionCreateCommand {
             CliTool::WriteStdin,
             CliTool::SearchSkill,
             CliTool::LoadImage,
+        ],
+        enable_coco_shim: true,
+        disable_coco_shim: false,
+    }
+}
+
+fn day_session_create_command() -> SessionCreateCommand {
+    SessionCreateCommand {
+        branch: BUILTIN_DAY_BRANCH.to_owned(),
+        role: CliSessionRole::Orchestrator,
+        provider_profile: None,
+        system_prompt: DAY_SYSTEM_PROMPT.to_owned(),
+        prompt: String::new(),
+        temperature: None,
+        max_tokens: Some(DEFAULT_MAX_TOKENS),
+        additional_params: None,
+        tools: vec![
+            CliTool::ExecCommand,
+            CliTool::WriteStdin,
+            CliTool::SearchSkill,
         ],
         enable_coco_shim: true,
         disable_coco_shim: false,
@@ -318,9 +502,13 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let worker =
+    let prompt_worker =
         PromptJobMessageQueueWorker::new(shared_store.clone(), shared_engine.as_ref().clone());
-    tokio::spawn(async move { worker.run().await })
+    let system_event_worker = SystemEventMessageQueueWorker::new(shared_store.clone());
+    tokio::spawn(async move {
+        tokio::try_join!(prompt_worker.run(), system_event_worker.run())?;
+        Ok(())
+    })
 }
 
 fn start_channel_task<B, S>(
@@ -401,14 +589,145 @@ enum PromptJobQueuePayloadError {
     DecodePromptJob { source: serde_json::Error },
 }
 
+#[derive(Debug, Snafu)]
+enum SystemEventQueuePayloadError {
+    #[snafu(display("Failed to decode system event queue payload: {source}"))]
+    DecodeSystemEvent { source: serde_json::Error },
+
+    #[snafu(display("Unsupported system event {event_type:?} version {version}"))]
+    UnsupportedEvent { event_type: String, version: u64 },
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemEventEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    version: u64,
+    data: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmBackendFailureRecoveryRequested {
+    job_id: String,
+    root_branch: String,
+    work_branch: String,
+    failed_branch: String,
+    base_node_id: String,
+    execution_id: String,
+    error_node_id: String,
+    retry_from_node_id: String,
+    message: String,
+}
+
+#[derive(Debug)]
+enum SystemEvent {
+    LlmBackendFailureRecoveryRequested(LlmBackendFailureRecoveryRequested),
+}
+
+struct SystemEventMessageQueueWorker<S> {
+    store: S,
+}
+
+impl<S> SystemEventMessageQueueWorker<S> {
+    fn new(store: S) -> Self {
+        Self { store }
+    }
+
+    async fn run(self) -> Result<()>
+    where
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        loop {
+            if self.drain_once().await? == 0 {
+                tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
+            }
+        }
+    }
+
+    async fn drain_once(&self) -> Result<usize>
+    where
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        let mut handled = 0;
+        while let Some(item) = self
+            .store
+            .peek_message(SYSTEM_EVENT_QUEUE)
+            .context(StoreSnafu)?
+        {
+            match decode_system_event_message(item.payload.clone()) {
+                Ok(event) => {
+                    if !self.queue_prompt_job_for_event(&item, event)? {
+                        return Ok(handled);
+                    }
+                    self.store
+                        .dequeue_message(SYSTEM_EVENT_QUEUE)
+                        .context(StoreSnafu)?;
+                }
+                Err(error) => {
+                    self.store
+                        .dequeue_message(SYSTEM_EVENT_QUEUE)
+                        .context(StoreSnafu)?;
+                    tracing::error!(
+                        message_id = %item.message_id,
+                        queue = SYSTEM_EVENT_QUEUE,
+                        error = %error,
+                        "discarded invalid system event queue message"
+                    );
+                }
+            }
+            handled += 1;
+        }
+        Ok(handled)
+    }
+
+    fn queue_prompt_job_for_event(
+        &self,
+        item: &MessageQueueItem,
+        event: SystemEvent,
+    ) -> Result<bool>
+    where
+        S: Store,
+    {
+        let route = route_system_event(&event);
+        match self.store.get_branch_head(route.branch) {
+            Ok(_) => {}
+            Err(StoreError::BranchNotFound { .. }) => {
+                tracing::warn!(
+                    message_id = %item.message_id,
+                    queue = SYSTEM_EVENT_QUEUE,
+                    branch = route.branch,
+                    "kept system event because target branch is missing"
+                );
+                return Ok(false);
+            }
+            Err(source) => return Err(source).context(StoreSnafu),
+        }
+
+        let request = materialize_system_event_prompt_job(item, route, &event);
+        queue_prompt_job_request(&self.store, request)?;
+        tracing::info!(
+            message_id = %item.message_id,
+            queue = SYSTEM_EVENT_QUEUE,
+            branch = route.branch,
+            "queued system event prompt job"
+        );
+        Ok(true)
+    }
+}
+
 struct PromptJobMessageQueueWorker<B, S> {
     store: S,
     engine: ConversationEngine<B, S>,
+    active_job_drives: Mutex<HashMap<String, Instant>>,
 }
 
 impl<B, S> PromptJobMessageQueueWorker<B, S> {
     fn new(store: S, engine: ConversationEngine<B, S>) -> Self {
-        Self { store, engine }
+        Self {
+            store,
+            engine,
+            active_job_drives: Mutex::new(HashMap::new()),
+        }
     }
 
     async fn run(self) -> Result<()>
@@ -520,9 +839,9 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .active_branch_prompt_job(&request.branch)
             .context(CoreEngineSnafu)?
         {
-            self.wait_for_active_branch_job(item, request, active_job)
-                .await;
-            return Ok(true);
+            return Ok(self
+                .wait_for_active_branch_job(item, request, active_job)
+                .await);
         }
 
         let guard = self.engine.lock_branch(&request.branch).await;
@@ -594,9 +913,9 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .context(CoreEngineSnafu)?
         {
             drop(guard);
-            self.wait_for_active_branch_job(&item, &request, active_job)
-                .await;
-            return Ok(true);
+            return Ok(self
+                .wait_for_active_branch_job(&item, &request, active_job)
+                .await);
         }
         let Some(item) = self
             .store
@@ -614,7 +933,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
         active_job: coco_mem::Job,
-    ) where
+    ) -> bool
+    where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
@@ -628,17 +948,51 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             "waiting to materialize queued prompt job request behind active branch job"
         );
 
-        if let Err(error) = self.engine.drive_job(&active_job.job_id).await {
-            tracing::warn!(
+        if !self.should_drive_active_job(&active_job).await {
+            tracing::info!(
                 message_id = %item.message_id,
                 queue = PROMPT_JOB_QUEUE,
                 branch = %request.branch,
                 job_id = %request.job_id,
                 active_job_id = %active_job.job_id,
-                error = %error,
-                "failed to wait for active branch prompt job before materializing queued request"
+                active_job_status = ?active_job.status,
+                "active branch prompt job was driven recently; queued request will wait"
             );
+            return false;
         }
+
+        match self.engine.drive_job(&active_job.job_id).await {
+            Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => true,
+            Ok(snapshot) => {
+                tracing::info!(
+                    message_id = %item.message_id,
+                    queue = PROMPT_JOB_QUEUE,
+                    branch = %request.branch,
+                    job_id = %request.job_id,
+                    active_job_id = %active_job.job_id,
+                    active_job_status = ?snapshot.status,
+                    "active branch prompt job still blocks queued request"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    message_id = %item.message_id,
+                    queue = PROMPT_JOB_QUEUE,
+                    branch = %request.branch,
+                    job_id = %request.job_id,
+                    active_job_id = %active_job.job_id,
+                    error = %error,
+                    "failed to wait for active branch prompt job before materializing queued request"
+                );
+                false
+            }
+        }
+    }
+
+    async fn should_drive_active_job(&self, active_job: &coco_mem::Job) -> bool {
+        let mut active_job_drives = self.active_job_drives.lock().await;
+        should_drive_active_job_with_backoff(&mut active_job_drives, active_job)
     }
 
     async fn handle_item(&self, item: MessageQueueItem)
@@ -904,6 +1258,7 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
+    let mut active_job_drives = HashMap::new();
     loop {
         let active_job = engine.active_branch_prompt_job(branch)?;
         let Some(active_job) = active_job else {
@@ -917,11 +1272,36 @@ where
             "waiting for active branch prompt job before handling queued telegram message"
         );
 
+        if !should_drive_active_job_with_backoff(&mut active_job_drives, &active_job) {
+            tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
+            continue;
+        }
+
         let snapshot = engine.drive_job(&active_job.job_id).await?;
         if !matches!(snapshot.status, JobStatus::Finished) {
             tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
         }
     }
+}
+
+fn should_drive_active_job_with_backoff(
+    active_job_drives: &mut HashMap<String, Instant>,
+    active_job: &coco_mem::Job,
+) -> bool {
+    let now = Instant::now();
+    active_job_drives
+        .retain(|_, last_drive| now.duration_since(*last_drive) < ACTIVE_JOB_REDRIVE_INTERVAL);
+
+    if matches!(active_job.status, JobStatus::Running)
+        && active_job_drives
+            .get(&active_job.job_id)
+            .is_some_and(|last_drive| now.duration_since(*last_drive) < ACTIVE_JOB_REDRIVE_INTERVAL)
+    {
+        return false;
+    }
+
+    active_job_drives.insert(active_job.job_id.clone(), now);
+    true
 }
 
 fn is_missing_branch_error(error: &crate::error::Error) -> bool {
@@ -1016,6 +1396,91 @@ fn decode_prompt_job_message(
     payload: serde_json::Value,
 ) -> std::result::Result<QueuedPromptRequest, PromptJobQueuePayloadError> {
     serde_json::from_value(payload).context(DecodePromptJobSnafu)
+}
+
+fn decode_system_event_message(
+    payload: serde_json::Value,
+) -> std::result::Result<SystemEvent, SystemEventQueuePayloadError> {
+    let envelope =
+        serde_json::from_value::<SystemEventEnvelope>(payload).context(DecodeSystemEventSnafu)?;
+    match (envelope.event_type.as_str(), envelope.version) {
+        ("llm.backend_failure.recovery_requested", 1) => {
+            let event = serde_json::from_value::<LlmBackendFailureRecoveryRequested>(envelope.data)
+                .context(DecodeSystemEventSnafu)?;
+            Ok(SystemEvent::LlmBackendFailureRecoveryRequested(event))
+        }
+        _ => UnsupportedEventSnafu {
+            event_type: envelope.event_type,
+            version: envelope.version,
+        }
+        .fail(),
+    }
+}
+
+fn render_system_event_prompt(event: &SystemEvent) -> String {
+    match event {
+        SystemEvent::LlmBackendFailureRecoveryRequested(event) => format!(
+            "Handle this LLM backend failure recovery event.\n\n\
+             Run `coco skill run recovery --handoff ...` from the `day` branch and pass the event fields below as the handoff. \
+             Treat work branch {work_branch:?} as the failed target branch for job {job_id:?}, not as the branch executing recovery. \
+             Do not fork or create another recovery branch; recover the original task through `day` and produce a normal successful answer.\n\n\
+             Event fields:\n\
+             - job_id: {job_id}\n\
+             - root_branch: {root_branch}\n\
+             - work_branch: {work_branch}\n\
+             - failed_branch: {failed_branch}\n\
+             - base_node_id: {base_node_id}\n\
+             - execution_id: {execution_id}\n\
+             - error_node_id: {error_node_id}\n\
+             - retry_from_node_id: {retry_from_node_id}\n\
+             - message: {message}",
+            job_id = event.job_id,
+            root_branch = event.root_branch,
+            work_branch = event.work_branch,
+            failed_branch = event.failed_branch,
+            base_node_id = event.base_node_id,
+            execution_id = event.execution_id,
+            error_node_id = event.error_node_id,
+            retry_from_node_id = event.retry_from_node_id,
+            message = event.message,
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SystemEventHandler {
+    Day,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SystemEventRoute {
+    branch: &'static str,
+    handler: SystemEventHandler,
+}
+
+fn route_system_event(event: &SystemEvent) -> SystemEventRoute {
+    match event {
+        SystemEvent::LlmBackendFailureRecoveryRequested(_) => SystemEventRoute {
+            branch: BUILTIN_DAY_BRANCH,
+            handler: SystemEventHandler::Day,
+        },
+    }
+}
+
+fn materialize_system_event_prompt_job(
+    item: &MessageQueueItem,
+    route: SystemEventRoute,
+    event: &SystemEvent,
+) -> QueuedPromptRequest {
+    match route.handler {
+        SystemEventHandler::Day => QueuedPromptRequest {
+            job_id: format!("job-{}", item.message_id),
+            branch: route.branch.to_owned(),
+            prompt: render_system_event_prompt(event),
+            merge_parents: vec![],
+            session_patch: None,
+        },
+    }
 }
 
 fn spawn_queued_prompt_job_driver<B, S>(engine: ConversationEngine<B, S>, job_id: String)
@@ -1255,6 +1720,7 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
@@ -1269,16 +1735,20 @@ mod tests {
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
         SessionConfig, StepContext,
     };
-    use coco_mem::{JobStatus, MemoryStore, MessageQueueStore, SessionRole};
+    use coco_mem::{
+        Job, JobStatus, MemoryStore, MessageQueueStore, SessionAnchorPatch, SessionRole,
+        SessionStore,
+    };
     use serde_json::json;
     use tokio::sync::Notify;
 
     use crate::app::prompt::QueuedPromptRequest;
 
     use super::{
-        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_telegram_message,
-        encode_telegram_message, resolve_daemon_socket_path,
+        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, SYSTEM_EVENT_QUEUE,
+        SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher,
+        TelegramMessageQueueWorker, decode_telegram_message, encode_telegram_message,
+        resolve_daemon_socket_path,
     };
 
     #[test]
@@ -1460,6 +1930,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_job_queue_worker_backs_off_when_active_job_waits_for_recovery() {
+        let store = MemoryStore::new();
+        let backend = FailingBackend::default();
+        let calls = backend.calls.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let engine = ConversationEngine::new(llm);
+        let active_job = engine
+            .submit_job("main", "active work", vec![])
+            .await
+            .unwrap();
+        let active_job_id = active_job.job_id.clone();
+
+        store
+            .enqueue_message(
+                PROMPT_JOB_QUEUE,
+                json!(QueuedPromptRequest {
+                    job_id: "job-request".to_owned(),
+                    branch: "main".to_owned(),
+                    prompt: "queued work".to_owned(),
+                    merge_parents: vec![],
+                    session_patch: None,
+                }),
+            )
+            .unwrap();
+        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
+
+        let result = tokio::time::timeout(Duration::from_millis(100), worker.drain_once()).await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.get_job(&active_job_id).unwrap().status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_job_queue_worker_throttles_running_active_job_redrive() {
+        let store = MemoryStore::new();
+        let backend = FailingBackend::default();
+        let calls = backend.calls.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        let engine = ConversationEngine::new(llm);
+        let active_job = engine
+            .submit_job("main", "active work", vec![])
+            .await
+            .unwrap();
+        let active_job_id = active_job.job_id.clone();
+        let request = QueuedPromptRequest {
+            job_id: "job-request".to_owned(),
+            branch: "main".to_owned(),
+            prompt: "queued work".to_owned(),
+            merge_parents: vec![],
+            session_patch: None,
+        };
+        store
+            .enqueue_message(PROMPT_JOB_QUEUE, json!(request.clone()))
+            .unwrap();
+        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
+
+        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        assert!(
+            !worker
+                .handle_prompt_request_queue_head(&item, &request)
+                .await
+                .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.get_job(&active_job_id).unwrap().status,
+            JobStatus::Running
+        );
+
+        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        assert!(
+            !worker
+                .handle_prompt_request_queue_head(&item, &request)
+                .await
+                .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn prompt_job_queue_worker_discards_prompt_request_for_missing_branch() {
         let store = MemoryStore::new();
         let backend = BlockingOnceBackend::default();
@@ -1528,10 +2092,114 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn system_event_queue_worker_materializes_day_prompt_request() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("day")).await.unwrap();
+        let item = store
+            .enqueue_message(
+                SYSTEM_EVENT_QUEUE,
+                json!({
+                    "type": "llm.backend_failure.recovery_requested",
+                    "version": 1,
+                    "dedupe_key": "llm.backend_failure:error-node",
+                    "data": {
+                        "job_id": "job-failed",
+                        "root_branch": "main",
+                        "work_branch": "main",
+                        "failed_branch": "main",
+                        "base_node_id": "base-node",
+                        "execution_id": "execution-1",
+                        "error_node_id": "error-node",
+                        "retry_from_node_id": "retry-node",
+                        "message": "backend failed"
+                    }
+                }),
+            )
+            .unwrap();
+        let worker = SystemEventMessageQueueWorker::new(store.clone());
+
+        assert_eq!(worker.drain_once().await.unwrap(), 1);
+
+        assert!(
+            store
+                .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .unwrap()
+                .is_empty()
+        );
+        let prompt_items = store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap();
+        assert_eq!(prompt_items.len(), 1);
+        let request: QueuedPromptRequest =
+            serde_json::from_value(prompt_items[0].payload.clone()).unwrap();
+        assert_eq!(request.job_id, format!("job-{}", item.message_id));
+        assert_eq!(request.branch, "day");
+        assert!(request.prompt.contains("job-failed"));
+        assert!(request.prompt.contains("retry-node"));
+        assert!(request.prompt.contains("coco skill run recovery"));
+        assert!(request.prompt.contains("from the `day` branch"));
+        assert!(request.prompt.contains("Do not fork"));
+        assert!(!request.prompt.contains("active recovery branch"));
+    }
+
+    #[tokio::test]
+    async fn derive_day_session_config_uses_latest_session_anchor() {
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(
+            store.clone(),
+            BlockingOnceBackend::default(),
+        ));
+        let mut config = session_config("main");
+        config.model = "old-model".to_owned();
+        llm.create_session(config).await.unwrap();
+        store
+            .handoff_session(
+                "main",
+                &SessionAnchorPatch {
+                    model: Some("new-model".to_owned()),
+                    max_tokens: Some(Some(12_345)),
+                    ..SessionAnchorPatch::default()
+                },
+            )
+            .unwrap();
+
+        let config = super::derive_day_session_config(&store)
+            .unwrap()
+            .expect("day config should be derived");
+
+        assert_eq!(config.model, "new-model");
+        assert_eq!(config.max_tokens, Some(12_345));
+    }
+
+    #[test]
+    fn active_job_drive_backoff_prunes_expired_entries() {
+        let mut active_job = Job::new("job-active", "main", "base");
+        active_job.status = JobStatus::Running;
+        let stale_job_id = "job-stale".to_owned();
+        let mut active_job_drives = HashMap::from([(
+            stale_job_id.clone(),
+            Instant::now() - super::ACTIVE_JOB_REDRIVE_INTERVAL,
+        )]);
+
+        assert!(super::should_drive_active_job_with_backoff(
+            &mut active_job_drives,
+            &active_job,
+        ));
+
+        assert!(!active_job_drives.contains_key(&stale_job_id));
+        assert!(active_job_drives.contains_key(&active_job.job_id));
+    }
+
     #[derive(Debug, Clone, Default)]
     struct BlockingOnceBackend {
         calls: Arc<AtomicUsize>,
         release_first: Arc<Notify>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FailingBackend {
+        calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -1551,6 +2219,19 @@ mod tests {
                 tool_calls: vec![],
                 final_text: Some("done".to_owned()),
                 trace_persisted: false,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CompletionBackend for FailingBackend {
+        async fn step(
+            &self,
+            _ctx: StepContext<'_>,
+        ) -> std::result::Result<BackendTurn, BackendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(BackendError::Failed {
+                message: "recoverable backend outage".to_owned(),
             })
         }
     }

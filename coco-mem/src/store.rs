@@ -153,6 +153,14 @@ pub trait JobStore {
         expected: JobStatus,
         next: JobStatus,
     ) -> StoreResult<Job>;
+
+    /// Moves the current work branch for an unfinished prompt job.
+    fn set_job_work_branch(
+        &self,
+        job_id: &str,
+        expected_work_branch: &str,
+        next_work_branch: &str,
+    ) -> StoreResult<Job>;
 }
 
 /// Generic persistent message queue storage API.
