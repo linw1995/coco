@@ -13,6 +13,7 @@ const MIN_ZOOM: f64 = 0.35;
 const MAX_ZOOM: f64 = 1.25;
 const ZOOM_STEP: f64 = 1.2;
 const CULL_PADDING: f64 = 520.0;
+const GRAPH_VIEWPORT_BUCKET: f64 = 256.0;
 const DEFAULT_GRAPH_VIEWPORT_WIDTH: f64 = 1280.0;
 const DEFAULT_GRAPH_VIEWPORT_HEIGHT: f64 = 720.0;
 
@@ -107,6 +108,14 @@ struct ClientQueueMessage {
 struct SelectedNode {
     target: String,
     id: Option<String>,
+}
+
+struct GraphViewportRequest {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    key: String,
 }
 
 #[wasm_bindgen(start)]
@@ -566,12 +575,34 @@ fn scroll_graph_from_minimap(document: &Document, event: &MouseEvent) -> Result<
 }
 
 fn update_graph_visibility(document: &Document) -> Result<(), JsValue> {
-    let Some(graph) = scroll_element(document, ".graph-wrap") else {
+    let Some(viewport) = current_graph_viewport(document) else {
         return Ok(());
     };
     let Some(items) = scroll_element(document, ".graph-items") else {
         return Ok(());
     };
+
+    if items.get_attribute("data-graph-items-key").as_deref() == Some(viewport.key.as_str())
+        || items.has_attribute("data-graph-items-pending")
+    {
+        return Ok(());
+    }
+
+    let Some(window) = web_sys::window() else {
+        return Ok(());
+    };
+    items.set_attribute("data-graph-items-pending", &viewport.key)?;
+    let load_document = document.clone();
+    spawn_local(async move {
+        if let Err(error) = load_graph_items(&window, &load_document, viewport).await {
+            web_sys::console::error_1(&error);
+        }
+    });
+    Ok(())
+}
+
+fn current_graph_viewport(document: &Document) -> Option<GraphViewportRequest> {
+    let graph = scroll_element(document, ".graph-wrap")?;
     let zoom = graph_zoom(document);
     let viewport_width = if graph.client_width() > 0 {
         f64::from(graph.client_width())
@@ -583,61 +614,60 @@ fn update_graph_visibility(document: &Document) -> Result<(), JsValue> {
     } else {
         DEFAULT_GRAPH_VIEWPORT_HEIGHT
     };
-    let left = f64::from(graph.scroll_left()) / zoom - CULL_PADDING;
-    let top = f64::from(graph.scroll_top()) / zoom - CULL_PADDING;
-    let right = left + viewport_width / zoom + CULL_PADDING * 2.0;
-    let bottom = top + viewport_height / zoom + CULL_PADDING * 2.0;
+    let left = bucket_floor(f64::from(graph.scroll_left()) / zoom - CULL_PADDING);
+    let top = bucket_floor(f64::from(graph.scroll_top()) / zoom - CULL_PADDING);
+    let right =
+        bucket_ceil(f64::from(graph.scroll_left()) / zoom + viewport_width / zoom + CULL_PADDING);
+    let bottom =
+        bucket_ceil(f64::from(graph.scroll_top()) / zoom + viewport_height / zoom + CULL_PADDING);
     let key = format!("{left:.0}:{top:.0}:{right:.0}:{bottom:.0}");
+    Some(GraphViewportRequest {
+        left,
+        top,
+        right,
+        bottom,
+        key,
+    })
+}
 
-    if items.get_attribute("data-graph-items-key").as_deref() == Some(key.as_str())
-        || items.get_attribute("data-graph-items-pending").as_deref() == Some(key.as_str())
-    {
-        return Ok(());
-    }
+fn bucket_floor(value: f64) -> f64 {
+    (value / GRAPH_VIEWPORT_BUCKET).floor() * GRAPH_VIEWPORT_BUCKET
+}
 
-    let Some(window) = web_sys::window() else {
-        return Ok(());
-    };
-    items.set_attribute("data-graph-items-pending", &key)?;
-    let load_document = document.clone();
-    spawn_local(async move {
-        if let Err(error) =
-            load_graph_items(&window, &load_document, left, top, right, bottom, key).await
-        {
-            web_sys::console::error_1(&error);
-        }
-    });
-    Ok(())
+fn bucket_ceil(value: f64) -> f64 {
+    (value / GRAPH_VIEWPORT_BUCKET).ceil() * GRAPH_VIEWPORT_BUCKET
 }
 
 async fn load_graph_items(
     window: &Window,
     document: &Document,
-    left: f64,
-    top: f64,
-    right: f64,
-    bottom: f64,
-    key: String,
+    viewport: GraphViewportRequest,
 ) -> Result<(), JsValue> {
-    let url =
-        format!("/api/graph-items?left={left:.0}&top={top:.0}&right={right:.0}&bottom={bottom:.0}");
+    let url = format!(
+        "/api/graph-items?left={:.0}&top={:.0}&right={:.0}&bottom={:.0}",
+        viewport.left, viewport.top, viewport.right, viewport.bottom
+    );
     let fragment = match fetch_text(window, &url).await {
         Ok(fragment) => fragment,
         Err(error) => {
-            let _ = clear_graph_items_pending(document, &key);
+            let _ = clear_graph_items_pending(document, &viewport.key);
             return Err(error);
         }
     };
     let Some(items) = scroll_element(document, ".graph-items") else {
         return Ok(());
     };
-    if items.get_attribute("data-graph-items-pending").as_deref() != Some(key.as_str()) {
+    if items.get_attribute("data-graph-items-pending").as_deref() != Some(viewport.key.as_str()) {
         return Ok(());
+    }
+    items.remove_attribute("data-graph-items-pending")?;
+
+    if current_graph_viewport(document).is_some_and(|current| current.key != viewport.key) {
+        return update_graph_visibility(document);
     }
 
     items.set_inner_html(&fragment);
-    items.set_attribute("data-graph-items-key", &key)?;
-    items.remove_attribute("data-graph-items-pending")?;
+    items.set_attribute("data-graph-items-key", &viewport.key)?;
     update_node_detail_from_hash(window, document)
 }
 
