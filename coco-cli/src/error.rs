@@ -3,6 +3,17 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+type JsonValueKindCheck = fn(&serde_json::Value) -> bool;
+
+const JSON_VALUE_KIND_CHECKS: &[(JsonValueKindCheck, &str)] = &[
+    (serde_json::Value::is_null, "null"),
+    (serde_json::Value::is_boolean, "boolean"),
+    (serde_json::Value::is_number, "number"),
+    (serde_json::Value::is_string, "string"),
+    (serde_json::Value::is_array, "array"),
+    (serde_json::Value::is_object, "object"),
+];
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
@@ -161,14 +172,13 @@ struct JsonValueKind<'a>(&'a serde_json::Value);
 
 impl fmt::Display for JsonValueKind<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self.0 {
-            serde_json::Value::Null => "null",
-            serde_json::Value::Bool(_) => "boolean",
-            serde_json::Value::Number(_) => "number",
-            serde_json::Value::String(_) => "string",
-            serde_json::Value::Array(_) => "array",
-            serde_json::Value::Object(_) => "object",
-        };
-        f.write_str(kind)
+        f.write_str(json_value_kind(self.0))
     }
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    JSON_VALUE_KIND_CHECKS
+        .iter()
+        .find_map(|(matches, kind)| matches(value).then_some(*kind))
+        .expect("serde_json::Value variants should be covered")
 }
