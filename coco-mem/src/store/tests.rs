@@ -2587,7 +2587,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["version"], "2026-05-24");
+    assert_eq!(meta["version"], "2026-05-25");
 }
 
 #[test]
@@ -2812,7 +2812,7 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated["version"], "2026-05-24");
+    assert_eq!(migrated["version"], "2026-05-25");
     let migrated_skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
@@ -3058,11 +3058,31 @@ fn open_migrates_legacy_jobs_json_to_snapshot_with_empty_wal() {
     assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-24");
+    assert_eq!(migrated_meta["version"], "2026-05-25");
 }
 
 #[test]
 fn open_migrates_previous_store_format_version_to_current() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!("2026-05-24");
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    FsStore::open(&path).unwrap();
+
+    let migrated_meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(migrated_meta["version"], "2026-05-25");
+}
+
+#[test]
+fn open_migrates_console_store_format_version_to_current() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
     let mut meta: serde_json::Value =
@@ -3078,7 +3098,7 @@ fn open_migrates_previous_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-24");
+    assert_eq!(migrated_meta["version"], "2026-05-25");
 }
 
 #[test]
@@ -3098,7 +3118,7 @@ fn open_migrates_recovery_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-24");
+    assert_eq!(migrated_meta["version"], "2026-05-25");
 }
 
 #[test]

@@ -27,10 +27,7 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-24";
-const PREVIOUS_STORE_FORMAT_VERSION: &str = "2026-05-23";
-const RECOVERY_STORE_FORMAT_VERSION: &str = "2026-05-21";
-const JOB_WAL_STORE_FORMAT_VERSION: &str = "2026-05-18";
+const STORE_FORMAT_VERSION: &str = "2026-05-25";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -68,7 +65,10 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "coco-orchestrator",
-        from_revision_ids: &[],
+        from_revision_ids: &[
+            // Before the orchestrator runner prompt included load_image.
+            "cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438",
+        ],
         target_revision_id: BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
     },
     BuiltinSkillMigration {
@@ -104,7 +104,14 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Runner,
         name: "telegram",
-        from_revision_ids: &[],
+        from_revision_ids: &[
+            // Telegram default before the attachment download script was added.
+            "8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c",
+            // Telegram default before downloads were directed into the workspace.
+            "fe5361a23cc71e2253b9d7867604cf1994db8fb6273dcae2ba2088a48c827e3c",
+            // Telegram default before the download script defaulted into the workspace.
+            "a86a9cb4ec5d5b8f6284970aa7c9feb53ddfbe7d1b984e9210dda7d1801edfd1",
+        ],
         target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
     },
 ];
@@ -126,27 +133,37 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-17-to-2026-05-18",
         from: StoreFormatVersion::Chronicle("2026-05-17"),
-        to: StoreFormatVersion::Chronicle(JOB_WAL_STORE_FORMAT_VERSION),
+        to: StoreFormatVersion::Chronicle("2026-05-18"),
         run: Persistence::migrate_jobs_to_wal,
         builtin_skills: &[],
     },
     StoreMigration {
         name: "2026-05-18-to-2026-05-21",
-        from: StoreFormatVersion::Chronicle(JOB_WAL_STORE_FORMAT_VERSION),
-        to: StoreFormatVersion::Chronicle(RECOVERY_STORE_FORMAT_VERSION),
+        from: StoreFormatVersion::Chronicle("2026-05-18"),
+        // PR #79 first introduced recovery/compact builtin skills at this version.
+        to: StoreFormatVersion::Chronicle("2026-05-21"),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
     },
     StoreMigration {
         name: "2026-05-21-to-2026-05-23",
-        from: StoreFormatVersion::Chronicle(RECOVERY_STORE_FORMAT_VERSION),
-        to: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
+        from: StoreFormatVersion::Chronicle("2026-05-21"),
+        // origin/main advanced to this version for console store entity views.
+        to: StoreFormatVersion::Chronicle("2026-05-23"),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
     },
     StoreMigration {
         name: "2026-05-23-to-2026-05-24",
-        from: StoreFormatVersion::Chronicle(PREVIOUS_STORE_FORMAT_VERSION),
+        from: StoreFormatVersion::Chronicle("2026-05-23"),
+        // origin/main advanced to this version before PR #79 was rebased.
+        to: StoreFormatVersion::Chronicle("2026-05-24"),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-24-to-2026-05-25",
+        from: StoreFormatVersion::Chronicle("2026-05-24"),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
@@ -3296,7 +3313,7 @@ where
 #[cfg(test)]
 mod builtin_skill_migration_tests {
     use super::{
-        BUILTIN_COCO_ORCHESTRATOR_REVISION_ID, BuiltinSkillMigration, BuiltinSkillMigrationAction,
+        BUILTIN_SKILL_MIGRATIONS, BuiltinSkillMigration, BuiltinSkillMigrationAction,
         STORE_MIGRATIONS, SessionRole, SkillVersion, SkillVersionSpec,
         builtin_skill_migration_action, default_skill_groups,
     };
@@ -3325,6 +3342,46 @@ mod builtin_skill_migration_tests {
     }
 
     #[test]
+    fn builtin_skill_migrations_keep_known_source_revisions() {
+        let orchestrator = builtin_migration(SessionRole::Orchestrator, "coco-orchestrator");
+        assert!(
+            orchestrator
+                .from_revision_ids
+                .contains(&"cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438")
+        );
+
+        let telegram = builtin_migration(SessionRole::Runner, "telegram");
+        assert!(
+            telegram
+                .from_revision_ids
+                .contains(&"8d8630a19107380d2ba0cc1bcd3bf904f888a68bf535364b12b30340a582265c")
+        );
+        assert!(
+            telegram
+                .from_revision_ids
+                .contains(&"fe5361a23cc71e2253b9d7867604cf1994db8fb6273dcae2ba2088a48c827e3c")
+        );
+        assert!(
+            telegram
+                .from_revision_ids
+                .contains(&"a86a9cb4ec5d5b8f6284970aa7c9feb53ddfbe7d1b984e9210dda7d1801edfd1")
+        );
+    }
+
+    #[test]
+    fn builtin_skill_migration_sources_exclude_current_targets() {
+        for migration in BUILTIN_SKILL_MIGRATIONS {
+            assert!(
+                !migration
+                    .from_revision_ids
+                    .contains(&migration.target_revision_id),
+                "builtin migration sources should only list old default revisions for {}",
+                migration.name
+            );
+        }
+    }
+
+    #[test]
     fn updates_known_builtin_revision_to_new_target() {
         let defaults = default_skill_groups();
         let record = defaults
@@ -3345,7 +3402,10 @@ mod builtin_skill_migration_tests {
         let migration = BuiltinSkillMigration {
             role: SessionRole::Orchestrator,
             name: "coco-orchestrator",
-            from_revision_ids: &[BUILTIN_COCO_ORCHESTRATOR_REVISION_ID],
+            from_revision_ids: &[
+                // Current default in this test before the synthetic target update.
+                "79a81ed8e48dc4bac77d8d87ad5566d3b25c1aa1c6fd63cf89aec1efbc0ea6b9",
+            ],
             target_revision_id: "new-target-revision",
         };
         assert_eq!(
@@ -3388,5 +3448,12 @@ mod builtin_skill_migration_tests {
             builtin_skill_migration_action(&migration, &record, &target),
             BuiltinSkillMigrationAction::SkipUserModified
         );
+    }
+
+    fn builtin_migration(role: SessionRole, name: &str) -> &'static BuiltinSkillMigration {
+        BUILTIN_SKILL_MIGRATIONS
+            .iter()
+            .find(|migration| migration.role == role && migration.name == name)
+            .expect("builtin migration should exist")
     }
 }
