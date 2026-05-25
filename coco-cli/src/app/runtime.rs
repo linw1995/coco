@@ -382,51 +382,159 @@ fn apply_forwarded_defaults(
     store_path_env: Option<&str>,
     parent_tool_use_id_env: Option<&str>,
 ) {
+    apply_forwarded_store_path(cli, store_path_env);
+    apply_forwarded_orchestrator_defaults(cli, scope, branch_env, parent_tool_use_id_env);
+    apply_forwarded_branch_default(cli, args, branch_env);
+}
+
+fn apply_forwarded_store_path(cli: &mut Cli, store_path_env: Option<&str>) {
     if let Some(store_path_env) = store_path_env {
         cli.store_path = std::path::PathBuf::from(store_path_env);
     }
+}
 
-    if scope == ForwardedRuntimeScope::Orchestrator
-        && let Some(parent_tool_use_id) = parent_tool_use_id_env
-    {
-        let parent_tool_use_id = parent_tool_use_id.to_owned();
-        apply_forwarded_shadow_parent(cli, parent_tool_use_id.clone());
-        apply_forwarded_skill_parent(cli, parent_tool_use_id, branch_env.map(str::to_owned));
-    }
-
-    if has_explicit_flag(args, "branch") {
+fn apply_forwarded_orchestrator_defaults(
+    cli: &mut Cli,
+    scope: ForwardedRuntimeScope,
+    branch_env: Option<&str>,
+    parent_tool_use_id_env: Option<&str>,
+) {
+    if scope != ForwardedRuntimeScope::Orchestrator {
         return;
     }
-    let Some(branch_env) = branch_env else {
+
+    let Some(parent_tool_use_id) = parent_tool_use_id_env else {
         return;
     };
-    let branch = branch_env.to_owned();
+    let parent_tool_use_id = parent_tool_use_id.to_owned();
+    apply_forwarded_shadow_parent(cli, parent_tool_use_id.clone());
+    apply_forwarded_skill_parent(cli, parent_tool_use_id, branch_env.map(str::to_owned));
+}
 
+fn apply_forwarded_branch_default(cli: &mut Cli, args: &[String], branch_env: Option<&str>) {
+    let Some(branch) = forwarded_branch_default(args, branch_env) else {
+        return;
+    };
+
+    if let Some(slot) = forwarded_branch_slot(cli) {
+        *slot = branch.to_owned();
+    }
+}
+
+fn forwarded_branch_default<'a>(args: &[String], branch_env: Option<&'a str>) -> Option<&'a str> {
+    if has_explicit_flag(args, "branch") {
+        None
+    } else {
+        branch_env
+    }
+}
+
+fn forwarded_branch_slot(cli: &mut Cli) -> Option<&mut String> {
     match &mut cli.command {
-        Command::Preset(_) => {}
-        Command::Prompt(command) => {
-            if command.command.is_none() {
-                command.run.branch = branch;
-            }
+        Command::Preset(_) | Command::Skill(_) | Command::Daemon(_) => None,
+        Command::Prompt(command) => forwarded_prompt_branch_slot(command),
+        Command::Session(command) => forwarded_session_branch_slot(command),
+    }
+}
+
+fn forwarded_prompt_branch_slot(command: &mut PromptCommand) -> Option<&mut String> {
+    command.command.is_none().then_some(&mut command.run.branch)
+}
+
+fn forwarded_session_branch_slot(command: &mut SessionCommand) -> Option<&mut String> {
+    let slot = forwarded_session_branch_slot_fn(&command.command)?;
+    slot(&mut command.command)
+}
+
+type ForwardedSessionBranchSlotFn = for<'a> fn(&'a mut SessionSubcommand) -> Option<&'a mut String>;
+
+fn forwarded_session_branch_slot_fn(
+    command: &SessionSubcommand,
+) -> Option<ForwardedSessionBranchSlotFn> {
+    forwarded_session_primary_branch_slot_fn(command)
+        .or_else(|| forwarded_session_secondary_branch_slot_fn(command))
+}
+
+fn forwarded_session_primary_branch_slot_fn(
+    command: &SessionSubcommand,
+) -> Option<ForwardedSessionBranchSlotFn> {
+    if matches!(
+        command,
+        SessionSubcommand::Create(_)
+            | SessionSubcommand::Get(_)
+            | SessionSubcommand::Delete(_)
+            | SessionSubcommand::Reopen(_)
+    ) {
+        return Some(forwarded_session_basic_branch_slot);
+    }
+    if matches!(
+        command,
+        SessionSubcommand::Rebase(_) | SessionSubcommand::Handoff(_)
+    ) {
+        return Some(forwarded_session_rebase_branch_slot);
+    }
+    None
+}
+
+fn forwarded_session_secondary_branch_slot_fn(
+    command: &SessionSubcommand,
+) -> Option<ForwardedSessionBranchSlotFn> {
+    if matches!(
+        command,
+        SessionSubcommand::Pr(_) | SessionSubcommand::Close(_)
+    ) {
+        return Some(forwarded_session_pr_branch_slot);
+    }
+    if matches!(
+        command,
+        SessionSubcommand::Merge(_) | SessionSubcommand::Feedback(_)
+    ) {
+        return Some(forwarded_session_merge_branch_slot);
+    }
+    None
+}
+
+fn forwarded_session_basic_branch_slot(command: &mut SessionSubcommand) -> Option<&mut String> {
+    match command {
+        SessionSubcommand::Create(command) => Some(&mut command.branch),
+        SessionSubcommand::Get(command)
+        | SessionSubcommand::Delete(command)
+        | SessionSubcommand::Reopen(command) => Some(&mut command.branch),
+        SessionSubcommand::Fork(_)
+        | SessionSubcommand::List(_)
+        | SessionSubcommand::Graph(_)
+        | SessionSubcommand::Show(_)
+        | SessionSubcommand::Rebase(_)
+        | SessionSubcommand::Handoff(_)
+        | SessionSubcommand::Pr(_)
+        | SessionSubcommand::Close(_)
+        | SessionSubcommand::Merge(_)
+        | SessionSubcommand::Feedback(_) => None,
+    }
+}
+
+fn forwarded_session_rebase_branch_slot(command: &mut SessionSubcommand) -> Option<&mut String> {
+    match command {
+        SessionSubcommand::Rebase(command) | SessionSubcommand::Handoff(command) => {
+            Some(&mut command.branch)
         }
-        Command::Session(command) => match &mut command.command {
-            SessionSubcommand::Create(command) => command.branch = branch,
-            SessionSubcommand::Fork(_) => {}
-            SessionSubcommand::List(_) => {}
-            SessionSubcommand::Get(command) => command.branch = branch,
-            SessionSubcommand::Graph(_) => {}
-            SessionSubcommand::Show(_) => {}
-            SessionSubcommand::Delete(command) => command.branch = branch,
-            SessionSubcommand::Rebase(command) => command.branch = branch,
-            SessionSubcommand::Handoff(command) => command.branch = branch,
-            SessionSubcommand::Reopen(command) => command.branch = branch,
-            SessionSubcommand::Pr(command) => command.branch = branch,
-            SessionSubcommand::Close(command) => command.branch = branch,
-            SessionSubcommand::Merge(command) => command.branch = branch,
-            SessionSubcommand::Feedback(command) => command.branch = branch,
-        },
-        Command::Skill(_) => {}
-        Command::Daemon(_) => {}
+        _ => None,
+    }
+}
+
+fn forwarded_session_pr_branch_slot(command: &mut SessionSubcommand) -> Option<&mut String> {
+    match command {
+        SessionSubcommand::Pr(command) => Some(&mut command.branch),
+        SessionSubcommand::Close(command) => Some(&mut command.branch),
+        _ => None,
+    }
+}
+
+fn forwarded_session_merge_branch_slot(command: &mut SessionSubcommand) -> Option<&mut String> {
+    match command {
+        SessionSubcommand::Merge(command) => Some(&mut command.branch),
+        SessionSubcommand::Feedback(command) => Some(&mut command.branch),
+        _ => None,
     }
 }
 
