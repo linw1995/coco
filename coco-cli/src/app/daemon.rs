@@ -1499,7 +1499,11 @@ where
     });
 }
 
-impl<B, S> CocoCliDaemonServerHandle<B, S> {
+impl<B, S> CocoCliDaemonServerHandle<B, S>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
     pub(crate) async fn wait(self) -> Result<()> {
         let Self {
             socket_path,
@@ -1561,46 +1565,99 @@ async fn wait_daemon_tasks<B, S>(
     mut console: Option<ConsoleServerHandle>,
     mut channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
     mut message_queue_task: tokio::task::JoinHandle<Result<()>>,
-) -> Result<()> {
+) -> Result<()>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
     tokio::select! {
         socket_result = socket_task => {
-            shutdown_console(console).await?;
-            if let Some(channel_task) = channel_task {
-                abort_channel_task(channel_task).await?;
-            }
-            abort_message_queue_task(message_queue_task).await?;
-            llm.cleanup_runtime_processes().await;
-            cleanup_socket(&socket_path);
+            cleanup_daemon_tasks(
+                &socket_path,
+                &llm,
+                DaemonCleanupTasks {
+                    console,
+                    channel_task,
+                    message_queue_task: Some(message_queue_task),
+                },
+            )
+            .await?;
             socket_result.context(JoinDaemonServerSnafu).map(|_| ())
         }
         console_result = async { console.as_mut().expect("console task should exist").wait_mut().await }, if console.is_some() => {
-            if let Some(channel_task) = channel_task {
-                abort_channel_task(channel_task).await?;
-            }
-            abort_message_queue_task(message_queue_task).await?;
-            llm.cleanup_runtime_processes().await;
-            cleanup_socket(&socket_path);
+            cleanup_daemon_tasks(
+                &socket_path,
+                &llm,
+                DaemonCleanupTasks {
+                    console: None,
+                    channel_task,
+                    message_queue_task: Some(message_queue_task),
+                },
+            )
+            .await?;
             console_result.context(ConsoleSnafu)
         }
         channel_result = async { channel_task.as_mut().expect("channel task should exist").await }, if channel_task.is_some() => {
-            shutdown_console(console).await?;
-            abort_message_queue_task(message_queue_task).await?;
-            llm.cleanup_runtime_processes().await;
-            cleanup_socket(&socket_path);
+            cleanup_daemon_tasks(
+                &socket_path,
+                &llm,
+                DaemonCleanupTasks {
+                    console,
+                    channel_task: None,
+                    message_queue_task: Some(message_queue_task),
+                },
+            )
+            .await?;
             channel_result.context(JoinChannelTaskSnafu)??;
             Ok(())
         }
         message_queue_result = &mut message_queue_task => {
-            shutdown_console(console).await?;
-            if let Some(channel_task) = channel_task {
-                abort_channel_task(channel_task).await?;
-            }
-            llm.cleanup_runtime_processes().await;
-            cleanup_socket(&socket_path);
+            cleanup_daemon_tasks(
+                &socket_path,
+                &llm,
+                DaemonCleanupTasks {
+                    console,
+                    channel_task,
+                    message_queue_task: None,
+                },
+            )
+            .await?;
             message_queue_result.context(JoinMessageQueueTaskSnafu)??;
             Ok(())
         }
     }
+}
+
+struct DaemonCleanupTasks {
+    console: Option<ConsoleServerHandle>,
+    channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    message_queue_task: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+async fn cleanup_daemon_tasks<B, S>(
+    socket_path: &Path,
+    llm: &Arc<LlmService<B, S>>,
+    tasks: DaemonCleanupTasks,
+) -> Result<()>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    shutdown_console(tasks.console).await?;
+    abort_optional_channel_task(tasks.channel_task).await?;
+    abort_optional_message_queue_task(tasks.message_queue_task).await?;
+    llm.cleanup_runtime_processes().await;
+    cleanup_socket(socket_path);
+    Ok(())
+}
+
+async fn abort_optional_channel_task(
+    channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    if let Some(channel_task) = channel_task {
+        abort_channel_task(channel_task).await?;
+    }
+    Ok(())
 }
 
 async fn shutdown_console(console: Option<ConsoleServerHandle>) -> Result<()> {
@@ -1617,6 +1674,15 @@ async fn abort_channel_task(channel_task: tokio::task::JoinHandle<Result<()>>) -
         Err(source) if source.is_cancelled() => Ok(()),
         Err(source) => Err(source).context(JoinChannelTaskSnafu),
     }
+}
+
+async fn abort_optional_message_queue_task(
+    message_queue_task: Option<tokio::task::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    if let Some(message_queue_task) = message_queue_task {
+        abort_message_queue_task(message_queue_task).await?;
+    }
+    Ok(())
 }
 
 async fn abort_message_queue_task(
