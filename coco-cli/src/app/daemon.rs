@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 
 use super::{
@@ -39,7 +39,7 @@ use crate::{
     error::{
         BindDaemonSocketSnafu, ChannelSnafu, ConsoleSnafu, CoreEngineSnafu, JoinChannelTaskSnafu,
         JoinDaemonServerSnafu, JoinMessageQueueTaskSnafu, LlmSnafu, ResolveDaemonSocketRootSnafu,
-        StoreSnafu,
+        ServeDaemonSocketSnafu, StoreSnafu,
     },
 };
 
@@ -61,10 +61,7 @@ const ACTIVE_JOB_JOIN_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
     llm: Arc<LlmService<B, S>>,
-    socket_task: tokio::task::JoinHandle<()>,
-    channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
-    message_queue_task: tokio::task::JoinHandle<Result<()>>,
-    console: Option<ConsoleServerHandle>,
+    tasks: DaemonTaskGroup,
 }
 
 pub(crate) struct DaemonServerOptions<'a> {
@@ -441,56 +438,115 @@ where
     let message_queue_task = start_message_queue_task(&shared_store, &shared_engine);
     let handle_llm = llm.clone();
 
-    let socket_task = tokio::spawn(async move {
-        loop {
-            let accepted = listener.accept().await;
-            let (mut stream, _) = match accepted {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    tracing::warn!(error = %error, "daemon socket accept failed");
-                    break;
-                }
-            };
-            let shared_store = shared_store.clone();
-            let llm = llm.clone();
-            let provider_profiles = provider_profiles.clone();
-            let shared_engine = shared_engine.clone();
-            tokio::spawn(async move {
-                let response = handle_client(
-                    &mut stream,
-                    &shared_store,
-                    &llm,
-                    &provider_profiles,
-                    &shared_engine,
-                )
-                .await;
-                let payload = encode_runtime_response(&response);
-                if let Err(error) = stream.write_all(&payload).await {
-                    tracing::warn!(
-                        error = %error,
-                        exit_code = response.exit_code,
-                        "failed to write daemon client response"
-                    );
-                } else {
-                    tracing::debug!(
-                        exit_code = response.exit_code,
-                        stdout_bytes = response.stdout.len(),
-                        stderr_bytes = response.stderr.len(),
-                        "handled daemon client request"
-                    );
-                }
-            });
-        }
-    });
+    let socket_task = start_socket_task(
+        listener,
+        shared_store,
+        llm,
+        provider_profiles,
+        shared_engine,
+    );
 
     Ok(CocoCliDaemonServerHandle {
         socket_path,
         llm: handle_llm,
-        socket_task,
-        channel_task,
-        message_queue_task,
-        console,
+        tasks: DaemonTaskGroup {
+            socket_task: Some(socket_task),
+            console,
+            channel_task,
+            message_queue_task: Some(message_queue_task),
+        },
     })
+}
+
+fn start_socket_task<B, S>(
+    listener: UnixListener,
+    shared_store: S,
+    llm: Arc<LlmService<B, S>>,
+    provider_profiles: ProviderProfiles,
+    shared_engine: Arc<ConversationEngine<B, S>>,
+) -> tokio::task::JoinHandle<Result<()>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        serve_daemon_socket(
+            listener,
+            shared_store,
+            llm,
+            provider_profiles,
+            shared_engine,
+        )
+        .await
+    })
+}
+
+async fn serve_daemon_socket<B, S>(
+    listener: UnixListener,
+    shared_store: S,
+    llm: Arc<LlmService<B, S>>,
+    provider_profiles: ProviderProfiles,
+    shared_engine: Arc<ConversationEngine<B, S>>,
+) -> Result<()>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let mut clients = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context(ServeDaemonSocketSnafu)?;
+                clients.spawn(handle_daemon_client(
+                    stream,
+                    shared_store.clone(),
+                    llm.clone(),
+                    provider_profiles.clone(),
+                    shared_engine.clone(),
+                ));
+            }
+            Some(result) = clients.join_next(), if !clients.is_empty() => {
+                if let Err(source) = result {
+                    tracing::warn!(error = %source, "daemon client task failed");
+                }
+            }
+        }
+    }
+}
+
+async fn handle_daemon_client<B, S>(
+    mut stream: UnixStream,
+    shared_store: S,
+    llm: Arc<LlmService<B, S>>,
+    provider_profiles: ProviderProfiles,
+    shared_engine: Arc<ConversationEngine<B, S>>,
+) where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let response = handle_client(
+        &mut stream,
+        &shared_store,
+        &llm,
+        &provider_profiles,
+        &shared_engine,
+    )
+    .await;
+    let payload = encode_runtime_response(&response);
+    if let Err(error) = stream.write_all(&payload).await {
+        tracing::warn!(
+            error = %error,
+            exit_code = response.exit_code,
+            "failed to write daemon client response"
+        );
+    } else {
+        tracing::debug!(
+            exit_code = response.exit_code,
+            stdout_bytes = response.stdout.len(),
+            stderr_bytes = response.stderr.len(),
+            "handled daemon client request"
+        );
+    }
 }
 
 fn start_message_queue_task<B, S>(
@@ -1670,118 +1726,227 @@ impl<B, S> CocoCliDaemonServerHandle<B, S> {
         let Self {
             socket_path,
             llm,
-            socket_task,
-            channel_task,
-            message_queue_task,
-            console,
+            tasks,
         } = self;
 
-        wait_daemon_tasks(
-            socket_path,
-            llm,
-            socket_task,
-            console,
-            channel_task,
-            message_queue_task,
-        )
-        .await
+        let result = tasks.run_until_exit().await;
+        llm.cleanup_runtime_processes().await;
+        cleanup_socket(&socket_path);
+        result
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn shutdown(self) -> Result<()> {
-        self.socket_task.abort();
-        if let Some(channel_task) = &self.channel_task {
-            channel_task.abort();
-        }
-        self.message_queue_task.abort();
-        let socket_result = self.socket_task.await;
-        if let Some(channel_task) = self.channel_task {
-            match channel_task.await {
-                Ok(result) => result?,
-                Err(source) if source.is_cancelled() => {}
-                Err(source) => return Err(source).context(JoinChannelTaskSnafu),
-            }
-        }
-        match self.message_queue_task.await {
-            Ok(result) => result?,
-            Err(source) if source.is_cancelled() => {}
-            Err(source) => return Err(source).context(JoinMessageQueueTaskSnafu),
-        }
-        if let Some(console) = self.console {
-            console.shutdown().await.context(ConsoleSnafu)?;
-        }
-        self.llm.cleanup_runtime_processes().await;
-        cleanup_socket(&self.socket_path);
-        match socket_result {
-            Ok(()) => Ok(()),
-            Err(source) if source.is_cancelled() => Ok(()),
-            Err(source) => Err(source).context(JoinDaemonServerSnafu),
-        }
+        let Self {
+            socket_path,
+            llm,
+            tasks,
+        } = self;
+
+        let result = tasks.shutdown_all().await;
+        llm.cleanup_runtime_processes().await;
+        cleanup_socket(&socket_path);
+        result
     }
 }
 
-async fn wait_daemon_tasks<B, S>(
-    socket_path: PathBuf,
-    llm: Arc<LlmService<B, S>>,
-    socket_task: tokio::task::JoinHandle<()>,
-    mut console: Option<ConsoleServerHandle>,
-    mut channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
-    mut message_queue_task: tokio::task::JoinHandle<Result<()>>,
-) -> Result<()> {
-    tokio::select! {
-        socket_result = socket_task => {
-            shutdown_console(console).await?;
-            abort_channel_task(channel_task).await?;
-            abort_message_queue_task(message_queue_task).await?;
-            llm.cleanup_runtime_processes().await;
-            cleanup_socket(&socket_path);
-            socket_result.context(JoinDaemonServerSnafu).map(|_| ())
-        }
-        console_result = async { console.as_mut().expect("console task should exist").wait_mut().await }, if console.is_some() => {
-            abort_channel_task(channel_task).await?;
-            abort_message_queue_task(message_queue_task).await?;
-            llm.cleanup_runtime_processes().await;
-            cleanup_socket(&socket_path);
-            console_result.context(ConsoleSnafu)
-        }
-        channel_result = async { channel_task.as_mut().expect("channel task should exist").await }, if channel_task.is_some() => {
-            shutdown_console(console).await?;
-            abort_message_queue_task(message_queue_task).await?;
-            llm.cleanup_runtime_processes().await;
-            cleanup_socket(&socket_path);
-            channel_result.context(JoinChannelTaskSnafu)??;
-            Ok(())
-        }
-        message_queue_result = &mut message_queue_task => {
-            shutdown_console(console).await?;
-            abort_channel_task(channel_task).await?;
-            llm.cleanup_runtime_processes().await;
-            cleanup_socket(&socket_path);
-            message_queue_result.context(JoinMessageQueueTaskSnafu)??;
-            Ok(())
-        }
-    }
-}
-
-async fn shutdown_console(console: Option<ConsoleServerHandle>) -> Result<()> {
-    if let Some(console) = console {
-        console.shutdown().await.context(ConsoleSnafu)?;
-    }
-    Ok(())
-}
-
-async fn abort_channel_task(
+struct DaemonTaskGroup {
+    socket_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    console: Option<ConsoleServerHandle>,
     channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
-) -> Result<()> {
-    if let Some(channel_task) = channel_task {
-        channel_task.abort();
-        match channel_task.await {
-            Ok(result) => result,
-            Err(source) if source.is_cancelled() => Ok(()),
-            Err(source) => Err(source).context(JoinChannelTaskSnafu),
-        }?;
+    message_queue_task: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonTaskKind {
+    Socket,
+    Console,
+    Channel,
+    MessageQueue,
+}
+
+struct DaemonTaskExit {
+    kind: DaemonTaskKind,
+    result: Result<()>,
+}
+
+impl DaemonTaskGroup {
+    async fn run_until_exit(mut self) -> Result<()> {
+        let exit = self.wait_for_exit().await;
+        tracing::warn!(
+            task = ?exit.kind,
+            "daemon task exited; shutting down remaining tasks"
+        );
+        let shutdown_result = self.shutdown_all().await;
+        merge_daemon_exit_results(exit.result, shutdown_result)
     }
-    Ok(())
+
+    async fn wait_for_exit(&mut self) -> DaemonTaskExit {
+        let Self {
+            socket_task,
+            console,
+            channel_task,
+            message_queue_task,
+        } = self;
+
+        tokio::select! {
+            socket_result = async { socket_task.as_mut().expect("socket task should exist").await }, if socket_task.is_some() => {
+                *socket_task = None;
+                DaemonTaskExit::socket(socket_result)
+            }
+            console_result = async { console.as_mut().expect("console task should exist").wait_mut().await }, if console.is_some() => {
+                *console = None;
+                DaemonTaskExit::console(console_result)
+            }
+            channel_result = async { channel_task.as_mut().expect("channel task should exist").await }, if channel_task.is_some() => {
+                *channel_task = None;
+                DaemonTaskExit::channel(channel_result)
+            }
+            message_queue_result = async { message_queue_task.as_mut().expect("message queue task should exist").await }, if message_queue_task.is_some() => {
+                *message_queue_task = None;
+                DaemonTaskExit::message_queue(message_queue_result)
+            }
+            else => unreachable!("daemon task group should contain at least one task"),
+        }
+    }
+
+    async fn shutdown_all(mut self) -> Result<()> {
+        self.shutdown_remaining().await
+    }
+
+    async fn shutdown_remaining(&mut self) -> Result<()> {
+        let mut first_error = None;
+        if let Some(socket_task) = self.socket_task.take() {
+            record_daemon_shutdown_result(
+                &mut first_error,
+                DaemonTaskKind::Socket,
+                abort_socket_task(socket_task).await,
+            );
+        }
+        if let Some(console) = self.console.take() {
+            record_daemon_shutdown_result(
+                &mut first_error,
+                DaemonTaskKind::Console,
+                console.shutdown().await.context(ConsoleSnafu),
+            );
+        }
+        if let Some(channel_task) = self.channel_task.take() {
+            record_daemon_shutdown_result(
+                &mut first_error,
+                DaemonTaskKind::Channel,
+                abort_channel_task(channel_task).await,
+            );
+        }
+        if let Some(message_queue_task) = self.message_queue_task.take() {
+            record_daemon_shutdown_result(
+                &mut first_error,
+                DaemonTaskKind::MessageQueue,
+                abort_message_queue_task(message_queue_task).await,
+            );
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl DaemonTaskExit {
+    fn socket(result: std::result::Result<Result<()>, tokio::task::JoinError>) -> Self {
+        Self {
+            kind: DaemonTaskKind::Socket,
+            result: joined_socket_task_result(result),
+        }
+    }
+
+    fn console(result: coco_console::Result<()>) -> Self {
+        Self {
+            kind: DaemonTaskKind::Console,
+            result: result.context(ConsoleSnafu),
+        }
+    }
+
+    fn channel(result: std::result::Result<Result<()>, tokio::task::JoinError>) -> Self {
+        Self {
+            kind: DaemonTaskKind::Channel,
+            result: joined_channel_task_result(result),
+        }
+    }
+
+    fn message_queue(result: std::result::Result<Result<()>, tokio::task::JoinError>) -> Self {
+        Self {
+            kind: DaemonTaskKind::MessageQueue,
+            result: joined_message_queue_task_result(result),
+        }
+    }
+}
+
+fn joined_socket_task_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    result.context(JoinDaemonServerSnafu)?
+}
+
+fn joined_channel_task_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    result.context(JoinChannelTaskSnafu)?
+}
+
+fn joined_message_queue_task_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    result.context(JoinMessageQueueTaskSnafu)?
+}
+
+fn merge_daemon_exit_results(exit_result: Result<()>, shutdown_result: Result<()>) -> Result<()> {
+    match (exit_result, shutdown_result) {
+        (Err(error), Err(shutdown_error)) => {
+            tracing::error!(
+                error = %shutdown_error,
+                "failed to shut down remaining daemon tasks"
+            );
+            Err(error)
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn record_daemon_shutdown_result(
+    first_error: &mut Option<crate::Error>,
+    task: DaemonTaskKind,
+    result: Result<()>,
+) {
+    if let Err(error) = result {
+        if first_error.is_none() {
+            *first_error = Some(error);
+        } else {
+            tracing::error!(
+                task = ?task,
+                error = %error,
+                "additional daemon task shutdown failed"
+            );
+        }
+    }
+}
+
+async fn abort_socket_task(socket_task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    socket_task.abort();
+    match socket_task.await {
+        Ok(result) => result,
+        Err(source) if source.is_cancelled() => Ok(()),
+        Err(source) => Err(source).context(JoinDaemonServerSnafu),
+    }
+}
+
+async fn abort_channel_task(channel_task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    channel_task.abort();
+    match channel_task.await {
+        Ok(result) => result,
+        Err(source) if source.is_cancelled() => Ok(()),
+        Err(source) => Err(source).context(JoinChannelTaskSnafu),
+    }
 }
 
 async fn abort_message_queue_task(
@@ -1911,9 +2076,10 @@ mod tests {
     use crate::app::prompt::QueuedPromptRequest;
 
     use super::{
-        LlmBackendFailureRecoveryRequested, PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker,
-        SYSTEM_EVENT_QUEUE, SystemEvent, SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_telegram_message,
+        DaemonTaskGroup, LlmBackendFailureRecoveryRequested, PROMPT_JOB_QUEUE,
+        PromptJobMessageQueueWorker, SYSTEM_EVENT_QUEUE, SystemEvent,
+        SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher,
+        TelegramMessageQueueWorker, abort_channel_task, decode_telegram_message,
         encode_telegram_message, resolve_daemon_socket_path,
     };
 
@@ -1953,6 +2119,52 @@ mod tests {
         let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
 
         assert_eq!(decoded, message);
+    }
+
+    #[tokio::test]
+    async fn abort_channel_task_handles_cancelled_tasks() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<crate::Result<()>>().await
+        });
+        started_rx.await.unwrap();
+
+        abort_channel_task(task).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_task_group_drains_remaining_tasks_after_first_exit() {
+        let tasks = DaemonTaskGroup {
+            socket_task: Some(tokio::spawn(async {
+                std::future::pending::<crate::Result<()>>().await
+            })),
+            console: None,
+            channel_task: Some(tokio::spawn(async { Ok(()) })),
+            message_queue_task: Some(tokio::spawn(async {
+                std::future::pending::<crate::Result<()>>().await
+            })),
+        };
+
+        tasks.run_until_exit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_task_group_returns_first_exit_error_after_shutdown() {
+        let tasks = DaemonTaskGroup {
+            socket_task: Some(tokio::spawn(async {
+                std::future::pending::<crate::Result<()>>().await
+            })),
+            console: None,
+            channel_task: Some(tokio::spawn(async { Err(crate::Error::EmptyPrompt) })),
+            message_queue_task: Some(tokio::spawn(async {
+                std::future::pending::<crate::Result<()>>().await
+            })),
+        };
+
+        let error = tasks.run_until_exit().await.unwrap_err();
+
+        assert!(matches!(error, crate::Error::EmptyPrompt));
     }
 
     #[tokio::test]

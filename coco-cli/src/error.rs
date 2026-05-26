@@ -127,6 +127,9 @@ pub enum Error {
     #[snafu(display("Failed to bind daemon socket {path:?}: {source}"))]
     BindDaemonSocket { path: PathBuf, source: io::Error },
 
+    #[snafu(display("Daemon socket server failed: {source}"))]
+    ServeDaemonSocket { source: io::Error },
+
     #[snafu(display("Daemon server task failed: {source}"))]
     JoinDaemonServer { source: tokio::task::JoinError },
 
