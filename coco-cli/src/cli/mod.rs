@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -63,4 +64,81 @@ pub enum Command {
     Session(SessionCommand),
     Skill(SkillCommand),
     Daemon(DaemonCommand),
+}
+
+impl Command {
+    fn display_name(&self) -> &'static str {
+        if let Some(name) = self.preset_display_name() {
+            name
+        } else {
+            self.non_preset_display_name()
+        }
+    }
+
+    fn non_preset_display_name(&self) -> &'static str {
+        if let Some(name) = self.prompt_display_name() {
+            name
+        } else {
+            self.non_prompt_display_name()
+        }
+    }
+
+    fn non_prompt_display_name(&self) -> &'static str {
+        if let Some(name) = self.session_display_name() {
+            name
+        } else {
+            self.skill_or_daemon_display_name()
+        }
+    }
+
+    fn skill_or_daemon_display_name(&self) -> &'static str {
+        if self.is_skill() { "skill" } else { "daemon" }
+    }
+
+    fn preset_display_name(&self) -> Option<&'static str> {
+        matches!(self, Self::Preset(_)).then_some("preset")
+    }
+
+    fn prompt_display_name(&self) -> Option<&'static str> {
+        matches!(self, Self::Prompt(_)).then_some("prompt")
+    }
+
+    fn session_display_name(&self) -> Option<&'static str> {
+        matches!(self, Self::Session(_)).then_some("session")
+    }
+
+    fn is_skill(&self) -> bool {
+        matches!(self, Self::Skill(_))
+    }
+}
+
+impl fmt::Display for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.display_name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn command_display_returns_top_level_cli_names() {
+        let cases = [
+            (["coco", "preset", "list"].as_slice(), "preset"),
+            (["coco", "prompt", "hello"].as_slice(), "prompt"),
+            (["coco", "session", "list"].as_slice(), "session"),
+            (["coco", "skill", "list"].as_slice(), "skill"),
+            (
+                ["coco", "daemon", "serve", "--no-console"].as_slice(),
+                "daemon",
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let cli = Cli::try_parse_from(args).expect("command display test args should parse");
+            assert_eq!(cli.command.to_string(), expected);
+        }
+    }
 }

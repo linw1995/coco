@@ -170,7 +170,7 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     tracing::debug!(
-        command = command_name(&cli.command),
+        command = %cli.command,
         store_path = %cli.store_path.display(),
         forwarded_runtime,
         "dispatching cli command"
@@ -292,16 +292,6 @@ where
         "forwarded runtime request completed"
     );
     response
-}
-
-fn command_name(command: &Command) -> &'static str {
-    match command {
-        Command::Preset(_) => "preset",
-        Command::Prompt(_) => "prompt",
-        Command::Session(_) => "session",
-        Command::Skill(_) => "skill",
-        Command::Daemon(_) => "daemon",
-    }
 }
 
 fn forwarded_runtime_scope(session_role: Option<SessionRole>) -> ForwardedRuntimeScope {
