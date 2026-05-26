@@ -10,8 +10,7 @@ use coco_channel::{
 use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
 use coco_core::{
-    ConversationEngine, CoreService, EngineError, FixedBranchResolver, JobStatusSnapshot,
-    SYSTEM_EVENT_QUEUE,
+    ConversationEngine, CoreService, EngineError, FixedBranchResolver, SYSTEM_EVENT_QUEUE,
 };
 use coco_llm::{
     CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService, Provider,
@@ -995,37 +994,35 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
 
         log_queued_request_waiting_for_active_branch_job(log_context, &active_job);
 
-        Ok(
-            match join_or_drive_active_branch_job(&self.engine, &active_job).await {
-                Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => {
-                    PromptQueueHeadResult::Continue
-                }
-                Ok(snapshot) => {
-                    tracing::info!(
-                        message_id = %item.message_id,
-                        queue = PROMPT_JOB_QUEUE,
-                        branch = %request.branch,
-                        job_id = %request.job_id,
-                        active_job_id = %active_job.job_id,
-                        active_job_status = ?snapshot.status,
-                        "active branch prompt job still blocks queued request"
-                    );
-                    PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL)
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        message_id = %item.message_id,
-                        queue = PROMPT_JOB_QUEUE,
-                        branch = %request.branch,
-                        job_id = %request.job_id,
-                        active_job_id = %active_job.job_id,
-                        error = %error,
-                        "failed to wait for active branch prompt job before materializing queued request"
-                    );
-                    PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL)
-                }
-            },
-        )
+        Ok(match self.engine.join_job(&active_job.job_id).await {
+            Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => {
+                PromptQueueHeadResult::Continue
+            }
+            Ok(snapshot) => {
+                tracing::info!(
+                    message_id = %item.message_id,
+                    queue = PROMPT_JOB_QUEUE,
+                    branch = %request.branch,
+                    job_id = %request.job_id,
+                    active_job_id = %active_job.job_id,
+                    active_job_status = ?snapshot.status,
+                    "active branch prompt job still blocks queued request"
+                );
+                PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    message_id = %item.message_id,
+                    queue = PROMPT_JOB_QUEUE,
+                    branch = %request.branch,
+                    job_id = %request.job_id,
+                    active_job_id = %active_job.job_id,
+                    error = %error,
+                    "failed to wait for active branch prompt job before materializing queued request"
+                );
+                PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL)
+            }
+        })
     }
 
     async fn active_job_join_decision(&self, active_job: &coco_mem::Job) -> ActiveJobJoinDecision {
@@ -1334,7 +1331,8 @@ where
 
         log_queued_request_waiting_for_active_branch_job(log_context, &active_job);
 
-        let snapshot = join_or_drive_active_branch_job(engine, &active_job)
+        let snapshot = engine
+            .join_job(&active_job.job_id)
             .await
             .context(CoreEngineSnafu)?;
         if !matches!(snapshot.status, JobStatus::Finished) {
@@ -1353,21 +1351,6 @@ enum PromptQueueHeadResult {
 enum ActiveJobJoinDecision {
     Join,
     Backoff(Duration),
-}
-
-async fn join_or_drive_active_branch_job<B, S>(
-    engine: &ConversationEngine<B, S>,
-    active_job: &coco_mem::Job,
-) -> std::result::Result<JobStatusSnapshot, EngineError>
-where
-    B: CompletionBackend + 'static,
-    S: Store + Clone + Send + Sync + 'static,
-{
-    if matches!(active_job.status, JobStatus::Queued | JobStatus::Running) {
-        return engine.drive_job(&active_job.job_id).await;
-    }
-
-    engine.join_job(&active_job.job_id).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2220,7 +2203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_job_queue_worker_starts_queued_active_job_once() {
+    async fn prompt_job_queue_worker_does_not_start_idle_active_job() {
         let store = MemoryStore::new();
         let backend = FailingBackend::default();
         let calls = backend.calls.clone();
@@ -2253,18 +2236,11 @@ mod tests {
             super::PromptQueueHeadResult::Wait(duration)
                 if duration == super::ACTIVE_JOB_JOIN_INTERVAL
         ));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             engine.get_job(&active_job_id).unwrap().status,
-            JobStatus::Running
+            JobStatus::Queued
         );
-        let failure_count = store
-            .list_children(&active_job.base)
-            .unwrap()
-            .into_iter()
-            .filter(|node| matches!(node.kind, Kind::Failure(_)))
-            .count();
-        assert_eq!(failure_count, 1);
 
         let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
         assert!(matches!(
@@ -2275,66 +2251,11 @@ mod tests {
             super::PromptQueueHeadResult::Wait(duration)
                 if duration <= super::ACTIVE_JOB_JOIN_INTERVAL
         ));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn prompt_job_queue_worker_restarts_detached_running_active_job_once() {
-        let store = MemoryStore::new();
-        let backend = FailingBackend::default();
-        let calls = backend.calls.clone();
-        let llm = Arc::new(LlmService::new(store.clone(), backend));
-        llm.create_session(session_config("main")).await.unwrap();
-        let engine = ConversationEngine::new(llm);
-        let active_job = engine
-            .submit_job("main", "active work", vec![])
-            .await
-            .unwrap();
-        let active_job_id = active_job.job_id.clone();
-        store
-            .set_job_status(&active_job_id, JobStatus::Queued, JobStatus::Running)
-            .unwrap();
-        let request = QueuedPromptRequest {
-            job_id: "job-request".to_owned(),
-            branch: "main".to_owned(),
-            prompt: "queued work".to_owned(),
-            merge_parents: vec![],
-            session_patch: None,
-        };
-        store
-            .enqueue_message(PROMPT_JOB_QUEUE, json!(request.clone()))
-            .unwrap();
-        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
-
-        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
-        assert!(matches!(
-            worker
-                .handle_prompt_request_queue_head(&item, &request)
-                .await
-                .unwrap(),
-            super::PromptQueueHeadResult::Wait(duration)
-                if duration == super::ACTIVE_JOB_JOIN_INTERVAL
-        ));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            engine.get_job(&active_job_id).unwrap().status,
-            JobStatus::Running
-        );
-
-        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
-        assert!(matches!(
-            worker
-                .handle_prompt_request_queue_head(&item, &request)
-                .await
-                .unwrap(),
-            super::PromptQueueHeadResult::Wait(duration)
-                if duration <= super::ACTIVE_JOB_JOIN_INTERVAL
-        ));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
