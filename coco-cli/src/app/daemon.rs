@@ -56,7 +56,6 @@ const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const TELEGRAM_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
-const CHANNEL_BRANCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const ACTIVE_JOB_REDRIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
@@ -748,12 +747,15 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         while let Some(item) = self.peek_prompt_queue_head()? {
             match decode_prompt_job_message(item.payload.clone()) {
                 Ok(request) => {
-                    if !self
+                    match self
                         .handle_prompt_request_queue_head(&item, &request)
                         .await?
                     {
-                        tokio::time::sleep(PROMPT_JOB_QUEUE_IDLE_DELAY).await;
-                        return Ok(());
+                        PromptQueueHeadResult::Continue => {}
+                        PromptQueueHeadResult::Wait(duration) => {
+                            tokio::time::sleep(duration).await;
+                            return Ok(());
+                        }
                     }
                 }
                 Err(_) => {
@@ -785,7 +787,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         &self,
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
-    ) -> Result<bool>
+    ) -> Result<PromptQueueHeadResult>
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
@@ -807,7 +809,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                         "discarded queued prompt job request for missing branch"
                     );
                 }
-                return Ok(true);
+                return Ok(PromptQueueHeadResult::Continue);
             }
             Err(error) => return Err(error).context(StoreSnafu),
         }
@@ -828,7 +830,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                         "discarded duplicate queued prompt job request"
                     );
                 }
-                return Ok(true);
+                return Ok(PromptQueueHeadResult::Continue);
             }
             Err(coco_mem::StoreError::PromptJobNotFound { .. }) => {}
             Err(error) => return Err(error).context(StoreSnafu),
@@ -846,7 +848,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
 
         let guard = self.engine.lock_branch(&request.branch).await;
         let Some(item) = self.peek_prompt_queue_head()? else {
-            return Ok(true);
+            return Ok(PromptQueueHeadResult::Continue);
         };
         let request = match decode_prompt_job_message(item.payload.clone()) {
             Ok(request) => request,
@@ -856,10 +858,10 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     .dequeue_message(PROMPT_JOB_QUEUE)
                     .context(StoreSnafu)?
                 else {
-                    return Ok(true);
+                    return Ok(PromptQueueHeadResult::Continue);
                 };
                 self.handle_item(item).await;
-                return Ok(true);
+                return Ok(PromptQueueHeadResult::Continue);
             }
         };
 
@@ -880,7 +882,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                         "discarded queued prompt job request for missing branch"
                     );
                 }
-                return Ok(true);
+                return Ok(PromptQueueHeadResult::Continue);
             }
             Err(error) => return Err(error).context(StoreSnafu),
         }
@@ -901,7 +903,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                         "discarded duplicate queued prompt job request"
                     );
                 }
-                return Ok(true);
+                return Ok(PromptQueueHeadResult::Continue);
             }
             Err(coco_mem::StoreError::PromptJobNotFound { .. }) => {}
             Err(error) => return Err(error).context(StoreSnafu),
@@ -922,10 +924,10 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .dequeue_message(PROMPT_JOB_QUEUE)
             .context(StoreSnafu)?
         else {
-            return Ok(true);
+            return Ok(PromptQueueHeadResult::Continue);
         };
         self.handle_item(item).await;
-        Ok(true)
+        Ok(PromptQueueHeadResult::Continue)
     }
 
     async fn wait_for_active_branch_job(
@@ -933,36 +935,34 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
         active_job: coco_mem::Job,
-    ) -> bool
+    ) -> PromptQueueHeadResult
     where
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        tracing::info!(
-            message_id = %item.message_id,
-            queue = PROMPT_JOB_QUEUE,
-            branch = %request.branch,
-            job_id = %request.job_id,
-            active_job_id = %active_job.job_id,
-            active_job_status = ?active_job.status,
-            "waiting to materialize queued prompt job request behind active branch job"
-        );
-
-        if !self.should_drive_active_job(&active_job).await {
-            tracing::info!(
-                message_id = %item.message_id,
-                queue = PROMPT_JOB_QUEUE,
-                branch = %request.branch,
-                job_id = %request.job_id,
-                active_job_id = %active_job.job_id,
-                active_job_status = ?active_job.status,
-                "active branch prompt job was driven recently; queued request will wait"
+        let log_context = QueuedBranchWaitLogContext {
+            message_id: &item.message_id,
+            queue: PROMPT_JOB_QUEUE,
+            branch: &request.branch,
+            job_id: Some(&request.job_id),
+        };
+        if let ActiveJobDriveDecision::Backoff(duration) =
+            self.active_job_drive_decision(&active_job).await
+        {
+            log_queued_request_active_branch_job_redrive_backoff(
+                log_context,
+                &active_job,
+                duration,
             );
-            return false;
+            return PromptQueueHeadResult::Wait(duration);
         }
 
+        log_queued_request_waiting_for_active_branch_job(log_context, &active_job);
+
         match self.engine.drive_job(&active_job.job_id).await {
-            Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => true,
+            Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => {
+                PromptQueueHeadResult::Continue
+            }
             Ok(snapshot) => {
                 tracing::info!(
                     message_id = %item.message_id,
@@ -973,7 +973,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     active_job_status = ?snapshot.status,
                     "active branch prompt job still blocks queued request"
                 );
-                false
+                PromptQueueHeadResult::Wait(ACTIVE_JOB_REDRIVE_INTERVAL)
             }
             Err(error) => {
                 tracing::warn!(
@@ -985,14 +985,17 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     error = %error,
                     "failed to wait for active branch prompt job before materializing queued request"
                 );
-                false
+                PromptQueueHeadResult::Wait(ACTIVE_JOB_REDRIVE_INTERVAL)
             }
         }
     }
 
-    async fn should_drive_active_job(&self, active_job: &coco_mem::Job) -> bool {
+    async fn active_job_drive_decision(
+        &self,
+        active_job: &coco_mem::Job,
+    ) -> ActiveJobDriveDecision {
         let mut active_job_drives = self.active_job_drives.lock().await;
-        should_drive_active_job_with_backoff(&mut active_job_drives, active_job)
+        active_job_drive_decision_with_backoff(&mut active_job_drives, active_job)
     }
 
     async fn handle_item(&self, item: MessageQueueItem)
@@ -1212,7 +1215,8 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
         );
 
         if let Err(error) =
-            wait_for_branch_to_accept_channel_prompt(&self.engine, &self.branch).await
+            wait_for_branch_to_accept_channel_prompt(&self.engine, &self.branch, &item.message_id)
+                .await
         {
             tracing::error!(
                 message_id = %item.message_id,
@@ -1253,6 +1257,7 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
 async fn wait_for_branch_to_accept_channel_prompt<B, S>(
     engine: &ConversationEngine<B, S>,
     branch: &str,
+    message_id: &str,
 ) -> std::result::Result<(), coco_core::EngineError>
 where
     B: CompletionBackend + 'static,
@@ -1265,43 +1270,125 @@ where
             return Ok(());
         };
 
-        tracing::info!(
-            branch = %branch,
-            active_job_id = %active_job.job_id,
-            active_job_status = ?active_job.status,
-            "waiting for active branch prompt job before handling queued telegram message"
-        );
-
-        if !should_drive_active_job_with_backoff(&mut active_job_drives, &active_job) {
-            tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
+        let log_context = QueuedBranchWaitLogContext {
+            message_id,
+            queue: TELEGRAM_INBOUND_QUEUE,
+            branch,
+            job_id: None,
+        };
+        if let ActiveJobDriveDecision::Backoff(duration) =
+            active_job_drive_decision_with_backoff(&mut active_job_drives, &active_job)
+        {
+            log_queued_request_active_branch_job_redrive_backoff(
+                log_context,
+                &active_job,
+                duration,
+            );
+            tokio::time::sleep(duration).await;
             continue;
         }
 
+        log_queued_request_waiting_for_active_branch_job(log_context, &active_job);
+
         let snapshot = engine.drive_job(&active_job.job_id).await?;
         if !matches!(snapshot.status, JobStatus::Finished) {
-            tokio::time::sleep(CHANNEL_BRANCH_WAIT_POLL_INTERVAL).await;
+            tokio::time::sleep(ACTIVE_JOB_REDRIVE_INTERVAL).await;
         }
     }
 }
 
-fn should_drive_active_job_with_backoff(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptQueueHeadResult {
+    Continue,
+    Wait(Duration),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveJobDriveDecision {
+    Drive,
+    Backoff(Duration),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueuedBranchWaitLogContext<'a> {
+    message_id: &'a str,
+    queue: &'a str,
+    branch: &'a str,
+    job_id: Option<&'a str>,
+}
+
+fn active_job_drive_decision_with_backoff(
     active_job_drives: &mut HashMap<String, Instant>,
     active_job: &coco_mem::Job,
-) -> bool {
+) -> ActiveJobDriveDecision {
     let now = Instant::now();
     active_job_drives
         .retain(|_, last_drive| now.duration_since(*last_drive) < ACTIVE_JOB_REDRIVE_INTERVAL);
 
     if matches!(active_job.status, JobStatus::Running)
-        && active_job_drives
-            .get(&active_job.job_id)
-            .is_some_and(|last_drive| now.duration_since(*last_drive) < ACTIVE_JOB_REDRIVE_INTERVAL)
+        && let Some(last_drive) = active_job_drives.get(&active_job.job_id)
     {
-        return false;
+        let elapsed = now.duration_since(*last_drive);
+        if elapsed < ACTIVE_JOB_REDRIVE_INTERVAL {
+            return ActiveJobDriveDecision::Backoff(ACTIVE_JOB_REDRIVE_INTERVAL - elapsed);
+        }
     }
 
     active_job_drives.insert(active_job.job_id.clone(), now);
-    true
+    ActiveJobDriveDecision::Drive
+}
+
+fn log_queued_request_active_branch_job_redrive_backoff(
+    context: QueuedBranchWaitLogContext<'_>,
+    active_job: &coco_mem::Job,
+    duration: Duration,
+) {
+    match context.job_id {
+        Some(job_id) => tracing::debug!(
+            message_id = %context.message_id,
+            queue = context.queue,
+            branch = %context.branch,
+            job_id = %job_id,
+            active_job_id = %active_job.job_id,
+            active_job_status = ?active_job.status,
+            wait_ms = duration.as_millis(),
+            "active branch prompt job was driven recently; queued request will wait"
+        ),
+        None => tracing::debug!(
+            message_id = %context.message_id,
+            queue = context.queue,
+            branch = %context.branch,
+            active_job_id = %active_job.job_id,
+            active_job_status = ?active_job.status,
+            wait_ms = duration.as_millis(),
+            "active branch prompt job was driven recently; queued request will wait"
+        ),
+    }
+}
+
+fn log_queued_request_waiting_for_active_branch_job(
+    context: QueuedBranchWaitLogContext<'_>,
+    active_job: &coco_mem::Job,
+) {
+    match context.job_id {
+        Some(job_id) => tracing::info!(
+            message_id = %context.message_id,
+            queue = context.queue,
+            branch = %context.branch,
+            job_id = %job_id,
+            active_job_id = %active_job.job_id,
+            active_job_status = ?active_job.status,
+            "waiting for active branch prompt job before handling queued request"
+        ),
+        None => tracing::info!(
+            message_id = %context.message_id,
+            queue = context.queue,
+            branch = %context.branch,
+            active_job_id = %active_job.job_id,
+            active_job_status = ?active_job.status,
+            "waiting for active branch prompt job before handling queued request"
+        ),
+    }
 }
 
 fn is_missing_branch_error(error: &crate::error::Error) -> bool {
@@ -1997,12 +2084,14 @@ mod tests {
         let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
 
         let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
-        assert!(
-            !worker
+        assert!(matches!(
+            worker
                 .handle_prompt_request_queue_head(&item, &request)
                 .await
-                .unwrap()
-        );
+                .unwrap(),
+            super::PromptQueueHeadResult::Wait(duration)
+                if duration == super::ACTIVE_JOB_REDRIVE_INTERVAL
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             engine.get_job(&active_job_id).unwrap().status,
@@ -2010,12 +2099,14 @@ mod tests {
         );
 
         let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
-        assert!(
-            !worker
+        assert!(matches!(
+            worker
                 .handle_prompt_request_queue_head(&item, &request)
                 .await
-                .unwrap()
-        );
+                .unwrap(),
+            super::PromptQueueHeadResult::Wait(duration)
+                if duration <= super::ACTIVE_JOB_REDRIVE_INTERVAL
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
@@ -2182,9 +2273,9 @@ mod tests {
             Instant::now() - super::ACTIVE_JOB_REDRIVE_INTERVAL,
         )]);
 
-        assert!(super::should_drive_active_job_with_backoff(
-            &mut active_job_drives,
-            &active_job,
+        assert!(matches!(
+            super::active_job_drive_decision_with_backoff(&mut active_job_drives, &active_job),
+            super::ActiveJobDriveDecision::Drive
         ));
 
         assert!(!active_job_drives.contains_key(&stale_job_id));
