@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{Arc, Mutex as StdMutex},
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, MessageQueueStore, Node,
@@ -16,7 +12,7 @@ use coco_llm::{
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jiff::Timestamp;
 use serde::Serialize;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, watch};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::{BatchPromptResult, BranchPromptOutcome, BranchPromptRequest, EngineError};
@@ -24,7 +20,6 @@ use crate::{BatchPromptResult, BranchPromptOutcome, BranchPromptRequest, EngineE
 type JobResult = std::result::Result<String, EngineError>;
 type InflightJob = Shared<BoxFuture<'static, JobResult>>;
 type InflightJobTable = Arc<AsyncMutex<HashMap<String, InflightJob>>>;
-type JobStatusWatchTable = Arc<StdMutex<HashMap<String, watch::Sender<u64>>>>;
 pub type BranchLockGuard = coco_llm::BranchLockGuard;
 pub const SYSTEM_EVENT_QUEUE: &str = "system";
 const LLM_BACKEND_FAILURE_RECOVERY_REQUESTED: &str = "llm.backend_failure.recovery_requested";
@@ -53,7 +48,6 @@ struct PromptReply {
 pub struct ConversationEngine<B = RigBackend, S = MemoryStore> {
     service: Arc<LlmService<B, S>>,
     inflight_jobs: InflightJobTable,
-    job_status_watchers: JobStatusWatchTable,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -89,7 +83,6 @@ impl<B, S> Clone for ConversationEngine<B, S> {
         Self {
             service: self.service.clone(),
             inflight_jobs: self.inflight_jobs.clone(),
-            job_status_watchers: self.job_status_watchers.clone(),
         }
     }
 }
@@ -105,7 +98,6 @@ impl<B, S> ConversationEngine<B, S> {
         Self {
             service,
             inflight_jobs: Arc::new(AsyncMutex::new(HashMap::new())),
-            job_status_watchers: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -426,7 +418,7 @@ where
             expected_work_branch,
             next_work_branch,
         )?;
-        self.notify_job_status_changed(job_id);
+        self.service.notify_job_status_changed(job_id);
         self.build_job_status_snapshot(&job)
     }
 
@@ -471,10 +463,11 @@ where
         &self,
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let mut job_status = self.subscribe_job_status(job_id);
+        let mut job_status = self.service.subscribe_job_status(job_id);
         loop {
             let snapshot = self.get_job(job_id)?;
             if matches!(snapshot.status, JobStatus::Finished) {
+                self.service.clear_job_status_watch(job_id);
                 return Ok(snapshot);
             }
 
@@ -522,7 +515,7 @@ where
         let result = inflight_job.clone().await;
 
         self.inflight_jobs.lock().await.remove(&job_id);
-        self.notify_job_status_changed(&job_id);
+        self.service.notify_job_status_changed(&job_id);
 
         result
     }
@@ -549,7 +542,7 @@ where
                 JobStatus::Queued,
                 JobStatus::Running,
             )?;
-            self.notify_job_status_changed(job_id);
+            self.service.notify_job_status_changed(job_id);
             tracing::info!(
                 job_id = %job.job_id,
                 branch = %job.branch,
@@ -759,7 +752,7 @@ where
             self.service
                 .store()
                 .set_job_work_branch(&job.job_id, &job.work_branch, &job.branch)?;
-        self.notify_job_status_changed(&job.job_id);
+        self.service.notify_job_status_changed(&job.job_id);
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
@@ -779,7 +772,7 @@ where
             JobStatus::Running,
             JobStatus::Finished,
         )?;
-        self.notify_job_status_changed(&job.job_id);
+        self.service.notify_job_status_changed(&job.job_id);
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
@@ -875,32 +868,6 @@ where
                     .shared()
             })
             .clone()
-    }
-
-    fn subscribe_job_status(&self, job_id: &str) -> watch::Receiver<u64> {
-        let mut watchers = self
-            .job_status_watchers
-            .lock()
-            .expect("job status watcher table should not be poisoned");
-        watchers
-            .entry(job_id.to_owned())
-            .or_insert_with(|| {
-                let (sender, _receiver) = watch::channel(0);
-                sender
-            })
-            .subscribe()
-    }
-
-    fn notify_job_status_changed(&self, job_id: &str) {
-        let sender = self
-            .job_status_watchers
-            .lock()
-            .expect("job status watcher table should not be poisoned")
-            .get(job_id)
-            .cloned();
-        if let Some(sender) = sender {
-            sender.send_modify(|version| *version = version.wrapping_add(1));
-        }
     }
 }
 
