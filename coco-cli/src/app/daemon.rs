@@ -1607,15 +1607,27 @@ async fn shutdown_console(console: Option<ConsoleServerHandle>) -> Result<()> {
 async fn abort_channel_task(
     channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
 ) -> Result<()> {
-    if let Some(channel_task) = channel_task {
-        channel_task.abort();
-        match channel_task.await {
-            Ok(result) => result,
-            Err(source) if source.is_cancelled() => Ok(()),
-            Err(source) => Err(source).context(JoinChannelTaskSnafu),
-        }?;
+    let Some(channel_task) = channel_task else {
+        return Ok(());
+    };
+    abort_joined_channel_task(channel_task).await
+}
+
+async fn abort_joined_channel_task(
+    channel_task: tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    channel_task.abort();
+    join_aborted_channel_task(channel_task).await
+}
+
+async fn join_aborted_channel_task(
+    channel_task: tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    match channel_task.await {
+        Ok(result) => result,
+        Err(source) if source.is_cancelled() => Ok(()),
+        Err(source) => Err(source).context(JoinChannelTaskSnafu),
     }
-    Ok(())
 }
 
 async fn abort_message_queue_task(
@@ -1747,8 +1759,8 @@ mod tests {
     use super::{
         PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, SYSTEM_EVENT_QUEUE,
         SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher,
-        TelegramMessageQueueWorker, decode_telegram_message, encode_telegram_message,
-        resolve_daemon_socket_path,
+        TelegramMessageQueueWorker, abort_channel_task, decode_telegram_message,
+        encode_telegram_message, resolve_daemon_socket_path,
     };
 
     #[test]
@@ -1787,6 +1799,20 @@ mod tests {
         let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
 
         assert_eq!(decoded, message);
+    }
+
+    #[tokio::test]
+    async fn abort_channel_task_handles_absent_and_cancelled_tasks() {
+        abort_channel_task(None).await.unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<crate::Result<()>>().await
+        });
+        started_rx.await.unwrap();
+
+        abort_channel_task(Some(task)).await.unwrap();
     }
 
     #[tokio::test]
