@@ -1,4 +1,3 @@
-use std::fmt;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -67,7 +66,11 @@ pub enum Command {
 }
 
 impl Command {
-    fn display_name(&self) -> &'static str {
+    // Clap exposes the matched subcommand name through ArgMatches and the
+    // generated Command metadata, but the typed enum value does not retain
+    // that token after parsing. Keep the mapping explicit and test it against
+    // clap's generated metadata.
+    pub fn name(&self) -> &'static str {
         match self {
             Self::Preset(_) => "preset",
             Self::Prompt(_) => "prompt",
@@ -78,19 +81,13 @@ impl Command {
     }
 }
 
-impl fmt::Display for Command {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.display_name())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::Cli;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[test]
-    fn command_display_returns_top_level_cli_names() {
+    fn command_name_matches_clap_subcommand_names() {
         let cases = [
             (["coco", "preset", "list"].as_slice(), "preset"),
             (["coco", "prompt", "hello"].as_slice(), "prompt"),
@@ -101,10 +98,21 @@ mod tests {
                 "daemon",
             ),
         ];
+        let expected_names = cases
+            .iter()
+            .map(|(_, expected)| *expected)
+            .collect::<Vec<_>>();
+        let clap_command = Cli::command();
+        let clap_names = clap_command
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(clap_names, expected_names);
 
         for (args, expected) in cases {
-            let cli = Cli::try_parse_from(args).expect("command display test args should parse");
-            assert_eq!(cli.command.to_string(), expected);
+            let cli = Cli::try_parse_from(args).expect("command name test args should parse");
+            assert_eq!(cli.command.name(), expected);
         }
     }
 }

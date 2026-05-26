@@ -170,7 +170,7 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     tracing::debug!(
-        command = %cli.command,
+        command = cli.command.name(),
         store_path = %cli.store_path.display(),
         forwarded_runtime,
         "dispatching cli command"
