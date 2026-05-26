@@ -335,55 +335,97 @@ where
 }
 
 fn should_forward_runtime_stdin(args: &[String]) -> bool {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--store-path" || arg == "--daemon-socket" {
-            index += 2;
-            continue;
-        }
-        if arg.starts_with("--store-path=") || arg.starts_with("--daemon-socket=") {
-            index += 1;
-            continue;
-        }
-        if arg.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        break;
-    }
-
-    if args.get(index).map(String::as_str) != Some("prompt") {
+    let Some(prompt_args) = runtime_prompt_args(args) else {
         return false;
-    }
-    index += 1;
+    };
 
-    while index < args.len() {
-        let arg = &args[index];
-        match arg.as_str() {
-            "status" | "branch-status" | "worker" => return false,
-            "--" => return index + 1 == args.len(),
-            "--branch" | "--role" | "--tool" => {
-                index += 2;
-            }
-            "--async" | "--json" | "--clear-tools" => {
-                index += 1;
-            }
-            value
-                if value.starts_with("--branch=")
-                    || value.starts_with("--role=")
-                    || value.starts_with("--tool=") =>
-            {
-                index += 1;
-            }
-            value if value.starts_with('-') => {
-                index += 1;
-            }
-            _ => return false,
+    prompt_accepts_forwarded_stdin(prompt_args)
+}
+
+fn runtime_prompt_args(args: &[String]) -> Option<&[String]> {
+    let index = first_runtime_command_index(args);
+    if args.get(index).map(String::as_str) == Some("prompt") {
+        Some(&args[index + 1..])
+    } else {
+        None
+    }
+}
+
+fn prompt_accepts_forwarded_stdin(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        match prompt_stdin_arg(arg) {
+            PromptStdinArg::Option(width) => index += width,
+            PromptStdinArg::EndOfOptions => return index + 1 == args.len(),
+            PromptStdinArg::TextOrSubcommand => return false,
         }
     }
 
     true
+}
+
+fn first_runtime_command_index(args: &[String]) -> usize {
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        let Some(width) = runtime_global_option_width(arg) else {
+            break;
+        };
+        index += width;
+    }
+    index
+}
+
+fn runtime_global_option_width(arg: &str) -> Option<usize> {
+    option_width(arg, &["--store-path", "--daemon-socket"], &[])
+}
+
+fn prompt_option_width(arg: &str) -> Option<usize> {
+    option_width(
+        arg,
+        &["--branch", "--role", "--tool"],
+        &["--async", "--json", "--clear-tools"],
+    )
+}
+
+fn option_width(arg: &str, value_options: &[&str], flag_options: &[&str]) -> Option<usize> {
+    if value_options.contains(&arg) {
+        return Some(2);
+    }
+    if flag_options.contains(&arg) {
+        return Some(1);
+    }
+    if has_inline_option_value(arg, value_options) {
+        return Some(1);
+    }
+    if arg.starts_with('-') {
+        return Some(1);
+    }
+    None
+}
+
+fn has_inline_option_value(arg: &str, value_options: &[&str]) -> bool {
+    value_options.iter().any(|option| {
+        arg.strip_prefix(option)
+            .is_some_and(|suffix| suffix.starts_with('='))
+    })
+}
+
+enum PromptStdinArg {
+    Option(usize),
+    EndOfOptions,
+    TextOrSubcommand,
+}
+
+fn prompt_stdin_arg(arg: &str) -> PromptStdinArg {
+    if ["status", "branch-status", "worker"].contains(&arg) {
+        return PromptStdinArg::TextOrSubcommand;
+    }
+    if arg == "--" {
+        return PromptStdinArg::EndOfOptions;
+    }
+    prompt_option_width(arg)
+        .map(PromptStdinArg::Option)
+        .unwrap_or(PromptStdinArg::TextOrSubcommand)
 }
 
 #[cfg(test)]
@@ -398,6 +440,10 @@ mod tests {
     use coco_cli::{COCO_DAEMON_SOCKET_ENV, resolve_default_daemon_socket_path};
     use coco_llm::COCO_CLI_RUNTIME_SOCKET_ENV;
     use tempfile::tempdir;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
 
     fn with_env_vars<T>(entries: &[(&str, Option<&str>)], run: impl FnOnce() -> T) -> T {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -572,27 +618,27 @@ mod tests {
 
     #[test]
     fn runtime_socket_stdin_is_only_forwarded_for_prompt_without_text() {
-        assert!(!should_forward_runtime_stdin(&[
-            "session".to_owned(),
-            "list".to_owned(),
-        ]));
-        assert!(!should_forward_runtime_stdin(&[
-            "prompt".to_owned(),
-            "status".to_owned(),
-            "--job".to_owned(),
-            "job-1".to_owned(),
-        ]));
-        assert!(!should_forward_runtime_stdin(&[
-            "prompt".to_owned(),
-            "--branch".to_owned(),
-            "draft".to_owned(),
-            "hello".to_owned(),
-        ]));
-        assert!(should_forward_runtime_stdin(&[
-            "prompt".to_owned(),
-            "--branch".to_owned(),
-            "draft".to_owned(),
-        ]));
+        assert!(!should_forward_runtime_stdin(&args(&["session", "list"])));
+        assert!(!should_forward_runtime_stdin(&args(&[
+            "prompt", "status", "--job", "job-1",
+        ])));
+        assert!(!should_forward_runtime_stdin(&args(&[
+            "prompt", "--branch", "draft", "hello",
+        ])));
+        assert!(should_forward_runtime_stdin(&args(&[
+            "prompt", "--branch", "draft",
+        ])));
+        assert!(should_forward_runtime_stdin(&args(&[
+            "--store-path=/tmp/store",
+            "--daemon-socket",
+            "/tmp/coco.sock",
+            "prompt",
+            "--branch=draft",
+        ])));
+        assert!(should_forward_runtime_stdin(&args(&["prompt", "--"])));
+        assert!(!should_forward_runtime_stdin(&args(&[
+            "prompt", "--", "hello",
+        ])));
     }
 
     #[test]
