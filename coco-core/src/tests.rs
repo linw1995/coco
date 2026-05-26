@@ -636,7 +636,7 @@ async fn llm_engine_coalesces_duplicate_drive_job_calls() {
 }
 
 #[tokio::test]
-async fn llm_engine_join_job_does_not_start_idle_job() {
+async fn llm_engine_join_job_waits_for_idle_job_without_starting_it() {
     let store = MemoryStore::new();
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
@@ -649,10 +649,56 @@ async fn llm_engine_join_job_does_not_start_idle_job() {
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
 
-    let snapshot = engine.join_job(&job.job_id).await.unwrap();
+    let result =
+        tokio::time::timeout(Duration::from_millis(20), engine.join_job(&job.job_id)).await;
 
+    assert!(result.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(snapshot.status, JobStatus::Queued);
+    assert_eq!(
+        store.get_job(&job.job_id).unwrap().status,
+        JobStatus::Queued
+    );
+}
+
+#[tokio::test]
+async fn llm_engine_join_job_waits_for_later_driver_notification() {
+    let store = MemoryStore::new();
+    let backend = BlockingBackend {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let started = backend.started.clone();
+    let release = backend.release.clone();
+    let calls = backend.calls.clone();
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+
+    let joiner = tokio::spawn({
+        let engine = engine.clone();
+        let job_id = job.job_id.clone();
+        async move { engine.join_job(&job_id).await }
+    });
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!joiner.is_finished());
+
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let job_id = job.job_id.clone();
+        async move { engine.drive_job(&job_id).await }
+    });
+    started.notified().await;
+    release.notify_waiters();
+
+    let driven = driver.await.unwrap().unwrap();
+    let joined = joiner.await.unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(driven.status, JobStatus::Finished);
+    assert_eq!(joined.status, JobStatus::Finished);
+    assert_eq!(driven.head, joined.head);
 }
 
 #[tokio::test]
