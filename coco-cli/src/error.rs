@@ -63,14 +63,14 @@ pub enum Error {
     ParsePresetAdditionalParams { source: serde_json::Error },
 
     #[snafu(display(
-        "Session additional params must be a JSON object, got {kind}",
-        kind = JsonValueKind(value)
+        "Session additional params must be a JSON object, got {value}",
+        value = JsonValuePreview(value)
     ))]
     InvalidSessionAdditionalParamsType { value: serde_json::Value },
 
     #[snafu(display(
-        "Preset additional params must be a JSON object, got {kind}",
-        kind = JsonValueKind(value)
+        "Preset additional params must be a JSON object, got {value}",
+        value = JsonValuePreview(value)
     ))]
     InvalidPresetAdditionalParamsType { value: serde_json::Value },
 
@@ -157,68 +157,40 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-struct JsonValueKind<'a>(&'a serde_json::Value);
+struct JsonValuePreview<'a>(&'a serde_json::Value);
 
-impl fmt::Display for JsonValueKind<'_> {
+impl fmt::Display for JsonValuePreview<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(json_value_kind(self.0))
+        write_json_value_preview(f, self.0)
     }
 }
 
-fn json_value_kind(value: &serde_json::Value) -> &'static str {
-    if value.is_null() {
-        "null"
-    } else {
-        non_null_json_value_kind(value)
+fn write_json_value_preview(f: &mut fmt::Formatter<'_>, value: &serde_json::Value) -> fmt::Result {
+    match value {
+        serde_json::Value::Array(_) => f.write_str("[..]"),
+        serde_json::Value::Object(_) => f.write_str("{..}"),
+        _ => write!(f, "{value}"),
     }
-}
-
-fn non_null_json_value_kind(value: &serde_json::Value) -> &'static str {
-    if value.is_boolean() {
-        "boolean"
-    } else {
-        scalar_json_value_kind(value)
-    }
-}
-
-fn scalar_json_value_kind(value: &serde_json::Value) -> &'static str {
-    if value.is_number() {
-        "number"
-    } else {
-        string_or_container_json_value_kind(value)
-    }
-}
-
-fn string_or_container_json_value_kind(value: &serde_json::Value) -> &'static str {
-    if value.is_string() {
-        "string"
-    } else {
-        container_json_value_kind(value)
-    }
-}
-
-fn container_json_value_kind(value: &serde_json::Value) -> &'static str {
-    if value.is_array() { "array" } else { "object" }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::json_value_kind;
+    use super::JsonValuePreview;
     use serde_json::json;
 
     #[test]
-    fn json_value_kind_names_all_value_variants() {
+    fn json_value_preview_renders_scalars_and_elides_nested_values() {
         let cases = [
             (serde_json::Value::Null, "null"),
-            (json!(true), "boolean"),
-            (json!(1), "number"),
-            (json!("text"), "string"),
-            (json!([]), "array"),
-            (json!({}), "object"),
+            (json!(true), "true"),
+            (json!(1), "1"),
+            (json!("text"), "\"text\""),
+            (json!([1, {"nested": true}]), "[..]"),
+            (json!({"nested": [1, 2]}), "{..}"),
         ];
 
         for (value, expected) in cases {
-            assert_eq!(json_value_kind(&value), expected);
+            assert_eq!(JsonValuePreview(&value).to_string(), expected);
         }
     }
 }
