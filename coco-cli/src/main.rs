@@ -392,8 +392,8 @@ mod tests {
 
     use super::{
         DaemonSocketSource, ForwardSocketError, ForwardingTarget, collect_forwarded_stdin,
-        is_daemon_serve_command, resolve_forwarding_target, should_fallback_to_local,
-        should_forward_runtime_stdin,
+        forward_to_socket, is_daemon_serve_command, resolve_forwarding_target,
+        should_fallback_to_local, should_forward_runtime_stdin,
     };
     use coco_cli::{COCO_DAEMON_SOCKET_ENV, resolve_default_daemon_socket_path};
     use coco_llm::COCO_CLI_RUNTIME_SOCKET_ENV;
@@ -649,6 +649,58 @@ mod tests {
         };
         assert!(
             parse
+                .to_string()
+                .starts_with("failed to parse coco-cli daemon response:")
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_to_socket_reports_connect_context() {
+        let socket_path = tempdir().unwrap().path().join("missing.sock");
+        let error = forward_to_socket(socket_path.to_str().unwrap(), &[], false)
+            .await
+            .unwrap_err();
+
+        let ForwardSocketError::Connect {
+            socket_path: reported_path,
+            source,
+        } = error
+        else {
+            panic!("expected connect error");
+        };
+        assert_eq!(reported_path, socket_path.to_string_lossy());
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn forward_to_socket_reports_parse_context() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("coco.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut request)
+                .await
+                .unwrap();
+            assert!(!request.is_empty());
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"not json")
+                .await
+                .unwrap();
+        });
+
+        let error = forward_to_socket(
+            socket_path.to_str().unwrap(),
+            &["session".to_owned(), "list".to_owned()],
+            false,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, ForwardSocketError::ParseResponse { .. }));
+        assert!(
+            error
                 .to_string()
                 .starts_with("failed to parse coco-cli daemon response:")
         );
