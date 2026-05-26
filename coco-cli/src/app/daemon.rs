@@ -1565,14 +1565,18 @@ async fn wait_daemon_tasks<B, S>(
     tokio::select! {
         socket_result = socket_task => {
             shutdown_console(console).await?;
-            abort_channel_task(channel_task).await?;
+            if let Some(channel_task) = channel_task {
+                abort_channel_task(channel_task).await?;
+            }
             abort_message_queue_task(message_queue_task).await?;
             llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             socket_result.context(JoinDaemonServerSnafu).map(|_| ())
         }
         console_result = async { console.as_mut().expect("console task should exist").wait_mut().await }, if console.is_some() => {
-            abort_channel_task(channel_task).await?;
+            if let Some(channel_task) = channel_task {
+                abort_channel_task(channel_task).await?;
+            }
             abort_message_queue_task(message_queue_task).await?;
             llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
@@ -1588,7 +1592,9 @@ async fn wait_daemon_tasks<B, S>(
         }
         message_queue_result = &mut message_queue_task => {
             shutdown_console(console).await?;
-            abort_channel_task(channel_task).await?;
+            if let Some(channel_task) = channel_task {
+                abort_channel_task(channel_task).await?;
+            }
             llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             message_queue_result.context(JoinMessageQueueTaskSnafu)??;
@@ -1604,25 +1610,8 @@ async fn shutdown_console(console: Option<ConsoleServerHandle>) -> Result<()> {
     Ok(())
 }
 
-async fn abort_channel_task(
-    channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
-) -> Result<()> {
-    let Some(channel_task) = channel_task else {
-        return Ok(());
-    };
-    abort_joined_channel_task(channel_task).await
-}
-
-async fn abort_joined_channel_task(
-    channel_task: tokio::task::JoinHandle<Result<()>>,
-) -> Result<()> {
+async fn abort_channel_task(channel_task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
     channel_task.abort();
-    join_aborted_channel_task(channel_task).await
-}
-
-async fn join_aborted_channel_task(
-    channel_task: tokio::task::JoinHandle<Result<()>>,
-) -> Result<()> {
     match channel_task.await {
         Ok(result) => result,
         Err(source) if source.is_cancelled() => Ok(()),
@@ -1802,9 +1791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_channel_task_handles_absent_and_cancelled_tasks() {
-        abort_channel_task(None).await.unwrap();
-
+    async fn abort_channel_task_handles_cancelled_tasks() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let _ = started_tx.send(());
@@ -1812,7 +1799,7 @@ mod tests {
         });
         started_rx.await.unwrap();
 
-        abort_channel_task(Some(task)).await.unwrap();
+        abort_channel_task(task).await.unwrap();
     }
 
     #[tokio::test]
