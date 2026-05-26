@@ -68,47 +68,13 @@ pub enum Command {
 
 impl Command {
     fn display_name(&self) -> &'static str {
-        if let Some(name) = self.preset_display_name() {
-            name
-        } else {
-            self.non_preset_display_name()
+        match self {
+            Self::Preset(_) => "preset",
+            Self::Prompt(_) => "prompt",
+            Self::Session(_) => "session",
+            Self::Skill(_) => "skill",
+            Self::Daemon(_) => "daemon",
         }
-    }
-
-    fn non_preset_display_name(&self) -> &'static str {
-        if let Some(name) = self.prompt_display_name() {
-            name
-        } else {
-            self.non_prompt_display_name()
-        }
-    }
-
-    fn non_prompt_display_name(&self) -> &'static str {
-        if let Some(name) = self.session_display_name() {
-            name
-        } else {
-            self.skill_or_daemon_display_name()
-        }
-    }
-
-    fn skill_or_daemon_display_name(&self) -> &'static str {
-        if self.is_skill() { "skill" } else { "daemon" }
-    }
-
-    fn preset_display_name(&self) -> Option<&'static str> {
-        matches!(self, Self::Preset(_)).then_some("preset")
-    }
-
-    fn prompt_display_name(&self) -> Option<&'static str> {
-        matches!(self, Self::Prompt(_)).then_some("prompt")
-    }
-
-    fn session_display_name(&self) -> Option<&'static str> {
-        matches!(self, Self::Session(_)).then_some("session")
-    }
-
-    fn is_skill(&self) -> bool {
-        matches!(self, Self::Skill(_))
     }
 }
 
