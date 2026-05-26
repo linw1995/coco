@@ -636,6 +636,68 @@ async fn llm_engine_coalesces_duplicate_drive_job_calls() {
 }
 
 #[tokio::test]
+async fn llm_engine_join_job_does_not_start_idle_job() {
+    let store = MemoryStore::new();
+    let backend = BlockingBackend {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let calls = backend.calls.clone();
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+
+    let snapshot = engine.join_job(&job.job_id).await.unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(snapshot.status, JobStatus::Queued);
+}
+
+#[tokio::test]
+async fn llm_engine_join_job_waits_for_inflight_job() {
+    let store = MemoryStore::new();
+    let backend = BlockingBackend {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let started = backend.started.clone();
+    let release = backend.release.clone();
+    let calls = backend.calls.clone();
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let job_id = job.job_id.clone();
+        async move { engine.drive_job(&job_id).await }
+    });
+    started.notified().await;
+
+    let joiner = tokio::spawn({
+        let engine = engine.clone();
+        let job_id = job.job_id.clone();
+        async move { engine.join_job(&job_id).await }
+    });
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!joiner.is_finished());
+
+    release.notify_waiters();
+    let driven = driver.await.unwrap().unwrap();
+    let joined = joiner.await.unwrap().unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(driven.status, JobStatus::Finished);
+    assert_eq!(joined.status, JobStatus::Finished);
+    assert_eq!(driven.head, joined.head);
+}
+
+#[tokio::test]
 async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
     let store = MemoryStore::new();
     let backend = FakeBackend::with_responses(&[(
@@ -666,12 +728,9 @@ async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
     assert_eq!(payload["data"]["failed_branch"], "main");
     assert_eq!(payload["data"]["base_node_id"], job.base);
     assert_eq!(payload["data"]["message"], "backend failed");
-    let error_node_id = payload["data"]["error_node_id"]
-        .as_str()
-        .expect("event should include error node id");
     assert_eq!(
         payload["dedupe_key"],
-        format!("llm.backend_failure:{error_node_id}")
+        format!("llm.backend_failure:{}:main:{}", job.job_id, job.base)
     );
 }
 

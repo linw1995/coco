@@ -458,6 +458,21 @@ where
         self.get_job(job_id)
     }
 
+    pub async fn join_job(
+        &self,
+        job_id: &str,
+    ) -> std::result::Result<JobStatusSnapshot, EngineError> {
+        let inflight_job = self.inflight_jobs.lock().await.get(job_id).cloned();
+        if let Some(inflight_job) = inflight_job {
+            tracing::debug!(
+                job_id = %job_id,
+                "joining inflight prompt job without starting a new drive"
+            );
+            let _ = inflight_job.await;
+        }
+        self.get_job(job_id)
+    }
+
     pub async fn drive_job_with_merge_parents(
         &self,
         job_id: &str,
@@ -858,7 +873,10 @@ fn backend_failure_recovery_event(
     SystemEventEnvelope {
         event_type: LLM_BACKEND_FAILURE_RECOVERY_REQUESTED,
         version: SYSTEM_EVENT_VERSION,
-        dedupe_key: format!("llm.backend_failure:{}", context.error_node_id),
+        dedupe_key: format!(
+            "llm.backend_failure:{}:{}:{}",
+            job.job_id, job.work_branch, context.retry_from_node_id
+        ),
         data: LlmBackendFailureRecoveryRequested {
             job_id: job.job_id.clone(),
             root_branch: job.branch.clone(),
