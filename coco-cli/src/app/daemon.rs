@@ -974,25 +974,45 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        let log_context = QueuedBranchWaitLogContext {
-            message_id: &item.message_id,
-            queue: PROMPT_JOB_QUEUE,
-            branch: &request.branch,
-            job_id: Some(&request.job_id),
-        };
         if active_job_is_waiting_for_recovery(&self.store, &active_job).context(StoreSnafu)? {
-            log_queued_request_active_branch_job_waiting_for_recovery(log_context, &active_job);
+            tracing::debug!(
+                message_id = %item.message_id,
+                queue = PROMPT_JOB_QUEUE,
+                branch = %request.branch,
+                job_id = %request.job_id,
+                active_job_id = %active_job.job_id,
+                active_job_status = ?active_job.status,
+                wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
+                "active branch prompt job is waiting for recovery; queued request will wait"
+            );
             return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL));
         }
 
         if let ActiveJobJoinDecision::Backoff(duration) =
             self.active_job_join_decision(&active_job).await
         {
-            log_queued_request_active_branch_job_join_backoff(log_context, &active_job, duration);
+            tracing::debug!(
+                message_id = %item.message_id,
+                queue = PROMPT_JOB_QUEUE,
+                branch = %request.branch,
+                job_id = %request.job_id,
+                active_job_id = %active_job.job_id,
+                active_job_status = ?active_job.status,
+                wait_ms = duration.as_millis(),
+                "active branch prompt job was joined recently; queued request will wait"
+            );
             return Ok(PromptQueueHeadResult::Wait(duration));
         }
 
-        log_queued_request_waiting_for_active_branch_job(log_context, &active_job);
+        tracing::info!(
+            message_id = %item.message_id,
+            queue = PROMPT_JOB_QUEUE,
+            branch = %request.branch,
+            job_id = %request.job_id,
+            active_job_id = %active_job.job_id,
+            active_job_status = ?active_job.status,
+            "waiting for active branch prompt job before handling queued request"
+        );
 
         Ok(match self.engine.join_job(&active_job.job_id).await {
             Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => {
@@ -1309,14 +1329,16 @@ where
             return Ok(());
         };
 
-        let log_context = QueuedBranchWaitLogContext {
-            message_id,
-            queue: TELEGRAM_INBOUND_QUEUE,
-            branch,
-            job_id: None,
-        };
         if active_job_is_waiting_for_recovery(store, &active_job).context(StoreSnafu)? {
-            log_queued_request_active_branch_job_waiting_for_recovery(log_context, &active_job);
+            tracing::debug!(
+                message_id = %message_id,
+                queue = TELEGRAM_INBOUND_QUEUE,
+                branch = %branch,
+                active_job_id = %active_job.job_id,
+                active_job_status = ?active_job.status,
+                wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
+                "active branch prompt job is waiting for recovery; queued request will wait"
+            );
             tokio::time::sleep(ACTIVE_JOB_JOIN_INTERVAL).await;
             continue;
         }
@@ -1324,12 +1346,27 @@ where
         if let ActiveJobJoinDecision::Backoff(duration) =
             active_job_join_decision_with_backoff(&mut active_job_joins, &active_job)
         {
-            log_queued_request_active_branch_job_join_backoff(log_context, &active_job, duration);
+            tracing::debug!(
+                message_id = %message_id,
+                queue = TELEGRAM_INBOUND_QUEUE,
+                branch = %branch,
+                active_job_id = %active_job.job_id,
+                active_job_status = ?active_job.status,
+                wait_ms = duration.as_millis(),
+                "active branch prompt job was joined recently; queued request will wait"
+            );
             tokio::time::sleep(duration).await;
             continue;
         }
 
-        log_queued_request_waiting_for_active_branch_job(log_context, &active_job);
+        tracing::info!(
+            message_id = %message_id,
+            queue = TELEGRAM_INBOUND_QUEUE,
+            branch = %branch,
+            active_job_id = %active_job.job_id,
+            active_job_status = ?active_job.status,
+            "waiting for active branch prompt job before handling queued request"
+        );
 
         let snapshot = engine
             .join_job(&active_job.job_id)
@@ -1351,14 +1388,6 @@ enum PromptQueueHeadResult {
 enum ActiveJobJoinDecision {
     Join,
     Backoff(Duration),
-}
-
-#[derive(Debug, Clone, Copy)]
-struct QueuedBranchWaitLogContext<'a> {
-    message_id: &'a str,
-    queue: &'a str,
-    branch: &'a str,
-    job_id: Option<&'a str>,
 }
 
 fn active_job_join_decision_with_backoff(
@@ -1406,86 +1435,6 @@ fn active_job_is_waiting_for_recovery(
         .list_children(&last_node.id)?
         .into_iter()
         .any(|child| matches!(child.kind, Kind::Failure(_))))
-}
-
-fn log_queued_request_active_branch_job_waiting_for_recovery(
-    context: QueuedBranchWaitLogContext<'_>,
-    active_job: &coco_mem::Job,
-) {
-    match context.job_id {
-        Some(job_id) => tracing::debug!(
-            message_id = %context.message_id,
-            queue = context.queue,
-            branch = %context.branch,
-            job_id = %job_id,
-            active_job_id = %active_job.job_id,
-            active_job_status = ?active_job.status,
-            wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
-            "active branch prompt job is waiting for recovery; queued request will wait"
-        ),
-        None => tracing::debug!(
-            message_id = %context.message_id,
-            queue = context.queue,
-            branch = %context.branch,
-            active_job_id = %active_job.job_id,
-            active_job_status = ?active_job.status,
-            wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
-            "active branch prompt job is waiting for recovery; queued request will wait"
-        ),
-    }
-}
-
-fn log_queued_request_active_branch_job_join_backoff(
-    context: QueuedBranchWaitLogContext<'_>,
-    active_job: &coco_mem::Job,
-    duration: Duration,
-) {
-    match context.job_id {
-        Some(job_id) => tracing::debug!(
-            message_id = %context.message_id,
-            queue = context.queue,
-            branch = %context.branch,
-            job_id = %job_id,
-            active_job_id = %active_job.job_id,
-            active_job_status = ?active_job.status,
-            wait_ms = duration.as_millis(),
-            "active branch prompt job was joined recently; queued request will wait"
-        ),
-        None => tracing::debug!(
-            message_id = %context.message_id,
-            queue = context.queue,
-            branch = %context.branch,
-            active_job_id = %active_job.job_id,
-            active_job_status = ?active_job.status,
-            wait_ms = duration.as_millis(),
-            "active branch prompt job was joined recently; queued request will wait"
-        ),
-    }
-}
-
-fn log_queued_request_waiting_for_active_branch_job(
-    context: QueuedBranchWaitLogContext<'_>,
-    active_job: &coco_mem::Job,
-) {
-    match context.job_id {
-        Some(job_id) => tracing::info!(
-            message_id = %context.message_id,
-            queue = context.queue,
-            branch = %context.branch,
-            job_id = %job_id,
-            active_job_id = %active_job.job_id,
-            active_job_status = ?active_job.status,
-            "waiting for active branch prompt job before handling queued request"
-        ),
-        None => tracing::info!(
-            message_id = %context.message_id,
-            queue = context.queue,
-            branch = %context.branch,
-            active_job_id = %active_job.job_id,
-            active_job_status = ?active_job.status,
-            "waiting for active branch prompt job before handling queued request"
-        ),
-    }
 }
 
 fn is_missing_branch_error(error: &crate::error::Error) -> bool {
