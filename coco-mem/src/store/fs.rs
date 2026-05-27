@@ -1078,7 +1078,7 @@ impl Persistence {
     }
 
     fn branch_message_queue_path(&self, branch: &str) -> PathBuf {
-        self.branches_dir
+        self.dir
             .join(BRANCH_QUEUE_DIR_NAME)
             .join(format!("{}.jsonl", encode_branch_name(branch)))
     }
@@ -1409,9 +1409,6 @@ impl Persistence {
         branch_paths.sort();
 
         for path in branch_paths {
-            if path.is_dir() {
-                continue;
-            }
             ensure!(
                 path.is_file(),
                 CorruptedStoreSnafu {
@@ -1626,7 +1623,7 @@ impl Persistence {
         let Some(branch) = prompt_job_branch_from_queue(queue) else {
             return Ok(self.queues_path.clone());
         };
-        let dir = self.branches_dir.join(BRANCH_QUEUE_DIR_NAME);
+        let dir = self.dir.join(BRANCH_QUEUE_DIR_NAME);
         fs::create_dir_all(&dir).context(WriteStoreDirectorySnafu { path: dir.clone() })?;
         Ok(self.branch_message_queue_path(branch))
     }
@@ -1636,7 +1633,7 @@ impl Persistence {
     ) -> Result<(HashMap<String, Vec<MessageQueueItem>>, usize)> {
         let mut queues = HashMap::new();
         let mut len = 0;
-        let branch_queues_dir = self.branches_dir.join(BRANCH_QUEUE_DIR_NAME);
+        let branch_queues_dir = self.dir.join(BRANCH_QUEUE_DIR_NAME);
         if !branch_queues_dir.exists() {
             return Ok((queues, len));
         }
@@ -1690,7 +1687,7 @@ impl Persistence {
         &self,
         queues: &HashMap<String, Vec<MessageQueueItem>>,
     ) -> Result<()> {
-        let branch_queues_dir = self.branches_dir.join(BRANCH_QUEUE_DIR_NAME);
+        let branch_queues_dir = self.dir.join(BRANCH_QUEUE_DIR_NAME);
         if !branch_queues_dir.exists() {
             return self.write_live_branch_message_queue_histories(queues);
         }

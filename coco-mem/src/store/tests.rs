@@ -1880,12 +1880,7 @@ fn fs_store_persists_branch_prompt_queue_under_branch_directory() {
         .enqueue_message("prompt.job/day", json!({"text": "recover"}))
         .unwrap();
 
-    assert!(
-        path.join("branches")
-            .join("queues")
-            .join("day.jsonl")
-            .is_file()
-    );
+    assert!(path.join("queues").join("day.jsonl").is_file());
     assert_eq!(
         store.list_message_queues().unwrap(),
         vec!["prompt.job/day".to_owned()]
@@ -1910,12 +1905,7 @@ fn fs_store_branch_prompt_queue_path_does_not_collide_with_branch_view_file() {
         .unwrap();
 
     assert!(path.join("branches").join("foo.jsonl").is_file());
-    assert!(
-        path.join("branches")
-            .join("queues")
-            .join("foo.jsonl.jsonl")
-            .is_file()
-    );
+    assert!(path.join("queues").join("foo.jsonl.jsonl").is_file());
     let items = store.list_queue_messages("prompt.job/foo.jsonl").unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].payload, json!({"text": "recover"}));
