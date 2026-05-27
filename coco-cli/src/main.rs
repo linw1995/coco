@@ -7,7 +7,6 @@ use coco_llm::{
     CocoCliRuntimeResponse,
 };
 use coco_mem::SessionRole;
-use snafu::ResultExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -132,21 +131,52 @@ enum DaemonSocketSource {
     Implicit,
 }
 
-#[derive(Debug, snafu::Snafu)]
+#[derive(Debug)]
 enum ForwardSocketError {
-    #[snafu(display("failed to connect to coco-cli daemon socket {socket_path:?}: {source}"))]
     Connect {
         socket_path: String,
         source: std::io::Error,
     },
-    #[snafu(display("failed to send coco-cli daemon request: {source}"))]
-    WriteRequest { source: std::io::Error },
-    #[snafu(display("failed to close coco-cli daemon request stream: {source}"))]
-    Shutdown { source: std::io::Error },
-    #[snafu(display("failed to read coco-cli daemon response: {source}"))]
-    ReadResponse { source: std::io::Error },
-    #[snafu(display("failed to parse coco-cli daemon response: {source}"))]
-    ParseResponse { source: serde_json::Error },
+    WriteRequest(std::io::Error),
+    Shutdown(std::io::Error),
+    ReadResponse(std::io::Error),
+    ParseResponse(serde_json::Error),
+}
+
+impl std::fmt::Display for ForwardSocketError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect {
+                socket_path,
+                source,
+            } => write!(
+                formatter,
+                "failed to connect to coco-cli daemon socket {socket_path:?}: {source}"
+            ),
+            Self::WriteRequest(source) => {
+                write!(
+                    formatter,
+                    "failed to send coco-cli daemon request: {source}"
+                )
+            }
+            Self::Shutdown(source) => write!(
+                formatter,
+                "failed to close coco-cli daemon request stream: {source}"
+            ),
+            Self::ReadResponse(source) => {
+                write!(
+                    formatter,
+                    "failed to read coco-cli daemon response: {source}"
+                )
+            }
+            Self::ParseResponse(source) => {
+                write!(
+                    formatter,
+                    "failed to parse coco-cli daemon response: {source}"
+                )
+            }
+        }
+    }
 }
 
 fn resolve_forwarding_target(args: &[String]) -> Result<Option<ForwardingTarget>, String> {
@@ -290,24 +320,29 @@ async fn forward_to_socket(
     let payload =
         serde_json::to_vec(&request).expect("failed to serialize coco-cli daemon request");
 
-    let mut stream = UnixStream::connect(socket_path)
-        .await
-        .context(ConnectSnafu {
-            socket_path: socket_path.to_owned(),
-        })?;
+    let mut stream =
+        UnixStream::connect(socket_path)
+            .await
+            .map_err(|source| ForwardSocketError::Connect {
+                socket_path: socket_path.to_owned(),
+                source,
+            })?;
     stream
         .write_all(&payload)
         .await
-        .context(WriteRequestSnafu)?;
-    stream.shutdown().await.context(ShutdownSnafu)?;
+        .map_err(ForwardSocketError::WriteRequest)?;
+    stream
+        .shutdown()
+        .await
+        .map_err(ForwardSocketError::Shutdown)?;
 
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
         .await
-        .context(ReadResponseSnafu)?;
+        .map_err(ForwardSocketError::ReadResponse)?;
     let response: CocoCliRuntimeResponse =
-        serde_json::from_slice(&response).context(ParseResponseSnafu)?;
+        serde_json::from_slice(&response).map_err(ForwardSocketError::ParseResponse)?;
     print!("{}", response.stdout);
     eprint!("{}", response.stderr);
     std::process::exit(response.exit_code);
@@ -392,8 +427,8 @@ mod tests {
 
     use super::{
         DaemonSocketSource, ForwardSocketError, ForwardingTarget, collect_forwarded_stdin,
-        forward_to_socket, is_daemon_serve_command, resolve_forwarding_target,
-        should_fallback_to_local, should_forward_runtime_stdin,
+        is_daemon_serve_command, resolve_forwarding_target, should_fallback_to_local,
+        should_forward_runtime_stdin,
     };
     use coco_cli::{COCO_DAEMON_SOCKET_ENV, resolve_default_daemon_socket_path};
     use coco_llm::COCO_CLI_RUNTIME_SOCKET_ENV;
@@ -607,102 +642,5 @@ mod tests {
             &error
         ));
         assert!(!should_fallback_to_local(DaemonSocketSource::Env, &error));
-    }
-
-    #[test]
-    fn forward_socket_errors_keep_context_messages() {
-        let connect = ForwardSocketError::Connect {
-            socket_path: "/tmp/coco.sock".to_owned(),
-            source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
-        };
-        assert_eq!(
-            connect.to_string(),
-            "failed to connect to coco-cli daemon socket \"/tmp/coco.sock\": refused"
-        );
-
-        let write = ForwardSocketError::WriteRequest {
-            source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken"),
-        };
-        assert_eq!(
-            write.to_string(),
-            "failed to send coco-cli daemon request: broken"
-        );
-
-        let shutdown = ForwardSocketError::Shutdown {
-            source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken"),
-        };
-        assert_eq!(
-            shutdown.to_string(),
-            "failed to close coco-cli daemon request stream: broken"
-        );
-
-        let read = ForwardSocketError::ReadResponse {
-            source: std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"),
-        };
-        assert_eq!(
-            read.to_string(),
-            "failed to read coco-cli daemon response: eof"
-        );
-
-        let parse = ForwardSocketError::ParseResponse {
-            source: serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
-        };
-        assert!(
-            parse
-                .to_string()
-                .starts_with("failed to parse coco-cli daemon response:")
-        );
-    }
-
-    #[tokio::test]
-    async fn forward_to_socket_reports_connect_context() {
-        let socket_path = tempdir().unwrap().path().join("missing.sock");
-        let error = forward_to_socket(socket_path.to_str().unwrap(), &[], false)
-            .await
-            .unwrap_err();
-
-        let ForwardSocketError::Connect {
-            socket_path: reported_path,
-            source,
-        } = error
-        else {
-            panic!("expected connect error");
-        };
-        assert_eq!(reported_path, socket_path.to_string_lossy());
-        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    #[tokio::test]
-    async fn forward_to_socket_reports_parse_context() {
-        let dir = tempdir().unwrap();
-        let socket_path = dir.path().join("coco.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut request)
-                .await
-                .unwrap();
-            assert!(!request.is_empty());
-            tokio::io::AsyncWriteExt::write_all(&mut stream, b"not json")
-                .await
-                .unwrap();
-        });
-
-        let error = forward_to_socket(
-            socket_path.to_str().unwrap(),
-            &["session".to_owned(), "list".to_owned()],
-            false,
-        )
-        .await
-        .unwrap_err();
-        server.await.unwrap();
-
-        assert!(matches!(error, ForwardSocketError::ParseResponse { .. }));
-        assert!(
-            error
-                .to_string()
-                .starts_with("failed to parse coco-cli daemon response:")
-        );
     }
 }

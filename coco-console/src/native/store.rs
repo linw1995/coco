@@ -256,6 +256,10 @@ where
     fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>> {
         self.inner.list_queue_messages(queue)
     }
+
+    fn list_message_queues(&self) -> StoreResult<Vec<String>> {
+        self.inner.list_message_queues()
+    }
 }
 
 impl<S> ProcessShareableStore for ConsoleStore<S>

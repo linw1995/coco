@@ -625,6 +625,12 @@ impl StoreState {
         self.message_queues.get(queue).cloned().unwrap_or_default()
     }
 
+    pub fn list_message_queues(&self) -> Vec<String> {
+        let mut queues = self.message_queues.keys().cloned().collect::<Vec<_>>();
+        queues.sort();
+        queues
+    }
+
     fn next_job_id(&self) -> String {
         loop {
             let candidate = format!("job-{}", nanoid::nanoid!());

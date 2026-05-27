@@ -1807,6 +1807,7 @@ where
     assert_eq!(store.dequeue_message("hooks").unwrap(), None);
     assert_eq!(store.peek_message("hooks").unwrap(), None);
     assert!(store.list_queue_messages("hooks").unwrap().is_empty());
+    assert!(store.list_message_queues().unwrap().is_empty());
 }
 
 fn assert_message_queue_isolates_named_queues<F>()
@@ -1828,6 +1829,10 @@ where
     assert_eq!(
         store.list_queue_messages("scheduler").unwrap(),
         vec![scheduler.clone()]
+    );
+    assert_eq!(
+        store.list_message_queues().unwrap(),
+        vec!["hooks".to_owned(), "scheduler".to_owned()]
     );
     assert_eq!(store.dequeue_message("hooks").unwrap(), Some(hook));
     assert_eq!(store.dequeue_message("scheduler").unwrap(), Some(scheduler));
@@ -1865,6 +1870,33 @@ where
     assert_eq!(same.message_id, first.message_id);
     assert_ne!(different_queue.message_id, first.message_id);
     assert_ne!(different_payload.message_id, first.message_id);
+}
+
+#[test]
+fn fs_store_persists_branch_prompt_queue_under_branch_directory() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let item = store
+        .enqueue_message("prompt.job/day", json!({"text": "recover"}))
+        .unwrap();
+
+    assert!(
+        path.join("branches")
+            .join("day")
+            .join("queue.jsonl")
+            .is_file()
+    );
+    assert_eq!(
+        store.list_message_queues().unwrap(),
+        vec!["prompt.job/day".to_owned()]
+    );
+    drop(store);
+
+    let reopened = FsStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.list_queue_messages("prompt.job/day").unwrap(),
+        vec![item]
+    );
 }
 
 fn assert_add_skill_starts_at_version_one<F>()
