@@ -59,7 +59,7 @@ const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const TELEGRAM_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
-const ACTIVE_JOB_JOIN_INTERVAL: Duration = Duration::from_secs(30);
+const ACTIVE_JOB_WAIT_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
@@ -767,7 +767,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
 struct PromptJobMessageQueueWorker<B, S> {
     store: S,
     engine: ConversationEngine<B, S>,
-    active_job_joins: Mutex<HashMap<String, Instant>>,
+    active_job_wait_logs: Mutex<HashMap<String, Instant>>,
 }
 
 impl<B, S> PromptJobMessageQueueWorker<B, S> {
@@ -775,7 +775,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         Self {
             store,
             engine,
-            active_job_joins: Mutex::new(HashMap::new()),
+            active_job_wait_logs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1009,10 +1009,10 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 job_id = %request.job_id,
                 active_job_id = %active_job.job_id,
                 active_job_status = ?active_job.status,
-                wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
+                wait_ms = ACTIVE_JOB_WAIT_INTERVAL.as_millis(),
                 "active branch prompt job has not started; queued request will wait"
             );
-            return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL));
+            return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_WAIT_INTERVAL));
         }
 
         if active_job_is_waiting_for_recovery(&self.store, &active_job).context(StoreSnafu)? {
@@ -1023,10 +1023,10 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 job_id = %request.job_id,
                 active_job_id = %active_job.job_id,
                 active_job_status = ?active_job.status,
-                wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
+                wait_ms = ACTIVE_JOB_WAIT_INTERVAL.as_millis(),
                 "active branch prompt job is waiting for recovery; queued request will wait"
             );
-            return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL));
+            return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_WAIT_INTERVAL));
         }
 
         if !self.engine.has_inflight_job(&active_job.job_id).await {
@@ -1037,14 +1037,14 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 job_id = %request.job_id,
                 active_job_id = %active_job.job_id,
                 active_job_status = ?active_job.status,
-                wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
+                wait_ms = ACTIVE_JOB_WAIT_INTERVAL.as_millis(),
                 "active branch prompt job has no inflight drive; queued request will wait"
             );
-            return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL));
+            return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_WAIT_INTERVAL));
         }
 
-        if let ActiveJobJoinDecision::Backoff(duration) =
-            self.active_job_join_decision(&active_job).await
+        if let ActiveJobWaitDecision::Backoff(duration) =
+            self.active_job_wait_decision(&active_job).await
         {
             tracing::debug!(
                 message_id = %item.message_id,
@@ -1054,7 +1054,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 active_job_id = %active_job.job_id,
                 active_job_status = ?active_job.status,
                 wait_ms = duration.as_millis(),
-                "active branch prompt job was joined recently; queued request will wait"
+                "active branch prompt job wait was logged recently; queued request will wait"
             );
             return Ok(PromptQueueHeadResult::Wait(duration));
         }
@@ -1066,43 +1066,16 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             job_id = %request.job_id,
             active_job_id = %active_job.job_id,
             active_job_status = ?active_job.status,
-            "waiting for active branch prompt job before handling queued request"
+            wait_ms = ACTIVE_JOB_WAIT_INTERVAL.as_millis(),
+            "active branch prompt job is still running; queued request will wait"
         );
 
-        Ok(match self.engine.join_job(&active_job.job_id).await {
-            Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => {
-                PromptQueueHeadResult::Continue
-            }
-            Ok(snapshot) => {
-                tracing::info!(
-                    message_id = %item.message_id,
-                    queue = %queue,
-                    branch = %request.branch,
-                    job_id = %request.job_id,
-                    active_job_id = %active_job.job_id,
-                    active_job_status = ?snapshot.status,
-                    "active branch prompt job still blocks queued request"
-                );
-                PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL)
-            }
-            Err(error) => {
-                tracing::warn!(
-                    message_id = %item.message_id,
-                    queue = %queue,
-                    branch = %request.branch,
-                    job_id = %request.job_id,
-                    active_job_id = %active_job.job_id,
-                    error = %error,
-                    "failed to wait for active branch prompt job before materializing queued request"
-                );
-                PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL)
-            }
-        })
+        Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_WAIT_INTERVAL))
     }
 
-    async fn active_job_join_decision(&self, active_job: &coco_mem::Job) -> ActiveJobJoinDecision {
-        let mut active_job_joins = self.active_job_joins.lock().await;
-        active_job_join_decision_with_backoff(&mut active_job_joins, active_job)
+    async fn active_job_wait_decision(&self, active_job: &coco_mem::Job) -> ActiveJobWaitDecision {
+        let mut active_job_wait_logs = self.active_job_wait_logs.lock().await;
+        active_job_wait_decision_with_backoff(&mut active_job_wait_logs, active_job)
     }
 
     async fn handle_item(&self, item: MessageQueueItem)
@@ -1417,8 +1390,8 @@ enum PromptQueueHeadResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActiveJobJoinDecision {
-    Join,
+enum ActiveJobWaitDecision {
+    Log,
     Backoff(Duration),
 }
 
@@ -1430,23 +1403,23 @@ fn shortest_wait(current: Option<Duration>, candidate: Duration) -> Duration {
     current.map_or(candidate, |current| current.min(candidate))
 }
 
-fn active_job_join_decision_with_backoff(
-    active_job_joins: &mut HashMap<String, Instant>,
+fn active_job_wait_decision_with_backoff(
+    active_job_wait_logs: &mut HashMap<String, Instant>,
     active_job: &coco_mem::Job,
-) -> ActiveJobJoinDecision {
+) -> ActiveJobWaitDecision {
     let now = Instant::now();
-    active_job_joins
-        .retain(|_, last_join| now.duration_since(*last_join) < ACTIVE_JOB_JOIN_INTERVAL);
+    active_job_wait_logs
+        .retain(|_, last_log| now.duration_since(*last_log) < ACTIVE_JOB_WAIT_INTERVAL);
 
-    if let Some(last_join) = active_job_joins.get(&active_job.job_id) {
-        let elapsed = now.duration_since(*last_join);
-        if elapsed < ACTIVE_JOB_JOIN_INTERVAL {
-            return ActiveJobJoinDecision::Backoff(ACTIVE_JOB_JOIN_INTERVAL - elapsed);
+    if let Some(last_log) = active_job_wait_logs.get(&active_job.job_id) {
+        let elapsed = now.duration_since(*last_log);
+        if elapsed < ACTIVE_JOB_WAIT_INTERVAL {
+            return ActiveJobWaitDecision::Backoff(ACTIVE_JOB_WAIT_INTERVAL - elapsed);
         }
     }
 
-    active_job_joins.insert(active_job.job_id.clone(), now);
-    ActiveJobJoinDecision::Join
+    active_job_wait_logs.insert(active_job.job_id.clone(), now);
+    ActiveJobWaitDecision::Log
 }
 
 fn active_job_is_waiting_for_recovery(
@@ -2083,7 +2056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_job_queue_worker_submits_queued_request_after_active_branch_job() {
+    async fn prompt_job_queue_worker_backs_off_when_active_branch_job_is_inflight() {
         let store = MemoryStore::new();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
@@ -2114,29 +2087,31 @@ mod tests {
             )
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
-        let drain_task = tokio::spawn(async move { worker.drain_once().await });
+        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        let request = super::decode_prompt_job_message(item.payload.clone()).unwrap();
+
+        assert!(matches!(
+            worker
+                .handle_prompt_request_queue_head(PROMPT_JOB_QUEUE, &item, &request)
+                .await
+                .unwrap(),
+            super::PromptQueueHeadResult::Wait(duration)
+                if duration == super::ACTIVE_JOB_WAIT_INTERVAL
+        ));
         assert!(engine.get_job("job-request").is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
             1
         );
-        assert!(!drain_task.is_finished());
 
         release_first.notify_waiters();
         let snapshot = drive_task.await.unwrap().unwrap();
         assert_eq!(snapshot.status, JobStatus::Finished);
-        drain_task.await.unwrap().unwrap();
         assert_eq!(
             engine.get_job(&active_job_id).unwrap().status,
             JobStatus::Finished
         );
-        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
-        wait_until(Duration::from_secs(1), || {
-            engine
-                .get_job("job-request")
-                .is_ok_and(|job| job.status == JobStatus::Finished)
-        })
-        .await;
     }
 
     #[tokio::test]
@@ -2222,7 +2197,7 @@ mod tests {
                 .await
                 .unwrap(),
             super::PromptQueueHeadResult::Wait(duration)
-                if duration == super::ACTIVE_JOB_JOIN_INTERVAL
+                if duration == super::ACTIVE_JOB_WAIT_INTERVAL
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -2237,7 +2212,7 @@ mod tests {
                 .await
                 .unwrap(),
             super::PromptQueueHeadResult::Wait(duration)
-                if duration <= super::ACTIVE_JOB_JOIN_INTERVAL
+                if duration <= super::ACTIVE_JOB_WAIT_INTERVAL
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -2306,6 +2281,70 @@ mod tests {
                 .is_ok_and(|job| job.status == JobStatus::Finished)
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn prompt_job_queue_worker_processes_branch_queue_when_legacy_head_is_inflight() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let calls = backend.calls.clone();
+        let release_first = backend.release_first.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("main")).await.unwrap();
+        llm.create_session(session_config("day")).await.unwrap();
+        let engine = ConversationEngine::new(llm);
+        let active_job = engine
+            .submit_job("main", "active main work", vec![])
+            .await
+            .unwrap();
+        let active_job_id = active_job.job_id.clone();
+        let drive_engine = engine.clone();
+        let drive_task = tokio::spawn(async move { drive_engine.drive_job(&active_job_id).await });
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
+
+        store
+            .enqueue_message(
+                PROMPT_JOB_QUEUE,
+                json!(QueuedPromptRequest {
+                    job_id: "job-main-queued".to_owned(),
+                    branch: "main".to_owned(),
+                    prompt: "queued main work".to_owned(),
+                    merge_parents: vec![],
+                    session_patch: None,
+                }),
+            )
+            .unwrap();
+        super::queue_prompt_job_request(
+            &store,
+            QueuedPromptRequest {
+                job_id: "job-day-queued".to_owned(),
+                branch: "day".to_owned(),
+                prompt: "queued day work".to_owned(),
+                merge_parents: vec![],
+                session_patch: None,
+            },
+        )
+        .unwrap();
+        let worker = PromptJobMessageQueueWorker::new(store.clone(), engine.clone());
+
+        worker.drain_once().await.unwrap();
+
+        assert!(engine.get_job("job-main-queued").is_err());
+        assert_eq!(
+            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            1
+        );
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
+        wait_until(Duration::from_secs(1), || {
+            engine
+                .get_job("job-day-queued")
+                .is_ok_and(|job| job.status == JobStatus::Finished)
+        })
+        .await;
+
+        release_first.notify_waiters();
+        let snapshot = drive_task.await.unwrap().unwrap();
+        assert_eq!(snapshot.status, JobStatus::Finished);
     }
 
     #[test]
