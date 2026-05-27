@@ -643,4 +643,40 @@ mod tests {
         ));
         assert!(!should_fallback_to_local(DaemonSocketSource::Env, &error));
     }
+
+    #[test]
+    fn forward_socket_error_display_covers_all_variants() {
+        let io_error = |message| std::io::Error::other(message);
+        let cases = vec![
+            (
+                ForwardSocketError::Connect {
+                    socket_path: "/tmp/coco.sock".to_owned(),
+                    source: io_error("connect failed"),
+                },
+                "failed to connect to coco-cli daemon socket \"/tmp/coco.sock\": connect failed",
+            ),
+            (
+                ForwardSocketError::WriteRequest(io_error("write failed")),
+                "failed to send coco-cli daemon request: write failed",
+            ),
+            (
+                ForwardSocketError::Shutdown(io_error("shutdown failed")),
+                "failed to close coco-cli daemon request stream: shutdown failed",
+            ),
+            (
+                ForwardSocketError::ReadResponse(io_error("read failed")),
+                "failed to read coco-cli daemon response: read failed",
+            ),
+            (
+                ForwardSocketError::ParseResponse(
+                    serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err(),
+                ),
+                "failed to parse coco-cli daemon response: EOF while parsing an object at line 1 column 1",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 }
