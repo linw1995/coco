@@ -1882,6 +1882,7 @@ fn fs_store_persists_branch_prompt_queue_under_branch_directory() {
 
     assert!(
         path.join("branches")
+            .join("queues")
             .join("day")
             .join("queue.jsonl")
             .is_file()
@@ -1897,6 +1898,29 @@ fn fs_store_persists_branch_prompt_queue_under_branch_directory() {
         reopened.list_queue_messages("prompt.job/day").unwrap(),
         vec![item]
     );
+}
+
+#[test]
+fn fs_store_branch_prompt_queue_path_does_not_collide_with_branch_view_file() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    store.fork("foo", &store.root_id()).unwrap();
+
+    store
+        .enqueue_message("prompt.job/foo.jsonl", json!({"text": "recover"}))
+        .unwrap();
+
+    assert!(path.join("branches").join("foo.jsonl").is_file());
+    assert!(
+        path.join("branches")
+            .join("queues")
+            .join("foo.jsonl")
+            .join("queue.jsonl")
+            .is_file()
+    );
+    let items = store.list_queue_messages("prompt.job/foo.jsonl").unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].payload, json!({"text": "recover"}));
 }
 
 fn assert_add_skill_starts_at_version_one<F>()

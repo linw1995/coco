@@ -37,6 +37,7 @@ const JOBS_FILE_NAME: &str = "jobs.json";
 const JOB_HISTORY_FILE_NAME: &str = "jobs.jsonl";
 const JOB_COMPACTION_FILE_NAME: &str = "jobs.compaction.json";
 const QUEUES_FILE_NAME: &str = "queues.jsonl";
+const BRANCH_QUEUE_DIR_NAME: &str = "queues";
 const BRANCH_QUEUE_FILE_NAME: &str = "queue.jsonl";
 const PROMPT_JOB_BRANCH_QUEUE_PREFIX: &str = "prompt.job/";
 const SKILLS_FILE_NAME: &str = "skills.json";
@@ -1079,6 +1080,7 @@ impl Persistence {
 
     fn branch_message_queue_path(&self, branch: &str) -> PathBuf {
         self.branches_dir
+            .join(BRANCH_QUEUE_DIR_NAME)
             .join(encode_branch_name(branch))
             .join(BRANCH_QUEUE_FILE_NAME)
     }
@@ -1626,7 +1628,10 @@ impl Persistence {
         let Some(branch) = prompt_job_branch_from_queue(queue) else {
             return Ok(self.queues_path.clone());
         };
-        let dir = self.branches_dir.join(encode_branch_name(branch));
+        let dir = self
+            .branches_dir
+            .join(BRANCH_QUEUE_DIR_NAME)
+            .join(encode_branch_name(branch));
         fs::create_dir_all(&dir).context(WriteStoreDirectorySnafu { path: dir.clone() })?;
         Ok(dir.join(BRANCH_QUEUE_FILE_NAME))
     }
@@ -1636,15 +1641,16 @@ impl Persistence {
     ) -> Result<(HashMap<String, Vec<MessageQueueItem>>, usize)> {
         let mut queues = HashMap::new();
         let mut len = 0;
-        if !self.branches_dir.exists() {
+        let branch_queues_dir = self.branches_dir.join(BRANCH_QUEUE_DIR_NAME);
+        if !branch_queues_dir.exists() {
             return Ok((queues, len));
         }
 
-        for entry in fs::read_dir(&self.branches_dir).context(WriteStoreDirectorySnafu {
-            path: self.branches_dir.clone(),
+        for entry in fs::read_dir(&branch_queues_dir).context(WriteStoreDirectorySnafu {
+            path: branch_queues_dir.clone(),
         })? {
             let entry = entry.context(WriteStoreDirectorySnafu {
-                path: self.branches_dir.clone(),
+                path: branch_queues_dir.clone(),
             })?;
             let branch_dir = entry.path();
             if !branch_dir.is_dir() {
@@ -1688,11 +1694,16 @@ impl Persistence {
         &self,
         queues: &HashMap<String, Vec<MessageQueueItem>>,
     ) -> Result<()> {
-        for entry in fs::read_dir(&self.branches_dir).context(WriteStoreDirectorySnafu {
-            path: self.branches_dir.clone(),
+        let branch_queues_dir = self.branches_dir.join(BRANCH_QUEUE_DIR_NAME);
+        if !branch_queues_dir.exists() {
+            return self.write_live_branch_message_queue_histories(queues);
+        }
+
+        for entry in fs::read_dir(&branch_queues_dir).context(WriteStoreDirectorySnafu {
+            path: branch_queues_dir.clone(),
         })? {
             let entry = entry.context(WriteStoreDirectorySnafu {
-                path: self.branches_dir.clone(),
+                path: branch_queues_dir.clone(),
             })?;
             let branch_dir = entry.path();
             if !branch_dir.is_dir() {
@@ -1704,6 +1715,13 @@ impl Persistence {
             }
         }
 
+        self.write_live_branch_message_queue_histories(queues)
+    }
+
+    fn write_live_branch_message_queue_histories(
+        &self,
+        queues: &HashMap<String, Vec<MessageQueueItem>>,
+    ) -> Result<()> {
         for (queue, items) in queues {
             let Some(branch) = prompt_job_branch_from_queue(queue) else {
                 continue;
