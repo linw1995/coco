@@ -37,6 +37,8 @@ const JOBS_FILE_NAME: &str = "jobs.json";
 const JOB_HISTORY_FILE_NAME: &str = "jobs.jsonl";
 const JOB_COMPACTION_FILE_NAME: &str = "jobs.compaction.json";
 const QUEUES_FILE_NAME: &str = "queues.jsonl";
+const BRANCH_QUEUE_DIR_NAME: &str = "queues";
+const PROMPT_JOB_BRANCH_QUEUE_PREFIX: &str = "prompt.job/";
 const SKILLS_FILE_NAME: &str = "skills.json";
 const PRESET_HISTORY_DIR_NAME: &str = "preset-history";
 const SKILL_HISTORY_DIR_NAME: &str = "skill-history";
@@ -261,6 +263,15 @@ struct PresetHistoryEntry {
 enum MessageQueueHistoryEntry {
     Enqueued { item: MessageQueueItem },
     Dequeued { queue: String, message_id: String },
+}
+
+impl MessageQueueHistoryEntry {
+    fn queue(&self) -> Option<&str> {
+        match self {
+            Self::Enqueued { item } => Some(&item.queue),
+            Self::Dequeued { queue, .. } => Some(queue),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1066,6 +1077,12 @@ impl Persistence {
             .join(format!("{}.jsonl", encode_branch_name(branch)))
     }
 
+    fn branch_message_queue_path(&self, branch: &str) -> PathBuf {
+        self.dir
+            .join(BRANCH_QUEUE_DIR_NAME)
+            .join(format!("{}.jsonl", encode_branch_name(branch)))
+    }
+
     fn create_preset_history_directory(&self) -> Result<()> {
         fs::create_dir_all(&self.preset_history_dir).context(WriteStoreDirectorySnafu {
             path: self.preset_history_dir.clone(),
@@ -1542,6 +1559,8 @@ impl Persistence {
     }
 
     fn load_message_queues(&self) -> Result<(HashMap<String, Vec<MessageQueueItem>>, usize)> {
+        let mut queues = HashMap::new();
+        let mut len = 0;
         if self.queues_path.exists() {
             ensure!(
                 self.queues_path.is_file(),
@@ -1551,19 +1570,27 @@ impl Persistence {
                 }
             );
             let entries = read_jsonl_file::<MessageQueueHistoryEntry>(&self.queues_path)?;
-            let len = entries.len();
-            return Ok((message_queues_from_history(entries), len));
-        }
-
-        if self.access == StoreAccess::ReadWrite {
+            len += entries.len();
+            queues.extend(message_queues_from_history(entries));
+        } else if self.access == StoreAccess::ReadWrite {
             write_jsonl_file(&self.queues_path, &[] as &[MessageQueueHistoryEntry])?;
         }
-        Ok((HashMap::new(), 0))
+
+        let (branch_queues, branch_len) = self.load_branch_message_queues()?;
+        len += branch_len;
+        queues.extend(branch_queues);
+        Ok((queues, len))
     }
 
     fn append_message_queue_history_entry(&self, entry: &MessageQueueHistoryEntry) -> Result<()> {
         self.ensure_writable()?;
-        append_jsonl_record_create(&self.queues_path, entry)
+        match entry.queue() {
+            Some(queue) => {
+                let path = self.message_queue_history_path(queue)?;
+                append_jsonl_record_create(&path, entry)
+            }
+            None => append_jsonl_record_create(&self.queues_path, entry),
+        }
     }
 
     fn rewrite_message_queue_history(&self, state: &StoreState) -> Result<()> {
@@ -1575,7 +1602,131 @@ impl Persistence {
         &self,
         queues: &HashMap<String, Vec<MessageQueueItem>>,
     ) -> Result<()> {
-        write_jsonl_file(&self.queues_path, &message_queue_history_entries(queues))
+        let mut root_queues = HashMap::new();
+        let mut branch_queues = HashMap::new();
+        for (queue, items) in queues {
+            if prompt_job_branch_from_queue(queue).is_some() {
+                branch_queues.insert(queue.clone(), items.clone());
+            } else {
+                root_queues.insert(queue.clone(), items.clone());
+            }
+        }
+
+        write_jsonl_file(
+            &self.queues_path,
+            &message_queue_history_entries(&root_queues),
+        )?;
+        self.rewrite_branch_message_queue_histories(&branch_queues)
+    }
+
+    fn message_queue_history_path(&self, queue: &str) -> Result<PathBuf> {
+        let Some(branch) = prompt_job_branch_from_queue(queue) else {
+            return Ok(self.queues_path.clone());
+        };
+        let dir = self.dir.join(BRANCH_QUEUE_DIR_NAME);
+        fs::create_dir_all(&dir).context(WriteStoreDirectorySnafu { path: dir.clone() })?;
+        Ok(self.branch_message_queue_path(branch))
+    }
+
+    fn load_branch_message_queues(
+        &self,
+    ) -> Result<(HashMap<String, Vec<MessageQueueItem>>, usize)> {
+        let mut queues = HashMap::new();
+        let mut len = 0;
+        let branch_queues_dir = self.dir.join(BRANCH_QUEUE_DIR_NAME);
+        if !branch_queues_dir.exists() {
+            return Ok((queues, len));
+        }
+
+        for entry in fs::read_dir(&branch_queues_dir).context(WriteStoreDirectorySnafu {
+            path: branch_queues_dir.clone(),
+        })? {
+            let entry = entry.context(WriteStoreDirectorySnafu {
+                path: branch_queues_dir.clone(),
+            })?;
+            let queue_path = entry.path();
+            if queue_path.is_dir() {
+                continue;
+            }
+            ensure!(
+                queue_path.is_file(),
+                CorruptedStoreSnafu {
+                    path: queue_path.clone(),
+                    message: "branch message queue WAL entry must be a file".to_owned(),
+                }
+            );
+            let encoded_branch = queue_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context(CorruptedStoreSnafu {
+                    path: queue_path.clone(),
+                    message: "branch message queue file name is not valid UTF-8".to_owned(),
+                })?
+                .strip_suffix(".jsonl")
+                .context(CorruptedStoreSnafu {
+                    path: queue_path.clone(),
+                    message: "branch message queue file must have .jsonl extension".to_owned(),
+                })?;
+            let branch = decode_branch_name(encoded_branch).context(CorruptedStoreSnafu {
+                path: queue_path.clone(),
+                message: "branch message queue file name cannot be decoded".to_owned(),
+            })?;
+            let queue = prompt_job_branch_queue_name(&branch);
+            let entries = read_jsonl_file::<MessageQueueHistoryEntry>(&queue_path)?;
+            len += entries.len();
+            queues.extend(
+                message_queues_from_history(entries)
+                    .into_iter()
+                    .filter(|(loaded_queue, _)| loaded_queue == &queue),
+            );
+        }
+        Ok((queues, len))
+    }
+
+    fn rewrite_branch_message_queue_histories(
+        &self,
+        queues: &HashMap<String, Vec<MessageQueueItem>>,
+    ) -> Result<()> {
+        let branch_queues_dir = self.dir.join(BRANCH_QUEUE_DIR_NAME);
+        if !branch_queues_dir.exists() {
+            return self.write_live_branch_message_queue_histories(queues);
+        }
+
+        for entry in fs::read_dir(&branch_queues_dir).context(WriteStoreDirectorySnafu {
+            path: branch_queues_dir.clone(),
+        })? {
+            let entry = entry.context(WriteStoreDirectorySnafu {
+                path: branch_queues_dir.clone(),
+            })?;
+            let queue_path = entry.path();
+            if queue_path.is_dir() {
+                continue;
+            }
+            write_jsonl_file(&queue_path, &[] as &[MessageQueueHistoryEntry])?;
+        }
+
+        self.write_live_branch_message_queue_histories(queues)
+    }
+
+    fn write_live_branch_message_queue_histories(
+        &self,
+        queues: &HashMap<String, Vec<MessageQueueItem>>,
+    ) -> Result<()> {
+        for (queue, items) in queues {
+            let Some(branch) = prompt_job_branch_from_queue(queue) else {
+                continue;
+            };
+            let queue_path = self.branch_message_queue_path(branch);
+            if let Some(parent) = queue_path.parent() {
+                fs::create_dir_all(parent).context(WriteStoreDirectorySnafu {
+                    path: parent.to_path_buf(),
+                })?;
+            }
+            let mut single = HashMap::new();
+            single.insert(queue.clone(), items.clone());
+            write_jsonl_file(&queue_path, &message_queue_history_entries(&single))?;
+        }
+        Ok(())
     }
 }
 
@@ -2071,6 +2222,14 @@ fn message_queue_log_should_compact(
     }
 
     log_len >= MESSAGE_QUEUE_COMPACT_MIN_LOG_ENTRIES && log_len > live_len.saturating_mul(2)
+}
+
+fn prompt_job_branch_from_queue(queue: &str) -> Option<&str> {
+    queue.strip_prefix(PROMPT_JOB_BRANCH_QUEUE_PREFIX)
+}
+
+fn prompt_job_branch_queue_name(branch: &str) -> String {
+    format!("{PROMPT_JOB_BRANCH_QUEUE_PREFIX}{branch}")
 }
 
 fn store_migration_from(from: &StoreFormatVersion) -> Option<&'static StoreMigration> {
@@ -2967,6 +3126,14 @@ impl MessageQueueStore for FsStore {
             .read()
             .expect("store lock poisoned")
             .list_queue_messages(queue))
+    }
+
+    fn list_message_queues(&self) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_message_queues())
     }
 }
 

@@ -30,6 +30,29 @@ use crate::{
 };
 
 pub(crate) const PROMPT_JOB_QUEUE: &str = "prompt.job";
+pub(crate) const PROMPT_JOB_BRANCH_QUEUE_PREFIX: &str = "prompt.job/";
+
+pub(crate) fn prompt_job_queue_for_branch(branch: &str) -> String {
+    format!("{PROMPT_JOB_BRANCH_QUEUE_PREFIX}{branch}")
+}
+
+fn is_prompt_job_queue(queue: &str) -> bool {
+    queue == PROMPT_JOB_QUEUE || queue.starts_with(PROMPT_JOB_BRANCH_QUEUE_PREFIX)
+}
+
+fn list_prompt_job_queue_messages(store: &impl Store) -> Result<Vec<MessageQueueItem>> {
+    let mut items = Vec::new();
+    for queue in store
+        .list_message_queues()
+        .context(StoreSnafu)?
+        .into_iter()
+        .filter(|queue| is_prompt_job_queue(queue))
+    {
+        items.extend(store.list_queue_messages(&queue).context(StoreSnafu)?);
+    }
+    items.sort_by_key(|item| item.created_at);
+    Ok(items)
+}
 
 #[derive(Debug, Serialize)]
 struct JobQueuedView {
@@ -409,8 +432,9 @@ pub(crate) fn queue_prompt_job_request(
     store: &impl Store,
     request: QueuedPromptRequest,
 ) -> Result<MessageQueueItem> {
+    let queue = prompt_job_queue_for_branch(&request.branch);
     store
-        .enqueue_message(PROMPT_JOB_QUEUE, json!(request))
+        .enqueue_message(&queue, json!(request))
         .context(StoreSnafu)
 }
 
@@ -549,9 +573,7 @@ fn load_queued_prompt_request_status(
     store: &impl Store,
     job_id: &str,
 ) -> Result<Option<QueuedPromptRequestStatusView>> {
-    let items = store
-        .list_queue_messages(PROMPT_JOB_QUEUE)
-        .context(StoreSnafu)?;
+    let items = list_prompt_job_queue_messages(store)?;
     let Some((item, request)) = items.into_iter().find_map(|item| {
         serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
             .ok()

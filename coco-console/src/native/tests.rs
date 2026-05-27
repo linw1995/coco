@@ -1,6 +1,6 @@
 use coco_mem::{
-    Anchor, BranchStore, Kind, MemoryStore, MergeParent, NewNode, NodeStore, Role, SessionAnchor,
-    SessionRole, SessionState, Tool,
+    Anchor, BranchStore, Kind, MemoryStore, MergeParent, MessageQueueStore, NewNode, NodeStore,
+    Role, SessionAnchor, SessionRole, SessionState, Tool,
 };
 use serde_json::json;
 
@@ -272,6 +272,17 @@ fn console_store_notifies_after_successful_writes() {
         .unwrap();
 
     assert_eq!(publisher.current_version(), 1);
+}
+
+#[test]
+fn console_store_lists_message_queues() {
+    let store = ConsoleStore::new(MemoryStore::new(), ConsolePublisher::new());
+
+    store
+        .enqueue_message("system", json!({"ok": true}))
+        .unwrap();
+
+    assert_eq!(store.list_message_queues().unwrap(), vec!["system"]);
 }
 
 #[test]

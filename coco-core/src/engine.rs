@@ -482,6 +482,10 @@ where
         }
     }
 
+    pub async fn has_inflight_job(&self, job_id: &str) -> bool {
+        self.inflight_jobs.lock().await.contains_key(job_id)
+    }
+
     pub async fn drive_job_with_merge_parents(
         &self,
         job_id: &str,

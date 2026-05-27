@@ -180,6 +180,9 @@ pub trait MessageQueueStore {
 
     /// Returns all persisted messages for a named queue in dequeue order.
     fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;
+
+    /// Returns all queue names that currently contain at least one message.
+    fn list_message_queues(&self) -> StoreResult<Vec<String>>;
 }
 
 /// Capability for stores with a process-shareable backing path.
