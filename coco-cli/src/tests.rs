@@ -51,6 +51,10 @@ use crate::{
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
+fn prompt_job_queue_for_branch(branch: &str) -> String {
+    format!("prompt.job/{branch}")
+}
+
 #[test]
 fn cli_help_uses_coco_command_name() {
     let error = Cli::try_parse_from(["coco", "--help"]).unwrap_err();
@@ -1202,7 +1206,9 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
     assert!(text_output.contains("status: Queued"));
     assert!(text_output.contains("branch: main"));
-    let queued_messages = store.list_queue_messages("prompt.job").unwrap();
+    let queued_messages = store
+        .list_queue_messages(&prompt_job_queue_for_branch("main"))
+        .unwrap();
     assert_eq!(queued_messages.len(), 1);
     let text_job_id = queued_messages[0].payload["job_id"].as_str().unwrap();
     assert!(store.get_job(text_job_id).is_err());
@@ -1267,7 +1273,20 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(value["status"], "queued");
     assert_eq!(value["branch"], "json");
     assert!(value["job_id"].is_string());
-    assert_eq!(store.list_queue_messages("prompt.job").unwrap().len(), 2);
+    assert_eq!(
+        store
+            .list_queue_messages(&prompt_job_queue_for_branch("main"))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .list_queue_messages(&prompt_job_queue_for_branch("json"))
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1321,7 +1340,12 @@ async fn forwarded_runtime_async_prompt_without_daemon_worker_drives_in_process(
 
     let value: Value = serde_json::from_str(&output).unwrap();
     let job_id = value["job_id"].as_str().unwrap();
-    assert!(store.list_queue_messages("prompt.job").unwrap().is_empty());
+    assert!(
+        store
+            .list_queue_messages(&prompt_job_queue_for_branch("main"))
+            .unwrap()
+            .is_empty()
+    );
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
