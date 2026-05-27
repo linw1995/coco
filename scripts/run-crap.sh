@@ -27,7 +27,6 @@ crap_allow_args=(
   --allow "run_session_command"
   --allow "render_node_content"
   --allow "abort_channel_task"
-  --allow "read_request"
   --allow "merge_json_value"
   --allow "configure_completion_request_builder"
   --allow "LlmService::run_locked"
