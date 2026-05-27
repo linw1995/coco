@@ -844,6 +844,9 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
     {
         loop {
             self.drain_once().await?;
+            if self.peek_prompt_queue_head()?.is_none() {
+                return Ok(());
+            }
         }
     }
 
@@ -853,8 +856,10 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         S: Store + Clone + Send + Sync + 'static,
     {
         let mut progressed = false;
+        let mut saw_item = false;
         let mut wait_duration = None;
         while let Some(item) = self.peek_prompt_queue_head()? {
+            saw_item = true;
             match decode_prompt_job_message(item.payload.clone()) {
                 Ok(request) => {
                     match self
@@ -883,7 +888,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 }
             }
         }
-        if !progressed {
+        if !progressed && saw_item {
             tokio::time::sleep(wait_duration.unwrap_or(PROMPT_JOB_QUEUE_IDLE_DELAY)).await;
         }
         Ok(())
@@ -2152,6 +2157,45 @@ mod tests {
         ));
         assert_eq!(
             engine.get_job(&active_job_id).unwrap().status,
+            JobStatus::Finished
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_job_queue_worker_exits_after_draining_branch_queue() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let calls = backend.calls.clone();
+        let release_first = backend.release_first.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("day")).await.unwrap();
+        let engine = ConversationEngine::new(llm);
+        let queue = prompt_job_queue_for_branch("day");
+        store
+            .enqueue_message(
+                &queue,
+                json!(QueuedPromptRequest {
+                    job_id: "job-day-queued".to_owned(),
+                    branch: "day".to_owned(),
+                    prompt: "queued work".to_owned(),
+                    merge_parents: vec![],
+                    session_patch: None,
+                }),
+            )
+            .unwrap();
+        let worker = PromptJobMessageQueueWorker::new(queue.clone(), store.clone(), engine.clone());
+
+        let worker_task = tokio::spawn(async move { worker.run().await });
+        wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
+        release_first.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), worker_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(store.list_queue_messages(&queue).unwrap().is_empty());
+        assert_eq!(
+            engine.join_job("job-day-queued").await.unwrap().status,
             JobStatus::Finished
         );
     }
