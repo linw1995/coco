@@ -1883,8 +1883,7 @@ fn fs_store_persists_branch_prompt_queue_under_branch_directory() {
     assert!(
         path.join("branches")
             .join("queues")
-            .join("day")
-            .join("queue.jsonl")
+            .join("day.jsonl")
             .is_file()
     );
     assert_eq!(
@@ -1914,8 +1913,7 @@ fn fs_store_branch_prompt_queue_path_does_not_collide_with_branch_view_file() {
     assert!(
         path.join("branches")
             .join("queues")
-            .join("foo.jsonl")
-            .join("queue.jsonl")
+            .join("foo.jsonl.jsonl")
             .is_file()
     );
     let items = store.list_queue_messages("prompt.job/foo.jsonl").unwrap();

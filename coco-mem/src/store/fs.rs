@@ -38,7 +38,6 @@ const JOB_HISTORY_FILE_NAME: &str = "jobs.jsonl";
 const JOB_COMPACTION_FILE_NAME: &str = "jobs.compaction.json";
 const QUEUES_FILE_NAME: &str = "queues.jsonl";
 const BRANCH_QUEUE_DIR_NAME: &str = "queues";
-const BRANCH_QUEUE_FILE_NAME: &str = "queue.jsonl";
 const PROMPT_JOB_BRANCH_QUEUE_PREFIX: &str = "prompt.job/";
 const SKILLS_FILE_NAME: &str = "skills.json";
 const PRESET_HISTORY_DIR_NAME: &str = "preset-history";
@@ -1081,8 +1080,7 @@ impl Persistence {
     fn branch_message_queue_path(&self, branch: &str) -> PathBuf {
         self.branches_dir
             .join(BRANCH_QUEUE_DIR_NAME)
-            .join(encode_branch_name(branch))
-            .join(BRANCH_QUEUE_FILE_NAME)
+            .join(format!("{}.jsonl", encode_branch_name(branch)))
     }
 
     fn create_preset_history_directory(&self) -> Result<()> {
@@ -1628,12 +1626,9 @@ impl Persistence {
         let Some(branch) = prompt_job_branch_from_queue(queue) else {
             return Ok(self.queues_path.clone());
         };
-        let dir = self
-            .branches_dir
-            .join(BRANCH_QUEUE_DIR_NAME)
-            .join(encode_branch_name(branch));
+        let dir = self.branches_dir.join(BRANCH_QUEUE_DIR_NAME);
         fs::create_dir_all(&dir).context(WriteStoreDirectorySnafu { path: dir.clone() })?;
-        Ok(dir.join(BRANCH_QUEUE_FILE_NAME))
+        Ok(self.branch_message_queue_path(branch))
     }
 
     fn load_branch_message_queues(
@@ -1652,12 +1647,8 @@ impl Persistence {
             let entry = entry.context(WriteStoreDirectorySnafu {
                 path: branch_queues_dir.clone(),
             })?;
-            let branch_dir = entry.path();
-            if !branch_dir.is_dir() {
-                continue;
-            }
-            let queue_path = branch_dir.join(BRANCH_QUEUE_FILE_NAME);
-            if !queue_path.exists() {
+            let queue_path = entry.path();
+            if queue_path.is_dir() {
                 continue;
             }
             ensure!(
@@ -1667,16 +1658,21 @@ impl Persistence {
                     message: "branch message queue WAL entry must be a file".to_owned(),
                 }
             );
-            let encoded_branch = branch_dir
+            let encoded_branch = queue_path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .context(CorruptedStoreSnafu {
-                    path: branch_dir.clone(),
-                    message: "branch message queue directory name is not valid UTF-8".to_owned(),
+                    path: queue_path.clone(),
+                    message: "branch message queue file name is not valid UTF-8".to_owned(),
+                })?
+                .strip_suffix(".jsonl")
+                .context(CorruptedStoreSnafu {
+                    path: queue_path.clone(),
+                    message: "branch message queue file must have .jsonl extension".to_owned(),
                 })?;
             let branch = decode_branch_name(encoded_branch).context(CorruptedStoreSnafu {
-                path: branch_dir.clone(),
-                message: "branch message queue directory name cannot be decoded".to_owned(),
+                path: queue_path.clone(),
+                message: "branch message queue file name cannot be decoded".to_owned(),
             })?;
             let queue = prompt_job_branch_queue_name(&branch);
             let entries = read_jsonl_file::<MessageQueueHistoryEntry>(&queue_path)?;
@@ -1705,14 +1701,11 @@ impl Persistence {
             let entry = entry.context(WriteStoreDirectorySnafu {
                 path: branch_queues_dir.clone(),
             })?;
-            let branch_dir = entry.path();
-            if !branch_dir.is_dir() {
+            let queue_path = entry.path();
+            if queue_path.is_dir() {
                 continue;
             }
-            let queue_path = branch_dir.join(BRANCH_QUEUE_FILE_NAME);
-            if queue_path.exists() {
-                write_jsonl_file(&queue_path, &[] as &[MessageQueueHistoryEntry])?;
-            }
+            write_jsonl_file(&queue_path, &[] as &[MessageQueueHistoryEntry])?;
         }
 
         self.write_live_branch_message_queue_histories(queues)
