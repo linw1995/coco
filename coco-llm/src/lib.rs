@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::IntoError;
 use snafu::prelude::*;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 
 pub use skill::{
     ExecutorError, SkillInvocationRequest, SkillInvocationResult, SkillSearchExecutor,
@@ -886,6 +886,7 @@ pub trait CompletionBackend: Send + Sync {
 
 type BranchLock = Arc<Mutex<()>>;
 type BranchLockTable = Arc<StdMutex<HashMap<String, BranchLock>>>;
+type JobStatusWatchTable = Arc<StdMutex<HashMap<String, watch::Sender<u64>>>>;
 type WorkflowLock = Arc<Mutex<()>>;
 
 pub struct BranchLockGuard {
@@ -933,6 +934,7 @@ pub struct LlmService<B = RigBackend, S = MemoryStore> {
     provider_configs: HashMap<String, ProviderRuntimeConfig>,
     runtime: RuntimeCapabilities,
     branch_locks: BranchLockTable,
+    job_status_watchers: JobStatusWatchTable,
     workflow_lock: WorkflowLock,
 }
 
@@ -1064,6 +1066,7 @@ impl<B, S> LlmServiceBuilder<B, S> {
                 unified_exec_sessions: unified_exec_tool::session_store(),
             },
             branch_locks: Arc::new(StdMutex::new(HashMap::new())),
+            job_status_watchers: Arc::new(StdMutex::new(HashMap::new())),
             workflow_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -1113,6 +1116,39 @@ impl<B, S> LlmService<B, S> {
             locks: self.branch_locks.clone(),
             guard: Some(guard),
         }
+    }
+
+    pub fn subscribe_job_status(&self, job_id: &str) -> watch::Receiver<u64> {
+        let mut watchers = self
+            .job_status_watchers
+            .lock()
+            .expect("job status watcher table poisoned");
+        watchers
+            .entry(job_id.to_owned())
+            .or_insert_with(|| {
+                let (sender, _receiver) = watch::channel(0);
+                sender
+            })
+            .subscribe()
+    }
+
+    pub fn notify_job_status_changed(&self, job_id: &str) {
+        let sender = self
+            .job_status_watchers
+            .lock()
+            .expect("job status watcher table poisoned")
+            .get(job_id)
+            .cloned();
+        if let Some(sender) = sender {
+            sender.send_modify(|version| *version = version.wrapping_add(1));
+        }
+    }
+
+    pub fn clear_job_status_watch(&self, job_id: &str) {
+        self.job_status_watchers
+            .lock()
+            .expect("job status watcher table poisoned")
+            .remove(job_id);
     }
 
     async fn lock_branch(&self, branch: &str) -> BranchLockGuard {

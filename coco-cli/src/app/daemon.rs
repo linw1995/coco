@@ -1001,6 +1001,20 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
+        if matches!(active_job.status, JobStatus::Queued) {
+            tracing::debug!(
+                message_id = %item.message_id,
+                queue = %queue,
+                branch = %request.branch,
+                job_id = %request.job_id,
+                active_job_id = %active_job.job_id,
+                active_job_status = ?active_job.status,
+                wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
+                "active branch prompt job has not started; queued request will wait"
+            );
+            return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL));
+        }
+
         if active_job_is_waiting_for_recovery(&self.store, &active_job).context(StoreSnafu)? {
             tracing::debug!(
                 message_id = %item.message_id,
@@ -1011,6 +1025,20 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 active_job_status = ?active_job.status,
                 wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
                 "active branch prompt job is waiting for recovery; queued request will wait"
+            );
+            return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL));
+        }
+
+        if !self.engine.has_inflight_job(&active_job.job_id).await {
+            tracing::debug!(
+                message_id = %item.message_id,
+                queue = %queue,
+                branch = %request.branch,
+                job_id = %request.job_id,
+                active_job_id = %active_job.job_id,
+                active_job_status = ?active_job.status,
+                wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
+                "active branch prompt job has no inflight drive; queued request will wait"
             );
             return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_JOIN_INTERVAL));
         }
@@ -1298,13 +1326,9 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
             "handling queued telegram inbound message"
         );
 
-        if let Err(error) = wait_for_branch_to_accept_channel_prompt(
-            &self.store,
-            &self.engine,
-            &self.branch,
-            &item.message_id,
-        )
-        .await
+        if let Err(error) =
+            wait_for_branch_to_accept_channel_prompt(&self.engine, &self.branch, &item.message_id)
+                .await
         {
             tracing::error!(
                 message_id = %item.message_id,
@@ -1343,7 +1367,6 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
 }
 
 async fn wait_for_branch_to_accept_channel_prompt<B, S>(
-    store: &S,
     engine: &ConversationEngine<B, S>,
     branch: &str,
     message_id: &str,
@@ -1352,7 +1375,6 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let mut active_job_joins = HashMap::new();
     loop {
         let active_job = engine
             .active_branch_prompt_job(branch)
@@ -1361,52 +1383,30 @@ where
             return Ok(());
         };
 
-        if active_job_is_waiting_for_recovery(store, &active_job).context(StoreSnafu)? {
+        if matches!(active_job.status, JobStatus::Queued) {
             tracing::debug!(
                 message_id = %message_id,
                 queue = TELEGRAM_INBOUND_QUEUE,
                 branch = %branch,
                 active_job_id = %active_job.job_id,
                 active_job_status = ?active_job.status,
-                wait_ms = ACTIVE_JOB_JOIN_INTERVAL.as_millis(),
-                "active branch prompt job is waiting for recovery; queued request will wait"
+                "active branch prompt job has not started; queued request will wait"
             );
-            tokio::time::sleep(ACTIVE_JOB_JOIN_INTERVAL).await;
-            continue;
-        }
-
-        if let ActiveJobJoinDecision::Backoff(duration) =
-            active_job_join_decision_with_backoff(&mut active_job_joins, &active_job)
-        {
-            tracing::debug!(
+        } else {
+            tracing::info!(
                 message_id = %message_id,
                 queue = TELEGRAM_INBOUND_QUEUE,
                 branch = %branch,
                 active_job_id = %active_job.job_id,
                 active_job_status = ?active_job.status,
-                wait_ms = duration.as_millis(),
-                "active branch prompt job was joined recently; queued request will wait"
+                "waiting for active branch prompt job before handling queued request"
             );
-            tokio::time::sleep(duration).await;
-            continue;
         }
 
-        tracing::info!(
-            message_id = %message_id,
-            queue = TELEGRAM_INBOUND_QUEUE,
-            branch = %branch,
-            active_job_id = %active_job.job_id,
-            active_job_status = ?active_job.status,
-            "waiting for active branch prompt job before handling queued request"
-        );
-
-        let snapshot = engine
+        engine
             .join_job(&active_job.job_id)
             .await
             .context(CoreEngineSnafu)?;
-        if !matches!(snapshot.status, JobStatus::Finished) {
-            tokio::time::sleep(ACTIVE_JOB_JOIN_INTERVAL).await;
-        }
     }
 }
 
@@ -1926,7 +1926,6 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
@@ -1942,8 +1941,8 @@ mod tests {
         SessionConfig, StepContext,
     };
     use coco_mem::{
-        BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore,
-        MessageQueueStore, NewNode, NodeStore, Role, SessionAnchorPatch, SessionRole, SessionStore,
+        BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MemoryStore, MessageQueueStore,
+        NewNode, NodeStore, Role, SessionAnchorPatch, SessionRole, SessionStore,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -2756,25 +2755,6 @@ mod tests {
 
         assert_eq!(config.model, "new-model");
         assert_eq!(config.max_tokens, Some(12_345));
-    }
-
-    #[test]
-    fn active_job_join_backoff_prunes_expired_entries() {
-        let mut active_job = Job::new("job-active", "main", "base");
-        active_job.status = JobStatus::Running;
-        let stale_job_id = "job-stale".to_owned();
-        let mut active_job_joins = HashMap::from([(
-            stale_job_id.clone(),
-            Instant::now() - super::ACTIVE_JOB_JOIN_INTERVAL,
-        )]);
-
-        assert!(matches!(
-            super::active_job_join_decision_with_backoff(&mut active_job_joins, &active_job),
-            super::ActiveJobJoinDecision::Join
-        ));
-
-        assert!(!active_job_joins.contains_key(&stale_job_id));
-        assert!(active_job_joins.contains_key(&active_job.job_id));
     }
 
     #[derive(Debug, Clone, Default)]
