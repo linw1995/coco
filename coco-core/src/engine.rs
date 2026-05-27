@@ -418,6 +418,7 @@ where
             expected_work_branch,
             next_work_branch,
         )?;
+        self.service.notify_job_status_changed(job_id);
         self.build_job_status_snapshot(&job)
     }
 
@@ -462,15 +463,23 @@ where
         &self,
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let inflight_job = self.inflight_jobs.lock().await.get(job_id).cloned();
-        if let Some(inflight_job) = inflight_job {
+        let mut job_status = self.service.subscribe_job_status(job_id);
+        loop {
+            let snapshot = self.get_job(job_id)?;
+            if matches!(snapshot.status, JobStatus::Finished) {
+                self.service.clear_job_status_watch(job_id);
+                return Ok(snapshot);
+            }
+
             tracing::debug!(
                 job_id = %job_id,
-                "joining inflight prompt job without starting a new drive"
+                status = ?snapshot.status,
+                "waiting for prompt job status notification"
             );
-            let _ = inflight_job.await;
+            if job_status.changed().await.is_err() {
+                return self.get_job(job_id);
+            }
         }
-        self.get_job(job_id)
     }
 
     pub async fn drive_job_with_merge_parents(
@@ -506,6 +515,7 @@ where
         let result = inflight_job.clone().await;
 
         self.inflight_jobs.lock().await.remove(&job_id);
+        self.service.notify_job_status_changed(&job_id);
 
         result
     }
@@ -532,6 +542,7 @@ where
                 JobStatus::Queued,
                 JobStatus::Running,
             )?;
+            self.service.notify_job_status_changed(job_id);
             tracing::info!(
                 job_id = %job.job_id,
                 branch = %job.branch,
@@ -741,6 +752,7 @@ where
             self.service
                 .store()
                 .set_job_work_branch(&job.job_id, &job.work_branch, &job.branch)?;
+        self.service.notify_job_status_changed(&job.job_id);
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
@@ -760,6 +772,7 @@ where
             JobStatus::Running,
             JobStatus::Finished,
         )?;
+        self.service.notify_job_status_changed(&job.job_id);
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
