@@ -5327,6 +5327,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completion_additional_params_deep_merge_objects() {
+        let defaults = serde_json::json!({
+            "metadata": {
+                "team": "infra",
+                "tags": ["default"],
+            },
+            "reasoning": {
+                "effort": "low",
+                "summary": "auto",
+            },
+            "service_tier": "default",
+        });
+        let overrides = serde_json::json!({
+            "metadata": {
+                "tags": ["override"],
+            },
+            "reasoning": {
+                "effort": "high",
+            },
+            "temperature": 0.2,
+        });
+
+        assert_eq!(
+            merge_completion_additional_params(Some(defaults), Some(overrides)),
+            Some(serde_json::json!({
+                "metadata": {
+                    "team": "infra",
+                    "tags": ["override"],
+                },
+                "reasoning": {
+                    "effort": "high",
+                    "summary": "auto",
+                },
+                "service_tier": "default",
+                "temperature": 0.2,
+            }))
+        );
+    }
+
+    #[test]
+    fn completion_additional_params_override_non_objects() {
+        assert_eq!(
+            merge_completion_additional_params(
+                Some(serde_json::json!({"service_tier": "default"})),
+                Some(serde_json::json!(false)),
+            ),
+            Some(serde_json::json!(false))
+        );
+        assert_eq!(
+            merge_completion_additional_params(
+                Some(serde_json::json!(["default"])),
+                Some(serde_json::json!({"service_tier": "priority"})),
+            ),
+            Some(serde_json::json!({"service_tier": "priority"}))
+        );
+        assert_eq!(
+            merge_completion_additional_params(None, Some(serde_json::json!({"max": 1}))),
+            Some(serde_json::json!({"max": 1}))
+        );
+    }
+
     #[tokio::test]
     async fn provider_profile_additional_params_do_not_leak_to_provider_override() {
         let store = MemoryStore::new();
