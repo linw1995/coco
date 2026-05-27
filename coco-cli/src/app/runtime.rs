@@ -565,3 +565,33 @@ fn apply_forwarded_skill_parent(cli: &mut Cli, parent_tool_use_id: String, branc
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::command_name;
+    use crate::cli::Cli;
+
+    #[test]
+    fn command_name_covers_all_cli_variants() {
+        let cases = [
+            (["coco", "preset", "list"].as_slice(), "preset"),
+            (
+                ["coco", "prompt", "status", "--job", "job-1"].as_slice(),
+                "prompt",
+            ),
+            (["coco", "session", "list"].as_slice(), "session"),
+            (["coco", "skill", "list"].as_slice(), "skill"),
+            (
+                ["coco", "daemon", "serve", "--no-console"].as_slice(),
+                "daemon",
+            ),
+        ];
+
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert_eq!(command_name(&cli.command), expected);
+        }
+    }
+}

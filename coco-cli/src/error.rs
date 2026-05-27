@@ -172,3 +172,41 @@ impl fmt::Display for JsonValueKind<'_> {
         f.write_str(kind)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{Error, JsonValueKind};
+
+    #[test]
+    fn json_value_kind_renders_all_json_kinds() {
+        let cases = [
+            (serde_json::Value::Null, "null"),
+            (json!(true), "boolean"),
+            (json!(1), "number"),
+            (json!("text"), "string"),
+            (json!([1]), "array"),
+            (json!({"key": "value"}), "object"),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(JsonValueKind(&value).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn additional_params_type_errors_report_json_kind() {
+        assert_eq!(
+            Error::InvalidSessionAdditionalParamsType { value: json!([]) }.to_string(),
+            "Session additional params must be a JSON object, got array"
+        );
+        assert_eq!(
+            Error::InvalidPresetAdditionalParamsType {
+                value: serde_json::Value::Null,
+            }
+            .to_string(),
+            "Preset additional params must be a JSON object, got null"
+        );
+    }
+}

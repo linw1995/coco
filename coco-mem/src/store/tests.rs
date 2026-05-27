@@ -1873,7 +1873,7 @@ where
 }
 
 #[test]
-fn fs_store_persists_branch_prompt_queue_under_branch_directory() {
+fn fs_store_persists_branch_prompt_queue_under_root_queue_directory() {
     let (_tempdir, path) = temp_store_path();
     let store = FsStore::open(&path).unwrap();
     let item = store
@@ -2971,6 +2971,63 @@ fn queue_wal_compacts_when_queues_are_empty() {
 
     assert!(store.list_queue_messages("hooks").unwrap().is_empty());
     assert!(read_jsonl_values(&path.join("queues.jsonl")).is_empty());
+}
+
+#[test]
+fn queue_wal_compaction_rewrites_root_and_branch_prompt_queues() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_live = store
+        .enqueue_message("hooks", json!({"text": "root"}))
+        .unwrap();
+    let branch_live = store
+        .enqueue_message("prompt.job/day", json!({"text": "branch"}))
+        .unwrap();
+
+    std::fs::create_dir_all(path.join("queues").join("ignored-dir")).unwrap();
+    for index in 0..70 {
+        let root = store
+            .enqueue_message("transient", json!({"index": index}))
+            .unwrap();
+        assert_eq!(store.dequeue_message("transient").unwrap(), Some(root));
+        let branch = store
+            .enqueue_message("prompt.job/tmp", json!({"index": index}))
+            .unwrap();
+        assert_eq!(
+            store.dequeue_message("prompt.job/tmp").unwrap(),
+            Some(branch)
+        );
+    }
+    drop(store);
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    assert_eq!(
+        reopened.list_queue_messages("hooks").unwrap(),
+        vec![root_live]
+    );
+    assert_eq!(
+        reopened.list_queue_messages("prompt.job/day").unwrap(),
+        vec![branch_live]
+    );
+    assert!(
+        reopened
+            .list_queue_messages("transient")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .list_queue_messages("prompt.job/tmp")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(read_jsonl_values(&path.join("queues.jsonl")).len(), 1);
+    assert_eq!(
+        read_jsonl_values(&path.join("queues").join("day.jsonl")).len(),
+        1
+    );
+    assert!(read_jsonl_values(&path.join("queues").join("tmp.jsonl")).is_empty());
 }
 
 #[test]
