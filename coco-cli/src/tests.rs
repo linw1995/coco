@@ -1287,6 +1287,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
             .len(),
         1
     );
+    assert!(store.list_queue_messages("prompt.job").unwrap().is_empty());
 }
 
 #[tokio::test]
