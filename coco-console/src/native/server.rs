@@ -381,3 +381,58 @@ async fn write_graph_event(stream: &mut tokio::net::TcpStream, version: u64) -> 
         .write_all(format!("event: graph\ndata: {version}\n\n").as_bytes())
         .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::read_request;
+    use tokio::io::AsyncWriteExt;
+
+    async fn read_request_from(bytes: &[u8]) -> Option<super::HttpRequest> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn({
+            let bytes = bytes.to_vec();
+            async move {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
+            }
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        let request = read_request(&mut stream).await.unwrap();
+        client.await.unwrap();
+        request
+    }
+
+    #[tokio::test]
+    async fn read_request_parses_path_and_version_query() {
+        let request = read_request_from(
+            b"GET /fragment?ignored=true&version=42 HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        )
+        .await
+        .expect("request should parse");
+
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/fragment");
+        assert_eq!(request.version, Some(42));
+    }
+
+    #[tokio::test]
+    async fn read_request_ignores_invalid_or_missing_version_query() {
+        let invalid = read_request_from(b"GET /fragment?version=bad HTTP/1.1\r\n\r\n")
+            .await
+            .expect("request should parse");
+        let missing = read_request_from(b"GET /fragment HTTP/1.1\r\n\r\n")
+            .await
+            .expect("request should parse");
+
+        assert_eq!(invalid.version, None);
+        assert_eq!(missing.version, None);
+    }
+
+    #[tokio::test]
+    async fn read_request_returns_none_for_empty_or_incomplete_request_line() {
+        assert_eq!(read_request_from(b"").await, None);
+        assert_eq!(read_request_from(b"GET\r\n\r\n").await, None);
+    }
+}

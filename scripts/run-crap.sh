@@ -29,8 +29,6 @@ crap_allow_args=(
   --allow "render_node_content"
   --allow "command_name"
   --allow "abort_channel_task"
-  --allow "ForwardSocketError::fmt"
-  --allow "read_request"
   --allow "merge_json_value"
   --allow "configure_completion_request_builder"
   --allow "LlmService::run_locked"
