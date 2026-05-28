@@ -19,7 +19,6 @@ crap_allow_args=(
   --allow "RigBackend::step"
   --allow "main"
   --allow "Persistence::load"
-  --allow "RunnerCli::into_cli"
   --allow "run_daemon_command"
   --allow "PromptJobMessageQueueWorker::handle_prompt_request_queue_head"
   --allow "JsonValueKind::fmt"

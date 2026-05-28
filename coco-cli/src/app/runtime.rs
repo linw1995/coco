@@ -570,8 +570,12 @@ fn apply_forwarded_skill_parent(cli: &mut Cli, parent_tool_use_id: String, branc
 mod tests {
     use clap::Parser;
 
-    use super::command_name;
-    use crate::cli::Cli;
+    use super::{ForwardedRuntimeScope, command_name, parse_forwarded_cli};
+    use crate::cli::{Cli, Command, PromptSubcommand, SessionSubcommand};
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
 
     #[test]
     fn command_name_covers_all_cli_variants() {
@@ -593,5 +597,114 @@ mod tests {
             let cli = Cli::try_parse_from(argv).unwrap();
             assert_eq!(command_name(&cli.command), expected);
         }
+    }
+
+    #[test]
+    fn runner_cli_maps_prompt_status_commands() {
+        let cli = parse_forwarded_cli(
+            &strings(&["coco", "prompt", "status", "--job", "job-1", "--json"]),
+            ForwardedRuntimeScope::Runner,
+        )
+        .unwrap();
+
+        let Command::Prompt(command) = cli.command else {
+            panic!("expected prompt command");
+        };
+        let Some(PromptSubcommand::Status(status)) = command.command else {
+            panic!("expected prompt status command");
+        };
+        assert_eq!(status.job, "job-1");
+        assert!(status.json);
+        assert_eq!(command.run.branch, "main");
+        assert!(command.run.text.is_empty());
+
+        let cli = parse_forwarded_cli(
+            &strings(&[
+                "coco",
+                "prompt",
+                "branch-status",
+                "--job",
+                "job-2",
+                "--branch",
+                "draft",
+                "--json",
+            ]),
+            ForwardedRuntimeScope::Runner,
+        )
+        .unwrap();
+
+        let Command::Prompt(command) = cli.command else {
+            panic!("expected prompt command");
+        };
+        let Some(PromptSubcommand::BranchStatus(status)) = command.command else {
+            panic!("expected prompt branch-status command");
+        };
+        assert_eq!(status.job, "job-2");
+        assert_eq!(status.branch.as_deref(), Some("draft"));
+        assert!(status.json);
+        assert_eq!(command.run.branch, "main");
+        assert!(command.run.text.is_empty());
+    }
+
+    #[test]
+    fn runner_cli_maps_session_commands() {
+        let cli = parse_forwarded_cli(
+            &strings(&["coco", "session", "list"]),
+            ForwardedRuntimeScope::Runner,
+        )
+        .unwrap();
+
+        let Command::Session(command) = cli.command else {
+            panic!("expected session command");
+        };
+        let SessionSubcommand::List(list) = command.command else {
+            panic!("expected session list command");
+        };
+        assert!(!list.json);
+
+        let cli = parse_forwarded_cli(
+            &strings(&["coco", "session", "get", "--branch", "draft", "--json"]),
+            ForwardedRuntimeScope::Runner,
+        )
+        .unwrap();
+
+        let Command::Session(command) = cli.command else {
+            panic!("expected session command");
+        };
+        let SessionSubcommand::Get(get) = command.command else {
+            panic!("expected session get command");
+        };
+        assert_eq!(get.branch, "draft");
+        assert!(get.json);
+
+        let cli = parse_forwarded_cli(
+            &strings(&["coco", "session", "graph", "--json", "--all"]),
+            ForwardedRuntimeScope::Runner,
+        )
+        .unwrap();
+
+        let Command::Session(command) = cli.command else {
+            panic!("expected session command");
+        };
+        let SessionSubcommand::Graph(graph) = command.command else {
+            panic!("expected session graph command");
+        };
+        assert!(graph.json);
+        assert!(graph.all);
+
+        let cli = parse_forwarded_cli(
+            &strings(&["coco", "session", "show", "node-1", "--json"]),
+            ForwardedRuntimeScope::Runner,
+        )
+        .unwrap();
+
+        let Command::Session(command) = cli.command else {
+            panic!("expected session command");
+        };
+        let SessionSubcommand::Show(show) = command.command else {
+            panic!("expected session show command");
+        };
+        assert_eq!(show.reference, "node-1");
+        assert!(show.json);
     }
 }
