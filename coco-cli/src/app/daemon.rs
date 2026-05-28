@@ -1977,6 +1977,9 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::ffi::OsString;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
@@ -1995,7 +1998,7 @@ mod tests {
     };
     use coco_mem::{
         BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MemoryStore, MessageQueueStore,
-        NewNode, NodeStore, Role, SessionAnchorPatch, SessionRole, SessionStore,
+        NewNode, NodeStore, ProviderProfile, Role, SessionAnchorPatch, SessionRole, SessionStore,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -2007,19 +2010,37 @@ mod tests {
     use crate::cli::{Cli, Command, DaemonCommand};
 
     use super::{
-        LlmBackendFailureRecoveryRequested, PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker,
-        SYSTEM_EVENT_QUEUE, SystemEvent, SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
+        ChannelConfigs, DEFAULT_SESSION_BRANCH, LlmBackendFailureRecoveryRequested,
+        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, ProviderProfiles, SYSTEM_EVENT_QUEUE,
+        SystemEvent, SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
         TelegramMessageQueuePublisher, TelegramMessageQueueWorker, daemon_console_config,
         decode_telegram_message, encode_telegram_message, resolve_daemon_command_socket_path,
-        resolve_daemon_socket_path,
+        resolve_daemon_socket_path, run_daemon_command,
     };
 
-    fn daemon_command(args: impl IntoIterator<Item = &'static str>) -> DaemonCommand {
+    fn daemon_command<I, T>(args: I) -> DaemonCommand
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
         let cli = Cli::parse_from(args);
         let Command::Daemon(command) = cli.command else {
             panic!("expected daemon command");
         };
         command
+    }
+
+    fn provider_profiles() -> ProviderProfiles {
+        ProviderProfiles::from_profiles(HashMap::from([(
+            "openai".to_owned(),
+            ProviderProfile {
+                provider: "openai".to_owned(),
+                secrets: BTreeMap::new(),
+                base_url: None,
+                default_model: Some("gpt-4.1-mini".to_owned()),
+                spec: Default::default(),
+            },
+        )]))
     }
 
     fn assert_prompt_job_id_format(job_id: &str) {
@@ -2078,6 +2099,40 @@ mod tests {
         let config = daemon_console_config(&command, Some(&publisher));
 
         assert!(config.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_daemon_command_reports_socket_parent_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_parent = temp_dir.path().join("not-a-directory");
+        fs::write(&socket_parent, "").unwrap();
+        let socket_path = socket_parent.join("coco.sock");
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(
+            store.clone(),
+            BlockingOnceBackend::default(),
+        ));
+        let command = daemon_command([
+            OsString::from("coco"),
+            OsString::from("daemon"),
+            OsString::from("serve"),
+            OsString::from("--socket"),
+            socket_path.into_os_string(),
+        ]);
+
+        let error = run_daemon_command(
+            command,
+            &store,
+            &llm,
+            &provider_profiles(),
+            &ChannelConfigs::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, crate::Error::BindDaemonSocket { .. }));
+        assert!(store.get_session_state(DEFAULT_SESSION_BRANCH).is_ok());
     }
 
     #[test]
