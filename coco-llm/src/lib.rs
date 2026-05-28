@@ -1202,13 +1202,18 @@ where
         Ok(anchor_id)
     }
 
-    pub async fn handoff_session(&self, branch: &str, patch: SessionConfigPatch) -> Result<String> {
+    pub async fn handoff_session(
+        &self,
+        branch: &str,
+        patch: SessionConfigPatch,
+        prompt: &str,
+    ) -> Result<String> {
         let _guard = self.lock_branch(branch).await;
         let has_tool_patch = patch.tools.is_some();
         let has_model_patch = patch.model.is_some();
         let anchor_id = self
             .store
-            .handoff_session(branch, &patch)
+            .handoff_session(branch, &patch, prompt)
             .context(MemorySnafu)?;
         tracing::info!(
             branch = %branch,
@@ -5969,7 +5974,7 @@ mod tests {
             .await
             .unwrap();
         let anchor_id = service
-            .handoff_session("main", SessionConfigPatch::default())
+            .handoff_session("main", SessionConfigPatch::default(), "Compacted context.")
             .await
             .unwrap();
         let result = service
@@ -5983,9 +5988,35 @@ mod tests {
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
-                (Role::User, "Conversation start.".to_owned()),
+                (Role::User, "Compacted context.".to_owned()),
                 (Role::User, "round two".to_owned()),
                 (Role::LLM, "second".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_session_prompt_seeds_empty_context() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[("main", &[Ok("continued")])]);
+        let service = LlmService::new(store, backend);
+        let mut config = session_config("main");
+        config.prompt = String::new();
+        service.create_session(config).await.unwrap();
+
+        service
+            .handoff_session("main", SessionConfigPatch::default(), "Compacted context.")
+            .await
+            .unwrap();
+        let result = service.run(request("main")).await.unwrap();
+
+        assert_eq!(result.text, "continued");
+        let session = service.resolve_session("main").unwrap();
+        assert_eq!(
+            text_messages_from_provider_history(&session.provider_history),
+            vec![
+                (Role::User, "Compacted context.".to_owned()),
+                (Role::LLM, "continued".to_owned()),
             ]
         );
     }

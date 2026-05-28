@@ -27,7 +27,7 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-29";
+const STORE_FORMAT_VERSION: &str = "2026-05-30";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -52,9 +52,9 @@ const BUILTIN_NEW_SKILL_REVISION_ID: &str =
 const BUILTIN_CRONJOB_REVISION_ID: &str =
     "872b8f90c21af69be61fe7d90085dbd4491ca6dedd0aeae08feeee65db3aae5a";
 const BUILTIN_RECOVERY_REVISION_ID: &str =
-    "dfc5ea6b5ef4c46ffb4c0c7d1fde59f1ebfe782eeb673a0987353047b72c7e3b";
+    "91adf3f8b4e2fb11008b58db4d0c62c21b1b76cbe13b53a58e81fdeca1548b3b";
 const BUILTIN_COMPACT_REVISION_ID: &str =
-    "d035938926144776ca4341aaa57eaa3ed28a76234222f1ff06fe06cf5d8ab9ff";
+    "6a260a4377c10fe227c4957db8a63ebfb8b6b292a9e3862c21402a1c1b73d14e";
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "dcf88bdb5caaa2c8e4702cd5dfaa3e20919e08ce367ab7965e1f0d62710a60f4";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
@@ -98,6 +98,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         from_revision_ids: &[
             // Before the prompt command was renamed to job.
             "6bf4094ad2dd2f9932cfc8d13a0f4a6b7adc9fe293e1ea6bc9f995d9c880a3f8",
+            // Before session handoff required an explicit prompt.
+            "dfc5ea6b5ef4c46ffb4c0c7d1fde59f1ebfe782eeb673a0987353047b72c7e3b",
         ],
         target_revision_id: BUILTIN_RECOVERY_REVISION_ID,
     },
@@ -107,6 +109,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         from_revision_ids: &[
             // Before the prompt command was renamed to job.
             "3abb36a6333215088666cb168fef445430d19e19e19232e9e703286e3be3b9c6",
+            // Before session handoff required an explicit prompt.
+            "d035938926144776ca4341aaa57eaa3ed28a76234222f1ff06fe06cf5d8ab9ff",
         ],
         target_revision_id: BUILTIN_COMPACT_REVISION_ID,
     },
@@ -196,6 +200,13 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-28-to-2026-05-29",
         from: StoreFormatVersion::Chronicle("2026-05-28"),
+        to: StoreFormatVersion::Chronicle("2026-05-29"),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-29-to-2026-05-30",
+        from: StoreFormatVersion::Chronicle("2026-05-29"),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
@@ -2836,9 +2847,14 @@ impl SessionStore for FsStore {
         apply_rebase_plan(&mut state, &self.persistence, plan)
     }
 
-    fn handoff_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
+    fn handoff_session(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        prompt: &str,
+    ) -> Result<String> {
         let mut state = self.inner.write().expect("store lock poisoned");
-        let plan = state.plan_handoff_session(name, patch)?;
+        let plan = state.plan_handoff_session(name, patch, prompt)?;
         apply_handoff_plan(&mut state, &self.persistence, plan)
     }
 }
@@ -3552,6 +3568,20 @@ mod builtin_skill_migration_tests {
             cronjob
                 .from_revision_ids
                 .contains(&"88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e")
+        );
+
+        let recovery = builtin_migration(SessionRole::Orchestrator, "recovery");
+        assert!(
+            recovery
+                .from_revision_ids
+                .contains(&"6bf4094ad2dd2f9932cfc8d13a0f4a6b7adc9fe293e1ea6bc9f995d9c880a3f8")
+        );
+
+        let compact = builtin_migration(SessionRole::Orchestrator, "compact");
+        assert!(
+            compact
+                .from_revision_ids
+                .contains(&"3abb36a6333215088666cb168fef445430d19e19e19232e9e703286e3be3b9c6")
         );
 
         let telegram = builtin_migration(SessionRole::Runner, "telegram");

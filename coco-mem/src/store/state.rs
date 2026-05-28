@@ -7,10 +7,10 @@ use snafu::prelude::*;
 use crate::StoreResult as Result;
 use crate::error::{
     AmbiguousNodePrefixSnafu, BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu,
-    DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSkillNameSnafu,
-    MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu, MultipleShadowParentsSnafu,
-    NotFoundSnafu, ParentNotFoundSnafu, PresetNotFoundSnafu, PresetVersionNotFoundSnafu,
-    PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
+    DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu,
+    InvalidSkillNameSnafu, MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu,
+    MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu, PresetNotFoundSnafu,
+    PresetVersionNotFoundSnafu, PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
     PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
     RefsNotConnectedSnafu, SessionStateMovedSnafu, SkillAlreadyExistsSnafu, SkillNotFoundSnafu,
     SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu,
@@ -652,7 +652,11 @@ impl StoreState {
         &self,
         name: &str,
         patch: &SessionAnchorPatch,
+        prompt: &str,
     ) -> Result<HandoffPlan> {
+        let prompt = prompt.trim();
+        ensure!(!prompt.is_empty(), InvalidSessionHandoffPromptSnafu);
+
         let branch = name.to_owned();
         let expected_old_head = self.get_branch_head(name)?.to_owned();
         let session_node_id = self
@@ -670,7 +674,8 @@ impl StoreState {
             _ => unreachable!("session chain should end with anchor"),
         }
         .clone();
-        let handoff_session_anchor = session_anchor.apply_patch(patch);
+        let mut handoff_session_anchor = session_anchor.apply_patch(patch);
+        handoff_session_anchor.prompt = prompt.to_owned();
         let node = self.plan_append_node(NewNode {
             parent: expected_old_head.clone(),
             role: Role::System,

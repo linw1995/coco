@@ -15,8 +15,8 @@ pub use prompt::{
 pub use session::{SessionBranchCommand, SessionGraphCommand, SessionShowCommand};
 #[cfg(test)]
 pub use session::{
-    SessionCloseCommand, SessionFeedbackCommand, SessionForkCommand, SessionMergeCommand,
-    SessionPrCommand,
+    SessionCloseCommand, SessionFeedbackCommand, SessionForkCommand, SessionHandoffCommand,
+    SessionMergeCommand, SessionPrCommand,
 };
 pub use session::{
     SessionCommand, SessionCreateCommand, SessionListCommand, SessionRebaseCommand,

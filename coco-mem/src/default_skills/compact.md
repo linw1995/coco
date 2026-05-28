@@ -12,7 +12,7 @@ coco session graph --json
 coco session show --json <ref>
 coco job list --json
 coco job status --json --job <job-id>
-coco session handoff --branch <branch> --system-prompt "<compacted system prompt>"
+coco session handoff --branch <branch> --prompt "<compacted handoff>"
 ```
 
 Rules:
@@ -32,11 +32,11 @@ Rules:
   and external references.
 - Drop stale narration, superseded plans, raw tool transcripts, repeated
   reasoning, and details that can be recovered from commands when needed.
-- Write the compacted content as a procedural system prompt for the next turn on
-  this branch. It should say what must remain true and what the branch should do
+- Write the compacted content as the handoff prompt for the next turn on this
+  branch. It should say what must remain true and what the branch should do
   next, not retell the full history.
-- Apply the result with `coco session handoff --branch <branch> --system-prompt
-  "<compacted system prompt>"`. Do not use `session rebase` for compaction;
+- Apply the result with `coco session handoff --branch <branch> --prompt
+  "<compacted handoff>"`. Do not use `session rebase` for compaction;
   compaction should append a new provider-context boundary, not rewrite the
   branch configuration in place.
 - Re-read the branch after handoff and report the new head id.

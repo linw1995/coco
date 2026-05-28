@@ -19,7 +19,7 @@ pub enum SessionSubcommand {
     Delete(SessionBranchCommand),
     Rebase(SessionRebaseCommand),
     #[command(name = "handoff")]
-    Handoff(SessionRebaseCommand),
+    Handoff(SessionHandoffCommand),
     #[command(name = "reopen")]
     Reopen(SessionBranchCommand),
     #[command(name = "pr")]
@@ -155,6 +155,15 @@ pub struct SessionRebaseCommand {
 
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionHandoffCommand {
+    #[command(flatten)]
+    pub rebase: SessionRebaseCommand,
+
+    #[arg(long)]
+    pub prompt: String,
 }
 
 #[derive(Debug, Args)]
