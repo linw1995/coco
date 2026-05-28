@@ -171,187 +171,359 @@ where
 {
     match command.command {
         SessionSubcommand::Create(command) => {
-            let config = resolve_session_config(command, provider_profiles)?;
-            llm.create_session(config).await.context(LlmSnafu)?;
-            Ok(None)
+            run_session_create_command(command, llm, provider_profiles).await
         }
         SessionSubcommand::Fork(command) => {
-            let branch = command.branch.clone();
-            let head_id = llm
-                .fork(branch.clone(), &command.from_ref)
-                .context(LlmSnafu)?;
-            let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
-            let result = SessionForkResult {
-                state: store.get_session_state(&branch).context(StoreSnafu)?,
-                role: anchor.role,
-                branch,
-                head_id,
-            };
-            Ok(Some(if command.json {
-                render_json(result)
-            } else {
-                render_session_fork_text(&result)
-            }))
+            run_session_fork_command(command.branch, command.from_ref, command.json, store, llm)
         }
-        SessionSubcommand::List(command) => {
-            let sessions = list_sessions(store)?;
-            Ok(Some(if command.json {
-                render_json(sessions)
-            } else {
-                render_session_list_text(&sessions)
-            }))
-        }
+        SessionSubcommand::List(command) => run_session_list_command(command.json, store),
         SessionSubcommand::Get(command) => {
-            let details = read_session_details(store, &command.branch)?;
-            Ok(Some(if command.json {
-                render_json(details)
-            } else {
-                render_session_details_text(&details)
-            }))
+            run_session_get_command(command.branch, command.json, store)
         }
         SessionSubcommand::Graph(command) => {
-            let mode = if command.all {
-                SessionGraphMode::All
-            } else {
-                SessionGraphMode::Anchors
-            };
-            let entries = build_session_graph_entries(store, mode)?;
-            Ok(Some(if command.json {
-                render_json(entries)
-            } else {
-                render_session_graph_text(&entries)
-            }))
+            run_session_graph_command(command.json, command.all, store)
         }
-        SessionSubcommand::Show(command) => Ok(Some(render_session_show(
-            store,
-            &command.reference,
-            command.json,
-        )?)),
+        SessionSubcommand::Show(command) => {
+            run_session_show_command(command.reference, command.json, store)
+        }
         SessionSubcommand::Delete(command) => {
-            llm.delete_session_branch(&command.branch)
-                .await
-                .context(LlmSnafu)?;
-            let result = SessionDeleteResult {
-                branch: command.branch,
-            };
-            Ok(Some(if command.json {
-                render_json(result)
-            } else {
-                render_session_delete_text(&result)
-            }))
+            run_session_delete_command(command.branch, command.json, llm).await
         }
         SessionSubcommand::Rebase(command) => {
-            let branch = command.branch.clone();
-            let json = command.json;
-            let rebase = resolve_session_rebase(command, store, provider_profiles)?;
-            let head_id = llm
-                .rebase_session(&branch, rebase.patch)
-                .await
-                .context(LlmSnafu)?;
-            let result = SessionRebaseResult { branch, head_id };
-            Ok(Some(if json {
-                render_json(result)
-            } else {
-                render_session_rebase_text(&result)
-            }))
+            run_session_rebase_command(command, store, llm, provider_profiles).await
         }
         SessionSubcommand::Handoff(command) => {
-            let branch = command.rebase.branch.clone();
-            let json = command.rebase.json;
-            let prompt = command.prompt.trim().to_owned();
-            ensure!(!prompt.is_empty(), EmptyPromptSnafu);
-            let handoff = resolve_session_rebase(command.rebase, store, provider_profiles)?;
-            let head = llm
-                .handoff_session(&branch, handoff.patch, &prompt)
-                .await
-                .context(LlmSnafu)?;
-            let result = SessionHandoffResult { head };
-            Ok(Some(if json {
-                render_json(result)
-            } else {
-                render_session_handoff_text(&result)
-            }))
+            run_session_handoff_command(
+                command.rebase,
+                command.prompt,
+                store,
+                llm,
+                provider_profiles,
+            )
+            .await
         }
         SessionSubcommand::Reopen(command) => {
-            let result = SessionMutationResult {
-                branch: command.branch.clone(),
-                state: store
-                    .set_session_state(&command.branch, None, SessionState::Active)
-                    .context(StoreSnafu)?,
-            };
-            Ok(Some(if command.json {
-                render_json(result)
-            } else {
-                render_session_mutation_text(&result)
-            }))
+            run_session_reopen_command(command.branch, command.json, store)
         }
         SessionSubcommand::Pr(command) => {
-            let json = command.json;
-            let pr = llm
-                .open_pull_request(&command.branch, &command.target_branch)
-                .await
-                .context(LlmSnafu)?;
-            let result = build_pull_request_result(store, pr)?;
-            Ok(Some(if json {
-                render_json(result)
-            } else {
-                render_pull_request_text(&result)
-            }))
+            run_session_pr_command(
+                command.branch,
+                command.target_branch,
+                command.json,
+                store,
+                llm,
+            )
+            .await
         }
         SessionSubcommand::Close(command) => {
-            let result = SessionMutationResult {
-                branch: command.branch.clone(),
-                state: store
-                    .set_session_state(
-                        &command.branch,
-                        None,
-                        SessionState::Paused {
-                            target_branch: command.target_branch,
-                            reason: PauseReason::Closed,
-                        },
-                    )
-                    .context(StoreSnafu)?,
-            };
-            Ok(Some(if command.json {
-                render_json(result)
-            } else {
-                render_session_mutation_text(&result)
-            }))
+            run_session_close_command(command.branch, command.target_branch, command.json, store)
         }
         SessionSubcommand::Merge(command) => {
-            let json = command.json;
-            let merged = llm
-                .merge_session(
-                    &command.branch,
-                    command.target_branch.as_deref(),
-                    &command.prompt,
-                )
-                .await
-                .context(LlmSnafu)?;
-            let result = build_session_merge_result(store, merged)?;
-            Ok(Some(if json {
-                render_json(result)
-            } else {
-                render_session_merge_text(&result)
-            }))
+            run_session_merge_command(
+                command.branch,
+                command.target_branch,
+                command.prompt,
+                command.json,
+                store,
+                llm,
+            )
+            .await
         }
         SessionSubcommand::Feedback(command) => {
-            let json = command.json;
-            let feedback = llm
-                .apply_feedback(
-                    &command.branch,
-                    &command.prompt,
-                    command.from_ref.as_deref(),
-                )
-                .await
-                .context(LlmSnafu)?;
-            let result = build_session_feedback_result(store, feedback)?;
-            Ok(Some(if json {
-                render_json(result)
-            } else {
-                render_session_feedback_text(&result)
-            }))
+            run_session_feedback_command(
+                command.branch,
+                command.prompt,
+                command.from_ref,
+                command.json,
+                store,
+                llm,
+            )
+            .await
         }
+    }
+}
+
+async fn run_session_create_command<B, S>(
+    command: SessionCreateCommand,
+    llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let config = resolve_session_config(command, provider_profiles)?;
+    llm.create_session(config).await.context(LlmSnafu)?;
+    Ok(None)
+}
+
+fn run_session_fork_command<B, S>(
+    branch: String,
+    from_ref: String,
+    json: bool,
+    store: &S,
+    llm: &Arc<LlmService<B, S>>,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let head_id = llm.fork(branch.clone(), &from_ref).context(LlmSnafu)?;
+    let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
+    let result = SessionForkResult {
+        state: store.get_session_state(&branch).context(StoreSnafu)?,
+        role: anchor.role,
+        branch,
+        head_id,
+    };
+    Ok(Some(render_session_result(
+        result,
+        json,
+        render_session_fork_text,
+    )))
+}
+
+fn run_session_list_command(
+    json: bool,
+    store: &(impl BranchStore + NodeStore + SessionStore),
+) -> Result<Option<String>> {
+    let sessions = list_sessions(store)?;
+    Ok(Some(render_session_result(sessions, json, |sessions| {
+        render_session_list_text(sessions)
+    })))
+}
+
+fn run_session_get_command(
+    branch: String,
+    json: bool,
+    store: &(impl BranchStore + NodeStore + SessionStore),
+) -> Result<Option<String>> {
+    let details = read_session_details(store, &branch)?;
+    Ok(Some(render_session_result(
+        details,
+        json,
+        render_session_details_text,
+    )))
+}
+
+fn run_session_graph_command(
+    json: bool,
+    all: bool,
+    store: &(impl BranchStore + NodeStore + SessionStore),
+) -> Result<Option<String>> {
+    let mode = if all {
+        SessionGraphMode::All
+    } else {
+        SessionGraphMode::Anchors
+    };
+    let entries = build_session_graph_entries(store, mode)?;
+    Ok(Some(render_session_result(entries, json, |entries| {
+        render_session_graph_text(entries)
+    })))
+}
+
+fn run_session_show_command(
+    reference: String,
+    json: bool,
+    store: &(impl BranchStore + NodeStore),
+) -> Result<Option<String>> {
+    Ok(Some(render_session_show(store, &reference, json)?))
+}
+
+async fn run_session_delete_command<B, S>(
+    branch: String,
+    json: bool,
+    llm: &Arc<LlmService<B, S>>,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    llm.delete_session_branch(&branch).await.context(LlmSnafu)?;
+    let result = SessionDeleteResult { branch };
+    Ok(Some(render_session_result(
+        result,
+        json,
+        render_session_delete_text,
+    )))
+}
+
+async fn run_session_rebase_command<B, S>(
+    command: SessionRebaseCommand,
+    store: &S,
+    llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let branch = command.branch.clone();
+    let json = command.json;
+    let rebase = resolve_session_rebase(command, store, provider_profiles)?;
+    let head_id = llm
+        .rebase_session(&branch, rebase.patch)
+        .await
+        .context(LlmSnafu)?;
+    let result = SessionRebaseResult { branch, head_id };
+    Ok(Some(render_session_result(
+        result,
+        json,
+        render_session_rebase_text,
+    )))
+}
+
+async fn run_session_handoff_command<B, S>(
+    rebase_command: SessionRebaseCommand,
+    prompt: String,
+    store: &S,
+    llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let branch = rebase_command.branch.clone();
+    let json = rebase_command.json;
+    let prompt = prompt.trim().to_owned();
+    ensure!(!prompt.is_empty(), EmptyPromptSnafu);
+    let handoff = resolve_session_rebase(rebase_command, store, provider_profiles)?;
+    let head = llm
+        .handoff_session(&branch, handoff.patch, &prompt)
+        .await
+        .context(LlmSnafu)?;
+    let result = SessionHandoffResult { head };
+    Ok(Some(render_session_result(
+        result,
+        json,
+        render_session_handoff_text,
+    )))
+}
+
+fn run_session_reopen_command(
+    branch: String,
+    json: bool,
+    store: &impl SessionStore,
+) -> Result<Option<String>> {
+    let result = SessionMutationResult {
+        branch: branch.clone(),
+        state: store
+            .set_session_state(&branch, None, SessionState::Active)
+            .context(StoreSnafu)?,
+    };
+    Ok(Some(render_session_result(
+        result,
+        json,
+        render_session_mutation_text,
+    )))
+}
+
+async fn run_session_pr_command<B, S>(
+    branch: String,
+    target_branch: String,
+    json: bool,
+    store: &S,
+    llm: &Arc<LlmService<B, S>>,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let pr = llm
+        .open_pull_request(&branch, &target_branch)
+        .await
+        .context(LlmSnafu)?;
+    let result = build_pull_request_result(store, pr)?;
+    Ok(Some(render_session_result(
+        result,
+        json,
+        render_pull_request_text,
+    )))
+}
+
+fn run_session_close_command(
+    branch: String,
+    target_branch: String,
+    json: bool,
+    store: &impl SessionStore,
+) -> Result<Option<String>> {
+    let result = SessionMutationResult {
+        branch: branch.clone(),
+        state: store
+            .set_session_state(
+                &branch,
+                None,
+                SessionState::Paused {
+                    target_branch,
+                    reason: PauseReason::Closed,
+                },
+            )
+            .context(StoreSnafu)?,
+    };
+    Ok(Some(render_session_result(
+        result,
+        json,
+        render_session_mutation_text,
+    )))
+}
+
+async fn run_session_merge_command<B, S>(
+    branch: String,
+    target_branch: Option<String>,
+    prompt: String,
+    json: bool,
+    store: &S,
+    llm: &Arc<LlmService<B, S>>,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let merged = llm
+        .merge_session(&branch, target_branch.as_deref(), &prompt)
+        .await
+        .context(LlmSnafu)?;
+    let result = build_session_merge_result(store, merged)?;
+    Ok(Some(render_session_result(
+        result,
+        json,
+        render_session_merge_text,
+    )))
+}
+
+async fn run_session_feedback_command<B, S>(
+    branch: String,
+    prompt: String,
+    from_ref: Option<String>,
+    json: bool,
+    store: &S,
+    llm: &Arc<LlmService<B, S>>,
+) -> Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let feedback = llm
+        .apply_feedback(&branch, &prompt, from_ref.as_deref())
+        .await
+        .context(LlmSnafu)?;
+    let result = build_session_feedback_result(store, feedback)?;
+    Ok(Some(render_session_result(
+        result,
+        json,
+        render_session_feedback_text,
+    )))
+}
+
+fn render_session_result<T>(result: T, json: bool, render_text: impl FnOnce(&T) -> String) -> String
+where
+    T: Serialize,
+{
+    if json {
+        render_json(result)
+    } else {
+        render_text(&result)
     }
 }
 

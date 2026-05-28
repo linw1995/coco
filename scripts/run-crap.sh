@@ -23,7 +23,6 @@ crap_allow_args=(
   --allow "JsonValueKind::fmt"
   --allow "forward_to_socket"
   --allow "collect_visible_skill_invocation_subtrees"
-  --allow "run_session_command"
   --allow "render_node_content"
   --allow "command_name"
   --allow "abort_channel_task"
