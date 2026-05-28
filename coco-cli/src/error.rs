@@ -115,10 +115,10 @@ pub enum Error {
     #[snafu(display("Failed to resolve current executable: {source}"))]
     ResolveCurrentExe { source: io::Error },
 
-    #[snafu(display("Failed to spawn prompt worker: {source}"))]
+    #[snafu(display("Failed to spawn job worker: {source}"))]
     SpawnPromptWorker { source: io::Error },
 
-    #[snafu(display("Current store cannot be shared with a prompt worker process"))]
+    #[snafu(display("Current store cannot be shared with a job worker process"))]
     StoreRuntimePathUnavailable,
 
     #[snafu(display("Failed to resolve daemon socket root: {source}"))]

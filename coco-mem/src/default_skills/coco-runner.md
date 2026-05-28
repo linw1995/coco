@@ -11,8 +11,8 @@ coco session get --branch <branch>
 coco session get --json --branch <branch>
 coco session graph
 coco session show <ref>
-coco prompt status --job <job>
-coco prompt branch-status --job <job> --branch <branch>
+coco job list
+coco job status --job <job>
 ```
 
 Rules:

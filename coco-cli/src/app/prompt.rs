@@ -11,7 +11,9 @@ use coco_llm::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, CompletionBackend, LlmService,
     SessionConfigPatch,
 };
-use coco_mem::{AnchorPayload, JobStore, Kind, MergeParent, MessageQueueItem, NodeStore, Store};
+use coco_mem::{
+    AnchorPayload, JobStore, Kind, MergeParent, MessageQueueItem, NodeStore, Store, StoreError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
@@ -20,7 +22,7 @@ use tokio::process::Command;
 use crate::{
     COCO_DAEMON_SOCKET_ENV, Result,
     cli::{
-        CliTool, PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
+        CliTool, PromptCommand, PromptListCommand, PromptRunCommand, PromptStatusCommand,
         PromptSubcommand, PromptWorkerCommand,
     },
     error::{
@@ -60,6 +62,18 @@ struct JobQueuedView {
     status: JobStatus,
     created_at: String,
     branch: String,
+}
+
+#[derive(Debug, Serialize)]
+struct JobListItemView {
+    job_id: String,
+    status: JobStatus,
+    created_at: String,
+    finished_at: Option<String>,
+    branch: String,
+    work_branch: String,
+    base: String,
+    head: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,11 +191,11 @@ where
             )
             .await
         }
+        Some(PromptSubcommand::List(command)) => {
+            run_prompt_list(command, shared_store, engine).await
+        }
         Some(PromptSubcommand::Status(command)) => {
             run_prompt_status(command, shared_store, engine).await
-        }
-        Some(PromptSubcommand::BranchStatus(command)) => {
-            run_prompt_branch_status(command, engine).await
         }
         Some(PromptSubcommand::Worker(command)) => run_prompt_worker(command, engine).await,
     }
@@ -365,30 +379,39 @@ where
     }))
 }
 
-async fn run_prompt_branch_status<B, S>(
-    command: PromptBranchStatusCommand,
+async fn run_prompt_list<B, S>(
+    command: PromptListCommand,
+    shared_store: &S,
     engine: &ConversationEngine<B, S>,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let snapshot = engine.get_job(&command.job).context(CoreEngineSnafu)?;
-    if command
-        .branch
-        .as_ref()
-        .is_none_or(|branch| branch == &snapshot.branch || branch == &snapshot.work_branch)
-    {
-        return Ok(Some(if command.json {
-            render_json(snapshot)
-        } else {
-            render_job_status_snapshot_text(&snapshot)
-        }));
-    }
+    let mut jobs = engine
+        .list_jobs()
+        .context(CoreEngineSnafu)?
+        .into_keys()
+        .map(|job_id| {
+            engine
+                .get_job(&job_id)
+                .map(job_list_item_from_snapshot)
+                .context(CoreEngineSnafu)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    jobs.extend(load_queued_prompt_request_list(shared_store)?);
+    jobs.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.job_id.cmp(&right.job_id))
+    });
+
     Ok(Some(if command.json {
-        render_json(Vec::<JobStatusSnapshot>::new())
+        render_json(jobs)
     } else {
-        "No matching prompt job.".to_owned()
+        render_job_list_text(&jobs)
     }))
 }
 
@@ -443,7 +466,7 @@ async fn spawn_prompt_worker(store_path: &Path, job_id: &str) -> Result<()> {
     Command::new(current_exe)
         .arg("--store-path")
         .arg(store_path)
-        .arg("prompt")
+        .arg("job")
         .arg("worker")
         .arg("--job")
         .arg(job_id)
@@ -514,6 +537,29 @@ fn render_job_queued_text(view: &JobQueuedView) -> String {
         "job_id: {}\nstatus: {:?}\ncreated_at: {}\nbranch: {}",
         view.job_id, view.status, view.created_at, view.branch
     )
+}
+
+fn render_job_list_text(jobs: &[JobListItemView]) -> String {
+    if jobs.is_empty() {
+        return "No jobs.".to_owned();
+    }
+
+    jobs.iter()
+        .map(|job| {
+            format!(
+                "{} {:?} branch={} work_branch={} base={} head={} created_at={} finished_at={}",
+                job.job_id,
+                job.status,
+                job.branch,
+                job.work_branch,
+                job.base,
+                job.head,
+                job.created_at,
+                job.finished_at.as_deref().unwrap_or("null")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_prompt_status_text(view: &PromptJobStatusView) -> String {
@@ -601,6 +647,48 @@ fn load_queued_prompt_request_status(
             merge_parents: request.merge_parents.clone(),
         },
     }))
+}
+
+fn load_queued_prompt_request_list(store: &impl Store) -> Result<Vec<JobListItemView>> {
+    let items = list_prompt_job_queue_messages(store)?;
+    let mut jobs = Vec::new();
+    for item in items {
+        let Ok(request) = serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
+        else {
+            continue;
+        };
+        let head = match store.get_branch_head(&request.branch) {
+            Ok(head) => head.to_owned(),
+            Err(StoreError::BranchNotFound { .. }) => continue,
+            Err(error) => return Err(error).context(StoreSnafu),
+        };
+        jobs.push(JobListItemView {
+            job_id: request.job_id,
+            status: JobStatus::Queued,
+            created_at: item.created_at.to_string(),
+            finished_at: None,
+            branch: request.branch.clone(),
+            work_branch: request.branch,
+            base: head.clone(),
+            head,
+        });
+    }
+    Ok(jobs)
+}
+
+fn job_list_item_from_snapshot(snapshot: JobStatusSnapshot) -> JobListItemView {
+    JobListItemView {
+        job_id: snapshot.job_id,
+        status: snapshot.status,
+        created_at: snapshot.created_at.to_string(),
+        finished_at: snapshot
+            .finished_at
+            .map(|finished_at| finished_at.to_string()),
+        branch: snapshot.branch,
+        work_branch: snapshot.work_branch,
+        base: snapshot.base,
+        head: snapshot.head,
+    }
 }
 
 pub(crate) fn next_prompt_job_id() -> String {

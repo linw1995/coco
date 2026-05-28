@@ -388,7 +388,7 @@ fn should_forward_runtime_stdin(args: &[String]) -> bool {
         break;
     }
 
-    if args.get(index).map(String::as_str) != Some("prompt") {
+    if !matches!(args.get(index).map(String::as_str), Some("job" | "prompt")) {
         return false;
     }
     index += 1;
@@ -396,7 +396,7 @@ fn should_forward_runtime_stdin(args: &[String]) -> bool {
     while index < args.len() {
         let arg = &args[index];
         match arg.as_str() {
-            "status" | "branch-status" | "worker" => return false,
+            "list" | "status" | "worker" => return false,
             "--" => return index + 1 == args.len(),
             "--branch" | "--role" | "--tool" => {
                 index += 2;
@@ -612,19 +612,19 @@ mod tests {
             "list".to_owned(),
         ]));
         assert!(!should_forward_runtime_stdin(&[
-            "prompt".to_owned(),
+            "job".to_owned(),
             "status".to_owned(),
             "--job".to_owned(),
             "job-1".to_owned(),
         ]));
         assert!(!should_forward_runtime_stdin(&[
-            "prompt".to_owned(),
+            "job".to_owned(),
             "--branch".to_owned(),
             "draft".to_owned(),
             "hello".to_owned(),
         ]));
         assert!(should_forward_runtime_stdin(&[
-            "prompt".to_owned(),
+            "job".to_owned(),
             "--branch".to_owned(),
             "draft".to_owned(),
         ]));
