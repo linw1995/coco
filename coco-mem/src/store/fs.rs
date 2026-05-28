@@ -1399,12 +1399,7 @@ impl Persistence {
             }
         );
         if self.access != StoreAccess::ReadWrite {
-            tracing::warn!(
-                store_path = %self.dir.display(),
-                from_version = %meta.version,
-                to_version = STORE_FORMAT_VERSION,
-                "read-only store requires writable format migration"
-            );
+            tracing::warn!(store_path = %self.dir.display(), from_version = %meta.version, to_version = STORE_FORMAT_VERSION, "read-only store requires writable format migration");
             return CorruptedStoreSnafu {
                 path: self.meta_path.clone(),
                 message: format!(
@@ -3559,6 +3554,111 @@ where
     }
 
     Ok(values)
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    #[test]
+    fn load_rejects_missing_branches_directory() {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let path = tempdir.path().join("store");
+        let (persistence, _) = Persistence::open(&path).expect("store should initialize");
+        drop(persistence);
+        fs::remove_dir_all(path.join(BRANCHES_DIR_NAME)).expect("branches directory should remove");
+
+        let err = Persistence::open(&path).expect_err("store should reject missing branches");
+
+        assert!(matches!(err, StoreError::CorruptedStore { .. }));
+    }
+
+    #[test]
+    fn load_read_only_rejects_skill_history_file() {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let path = tempdir.path().join("store");
+        let (persistence, _) = Persistence::open(&path).expect("store should initialize");
+        drop(persistence);
+        fs::remove_dir_all(path.join(SKILL_HISTORY_DIR_NAME))
+            .expect("skill history directory should remove");
+        fs::write(path.join(SKILL_HISTORY_DIR_NAME), b"not a directory")
+            .expect("skill history file should write");
+
+        let err = Persistence::open_read_only(&path)
+            .expect_err("read-only store should reject skill history file");
+
+        assert!(matches!(err, StoreError::CorruptedStore { .. }));
+    }
+
+    #[test]
+    fn load_read_only_rejects_preset_history_file() {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let path = tempdir.path().join("store");
+        let (persistence, _) = Persistence::open(&path).expect("store should initialize");
+        drop(persistence);
+        fs::remove_dir_all(path.join(PRESET_HISTORY_DIR_NAME))
+            .expect("preset history directory should remove");
+        fs::write(path.join(PRESET_HISTORY_DIR_NAME), b"not a directory")
+            .expect("preset history file should write");
+
+        let err = Persistence::open_read_only(&path)
+            .expect_err("read-only store should reject preset history file");
+
+        assert!(matches!(err, StoreError::CorruptedStore { .. }));
+    }
+
+    #[test]
+    fn read_migrated_meta_rejects_non_current_version() {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let path = tempdir.path().join("store");
+        let (persistence, state) = Persistence::open(&path).expect("store should initialize");
+        write_json_file(
+            &persistence.meta_path,
+            &Meta {
+                version: StoreFormatVersion::Chronicle("2026-05-29".to_owned()),
+                root_id: state.root_id().to_owned(),
+            },
+        )
+        .expect("stale meta should write");
+
+        let err = persistence
+            .read_migrated_meta()
+            .expect_err("stale migrated meta should fail");
+
+        assert!(matches!(err, StoreError::CorruptedStore { .. }));
+    }
+
+    #[test]
+    fn recover_preset_snapshots_persists_recovered_records() {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let path = tempdir.path().join("store");
+        let (persistence, mut state) = Persistence::open(&path).expect("store should initialize");
+        state
+            .set_preset(
+                "default",
+                Preset {
+                    role: SessionRole::Orchestrator,
+                    provider_profile: "openai".to_owned(),
+                    model: "gpt-5.4".to_owned(),
+                    tools: vec![],
+                    system_prompt: "system".to_owned(),
+                    prompt: "prompt".to_owned(),
+                    temperature: Some(0.2),
+                    max_tokens: Some(256),
+                    additional_params: None,
+                    enable_coco_shim: false,
+                },
+            )
+            .expect("preset should be inserted");
+
+        persistence
+            .recover_preset_snapshots(&state, HashMap::new())
+            .expect("preset snapshots should recover");
+
+        let snapshots =
+            read_preset_snapshots(&persistence.presets_path).expect("snapshots should read");
+        assert!(snapshots.contains_key("default"));
+    }
 }
 
 #[cfg(test)]
