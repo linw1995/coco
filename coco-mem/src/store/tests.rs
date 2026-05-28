@@ -2174,7 +2174,7 @@ where
             .current()
             .unwrap()
             .body
-            .contains("coco prompt worker --job <job-id>")
+            .contains("coco job worker --job <job-id>")
     );
     assert!(recovery.current().unwrap().body.contains("Do not fork a"));
     assert!(

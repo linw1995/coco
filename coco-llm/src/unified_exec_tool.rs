@@ -3604,7 +3604,7 @@ mod tests {
         };
 
         let request = CocoCliRuntimeRequest {
-            args: vec!["prompt".to_owned(), "hello".to_owned()],
+            args: vec!["job".to_owned(), "hello".to_owned()],
             stdin: b"stdin".to_vec(),
             branch_env: Some("draft".to_owned()),
             session_role: Some(coco_mem::SessionRole::Runner),

@@ -13,7 +13,7 @@ use super::{
 use crate::{
     Cli, Result,
     cli::{
-        Command, PresetCommand, PromptBranchStatusCommand, PromptCommand, PromptRunCommand,
+        Command, PresetCommand, PromptCommand, PromptListCommand, PromptRunCommand,
         PromptStatusCommand, PromptSubcommand, SessionBranchCommand, SessionCommand,
         SessionGraphCommand, SessionShowCommand, SessionSubcommand, SkillCommand, SkillSubcommand,
     },
@@ -55,7 +55,8 @@ struct ForwardedCli {
 #[derive(Debug, Subcommand)]
 enum ForwardedCommand {
     Preset(PresetCommand),
-    Prompt(PromptCommand),
+    #[command(alias = "prompt")]
+    Job(PromptCommand),
     Session(SessionCommand),
     Skill(SkillCommand),
 }
@@ -69,7 +70,8 @@ struct RunnerCli {
 
 #[derive(Debug, Subcommand)]
 enum RunnerCommand {
-    Prompt(RunnerPromptCommand),
+    #[command(alias = "prompt")]
+    Job(RunnerPromptCommand),
     Session(RunnerSessionCommand),
 }
 
@@ -81,9 +83,8 @@ struct RunnerPromptCommand {
 
 #[derive(Debug, Subcommand)]
 enum RunnerPromptSubcommand {
+    List(PromptListCommand),
     Status(PromptStatusCommand),
-    #[command(name = "branch-status")]
-    BranchStatus(PromptBranchStatusCommand),
 }
 
 #[derive(Debug, Args)]
@@ -103,12 +104,10 @@ enum RunnerSessionSubcommand {
 impl RunnerCli {
     fn into_cli(self) -> Cli {
         let command = match self.command {
-            RunnerCommand::Prompt(command) => Command::Prompt(PromptCommand {
+            RunnerCommand::Job(command) => Command::Job(PromptCommand {
                 command: Some(match command.command {
+                    RunnerPromptSubcommand::List(command) => PromptSubcommand::List(command),
                     RunnerPromptSubcommand::Status(command) => PromptSubcommand::Status(command),
-                    RunnerPromptSubcommand::BranchStatus(command) => {
-                        PromptSubcommand::BranchStatus(command)
-                    }
                 }),
                 run: PromptRunCommand {
                     branch: "main".to_owned(),
@@ -150,7 +149,7 @@ impl ForwardedCli {
             store_path: default_forwarded_store_path(),
             command: match self.command {
                 ForwardedCommand::Preset(command) => Command::Preset(command),
-                ForwardedCommand::Prompt(command) => Command::Prompt(command),
+                ForwardedCommand::Job(command) => Command::Job(command),
                 ForwardedCommand::Session(command) => Command::Session(command),
                 ForwardedCommand::Skill(command) => Command::Skill(command),
             },
@@ -179,7 +178,7 @@ where
         Command::Preset(command) => {
             run_preset_command(command, services.shared_store, services.provider_profiles).await
         }
-        Command::Prompt(command) => {
+        Command::Job(command) => {
             run_prompt_command(
                 command,
                 reader,
@@ -297,7 +296,7 @@ where
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Preset(_) => "preset",
-        Command::Prompt(_) => "prompt",
+        Command::Job(_) => "job",
         Command::Session(_) => "session",
         Command::Skill(_) => "skill",
         Command::Daemon(_) => "daemon",
@@ -432,7 +431,7 @@ fn forwarded_branch_default<'a>(args: &[String], branch_env: Option<&'a str>) ->
 fn forwarded_branch_slot(cli: &mut Cli) -> Option<&mut String> {
     match &mut cli.command {
         Command::Preset(_) | Command::Skill(_) | Command::Daemon(_) => None,
-        Command::Prompt(command) => forwarded_prompt_branch_slot(command),
+        Command::Job(command) => forwarded_prompt_branch_slot(command),
         Command::Session(command) => forwarded_session_branch_slot(command),
     }
 }
@@ -539,7 +538,7 @@ fn forwarded_session_merge_branch_slot(command: &mut SessionSubcommand) -> Optio
 }
 
 fn apply_forwarded_shadow_parent(cli: &mut Cli, shadow_parent: String) {
-    if let Command::Prompt(command) = &mut cli.command {
+    if let Command::Job(command) = &mut cli.command {
         match &mut command.command {
             None => command
                 .run
@@ -548,7 +547,7 @@ fn apply_forwarded_shadow_parent(cli: &mut Cli, shadow_parent: String) {
             Some(PromptSubcommand::Worker(command)) => command
                 .merge_parents
                 .push(MergeParent::shadow(shadow_parent)),
-            Some(PromptSubcommand::Status(_)) | Some(PromptSubcommand::BranchStatus(_)) => {}
+            Some(PromptSubcommand::List(_)) | Some(PromptSubcommand::Status(_)) => {}
         }
     }
 }
@@ -578,8 +577,8 @@ mod tests {
         let cases = [
             (["coco", "preset", "list"].as_slice(), "preset"),
             (
-                ["coco", "prompt", "status", "--job", "job-1"].as_slice(),
-                "prompt",
+                ["coco", "job", "status", "--job", "job-1"].as_slice(),
+                "job",
             ),
             (["coco", "session", "list"].as_slice(), "session"),
             (["coco", "skill", "list"].as_slice(), "skill"),
