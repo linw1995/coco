@@ -164,6 +164,42 @@ fn write_jsonl_values(path: &Path, values: &[serde_json::Value]) {
     fs::write(path, text).unwrap();
 }
 
+fn cronjob_run_script_before_stale_job_state_fix() -> String {
+    include_str!("fixtures/cronjob_run_2026_05_25_before_stale_job_state_fix.py").to_owned()
+}
+
+fn downgrade_cronjob_skill_to_previous_builtin(path: &Path) {
+    const OLD_CRONJOB_REVISION_ID: &str =
+        "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e";
+
+    fn downgrade_snapshot(snapshot: &mut serde_json::Value, old_script: &str) {
+        snapshot["id"] = json!(OLD_CRONJOB_REVISION_ID);
+        let scripts = snapshot["scripts"]
+            .as_array_mut()
+            .expect("cronjob skill should have scripts");
+        let runner = scripts
+            .iter_mut()
+            .find(|script| script["path"] == "scripts/cronjob_run.py")
+            .expect("cronjob skill should include runner script");
+        runner["content"] = json!(old_script);
+    }
+
+    let old_script = cronjob_run_script_before_stale_job_state_fix();
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    downgrade_snapshot(&mut skills["orchestrator"]["cronjob"], &old_script);
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+
+    let history_path = path.join("skill-history/orchestrator/cronjob.jsonl");
+    let mut history = read_jsonl_values(&history_path);
+    downgrade_snapshot(&mut history[0], &old_script);
+    write_jsonl_values(&history_path, &history);
+}
+
 fn temp_store_path() -> (tempfile::TempDir, std::path::PathBuf) {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
@@ -2631,7 +2667,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["version"], "2026-05-25");
+    assert_eq!(meta["version"], "2026-05-28");
 }
 
 #[test]
@@ -2856,7 +2892,7 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated["version"], "2026-05-25");
+    assert_eq!(migrated["version"], "2026-05-28");
     let migrated_skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
@@ -3159,7 +3195,7 @@ fn open_migrates_legacy_jobs_json_to_snapshot_with_empty_wal() {
     assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-25");
+    assert_eq!(migrated_meta["version"], "2026-05-28");
 }
 
 #[test]
@@ -3179,7 +3215,48 @@ fn open_migrates_previous_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-25");
+    assert_eq!(migrated_meta["version"], "2026-05-28");
+}
+
+#[test]
+fn open_migrates_previous_cronjob_builtin_skill_to_current() {
+    let (_tempdir, path) = temp_store_path();
+    FsStore::open(&path).unwrap();
+    downgrade_cronjob_skill_to_previous_builtin(&path);
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    meta["version"] = json!("2026-05-25");
+    fs::write(
+        path.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let reopened = FsStore::open(&path).unwrap();
+
+    let migrated_meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(migrated_meta["version"], "2026-05-28");
+    let cronjob = reopened
+        .get_skill(SessionRole::Orchestrator, "cronjob")
+        .unwrap();
+    let current = cronjob.current().unwrap();
+    assert_eq!(cronjob.current_version, 2);
+    assert_eq!(
+        current.id,
+        "f57de170e92e784a37b2debbcf6854c73857235a4bf0e699a1cd67035b24cd92"
+    );
+    assert!(
+        current
+            .scripts
+            .iter()
+            .find(|script| script.path == "scripts/cronjob_run.py")
+            .unwrap()
+            .content
+            .contains("no longer exists")
+    );
+    let history = read_jsonl_values(&path.join("skill-history/orchestrator/cronjob.jsonl"));
+    assert_eq!(history.len(), 2);
 }
 
 #[test]
@@ -3199,7 +3276,7 @@ fn open_migrates_console_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-25");
+    assert_eq!(migrated_meta["version"], "2026-05-28");
 }
 
 #[test]
@@ -3219,7 +3296,7 @@ fn open_migrates_recovery_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-25");
+    assert_eq!(migrated_meta["version"], "2026-05-28");
 }
 
 #[test]

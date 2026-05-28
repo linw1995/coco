@@ -235,11 +235,16 @@ can build `.#coco-image-linux-arm64` locally.
 The entrypoint supervises one `supercronic -inotify` process per active
 crontab file. It scans the crontab directory periodically, so adding the first
 task for a new timezone does not require a container restart.
+When an installed cronjob runner already exists, startup refreshes
+`data/install/cronjob_run.py` from the current built-in `cronjob` skill before
+starting `supercronic`.
 
 Persistent cronjob paths live under `/data/skills/orchestrator/cronjob`:
 
 - `data/install/crontabs/`: CoCo-managed crontab files, grouped by schedule
   timezone and consumed directly by `supercronic`.
+- `data/install/cronjob_run.py`: installed runner script refreshed from the
+  current built-in skill at startup when present.
 - `data/state/`: runner state.
 - `data/logs/`: cronjob logs.
 

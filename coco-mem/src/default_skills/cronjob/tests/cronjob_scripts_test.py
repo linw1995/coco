@@ -662,6 +662,36 @@ class CronjobScriptTests(unittest.TestCase):
         self.assertIn("failed to resolve previous job job-old status", result.stderr)
         self.assertEqual([call["kind"] for call in calls], ["status"])
 
+    def test_runner_ignores_missing_previous_job_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fake_coco = write_fake_coco(
+                workspace,
+                status=None,
+                status_error='Prompt job "job-old" not found',
+            )
+            task_file = write_task_file(workspace, fake_coco, repeat="skip")
+            state_file = workspace / "state" / "daily-review.state.json"
+            state_file.parent.mkdir(parents=True)
+            state_file.write_text(
+                '{"last_job_id": "job-old", "branch": "main"}\n', encoding="utf-8"
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(RUN_SCRIPT), "--task-file", str(task_file)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            calls = read_fake_coco_calls(workspace)
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("previous job job-old no longer exists", result.stdout)
+        self.assertEqual([call["kind"] for call in calls], ["status", "submit"])
+        self.assertEqual(state["last_job_id"], "job-new")
+
 
 def run_add(
     workspace: Path,
@@ -701,14 +731,16 @@ def run_add(
     )
 
 
-def write_fake_coco(workspace: Path, *, status: str | None) -> Path:
+def write_fake_coco(
+    workspace: Path, *, status: str | None, status_error: str = "status unavailable"
+) -> Path:
     path = workspace / "fake-coco.py"
     calls_file = workspace / "coco-calls.jsonl"
     status_response = (
         f"print(json.dumps({{'job': {{'status': {status!r}}}}}))\n"
         "                raise SystemExit(0)"
         if status is not None
-        else "print('status unavailable', file=sys.stderr)\n                raise SystemExit(1)"
+        else f"print({status_error!r}, file=sys.stderr)\n                raise SystemExit(1)"
     )
     path.write_text(
         textwrap.dedent(
