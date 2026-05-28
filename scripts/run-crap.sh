@@ -30,7 +30,6 @@ crap_allow_args=(
   --allow "abort_channel_task"
   --allow "LlmService::run_locked"
   --allow "start_coco_cli_runtime_server"
-  --allow "render_node_show_text"
 )
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
