@@ -30,6 +30,9 @@ serde_json.workspace = true
 # Identifiers.
 nanoid.workspace = true
 
+# Hashing.
+sha2 = "0.10.9"
+
 # Error handling.
 snafu.workspace = true
 
