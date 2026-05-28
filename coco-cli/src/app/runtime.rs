@@ -294,12 +294,20 @@ where
 }
 
 fn command_name(command: &Command) -> &'static str {
-    match command {
-        Command::Preset(_) => "preset",
-        Command::Job(_) => "job",
-        Command::Session(_) => "session",
-        Command::Skill(_) => "skill",
-        Command::Daemon(_) => "daemon",
+    RuntimeCommandName(command).as_str()
+}
+
+struct RuntimeCommandName<'a>(&'a Command);
+
+impl RuntimeCommandName<'_> {
+    fn as_str(&self) -> &'static str {
+        match self.0 {
+            Command::Preset(_) => "preset",
+            Command::Job(_) => "job",
+            Command::Session(_) => "session",
+            Command::Skill(_) => "skill",
+            Command::Daemon(_) => "daemon",
+        }
     }
 }
 
