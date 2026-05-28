@@ -571,9 +571,9 @@ mod tests {
 
     use super::{ForwardedRuntimeScope, command_name, parse_forwarded_cli};
     use crate::cli::{
-        Cli, Command, PromptBranchStatusCommand, PromptCommand, PromptRunCommand,
-        PromptStatusCommand, PromptSubcommand, SessionBranchCommand, SessionCommand,
-        SessionGraphCommand, SessionListCommand, SessionShowCommand, SessionSubcommand,
+        Cli, Command, PromptCommand, PromptListCommand, PromptRunCommand, PromptStatusCommand,
+        PromptSubcommand, SessionBranchCommand, SessionCommand, SessionGraphCommand,
+        SessionListCommand, SessionShowCommand, SessionSubcommand,
     };
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -607,11 +607,11 @@ mod tests {
     }
 
     #[test]
-    fn runner_cli_maps_prompt_status_commands() {
-        let cli = parse_runner_cli(&["coco", "prompt", "status", "--job", "job-1", "--json"]);
+    fn runner_cli_maps_job_commands() {
+        let cli = parse_runner_cli(&["coco", "job", "status", "--job", "job-1", "--json"]);
         assert!(matches!(
             cli.command,
-            Command::Prompt(PromptCommand {
+            Command::Job(PromptCommand {
                 command: Some(PromptSubcommand::Status(PromptStatusCommand {
                     job,
                     json: true,
@@ -624,30 +624,19 @@ mod tests {
             }) if job == "job-1" && branch == "main" && text.is_empty()
         ));
 
-        let cli = parse_runner_cli(&[
-            "coco",
-            "prompt",
-            "branch-status",
-            "--job",
-            "job-2",
-            "--branch",
-            "draft",
-            "--json",
-        ]);
+        let cli = parse_runner_cli(&["coco", "job", "list", "--json"]);
         assert!(matches!(
             cli.command,
-            Command::Prompt(PromptCommand {
-                command: Some(PromptSubcommand::BranchStatus(PromptBranchStatusCommand {
-                    job,
-                    branch: Some(branch),
+            Command::Job(PromptCommand {
+                command: Some(PromptSubcommand::List(PromptListCommand {
                     json: true,
                 })),
                 run: PromptRunCommand {
-                    branch: run_branch,
+                    branch,
                     ref text,
                     ..
                 },
-            }) if job == "job-2" && branch == "draft" && run_branch == "main" && text.is_empty()
+            }) if branch == "main" && text.is_empty()
         ));
     }
 
