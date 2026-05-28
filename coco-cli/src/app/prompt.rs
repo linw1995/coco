@@ -603,8 +603,14 @@ fn load_queued_prompt_request_status(
     }))
 }
 
+pub(crate) const PROMPT_JOB_ID_BODY_LEN: usize = 21;
+pub(crate) const PROMPT_JOB_ID_PREFIX: &str = "job-";
+
 pub(crate) fn next_prompt_job_id() -> String {
-    format!("job-{}", nanoid::nanoid!())
+    format!(
+        "{PROMPT_JOB_ID_PREFIX}{}",
+        nanoid::nanoid!(PROMPT_JOB_ID_BODY_LEN)
+    )
 }
 
 fn render_merge_parents(parents: &[MergeParent]) -> String {

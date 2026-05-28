@@ -21,6 +21,7 @@ use coco_mem::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -29,8 +30,8 @@ use tokio::sync::Notify;
 use super::{
     config::{ChannelConfigs, ProviderProfiles, resolve_channel_secret},
     prompt::{
-        PROMPT_JOB_BRANCH_QUEUE_PREFIX, PROMPT_JOB_QUEUE, QueuedPromptRequest,
-        queue_prompt_job_request,
+        PROMPT_JOB_BRANCH_QUEUE_PREFIX, PROMPT_JOB_ID_BODY_LEN, PROMPT_JOB_ID_PREFIX,
+        PROMPT_JOB_QUEUE, QueuedPromptRequest, queue_prompt_job_request,
     },
     run_forwarded_with_services,
     runtime::{ForwardedRuntimeInputs, RuntimeServices},
@@ -1679,9 +1680,19 @@ fn materialize_system_event_prompt_job(
 fn stable_system_event_prompt_job_id(event: &SystemEvent) -> String {
     match event {
         SystemEvent::LlmBackendFailureRecoveryRequested(event) => {
-            format!("job-{}", hex_encode(event.dedupe_key.as_bytes()))
+            stable_prompt_job_id_from_dedupe_key(&event.dedupe_key)
         }
     }
+}
+
+fn stable_prompt_job_id_from_dedupe_key(dedupe_key: &str) -> String {
+    let digest = Sha256::digest(dedupe_key.as_bytes());
+    let body = nanoid::format(
+        |size| digest.iter().copied().cycle().take(size).collect(),
+        &nanoid::alphabet::SAFE,
+        PROMPT_JOB_ID_BODY_LEN,
+    );
+    format!("{PROMPT_JOB_ID_PREFIX}{body}")
 }
 
 fn backend_failure_recovery_dedupe_key(
@@ -1690,16 +1701,6 @@ fn backend_failure_recovery_dedupe_key(
     retry_from_node_id: &str,
 ) -> String {
     format!("llm.backend_failure:{job_id}:{work_branch}:{retry_from_node_id}")
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
 }
 
 fn spawn_queued_prompt_job_driver<B, S>(engine: ConversationEngine<B, S>, job_id: String)
@@ -1960,7 +1961,10 @@ mod tests {
     use serde_json::json;
     use tokio::sync::Notify;
 
-    use crate::app::prompt::{QueuedPromptRequest, prompt_job_queue_for_branch};
+    use crate::app::prompt::{
+        PROMPT_JOB_ID_BODY_LEN, PROMPT_JOB_ID_PREFIX, QueuedPromptRequest,
+        prompt_job_queue_for_branch,
+    };
 
     use super::{
         LlmBackendFailureRecoveryRequested, PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker,
@@ -1968,6 +1972,19 @@ mod tests {
         TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_telegram_message,
         encode_telegram_message, resolve_daemon_socket_path,
     };
+
+    fn assert_prompt_job_id_format(job_id: &str) {
+        assert!(job_id.starts_with(PROMPT_JOB_ID_PREFIX));
+        assert_eq!(
+            job_id.len(),
+            PROMPT_JOB_ID_PREFIX.len() + PROMPT_JOB_ID_BODY_LEN
+        );
+        assert!(
+            job_id[PROMPT_JOB_ID_PREFIX.len()..]
+                .chars()
+                .all(|character| nanoid::alphabet::SAFE.contains(&character))
+        );
+    }
 
     #[test]
     fn resolve_daemon_socket_path_uses_explicit_socket() {
@@ -2638,11 +2655,9 @@ mod tests {
             serde_json::from_value(prompt_items[0].payload.clone()).unwrap();
         assert_eq!(
             request.job_id,
-            format!(
-                "job-{}",
-                super::hex_encode(b"llm.backend_failure:error-node")
-            )
+            super::stable_prompt_job_id_from_dedupe_key("llm.backend_failure:error-node")
         );
+        assert_prompt_job_id_format(&request.job_id);
         assert_eq!(request.branch, "day");
         assert!(request.prompt.contains("job-failed"));
         assert!(request.prompt.contains("retry-node"));
@@ -2692,8 +2707,9 @@ mod tests {
             serde_json::from_value(prompt_items[0].payload.clone()).unwrap();
         assert_eq!(
             request.job_id,
-            format!("job-{}", super::hex_encode(dedupe_key.as_bytes()))
+            super::stable_prompt_job_id_from_dedupe_key(&dedupe_key)
         );
+        assert_prompt_job_id_format(&request.job_id);
     }
 
     #[tokio::test]
@@ -2740,11 +2756,11 @@ mod tests {
             serde_json::from_value(prompt_items[0].payload.clone()).unwrap();
         assert_eq!(
             request.job_id,
-            format!(
-                "job-{}",
-                super::hex_encode(b"llm.backend_failure:job-failed:main:retry-node")
+            super::stable_prompt_job_id_from_dedupe_key(
+                "llm.backend_failure:job-failed:main:retry-node"
             )
         );
+        assert_prompt_job_id_format(&request.job_id);
     }
 
     #[tokio::test]
@@ -2834,6 +2850,8 @@ mod tests {
             super::stable_system_event_prompt_job_id(&left),
             super::stable_system_event_prompt_job_id(&right)
         );
+        assert_prompt_job_id_format(&super::stable_system_event_prompt_job_id(&left));
+        assert_prompt_job_id_format(&super::stable_system_event_prompt_job_id(&right));
     }
 
     #[tokio::test]
@@ -2844,9 +2862,8 @@ mod tests {
         llm.create_session(session_config("day")).await.unwrap();
         store
             .submit_job_with_id(
-                &format!(
-                    "job-{}",
-                    super::hex_encode(b"llm.backend_failure:job-failed:main:retry-node")
+                &super::stable_prompt_job_id_from_dedupe_key(
+                    "llm.backend_failure:job-failed:main:retry-node",
                 ),
                 "day",
                 &store.get_branch_head("day").unwrap(),
