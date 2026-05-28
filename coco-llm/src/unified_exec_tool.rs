@@ -1973,6 +1973,19 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingCliBridge;
+
+    #[async_trait]
+    impl crate::UnifiedExecCliBridge for FailingCliBridge {
+        async fn execute_coco_cli(
+            &self,
+            _request: CocoCliRuntimeRequest,
+        ) -> std::result::Result<CocoCliRuntimeResponse, crate::UnifiedExecCliBridgeError> {
+            Err(crate::UnifiedExecCliBridgeError::Unavailable)
+        }
+    }
+
     fn temp_exec_command_tool() -> Tool {
         Tool {
             name: "exec_command".to_owned(),
@@ -3569,6 +3582,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coco_cli_runtime_server_skips_unavailable_bridge() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = test_context();
+
+        let server = start_coco_cli_runtime_server(workspace.path(), &context)
+            .await
+            .unwrap();
+
+        assert!(server.is_none());
+    }
+
+    #[tokio::test]
     async fn coco_cli_runtime_socket_forwards_requests_to_bridge() {
         let workspace = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
@@ -3628,6 +3653,85 @@ mod tests {
         assert_eq!(forwarded.as_slice(), &[request]);
         assert!(server.socket_path.starts_with(runtime.path().join("coco")));
         assert!(!server.socket_path.starts_with(workspace.path()));
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coco_cli_runtime_socket_rejects_invalid_requests() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let bridge = crate::UnifiedExecCliBridgeHandle::new(Arc::new(FakeCliBridge {
+            requests: requests.clone(),
+        }));
+        let context = ToolRuntimeEnv {
+            cli_bridge: bridge,
+            ..test_context()
+        };
+        let server = crate::with_process_env_async(
+            &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],
+            || async { start_coco_cli_runtime_server(workspace.path(), &context).await },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut stream = UnixStream::connect(&server.socket_path).await.unwrap();
+        stream.write_all(b"not json").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output).await.unwrap();
+        let response = serde_json::from_slice::<CocoCliRuntimeResponse>(&output).unwrap();
+
+        assert_eq!(response.exit_code, 2);
+        assert!(response.stdout.is_empty());
+        assert!(
+            response
+                .stderr
+                .starts_with("invalid coco-cli runtime request:")
+        );
+        assert!(requests.lock().await.is_empty());
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coco_cli_runtime_socket_reports_bridge_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let bridge = crate::UnifiedExecCliBridgeHandle::new(Arc::new(FailingCliBridge));
+        let context = ToolRuntimeEnv {
+            cli_bridge: bridge,
+            ..test_context()
+        };
+        let server = crate::with_process_env_async(
+            &[("XDG_RUNTIME_DIR", Some(runtime.path().as_os_str()))],
+            || async { start_coco_cli_runtime_server(workspace.path(), &context).await },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let request = CocoCliRuntimeRequest {
+            args: vec!["job".to_owned()],
+            stdin: Vec::new(),
+            branch_env: None,
+            session_role: None,
+            store_path_env: None,
+            parent_tool_use_id_env: None,
+        };
+        let payload = serde_json::to_vec(&request).unwrap();
+
+        let mut stream = UnixStream::connect(&server.socket_path).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output).await.unwrap();
+        let response = serde_json::from_slice::<CocoCliRuntimeResponse>(&output).unwrap();
+
+        assert_eq!(response.exit_code, 1);
+        assert!(response.stdout.is_empty());
+        assert_eq!(response.stderr, "coco-cli runtime bridge is unavailable");
 
         server.shutdown().await.unwrap();
     }
