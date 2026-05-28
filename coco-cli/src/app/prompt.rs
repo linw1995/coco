@@ -666,8 +666,8 @@ fn load_queued_prompt_request_list(store: &impl Store) -> Result<Vec<JobListItem
                 status: JobStatus::Queued,
                 created_at: item.created_at.to_string(),
                 finished_at: None,
-                branch: request.branch,
-                work_branch: String::new(),
+                branch: request.branch.clone(),
+                work_branch: request.branch,
                 base: head.clone(),
                 head,
             })

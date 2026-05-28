@@ -1267,6 +1267,8 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(pending_list.as_array().unwrap().len(), 1);
     assert_eq!(pending_list[0]["job_id"], text_job_id);
     assert_eq!(pending_list[0]["status"], "queued");
+    assert_eq!(pending_list[0]["branch"], "main");
+    assert_eq!(pending_list[0]["work_branch"], "main");
 
     let json_output = crate::app::runtime::run_with_services(
         Cli::try_parse_from([
