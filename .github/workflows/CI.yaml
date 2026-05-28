@@ -75,10 +75,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-nix
 
       - name: Run builtin skill script tests
-        run: nix develop --command bash scripts/test-builtin-skill-scripts.sh
+        run: bash scripts/test-builtin-skill-scripts.sh
 
   nix-build:
     needs:
