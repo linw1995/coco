@@ -711,7 +711,8 @@ impl<S> SystemEventMessageQueueWorker<S> {
         }
 
         let request = materialize_system_event_prompt_job(route, &event);
-        if self.prompt_job_request_exists(&request.job_id)? {
+        let dedupe_job_ids = system_event_prompt_job_dedupe_ids(&event);
+        if self.prompt_job_request_exists(&dedupe_job_ids)? {
             tracing::debug!(
                 message_id = %item.message_id,
                 queue = SYSTEM_EVENT_QUEUE,
@@ -732,14 +733,16 @@ impl<S> SystemEventMessageQueueWorker<S> {
         Ok(true)
     }
 
-    fn prompt_job_request_exists(&self, job_id: &str) -> Result<bool>
+    fn prompt_job_request_exists(&self, job_ids: &[String]) -> Result<bool>
     where
         S: Store,
     {
-        match self.store.get_job(job_id) {
-            Ok(_) => return Ok(true),
-            Err(StoreError::PromptJobNotFound { .. }) => {}
-            Err(source) => return Err(source).context(StoreSnafu),
+        for job_id in job_ids {
+            match self.store.get_job(job_id) {
+                Ok(_) => return Ok(true),
+                Err(StoreError::PromptJobNotFound { .. }) => {}
+                Err(source) => return Err(source).context(StoreSnafu),
+            }
         }
 
         for queue in self
@@ -755,7 +758,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
                 .context(StoreSnafu)?
                 .into_iter()
                 .filter_map(|item| decode_prompt_job_message(item.payload).ok())
-                .any(|request| request.job_id == job_id)
+                .any(|request| job_ids.contains(&request.job_id))
             {
                 return Ok(true);
             }
@@ -1685,6 +1688,15 @@ fn stable_system_event_prompt_job_id(event: &SystemEvent) -> String {
     }
 }
 
+fn system_event_prompt_job_dedupe_ids(event: &SystemEvent) -> Vec<String> {
+    match event {
+        SystemEvent::LlmBackendFailureRecoveryRequested(event) => vec![
+            stable_prompt_job_id_from_dedupe_key(&event.dedupe_key),
+            legacy_prompt_job_id_from_dedupe_key(&event.dedupe_key),
+        ],
+    }
+}
+
 fn stable_prompt_job_id_from_dedupe_key(dedupe_key: &str) -> String {
     let digest = Sha256::digest(dedupe_key.as_bytes());
     let body = nanoid::format(
@@ -1695,12 +1707,29 @@ fn stable_prompt_job_id_from_dedupe_key(dedupe_key: &str) -> String {
     format!("{PROMPT_JOB_ID_PREFIX}{body}")
 }
 
+fn legacy_prompt_job_id_from_dedupe_key(dedupe_key: &str) -> String {
+    format!(
+        "{PROMPT_JOB_ID_PREFIX}{}",
+        hex_encode(dedupe_key.as_bytes())
+    )
+}
+
 fn backend_failure_recovery_dedupe_key(
     job_id: &str,
     work_branch: &str,
     retry_from_node_id: &str,
 ) -> String {
     format!("llm.backend_failure:{job_id}:{work_branch}:{retry_from_node_id}")
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn spawn_queued_prompt_job_driver<B, S>(engine: ConversationEngine<B, S>, job_id: String)
@@ -2905,6 +2934,124 @@ mod tests {
                 .list_queue_messages(PROMPT_JOB_QUEUE)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn system_event_queue_worker_skips_recovery_prompt_when_legacy_job_exists() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("day")).await.unwrap();
+        store
+            .submit_job_with_id(
+                &super::legacy_prompt_job_id_from_dedupe_key(
+                    "llm.backend_failure:job-failed:main:retry-node",
+                ),
+                "day",
+                &store.get_branch_head("day").unwrap(),
+            )
+            .unwrap();
+        store
+            .enqueue_message(
+                SYSTEM_EVENT_QUEUE,
+                json!({
+                    "type": "llm.backend_failure.recovery_requested",
+                    "version": 1,
+                    "dedupe_key": "llm.backend_failure:job-failed:main:retry-node",
+                    "data": {
+                        "job_id": "job-failed",
+                        "root_branch": "main",
+                        "work_branch": "main",
+                        "failed_branch": "main",
+                        "base_node_id": "base-node",
+                        "execution_id": "execution-1",
+                        "error_node_id": "error-node",
+                        "retry_from_node_id": "retry-node",
+                        "message": "backend failed"
+                    }
+                }),
+            )
+            .unwrap();
+        let worker = SystemEventMessageQueueWorker::new(store.clone());
+
+        assert_eq!(worker.drain_once().await.unwrap(), 1);
+
+        assert!(
+            store
+                .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn system_event_queue_worker_skips_recovery_prompt_when_legacy_request_exists() {
+        let store = MemoryStore::new();
+        let backend = BlockingOnceBackend::default();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        llm.create_session(session_config("day")).await.unwrap();
+        super::queue_prompt_job_request(
+            &store,
+            QueuedPromptRequest {
+                job_id: super::legacy_prompt_job_id_from_dedupe_key(
+                    "llm.backend_failure:job-failed:main:retry-node",
+                ),
+                branch: "day".to_owned(),
+                prompt: "recover".to_owned(),
+                merge_parents: vec![],
+                session_patch: None,
+            },
+        )
+        .unwrap();
+        store
+            .enqueue_message(
+                SYSTEM_EVENT_QUEUE,
+                json!({
+                    "type": "llm.backend_failure.recovery_requested",
+                    "version": 1,
+                    "dedupe_key": "llm.backend_failure:job-failed:main:retry-node",
+                    "data": {
+                        "job_id": "job-failed",
+                        "root_branch": "main",
+                        "work_branch": "main",
+                        "failed_branch": "main",
+                        "base_node_id": "base-node",
+                        "execution_id": "execution-1",
+                        "error_node_id": "error-node",
+                        "retry_from_node_id": "retry-node",
+                        "message": "backend failed"
+                    }
+                }),
+            )
+            .unwrap();
+        let worker = SystemEventMessageQueueWorker::new(store.clone());
+
+        assert_eq!(worker.drain_once().await.unwrap(), 1);
+
+        assert!(
+            store
+                .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .unwrap()
+                .is_empty()
+        );
+        let prompt_items = store
+            .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .unwrap();
+        assert_eq!(prompt_items.len(), 1);
+        let request: QueuedPromptRequest =
+            serde_json::from_value(prompt_items[0].payload.clone()).unwrap();
+        assert_eq!(
+            request.job_id,
+            super::legacy_prompt_job_id_from_dedupe_key(
+                "llm.backend_failure:job-failed:main:retry-node"
+            )
         );
     }
 

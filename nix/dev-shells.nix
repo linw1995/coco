@@ -14,13 +14,21 @@
     cargoHash = "sha256-+C6MBqV1RJqZapMYhMVYyczLDPGrqSwVX0tKs2fJ4n0=";
     doCheck = false;
   };
+
+  rustNativeBuildInputs = [
+    (rustDevToolchainFor pkgs)
+  ];
+
+  lintPackages = with pkgs; [
+    prek
+    ruff
+    taplo
+    uv
+  ];
 in {
   default = pkgs.mkShell {
-    nativeBuildInputs = [
-      (rustDevToolchainFor pkgs)
-    ];
+    nativeBuildInputs = rustNativeBuildInputs;
     packages = with pkgs; [
-      prek
       grcov
 
       cargo-crap
@@ -28,9 +36,11 @@ in {
       wasm-bindgen-cli
 
       nono
-      ruff
-      taplo
-      uv
-    ];
+    ] ++ lintPackages;
+  };
+
+  lint = pkgs.mkShell {
+    nativeBuildInputs = rustNativeBuildInputs;
+    packages = lintPackages;
   };
 }
