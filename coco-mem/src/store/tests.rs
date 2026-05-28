@@ -250,6 +250,73 @@ fn downgrade_cronjob_skill_to_prompt_command_builtin(path: &Path) {
     write_jsonl_values(&history_path, &history);
 }
 
+fn downgrade_handoff_skills_to_system_prompt_builtin(path: &Path) {
+    fn downgrade_snapshot(
+        snapshot: &mut serde_json::Value,
+        old_revision_id: &str,
+        current_command: &str,
+        old_command: &str,
+    ) {
+        snapshot["id"] = json!(old_revision_id);
+        let body = snapshot["body"]
+            .as_str()
+            .expect("skill body should be a string")
+            .replace(current_command, old_command);
+        snapshot["body"] = json!(body);
+    }
+
+    let mut skills: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
+    downgrade_snapshot(
+        &mut skills["orchestrator"]["recovery"],
+        "dfc5ea6b5ef4c46ffb4c0c7d1fde59f1ebfe782eeb673a0987353047b72c7e3b",
+        r#"coco session handoff --branch <branch> --prompt "<recovered context>""#,
+        r#"coco session handoff --branch <branch> --system-prompt "<recovered context>""#,
+    );
+    skills["orchestrator"]["compact"]["id"] =
+        json!("d035938926144776ca4341aaa57eaa3ed28a76234222f1ff06fe06cf5d8ab9ff");
+    skills["orchestrator"]["compact"]["body"] = json!(compact_body_before_handoff_prompt());
+    fs::write(
+        path.join("skills.json"),
+        serde_json::to_string_pretty(&skills).unwrap(),
+    )
+    .unwrap();
+
+    let recovery_history_path = path.join("skill-history/orchestrator/recovery.jsonl");
+    let mut recovery_history = read_jsonl_values(&recovery_history_path);
+    downgrade_snapshot(
+        &mut recovery_history[0],
+        "dfc5ea6b5ef4c46ffb4c0c7d1fde59f1ebfe782eeb673a0987353047b72c7e3b",
+        r#"coco session handoff --branch <branch> --prompt "<recovered context>""#,
+        r#"coco session handoff --branch <branch> --system-prompt "<recovered context>""#,
+    );
+    write_jsonl_values(&recovery_history_path, &recovery_history);
+
+    let compact_history_path = path.join("skill-history/orchestrator/compact.jsonl");
+    let mut compact_history = read_jsonl_values(&compact_history_path);
+    compact_history[0]["id"] =
+        json!("d035938926144776ca4341aaa57eaa3ed28a76234222f1ff06fe06cf5d8ab9ff");
+    compact_history[0]["body"] = json!(compact_body_before_handoff_prompt());
+    write_jsonl_values(&compact_history_path, &compact_history);
+}
+
+fn compact_body_before_handoff_prompt() -> String {
+    include_str!("../default_skills/compact.md")
+        .trim()
+        .replace(
+            r#"coco session handoff --branch <branch> --prompt "<compacted handoff>""#,
+            r#"coco session handoff --branch <branch> --system-prompt "<compacted system prompt>""#,
+        )
+        .replace(
+            "Write the compacted content as the handoff prompt for the next turn on this\n  branch.",
+            "Write the compacted content as a procedural system prompt for the next turn on\n  this branch.",
+        )
+        .replace(
+            "Apply the result with `coco session handoff --branch <branch> --prompt\n  \"<compacted handoff>\"`.",
+            "Apply the result with `coco session handoff --branch <branch> --system-prompt\n  \"<compacted system prompt>\"`.",
+        )
+}
+
 fn temp_store_path() -> (tempfile::TempDir, std::path::PathBuf) {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
@@ -2742,7 +2809,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["version"], "2026-05-29");
+    assert_eq!(meta["version"], "2026-05-30");
 }
 
 #[test]
@@ -2967,7 +3034,7 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated["version"], "2026-05-29");
+    assert_eq!(migrated["version"], "2026-05-30");
     let migrated_skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
@@ -3270,7 +3337,7 @@ fn open_migrates_legacy_jobs_json_to_snapshot_with_empty_wal() {
     assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-29");
+    assert_eq!(migrated_meta["version"], "2026-05-30");
 }
 
 #[test]
@@ -3290,7 +3357,7 @@ fn open_migrates_previous_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-29");
+    assert_eq!(migrated_meta["version"], "2026-05-30");
 }
 
 #[test]
@@ -3311,7 +3378,7 @@ fn open_migrates_previous_cronjob_builtin_skill_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-29");
+    assert_eq!(migrated_meta["version"], "2026-05-30");
     let cronjob = reopened
         .get_skill(SessionRole::Orchestrator, "cronjob")
         .unwrap();
@@ -3339,9 +3406,10 @@ fn open_migrates_current_version_builtin_skills_to_current() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
     downgrade_cronjob_skill_to_prompt_command_builtin(&path);
+    downgrade_handoff_skills_to_system_prompt_builtin(&path);
     let mut meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    meta["version"] = json!("2026-05-28");
+    meta["version"] = json!("2026-05-29");
     fs::write(
         path.join("meta.json"),
         serde_json::to_string_pretty(&meta).unwrap(),
@@ -3352,7 +3420,7 @@ fn open_migrates_current_version_builtin_skills_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-29");
+    assert_eq!(migrated_meta["version"], "2026-05-30");
     let cronjob = reopened
         .get_skill(SessionRole::Orchestrator, "cronjob")
         .unwrap();
@@ -3360,6 +3428,34 @@ fn open_migrates_current_version_builtin_skills_to_current() {
     assert_eq!(
         cronjob.current().unwrap().id,
         "872b8f90c21af69be61fe7d90085dbd4491ca6dedd0aeae08feeee65db3aae5a"
+    );
+    let recovery = reopened
+        .get_skill(SessionRole::Orchestrator, "recovery")
+        .unwrap();
+    assert_eq!(
+        recovery.current().unwrap().id,
+        "91adf3f8b4e2fb11008b58db4d0c62c21b1b76cbe13b53a58e81fdeca1548b3b"
+    );
+    assert!(
+        recovery
+            .current()
+            .unwrap()
+            .body
+            .contains(r#"--prompt "<recovered context>""#)
+    );
+    let compact = reopened
+        .get_skill(SessionRole::Orchestrator, "compact")
+        .unwrap();
+    assert_eq!(
+        compact.current().unwrap().id,
+        "6a260a4377c10fe227c4957db8a63ebfb8b6b292a9e3862c21402a1c1b73d14e"
+    );
+    assert!(
+        compact
+            .current()
+            .unwrap()
+            .body
+            .contains(r#"--prompt "<compacted handoff>""#)
     );
 }
 
@@ -3380,7 +3476,7 @@ fn open_migrates_console_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-29");
+    assert_eq!(migrated_meta["version"], "2026-05-30");
 }
 
 #[test]
@@ -3400,7 +3496,7 @@ fn open_migrates_recovery_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-29");
+    assert_eq!(migrated_meta["version"], "2026-05-30");
 }
 
 #[test]
