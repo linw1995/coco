@@ -37,6 +37,7 @@ fn binary_forwards_prompt_stdin_to_runtime_socket() {
         .env(COCO_SESSION_ROLE_ENV, "runner")
         .env(COCO_STORE_PATH_ENV, "/tmp/store")
         .env(COCO_PARENT_TOOL_USE_ID_ENV, "tool-call")
+        .env("RUST_LOG", "warn")
         .args(["job", "--branch", "draft"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
