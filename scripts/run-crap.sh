@@ -29,7 +29,6 @@ crap_allow_args=(
   --allow "render_node_content"
   --allow "command_name"
   --allow "abort_channel_task"
-  --allow "merge_json_value"
   --allow "configure_completion_request_builder"
   --allow "LlmService::run_locked"
   --allow "start_coco_cli_runtime_server"
