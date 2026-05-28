@@ -1653,6 +1653,23 @@ where
     ));
 }
 
+fn assert_handoff_session_rejects_empty_prompt<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create();
+    let root_id = store.root_id();
+    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    store.fork("main", &session_id).unwrap();
+
+    let err = store
+        .handoff_session("main", &SessionAnchorPatch::default(), "  ")
+        .unwrap_err();
+
+    assert!(matches!(err, Error::InvalidSessionHandoffPrompt));
+    assert_eq!(store.get_branch_head("main").unwrap(), session_id);
+}
+
 fn assert_handoff_session_applies_session_patch<F>()
 where
     F: TestStoreFactory,
@@ -2551,6 +2568,11 @@ macro_rules! define_common_store_tests {
             #[test]
             fn handoff_session_requires_visible_session_anchor() {
                 assert_handoff_session_requires_visible_session_anchor::<$factory>();
+            }
+
+            #[test]
+            fn handoff_session_rejects_empty_prompt() {
+                assert_handoff_session_rejects_empty_prompt::<$factory>();
             }
 
             #[test]

@@ -106,6 +106,9 @@ pub enum StoreError {
     #[snafu(display("Branch {branch:?} has no session anchor"))]
     MissingSessionAnchor { branch: String },
 
+    #[snafu(display("Session handoff prompt must not be empty"))]
+    InvalidSessionHandoffPrompt,
+
     #[snafu(display("Store path {path:?} is not a directory"))]
     StorePathIsNotDirectory { path: PathBuf },
 
