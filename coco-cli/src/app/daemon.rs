@@ -92,8 +92,9 @@ where
     let socket_path = resolve_daemon_command_socket_path(&command)?;
     let shared_engine = Arc::new(ConversationEngine::new(llm.clone()));
     let console_config = daemon_console_config(&command, console_publisher.as_ref());
-    let server = start_daemon_command_server(
-        command,
+
+    ensure_initial_session(shared_store, llm, provider_profiles).await?;
+    let server = start_daemon_server(
         &socket_path,
         shared_store,
         llm,
@@ -104,8 +105,7 @@ where
             console_config,
             console_publisher,
         },
-    )
-    .await?;
+    )?;
     spawn_resume_incomplete_jobs(shared_engine);
     server.wait().await?;
     Ok(None)
@@ -126,34 +126,6 @@ fn daemon_console_config(
             addr: command.console_addr,
         }),
         _ => None,
-    }
-}
-
-async fn start_daemon_command_server<B, S>(
-    command: DaemonCommand,
-    socket_path: &Path,
-    shared_store: &S,
-    llm: &Arc<LlmService<B, S>>,
-    provider_profiles: &ProviderProfiles,
-    shared_engine: &Arc<ConversationEngine<B, S>>,
-    options: DaemonServerOptions<'_>,
-) -> Result<CocoCliDaemonServerHandle<B, S>>
-where
-    B: CompletionBackend + 'static,
-    S: Store + Clone + Send + Sync + 'static,
-{
-    match command.command {
-        DaemonSubcommand::Serve(_) => {
-            ensure_initial_session(shared_store, llm, provider_profiles).await?;
-            start_daemon_server(
-                socket_path,
-                shared_store,
-                llm,
-                provider_profiles,
-                shared_engine,
-                options,
-            )
-        }
     }
 }
 
@@ -2013,7 +1985,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
+    use clap::Parser;
     use coco_channel::{InboundMessage, MessageHandler, TelegramImageAttachment};
+    use coco_console::ConsolePublisher;
     use coco_core::ConversationEngine;
     use coco_llm::{
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
@@ -2030,13 +2004,23 @@ mod tests {
         PROMPT_JOB_ID_BODY_LEN, PROMPT_JOB_ID_PREFIX, QueuedPromptRequest,
         prompt_job_queue_for_branch,
     };
+    use crate::cli::{Cli, Command, DaemonCommand};
 
     use super::{
         LlmBackendFailureRecoveryRequested, PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker,
         SYSTEM_EVENT_QUEUE, SystemEvent, SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_telegram_message,
-        encode_telegram_message, resolve_daemon_socket_path,
+        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, daemon_console_config,
+        decode_telegram_message, encode_telegram_message, resolve_daemon_command_socket_path,
+        resolve_daemon_socket_path,
     };
+
+    fn daemon_command(args: impl IntoIterator<Item = &'static str>) -> DaemonCommand {
+        let cli = Cli::parse_from(args);
+        let Command::Daemon(command) = cli.command else {
+            panic!("expected daemon command");
+        };
+        command
+    }
 
     fn assert_prompt_job_id_format(job_id: &str) {
         assert!(job_id.starts_with(PROMPT_JOB_ID_PREFIX));
@@ -2056,6 +2040,44 @@ mod tests {
         let path = resolve_daemon_socket_path(Some(Path::new("/tmp/coco.sock"))).unwrap();
 
         assert_eq!(path, PathBuf::from("/tmp/coco.sock"));
+    }
+
+    #[test]
+    fn resolve_daemon_command_socket_path_uses_serve_socket() {
+        let command = daemon_command(["coco", "daemon", "serve", "--socket", "/tmp/coco.sock"]);
+
+        let path = resolve_daemon_command_socket_path(&command).unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/coco.sock"));
+    }
+
+    #[test]
+    fn daemon_console_config_uses_serve_addr_when_enabled() {
+        let command = daemon_command(["coco", "daemon", "serve", "--console-addr", "127.0.0.1:0"]);
+        let publisher = ConsolePublisher::new();
+
+        let config = daemon_console_config(&command, Some(&publisher)).unwrap();
+
+        assert_eq!(config.addr, "127.0.0.1:0".parse().unwrap());
+    }
+
+    #[test]
+    fn daemon_console_config_returns_none_without_publisher() {
+        let command = daemon_command(["coco", "daemon", "serve"]);
+
+        let config = daemon_console_config(&command, None);
+
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn daemon_console_config_returns_none_when_disabled() {
+        let command = daemon_command(["coco", "daemon", "serve", "--no-console"]);
+        let publisher = ConsolePublisher::new();
+
+        let config = daemon_console_config(&command, Some(&publisher));
+
+        assert!(config.is_none());
     }
 
     #[test]
