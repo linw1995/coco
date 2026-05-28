@@ -1319,94 +1319,120 @@ impl Persistence {
     }
 
     fn load(&self) -> Result<(Self, StoreState)> {
+        self.ensure_load_layout()?;
+        let meta = self.load_current_meta()?;
+        let mut store = self.load_nodes(&meta)?;
+        self.load_branches(&mut store)?;
+        self.load_sessions(&mut store)?;
+        let preset_snapshots = self.load_presets(&mut store)?;
+        self.load_jobs_and_queues(&mut store)?;
+        self.load_skills(&mut store)?;
+        self.recover_preset_snapshots(&store, preset_snapshots)?;
+
+        Ok((self.clone(), store))
+    }
+
+    fn ensure_store_file(&self, path: &Path, message: &str) -> Result<()> {
         ensure!(
-            self.meta_path.is_file(),
+            path.is_file(),
             CorruptedStoreSnafu {
-                path: self.meta_path.clone(),
-                message: "missing meta.json".to_owned(),
+                path: path.to_owned(),
+                message: message.to_owned(),
             }
         );
+        Ok(())
+    }
+
+    fn ensure_store_directory(&self, path: &Path, message: &str) -> Result<()> {
         ensure!(
-            self.nodes_path.is_file(),
+            path.is_dir(),
             CorruptedStoreSnafu {
-                path: self.nodes_path.clone(),
-                message: "missing nodes.jsonl".to_owned(),
+                path: path.to_owned(),
+                message: message.to_owned(),
             }
         );
-        ensure!(
-            self.branches_dir.is_dir(),
-            CorruptedStoreSnafu {
-                path: self.branches_dir.clone(),
-                message: "missing branches directory".to_owned(),
-            }
-        );
-        ensure!(
-            self.jobs_path.is_file(),
-            CorruptedStoreSnafu {
-                path: self.jobs_path.clone(),
-                message: "missing jobs snapshot file".to_owned(),
-            }
-        );
-        ensure!(
-            self.skills_path.is_file(),
-            CorruptedStoreSnafu {
-                path: self.skills_path.clone(),
-                message: "missing skills metadata file".to_owned(),
-            }
-        );
+        Ok(())
+    }
+
+    fn ensure_existing_directory_if_present(&self, path: &Path, message: &str) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        self.ensure_store_directory(path, message)
+    }
+
+    fn ensure_load_layout(&self) -> Result<()> {
+        self.ensure_store_file(&self.meta_path, "missing meta.json")?;
+        self.ensure_store_file(&self.nodes_path, "missing nodes.jsonl")?;
+        self.ensure_store_directory(&self.branches_dir, "missing branches directory")?;
+        self.ensure_store_file(&self.jobs_path, "missing jobs snapshot file")?;
+        self.ensure_store_file(&self.skills_path, "missing skills metadata file")?;
         if self.access == StoreAccess::ReadWrite {
             self.create_skill_history_directories()?;
-        } else if self.skill_history_dir.exists() {
-            ensure!(
-                self.skill_history_dir.is_dir(),
-                CorruptedStoreSnafu {
-                    path: self.skill_history_dir.clone(),
-                    message: "skill history entry must be a directory".to_owned(),
-                }
-            );
+        } else {
+            self.ensure_existing_directory_if_present(
+                &self.skill_history_dir,
+                "skill history entry must be a directory",
+            )?;
         }
+        Ok(())
+    }
+
+    fn load_current_meta(&self) -> Result<Meta> {
         let mut meta = read_json_file::<Meta>(&self.meta_path)?;
         if meta.version != StoreFormatVersion::current() {
-            ensure!(
-                store_migration_from(&meta.version).is_some(),
-                CorruptedStoreSnafu {
-                    path: self.meta_path.clone(),
-                    message: format!(
-                        "unsupported store format version {}, expected {}",
-                        meta.version, STORE_FORMAT_VERSION
-                    ),
-                }
-            );
-            if self.access != StoreAccess::ReadWrite {
-                tracing::warn!(
-                    store_path = %self.dir.display(),
-                    from_version = %meta.version,
-                    to_version = STORE_FORMAT_VERSION,
-                    "read-only store requires writable format migration"
-                );
-                return CorruptedStoreSnafu {
-                    path: self.meta_path.clone(),
-                    message: format!(
-                        "store format version {} requires writable migration to {}",
-                        meta.version, STORE_FORMAT_VERSION
-                    ),
-                }
-                .fail();
-            }
-            self.migrate_store(meta.version.clone(), &meta.root_id)?;
-            meta = read_json_file::<Meta>(&self.meta_path)?;
-            ensure!(
-                meta.version == StoreFormatVersion::current(),
-                CorruptedStoreSnafu {
-                    path: self.meta_path.clone(),
-                    message: format!(
-                        "store migration did not upgrade format version to {}",
-                        STORE_FORMAT_VERSION
-                    ),
-                }
-            );
+            self.migrate_store_to_current_format(&meta)?;
+            meta = self.read_migrated_meta()?;
         }
+        Ok(meta)
+    }
 
+    fn migrate_store_to_current_format(&self, meta: &Meta) -> Result<()> {
+        ensure!(
+            store_migration_from(&meta.version).is_some(),
+            CorruptedStoreSnafu {
+                path: self.meta_path.clone(),
+                message: format!(
+                    "unsupported store format version {}, expected {}",
+                    meta.version, STORE_FORMAT_VERSION
+                ),
+            }
+        );
+        if self.access != StoreAccess::ReadWrite {
+            tracing::warn!(
+                store_path = %self.dir.display(),
+                from_version = %meta.version,
+                to_version = STORE_FORMAT_VERSION,
+                "read-only store requires writable format migration"
+            );
+            return CorruptedStoreSnafu {
+                path: self.meta_path.clone(),
+                message: format!(
+                    "store format version {} requires writable migration to {}",
+                    meta.version, STORE_FORMAT_VERSION
+                ),
+            }
+            .fail();
+        }
+        self.migrate_store(meta.version.clone(), &meta.root_id)
+    }
+
+    fn read_migrated_meta(&self) -> Result<Meta> {
+        let meta = read_json_file::<Meta>(&self.meta_path)?;
+        ensure!(
+            meta.version == StoreFormatVersion::current(),
+            CorruptedStoreSnafu {
+                path: self.meta_path.clone(),
+                message: format!(
+                    "store migration did not upgrade format version to {}",
+                    STORE_FORMAT_VERSION
+                ),
+            }
+        );
+        Ok(meta)
+    }
+
+    fn load_nodes(&self, meta: &Meta) -> Result<StoreState> {
         let nodes = read_jsonl_file::<Node>(&self.nodes_path)?;
         let mut node_iter = nodes.into_iter();
         let root = node_iter.next().context(CorruptedStoreSnafu {
@@ -1435,7 +1461,10 @@ impl Persistence {
         for node in node_iter {
             store.insert_existing_node(node)?;
         }
+        Ok(store)
+    }
 
+    fn load_branches(&self, store: &mut StoreState) -> Result<()> {
         let mut seen_branches = HashSet::new();
         let entries = fs::read_dir(&self.branches_dir).context(WriteStoreDirectorySnafu {
             path: self.branches_dir.clone(),
@@ -1466,53 +1495,55 @@ impl Persistence {
                 }
             );
             let nodes = read_jsonl_file::<Node>(&path)?;
-            let head_id = validate_branch_view(&path, &branch, &nodes, &store)?;
+            let head_id = validate_branch_view(&path, &branch, &nodes, store)?;
             store.apply_fork(branch, head_id)?;
         }
+        Ok(())
+    }
 
-        ensure!(
-            self.sessions_path.is_file(),
-            CorruptedStoreSnafu {
-                path: self.sessions_path.clone(),
-                message: "missing sessions metadata file".to_owned(),
-            }
-        );
+    fn load_sessions(&self, store: &mut StoreState) -> Result<()> {
+        self.ensure_store_file(&self.sessions_path, "missing sessions metadata file")?;
         store.sessions = read_json_file::<HashMap<String, SessionState>>(&self.sessions_path)?;
-        map_session_validation_error(&self.sessions_path, store.validate_session_records())?;
+        map_session_validation_error(&self.sessions_path, store.validate_session_records())
+    }
+
+    fn load_presets(
+        &self,
+        store: &mut StoreState,
+    ) -> Result<HashMap<String, PersistedPresetRecord>> {
         if self.access == StoreAccess::ReadWrite {
             self.create_preset_history_directory()?;
-        } else if self.preset_history_dir.exists() {
-            ensure!(
-                self.preset_history_dir.is_dir(),
-                CorruptedStoreSnafu {
-                    path: self.preset_history_dir.clone(),
-                    message: "preset history entry must be a directory".to_owned(),
-                }
-            );
+        } else {
+            self.ensure_existing_directory_if_present(
+                &self.preset_history_dir,
+                "preset history entry must be a directory",
+            )?;
         }
-        ensure!(
-            self.presets_path.is_file(),
-            CorruptedStoreSnafu {
-                path: self.presets_path.clone(),
-                message: "missing presets metadata file".to_owned(),
-            }
-        );
+        self.ensure_store_file(&self.presets_path, "missing presets metadata file")?;
         let preset_snapshots = read_preset_snapshots(&self.presets_path)?;
         let presets = load_preset_history_records(self)?;
         validate_preset_snapshots(&preset_snapshots, &presets)?;
         store.presets = presets;
+        Ok(preset_snapshots)
+    }
+
+    fn load_jobs_and_queues(&self, store: &mut StoreState) -> Result<()> {
         self.recover_job_compaction()?;
-        let job_log_len = self.load_jobs(&mut store)?;
+        let job_log_len = self.load_jobs(store)?;
         if self.access == StoreAccess::ReadWrite && job_log_should_compact(job_log_len) {
-            self.rewrite_jobs(&store)?;
+            self.rewrite_jobs(store)?;
         }
         let (message_queues, message_queue_log_len) = self.load_message_queues()?;
         store.message_queues = message_queues;
         if self.access == StoreAccess::ReadWrite
             && message_queue_log_should_compact(&store.message_queues, message_queue_log_len)
         {
-            self.rewrite_message_queue_history(&store)?;
+            self.rewrite_message_queue_history(store)?;
         }
+        Ok(())
+    }
+
+    fn load_skills(&self, store: &mut StoreState) -> Result<()> {
         let skill_groups = read_json_file::<PersistedSkillGroups>(&self.skills_path)?;
         if skill_groups.is_empty() {
             store.skill_groups = default_skill_groups();
@@ -1530,12 +1561,19 @@ impl Persistence {
                 let _ = write_json_file(&self.skills_path, &recovered);
             }
         }
+        Ok(())
+    }
+
+    fn recover_preset_snapshots(
+        &self,
+        store: &StoreState,
+        preset_snapshots: HashMap<String, PersistedPresetRecord>,
+    ) -> Result<()> {
         let recovered_preset_snapshots = persisted_preset_records(&store.presets);
         if self.access == StoreAccess::ReadWrite && recovered_preset_snapshots != preset_snapshots {
-            self.persist_presets(&store)?;
+            self.persist_presets(store)?;
         }
-
-        Ok((self.clone(), store))
+        Ok(())
     }
 
     pub fn persist_sessions(&self, state: &StoreState) -> Result<()> {

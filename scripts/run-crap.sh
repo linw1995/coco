@@ -17,7 +17,6 @@ crap_args=(
 crap_allow_args=(
   --allow "handle_connection"
   --allow "main"
-  --allow "Persistence::load"
   --allow "run_daemon_command"
   --allow "PromptJobMessageQueueWorker::handle_prompt_request_queue_head"
   --allow "JsonValueKind::fmt"
