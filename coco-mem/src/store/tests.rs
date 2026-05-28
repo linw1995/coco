@@ -1565,7 +1565,7 @@ where
     store.fork("main", &child_id).unwrap();
 
     let new_head = store
-        .handoff_session("main", &SessionAnchorPatch::default())
+        .handoff_session("main", &SessionAnchorPatch::default(), "handoff prompt")
         .unwrap();
 
     assert_ne!(new_head, child_id);
@@ -1579,6 +1579,7 @@ where
     assert_eq!(session.provider.as_deref(), Some("openai"));
     assert_eq!(session.model, "gpt-5.4");
     assert_eq!(session.system_prompt, "system");
+    assert_eq!(session.prompt, "handoff prompt");
     assert_eq!(ancestry[1].id, child_id);
     assert_eq!(ancestry[2].id, session_id);
     assert_eq!(ancestry[3].id, root_id);
@@ -1593,7 +1594,7 @@ where
     store.fork("main", &root_id).unwrap();
 
     let err = store
-        .handoff_session("main", &SessionAnchorPatch::default())
+        .handoff_session("main", &SessionAnchorPatch::default(), "handoff prompt")
         .unwrap_err();
 
     assert!(matches!(
@@ -1620,6 +1621,7 @@ where
                 max_tokens: Some(Some(256)),
                 ..SessionAnchorPatch::default()
             },
+            "handoff prompt",
         )
         .unwrap();
 
@@ -1631,6 +1633,7 @@ where
     assert_eq!(session.provider.as_deref(), Some("openai"));
     assert_eq!(session.model, "claude-sonnet-4-20250514");
     assert_eq!(session.system_prompt, "You are strict.");
+    assert_eq!(session.prompt, "handoff prompt");
     assert_eq!(session.max_tokens, Some(256));
 }
 
@@ -2667,7 +2670,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["version"], "2026-05-28");
+    assert_eq!(meta["version"], "2026-05-29");
 }
 
 #[test]
@@ -2892,7 +2895,7 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated["version"], "2026-05-28");
+    assert_eq!(migrated["version"], "2026-05-29");
     let migrated_skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
@@ -3195,7 +3198,7 @@ fn open_migrates_legacy_jobs_json_to_snapshot_with_empty_wal() {
     assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-28");
+    assert_eq!(migrated_meta["version"], "2026-05-29");
 }
 
 #[test]
@@ -3215,7 +3218,7 @@ fn open_migrates_previous_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-28");
+    assert_eq!(migrated_meta["version"], "2026-05-29");
 }
 
 #[test]
@@ -3236,7 +3239,7 @@ fn open_migrates_previous_cronjob_builtin_skill_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-28");
+    assert_eq!(migrated_meta["version"], "2026-05-29");
     let cronjob = reopened
         .get_skill(SessionRole::Orchestrator, "cronjob")
         .unwrap();
@@ -3276,7 +3279,7 @@ fn open_migrates_console_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-28");
+    assert_eq!(migrated_meta["version"], "2026-05-29");
 }
 
 #[test]
@@ -3296,7 +3299,7 @@ fn open_migrates_recovery_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-28");
+    assert_eq!(migrated_meta["version"], "2026-05-29");
 }
 
 #[test]

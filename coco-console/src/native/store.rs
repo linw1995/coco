@@ -120,8 +120,13 @@ where
         self.notify_if_ok(self.inner.rebase_session(name, patch))
     }
 
-    fn handoff_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
-        self.notify_if_ok(self.inner.handoff_session(name, patch))
+    fn handoff_session(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        prompt: &str,
+    ) -> StoreResult<String> {
+        self.notify_if_ok(self.inner.handoff_session(name, patch, prompt))
     }
 }
 

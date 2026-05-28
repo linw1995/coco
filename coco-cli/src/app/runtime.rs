@@ -515,9 +515,8 @@ fn forwarded_session_basic_branch_slot(command: &mut SessionSubcommand) -> Optio
 
 fn forwarded_session_rebase_branch_slot(command: &mut SessionSubcommand) -> Option<&mut String> {
     match command {
-        SessionSubcommand::Rebase(command) | SessionSubcommand::Handoff(command) => {
-            Some(&mut command.branch)
-        }
+        SessionSubcommand::Rebase(command) => Some(&mut command.branch),
+        SessionSubcommand::Handoff(command) => Some(&mut command.rebase.branch),
         _ => None,
     }
 }

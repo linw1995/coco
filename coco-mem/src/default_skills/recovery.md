@@ -35,7 +35,7 @@ coco prompt worker --job <job-id>
 coco session get --json --branch <branch>
 coco session show --json <ref>
 coco session rebase --branch <branch> --provider-profile <profile>
-coco session handoff --branch <branch> --system-prompt "<recovered context>"
+coco session handoff --branch <branch> --prompt "<recovered context>"
 coco session rebase --branch <branch> --model <model>
 coco session rebase --branch <branch> --temperature <temperature>
 coco session rebase --branch <branch> --max-tokens <tokens>

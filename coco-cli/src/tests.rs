@@ -42,8 +42,8 @@ use crate::{
         PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
         PromptSubcommand, PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand,
         SessionCommand, SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand,
-        SessionGraphCommand, SessionMergeCommand, SessionPrCommand, SessionRebaseCommand,
-        SessionShowCommand, SessionSubcommand,
+        SessionGraphCommand, SessionHandoffCommand, SessionMergeCommand, SessionPrCommand,
+        SessionRebaseCommand, SessionShowCommand, SessionSubcommand,
     },
     store::open_store,
 };
@@ -468,21 +468,24 @@ fn session_handoff_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> 
         daemon_socket: None,
         store_path,
         command: Command::Session(SessionCommand {
-            command: SessionSubcommand::Handoff(SessionRebaseCommand {
-                branch: branch.unwrap_or("main").to_owned(),
-                preset: None,
-                provider_profile: None,
-                role: None,
-                provider: None,
-                model: Some("claude-sonnet-4-20250514".to_owned()),
-                system_prompt: Some("You are precise.".to_owned()),
-                temperature: None,
-                clear_temperature: false,
-                max_tokens: Some(256),
-                clear_max_tokens: false,
-                tools: vec![],
-                clear_tools: false,
-                json: true,
+            command: SessionSubcommand::Handoff(SessionHandoffCommand {
+                rebase: SessionRebaseCommand {
+                    branch: branch.unwrap_or("main").to_owned(),
+                    preset: None,
+                    provider_profile: None,
+                    role: None,
+                    provider: None,
+                    model: Some("claude-sonnet-4-20250514".to_owned()),
+                    system_prompt: Some("You are precise.".to_owned()),
+                    temperature: None,
+                    clear_temperature: false,
+                    max_tokens: Some(256),
+                    clear_max_tokens: false,
+                    tools: vec![],
+                    clear_tools: false,
+                    json: true,
+                },
+                prompt: "handoff prompt".to_owned(),
             }),
         }),
     }
@@ -2229,6 +2232,8 @@ async fn session_handoff_appends_inherited_session_anchor() {
             "handoff",
             "--branch",
             "main",
+            "--prompt",
+            "handoff prompt",
         ])
         .unwrap(),
         &mut Cursor::new(""),
@@ -2264,6 +2269,7 @@ async fn session_handoff_appends_inherited_session_anchor() {
     assert_eq!(session.provider, None);
     assert_eq!(session.model, "claude-sonnet-4-20250514");
     assert_eq!(session.system_prompt, "You are precise.");
+    assert_eq!(session.prompt, "handoff prompt");
     assert_eq!(session.temperature, Some(0.2));
     assert_eq!(session.max_tokens, Some(256));
 }

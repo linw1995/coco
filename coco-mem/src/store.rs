@@ -74,7 +74,12 @@ pub trait SessionStore {
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
 
     /// Appends a new full session anchor to reset provider context for a branch.
-    fn handoff_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+    fn handoff_session(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        prompt: &str,
+    ) -> StoreResult<String>;
 }
 
 /// Preset storage API.

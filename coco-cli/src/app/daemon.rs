@@ -2909,6 +2909,7 @@ mod tests {
                     max_tokens: Some(Some(12_345)),
                     ..SessionAnchorPatch::default()
                 },
+                "day handoff",
             )
             .unwrap();
 

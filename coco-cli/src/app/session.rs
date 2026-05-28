@@ -19,7 +19,7 @@ use crate::{
     cli::{CliTool, SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand},
     env::resolve_env_tools,
     error::{
-        AmbiguousNodePrefixSnafu, LlmSnafu, MissingProviderProfileModelSnafu,
+        AmbiguousNodePrefixSnafu, EmptyPromptSnafu, LlmSnafu, MissingProviderProfileModelSnafu,
         ParseSessionAdditionalParamsSnafu, StoreSnafu, UnknownShowReferenceSnafu,
     },
 };
@@ -256,11 +256,13 @@ where
             }))
         }
         SessionSubcommand::Handoff(command) => {
-            let branch = command.branch.clone();
-            let json = command.json;
-            let handoff = resolve_session_rebase(command, store, provider_profiles)?;
+            let branch = command.rebase.branch.clone();
+            let json = command.rebase.json;
+            let prompt = command.prompt.trim().to_owned();
+            ensure!(!prompt.is_empty(), EmptyPromptSnafu);
+            let handoff = resolve_session_rebase(command.rebase, store, provider_profiles)?;
             let head = llm
-                .handoff_session(&branch, handoff.patch)
+                .handoff_session(&branch, handoff.patch, &prompt)
                 .await
                 .context(LlmSnafu)?;
             let result = SessionHandoffResult { head };
