@@ -20,7 +20,6 @@ crap_allow_args=(
   --allow "Persistence::load"
   --allow "run_daemon_command"
   --allow "PromptJobMessageQueueWorker::handle_prompt_request_queue_head"
-  --allow "JsonValueKind::fmt"
   --allow "forward_to_socket"
   --allow "collect_visible_skill_invocation_subtrees"
   --allow "run_session_command"

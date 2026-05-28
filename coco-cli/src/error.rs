@@ -159,17 +159,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 struct JsonValueKind<'a>(&'a serde_json::Value);
 
-impl fmt::Display for JsonValueKind<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self.0 {
+impl JsonValueKind<'_> {
+    fn name(&self) -> &'static str {
+        match self.0 {
             serde_json::Value::Null => "null",
             serde_json::Value::Bool(_) => "boolean",
             serde_json::Value::Number(_) => "number",
             serde_json::Value::String(_) => "string",
             serde_json::Value::Array(_) => "array",
             serde_json::Value::Object(_) => "object",
-        };
-        f.write_str(kind)
+        }
+    }
+}
+
+impl fmt::Display for JsonValueKind<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 
