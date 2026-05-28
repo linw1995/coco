@@ -11,7 +11,9 @@ use coco_llm::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_SESSION_BRANCH_ENV, CompletionBackend, LlmService,
     SessionConfigPatch,
 };
-use coco_mem::{AnchorPayload, JobStore, Kind, MergeParent, MessageQueueItem, NodeStore, Store};
+use coco_mem::{
+    AnchorPayload, JobStore, Kind, MergeParent, MessageQueueItem, NodeStore, Store, StoreError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
@@ -649,30 +651,29 @@ fn load_queued_prompt_request_status(
 
 fn load_queued_prompt_request_list(store: &impl Store) -> Result<Vec<JobListItemView>> {
     let items = list_prompt_job_queue_messages(store)?;
-    items
-        .into_iter()
-        .filter_map(|item| {
-            serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
-                .ok()
-                .map(|request| (item, request))
-        })
-        .map(|(item, request)| {
-            let head = store
-                .get_branch_head(&request.branch)
-                .context(StoreSnafu)?
-                .to_owned();
-            Ok(JobListItemView {
-                job_id: request.job_id,
-                status: JobStatus::Queued,
-                created_at: item.created_at.to_string(),
-                finished_at: None,
-                branch: request.branch.clone(),
-                work_branch: request.branch,
-                base: head.clone(),
-                head,
-            })
-        })
-        .collect()
+    let mut jobs = Vec::new();
+    for item in items {
+        let Ok(request) = serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
+        else {
+            continue;
+        };
+        let head = match store.get_branch_head(&request.branch) {
+            Ok(head) => head.to_owned(),
+            Err(StoreError::BranchNotFound { .. }) => continue,
+            Err(error) => return Err(error).context(StoreSnafu),
+        };
+        jobs.push(JobListItemView {
+            job_id: request.job_id,
+            status: JobStatus::Queued,
+            created_at: item.created_at.to_string(),
+            finished_at: None,
+            branch: request.branch.clone(),
+            work_branch: request.branch,
+            base: head.clone(),
+            head,
+        });
+    }
+    Ok(jobs)
 }
 
 fn job_list_item_from_snapshot(snapshot: JobStatusSnapshot) -> JobListItemView {

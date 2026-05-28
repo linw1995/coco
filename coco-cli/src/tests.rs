@@ -1249,6 +1249,19 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(pending_status["job"]["status"], "queued");
     assert_eq!(pending_status["job"]["branch"], "main");
 
+    store
+        .enqueue_message(
+            &prompt_job_queue_for_branch("missing"),
+            json!({
+                "job_id": "job-stale",
+                "branch": "missing",
+                "prompt": "stale",
+                "merge_parents": [],
+                "session_patch": null,
+            }),
+        )
+        .unwrap();
+
     let pending_list_output = crate::app::runtime::run_with_services(
         prompt_list_cli(store_path.clone()),
         &mut Cursor::new(""),
