@@ -3976,6 +3976,11 @@ mod tests {
     use std::time::Duration;
 
     use coco_mem::{BranchStore, FsStore, MemoryStore, NodeStore, SessionStore};
+    use rig::completion::{
+        CompletionError, CompletionModel, CompletionRequestBuilder, CompletionResponse,
+        ToolDefinition,
+    };
+    use rig::streaming::StreamingCompletionResponse;
     use tokio::sync::{Barrier, Notify};
 
     type RecordedCalls = Arc<Mutex<Vec<(ResolvedSession, ResolvedCompletionRequest)>>>;
@@ -4399,6 +4404,93 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct BuilderTestModel;
+
+    impl CompletionModel for BuilderTestModel {
+        type Client = ();
+        type Response = ();
+        type StreamingResponse = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: rig::completion::CompletionRequest,
+        ) -> std::result::Result<CompletionResponse<Self::Response>, CompletionError> {
+            Err(CompletionError::RequestError(Box::new(
+                std::io::Error::other("unused test model"),
+            )))
+        }
+
+        async fn stream(
+            &self,
+            _request: rig::completion::CompletionRequest,
+        ) -> std::result::Result<
+            StreamingCompletionResponse<Self::StreamingResponse>,
+            CompletionError,
+        > {
+            Err(CompletionError::RequestError(Box::new(
+                std::io::Error::other("unused test model"),
+            )))
+        }
+    }
+
+    fn resolved_session_with_system_prompt(system_prompt: &str) -> ResolvedSession {
+        ResolvedSession {
+            branch: "main".to_owned(),
+            anchor_id: "session-anchor".to_owned(),
+            config: SessionModelConfig {
+                role: SessionRole::Orchestrator,
+                provider_profile: None,
+                provider: Provider::OpenAi,
+                model: "gpt-4.1-mini".to_owned(),
+                secrets: BTreeMap::new(),
+                base_url: None,
+                system_prompt: system_prompt.to_owned(),
+                tools: vec![],
+                temperature: None,
+                max_tokens: None,
+                additional_params: None,
+                enable_coco_shim: false,
+            },
+            provider_history: vec![],
+            tool_runtime_env: ToolRuntimeEnv {
+                session_branch: "main".to_owned(),
+                session_role: SessionRole::Orchestrator,
+                current_skill_name: None,
+                active_skill: None,
+                store_path: None,
+                enable_coco_shim: false,
+                cli_bridge: UnifiedExecCliBridgeHandle::default(),
+                skill_executor: SkillSearchExecutorHandle::default(),
+            },
+            profile_additional_params: None,
+        }
+    }
+
+    fn resolved_completion_request(
+        temperature: Option<f64>,
+        max_tokens: Option<u64>,
+        additional_params: Option<Value>,
+    ) -> ResolvedCompletionRequest {
+        ResolvedCompletionRequest {
+            branch: "main".to_owned(),
+            provider: Provider::OpenAi,
+            model: "gpt-4.1-mini".to_owned(),
+            secrets: BTreeMap::new(),
+            base_url: None,
+            temperature,
+            max_tokens,
+            additional_params,
+            runtime: RuntimeCapabilities::default(),
+            trace_node_appender: None,
+            trace_node_store: None,
+        }
+    }
+
     fn session_config(branch: &str) -> SessionConfig {
         SessionConfig {
             branch: branch.to_owned(),
@@ -4454,6 +4546,87 @@ mod tests {
 
     fn exec_command_tool() -> Tool {
         crate::builtin_tool_definition("exec_command").expect("builtin tool should exist")
+    }
+
+    #[tokio::test]
+    async fn builder_test_model_rejects_unused_send_paths() {
+        let model = BuilderTestModel::make(&(), "test-model");
+        let completion_error = CompletionRequestBuilder::new(model.clone(), "Hello")
+            .send()
+            .await
+            .unwrap_err();
+        let stream_error = match CompletionRequestBuilder::new(model, "Hello").stream().await {
+            Ok(_) => panic!("test model should reject stream requests"),
+            Err(error) => error,
+        };
+
+        assert!(completion_error.to_string().contains("unused test model"));
+        assert!(stream_error.to_string().contains("unused test model"));
+    }
+
+    #[test]
+    fn configure_completion_request_builder_applies_optional_settings() {
+        let session = resolved_session_with_system_prompt("Follow the system.");
+        let request = resolved_completion_request(
+            Some(0.4),
+            Some(128),
+            Some(serde_json::json!({"reasoning": {"effort": "low"}})),
+        );
+        let tools = vec![ToolDefinition {
+            name: "exec_command".to_owned(),
+            description: "Run a command".to_owned(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let built = configure_completion_request_builder(
+            CompletionRequestBuilder::new(BuilderTestModel, "Hello"),
+            &session,
+            &request,
+            &tools,
+        )
+        .build();
+
+        let messages = built.chat_history.iter().collect::<Vec<_>>();
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                rig::completion::message::Message::System { content },
+                rig::completion::message::Message::User { .. },
+            ] if content == "Follow the system."
+        ));
+        assert_eq!(built.preamble, None);
+        assert_eq!(built.tools, tools);
+        assert_eq!(built.temperature, Some(0.4));
+        assert_eq!(built.max_tokens, Some(128));
+        assert_eq!(
+            built.additional_params,
+            Some(serde_json::json!({"reasoning": {"effort": "low"}}))
+        );
+    }
+
+    #[test]
+    fn configure_completion_request_builder_leaves_absent_settings_empty() {
+        let session = resolved_session_with_system_prompt("");
+        let request = resolved_completion_request(None, None, None);
+
+        let built = configure_completion_request_builder(
+            CompletionRequestBuilder::new(BuilderTestModel, "Hello"),
+            &session,
+            &request,
+            &[],
+        )
+        .build();
+
+        let messages = built.chat_history.iter().collect::<Vec<_>>();
+        assert!(matches!(
+            messages.as_slice(),
+            [rig::completion::message::Message::User { .. }]
+        ));
+        assert_eq!(built.preamble, None);
+        assert!(built.tools.is_empty());
+        assert_eq!(built.temperature, None);
+        assert_eq!(built.max_tokens, None);
+        assert_eq!(built.additional_params, None);
     }
 
     fn text_messages_from_provider_history(
