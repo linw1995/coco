@@ -89,36 +89,72 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let socket_path = resolve_daemon_socket_path(match &command.command {
-        DaemonSubcommand::Serve(command) => command.socket.as_deref(),
-    })?;
+    let socket_path = resolve_daemon_command_socket_path(&command)?;
     let shared_engine = Arc::new(ConversationEngine::new(llm.clone()));
-    let console_config = match (&command.command, console_publisher.as_ref()) {
+    let console_config = daemon_console_config(&command, console_publisher.as_ref());
+    let server = start_daemon_command_server(
+        command,
+        &socket_path,
+        shared_store,
+        llm,
+        provider_profiles,
+        &shared_engine,
+        DaemonServerOptions {
+            channel_configs,
+            console_config,
+            console_publisher,
+        },
+    )
+    .await?;
+    spawn_resume_incomplete_jobs(shared_engine);
+    server.wait().await?;
+    Ok(None)
+}
+
+fn resolve_daemon_command_socket_path(command: &DaemonCommand) -> Result<PathBuf> {
+    resolve_daemon_socket_path(match &command.command {
+        DaemonSubcommand::Serve(command) => command.socket.as_deref(),
+    })
+}
+
+fn daemon_console_config(
+    command: &DaemonCommand,
+    console_publisher: Option<&ConsolePublisher>,
+) -> Option<ConsoleConfig> {
+    match (&command.command, console_publisher) {
         (DaemonSubcommand::Serve(command), Some(_)) if !command.no_console => Some(ConsoleConfig {
             addr: command.console_addr,
         }),
         _ => None,
-    };
-    let server = match command.command {
+    }
+}
+
+async fn start_daemon_command_server<B, S>(
+    command: DaemonCommand,
+    socket_path: &Path,
+    shared_store: &S,
+    llm: &Arc<LlmService<B, S>>,
+    provider_profiles: &ProviderProfiles,
+    shared_engine: &Arc<ConversationEngine<B, S>>,
+    options: DaemonServerOptions<'_>,
+) -> Result<CocoCliDaemonServerHandle<B, S>>
+where
+    B: CompletionBackend + 'static,
+    S: Store + Clone + Send + Sync + 'static,
+{
+    match command.command {
         DaemonSubcommand::Serve(_) => {
             ensure_initial_session(shared_store, llm, provider_profiles).await?;
             start_daemon_server(
-                &socket_path,
+                socket_path,
                 shared_store,
                 llm,
                 provider_profiles,
-                &shared_engine,
-                DaemonServerOptions {
-                    channel_configs,
-                    console_config,
-                    console_publisher,
-                },
-            )?
+                shared_engine,
+                options,
+            )
         }
-    };
-    spawn_resume_incomplete_jobs(shared_engine);
-    server.wait().await?;
-    Ok(None)
+    }
 }
 
 pub(crate) async fn ensure_initial_session<B, S>(
