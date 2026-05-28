@@ -19,9 +19,9 @@ coco preset list
 coco preset show --name <preset>
 coco preset set --name <preset> [session options]
 coco session rebase --preset <preset> --branch <branch>
-coco prompt --branch <branch> "<text>"
-coco prompt status --job <job>
-coco prompt branch-status --job <job> --branch <branch>
+coco job --branch <branch> "<text>"
+coco job list
+coco job status --job <job>
 coco skill run <skill>
 coco skill run <skill> --handoff "<task>"
 ```
@@ -46,7 +46,7 @@ ANCHOR=$(coco session get --json --branch "$COCO_BRANCH" | jq -r '.anchor_id')
 INVOCATION=$(coco session show --json "$ANCHOR" | jq -r '.node.parent')
 BASE=$(coco session show --json "$INVOCATION" | jq -r '.node.parent')
 coco session fork --branch "$RUNNER_BRANCH" --from-ref "$BASE"
-coco prompt --branch "$RUNNER_BRANCH" --role runner \
+coco job --branch "$RUNNER_BRANCH" --role runner \
   --tool exec_command --tool write_stdin --tool search_skill --tool load_image \
   --enable-coco-shim "<task>"
 ```

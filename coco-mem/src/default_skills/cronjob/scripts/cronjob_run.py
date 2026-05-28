@@ -199,7 +199,7 @@ def wait_for_previous_job(task: dict[str, str], state_path: Path) -> None:
 
 def prompt_status(coco_bin: str, job_id: str) -> str | None:
     result = subprocess.run(
-        [coco_bin, "prompt", "status", "--json", "--job", job_id],
+        [coco_bin, "job", "status", "--json", "--job", job_id],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -226,7 +226,7 @@ def submit_prompt(task: dict[str, str]) -> dict[str, str]:
     result = subprocess.run(
         [
             task["coco_bin"],
-            "prompt",
+            "job",
             "--async",
             "--json",
             "--branch",
@@ -243,11 +243,9 @@ def submit_prompt(task: dict[str, str]) -> dict[str, str]:
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        raise SystemExit(f"coco prompt did not return JSON: {result.stdout}") from error
+        raise SystemExit(f"coco job did not return JSON: {result.stdout}") from error
     if "job_id" not in payload:
-        raise SystemExit(
-            f"coco prompt response did not include job_id: {result.stdout}"
-        )
+        raise SystemExit(f"coco job response did not include job_id: {result.stdout}")
     return payload
 
 

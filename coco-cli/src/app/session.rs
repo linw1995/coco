@@ -1790,8 +1790,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphNodeEntry, render_graph_connector_row};
-    use coco_mem::{Kind, MergeParent, Role};
+    use super::{
+        GraphNodeEntry, NodeShowResult, render_graph_connector_row, render_node_show_text,
+    };
+    use coco_mem::{
+        Anchor, AnchorPayload, Kind, MergeParent, Node, Role, SessionAnchor, SessionAnchorPatch,
+        SessionRole, SkillInvocationAnchor, SkillInvocationMode, Tool, ToolResult, ToolUse,
+    };
     use serde_json::json;
 
     fn graph_entry(
@@ -1815,6 +1820,34 @@ mod tests {
                 .map(|node_id| MergeParent::merge(*node_id))
                 .collect(),
             labels: Vec::new(),
+        }
+    }
+
+    fn show_result(kind: Kind) -> NodeShowResult {
+        let node: Node = serde_json::from_value(json!({
+            "id": "node-id",
+            "parent": "parent-node",
+            "created_at": "1970-01-01T00:00:00Z",
+            "role": Role::User,
+            "metadata": {
+                "execution_id": "execution-1",
+                "call_id": null
+            },
+            "kind": kind,
+        }))
+        .expect("show test node should deserialize");
+
+        NodeShowResult {
+            reference: "main".to_owned(),
+            resolved_id: node.id.clone(),
+            children: vec!["child-1".to_owned(), "child-2".to_owned()],
+            node,
+        }
+    }
+
+    fn assert_show_text_contains(output: &str, expected: &[&str]) {
+        for text in expected {
+            assert!(output.contains(text), "expected output to contain {text:?}");
         }
     }
 
@@ -1868,5 +1901,150 @@ mod tests {
         let connector_row = render_graph_connector_row(&active_columns, &next_columns, 0, &entry);
 
         assert_eq!(connector_row.as_deref(), Some("|/"));
+    }
+
+    #[test]
+    fn render_node_show_text_includes_session_details() {
+        let result = show_result(Kind::Anchor(Anchor {
+            merge_parents: vec![
+                MergeParent::merge("merge-parent"),
+                MergeParent::shadow("shadow-parent"),
+            ],
+            payload: AnchorPayload::Session(Box::new(SessionAnchor {
+                role: SessionRole::Runner,
+                provider_profile: Some("profile".to_owned()),
+                provider: Some("openai".to_owned()),
+                model: "gpt-test".to_owned(),
+                tools: vec![Tool {
+                    name: "exec_command".to_owned(),
+                    description: "Run a command".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                }],
+                system_prompt: "System prompt".to_owned(),
+                prompt: "User prompt".to_owned(),
+                temperature: Some(0.7),
+                max_tokens: Some(1024),
+                additional_params: Some(json!({"top_p": 0.9})),
+                enable_coco_shim: true,
+                active_skill: None,
+            })),
+        }));
+
+        let output = render_node_show_text(&result);
+
+        assert_show_text_contains(
+            &output,
+            &[
+                "children: [child-1, child-2]",
+                "kind: session",
+                "execution_id: execution-1",
+                "merge_parents: [merge:merge-parent, shadow:shadow-parent]",
+                "provider: openai",
+                "model: gpt-test",
+                "temperature: 0.7",
+                "max_tokens: 1024",
+                "tools: [exec_command]",
+                "system_prompt:\nSystem prompt",
+                "prompt:\nUser prompt",
+                "additional_params:\n{\n  \"top_p\": 0.9\n}",
+            ],
+        );
+    }
+
+    #[test]
+    fn render_node_show_text_includes_session_patch_details() {
+        let result = show_result(Kind::Anchor(Anchor {
+            merge_parents: Vec::new(),
+            payload: AnchorPayload::SessionPatch(SessionAnchorPatch {
+                role: Some(SessionRole::Orchestrator),
+                provider_profile: Some(Some("default".to_owned())),
+                provider: Some(None),
+                model: Some("gpt-patch".to_owned()),
+                tools: Some(Vec::new()),
+                system_prompt: Some("Patched prompt".to_owned()),
+                temperature: Some(None),
+                max_tokens: Some(Some(2048)),
+                additional_params: Some(Some(json!({"seed": 7}))),
+                enable_coco_shim: Some(false),
+            }),
+        }));
+
+        let output = render_node_show_text(&result);
+
+        assert_show_text_contains(
+            &output,
+            &[
+                "kind: session_patch",
+                "merge_parents: []",
+                "patch:\n{",
+                "\"provider_profile\": \"default\"",
+                "\"provider\": null",
+                "\"model\": \"gpt-patch\"",
+                "\"max_tokens\": 2048",
+            ],
+        );
+    }
+
+    #[test]
+    fn render_node_show_text_includes_skill_invocation_details() {
+        let result = show_result(Kind::Anchor(Anchor {
+            merge_parents: Vec::new(),
+            payload: AnchorPayload::SkillInvocation(SkillInvocationAnchor {
+                skill_name: "documents".to_owned(),
+                mode: SkillInvocationMode::Handoff {
+                    prompt: "Render this".to_owned(),
+                },
+            }),
+        }));
+
+        let output = render_node_show_text(&result);
+
+        assert_show_text_contains(
+            &output,
+            &[
+                "kind: skill_invocation",
+                "skill_name: documents",
+                "mode:\n{",
+                "\"kind\": \"handoff\"",
+                "\"prompt\": \"Render this\"",
+            ],
+        );
+    }
+
+    #[test]
+    fn render_node_show_text_includes_tool_use_and_result_details() {
+        let tool_use = render_node_show_text(&show_result(Kind::tool_uses(vec![ToolUse {
+            id: "toolu-1".to_owned(),
+            name: "exec_command".to_owned(),
+            input: json!({"cmd": "true"}),
+        }])));
+        let tool_result =
+            render_node_show_text(&show_result(Kind::tool_results(vec![ToolResult {
+                id: "toolu-1".to_owned(),
+                output: "done".to_owned(),
+            }])));
+
+        assert_show_text_contains(
+            &tool_use,
+            &[
+                "kind: tool_use",
+                "tool_id: toolu-1",
+                "tool_name: exec_command",
+                "input:\n{\n  \"cmd\": \"true\"\n}",
+            ],
+        );
+        assert_show_text_contains(
+            &tool_result,
+            &["kind: tool_result", "tool_id: toolu-1", "output:\ndone"],
+        );
+    }
+
+    #[test]
+    fn render_node_show_text_includes_text_and_failure_details() {
+        let text = render_node_show_text(&show_result(Kind::Text("visible text".to_owned())));
+        let failure = render_node_show_text(&show_result(Kind::Failure("boom".to_owned())));
+
+        assert_show_text_contains(&text, &["kind: text", "text:\nvisible text"]);
+        assert_show_text_contains(&failure, &["kind: failure", "message:\nboom"]);
     }
 }
