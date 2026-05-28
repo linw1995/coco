@@ -17,7 +17,7 @@ jobs:
       - uses: ./.github/actions/setup-nix
 
       - name: Run repository checks
-        run: nix develop .#lint --command prek -a
+        run: nix develop --command prek -a
 
   test:
     needs:

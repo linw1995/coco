@@ -4,31 +4,24 @@
 }: let
   cargo-crap = pkgs.rustPlatform.buildRustPackage rec {
     pname = "cargo-crap";
-    version = "0.2.1";
+    version = "0.2.2";
 
-    src = pkgs.fetchCrate {
-      inherit pname version;
-      hash = "sha256-hjLl+FOTHMive61zGdhmAVGxDiApVxSBz1Nn5nKJTT8=";
+    src = pkgs.fetchurl {
+      url = "https://static.crates.io/crates/${pname}/${pname}-${version}.crate";
+      name = "${pname}-${version}.tar.gz";
+      hash = "sha256-Ej+k1P4Am2AXD8PVhrcrCdisA/0AAOI/8j2x0ULuOmY=";
     };
 
-    cargoHash = "sha256-+C6MBqV1RJqZapMYhMVYyczLDPGrqSwVX0tKs2fJ4n0=";
+    cargoHash = "sha256-vzkGNzQrVOtfpGLniGTdPRQfwA9jn5elXhudrFC7w9g=";
     doCheck = false;
   };
-
-  rustNativeBuildInputs = [
-    (rustDevToolchainFor pkgs)
-  ];
-
-  lintPackages = with pkgs; [
-    prek
-    ruff
-    taplo
-    uv
-  ];
 in {
   default = pkgs.mkShell {
-    nativeBuildInputs = rustNativeBuildInputs;
+    nativeBuildInputs = [
+      (rustDevToolchainFor pkgs)
+    ];
     packages = with pkgs; [
+      prek
       grcov
 
       cargo-crap
@@ -36,11 +29,9 @@ in {
       wasm-bindgen-cli
 
       nono
-    ] ++ lintPackages;
-  };
-
-  lint = pkgs.mkShell {
-    nativeBuildInputs = rustNativeBuildInputs;
-    packages = lintPackages;
+      ruff
+      taplo
+      uv
+    ];
   };
 }
