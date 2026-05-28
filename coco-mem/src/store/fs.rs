@@ -27,7 +27,7 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-25";
+const STORE_FORMAT_VERSION: &str = "2026-05-28";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -50,7 +50,7 @@ const BUILTIN_COCO_ORCHESTRATOR_REVISION_ID: &str =
 const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
-    "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e";
+    "f57de170e92e784a37b2debbcf6854c73857235a4bf0e699a1cd67035b24cd92";
 const BUILTIN_RECOVERY_REVISION_ID: &str =
     "6bf4094ad2dd2f9932cfc8d13a0f4a6b7adc9fe293e1ea6bc9f995d9c880a3f8";
 const BUILTIN_COMPACT_REVISION_ID: &str =
@@ -82,7 +82,10 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "cronjob",
-        from_revision_ids: &[],
+        from_revision_ids: &[
+            // Cronjob default before stale prompt job state was ignored.
+            "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e",
+        ],
         target_revision_id: BUILTIN_CRONJOB_REVISION_ID,
     },
     BuiltinSkillMigration {
@@ -166,6 +169,13 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-24-to-2026-05-25",
         from: StoreFormatVersion::Chronicle("2026-05-24"),
+        to: StoreFormatVersion::Chronicle("2026-05-25"),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-25-to-2026-05-28",
+        from: StoreFormatVersion::Chronicle("2026-05-25"),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
@@ -3515,6 +3525,13 @@ mod builtin_skill_migration_tests {
             orchestrator
                 .from_revision_ids
                 .contains(&"cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438")
+        );
+
+        let cronjob = builtin_migration(SessionRole::Orchestrator, "cronjob");
+        assert!(
+            cronjob
+                .from_revision_ids
+                .contains(&"88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e")
         );
 
         let telegram = builtin_migration(SessionRole::Runner, "telegram");

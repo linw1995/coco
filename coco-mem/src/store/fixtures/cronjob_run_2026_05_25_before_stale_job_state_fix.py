@@ -14,7 +14,6 @@ from pathlib import Path
 
 
 ACTIVE_STATUSES = {"queued", "running"}
-MISSING_STATUS = "missing"
 
 
 def main() -> int:
@@ -184,11 +183,6 @@ def wait_for_previous_job(task: dict[str, str], state_path: Path) -> None:
             raise SystemExit(
                 f"failed to resolve previous job {job_id} status for task {task['id']}"
             )
-        if status == MISSING_STATUS:
-            print(
-                f"Ignoring stale state for {task['id']}: previous job {job_id} no longer exists."
-            )
-            return
         if status not in ACTIVE_STATUSES:
             return
         if task["repeat"] == "skip":
@@ -206,8 +200,6 @@ def prompt_status(coco_bin: str, job_id: str) -> str | None:
         text=True,
     )
     if result.returncode != 0:
-        if prompt_job_not_found(result.stderr, job_id):
-            return MISSING_STATUS
         return None
     try:
         payload = json.loads(result.stdout)
@@ -216,10 +208,6 @@ def prompt_status(coco_bin: str, job_id: str) -> str | None:
     job = payload.get("job", payload)
     status = job.get("status")
     return status if isinstance(status, str) else None
-
-
-def prompt_job_not_found(stderr: str, job_id: str) -> bool:
-    return f'Prompt job "{job_id}" not found' in stderr
 
 
 def submit_prompt(task: dict[str, str]) -> dict[str, str]:

@@ -79,7 +79,47 @@ start_cron() {
     return 0
   fi
 
+  refresh_cronjob_runner "${cronjob_install_dir}"
   supervise_crontabs "${cronjob_crontab_dir}" &
+}
+
+refresh_cronjob_runner() {
+  install_dir="$1"
+  runner_path="${install_dir}/cronjob_run.py"
+  if [ ! -f "${runner_path}" ]; then
+    return 0
+  fi
+  if ! command -v coco >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    printf 'warning: failed to refresh cronjob runner; coco or jq is unavailable\n' >&2
+    return 0
+  fi
+
+  tmp_json="${runner_path}.skill.json.$$"
+  tmp_script="${runner_path}.tmp.$$"
+  if ! coco skill show --role orchestrator --name cronjob --json >"${tmp_json}" 2>/dev/null; then
+    printf 'warning: failed to refresh cronjob runner from current builtin skill\n' >&2
+    rm -f "${tmp_json}" "${tmp_script}"
+    return 0
+  fi
+  if ! jq -r \
+    '. as $root | $root.versions[] | select(.version == $root.current_version) | .scripts[] | select(.path == "scripts/cronjob_run.py") | .content' \
+    <"${tmp_json}" \
+    >"${tmp_script}"; then
+    printf 'warning: failed to extract current cronjob runner script\n' >&2
+    rm -f "${tmp_json}" "${tmp_script}"
+    return 0
+  fi
+  rm -f "${tmp_json}"
+  if [ ! -s "${tmp_script}" ]; then
+    printf 'warning: current cronjob skill did not include cronjob_run.py\n' >&2
+    rm -f "${tmp_script}"
+    return 0
+  fi
+  chmod 0755 "${tmp_script}"
+  if ! mv "${tmp_script}" "${runner_path}"; then
+    printf 'warning: failed to install refreshed cronjob runner at %s\n' "${runner_path}" >&2
+    rm -f "${tmp_script}"
+  fi
 }
 
 supervise_crontabs() {
