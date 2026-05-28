@@ -570,8 +570,20 @@ fn apply_forwarded_skill_parent(cli: &mut Cli, parent_tool_use_id: String, branc
 mod tests {
     use clap::Parser;
 
-    use super::command_name;
-    use crate::cli::Cli;
+    use super::{ForwardedRuntimeScope, command_name, parse_forwarded_cli};
+    use crate::cli::{
+        Cli, Command, PromptBranchStatusCommand, PromptCommand, PromptRunCommand,
+        PromptStatusCommand, PromptSubcommand, SessionBranchCommand, SessionCommand,
+        SessionGraphCommand, SessionListCommand, SessionShowCommand, SessionSubcommand,
+    };
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn parse_runner_cli(argv: &[&str]) -> Cli {
+        parse_forwarded_cli(&strings(argv), ForwardedRuntimeScope::Runner).unwrap()
+    }
 
     #[test]
     fn command_name_covers_all_cli_variants() {
@@ -593,5 +605,94 @@ mod tests {
             let cli = Cli::try_parse_from(argv).unwrap();
             assert_eq!(command_name(&cli.command), expected);
         }
+    }
+
+    #[test]
+    fn runner_cli_maps_prompt_status_commands() {
+        let cli = parse_runner_cli(&["coco", "prompt", "status", "--job", "job-1", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Command::Prompt(PromptCommand {
+                command: Some(PromptSubcommand::Status(PromptStatusCommand {
+                    job,
+                    json: true,
+                })),
+                run: PromptRunCommand {
+                    branch,
+                    ref text,
+                    ..
+                },
+            }) if job == "job-1" && branch == "main" && text.is_empty()
+        ));
+
+        let cli = parse_runner_cli(&[
+            "coco",
+            "prompt",
+            "branch-status",
+            "--job",
+            "job-2",
+            "--branch",
+            "draft",
+            "--json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Prompt(PromptCommand {
+                command: Some(PromptSubcommand::BranchStatus(PromptBranchStatusCommand {
+                    job,
+                    branch: Some(branch),
+                    json: true,
+                })),
+                run: PromptRunCommand {
+                    branch: run_branch,
+                    ref text,
+                    ..
+                },
+            }) if job == "job-2" && branch == "draft" && run_branch == "main" && text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn runner_cli_maps_session_commands() {
+        let cli = parse_runner_cli(&["coco", "session", "list"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCommand {
+                command: SessionSubcommand::List(SessionListCommand { json: false }),
+            })
+        ));
+
+        let cli = parse_runner_cli(&["coco", "session", "get", "--branch", "draft", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCommand {
+                command: SessionSubcommand::Get(SessionBranchCommand {
+                    branch,
+                    json: true,
+                }),
+            }) if branch == "draft"
+        ));
+
+        let cli = parse_runner_cli(&["coco", "session", "graph", "--json", "--all"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCommand {
+                command: SessionSubcommand::Graph(SessionGraphCommand {
+                    json: true,
+                    all: true,
+                }),
+            })
+        ));
+
+        let cli = parse_runner_cli(&["coco", "session", "show", "node-1", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCommand {
+                command: SessionSubcommand::Show(SessionShowCommand {
+                    reference,
+                    json: true,
+                }),
+            }) if reference == "node-1"
+        ));
     }
 }
