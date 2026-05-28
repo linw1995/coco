@@ -1361,6 +1361,13 @@ where
     }
 }
 
+struct PreparedCompletionRun {
+    original_head: String,
+    retry_from_node_id: String,
+    session: ResolvedSession,
+    resolved: ResolvedCompletionRequest,
+}
+
 impl<B, S> LlmService<B, S>
 where
     B: CompletionBackend,
@@ -1401,6 +1408,15 @@ where
     }
 
     async fn run_locked(&self, request: CompletionRequest) -> Result<CompletionResult> {
+        let prepared = self.prepare_completion_run(request)?;
+        let completed = self
+            .backend
+            .complete(prepared.session.clone(), prepared.resolved.clone())
+            .await;
+        self.finish_completion_run(prepared, completed)
+    }
+
+    fn prepare_completion_run(&self, request: CompletionRequest) -> Result<PreparedCompletionRun> {
         let branch = request.branch.clone();
         let origin_kind = completion_origin_kind(&request.origin);
         let input_kind = completion_input_kind(&request.input);
@@ -1472,153 +1488,257 @@ where
             Some(trace_node_appender),
             Some(trace_node_store),
         );
-        match self
-            .backend
-            .complete(session.clone(), resolved.clone())
-            .await
-        {
-            Ok(run) => {
-                let BackendRun {
-                    steps,
-                    outcome,
-                    head,
-                } = run;
-                match outcome {
-                    BackendOutcome::Succeeded { text } => {
-                        let (last_execution_id, steps) =
-                            normalize_backend_steps(steps, Some(text.clone()));
-                        let response_node_id = match resolved.trace_node_appender.as_ref() {
-                            Some(trace_node_appender) => match head.as_deref() {
-                                Some(head_id) => self
-                                    .validate_terminal_text_with_trace_node_appender(
-                                        &resolved.branch,
-                                        &last_execution_id,
-                                        head_id,
-                                        &text,
-                                    )?,
-                                None => self.persist_backend_steps_with_trace_node_appender(
-                                    &resolved.branch,
-                                    &retry_from_node_id,
-                                    trace_node_appender,
-                                    resolved.trace_node_store.as_deref(),
-                                    &steps,
-                                )?,
-                            },
-                            None => self
-                                .append_backend_steps(retry_from_node_id.clone(), &steps)
-                                .context(MemorySnafu)?,
-                        };
-                        self.move_branch_head(&resolved.branch, &original_head, &response_node_id)?;
 
-                        tracing::info!(
-                            branch = %resolved.branch,
-                            execution_id = %last_execution_id,
-                            response_node_id = %response_node_id,
-                            branch_head = %response_node_id,
-                            step_count = steps.len(),
-                            "completion succeeded"
-                        );
-                        Ok(CompletionResult {
-                            branch: resolved.branch,
-                            anchor_id: session.anchor_id,
-                            execution_id: last_execution_id,
-                            response_node_id: response_node_id.clone(),
-                            branch_head: response_node_id,
-                            text,
-                        })
-                    }
-                    BackendOutcome::Failed { message } => {
-                        let (execution_id, steps) = normalize_backend_steps(steps, None);
-                        let error_node_id = match resolved.trace_node_appender.as_ref() {
-                            Some(trace_node_appender) => {
-                                head.clone().map_or_else(
-                                    || {
-                                        self.persist_backend_steps_with_trace_node_appender(
-                                            &resolved.branch,
-                                            &retry_from_node_id,
-                                            trace_node_appender,
-                                            resolved.trace_node_store.as_deref(),
-                                            &steps,
-                                        )
-                                    },
-                                    Ok,
-                                )?;
-                                self.append_failure_with_trace_node_appender(
-                                    &resolved.branch,
-                                    &retry_from_node_id,
-                                    trace_node_appender,
-                                    &execution_id,
-                                    &message,
-                                )?
-                            }
-                            None => self.append_failure_node(
-                                self.append_backend_steps(retry_from_node_id.clone(), &steps)
-                                    .context(MemorySnafu)?,
-                                &execution_id,
-                                &message,
-                            )?,
-                        };
-                        self.move_branch_head(
+        Ok(PreparedCompletionRun {
+            original_head,
+            retry_from_node_id,
+            session,
+            resolved,
+        })
+    }
+
+    fn finish_completion_run(
+        &self,
+        prepared: PreparedCompletionRun,
+        completed: std::result::Result<BackendRun, BackendError>,
+    ) -> Result<CompletionResult> {
+        match completed {
+            Ok(run) => self.finish_backend_run(prepared, run),
+            Err(source) => self.finish_backend_error(prepared, source),
+        }
+    }
+
+    fn finish_backend_run(
+        &self,
+        prepared: PreparedCompletionRun,
+        run: BackendRun,
+    ) -> Result<CompletionResult> {
+        let BackendRun {
+            steps,
+            outcome,
+            head,
+        } = run;
+        match outcome {
+            BackendOutcome::Succeeded { text } => {
+                self.finish_successful_backend_run(prepared, steps, head, text)
+            }
+            BackendOutcome::Failed { message } => {
+                self.finish_failed_backend_run(prepared, steps, head, message)
+            }
+        }
+    }
+
+    fn finish_successful_backend_run(
+        &self,
+        prepared: PreparedCompletionRun,
+        steps: Vec<BackendStep>,
+        head: Option<String>,
+        text: String,
+    ) -> Result<CompletionResult> {
+        let PreparedCompletionRun {
+            original_head,
+            retry_from_node_id,
+            session,
+            resolved,
+            ..
+        } = prepared;
+        let (last_execution_id, steps) = normalize_backend_steps(steps, Some(text.clone()));
+        let response_node_id = self.persist_successful_backend_run(
+            &resolved,
+            &retry_from_node_id,
+            &last_execution_id,
+            head.as_deref(),
+            &text,
+            &steps,
+        )?;
+        self.move_branch_head(&resolved.branch, &original_head, &response_node_id)?;
+
+        tracing::info!(
+            branch = %resolved.branch,
+            execution_id = %last_execution_id,
+            response_node_id = %response_node_id,
+            branch_head = %response_node_id,
+            step_count = steps.len(),
+            "completion succeeded"
+        );
+        Ok(CompletionResult {
+            branch: resolved.branch,
+            anchor_id: session.anchor_id,
+            execution_id: last_execution_id,
+            response_node_id: response_node_id.clone(),
+            branch_head: response_node_id,
+            text,
+        })
+    }
+
+    fn persist_successful_backend_run(
+        &self,
+        resolved: &ResolvedCompletionRequest,
+        retry_from_node_id: &str,
+        execution_id: &str,
+        head: Option<&str>,
+        text: &str,
+        steps: &[BackendStep],
+    ) -> Result<String> {
+        match resolved.trace_node_appender.as_ref() {
+            Some(trace_node_appender) => match head {
+                Some(head_id) => self.validate_terminal_text_with_trace_node_appender(
+                    &resolved.branch,
+                    execution_id,
+                    head_id,
+                    text,
+                ),
+                None => self.persist_backend_steps_with_trace_node_appender(
+                    &resolved.branch,
+                    retry_from_node_id,
+                    trace_node_appender,
+                    resolved.trace_node_store.as_deref(),
+                    steps,
+                ),
+            },
+            None => self
+                .append_backend_steps(retry_from_node_id.to_owned(), steps)
+                .context(MemorySnafu),
+        }
+    }
+
+    fn finish_failed_backend_run(
+        &self,
+        prepared: PreparedCompletionRun,
+        steps: Vec<BackendStep>,
+        head: Option<String>,
+        message: String,
+    ) -> Result<CompletionResult> {
+        let PreparedCompletionRun {
+            original_head,
+            retry_from_node_id,
+            resolved,
+            ..
+        } = prepared;
+        let (execution_id, steps) = normalize_backend_steps(steps, None);
+        let error_node_id = self.persist_failed_backend_run(
+            &resolved,
+            &retry_from_node_id,
+            &execution_id,
+            head,
+            &message,
+            &steps,
+        )?;
+        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
+        tracing::warn!(
+            branch = %resolved.branch,
+            execution_id = %execution_id,
+            error_node_id = %error_node_id,
+            retry_from_node_id = %retry_from_node_id,
+            step_count = steps.len(),
+            error = %message,
+            "completion failed with backend outcome"
+        );
+        Err(BackendSnafu {
+            context: Box::new(BackendFailureContext {
+                branch: resolved.branch,
+                execution_id,
+                error_node_id,
+                retry_from_node_id,
+            }),
+        }
+        .into_error(BackendError::failed(message)))
+    }
+
+    fn persist_failed_backend_run(
+        &self,
+        resolved: &ResolvedCompletionRequest,
+        retry_from_node_id: &str,
+        execution_id: &str,
+        head: Option<String>,
+        message: &str,
+        steps: &[BackendStep],
+    ) -> Result<String> {
+        match resolved.trace_node_appender.as_ref() {
+            Some(trace_node_appender) => {
+                head.map_or_else(
+                    || {
+                        self.persist_backend_steps_with_trace_node_appender(
                             &resolved.branch,
-                            &original_head,
-                            &retry_from_node_id,
-                        )?;
-                        tracing::warn!(
-                            branch = %resolved.branch,
-                            execution_id = %execution_id,
-                            error_node_id = %error_node_id,
-                            retry_from_node_id = %retry_from_node_id,
-                            step_count = steps.len(),
-                            error = %message,
-                            "completion failed with backend outcome"
-                        );
-                        Err(BackendSnafu {
-                            context: Box::new(BackendFailureContext {
-                                branch: resolved.branch,
-                                execution_id,
-                                error_node_id,
-                                retry_from_node_id,
-                            }),
-                        }
-                        .into_error(BackendError::failed(message)))
-                    }
-                }
+                            retry_from_node_id,
+                            trace_node_appender,
+                            resolved.trace_node_store.as_deref(),
+                            steps,
+                        )
+                    },
+                    Ok,
+                )?;
+                self.append_failure_with_trace_node_appender(
+                    &resolved.branch,
+                    retry_from_node_id,
+                    trace_node_appender,
+                    execution_id,
+                    message,
+                )
             }
-            Err(source) => {
-                let execution_id = format!("execution-{}", nanoid::nanoid!());
-                let error_node_id = match resolved.trace_node_appender.as_ref() {
-                    Some(trace_node_appender) => self.append_failure_with_trace_node_appender(
-                        &resolved.branch,
-                        &retry_from_node_id,
-                        trace_node_appender,
-                        &execution_id,
-                        &source.to_string(),
-                    )?,
-                    None => self.append_failure_node(
-                        retry_from_node_id.clone(),
-                        &execution_id,
-                        &source.to_string(),
-                    )?,
-                };
-                self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
-                tracing::error!(
-                    branch = %resolved.branch,
-                    execution_id = %execution_id,
-                    error_node_id = %error_node_id,
-                    retry_from_node_id = %retry_from_node_id,
-                    error = %source,
-                    "completion backend returned error"
-                );
-                Err(BackendSnafu {
-                    context: Box::new(BackendFailureContext {
-                        branch: resolved.branch,
-                        execution_id,
-                        error_node_id,
-                        retry_from_node_id,
-                    }),
-                }
-                .into_error(source))
-            }
+            None => self.append_failure_node(
+                self.append_backend_steps(retry_from_node_id.to_owned(), steps)
+                    .context(MemorySnafu)?,
+                execution_id,
+                message,
+            ),
+        }
+    }
+
+    fn finish_backend_error(
+        &self,
+        prepared: PreparedCompletionRun,
+        source: BackendError,
+    ) -> Result<CompletionResult> {
+        let PreparedCompletionRun {
+            original_head,
+            retry_from_node_id,
+            resolved,
+            ..
+        } = prepared;
+        let execution_id = format!("execution-{}", nanoid::nanoid!());
+        let error_node_id =
+            self.persist_backend_error(&resolved, &retry_from_node_id, &execution_id, &source)?;
+        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
+        tracing::error!(
+            branch = %resolved.branch,
+            execution_id = %execution_id,
+            error_node_id = %error_node_id,
+            retry_from_node_id = %retry_from_node_id,
+            error = %source,
+            "completion backend returned error"
+        );
+        Err(BackendSnafu {
+            context: Box::new(BackendFailureContext {
+                branch: resolved.branch,
+                execution_id,
+                error_node_id,
+                retry_from_node_id,
+            }),
+        }
+        .into_error(source))
+    }
+
+    fn persist_backend_error(
+        &self,
+        resolved: &ResolvedCompletionRequest,
+        retry_from_node_id: &str,
+        execution_id: &str,
+        source: &BackendError,
+    ) -> Result<String> {
+        match resolved.trace_node_appender.as_ref() {
+            Some(trace_node_appender) => self.append_failure_with_trace_node_appender(
+                &resolved.branch,
+                retry_from_node_id,
+                trace_node_appender,
+                execution_id,
+                &source.to_string(),
+            ),
+            None => self.append_failure_node(
+                retry_from_node_id.to_owned(),
+                execution_id,
+                &source.to_string(),
+            ),
         }
     }
 }

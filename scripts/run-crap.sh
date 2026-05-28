@@ -27,7 +27,6 @@ crap_allow_args=(
   --allow "render_node_content"
   --allow "command_name"
   --allow "abort_channel_task"
-  --allow "LlmService::run_locked"
 )
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
