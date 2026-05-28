@@ -108,7 +108,7 @@ Then trigger the first provider request:
 docker compose run --rm \
   -e COCO_START_CRON=0 \
   coco \
-  coco prompt --branch main "Reply with OK after authentication succeeds."
+  coco job --branch main "Reply with OK after authentication succeeds."
 ```
 
 When the command prints the verification URL and device code, finish the login

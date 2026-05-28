@@ -48,29 +48,22 @@ pub struct PromptRunCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum PromptSubcommand {
+    List(PromptListCommand),
     Status(PromptStatusCommand),
-    #[command(name = "branch-status")]
-    BranchStatus(PromptBranchStatusCommand),
     #[command(hide = true)]
     Worker(PromptWorkerCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct PromptListCommand {
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct PromptStatusCommand {
     #[arg(long)]
     pub job: String,
-
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct PromptBranchStatusCommand {
-    #[arg(long)]
-    pub job: String,
-
-    #[arg(long)]
-    pub branch: Option<String>,
 
     #[arg(long)]
     pub json: bool,

@@ -10,8 +10,8 @@ Useful commands:
 coco session get --json --branch <branch>
 coco session graph --json
 coco session show --json <ref>
-coco prompt status --json --job <job-id>
-coco prompt branch-status --job <job-id> --branch <branch>
+coco job list --json
+coco job status --json --job <job-id>
 coco session handoff --branch <branch> --prompt "<compacted handoff>"
 ```
 

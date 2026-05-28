@@ -752,11 +752,11 @@ def write_fake_coco(
 
             calls = Path({str(calls_file)!r})
             args = sys.argv[1:]
-            if args[:3] == ["prompt", "status", "--json"]:
+            if args[:3] == ["job", "status", "--json"]:
                 with calls.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({{"kind": "status", "args": args}}) + "\\n")
                 {status_response}
-            if args[:4] == ["prompt", "--async", "--json", "--branch"]:
+            if args[:4] == ["job", "--async", "--json", "--branch"]:
                 with calls.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({{"kind": "submit", "args": args}}) + "\\n")
                 print(json.dumps({{"job_id": "job-new", "status": "queued", "branch": args[4]}}))

@@ -3923,53 +3923,68 @@ fn parse_env_placeholder(value: &str) -> Option<&str> {
 #[async_trait]
 impl CompletionBackend for RigBackend {
     async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
-        use rig::client::CompletionClient;
-        use rig::providers::{anthropic, chatgpt, openai};
-
         match ctx.request.provider {
-            Provider::OpenAi => {
-                let api_key = resolve_provider_api_key(
-                    ctx.request.provider,
-                    "OPENAI_API_KEY",
-                    &ctx.request.secrets,
-                )?;
-                let mut builder = openai::Client::builder().api_key(&api_key);
-                if let Some(base_url) = resolve_base_url(ctx.request.base_url.as_deref())? {
-                    builder = builder.base_url(&base_url);
-                }
-                let client = builder
-                    .build()
-                    .map_err(|source| BackendError::failed(source.to_string()))?;
-                send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
-            }
-            Provider::Anthropic => {
-                let api_key = resolve_provider_api_key(
-                    ctx.request.provider,
-                    "ANTHROPIC_API_KEY",
-                    &ctx.request.secrets,
-                )?;
-                let mut builder = anthropic::Client::builder().api_key(api_key);
-                if let Some(base_url) = resolve_base_url(ctx.request.base_url.as_deref())? {
-                    builder = builder.base_url(&base_url);
-                }
-                let client = builder
-                    .build()
-                    .map_err(|source| BackendError::failed(source.to_string()))?;
-                send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
-            }
-            Provider::ChatGpt => {
-                let mut builder =
-                    chatgpt::Client::builder().api_key(resolve_chatgpt_auth(&ctx.request.secrets)?);
-                if let Some(base_url) = resolve_base_url(ctx.request.base_url.as_deref())? {
-                    builder = builder.base_url(base_url);
-                }
-                let client = builder
-                    .build()
-                    .map_err(|source| BackendError::failed(source.to_string()))?;
-                send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
-            }
+            Provider::OpenAi => send_openai_completion_turn(ctx).await,
+            Provider::Anthropic => send_anthropic_completion_turn(ctx).await,
+            Provider::ChatGpt => send_chatgpt_completion_turn(ctx).await,
         }
     }
+}
+
+async fn send_openai_completion_turn(
+    ctx: StepContext<'_>,
+) -> std::result::Result<BackendTurn, BackendError> {
+    use rig::client::CompletionClient;
+    use rig::providers::openai;
+
+    let api_key =
+        resolve_provider_api_key(ctx.request.provider, "OPENAI_API_KEY", &ctx.request.secrets)?;
+    let mut builder = openai::Client::builder().api_key(&api_key);
+    if let Some(base_url) = resolve_base_url(ctx.request.base_url.as_deref())? {
+        builder = builder.base_url(&base_url);
+    }
+    let client = builder
+        .build()
+        .map_err(|source| BackendError::failed(source.to_string()))?;
+    send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
+}
+
+async fn send_anthropic_completion_turn(
+    ctx: StepContext<'_>,
+) -> std::result::Result<BackendTurn, BackendError> {
+    use rig::client::CompletionClient;
+    use rig::providers::anthropic;
+
+    let api_key = resolve_provider_api_key(
+        ctx.request.provider,
+        "ANTHROPIC_API_KEY",
+        &ctx.request.secrets,
+    )?;
+    let mut builder = anthropic::Client::builder().api_key(api_key);
+    if let Some(base_url) = resolve_base_url(ctx.request.base_url.as_deref())? {
+        builder = builder.base_url(&base_url);
+    }
+    let client = builder
+        .build()
+        .map_err(|source| BackendError::failed(source.to_string()))?;
+    send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
+}
+
+async fn send_chatgpt_completion_turn(
+    ctx: StepContext<'_>,
+) -> std::result::Result<BackendTurn, BackendError> {
+    use rig::client::CompletionClient;
+    use rig::providers::chatgpt;
+
+    let mut builder =
+        chatgpt::Client::builder().api_key(resolve_chatgpt_auth(&ctx.request.secrets)?);
+    if let Some(base_url) = resolve_base_url(ctx.request.base_url.as_deref())? {
+        builder = builder.base_url(base_url);
+    }
+    let client = builder
+        .build()
+        .map_err(|source| BackendError::failed(source.to_string()))?;
+    send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
 }
 
 #[cfg(test)]
@@ -4512,6 +4527,81 @@ mod tests {
             additional_params: None,
             enable_coco_shim: false,
         }
+    }
+
+    fn resolved_session_for_step() -> ResolvedSession {
+        ResolvedSession {
+            branch: "main".to_owned(),
+            anchor_id: "session-anchor".to_owned(),
+            config: SessionModelConfig {
+                role: SessionRole::Orchestrator,
+                provider_profile: None,
+                provider: Provider::OpenAi,
+                model: "gpt-test".to_owned(),
+                secrets: BTreeMap::new(),
+                base_url: None,
+                system_prompt: "You are helpful.".to_owned(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                additional_params: None,
+                enable_coco_shim: false,
+            },
+            provider_history: Vec::new(),
+            tool_runtime_env: ToolRuntimeEnv {
+                session_branch: "main".to_owned(),
+                session_role: SessionRole::Orchestrator,
+                current_skill_name: None,
+                active_skill: None,
+                store_path: None,
+                enable_coco_shim: false,
+                cli_bridge: UnifiedExecCliBridgeHandle::default(),
+                skill_executor: SkillSearchExecutorHandle::default(),
+            },
+            profile_additional_params: None,
+        }
+    }
+
+    fn resolved_request_for_step(
+        provider: Provider,
+        secrets: BTreeMap<String, String>,
+        base_url: Option<&str>,
+    ) -> ResolvedCompletionRequest {
+        ResolvedCompletionRequest {
+            branch: "main".to_owned(),
+            provider,
+            model: "gpt-test".to_owned(),
+            secrets,
+            base_url: base_url.map(str::to_owned),
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+            runtime: RuntimeCapabilities::default(),
+            trace_node_appender: None,
+            trace_node_store: None,
+        }
+    }
+
+    async fn rig_backend_step_error(
+        request: &ResolvedCompletionRequest,
+        env: &[(&str, Option<&OsStr>)],
+    ) -> BackendError {
+        let backend = RigBackend;
+        let session = resolved_session_for_step();
+        let prompt = CompletionMessage::user("Hello");
+        with_process_env_async(env, || async {
+            backend
+                .step(StepContext {
+                    session: &session,
+                    request,
+                    prompt: &prompt,
+                    history: &[],
+                    tool_definitions: &[],
+                })
+                .await
+                .unwrap_err()
+        })
+        .await
     }
 
     fn request(branch: &str) -> CompletionRequest {
@@ -5106,6 +5196,167 @@ mod tests {
     fn provider_parse_accepts_chatgpt() {
         assert_eq!(Provider::parse("chatgpt").unwrap(), Provider::ChatGpt);
         assert_eq!(Provider::ChatGpt.as_str(), "chatgpt");
+    }
+
+    #[tokio::test]
+    async fn rig_backend_step_reports_missing_openai_key() {
+        let request = resolved_request_for_step(Provider::OpenAi, BTreeMap::new(), None);
+
+        let error = rig_backend_step_error(
+            &request,
+            &[
+                ("COCO_API_KEY", None),
+                ("OPENAI_API_KEY", None),
+                ("ANTHROPIC_API_KEY", None),
+            ],
+        )
+        .await;
+
+        assert_eq!(error.to_string(), "missing API key for provider openai");
+    }
+
+    #[tokio::test]
+    async fn rig_backend_step_reports_missing_anthropic_key() {
+        let request = resolved_request_for_step(Provider::Anthropic, BTreeMap::new(), None);
+
+        let error = rig_backend_step_error(
+            &request,
+            &[
+                ("COCO_API_KEY", None),
+                ("OPENAI_API_KEY", None),
+                ("ANTHROPIC_API_KEY", None),
+            ],
+        )
+        .await;
+
+        assert_eq!(error.to_string(), "missing API key for provider anthropic");
+    }
+
+    #[tokio::test]
+    async fn rig_backend_step_reports_invalid_openai_base_url_env_reference() {
+        let request = resolved_request_for_step(
+            Provider::OpenAi,
+            BTreeMap::new(),
+            Some("${COCO_OPENAI_BASE_URL"),
+        );
+
+        let error = rig_backend_step_error(
+            &request,
+            &[
+                ("COCO_API_KEY", Some(OsStr::new("test-key"))),
+                ("OPENAI_API_KEY", None),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            error.to_string(),
+            "invalid base URL environment reference \"${COCO_OPENAI_BASE_URL\""
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_backend_step_maps_openai_client_build_errors() {
+        let request =
+            resolved_request_for_step(Provider::OpenAi, BTreeMap::new(), Some("not a url"));
+
+        let error = rig_backend_step_error(
+            &request,
+            &[
+                ("COCO_API_KEY", Some(OsStr::new("test-key"))),
+                ("OPENAI_API_KEY", None),
+            ],
+        )
+        .await;
+
+        assert!(matches!(error, BackendError::Failed { .. }));
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rig_backend_step_reports_missing_anthropic_base_url_env_reference() {
+        let request = resolved_request_for_step(
+            Provider::Anthropic,
+            BTreeMap::new(),
+            Some("${COCO_ANTHROPIC_BASE_URL}"),
+        );
+
+        let error = rig_backend_step_error(
+            &request,
+            &[
+                ("COCO_API_KEY", Some(OsStr::new("test-key"))),
+                ("ANTHROPIC_API_KEY", None),
+                ("COCO_ANTHROPIC_BASE_URL", None),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            error.to_string(),
+            "missing base URL in environment variable COCO_ANTHROPIC_BASE_URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_backend_step_maps_anthropic_client_build_errors() {
+        let request =
+            resolved_request_for_step(Provider::Anthropic, BTreeMap::new(), Some("not a url"));
+
+        let error = rig_backend_step_error(
+            &request,
+            &[
+                ("COCO_API_KEY", Some(OsStr::new("test-key"))),
+                ("ANTHROPIC_API_KEY", None),
+            ],
+        )
+        .await;
+
+        assert!(matches!(error, BackendError::Failed { .. }));
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rig_backend_step_reports_chatgpt_coco_api_key_conflict() {
+        let request = resolved_request_for_step(Provider::ChatGpt, BTreeMap::new(), None);
+
+        let error = rig_backend_step_error(
+            &request,
+            &[
+                ("COCO_API_KEY", Some(OsStr::new("generic-key"))),
+                ("CHATGPT_ACCESS_TOKEN", None),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            error.to_string(),
+            "COCO_API_KEY must not be set when provider is chatgpt"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_backend_step_maps_chatgpt_client_build_errors() {
+        let request = resolved_request_for_step(
+            Provider::ChatGpt,
+            secrets(&[("access_token", "COCO_CHATGPT_ACCESS_TOKEN")]),
+            Some("not a url"),
+        );
+
+        let error = rig_backend_step_error(
+            &request,
+            &[
+                ("COCO_API_KEY", None),
+                (
+                    "COCO_CHATGPT_ACCESS_TOKEN",
+                    Some(OsStr::new("chatgpt-token")),
+                ),
+                ("CHATGPT_ACCESS_TOKEN", None),
+            ],
+        )
+        .await;
+
+        assert!(matches!(error, BackendError::Failed { .. }));
+        assert!(!error.to_string().is_empty());
     }
 
     fn secrets(entries: &[(&str, &str)]) -> BTreeMap<String, String> {

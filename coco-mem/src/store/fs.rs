@@ -46,17 +46,17 @@ const SHARED_SKILL_HISTORY_DIR_NAME: &str = "shared";
 const ORCHESTRATOR_SKILL_HISTORY_DIR_NAME: &str = "orchestrator";
 const RUNNER_SKILL_HISTORY_DIR_NAME: &str = "runner";
 const BUILTIN_COCO_ORCHESTRATOR_REVISION_ID: &str =
-    "79a81ed8e48dc4bac77d8d87ad5566d3b25c1aa1c6fd63cf89aec1efbc0ea6b9";
+    "1df4b89775b27c799b4f6b80b32b75c0cccd837dd574048484b38c13a5aff146";
 const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
-    "f57de170e92e784a37b2debbcf6854c73857235a4bf0e699a1cd67035b24cd92";
+    "872b8f90c21af69be61fe7d90085dbd4491ca6dedd0aeae08feeee65db3aae5a";
 const BUILTIN_RECOVERY_REVISION_ID: &str =
-    "ff6b2a8ade970bf8e92c5c3b3012f3d1ed183e1fa9edf8691254ea0f515ed8a2";
+    "91adf3f8b4e2fb11008b58db4d0c62c21b1b76cbe13b53a58e81fdeca1548b3b";
 const BUILTIN_COMPACT_REVISION_ID: &str =
-    "e9bd74455d7ce08be93a30c4cfcb3625f4daa6c1a76a8a5aae60ffe9990ab8e8";
+    "6a260a4377c10fe227c4957db8a63ebfb8b6b292a9e3862c21402a1c1b73d14e";
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
-    "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22";
+    "dcf88bdb5caaa2c8e4702cd5dfaa3e20919e08ce367ab7965e1f0d62710a60f4";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
     "1b3f4dcf9b56400edb41ba960e6743b2e938ee58800e5dbb7fc02b11a8d432a0";
 const BRANCHES_DIR_NAME: &str = "branches";
@@ -70,6 +70,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         from_revision_ids: &[
             // Before the orchestrator runner prompt included load_image.
             "cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438",
+            // Before the prompt command was renamed to job.
+            "79a81ed8e48dc4bac77d8d87ad5566d3b25c1aa1c6fd63cf89aec1efbc0ea6b9",
         ],
         target_revision_id: BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
     },
@@ -85,6 +87,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         from_revision_ids: &[
             // Cronjob default before stale prompt job state was ignored.
             "88035685e93fab0d2a1b297aaf3e34da83e7415415112cc2266f7135ed019b9e",
+            // Before the prompt command was renamed to job.
+            "f57de170e92e784a37b2debbcf6854c73857235a4bf0e699a1cd67035b24cd92",
         ],
         target_revision_id: BUILTIN_CRONJOB_REVISION_ID,
     },
@@ -92,8 +96,10 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         role: SessionRole::Orchestrator,
         name: "recovery",
         from_revision_ids: &[
-            // Recovery default before session handoff required an explicit prompt.
+            // Before the prompt command was renamed to job.
             "6bf4094ad2dd2f9932cfc8d13a0f4a6b7adc9fe293e1ea6bc9f995d9c880a3f8",
+            // Before session handoff required an explicit prompt.
+            "dfc5ea6b5ef4c46ffb4c0c7d1fde59f1ebfe782eeb673a0987353047b72c7e3b",
         ],
         target_revision_id: BUILTIN_RECOVERY_REVISION_ID,
     },
@@ -101,15 +107,20 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
         role: SessionRole::Orchestrator,
         name: "compact",
         from_revision_ids: &[
-            // Compact default before session handoff required an explicit prompt.
+            // Before the prompt command was renamed to job.
             "3abb36a6333215088666cb168fef445430d19e19e19232e9e703286e3be3b9c6",
+            // Before session handoff required an explicit prompt.
+            "d035938926144776ca4341aaa57eaa3ed28a76234222f1ff06fe06cf5d8ab9ff",
         ],
         target_revision_id: BUILTIN_COMPACT_REVISION_ID,
     },
     BuiltinSkillMigration {
         role: SessionRole::Runner,
         name: "coco-runner",
-        from_revision_ids: &[],
+        from_revision_ids: &[
+            // Before the prompt command was renamed to job.
+            "faa2096bbf0847b8e91247c56caf688e02442bdebde1d6dabae0b830ab373f22",
+        ],
         target_revision_id: BUILTIN_COCO_RUNNER_REVISION_ID,
     },
     BuiltinSkillMigration {
@@ -3620,7 +3631,7 @@ mod builtin_skill_migration_tests {
             name: "coco-orchestrator",
             from_revision_ids: &[
                 // Current default in this test before the synthetic target update.
-                "79a81ed8e48dc4bac77d8d87ad5566d3b25c1aa1c6fd63cf89aec1efbc0ea6b9",
+                "1df4b89775b27c799b4f6b80b32b75c0cccd837dd574048484b38c13a5aff146",
             ],
             target_revision_id: "new-target-revision",
         };

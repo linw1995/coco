@@ -9,8 +9,8 @@ pub use preset::{
     PresetCommand, PresetNameCommand, PresetRollbackCommand, PresetSetCommand, PresetSubcommand,
 };
 pub use prompt::{
-    PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
-    PromptSubcommand, PromptWorkerCommand,
+    PromptCommand, PromptListCommand, PromptRunCommand, PromptStatusCommand, PromptSubcommand,
+    PromptWorkerCommand,
 };
 pub use session::{SessionBranchCommand, SessionGraphCommand, SessionShowCommand};
 #[cfg(test)]
@@ -59,7 +59,8 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Preset(PresetCommand),
-    Prompt(PromptCommand),
+    #[command(alias = "prompt")]
+    Job(PromptCommand),
     Session(SessionCommand),
     Skill(SkillCommand),
     Daemon(DaemonCommand),

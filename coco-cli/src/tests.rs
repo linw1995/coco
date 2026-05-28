@@ -39,11 +39,11 @@ use crate::{
     },
     cli::{
         Command, DaemonSubcommand, PresetCommand, PresetSetCommand, PresetSubcommand,
-        PromptBranchStatusCommand, PromptCommand, PromptRunCommand, PromptStatusCommand,
-        PromptSubcommand, PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand,
-        SessionCommand, SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand,
-        SessionGraphCommand, SessionHandoffCommand, SessionMergeCommand, SessionPrCommand,
-        SessionRebaseCommand, SessionShowCommand, SessionSubcommand,
+        PromptCommand, PromptListCommand, PromptRunCommand, PromptStatusCommand, PromptSubcommand,
+        PromptWorkerCommand, SessionBranchCommand, SessionCloseCommand, SessionCommand,
+        SessionCreateCommand, SessionFeedbackCommand, SessionForkCommand, SessionGraphCommand,
+        SessionHandoffCommand, SessionMergeCommand, SessionPrCommand, SessionRebaseCommand,
+        SessionShowCommand, SessionSubcommand,
     },
     store::open_store,
 };
@@ -172,7 +172,7 @@ fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str
     Cli {
         daemon_socket: None,
         store_path,
-        command: Command::Prompt(PromptCommand {
+        command: Command::Job(PromptCommand {
             command: None,
             run: PromptRunCommand {
                 branch: branch.unwrap_or("main").to_owned(),
@@ -194,7 +194,7 @@ fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
     Cli {
         daemon_socket: None,
         store_path,
-        command: Command::Prompt(PromptCommand {
+        command: Command::Job(PromptCommand {
             command: Some(PromptSubcommand::Worker(PromptWorkerCommand {
                 job: job.to_owned(),
                 merge_parents: vec![],
@@ -219,7 +219,7 @@ fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
     Cli {
         daemon_socket: None,
         store_path,
-        command: Command::Prompt(PromptCommand {
+        command: Command::Job(PromptCommand {
             command: Some(PromptSubcommand::Status(PromptStatusCommand {
                 job: job.to_owned(),
                 json: true,
@@ -240,20 +240,12 @@ fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
     }
 }
 
-fn prompt_branch_status_cli(
-    store_path: std::path::PathBuf,
-    job: &str,
-    branch: Option<&str>,
-) -> Cli {
+fn prompt_list_cli(store_path: std::path::PathBuf) -> Cli {
     Cli {
         daemon_socket: None,
         store_path,
-        command: Command::Prompt(PromptCommand {
-            command: Some(PromptSubcommand::BranchStatus(PromptBranchStatusCommand {
-                job: job.to_owned(),
-                branch: branch.map(str::to_owned),
-                json: true,
-            })),
+        command: Command::Job(PromptCommand {
+            command: Some(PromptSubcommand::List(PromptListCommand { json: true })),
             run: PromptRunCommand {
                 branch: "main".to_owned(),
                 asynchronous: false,
@@ -994,7 +986,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
             "coco-cli",
             "--store-path",
             store_path.to_str().unwrap(),
-            "prompt",
+            "job",
             "--branch",
             "runner",
             "--role",
@@ -1115,7 +1107,7 @@ async fn prompt_persists_single_job_even_without_async() {
             "coco-cli",
             "--store-path",
             store_path.to_str().unwrap(),
-            "prompt",
+            "job",
             "status",
             "--job",
             &job_id,
@@ -1133,7 +1125,7 @@ async fn prompt_persists_single_job_even_without_async() {
     assert!(status_text_output.contains("prompt: hello"));
 
     let status_output = run_with_backend(
-        prompt_status_cli(store_path, &job_id),
+        prompt_status_cli(store_path.clone(), &job_id),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -1148,6 +1140,20 @@ async fn prompt_persists_single_job_even_without_async() {
     assert_eq!(value["base_node"]["merge_parents"], json!([]));
     assert!(value["base_node"]["node_id"].is_string());
     assert!(value["job"]["head"].is_string());
+
+    let list_output = run_with_backend(
+        prompt_list_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let list: Value = serde_json::from_str(&list_output).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["job_id"], job_id);
+    assert_eq!(list[0]["status"], "finished");
+    assert_eq!(list[0]["branch"], "main");
 }
 
 #[tokio::test]
@@ -1186,7 +1192,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
             "coco-cli",
             "--store-path",
             store_path.to_str().unwrap(),
-            "prompt",
+            "job",
             "--branch",
             "main",
             "--async",
@@ -1223,7 +1229,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
             "coco-cli",
             "--store-path",
             store_path.to_str().unwrap(),
-            "prompt",
+            "job",
             "status",
             "--json",
             "--job",
@@ -1246,12 +1252,46 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(pending_status["job"]["status"], "queued");
     assert_eq!(pending_status["job"]["branch"], "main");
 
+    store
+        .enqueue_message(
+            &prompt_job_queue_for_branch("missing"),
+            json!({
+                "job_id": "job-stale",
+                "branch": "missing",
+                "prompt": "stale",
+                "merge_parents": [],
+                "session_patch": null,
+            }),
+        )
+        .unwrap();
+
+    let pending_list_output = crate::app::runtime::run_with_services(
+        prompt_list_cli(store_path.clone()),
+        &mut Cursor::new(""),
+        RuntimeServices {
+            shared_store: &store,
+            llm: &llm,
+            provider_profiles: shared_test_provider_profiles(),
+            shared_engine: Some(&shared_engine),
+        },
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pending_list: Value = serde_json::from_str(&pending_list_output).unwrap();
+    assert_eq!(pending_list.as_array().unwrap().len(), 1);
+    assert_eq!(pending_list[0]["job_id"], text_job_id);
+    assert_eq!(pending_list[0]["status"], "queued");
+    assert_eq!(pending_list[0]["branch"], "main");
+    assert_eq!(pending_list[0]["work_branch"], "main");
+
     let json_output = crate::app::runtime::run_with_services(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
             store_path.to_str().unwrap(),
-            "prompt",
+            "job",
             "--branch",
             "json",
             "--async",
@@ -1321,7 +1361,7 @@ async fn forwarded_runtime_async_prompt_without_daemon_worker_drives_in_process(
             "coco-cli",
             "--store-path",
             store_path.to_str().unwrap(),
-            "prompt",
+            "job",
             "--branch",
             "main",
             "--async",
@@ -1411,42 +1451,6 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
     assert_eq!(value["base_node"]["merge_parents"], json!([]));
     assert!(value["base_node"]["node_id"].is_string());
     assert!(value["job"]["head"].is_string());
-
-    let branch_output = run_with_backend(
-        prompt_branch_status_cli(store_path.clone(), &job.job_id, Some("main")),
-        &mut Cursor::new(""),
-        FakeBackend::with_responses(&[]),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let branch_value: Value = serde_json::from_str(&branch_output).unwrap();
-    assert_eq!(branch_value["branch"], "main");
-    assert!(branch_value["head"].is_string());
-
-    let branch_text_output = run_with_backend(
-        Cli::try_parse_from([
-            "coco-cli",
-            "--store-path",
-            store_path.to_str().unwrap(),
-            "prompt",
-            "branch-status",
-            "--job",
-            &job.job_id,
-            "--branch",
-            "main",
-        ])
-        .unwrap(),
-        &mut Cursor::new(""),
-        FakeBackend::with_responses(&[]),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    assert!(serde_json::from_str::<serde_json::Value>(&branch_text_output).is_err());
-    assert!(branch_text_output.contains("status: Finished"));
-    assert!(branch_text_output.contains("branch: main"));
 }
 
 #[tokio::test]
@@ -1502,7 +1506,7 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
 }
 
 #[tokio::test]
-async fn prompt_branch_status_reports_running_task_progress() {
+async fn prompt_status_reports_running_task_progress() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
@@ -1546,7 +1550,7 @@ async fn prompt_branch_status_reports_running_task_progress() {
     started.notified().await;
 
     let output = run_with_backend(
-        prompt_branch_status_cli(store_path.clone(), &job_id, Some("main")),
+        prompt_status_cli(store_path.clone(), &job_id),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -1554,9 +1558,9 @@ async fn prompt_branch_status_reports_running_task_progress() {
     .unwrap()
     .unwrap();
     let value: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(value["status"], "running");
-    assert!(value["finished_at"].is_null());
-    assert_eq!(value["head"], json!(job.base));
+    assert_eq!(value["job"]["status"], "running");
+    assert!(value["job"]["finished_at"].is_null());
+    assert_eq!(value["job"]["head"], json!(job.base));
 
     release.notify_waiters();
     worker.await.unwrap();
@@ -5160,7 +5164,7 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
-            args: &["prompt".to_owned(), "hello".to_owned()],
+            args: &["job".to_owned(), "hello".to_owned()],
             stdin: &[],
             branch_env: Some("draft"),
             session_role: Some(SessionRole::Orchestrator),
@@ -5209,7 +5213,7 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
-            args: &["prompt".to_owned(), "hello".to_owned()],
+            args: &["job".to_owned(), "hello".to_owned()],
             stdin: &[],
             branch_env: Some("draft"),
             session_role: Some(SessionRole::Orchestrator),
@@ -5504,7 +5508,7 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
             args: &[
-                "prompt".to_owned(),
+                "job".to_owned(),
                 "--branch".to_owned(),
                 "main".to_owned(),
                 "hello".to_owned(),
@@ -5559,7 +5563,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
             args: &[
-                "prompt".to_owned(),
+                "job".to_owned(),
                 "worker".to_owned(),
                 "--job".to_owned(),
                 job.job_id.clone(),
@@ -5612,7 +5616,7 @@ async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
-            args: &["prompt".to_owned(), "--help".to_owned()],
+            args: &["job".to_owned(), "--help".to_owned()],
             stdin: &[],
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
@@ -5629,9 +5633,9 @@ async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
     .await;
 
     assert_eq!(response.exit_code, 0);
-    assert!(response.stdout.contains("Usage: coco prompt"));
+    assert!(response.stdout.contains("Usage: coco job"));
+    assert!(response.stdout.contains("list"));
     assert!(response.stdout.contains("status"));
-    assert!(response.stdout.contains("branch-status"));
     assert!(!response.stdout.contains("[TEXT]"));
     assert!(!response.stdout.contains("--async"));
     assert!(!response.stdout.contains("--store-path"));
@@ -5682,7 +5686,7 @@ async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
 
     let response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
-            args: &["prompt".to_owned(), "--help".to_owned()],
+            args: &["job".to_owned(), "--help".to_owned()],
             stdin: &[],
             branch_env: Some("main"),
             session_role: Some(SessionRole::Orchestrator),
@@ -5699,7 +5703,7 @@ async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
     .await;
 
     assert_eq!(response.exit_code, 0);
-    assert!(response.stdout.contains("Usage: coco prompt"));
+    assert!(response.stdout.contains("Usage: coco job"));
     assert!(!response.stdout.contains("--store-path"));
     assert!(response.stderr.is_empty());
 }
@@ -5712,7 +5716,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
 
     let prompt_response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
-            args: &["prompt".to_owned(), "hello".to_owned()],
+            args: &["job".to_owned(), "hello".to_owned()],
             stdin: &[],
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
@@ -5734,11 +5738,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
             .stderr
             .contains("unrecognized subcommand 'hello'")
     );
-    assert!(
-        prompt_response
-            .stderr
-            .contains("Usage: coco prompt <COMMAND>")
-    );
+    assert!(prompt_response.stderr.contains("Usage: coco job <COMMAND>"));
 
     let session_response = run_forwarded_with_services(
         ForwardedRuntimeInputs {
@@ -5909,7 +5909,7 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
     };
 
     let request = coco_llm::CocoCliRuntimeRequest {
-        args: vec!["prompt".to_owned(), "hello".to_owned()],
+        args: vec!["job".to_owned(), "hello".to_owned()],
         stdin: Vec::new(),
         branch_env: Some("main".to_owned()),
         session_role: Some(SessionRole::Orchestrator),
