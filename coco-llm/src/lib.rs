@@ -1580,25 +1580,24 @@ where
         text: &str,
         steps: &[BackendStep],
     ) -> Result<String> {
-        match resolved.trace_node_appender.as_ref() {
-            Some(trace_node_appender) => match head {
-                Some(head_id) => self.validate_terminal_text_with_trace_node_appender(
-                    &resolved.branch,
-                    execution_id,
-                    head_id,
-                    text,
-                ),
-                None => self.persist_backend_steps_with_trace_node_appender(
-                    &resolved.branch,
-                    retry_from_node_id,
-                    trace_node_appender,
-                    resolved.trace_node_store.as_deref(),
-                    steps,
-                ),
-            },
-            None => self
-                .append_backend_steps(retry_from_node_id.to_owned(), steps)
-                .context(MemorySnafu),
+        let trace_node_appender = resolved
+            .trace_node_appender
+            .as_ref()
+            .expect("completion runs should always persist through a trace node appender");
+        match head {
+            Some(head_id) => self.validate_terminal_text_with_trace_node_appender(
+                &resolved.branch,
+                execution_id,
+                head_id,
+                text,
+            ),
+            None => self.persist_backend_steps_with_trace_node_appender(
+                &resolved.branch,
+                retry_from_node_id,
+                trace_node_appender,
+                resolved.trace_node_store.as_deref(),
+                steps,
+            ),
         }
     }
 
@@ -1654,35 +1653,29 @@ where
         message: &str,
         steps: &[BackendStep],
     ) -> Result<String> {
-        match resolved.trace_node_appender.as_ref() {
-            Some(trace_node_appender) => {
-                head.map_or_else(
-                    || {
-                        self.persist_backend_steps_with_trace_node_appender(
-                            &resolved.branch,
-                            retry_from_node_id,
-                            trace_node_appender,
-                            resolved.trace_node_store.as_deref(),
-                            steps,
-                        )
-                    },
-                    Ok,
-                )?;
-                self.append_failure_with_trace_node_appender(
+        let trace_node_appender = resolved
+            .trace_node_appender
+            .as_ref()
+            .expect("completion runs should always persist through a trace node appender");
+        head.map_or_else(
+            || {
+                self.persist_backend_steps_with_trace_node_appender(
                     &resolved.branch,
                     retry_from_node_id,
                     trace_node_appender,
-                    execution_id,
-                    message,
+                    resolved.trace_node_store.as_deref(),
+                    steps,
                 )
-            }
-            None => self.append_failure_node(
-                self.append_backend_steps(retry_from_node_id.to_owned(), steps)
-                    .context(MemorySnafu)?,
-                execution_id,
-                message,
-            ),
-        }
+            },
+            Ok,
+        )?;
+        self.append_failure_with_trace_node_appender(
+            &resolved.branch,
+            retry_from_node_id,
+            trace_node_appender,
+            execution_id,
+            message,
+        )
     }
 
     fn finish_backend_error(
@@ -1726,20 +1719,17 @@ where
         execution_id: &str,
         source: &BackendError,
     ) -> Result<String> {
-        match resolved.trace_node_appender.as_ref() {
-            Some(trace_node_appender) => self.append_failure_with_trace_node_appender(
-                &resolved.branch,
-                retry_from_node_id,
-                trace_node_appender,
-                execution_id,
-                &source.to_string(),
-            ),
-            None => self.append_failure_node(
-                retry_from_node_id.to_owned(),
-                execution_id,
-                &source.to_string(),
-            ),
-        }
+        let trace_node_appender = resolved
+            .trace_node_appender
+            .as_ref()
+            .expect("completion runs should always persist through a trace node appender");
+        self.append_failure_with_trace_node_appender(
+            &resolved.branch,
+            retry_from_node_id,
+            trace_node_appender,
+            execution_id,
+            &source.to_string(),
+        )
     }
 }
 
@@ -1909,38 +1899,6 @@ where
             .context(MemorySnafu)
     }
 
-    fn append_backend_events(
-        &self,
-        parent_id: String,
-        execution: &ExecutionMetadata,
-        events: &[BackendEvent],
-    ) -> std::result::Result<String, StoreError> {
-        let mut parent_id = parent_id;
-        for (role, metadata, kind) in persisted_nodes_from_backend_events(events, execution) {
-            let kind = normalize_kind_for_primary_parent(kind, &parent_id);
-            parent_id = self.store.append(NewNode {
-                parent: parent_id,
-                role,
-                metadata,
-                kind,
-            })?;
-        }
-
-        Ok(parent_id)
-    }
-
-    fn append_backend_steps(
-        &self,
-        mut parent_id: String,
-        steps: &[BackendStep],
-    ) -> std::result::Result<String, StoreError> {
-        for step in steps {
-            parent_id = self.append_backend_events(parent_id, &step.execution, &step.events)?;
-        }
-
-        Ok(parent_id)
-    }
-
     fn persist_backend_steps_with_trace_node_appender(
         &self,
         branch: &str,
@@ -2022,24 +1980,6 @@ where
         .into_error(BackendError::failed(format!(
             "backend returned head {head:?} without terminal assistant text {text:?}"
         ))))
-    }
-
-    fn append_failure_node(
-        &self,
-        parent_id: String,
-        execution_id: &str,
-        message: &str,
-    ) -> Result<String> {
-        self.store
-            .append(NewNode {
-                parent: parent_id,
-                role: Role::System,
-                metadata: BackendMetadata::builder()
-                    .execution(&ExecutionMetadata::new(execution_id.to_owned()))
-                    .build(),
-                kind: Kind::Failure(message.to_owned()),
-            })
-            .context(MemorySnafu)
     }
 }
 
