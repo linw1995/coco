@@ -16,7 +16,6 @@ crap_args=(
 )
 crap_allow_args=(
   --allow "handle_connection"
-  --allow "RigBackend::step"
   --allow "main"
   --allow "Persistence::load"
   --allow "run_daemon_command"
