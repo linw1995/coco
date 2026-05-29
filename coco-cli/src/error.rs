@@ -63,14 +63,14 @@ pub enum Error {
     ParsePresetAdditionalParams { source: serde_json::Error },
 
     #[snafu(display(
-        "Session additional params must be a JSON object, got {kind}",
-        kind = JsonValueKind(value)
+        "Session additional params must be a JSON object, got {value}",
+        value = JsonValuePreview(value)
     ))]
     InvalidSessionAdditionalParamsType { value: serde_json::Value },
 
     #[snafu(display(
-        "Preset additional params must be a JSON object, got {kind}",
-        kind = JsonValueKind(value)
+        "Preset additional params must be a JSON object, got {value}",
+        value = JsonValuePreview(value)
     ))]
     InvalidPresetAdditionalParamsType { value: serde_json::Value },
 
@@ -157,24 +157,19 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-struct JsonValueKind<'a>(&'a serde_json::Value);
+struct JsonValuePreview<'a>(&'a serde_json::Value);
 
-impl JsonValueKind<'_> {
-    fn name(&self) -> &'static str {
-        match self.0 {
-            serde_json::Value::Null => "null",
-            serde_json::Value::Bool(_) => "boolean",
-            serde_json::Value::Number(_) => "number",
-            serde_json::Value::String(_) => "string",
-            serde_json::Value::Array(_) => "array",
-            serde_json::Value::Object(_) => "object",
-        }
+impl fmt::Display for JsonValuePreview<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_json_value_preview(f, self.0)
     }
 }
 
-impl fmt::Display for JsonValueKind<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+fn write_json_value_preview(f: &mut fmt::Formatter<'_>, value: &serde_json::Value) -> fmt::Result {
+    match value {
+        serde_json::Value::Array(_) => f.write_str("[..]"),
+        serde_json::Value::Object(_) => f.write_str("{..}"),
+        _ => write!(f, "{value}"),
     }
 }
 
@@ -182,29 +177,29 @@ impl fmt::Display for JsonValueKind<'_> {
 mod tests {
     use serde_json::json;
 
-    use super::{Error, JsonValueKind};
+    use super::{Error, JsonValuePreview};
 
     #[test]
-    fn json_value_kind_renders_all_json_kinds() {
+    fn json_value_preview_renders_scalars_and_elides_nested_values() {
         let cases = [
             (serde_json::Value::Null, "null"),
-            (json!(true), "boolean"),
-            (json!(1), "number"),
-            (json!("text"), "string"),
-            (json!([1]), "array"),
-            (json!({"key": "value"}), "object"),
+            (json!(true), "true"),
+            (json!(1), "1"),
+            (json!("text"), "\"text\""),
+            (json!([1, {"nested": true}]), "[..]"),
+            (json!({"nested": [1, 2]}), "{..}"),
         ];
 
         for (value, expected) in cases {
-            assert_eq!(JsonValueKind(&value).to_string(), expected);
+            assert_eq!(JsonValuePreview(&value).to_string(), expected);
         }
     }
 
     #[test]
-    fn additional_params_type_errors_report_json_kind() {
+    fn additional_params_type_errors_preview_json_value() {
         assert_eq!(
             Error::InvalidSessionAdditionalParamsType { value: json!([]) }.to_string(),
-            "Session additional params must be a JSON object, got array"
+            "Session additional params must be a JSON object, got [..]"
         );
         assert_eq!(
             Error::InvalidPresetAdditionalParamsType {
