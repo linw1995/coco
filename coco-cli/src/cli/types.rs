@@ -43,6 +43,17 @@ pub enum CliTool {
 }
 
 impl CliTool {
+    pub const ALL: [Self; 4] = [
+        Self::ExecCommand,
+        Self::WriteStdin,
+        Self::SearchSkill,
+        Self::LoadImage,
+    ];
+
+    pub fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "exec_command" => Some(Self::ExecCommand),

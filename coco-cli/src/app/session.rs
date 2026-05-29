@@ -541,7 +541,9 @@ pub fn resolve_session_config(
         .context(MissingProviderProfileModelSnafu {
             profile: provider_profile.clone(),
         })?;
-    let tools = if command.tools.is_empty() {
+    let tools = if command.enable_all_tools {
+        resolve_cli_tools(CliTool::all())
+    } else if command.tools.is_empty() {
         resolve_cli_tools(&resolve_env_tools()?)
     } else {
         resolve_cli_tools(&command.tools)
@@ -1900,6 +1902,8 @@ fn resolve_session_rebase(
     }
     if command.clear_tools {
         patch.tools = Some(vec![]);
+    } else if command.enable_all_tools {
+        patch.tools = Some(resolve_cli_tools(CliTool::all()));
     } else if !command.tools.is_empty() {
         patch.tools = Some(resolve_cli_tools(&command.tools));
     }

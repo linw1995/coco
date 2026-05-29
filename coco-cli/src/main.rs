@@ -417,7 +417,7 @@ fn should_forward_runtime_stdin(args: &[String]) -> bool {
             "--branch" | "--role" | "--tool" => {
                 index += 2;
             }
-            "--async" | "--json" | "--clear-tools" => {
+            "--async" | "--json" | "--clear-tools" | "--enable-all-tools" => {
                 index += 1;
             }
             value

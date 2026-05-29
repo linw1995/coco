@@ -55,6 +55,14 @@ fn prompt_job_queue_for_branch(branch: &str) -> String {
     format!("prompt.job/{branch}")
 }
 
+fn tool_names(tools: &[coco_mem::Tool]) -> Vec<&str> {
+    tools.iter().map(|tool| tool.name.as_str()).collect()
+}
+
+fn all_builtin_tool_names() -> Vec<&'static str> {
+    vec!["exec_command", "write_stdin", "search_skill", "load_image"]
+}
+
 #[test]
 fn cli_help_uses_coco_command_name() {
     let error = Cli::try_parse_from(["coco", "--help"]).unwrap_err();
@@ -181,6 +189,7 @@ fn prompt_cli(store_path: std::path::PathBuf, branch: Option<&str>, text: &[&str
                 text: text.iter().map(|part| (*part).to_owned()).collect(),
                 role: None,
                 tools: vec![],
+                enable_all_tools: false,
                 clear_tools: false,
                 enable_coco_shim: false,
                 disable_coco_shim: false,
@@ -206,6 +215,7 @@ fn prompt_worker_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
                 text: vec![],
                 role: None,
                 tools: vec![],
+                enable_all_tools: false,
                 clear_tools: false,
                 enable_coco_shim: false,
                 disable_coco_shim: false,
@@ -231,6 +241,7 @@ fn prompt_status_cli(store_path: std::path::PathBuf, job: &str) -> Cli {
                 text: vec![],
                 role: None,
                 tools: vec![],
+                enable_all_tools: false,
                 clear_tools: false,
                 enable_coco_shim: false,
                 disable_coco_shim: false,
@@ -253,6 +264,7 @@ fn prompt_list_cli(store_path: std::path::PathBuf) -> Cli {
                 text: vec![],
                 role: None,
                 tools: vec![],
+                enable_all_tools: false,
                 clear_tools: false,
                 enable_coco_shim: false,
                 disable_coco_shim: false,
@@ -277,6 +289,7 @@ fn session_create_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
                 max_tokens: Some(64),
                 additional_params: None,
                 tools: vec![],
+                enable_all_tools: false,
                 enable_coco_shim: false,
                 disable_coco_shim: false,
             }),
@@ -448,6 +461,7 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
                 max_tokens: Some(256),
                 clear_max_tokens: false,
                 tools: vec![],
+                enable_all_tools: false,
                 clear_tools: false,
                 json: true,
             }),
@@ -474,6 +488,7 @@ fn session_handoff_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> 
                     max_tokens: Some(256),
                     clear_max_tokens: false,
                     tools: vec![],
+                    enable_all_tools: false,
                     clear_tools: false,
                     json: true,
                 },
@@ -1024,6 +1039,62 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
     assert_eq!(patch.enable_coco_shim, Some(true));
     assert_eq!(ancestry[2].parent, original_main_head);
     assert_eq!(ancestry[3].id, original_main_head);
+}
+
+#[tokio::test]
+async fn prompt_enable_all_tools_appends_all_tool_patch() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+    run_with_backend(
+        session_fork_cli(store_path.clone(), "runner", Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "job",
+            "--branch",
+            "runner",
+            "--enable-all-tools",
+            "run date",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[("runner", &[Ok("runner done")])]),
+    )
+    .await
+    .unwrap();
+
+    let store = open_store(&store_path).unwrap();
+    let ancestry = store.ancestry("runner").unwrap();
+    let Kind::Anchor(anchor) = &ancestry[2].kind else {
+        panic!("expected session patch anchor");
+    };
+    let patch = anchor
+        .as_session_patch()
+        .expect("expected session patch anchor");
+    assert_eq!(
+        tool_names(patch.tools.as_ref().expect("expected tools patch")),
+        all_builtin_tool_names()
+    );
 }
 
 #[tokio::test]
@@ -1864,6 +1935,7 @@ async fn session_create_persists_additional_params() {
                                 .to_owned(),
                         ),
                         tools: vec![],
+                        enable_all_tools: false,
                         enable_coco_shim: false,
                         disable_coco_shim: false,
                     }),
@@ -4519,8 +4591,38 @@ fn preset_set_parses_name_and_patch_flags() {
     assert_eq!(command.model.as_deref(), Some("claude-sonnet-4-20250514"));
     assert_eq!(command.system_prompt, "You are precise.");
     assert_eq!(command.tools, vec![crate::cli::CliTool::ExecCommand]);
+    assert!(!command.enable_all_tools);
     assert!(command.enable_coco_shim);
     assert!(!command.json);
+}
+
+#[test]
+fn preset_set_parses_enable_all_tools_flag() {
+    let cli = Cli::try_parse_from([
+        "coco-cli",
+        "preset",
+        "set",
+        "--name",
+        "coding",
+        "--role",
+        "runner",
+        "--provider-profile",
+        "anthropic-main",
+        "--system-prompt",
+        "You are precise.",
+        "--enable-all-tools",
+    ])
+    .unwrap();
+
+    let Command::Preset(command) = cli.command else {
+        panic!("expected preset command");
+    };
+    let PresetSubcommand::Set(command) = command.command else {
+        panic!("expected preset set command");
+    };
+
+    assert!(command.enable_all_tools);
+    assert!(command.tools.is_empty());
 }
 
 #[test]
@@ -5075,6 +5177,7 @@ async fn session_rebase_applies_preset_patch() {
                     temperature: None,
                     max_tokens: Some(256),
                     tools: vec![],
+                    enable_all_tools: false,
                     additional_params: Some("{\"reasoning_effort\":\"medium\"}".to_owned()),
                     enable_coco_shim: true,
                     disable_coco_shim: false,
@@ -6141,6 +6244,7 @@ fn resolve_session_config_reads_coco_prefixed_env_only() {
                     max_tokens: Some(64),
                     additional_params: None,
                     tools: vec![],
+                    enable_all_tools: false,
                     enable_coco_shim: false,
                     disable_coco_shim: false,
                 })
@@ -6175,6 +6279,7 @@ fn resolve_session_config_accepts_chatgpt_provider() {
                     max_tokens: Some(64),
                     additional_params: None,
                     tools: vec![],
+                    enable_all_tools: false,
                     enable_coco_shim: false,
                     disable_coco_shim: false,
                 })
@@ -6212,6 +6317,7 @@ fn resolve_session_config_reads_tools_from_env() {
                     max_tokens: Some(64),
                     additional_params: None,
                     tools: vec![],
+                    enable_all_tools: false,
                     enable_coco_shim: true,
                     disable_coco_shim: false,
                 })
@@ -6228,6 +6334,40 @@ fn resolve_session_config_reads_tools_from_env() {
         vec!["exec_command", "write_stdin", "search_skill", "load_image"]
     );
     assert!(config.enable_coco_shim);
+}
+
+#[test]
+fn resolve_session_config_enable_all_tools_overrides_env_tools() {
+    let config = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(with_coco_env_async(
+            &[
+                ("COCO_PROVIDER", "openai"),
+                ("COCO_MODEL", "gpt-4.1-mini"),
+                ("COCO_TOOLS", "exec_command"),
+            ],
+            || async {
+                resolve_session_config(SessionCreateCommand {
+                    branch: "main".to_owned(),
+                    role: crate::cli::CliSessionRole::Orchestrator,
+                    provider_profile: None,
+                    system_prompt: "You are helpful.".to_owned(),
+                    prompt: "".to_owned(),
+                    temperature: Some(0.2),
+                    max_tokens: Some(64),
+                    additional_params: None,
+                    tools: vec![],
+                    enable_all_tools: true,
+                    enable_coco_shim: false,
+                    disable_coco_shim: false,
+                })
+                .unwrap()
+            },
+        ));
+
+    assert_eq!(tool_names(&config.tools), all_builtin_tool_names());
 }
 
 #[test]
@@ -6251,6 +6391,7 @@ fn resolve_session_config_parses_additional_params_json_object() {
                         "{\"service_tier\":\"priority\",\"reasoning_effort\":\"low\"}".to_owned(),
                     ),
                     tools: vec![],
+                    enable_all_tools: false,
                     enable_coco_shim: false,
                     disable_coco_shim: false,
                 })
@@ -6292,6 +6433,7 @@ fn resolve_session_config_persists_only_explicit_additional_params() {
             max_tokens: Some(64),
             additional_params: Some("{\"service_tier\":\"flex\"}".to_owned()),
             tools: vec![],
+            enable_all_tools: false,
             enable_coco_shim: false,
             disable_coco_shim: false,
         },
@@ -6324,6 +6466,7 @@ fn resolve_session_config_rejects_non_object_additional_params() {
                     max_tokens: Some(64),
                     additional_params: Some("[1,2,3]".to_owned()),
                     tools: vec![],
+                    enable_all_tools: false,
                     enable_coco_shim: false,
                     disable_coco_shim: false,
                 })
