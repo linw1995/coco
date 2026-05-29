@@ -65,3 +65,66 @@ pub enum Command {
     Skill(SkillCommand),
     Daemon(DaemonCommand),
 }
+
+impl Command {
+    // Clap exposes the matched subcommand name through ArgMatches and the
+    // generated Command metadata, but the typed enum value does not retain
+    // that token after parsing. Keep the mapping explicit and test it against
+    // clap's generated metadata.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Preset(_) => "preset",
+            Self::Job(_) => "job",
+            Self::Session(_) => "session",
+            Self::Skill(_) => "skill",
+            Self::Daemon(_) => "daemon",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn command_name_matches_clap_subcommand_names() {
+        let cases = [
+            (["coco", "preset", "list"].as_slice(), "preset"),
+            (
+                ["coco", "job", "status", "--job", "job-1"].as_slice(),
+                "job",
+            ),
+            (["coco", "session", "list"].as_slice(), "session"),
+            (["coco", "skill", "list"].as_slice(), "skill"),
+            (
+                ["coco", "daemon", "serve", "--no-console"].as_slice(),
+                "daemon",
+            ),
+        ];
+        let expected_names = cases
+            .iter()
+            .map(|(_, expected)| *expected)
+            .collect::<Vec<_>>();
+        let clap_command = Cli::command();
+        let clap_names = clap_command
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(clap_names, expected_names);
+
+        for (args, expected) in cases {
+            let cli = Cli::try_parse_from(args).expect("command name test args should parse");
+            assert_eq!(cli.command.name(), expected);
+        }
+    }
+
+    #[test]
+    fn prompt_alias_uses_job_command_name() {
+        let cli = Cli::try_parse_from(["coco", "prompt", "hello"])
+            .expect("prompt alias should parse as job");
+
+        assert_eq!(cli.command.name(), "job");
+    }
+}
