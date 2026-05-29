@@ -301,13 +301,21 @@ async fn forward_to_socket(
     args: &[String],
     forward_stdin: bool,
 ) -> Result<(), ForwardSocketError> {
-    let stdin = if forward_stdin {
-        read_forwarded_stdin()
-    } else {
-        Vec::new()
-    };
+    let request = build_forward_socket_request(args, collect_forward_socket_stdin(forward_stdin));
+    let response = exchange_forward_socket_request(socket_path, request).await?;
+    exit_with_forward_socket_response(response);
+}
 
-    let request = CocoCliRuntimeRequest {
+fn collect_forward_socket_stdin(forward_stdin: bool) -> Vec<u8> {
+    if !forward_stdin {
+        return Vec::new();
+    }
+
+    read_forwarded_stdin()
+}
+
+fn build_forward_socket_request(args: &[String], stdin: Vec<u8>) -> CocoCliRuntimeRequest {
+    CocoCliRuntimeRequest {
         args: args.to_vec(),
         stdin,
         branch_env: std::env::var(COCO_SESSION_BRANCH_ENV).ok(),
@@ -316,7 +324,19 @@ async fn forward_to_socket(
             .and_then(|value| SessionRole::parse(&value)),
         store_path_env: std::env::var(COCO_STORE_PATH_ENV).ok(),
         parent_tool_use_id_env: std::env::var(COCO_PARENT_TOOL_USE_ID_ENV).ok(),
-    };
+    }
+}
+
+fn exit_with_forward_socket_response(response: CocoCliRuntimeResponse) -> ! {
+    print!("{}", response.stdout);
+    eprint!("{}", response.stderr);
+    std::process::exit(response.exit_code);
+}
+
+async fn exchange_forward_socket_request(
+    socket_path: &str,
+    request: CocoCliRuntimeRequest,
+) -> Result<CocoCliRuntimeResponse, ForwardSocketError> {
     let payload =
         serde_json::to_vec(&request).expect("failed to serialize coco-cli daemon request");
 
@@ -341,11 +361,7 @@ async fn forward_to_socket(
         .read_to_end(&mut response)
         .await
         .map_err(ForwardSocketError::ReadResponse)?;
-    let response: CocoCliRuntimeResponse =
-        serde_json::from_slice(&response).map_err(ForwardSocketError::ParseResponse)?;
-    print!("{}", response.stdout);
-    eprint!("{}", response.stderr);
-    std::process::exit(response.exit_code);
+    serde_json::from_slice(&response).map_err(ForwardSocketError::ParseResponse)
 }
 
 fn read_forwarded_stdin() -> Vec<u8> {
@@ -426,12 +442,17 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::{
-        DaemonSocketSource, ForwardSocketError, ForwardingTarget, collect_forwarded_stdin,
-        forward_to_socket, is_daemon_serve_command, resolve_forwarding_target,
-        should_fallback_to_local, should_forward_runtime_stdin,
+        DaemonSocketSource, ForwardSocketError, ForwardingTarget, build_forward_socket_request,
+        collect_forward_socket_stdin, collect_forwarded_stdin, exchange_forward_socket_request,
+        is_daemon_serve_command, resolve_forwarding_target, should_fallback_to_local,
+        should_forward_runtime_stdin,
     };
     use coco_cli::{COCO_DAEMON_SOCKET_ENV, resolve_default_daemon_socket_path};
-    use coco_llm::COCO_CLI_RUNTIME_SOCKET_ENV;
+    use coco_llm::{
+        COCO_CLI_RUNTIME_SOCKET_ENV, COCO_PARENT_TOOL_USE_ID_ENV, COCO_SESSION_BRANCH_ENV,
+        COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
+    };
+    use coco_mem::SessionRole;
     use tempfile::tempdir;
 
     fn with_env_vars<T>(entries: &[(&str, Option<&str>)], run: impl FnOnce() -> T) -> T {
@@ -606,6 +627,36 @@ mod tests {
     }
 
     #[test]
+    fn forward_socket_stdin_is_empty_when_not_forwarded() {
+        assert!(collect_forward_socket_stdin(false).is_empty());
+    }
+
+    #[test]
+    fn forward_socket_request_captures_environment() {
+        let request = with_env_vars(
+            &[
+                (COCO_SESSION_BRANCH_ENV, Some("feature")),
+                (COCO_SESSION_ROLE_ENV, Some("runner")),
+                (COCO_STORE_PATH_ENV, Some("/tmp/store")),
+                (COCO_PARENT_TOOL_USE_ID_ENV, Some("tool-call")),
+            ],
+            || {
+                build_forward_socket_request(
+                    &["session".to_owned(), "list".to_owned()],
+                    b"input".to_vec(),
+                )
+            },
+        );
+
+        assert_eq!(request.args, ["session", "list"]);
+        assert_eq!(request.stdin, b"input");
+        assert_eq!(request.branch_env.as_deref(), Some("feature"));
+        assert_eq!(request.session_role, Some(SessionRole::Runner));
+        assert_eq!(request.store_path_env.as_deref(), Some("/tmp/store"));
+        assert_eq!(request.parent_tool_use_id_env.as_deref(), Some("tool-call"));
+    }
+
+    #[test]
     fn runtime_socket_stdin_is_only_forwarded_for_prompt_without_text() {
         assert!(!should_forward_runtime_stdin(&[
             "session".to_owned(),
@@ -684,8 +735,16 @@ mod tests {
     async fn forward_to_socket_reports_connect_context() {
         let dir = tempdir().unwrap();
         let socket_path = dir.path().join("missing.sock");
+        let request = CocoCliRuntimeRequest {
+            args: Vec::new(),
+            stdin: Vec::new(),
+            branch_env: None,
+            session_role: None,
+            store_path_env: None,
+            parent_tool_use_id_env: None,
+        };
 
-        let error = forward_to_socket(socket_path.to_str().unwrap(), &[], false)
+        let error = exchange_forward_socket_request(socket_path.to_str().unwrap(), request)
             .await
             .unwrap_err();
 
@@ -698,6 +757,54 @@ mod tests {
         };
         assert_eq!(reported_path, socket_path.to_string_lossy());
         assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn forward_to_socket_exchanges_runtime_request() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("coco.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let request = serde_json::from_slice::<CocoCliRuntimeRequest>(&request).unwrap();
+            assert_eq!(request.args, ["session", "list"]);
+            assert_eq!(request.stdin, b"input");
+            assert_eq!(request.branch_env.as_deref(), Some("feature"));
+            assert_eq!(request.session_role, Some(SessionRole::Runner));
+            assert_eq!(request.store_path_env.as_deref(), Some("/tmp/store"));
+            assert_eq!(request.parent_tool_use_id_env.as_deref(), Some("tool-call"));
+
+            let response = CocoCliRuntimeResponse {
+                exit_code: 7,
+                stdout: "output".to_owned(),
+                stderr: "warning".to_owned(),
+            };
+            let payload = serde_json::to_vec(&response).unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &payload)
+                .await
+                .unwrap();
+        });
+        let request = CocoCliRuntimeRequest {
+            args: vec!["session".to_owned(), "list".to_owned()],
+            stdin: b"input".to_vec(),
+            branch_env: Some("feature".to_owned()),
+            session_role: Some(SessionRole::Runner),
+            store_path_env: Some("/tmp/store".to_owned()),
+            parent_tool_use_id_env: Some("tool-call".to_owned()),
+        };
+
+        let response = exchange_forward_socket_request(socket_path.to_str().unwrap(), request)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.exit_code, 7);
+        assert_eq!(response.stdout, "output");
+        assert_eq!(response.stderr, "warning");
     }
 
     #[tokio::test]
@@ -716,14 +823,18 @@ mod tests {
                 .await
                 .unwrap();
         });
+        let request = CocoCliRuntimeRequest {
+            args: vec!["session".to_owned(), "list".to_owned()],
+            stdin: Vec::new(),
+            branch_env: None,
+            session_role: None,
+            store_path_env: None,
+            parent_tool_use_id_env: None,
+        };
 
-        let error = forward_to_socket(
-            socket_path.to_str().unwrap(),
-            &["session".to_owned(), "list".to_owned()],
-            false,
-        )
-        .await
-        .unwrap_err();
+        let error = exchange_forward_socket_request(socket_path.to_str().unwrap(), request)
+            .await
+            .unwrap_err();
         server.await.unwrap();
 
         assert!(matches!(error, ForwardSocketError::ParseResponse(_)));

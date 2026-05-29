@@ -14,7 +14,7 @@ portable-pty = "0.9.0"
 tokio.workspace = true
 
 # LLM backend.
-rig = { package = "rig-core", git = "https://github.com/0xPlaygrounds/rig", branch = "main", features = [
+rig = { package = "rig-core", git = "https://github.com/geraschenko/rig", branch = "anton/output_none", features = [
   "derive",
 ] }
 
