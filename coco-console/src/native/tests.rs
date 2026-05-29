@@ -1,6 +1,7 @@
 use coco_mem::{
     Anchor, BranchStore, Kind, MemoryStore, MergeParent, MessageQueueStore, NewNode, NodeStore,
-    Role, SessionAnchor, SessionRole, SessionState, Tool,
+    Role, SessionAnchor, SessionRole, SessionState, SkillInvocationAnchor, SkillInvocationMode,
+    Tool,
 };
 use serde_json::json;
 
@@ -197,6 +198,86 @@ fn graph_snapshot_contains_shadow_parent_edges() {
         source: shadow_parent,
         target: prompt,
         kind: GraphEdgeKind::ShadowParent,
+    }));
+}
+
+#[test]
+fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &session).unwrap();
+    let tool_use = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::tool_use(coco_mem::ToolUse {
+                id: "tool-1".to_owned(),
+                name: "skill".to_owned(),
+                input: json!({}),
+            }),
+        })
+        .unwrap();
+    store.set_branch_head("main", &session, &tool_use).unwrap();
+    let ignored_child = store
+        .append(NewNode {
+            parent: tool_use.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("not a skill subtree".to_owned()),
+        })
+        .unwrap();
+    let invocation = store
+        .append(NewNode {
+            parent: tool_use.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_invocation(
+                Vec::new(),
+                SkillInvocationAnchor {
+                    skill_name: "fast-rust".to_owned(),
+                    mode: SkillInvocationMode::InheritContext,
+                },
+            )),
+        })
+        .unwrap();
+    let invocation_child = store
+        .append(NewNode {
+            parent: invocation.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("delegated context".to_owned()),
+        })
+        .unwrap();
+
+    let snapshot = build_graph_snapshot(&store, 9).unwrap();
+    let node_ids = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(node_ids.contains(&tool_use.as_str()));
+    assert!(node_ids.contains(&invocation.as_str()));
+    assert!(node_ids.contains(&invocation_child.as_str()));
+    assert!(!node_ids.contains(&ignored_child.as_str()));
+    assert!(snapshot.edges.contains(&GraphEdge {
+        source: tool_use,
+        target: invocation.clone(),
+        kind: GraphEdgeKind::PrimaryParent,
+    }));
+    assert!(snapshot.edges.contains(&GraphEdge {
+        source: invocation,
+        target: invocation_child,
+        kind: GraphEdgeKind::PrimaryParent,
     }));
 }
 
