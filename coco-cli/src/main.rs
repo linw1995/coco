@@ -11,18 +11,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use coco_cli::{
-    COCO_DAEMON_SOCKET_ENV, Cli, init_tracing, resolve_default_daemon_socket_path, run,
+    COCO_DAEMON_SOCKET_ENV, Cli, LoggingGuard, init_tracing, resolve_default_daemon_socket_path,
+    run,
 };
 
 #[tokio::main]
 async fn main() {
-    let _logging_guard = match init_tracing() {
-        Ok(guard) => Some(guard),
-        Err(error) => {
-            eprintln!("{error}");
-            None
-        }
-    };
+    let _logging_guard = init_cli_tracing();
     let args = std::env::args().collect::<Vec<_>>();
     if shim_mode_is_disabled() {
         eprintln!(
@@ -34,57 +29,9 @@ async fn main() {
         );
         std::process::exit(1);
     }
-    match resolve_forwarding_target(&args[1..]) {
-        Ok(Some(ForwardingTarget::RuntimeSocket { socket_path })) => {
-            tracing::debug!(
-                socket_path = %socket_path,
-                arg_count = args.len().saturating_sub(1),
-                "forwarding cli command to runtime socket"
-            );
-            if let Err(error) = forward_to_socket(
-                &socket_path,
-                &args[1..],
-                should_forward_runtime_stdin(&args[1..]),
-            )
-            .await
-            {
-                tracing::warn!(socket_path = %socket_path, error = %error, "runtime socket forwarding failed");
-                eprintln!("{error}");
-                std::process::exit(1);
-            }
-        }
-        Ok(Some(ForwardingTarget::DaemonSocket {
-            socket_path,
-            forwarded_args,
-            source,
-        })) => {
-            tracing::debug!(
-                socket_path = %socket_path,
-                arg_count = forwarded_args.len(),
-                source = ?source,
-                "forwarding cli command to daemon socket"
-            );
-            if let Err(error) = forward_to_socket(&socket_path, &forwarded_args, true).await {
-                if should_fallback_to_local(source, &error) {
-                    tracing::info!(
-                        socket_path = %socket_path,
-                        error = %error,
-                        "daemon socket unavailable; falling back to local execution"
-                    );
-                    let _ = std::fs::remove_file(&socket_path);
-                } else {
-                    tracing::warn!(socket_path = %socket_path, error = %error, "daemon socket forwarding failed");
-                    eprintln!("{error}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to resolve cli forwarding target");
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
+    if let Err(error) = forward_cli_command(&args[1..]).await {
+        eprintln!("{error}");
+        std::process::exit(1);
     }
 
     let cli = Cli::parse();
@@ -96,6 +43,16 @@ async fn main() {
             tracing::warn!(error = %error, "cli command failed");
             eprintln!("{error}");
             std::process::exit(1);
+        }
+    }
+}
+
+fn init_cli_tracing() -> Option<LoggingGuard> {
+    match init_tracing() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("{error}");
+            None
         }
     }
 }
@@ -294,6 +251,66 @@ fn should_fallback_to_local(source: DaemonSocketSource, error: &ForwardSocketErr
             ErrorKind::ConnectionRefused | ErrorKind::NotFound
         )
     )
+}
+
+async fn forward_cli_command(args: &[String]) -> Result<(), String> {
+    match resolve_forwarding_target(args) {
+        Ok(Some(ForwardingTarget::RuntimeSocket { socket_path })) => {
+            forward_runtime_socket(&socket_path, args).await
+        }
+        Ok(Some(ForwardingTarget::DaemonSocket {
+            socket_path,
+            forwarded_args,
+            source,
+        })) => forward_daemon_socket(&socket_path, &forwarded_args, source).await,
+        Ok(None) => Ok(()),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to resolve cli forwarding target");
+            Err(error)
+        }
+    }
+}
+
+async fn forward_runtime_socket(socket_path: &str, args: &[String]) -> Result<(), String> {
+    tracing::debug!(
+        socket_path = %socket_path,
+        arg_count = args.len(),
+        "forwarding cli command to runtime socket"
+    );
+    forward_to_socket(socket_path, args, should_forward_runtime_stdin(args))
+        .await
+        .map_err(|error| {
+            tracing::warn!(socket_path = %socket_path, error = %error, "runtime socket forwarding failed");
+            error.to_string()
+        })
+}
+
+async fn forward_daemon_socket(
+    socket_path: &str,
+    forwarded_args: &[String],
+    source: DaemonSocketSource,
+) -> Result<(), String> {
+    tracing::debug!(
+        socket_path = %socket_path,
+        arg_count = forwarded_args.len(),
+        source = ?source,
+        "forwarding cli command to daemon socket"
+    );
+    let Err(error) = forward_to_socket(socket_path, forwarded_args, true).await else {
+        return Ok(());
+    };
+    if should_fallback_to_local(source, &error) {
+        tracing::info!(
+            socket_path = %socket_path,
+            error = %error,
+            "daemon socket unavailable; falling back to local execution"
+        );
+        let _ = std::fs::remove_file(socket_path);
+        return Ok(());
+    }
+
+    tracing::warn!(socket_path = %socket_path, error = %error, "daemon socket forwarding failed");
+    Err(error.to_string())
 }
 
 async fn forward_to_socket(
