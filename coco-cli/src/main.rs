@@ -318,8 +318,9 @@ async fn forward_to_socket(
     args: &[String],
     forward_stdin: bool,
 ) -> Result<(), ForwardSocketError> {
+    let mut stream = connect_forward_socket(socket_path).await?;
     let request = build_forward_socket_request(args, collect_forward_socket_stdin(forward_stdin));
-    let response = exchange_forward_socket_request(socket_path, request).await?;
+    let response = exchange_forward_socket_request_stream(&mut stream, request).await?;
     exit_with_forward_socket_response(response);
 }
 
@@ -350,20 +351,30 @@ fn exit_with_forward_socket_response(response: CocoCliRuntimeResponse) -> ! {
     std::process::exit(response.exit_code);
 }
 
+#[cfg(test)]
 async fn exchange_forward_socket_request(
     socket_path: &str,
     request: CocoCliRuntimeRequest,
 ) -> Result<CocoCliRuntimeResponse, ForwardSocketError> {
+    let mut stream = connect_forward_socket(socket_path).await?;
+    exchange_forward_socket_request_stream(&mut stream, request).await
+}
+
+async fn connect_forward_socket(socket_path: &str) -> Result<UnixStream, ForwardSocketError> {
+    UnixStream::connect(socket_path)
+        .await
+        .map_err(|source| ForwardSocketError::Connect {
+            socket_path: socket_path.to_owned(),
+            source,
+        })
+}
+
+async fn exchange_forward_socket_request_stream(
+    stream: &mut UnixStream,
+    request: CocoCliRuntimeRequest,
+) -> Result<CocoCliRuntimeResponse, ForwardSocketError> {
     let payload =
         serde_json::to_vec(&request).expect("failed to serialize coco-cli daemon request");
-
-    let mut stream =
-        UnixStream::connect(socket_path)
-            .await
-            .map_err(|source| ForwardSocketError::Connect {
-                socket_path: socket_path.to_owned(),
-                source,
-            })?;
     stream
         .write_all(&payload)
         .await
