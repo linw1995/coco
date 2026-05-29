@@ -318,8 +318,9 @@ async fn forward_to_socket(
     args: &[String],
     forward_stdin: bool,
 ) -> Result<(), ForwardSocketError> {
+    let mut stream = connect_forward_socket(socket_path).await?;
     let request = build_forward_socket_request(args, collect_forward_socket_stdin(forward_stdin));
-    let response = exchange_forward_socket_request(socket_path, request).await?;
+    let response = exchange_forward_socket_request_stream(&mut stream, request).await?;
     exit_with_forward_socket_response(response);
 }
 
@@ -350,20 +351,30 @@ fn exit_with_forward_socket_response(response: CocoCliRuntimeResponse) -> ! {
     std::process::exit(response.exit_code);
 }
 
+#[cfg(test)]
 async fn exchange_forward_socket_request(
     socket_path: &str,
     request: CocoCliRuntimeRequest,
 ) -> Result<CocoCliRuntimeResponse, ForwardSocketError> {
+    let mut stream = connect_forward_socket(socket_path).await?;
+    exchange_forward_socket_request_stream(&mut stream, request).await
+}
+
+async fn connect_forward_socket(socket_path: &str) -> Result<UnixStream, ForwardSocketError> {
+    UnixStream::connect(socket_path)
+        .await
+        .map_err(|source| ForwardSocketError::Connect {
+            socket_path: socket_path.to_owned(),
+            source,
+        })
+}
+
+async fn exchange_forward_socket_request_stream(
+    stream: &mut UnixStream,
+    request: CocoCliRuntimeRequest,
+) -> Result<CocoCliRuntimeResponse, ForwardSocketError> {
     let payload =
         serde_json::to_vec(&request).expect("failed to serialize coco-cli daemon request");
-
-    let mut stream =
-        UnixStream::connect(socket_path)
-            .await
-            .map_err(|source| ForwardSocketError::Connect {
-                socket_path: socket_path.to_owned(),
-                source,
-            })?;
     stream
         .write_all(&payload)
         .await
@@ -461,6 +472,7 @@ mod tests {
     use super::{
         DaemonSocketSource, ForwardSocketError, ForwardingTarget, build_forward_socket_request,
         collect_forward_socket_stdin, collect_forwarded_stdin, exchange_forward_socket_request,
+        forward_cli_command, forward_daemon_socket, forward_runtime_socket,
         is_daemon_serve_command, resolve_forwarding_target, should_fallback_to_local,
         should_forward_runtime_stdin,
     };
@@ -710,6 +722,77 @@ mod tests {
             &error
         ));
         assert!(!should_fallback_to_local(DaemonSocketSource::Env, &error));
+    }
+
+    #[test]
+    fn forward_cli_command_reports_resolution_errors() {
+        let error = with_env_vars(
+            &[
+                (COCO_CLI_RUNTIME_SOCKET_ENV, None),
+                (COCO_DAEMON_SOCKET_ENV, None),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        forward_cli_command(&["--daemon-socket".to_owned()])
+                            .await
+                            .unwrap_err()
+                    })
+            },
+        );
+
+        assert_eq!(error, "coco command \"--daemon-socket\" requires a value");
+    }
+
+    #[tokio::test]
+    async fn forward_runtime_socket_reports_connect_failure() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("missing-runtime.sock");
+
+        let error = forward_runtime_socket(
+            socket_path.to_str().unwrap(),
+            &["session".to_owned(), "list".to_owned()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("failed to connect to coco-cli daemon socket"));
+        assert!(error.contains("missing-runtime.sock"));
+    }
+
+    #[tokio::test]
+    async fn forward_daemon_socket_reports_explicit_connect_failure() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("missing-daemon.sock");
+
+        let error = forward_daemon_socket(
+            socket_path.to_str().unwrap(),
+            &["session".to_owned(), "list".to_owned()],
+            DaemonSocketSource::Flag,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("failed to connect to coco-cli daemon socket"));
+        assert!(error.contains("missing-daemon.sock"));
+    }
+
+    #[tokio::test]
+    async fn forward_daemon_socket_falls_back_for_implicit_connect_failure() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("missing-implicit.sock");
+
+        let result = forward_daemon_socket(
+            socket_path.to_str().unwrap(),
+            &["session".to_owned(), "list".to_owned()],
+            DaemonSocketSource::Implicit,
+        )
+        .await;
+
+        assert!(result.is_ok());
     }
 
     #[test]
