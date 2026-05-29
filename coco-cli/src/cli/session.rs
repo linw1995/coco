@@ -159,6 +159,12 @@ pub struct SessionRebaseCommand {
     #[arg(long)]
     pub clear_tools: bool,
 
+    #[arg(long, conflicts_with = "disable_coco_shim")]
+    pub enable_coco_shim: bool,
+
+    #[arg(long, conflicts_with = "enable_coco_shim")]
+    pub disable_coco_shim: bool,
+
     #[arg(long)]
     pub json: bool,
 }

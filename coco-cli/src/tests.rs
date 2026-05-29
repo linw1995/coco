@@ -463,6 +463,8 @@ fn session_rebase_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> C
                 tools: vec![],
                 enable_all_tools: false,
                 clear_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
                 json: true,
             }),
         }),
@@ -490,6 +492,8 @@ fn session_handoff_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> 
                     tools: vec![],
                     enable_all_tools: false,
                     clear_tools: false,
+                    enable_coco_shim: false,
+                    disable_coco_shim: false,
                     json: true,
                 },
                 prompt: "handoff prompt".to_owned(),
@@ -2224,6 +2228,7 @@ async fn session_rebase_updates_visible_session_config() {
             "--clear-temperature",
             "--max-tokens",
             "256",
+            "--enable-coco-shim",
         ])
         .unwrap(),
         &mut Cursor::new(""),
@@ -2251,7 +2256,7 @@ async fn session_rebase_updates_visible_session_config() {
     assert_ne!(rebase_value["head_id"], json!(original_head));
 
     let get_output = run_with_backend(
-        session_get_cli(store_path, Some("main")),
+        session_get_cli(store_path.clone(), Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
@@ -2269,6 +2274,37 @@ async fn session_rebase_updates_visible_session_config() {
     assert_eq!(value["anchor"]["temperature"], Value::Null);
     assert_eq!(value["anchor"]["max_tokens"], json!(256));
     assert_eq!(value["anchor"]["tools"], json!([]));
+    assert_eq!(value["anchor"]["enable_coco_shim"], true);
+
+    run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "rebase",
+            "--branch",
+            "main",
+            "--disable-coco-shim",
+            "--json",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let disabled_output = run_with_backend(
+        session_get_cli(store_path, Some("main")),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let disabled_value: Value = serde_json::from_str(&disabled_output).unwrap();
+    assert_eq!(disabled_value["anchor"]["enable_coco_shim"], false);
 }
 
 #[tokio::test]
