@@ -89,36 +89,44 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let socket_path = resolve_daemon_socket_path(match &command.command {
-        DaemonSubcommand::Serve(command) => command.socket.as_deref(),
-    })?;
+    let socket_path = resolve_daemon_command_socket_path(&command)?;
     let shared_engine = Arc::new(ConversationEngine::new(llm.clone()));
-    let console_config = match (&command.command, console_publisher.as_ref()) {
+    let console_config = daemon_console_config(&command, console_publisher.as_ref());
+
+    ensure_initial_session(shared_store, llm, provider_profiles).await?;
+    let server = start_daemon_server(
+        &socket_path,
+        shared_store,
+        llm,
+        provider_profiles,
+        &shared_engine,
+        DaemonServerOptions {
+            channel_configs,
+            console_config,
+            console_publisher,
+        },
+    )?;
+    spawn_resume_incomplete_jobs(shared_engine);
+    server.wait().await?;
+    Ok(None)
+}
+
+fn resolve_daemon_command_socket_path(command: &DaemonCommand) -> Result<PathBuf> {
+    resolve_daemon_socket_path(match &command.command {
+        DaemonSubcommand::Serve(command) => command.socket.as_deref(),
+    })
+}
+
+fn daemon_console_config(
+    command: &DaemonCommand,
+    console_publisher: Option<&ConsolePublisher>,
+) -> Option<ConsoleConfig> {
+    match (&command.command, console_publisher) {
         (DaemonSubcommand::Serve(command), Some(_)) if !command.no_console => Some(ConsoleConfig {
             addr: command.console_addr,
         }),
         _ => None,
-    };
-    let server = match command.command {
-        DaemonSubcommand::Serve(_) => {
-            ensure_initial_session(shared_store, llm, provider_profiles).await?;
-            start_daemon_server(
-                &socket_path,
-                shared_store,
-                llm,
-                provider_profiles,
-                &shared_engine,
-                DaemonServerOptions {
-                    channel_configs,
-                    console_config,
-                    console_publisher,
-                },
-            )?
-        }
-    };
-    spawn_resume_incomplete_jobs(shared_engine);
-    server.wait().await?;
-    Ok(None)
+    }
 }
 
 pub(crate) async fn ensure_initial_session<B, S>(
@@ -1969,6 +1977,9 @@ fn canonicalize_existing_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::ffi::OsString;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
@@ -1977,7 +1988,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
+    use clap::Parser;
     use coco_channel::{InboundMessage, MessageHandler, TelegramImageAttachment};
+    use coco_console::ConsolePublisher;
     use coco_core::ConversationEngine;
     use coco_llm::{
         BackendError, BackendTurn, CompletionBackend, CompletionMessage, LlmService, Provider,
@@ -1985,7 +1998,7 @@ mod tests {
     };
     use coco_mem::{
         BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MemoryStore, MessageQueueStore,
-        NewNode, NodeStore, Role, SessionAnchorPatch, SessionRole, SessionStore,
+        NewNode, NodeStore, ProviderProfile, Role, SessionAnchorPatch, SessionRole, SessionStore,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -1994,13 +2007,41 @@ mod tests {
         PROMPT_JOB_ID_BODY_LEN, PROMPT_JOB_ID_PREFIX, QueuedPromptRequest,
         prompt_job_queue_for_branch,
     };
+    use crate::cli::{Cli, Command, DaemonCommand};
 
     use super::{
-        LlmBackendFailureRecoveryRequested, PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker,
-        SYSTEM_EVENT_QUEUE, SystemEvent, SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, decode_telegram_message,
-        encode_telegram_message, resolve_daemon_socket_path,
+        ChannelConfigs, DEFAULT_SESSION_BRANCH, LlmBackendFailureRecoveryRequested,
+        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, ProviderProfiles, SYSTEM_EVENT_QUEUE,
+        SystemEvent, SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
+        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, daemon_console_config,
+        decode_telegram_message, encode_telegram_message, resolve_daemon_command_socket_path,
+        resolve_daemon_socket_path, run_daemon_command,
     };
+
+    fn daemon_command<I, T>(args: I) -> DaemonCommand
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let cli = Cli::parse_from(args);
+        let Command::Daemon(command) = cli.command else {
+            panic!("expected daemon command");
+        };
+        command
+    }
+
+    fn provider_profiles() -> ProviderProfiles {
+        ProviderProfiles::from_profiles(HashMap::from([(
+            "openai".to_owned(),
+            ProviderProfile {
+                provider: "openai".to_owned(),
+                secrets: BTreeMap::new(),
+                base_url: None,
+                default_model: Some("gpt-4.1-mini".to_owned()),
+                spec: Default::default(),
+            },
+        )]))
+    }
 
     fn assert_prompt_job_id_format(job_id: &str) {
         assert!(job_id.starts_with(PROMPT_JOB_ID_PREFIX));
@@ -2020,6 +2061,78 @@ mod tests {
         let path = resolve_daemon_socket_path(Some(Path::new("/tmp/coco.sock"))).unwrap();
 
         assert_eq!(path, PathBuf::from("/tmp/coco.sock"));
+    }
+
+    #[test]
+    fn resolve_daemon_command_socket_path_uses_serve_socket() {
+        let command = daemon_command(["coco", "daemon", "serve", "--socket", "/tmp/coco.sock"]);
+
+        let path = resolve_daemon_command_socket_path(&command).unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/coco.sock"));
+    }
+
+    #[test]
+    fn daemon_console_config_uses_serve_addr_when_enabled() {
+        let command = daemon_command(["coco", "daemon", "serve", "--console-addr", "127.0.0.1:0"]);
+        let publisher = ConsolePublisher::new();
+
+        let config = daemon_console_config(&command, Some(&publisher)).unwrap();
+
+        assert_eq!(config.addr, "127.0.0.1:0".parse().unwrap());
+    }
+
+    #[test]
+    fn daemon_console_config_returns_none_without_publisher() {
+        let command = daemon_command(["coco", "daemon", "serve"]);
+
+        let config = daemon_console_config(&command, None);
+
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn daemon_console_config_returns_none_when_disabled() {
+        let command = daemon_command(["coco", "daemon", "serve", "--no-console"]);
+        let publisher = ConsolePublisher::new();
+
+        let config = daemon_console_config(&command, Some(&publisher));
+
+        assert!(config.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_daemon_command_reports_socket_parent_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_parent = temp_dir.path().join("not-a-directory");
+        fs::write(&socket_parent, "").unwrap();
+        let socket_path = socket_parent.join("coco.sock");
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(
+            store.clone(),
+            BlockingOnceBackend::default(),
+        ));
+        let command = daemon_command([
+            OsString::from("coco"),
+            OsString::from("daemon"),
+            OsString::from("serve"),
+            OsString::from("--socket"),
+            socket_path.into_os_string(),
+        ]);
+
+        let error = run_daemon_command(
+            command,
+            &store,
+            &llm,
+            &provider_profiles(),
+            &ChannelConfigs::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, crate::Error::BindDaemonSocket { .. }));
+        assert!(store.get_session_state(DEFAULT_SESSION_BRANCH).is_ok());
     }
 
     #[test]
