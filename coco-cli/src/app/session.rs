@@ -1917,6 +1917,11 @@ fn resolve_session_rebase(
     } else if let Some(max_tokens) = command.max_tokens {
         patch.max_tokens = Some(Some(max_tokens));
     }
+    if command.enable_coco_shim {
+        patch.enable_coco_shim = Some(true);
+    } else if command.disable_coco_shim {
+        patch.enable_coco_shim = Some(false);
+    }
 
     Ok(ResolvedSessionRebase { patch })
 }
