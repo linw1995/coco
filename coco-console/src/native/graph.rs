@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use coco_mem::{
-    AnchorPayload, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, SessionState,
-    SessionStore,
+    Anchor, AnchorPayload, BranchStore, Kind, ManyOrOne, MergeParent, Node, NodeStore, PauseReason,
+    SessionAnchor, SessionState, SessionStore, ToolResult, ToolUse,
 };
 use serde::Serialize;
 use snafu::prelude::*;
@@ -315,32 +315,46 @@ fn summarize_node(node: &Node) -> String {
 
 fn render_node_content(node: &Node) -> String {
     match &node.kind {
-        Kind::Anchor(anchor) => match &anchor.payload {
-            AnchorPayload::Session(session) => {
-                if session.prompt.trim().is_empty() {
-                    session.system_prompt.clone()
-                } else {
-                    session.prompt.clone()
-                }
-            }
-            AnchorPayload::SessionPatch(patch) => {
-                serde_json::to_string(patch).expect("session patch should serialize")
-            }
-            AnchorPayload::Prompt(prompt) => prompt.prompt.clone(),
-            AnchorPayload::SkillInvocation(invocation) => invocation.skill_name.clone(),
-            AnchorPayload::SkillResult(skill_result) => skill_result.output.clone(),
-        },
-        Kind::ToolUse(tool_uses) => tool_uses
-            .first()
-            .map(|tool_use| tool_use.input.to_string())
-            .unwrap_or_default(),
-        Kind::ToolResult(tool_results) => tool_results
-            .first()
-            .map(|tool_result| tool_result.output.clone())
-            .unwrap_or_default(),
+        Kind::Anchor(anchor) => render_anchor_content(anchor),
+        Kind::ToolUse(tool_uses) => render_tool_use_content(tool_uses),
+        Kind::ToolResult(tool_results) => render_tool_result_content(tool_results),
         Kind::Text(text) => text.clone(),
         Kind::Failure(message) => message.clone(),
     }
+}
+
+fn render_anchor_content(anchor: &Anchor) -> String {
+    match &anchor.payload {
+        AnchorPayload::Session(session) => render_session_content(session),
+        AnchorPayload::SessionPatch(patch) => {
+            serde_json::to_string(patch).expect("session patch should serialize")
+        }
+        AnchorPayload::Prompt(prompt) => prompt.prompt.clone(),
+        AnchorPayload::SkillInvocation(invocation) => invocation.skill_name.clone(),
+        AnchorPayload::SkillResult(skill_result) => skill_result.output.clone(),
+    }
+}
+
+fn render_session_content(session: &SessionAnchor) -> String {
+    if session.prompt.trim().is_empty() {
+        session.system_prompt.clone()
+    } else {
+        session.prompt.clone()
+    }
+}
+
+fn render_tool_use_content(tool_uses: &ManyOrOne<ToolUse>) -> String {
+    tool_uses
+        .first()
+        .map(|tool_use| tool_use.input.to_string())
+        .unwrap_or_default()
+}
+
+fn render_tool_result_content(tool_results: &ManyOrOne<ToolResult>) -> String {
+    tool_results
+        .first()
+        .map(|tool_result| tool_result.output.clone())
+        .unwrap_or_default()
 }
 
 fn truncate_summary(raw: &str) -> String {
