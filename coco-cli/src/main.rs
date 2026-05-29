@@ -713,11 +713,25 @@ mod tests {
         assert!(!should_fallback_to_local(DaemonSocketSource::Env, &error));
     }
 
-    #[tokio::test]
-    async fn forward_cli_command_reports_resolution_errors() {
-        let error = forward_cli_command(&["--daemon-socket".to_owned()])
-            .await
-            .unwrap_err();
+    #[test]
+    fn forward_cli_command_reports_resolution_errors() {
+        let error = with_env_vars(
+            &[
+                (COCO_CLI_RUNTIME_SOCKET_ENV, None),
+                (COCO_DAEMON_SOCKET_ENV, None),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        forward_cli_command(&["--daemon-socket".to_owned()])
+                            .await
+                            .unwrap_err()
+                    })
+            },
+        );
 
         assert_eq!(error, "coco command \"--daemon-socket\" requires a value");
     }
