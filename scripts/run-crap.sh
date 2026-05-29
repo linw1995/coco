@@ -16,7 +16,6 @@ crap_args=(
 )
 crap_allow_args=(
   --allow "handle_connection"
-  --allow "collect_visible_skill_invocation_subtrees"
   --allow "render_node_content"
   --allow "abort_channel_task"
 )

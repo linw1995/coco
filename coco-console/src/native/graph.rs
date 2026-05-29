@@ -227,29 +227,52 @@ fn collect_visible_skill_invocation_subtrees(
     parent_id: &str,
     pending: &mut Vec<String>,
 ) -> Result<()> {
-    let mut descendants = store
-        .list_children(parent_id)
-        .context(StoreSnafu)?
-        .into_iter()
-        .filter_map(|child| match child.kind {
-            Kind::Anchor(anchor) if anchor.as_skill_invocation().is_some() => Some(child.id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut descendants = skill_invocation_children(store, parent_id)?;
     let mut visited = BTreeSet::new();
 
-    while let Some(node_id) = descendants.pop() {
-        if node_id.is_empty() || !visited.insert(node_id.clone()) {
-            continue;
-        }
-
+    while let Some(node_id) = next_unvisited_descendant(&mut descendants, &mut visited) {
         pending.push(node_id.clone());
-        for child in store.list_children(&node_id).context(StoreSnafu)? {
-            descendants.push(child.id);
-        }
+        descendants.extend(child_ids(store, &node_id)?);
     }
 
     Ok(())
+}
+
+fn skill_invocation_children(store: &impl NodeStore, parent_id: &str) -> Result<Vec<String>> {
+    Ok(store
+        .list_children(parent_id)
+        .context(StoreSnafu)?
+        .into_iter()
+        .filter_map(skill_invocation_child_id)
+        .collect())
+}
+
+fn skill_invocation_child_id(child: Node) -> Option<String> {
+    match child.kind {
+        Kind::Anchor(anchor) if anchor.as_skill_invocation().is_some() => Some(child.id),
+        _ => None,
+    }
+}
+
+fn next_unvisited_descendant(
+    descendants: &mut Vec<String>,
+    visited: &mut BTreeSet<String>,
+) -> Option<String> {
+    while let Some(node_id) = descendants.pop() {
+        if !node_id.is_empty() && visited.insert(node_id.clone()) {
+            return Some(node_id);
+        }
+    }
+    None
+}
+
+fn child_ids(store: &impl NodeStore, node_id: &str) -> Result<Vec<String>> {
+    Ok(store
+        .list_children(node_id)
+        .context(StoreSnafu)?
+        .into_iter()
+        .map(|child| child.id)
+        .collect())
 }
 
 fn resolve_visible_parent(visible_node_ids: &BTreeSet<String>, start_id: &str) -> Option<String> {
