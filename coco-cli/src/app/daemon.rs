@@ -1027,18 +1027,16 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .store
             .dequeue_message(&self.queue)
             .context(StoreSnafu)?
-            .is_none()
+            .is_some()
         {
-            return Ok(());
+            tracing::warn!(
+                message_id = %item.message_id,
+                queue = %self.queue,
+                job_id = %request.job_id,
+                branch = %request.branch,
+                "discarded queued prompt job request for missing branch"
+            );
         }
-
-        tracing::warn!(
-            message_id = %item.message_id,
-            queue = %self.queue,
-            job_id = %request.job_id,
-            branch = %request.branch,
-            "discarded queued prompt job request for missing branch"
-        );
         Ok(())
     }
 
@@ -1054,18 +1052,16 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             .store
             .dequeue_message(&self.queue)
             .context(StoreSnafu)?
-            .is_none()
+            .is_some()
         {
-            return Ok(());
+            tracing::warn!(
+                message_id = %item.message_id,
+                queue = %self.queue,
+                job_id = %request.job_id,
+                branch = %request.branch,
+                "discarded duplicate queued prompt job request"
+            );
         }
-
-        tracing::warn!(
-            message_id = %item.message_id,
-            queue = %self.queue,
-            job_id = %request.job_id,
-            branch = %request.branch,
-            "discarded duplicate queued prompt job request"
-        );
         Ok(())
     }
 
