@@ -924,48 +924,11 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         B: CompletionBackend + 'static,
         S: Store + Clone + Send + Sync + 'static,
     {
-        match self.store.get_branch_head(&request.branch) {
-            Ok(_) => {}
-            Err(coco_mem::StoreError::BranchNotFound { .. }) => {
-                if self
-                    .store
-                    .dequeue_message(&self.queue)
-                    .context(StoreSnafu)?
-                    .is_some()
-                {
-                    tracing::warn!(
-                        message_id = %item.message_id,
-                        queue = %self.queue,
-                        job_id = %request.job_id,
-                        branch = %request.branch,
-                        "discarded queued prompt job request for missing branch"
-                    );
-                }
-                return Ok(PromptQueueHeadResult::Continue);
-            }
-            Err(error) => return Err(error).context(StoreSnafu),
-        }
-
-        match self.store.get_job(&request.job_id) {
-            Ok(_) => {
-                if self
-                    .store
-                    .dequeue_message(&self.queue)
-                    .context(StoreSnafu)?
-                    .is_some()
-                {
-                    tracing::warn!(
-                        message_id = %item.message_id,
-                        queue = %self.queue,
-                        job_id = %request.job_id,
-                        branch = %request.branch,
-                        "discarded duplicate queued prompt job request"
-                    );
-                }
-                return Ok(PromptQueueHeadResult::Continue);
-            }
-            Err(coco_mem::StoreError::PromptJobNotFound { .. }) => {}
-            Err(error) => return Err(error).context(StoreSnafu),
+        if matches!(
+            self.ensure_prompt_request_queue_head_ready(item, request)?,
+            PromptQueueHeadReadiness::Continue
+        ) {
+            return Ok(PromptQueueHeadResult::Continue);
         }
 
         if let Some(active_job) = self
@@ -997,48 +960,11 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             }
         };
 
-        match self.store.get_branch_head(&request.branch) {
-            Ok(_) => {}
-            Err(coco_mem::StoreError::BranchNotFound { .. }) => {
-                if self
-                    .store
-                    .dequeue_message(&self.queue)
-                    .context(StoreSnafu)?
-                    .is_some()
-                {
-                    tracing::warn!(
-                        message_id = %item.message_id,
-                        queue = %self.queue,
-                        job_id = %request.job_id,
-                        branch = %request.branch,
-                        "discarded queued prompt job request for missing branch"
-                    );
-                }
-                return Ok(PromptQueueHeadResult::Continue);
-            }
-            Err(error) => return Err(error).context(StoreSnafu),
-        }
-
-        match self.store.get_job(&request.job_id) {
-            Ok(_) => {
-                if self
-                    .store
-                    .dequeue_message(&self.queue)
-                    .context(StoreSnafu)?
-                    .is_some()
-                {
-                    tracing::warn!(
-                        message_id = %item.message_id,
-                        queue = %self.queue,
-                        job_id = %request.job_id,
-                        branch = %request.branch,
-                        "discarded duplicate queued prompt job request"
-                    );
-                }
-                return Ok(PromptQueueHeadResult::Continue);
-            }
-            Err(coco_mem::StoreError::PromptJobNotFound { .. }) => {}
-            Err(error) => return Err(error).context(StoreSnafu),
+        if matches!(
+            self.ensure_prompt_request_queue_head_ready(&item, &request)?,
+            PromptQueueHeadReadiness::Continue
+        ) {
+            return Ok(PromptQueueHeadResult::Continue);
         }
 
         if let Some(active_job) = self
@@ -1060,6 +986,85 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         };
         self.handle_item(item).await;
         Ok(PromptQueueHeadResult::Continue)
+    }
+
+    fn ensure_prompt_request_queue_head_ready(
+        &self,
+        item: &MessageQueueItem,
+        request: &QueuedPromptRequest,
+    ) -> Result<PromptQueueHeadReadiness>
+    where
+        S: Store,
+    {
+        match self.store.get_branch_head(&request.branch) {
+            Ok(_) => {}
+            Err(coco_mem::StoreError::BranchNotFound { .. }) => {
+                self.discard_prompt_request_for_missing_branch(item, request)?;
+                return Ok(PromptQueueHeadReadiness::Continue);
+            }
+            Err(error) => return Err(error).context(StoreSnafu),
+        }
+
+        match self.store.get_job(&request.job_id) {
+            Ok(_) => {
+                self.discard_duplicate_prompt_request(item, request)?;
+                return Ok(PromptQueueHeadReadiness::Continue);
+            }
+            Err(coco_mem::StoreError::PromptJobNotFound { .. }) => {}
+            Err(error) => return Err(error).context(StoreSnafu),
+        }
+
+        Ok(PromptQueueHeadReadiness::Ready)
+    }
+
+    fn discard_prompt_request_for_missing_branch(
+        &self,
+        item: &MessageQueueItem,
+        request: &QueuedPromptRequest,
+    ) -> Result<()>
+    where
+        S: Store,
+    {
+        if self
+            .store
+            .dequeue_message(&self.queue)
+            .context(StoreSnafu)?
+            .is_some()
+        {
+            tracing::warn!(
+                message_id = %item.message_id,
+                queue = %self.queue,
+                job_id = %request.job_id,
+                branch = %request.branch,
+                "discarded queued prompt job request for missing branch"
+            );
+        }
+        Ok(())
+    }
+
+    fn discard_duplicate_prompt_request(
+        &self,
+        item: &MessageQueueItem,
+        request: &QueuedPromptRequest,
+    ) -> Result<()>
+    where
+        S: Store,
+    {
+        if self
+            .store
+            .dequeue_message(&self.queue)
+            .context(StoreSnafu)?
+            .is_some()
+        {
+            tracing::warn!(
+                message_id = %item.message_id,
+                queue = %self.queue,
+                job_id = %request.job_id,
+                branch = %request.branch,
+                "discarded duplicate queued prompt job request"
+            );
+        }
+        Ok(())
     }
 
     async fn wait_for_active_branch_job(
@@ -1466,6 +1471,12 @@ where
 enum PromptQueueHeadResult {
     Continue,
     Wait(Duration),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptQueueHeadReadiness {
+    Ready,
+    Continue,
 }
 
 fn is_prompt_job_queue(queue: &str) -> bool {
