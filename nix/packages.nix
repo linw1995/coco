@@ -18,6 +18,8 @@
     fileset = lib.fileset.unions [
       (craneLib.fileset.commonCargoSources root)
       (lib.fileset.maybeMissing (root + /coco-console/src/native/style.css))
+      (lib.fileset.maybeMissing (root + /coco-console/src/native/templates))
+      (lib.fileset.maybeMissing (root + /coco-console/templates))
       (lib.fileset.maybeMissing (root + /coco-mem/src/default_skills))
     ];
   };
