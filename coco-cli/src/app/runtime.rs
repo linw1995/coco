@@ -169,7 +169,7 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     tracing::debug!(
-        command = command_name(&cli.command),
+        command = cli.command.name(),
         store_path = %cli.store_path.display(),
         forwarded_runtime,
         "dispatching cli command"
@@ -291,16 +291,6 @@ where
         "forwarded runtime request completed"
     );
     response
-}
-
-fn command_name(command: &Command) -> &'static str {
-    match command {
-        Command::Preset(_) => "preset",
-        Command::Job(_) => "job",
-        Command::Session(_) => "session",
-        Command::Skill(_) => "skill",
-        Command::Daemon(_) => "daemon",
-    }
 }
 
 fn forwarded_runtime_scope(session_role: Option<SessionRole>) -> ForwardedRuntimeScope {
@@ -566,9 +556,7 @@ fn apply_forwarded_skill_parent(cli: &mut Cli, parent_tool_use_id: String, branc
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
-    use super::{ForwardedRuntimeScope, command_name, parse_forwarded_cli};
+    use super::{ForwardedRuntimeScope, parse_forwarded_cli};
     use crate::cli::{
         Cli, Command, PromptCommand, PromptListCommand, PromptRunCommand, PromptStatusCommand,
         PromptSubcommand, SessionBranchCommand, SessionCommand, SessionGraphCommand,
@@ -581,28 +569,6 @@ mod tests {
 
     fn parse_runner_cli(argv: &[&str]) -> Cli {
         parse_forwarded_cli(&strings(argv), ForwardedRuntimeScope::Runner).unwrap()
-    }
-
-    #[test]
-    fn command_name_covers_all_cli_variants() {
-        let cases = [
-            (["coco", "preset", "list"].as_slice(), "preset"),
-            (
-                ["coco", "job", "status", "--job", "job-1"].as_slice(),
-                "job",
-            ),
-            (["coco", "session", "list"].as_slice(), "session"),
-            (["coco", "skill", "list"].as_slice(), "skill"),
-            (
-                ["coco", "daemon", "serve", "--no-console"].as_slice(),
-                "daemon",
-            ),
-        ];
-
-        for (argv, expected) in cases {
-            let cli = Cli::try_parse_from(argv).unwrap();
-            assert_eq!(command_name(&cli.command), expected);
-        }
     }
 
     #[test]
