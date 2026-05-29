@@ -17,16 +17,11 @@ crap_args=(
 crap_allow_args=(
   --allow "handle_connection"
   --allow "main"
-  --allow "Persistence::load"
-  --allow "run_daemon_command"
   --allow "PromptJobMessageQueueWorker::handle_prompt_request_queue_head"
-  --allow "forward_to_socket"
   --allow "collect_visible_skill_invocation_subtrees"
-  --allow "run_session_command"
   --allow "render_node_content"
   --allow "command_name"
   --allow "abort_channel_task"
-  --allow "LlmService::run_locked"
 )
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
