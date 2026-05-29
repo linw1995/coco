@@ -160,7 +160,11 @@ fn resolve_preset(command: PresetSetCommand, store: &impl ProviderProfileLookup)
             .model
             .or(profile.default_model)
             .context(crate::error::MissingPresetModelSnafu)?,
-        tools: resolve_cli_tools(&command.tools),
+        tools: if command.enable_all_tools {
+            resolve_cli_tools(CliTool::all())
+        } else {
+            resolve_cli_tools(&command.tools)
+        },
         system_prompt: command.system_prompt,
         prompt: command.prompt,
         temperature: command.temperature,

@@ -116,6 +116,7 @@ impl RunnerCli {
                     text: vec![],
                     role: None,
                     tools: vec![],
+                    enable_all_tools: false,
                     clear_tools: false,
                     enable_coco_shim: false,
                     disable_coco_shim: false,

@@ -321,6 +321,7 @@ fn default_session_create_command() -> SessionCreateCommand {
             CliTool::SearchSkill,
             CliTool::LoadImage,
         ],
+        enable_all_tools: false,
         enable_coco_shim: true,
         disable_coco_shim: false,
     }
@@ -341,6 +342,7 @@ fn day_session_create_command() -> SessionCreateCommand {
             CliTool::WriteStdin,
             CliTool::SearchSkill,
         ],
+        enable_all_tools: false,
         enable_coco_shim: true,
         disable_coco_shim: false,
     }

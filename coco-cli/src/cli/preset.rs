@@ -46,6 +46,9 @@ pub struct PresetSetCommand {
     #[arg(long = "tool", value_enum)]
     pub tools: Vec<CliTool>,
 
+    #[arg(long, conflicts_with = "tools")]
+    pub enable_all_tools: bool,
+
     #[arg(long = "additional-params", value_name = "JSON")]
     pub additional_params: Option<String>,
 

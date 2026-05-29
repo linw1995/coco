@@ -33,6 +33,9 @@ pub struct PromptRunCommand {
     #[arg(long = "tool", value_enum, conflicts_with = "clear_tools")]
     pub tools: Vec<CliTool>,
 
+    #[arg(long, conflicts_with_all = ["tools", "clear_tools"])]
+    pub enable_all_tools: bool,
+
     #[arg(long)]
     pub clear_tools: bool,
 

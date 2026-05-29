@@ -320,6 +320,9 @@ fn resolve_prompt_session_patch(command: &PromptRunCommand) -> Option<SessionCon
     if command.clear_tools {
         patch.tools = Some(vec![]);
         has_patch = true;
+    } else if command.enable_all_tools {
+        patch.tools = Some(resolve_cli_tools(CliTool::all()));
+        has_patch = true;
     } else if !command.tools.is_empty() {
         patch.tools = Some(resolve_cli_tools(&command.tools));
         has_patch = true;
