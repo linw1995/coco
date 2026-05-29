@@ -1,12 +1,50 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
+use askama::Template as _;
 use coco_mem::{PauseReason, SessionState};
 use leptos::{html::HtmlElement, prelude::*};
 
 use crate::graph::{GraphNode, GraphSnapshot, css_token, node_target_id, shorten_id};
 use crate::layout::{
-    GraphLayout, GraphLayoutEdgeKind, layout_graph, line_points, routed_elbow_points,
+    GraphLayout, GraphLayoutEdge, GraphLayoutEdgeKind, GraphNodeOccurrence, layout_graph,
+    line_points, routed_elbow_points,
 };
+
+const GRAPH_MARKERS_SVG: &str = include_str!("templates/graph_markers.svg");
+
+#[derive(askama::Template)]
+#[template(path = "native/node.svg", escape = "html")]
+struct NodeTemplate<'a> {
+    href: &'a str,
+    node_target: &'a str,
+    node_id: &'a str,
+    class: &'a str,
+    x: i32,
+    y: i32,
+    title: &'a str,
+    label: &'a str,
+    kind: &'a str,
+}
+
+#[derive(askama::Template)]
+#[template(path = "native/primary_edge.svg", escape = "html")]
+struct PrimaryEdgeTemplate<'a> {
+    class: &'a str,
+    marker_end: Option<&'a str>,
+    x1: &'a str,
+    y1: &'a str,
+    x2: &'a str,
+    y2: &'a str,
+}
+
+#[derive(askama::Template)]
+#[template(path = "native/routed_edge.svg", escape = "html")]
+struct RoutedEdgeTemplate<'a> {
+    class: &'a str,
+    marker_end: Option<&'a str>,
+    points: &'a str,
+}
 
 pub fn render_index_page(snapshot: &GraphSnapshot) -> String {
     render_snapshot_document(snapshot, true)
@@ -88,201 +126,242 @@ fn render_content(snapshot: &GraphSnapshot) -> AnyView {
     }
 
     let layout = layout_graph(snapshot);
-    let graph = render_graph(snapshot, &layout);
-    let minimap = render_minimap(&layout);
+    let graph_shell = render_graph_shell(snapshot, &layout);
     let side = render_side(snapshot);
 
     view! {
         <section class="content">
-            <div class="graph-shell">
-                <div class="graph-wrap">{graph}</div>
-                {minimap}
-            </div>
+            <div class="graph-shell" inner_html=graph_shell></div>
             {side}
         </section>
     }
     .into_any()
 }
 
-fn render_graph(snapshot: &GraphSnapshot, layout: &GraphLayout) -> AnyView {
-    let edge_views = layout
-        .primary_edges
-        .iter()
-        .chain(layout.fork_edges.iter())
-        .chain(layout.merge_edges.iter())
-        .map(|edge| {
-            let marker = match edge.kind {
-                GraphLayoutEdgeKind::PrimaryParent => "url(#arrowhead)",
-                GraphLayoutEdgeKind::Fork => "url(#fork-arrowhead)",
-                GraphLayoutEdgeKind::MergeParent => "url(#merge-arrowhead)",
-            };
-            match edge.kind {
-                GraphLayoutEdgeKind::PrimaryParent => {
-                    let (x1, y1, x2, y2) =
-                        line_points(edge.source, edge.target, edge.target_port_offset);
-                    view! { <line class="edge primary-parent" marker-end=marker x1=x1 y1=y1 x2=x2 y2=y2 /> }
-                        .into_any()
-                }
-                GraphLayoutEdgeKind::Fork => {
-                    let points = routed_elbow_points(
-                        edge.source,
-                        edge.target,
-                        edge.route_slot,
-                        edge.target_port_offset,
-                    );
-                    view! { <polyline class="edge fork" marker-end=marker points=points /> }
-                        .into_any()
-                }
-                GraphLayoutEdgeKind::MergeParent => {
-                    let points = routed_elbow_points(
-                        edge.source,
-                        edge.target,
-                        edge.route_slot,
-                        edge.target_port_offset,
-                    );
-                    view! { <polyline class="edge merge-parent" marker-end=marker points=points /> }
-                        .into_any()
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    let lane_views = layout
-        .lanes
-        .iter()
-        .map(|lane| {
-            let y = lane.y.to_string();
-            let label = lane.label.clone();
-            view! { <text class="lane-label" x="64" y=y>{label}</text> }
-        })
-        .collect::<Vec<_>>();
+fn render_graph_shell(snapshot: &GraphSnapshot, layout: &GraphLayout) -> String {
+    let mut html = String::with_capacity(estimate_graph_shell_capacity(snapshot, layout));
+    html.push_str("<div class=\"graph-wrap\">");
+    render_graph_html(snapshot, layout, &mut html);
+    html.push_str("</div>");
+    render_minimap_html(layout, &mut html);
+    html
+}
+
+fn render_graph_html(snapshot: &GraphSnapshot, layout: &GraphLayout, html: &mut String) {
     let nodes_by_id = snapshot
         .nodes
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<HashMap<_, _>>();
-    let node_views = layout
-        .occurrences
-        .iter()
-        .filter_map(|occurrence| {
-            let node = nodes_by_id.get(occurrence.node_id.as_str())?;
-            let labels = if node.labels.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", node.labels.join(", "))
-            };
-            let class = if node.labels.is_empty() {
-                format!("node {}", css_token(&node.kind))
-            } else {
-                format!("node {} active", css_token(&node.kind))
-            };
-            let transform = format!("translate({} {})", occurrence.point.x, occurrence.point.y);
-            let title = format!("{}: {}", node.short_id, node.summary);
-            let label = format!("{}{}", node.short_id, labels);
-            let kind = node.kind.clone();
-            let node_target = occurrence.node_target.clone();
-            let href = format!("#{node_target}");
-            let node_id = node.id.clone();
-            Some(view! {
-                <a class="node-link" href=href data-node-target=node_target data-node-id=node_id>
-                    <g class=class transform=transform>
-                        <title>{title}</title>
-                        <circle class="core" r="26" />
-                        <text class="node-label" y="44">{label}</text>
-                        <text class="node-kind" y="58">{kind}</text>
-                    </g>
-                </a>
-            })
-        })
-        .collect::<Vec<_>>();
-    let view_box = format!("0 0 {} {}", layout.width, layout.height);
-    let width = layout.width.to_string();
-    let height = layout.height.to_string();
 
-    view! {
-        <svg class="graph" role="img" aria-label="CoCo node graph" viewBox=view_box width=width.clone() height=height.clone()>
-            <defs>
-                <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
-                    <path class="arrowhead" d="M 0 0 L 10 4 L 0 8 z" />
-                </marker>
-                <marker id="merge-arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
-                    <path class="merge-arrowhead" d="M 0 0 L 10 4 L 0 8 z" />
-                </marker>
-                <marker id="fork-arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
-                    <path class="fork-arrowhead" d="M 0 0 L 10 4 L 0 8 z" />
-                </marker>
-            </defs>
-            <rect class="graph-bg" width=width.clone() height=height.clone() />
-            {lane_views}
-            {edge_views}
-            {node_views}
-        </svg>
+    write!(
+        html,
+        "<svg class=\"graph\" role=\"img\" aria-label=\"CoCo node graph\" viewBox=\"0 0 {} {}\" width=\"{}\" height=\"{}\">",
+        layout.width, layout.height, layout.width, layout.height
+    )
+    .expect("writing to string should not fail");
+    html.push_str(GRAPH_MARKERS_SVG);
+    write!(
+        html,
+        "<rect class=\"graph-bg\" width=\"{}\" height=\"{}\"></rect>",
+        layout.width, layout.height
+    )
+    .expect("writing to string should not fail");
+
+    for lane in &layout.lanes {
+        write!(
+            html,
+            "<text class=\"lane-label\" x=\"64\" y=\"{}\">",
+            lane.y
+        )
+        .expect("writing to string should not fail");
+        push_escaped_text(html, &lane.label);
+        html.push_str("</text>");
     }
-    .into_any()
-}
-
-fn render_minimap(layout: &GraphLayout) -> AnyView {
-    let edge_views = layout
+    for edge in layout
         .primary_edges
         .iter()
         .chain(layout.fork_edges.iter())
         .chain(layout.merge_edges.iter())
-        .map(|edge| match edge.kind {
-            GraphLayoutEdgeKind::PrimaryParent => {
-                let (x1, y1, x2, y2) =
-                    line_points(edge.source, edge.target, edge.target_port_offset);
-                view! { <line class="minimap-edge primary-parent" x1=x1 y1=y1 x2=x2 y2=y2 /> }
-                    .into_any()
-            }
-            GraphLayoutEdgeKind::Fork => {
-                let points = routed_elbow_points(
-                    edge.source,
-                    edge.target,
-                    edge.route_slot,
-                    edge.target_port_offset,
-                );
-                view! { <polyline class="minimap-edge fork" points=points /> }.into_any()
-            }
-            GraphLayoutEdgeKind::MergeParent => {
-                let points = routed_elbow_points(
-                    edge.source,
-                    edge.target,
-                    edge.route_slot,
-                    edge.target_port_offset,
-                );
-                view! { <polyline class="minimap-edge merge-parent" points=points /> }.into_any()
-            }
-        })
-        .collect::<Vec<_>>();
-    let node_views = layout
-        .occurrences
-        .iter()
-        .map(|occurrence| {
-            let x = occurrence.point.x.to_string();
-            let y = occurrence.point.y.to_string();
-            view! { <circle class="minimap-node" cx=x cy=y r="26" /> }
-        })
-        .collect::<Vec<_>>();
-    let view_box = format!("0 0 {} {}", layout.width, layout.height);
-    let graph_width = layout.width.to_string();
-    let graph_height = layout.height.to_string();
-
-    view! {
-        <svg
-            class="minimap"
-            role="img"
-            aria-label="Graph minimap"
-            viewBox=view_box
-            preserveAspectRatio="xMidYMid meet"
-            data-graph-width=graph_width
-            data-graph-height=graph_height
-        >
-            <rect class="minimap-bg" x="0" y="0" width=layout.width.to_string() height=layout.height.to_string() />
-            {edge_views}
-            {node_views}
-            <rect class="minimap-viewport" x="0" y="0" width="0" height="0" rx="18" />
-        </svg>
+    {
+        render_graph_edge_html(edge, html);
     }
-    .into_any()
+    for occurrence in &layout.occurrences {
+        let Some(node) = nodes_by_id.get(occurrence.node_id.as_str()) else {
+            continue;
+        };
+        render_graph_node_html(node, occurrence, html);
+    }
+
+    html.push_str("</svg>");
+}
+
+fn render_graph_edge_html(edge: &GraphLayoutEdge, html: &mut String) {
+    match edge.kind {
+        GraphLayoutEdgeKind::PrimaryParent => render_primary_edge_path_html(
+            edge,
+            "edge primary-parent",
+            Some("url(#arrowhead)"),
+            html,
+        ),
+        GraphLayoutEdgeKind::Fork => {
+            render_routed_edge_path_html(edge, "edge fork", Some("url(#fork-arrowhead)"), html)
+        }
+        GraphLayoutEdgeKind::MergeParent => render_routed_edge_path_html(
+            edge,
+            "edge merge-parent",
+            Some("url(#merge-arrowhead)"),
+            html,
+        ),
+    }
+}
+
+fn render_graph_node_html(node: &GraphNode, occurrence: &GraphNodeOccurrence, html: &mut String) {
+    let class = if node.labels.is_empty() {
+        format!("node {}", css_token(&node.kind))
+    } else {
+        format!("node {} active", css_token(&node.kind))
+    };
+    let title = format!("{}: {}", node.short_id, node.summary);
+    let href = format!("#{}", occurrence.node_target);
+    let mut label = node.short_id.clone();
+    if !node.labels.is_empty() {
+        label.push(' ');
+        label.push_str(&node.labels.join(", "));
+    }
+
+    NodeTemplate {
+        href: &href,
+        node_target: &occurrence.node_target,
+        node_id: &node.id,
+        class: &class,
+        x: occurrence.point.x,
+        y: occurrence.point.y,
+        title: &title,
+        label: &label,
+        kind: &node.kind,
+    }
+    .render_into(html)
+    .expect("writing to string should not fail");
+}
+
+fn render_minimap_html(layout: &GraphLayout, html: &mut String) {
+    write!(
+        html,
+        "<svg class=\"minimap\" role=\"img\" aria-label=\"Graph minimap\" viewBox=\"0 0 {} {}\" preserveAspectRatio=\"xMidYMid meet\" data-graph-width=\"{}\" data-graph-height=\"{}\">",
+        layout.width, layout.height, layout.width, layout.height
+    )
+    .expect("writing to string should not fail");
+    write!(
+        html,
+        "<rect class=\"minimap-bg\" x=\"0\" y=\"0\" width=\"{}\" height=\"{}\"></rect>",
+        layout.width, layout.height
+    )
+    .expect("writing to string should not fail");
+    for edge in layout
+        .primary_edges
+        .iter()
+        .chain(layout.fork_edges.iter())
+        .chain(layout.merge_edges.iter())
+    {
+        render_minimap_edge_html(edge, html);
+    }
+    for occurrence in &layout.occurrences {
+        write!(
+            html,
+            "<circle class=\"minimap-node\" cx=\"{}\" cy=\"{}\" r=\"26\"></circle>",
+            occurrence.point.x, occurrence.point.y
+        )
+        .expect("writing to string should not fail");
+    }
+    html.push_str(
+        "<rect class=\"minimap-viewport\" x=\"0\" y=\"0\" width=\"0\" height=\"0\" rx=\"18\"></rect></svg>",
+    );
+}
+
+fn render_minimap_edge_html(edge: &GraphLayoutEdge, html: &mut String) {
+    match edge.kind {
+        GraphLayoutEdgeKind::PrimaryParent => {
+            render_primary_edge_path_html(edge, "minimap-edge primary-parent", None, html)
+        }
+        GraphLayoutEdgeKind::Fork => {
+            render_routed_edge_path_html(edge, "minimap-edge fork", None, html)
+        }
+        GraphLayoutEdgeKind::MergeParent => {
+            render_routed_edge_path_html(edge, "minimap-edge merge-parent", None, html)
+        }
+    }
+}
+
+fn render_primary_edge_path_html(
+    edge: &GraphLayoutEdge,
+    class: &str,
+    marker_end: Option<&str>,
+    html: &mut String,
+) {
+    let (x1, y1, x2, y2) = line_points(edge.source, edge.target, edge.target_port_offset);
+    PrimaryEdgeTemplate {
+        class,
+        marker_end,
+        x1: &x1,
+        y1: &y1,
+        x2: &x2,
+        y2: &y2,
+    }
+    .render_into(html)
+    .expect("writing to string should not fail");
+}
+
+fn render_routed_edge_path_html(
+    edge: &GraphLayoutEdge,
+    class: &str,
+    marker_end: Option<&str>,
+    html: &mut String,
+) {
+    let points = routed_elbow_points(
+        edge.source,
+        edge.target,
+        edge.route_slot,
+        edge.target_port_offset,
+    );
+    RoutedEdgeTemplate {
+        class,
+        marker_end,
+        points: &points,
+    }
+    .render_into(html)
+    .expect("writing to string should not fail");
+}
+
+fn estimate_graph_shell_capacity(snapshot: &GraphSnapshot, layout: &GraphLayout) -> usize {
+    let edge_count =
+        layout.primary_edges.len() + layout.fork_edges.len() + layout.merge_edges.len();
+    2_048
+        + layout.lanes.len() * 96
+        + edge_count * 160
+        + layout.occurrences.len() * 320
+        + snapshot
+            .nodes
+            .iter()
+            .map(|node| {
+                node.id.len()
+                    + node.short_id.len()
+                    + node.kind.len()
+                    + node.summary.len()
+                    + node.labels.iter().map(String::len).sum::<usize>()
+            })
+            .sum::<usize>()
+}
+
+fn push_escaped_text(html: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => html.push_str("&amp;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            _ => html.push(ch),
+        }
+    }
 }
 
 fn render_selection_style(snapshot: &GraphSnapshot) -> String {
