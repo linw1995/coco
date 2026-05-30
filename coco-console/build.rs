@@ -32,13 +32,6 @@ enum BuildError {
     #[snafu(display("{program} exited with {status}"))]
     CommandFailed { program: String, status: ExitStatus },
 
-    #[snafu(display("Failed to copy generated asset from {} to {}: {source}", from.display(), to.display()))]
-    CopyGeneratedAsset {
-        from: PathBuf,
-        to: PathBuf,
-        source: io::Error,
-    },
-
     #[snafu(display("Failed to read generated loader {}: {source}", path.display()))]
     ReadGeneratedLoader { path: PathBuf, source: io::Error },
 
@@ -76,7 +69,7 @@ fn run() -> BuildResult<()> {
     let pkg_dir = out_dir.join("pkg");
 
     if env::var_os(SKIP_ENV).is_some() {
-        prepare_skipped_package(&manifest_dir, &pkg_dir)?;
+        prepare_skipped_package(&pkg_dir)?;
         return Ok(());
     }
 
@@ -110,25 +103,11 @@ fn run() -> BuildResult<()> {
     Ok(())
 }
 
-fn prepare_skipped_package(manifest_dir: &Path, pkg_dir: &Path) -> BuildResult<()> {
+fn prepare_skipped_package(pkg_dir: &Path) -> BuildResult<()> {
     fs::create_dir_all(pkg_dir).context(CreatePackageDirectorySnafu {
         path: pkg_dir.to_path_buf(),
     })?;
-    let source_pkg_dir = manifest_dir.join("pkg");
-    if source_pkg_dir.join(JS_ASSET).is_file() && source_pkg_dir.join(WASM_ASSET).is_file() {
-        copy_generated_asset(&source_pkg_dir.join(JS_ASSET), &pkg_dir.join(JS_ASSET))?;
-        copy_generated_asset(&source_pkg_dir.join(WASM_ASSET), &pkg_dir.join(WASM_ASSET))?;
-    } else {
-        write_skipped_package_stubs(pkg_dir)?;
-    }
-    Ok(())
-}
-
-fn copy_generated_asset(from: &Path, to: &Path) -> BuildResult<()> {
-    fs::copy(from, to).context(CopyGeneratedAssetSnafu {
-        from: from.to_path_buf(),
-        to: to.to_path_buf(),
-    })?;
+    write_skipped_package_stubs(pkg_dir)?;
     Ok(())
 }
 
