@@ -1007,6 +1007,7 @@ mod tests {
         )
         .await;
 
+        // grcov: ignore-start
         if !COCO_CONSOLE_ASSETS_BUILT {
             assert!(js.starts_with(b"HTTP/1.1 404 Not Found"), "{js:?}");
             assert!(contains_bytes(
@@ -1023,6 +1024,7 @@ mod tests {
             assert!(contains_bytes(&wasm, b"console wasm asset not built"));
             return;
         }
+        // grcov: ignore-end
 
         assert!(js.starts_with(b"HTTP/1.1 200 OK"), "{js:?}");
         assert!(contains_bytes(
