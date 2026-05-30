@@ -15,7 +15,6 @@ crap_args=(
   --threshold "${crap_threshold}"
 )
 crap_allow_args=(
-  --allow "render_node_content"
 )
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then

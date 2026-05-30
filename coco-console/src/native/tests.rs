@@ -1,7 +1,7 @@
 use coco_mem::{
     Anchor, BranchStore, Kind, MemoryStore, MergeParent, MessageQueueStore, NewNode, NodeStore,
-    Role, SessionAnchor, SessionRole, SessionState, SkillInvocationAnchor, SkillInvocationMode,
-    Tool,
+    PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
+    SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor, Tool, ToolResult, ToolUse,
 };
 use serde_json::json;
 
@@ -279,6 +279,184 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
         target: invocation_child,
         kind: GraphEdgeKind::PrimaryParent,
     }));
+}
+
+fn snapshot_content<'a>(snapshot: &'a GraphSnapshot, node_id: &str) -> &'a str {
+    snapshot
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .map(|node| node.content.as_str())
+        .expect("node should be visible")
+}
+
+#[test]
+fn graph_snapshot_renders_content_for_visible_node_kinds() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let mut empty_prompt_session_anchor = session_anchor();
+    empty_prompt_session_anchor.prompt.clear();
+    empty_prompt_session_anchor.system_prompt = "system fallback".to_owned();
+    let empty_prompt_session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), empty_prompt_session_anchor)),
+        })
+        .unwrap();
+    store.fork("main", &empty_prompt_session).unwrap();
+
+    let mut prompted_session_anchor = session_anchor();
+    prompted_session_anchor.prompt = "session prompt".to_owned();
+    let prompted_session = store
+        .append(NewNode {
+            parent: empty_prompt_session.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), prompted_session_anchor)),
+        })
+        .unwrap();
+
+    let session_patch = SessionAnchorPatch {
+        model: Some("gpt-5-mini".to_owned()),
+        ..SessionAnchorPatch::default()
+    };
+    let patch = store
+        .append(NewNode {
+            parent: prompted_session.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session_patch(Vec::new(), session_patch.clone())),
+        })
+        .unwrap();
+    let prompt = store
+        .append(NewNode {
+            parent: patch.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "prompt anchor".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    let invocation = store
+        .append(NewNode {
+            parent: prompt.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_invocation(
+                Vec::new(),
+                SkillInvocationAnchor {
+                    skill_name: "rust-skill".to_owned(),
+                    mode: SkillInvocationMode::InheritContext,
+                },
+            )),
+        })
+        .unwrap();
+    let skill_result = store
+        .append(NewNode {
+            parent: invocation.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_result(
+                Vec::new(),
+                SkillResultAnchor {
+                    skill_name: "rust-skill".to_owned(),
+                    output: "skill output".to_owned(),
+                },
+            )),
+        })
+        .unwrap();
+    let tool_use = store
+        .append(NewNode {
+            parent: skill_result.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::tool_use(ToolUse {
+                id: "tool-1".to_owned(),
+                name: "shell".to_owned(),
+                input: json!({"cmd": "cargo test"}),
+            }),
+        })
+        .unwrap();
+    let empty_tool_use = store
+        .append(NewNode {
+            parent: tool_use.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::tool_use_items(Vec::new()),
+        })
+        .unwrap();
+    let tool_result = store
+        .append(NewNode {
+            parent: empty_tool_use.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::tool_result(ToolResult {
+                id: "tool-1".to_owned(),
+                output: "tool output".to_owned(),
+            }),
+        })
+        .unwrap();
+    let empty_tool_result = store
+        .append(NewNode {
+            parent: tool_result.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::tool_result_items(Vec::new()),
+        })
+        .unwrap();
+    let text = store
+        .append(NewNode {
+            parent: empty_tool_result.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("plain text".to_owned()),
+        })
+        .unwrap();
+    let failure = store
+        .append(NewNode {
+            parent: text.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Failure("failure message".to_owned()),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &empty_prompt_session, &failure)
+        .unwrap();
+
+    let snapshot = build_graph_snapshot(&store, 10).unwrap();
+
+    assert_eq!(
+        snapshot_content(&snapshot, &empty_prompt_session),
+        "system fallback"
+    );
+    assert_eq!(
+        snapshot_content(&snapshot, &prompted_session),
+        "session prompt"
+    );
+    assert_eq!(
+        snapshot_content(&snapshot, &patch),
+        serde_json::to_string(&session_patch).unwrap()
+    );
+    assert_eq!(snapshot_content(&snapshot, &prompt), "prompt anchor");
+    assert_eq!(snapshot_content(&snapshot, &invocation), "rust-skill");
+    assert_eq!(snapshot_content(&snapshot, &skill_result), "skill output");
+    assert_eq!(
+        snapshot_content(&snapshot, &tool_use),
+        json!({"cmd": "cargo test"}).to_string()
+    );
+    assert_eq!(snapshot_content(&snapshot, &empty_tool_use), "");
+    assert_eq!(snapshot_content(&snapshot, &tool_result), "tool output");
+    assert_eq!(snapshot_content(&snapshot, &empty_tool_result), "");
+    assert_eq!(snapshot_content(&snapshot, &text), "plain text");
+    assert_eq!(snapshot_content(&snapshot, &failure), "failure message");
 }
 
 #[test]
