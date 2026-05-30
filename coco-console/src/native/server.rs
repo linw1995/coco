@@ -131,10 +131,7 @@ where
 {
     let access_log = AccessLog::new(peer_addr, &request);
     let result = handle_request_inner(&mut stream, request, state).await;
-    match &result {
-        Ok(status) => access_log.log(*status),
-        Err(error) => access_log.log_error(error),
-    }
+    access_log.log_result(&result);
     result.map(|_| ())
 }
 
@@ -251,6 +248,13 @@ impl AccessLog {
             duration_ms = self.started_at.elapsed().as_millis(),
             "console access"
         );
+    }
+
+    fn log_result(&self, result: &io::Result<u16>) {
+        match result {
+            Ok(status) => self.log(*status),
+            Err(error) => self.log_error(error),
+        }
     }
 
     fn log_error(&self, error: &io::Error) {
@@ -690,6 +694,29 @@ mod tests {
             store: MemoryStore::new(),
             publisher: crate::ConsolePublisher::new(),
         }
+    }
+
+    #[test]
+    fn access_log_records_success_and_error_results() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::dispatcher::with_default(&tracing::Dispatch::new(subscriber), || {
+            let request = super::HttpRequest {
+                method: "GET".to_owned(),
+                path: "/fragment".to_owned(),
+                query: Default::default(),
+                body: Default::default(),
+            };
+            let access_log = super::AccessLog::new("127.0.0.1:12345".parse().unwrap(), &request);
+
+            access_log.log_result(&Ok(200));
+            access_log.log_result(&Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "client closed",
+            )));
+        });
     }
 
     async fn read_request_from(bytes: &[u8]) -> Option<super::HttpRequest> {

@@ -51,3 +51,7 @@ web-sys = { version = "=0.3.94", features = [
 [build-dependencies]
 # Build script error handling.
 snafu.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Native server tests.
+tracing-subscriber.workspace = true
