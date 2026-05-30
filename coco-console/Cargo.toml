@@ -19,6 +19,7 @@ coco-mem = { path = "../coco-mem" }
 askama = "0.16.0"
 leptos.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 # Error handling.
 snafu.workspace = true
