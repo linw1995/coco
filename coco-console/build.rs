@@ -1,3 +1,4 @@
+// grcov: ignore-start
 use std::env;
 use std::fs;
 use std::io;
@@ -161,3 +162,4 @@ fn append_auto_start(path: &Path) -> BuildResult<()> {
     }
     Ok(())
 }
+// grcov: ignore-end
