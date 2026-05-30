@@ -696,7 +696,7 @@ fn graph_viewport_response_uses_stable_keys_for_patchable_items() {
             .any(|node| node.key == "node:merged:340:90")
     );
     assert!(response.edges.iter().any(|edge| {
-        edge.key == "edge:primary_parent:base:merged"
+        edge.key == "edge:primary_parent:base:120:90:merged:340:90"
             && edge.source_id == "base"
             && edge.target_id == "merged"
     }));
@@ -734,6 +734,41 @@ fn graph_viewport_uses_unique_keys_for_duplicate_node_occurrences() {
         merged_keys
             .iter()
             .all(|key| key.starts_with("node:merged:"))
+    );
+}
+
+#[test]
+fn graph_viewport_uses_unique_keys_for_duplicate_edge_occurrences() {
+    let mut snapshot = two_node_snapshot(31);
+    snapshot.branches.push(GraphBranch {
+        name: "side".to_owned(),
+        head_id: "merged".to_owned(),
+        state: SessionState::Active,
+    });
+
+    let response = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: 0,
+            y: 0,
+            width: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH + 80,
+            height: GRAPH_TOP_Y + GRAPH_LANE_HEIGHT + 80,
+            overscan: 0,
+        },
+    );
+    let edge_keys = response
+        .edges
+        .iter()
+        .filter(|edge| edge.source_id == "base" && edge.target_id == "merged")
+        .map(|edge| edge.key.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(edge_keys.len(), 2);
+    assert_ne!(edge_keys[0], edge_keys[1]);
+    assert!(
+        edge_keys
+            .iter()
+            .all(|key| key.contains(":base:") && key.contains(":merged:"))
     );
 }
 
@@ -802,7 +837,7 @@ fn graph_viewport_overscan_preloads_nodes_and_edges() {
         response
             .edges
             .iter()
-            .any(|edge| edge.key == "edge:primary_parent:base:merged"),
+            .any(|edge| edge.key == "edge:primary_parent:base:120:90:merged:340:90"),
         "edges can render from the expanded viewport even when an endpoint is outside the strict view"
     );
 }
@@ -956,7 +991,7 @@ fn graph_viewport_includes_edges_crossing_visible_bounds() {
         response
             .edges
             .iter()
-            .any(|edge| edge.key == "edge:primary_parent:base:merged")
+            .any(|edge| edge.key == "edge:primary_parent:base:120:90:merged:340:90")
     );
 }
 
@@ -1034,7 +1069,8 @@ fn graph_viewport_diff_keeps_edges_when_only_an_endpoint_leaves_viewport() {
     );
     assert!(
         !diff.removed.iter().any(|item| {
-            item.kind == GraphViewportItemKind::Edge && item.key == "edge:primary_parent:n0:n1"
+            item.kind == GraphViewportItemKind::Edge
+                && item.key == "edge:primary_parent:n0:120:90:n1:340:90"
         }),
         "an edge can remain visible while only one endpoint node is in the viewport payload"
     );
@@ -1082,11 +1118,12 @@ fn graph_viewport_diff_sliding_window_replaces_incident_edges() {
         diff.added
             .edges
             .iter()
-            .any(|edge| edge.key == "edge:primary_parent:n1:n2")
+            .any(|edge| edge.key == "edge:primary_parent:n1:340:90:n2:560:90")
     );
     assert!(
         !diff.removed.iter().any(|item| {
-            item.kind == GraphViewportItemKind::Edge && item.key == "edge:primary_parent:n0:n1"
+            item.kind == GraphViewportItemKind::Edge
+                && item.key == "edge:primary_parent:n0:120:90:n1:340:90"
         }),
         "sliding the viewport should keep a crossing edge until it leaves the expanded render area"
     );
@@ -1153,7 +1190,7 @@ fn graph_viewport_diff_known_items_reports_added_updated_and_removed() {
         diff.added
             .edges
             .iter()
-            .any(|edge| edge.key == "edge:primary_parent:base:merged")
+            .any(|edge| edge.key == "edge:primary_parent:base:120:90:merged:340:90")
     );
     assert!(
         diff.updated
@@ -1213,7 +1250,7 @@ fn graph_viewport_diff_known_empty_set_reports_current_items_as_added() {
         diff.added
             .edges
             .iter()
-            .any(|edge| edge.key == "edge:primary_parent:base:merged")
+            .any(|edge| edge.key == "edge:primary_parent:base:120:90:merged:340:90")
     );
     assert!(diff.removed.is_empty());
 }
@@ -1237,7 +1274,7 @@ fn graph_viewport_diff_known_items_updates_edges_without_visible_endpoint_nodes(
             known: Some(GraphViewportKnownItems {
                 lanes: Vec::new(),
                 nodes: vec!["node:n0:120:90".to_owned()],
-                edges: vec!["edge:primary_parent:n0:n1".to_owned()],
+                edges: vec!["edge:primary_parent:n0:120:90:n1:340:90".to_owned()],
             }),
         },
     );
@@ -1254,10 +1291,11 @@ fn graph_viewport_diff_known_items_updates_edges_without_visible_endpoint_nodes(
         diff.updated
             .edges
             .iter()
-            .any(|edge| edge.key == "edge:primary_parent:n0:n1")
+            .any(|edge| edge.key == "edge:primary_parent:n0:120:90:n1:340:90")
     );
     assert!(!diff.removed.iter().any(|item| {
-        item.kind == GraphViewportItemKind::Edge && item.key == "edge:primary_parent:n0:n1"
+        item.kind == GraphViewportItemKind::Edge
+            && item.key == "edge:primary_parent:n0:120:90:n1:340:90"
     }));
 }
 
@@ -1304,7 +1342,7 @@ fn graph_viewport_diff_zooming_out_adds_newly_visible_items() {
         diff.added
             .edges
             .iter()
-            .any(|edge| edge.key == "edge:primary_parent:n1:n2")
+            .any(|edge| edge.key == "edge:primary_parent:n1:340:90:n2:560:90")
     );
     assert!(
         !diff
@@ -1352,7 +1390,8 @@ fn graph_viewport_diff_zooming_in_removes_items_outside_new_viewport() {
         })
     );
     assert!(diff.removed.iter().any(|item| {
-        item.kind == GraphViewportItemKind::Edge && item.key == "edge:primary_parent:n1:n2"
+        item.kind == GraphViewportItemKind::Edge
+            && item.key == "edge:primary_parent:n1:340:90:n2:560:90"
     }));
     assert!(diff.added.nodes.is_empty());
 }

@@ -625,16 +625,17 @@ async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
 }
 
 async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
-    let (window, previous, current) = {
+    let (window, rendered, current, known_query) = {
         let mut graph = graph.borrow_mut();
         graph.patch_requested = false;
         (
             graph.window.clone(),
             graph.rendered_viewport,
             graph.viewport,
+            graph.rendered.known_query(),
         )
     };
-    if same_viewport(previous, current) {
+    if same_viewport(rendered, current) {
         let mut graph = graph.borrow_mut();
         if graph.patch_requested {
             return Ok(true);
@@ -643,22 +644,30 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
         return Ok(false);
     }
 
-    let query = format!(
-        "{}&{}",
-        previous.request_query_with_prefix("previous_"),
-        current.request_query()
-    );
+    let mut query = format!("{}&known=1", current.request_query());
+    if !known_query.is_empty() {
+        query.push('&');
+        query.push_str(&known_query);
+    }
     let response = fetch_json::<GraphViewportDiffResponse>(
         &window,
         &format!("/api/graph/viewport/diff?{query}"),
     )
     .await?;
-    let mut graph = graph.borrow_mut();
-    graph.apply_diff(response)?;
-    let should_continue =
-        graph.patch_requested || !same_viewport(graph.rendered_viewport, graph.viewport);
-    if !should_continue {
-        graph.patch_in_flight = false;
+    let (document, refresh_shell, should_continue) = {
+        let mut graph = graph.borrow_mut();
+        let refresh_shell = response.version != graph.version;
+        let document = graph.document.clone();
+        graph.apply_diff(response)?;
+        let should_continue =
+            graph.patch_requested || !same_viewport(graph.rendered_viewport, graph.viewport);
+        if !should_continue {
+            graph.patch_in_flight = false;
+        }
+        (document, refresh_shell, should_continue)
+    };
+    if refresh_shell {
+        refresh_server_rendered_sections(&window, &document).await?;
     }
     Ok(should_continue)
 }

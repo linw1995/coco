@@ -897,10 +897,14 @@ fn node_key(node_id: &str, point: Point) -> String {
 
 fn edge_key(edge: &GraphLayoutEdge) -> String {
     format!(
-        "edge:{}:{}:{}",
+        "edge:{}:{}:{}:{}:{}:{}:{}",
         edge.kind.key_part(),
         edge.source_node_id,
-        edge.target_node_id
+        edge.source.x,
+        edge.source.y,
+        edge.target_node_id,
+        edge.target.x,
+        edge.target.y
     )
 }
 
