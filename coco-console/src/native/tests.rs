@@ -512,6 +512,38 @@ fn routed_edges_use_inter_lane_corridors() {
 }
 
 #[test]
+fn streamed_graph_markup_escapes_dynamic_values() {
+    let mut node = graph_node("node-\"<&", 0);
+    node.kind = "Text<&".to_owned();
+    node.summary = "<script>alert(1)</script> & title".to_owned();
+    node.content = "<img src=x onerror=alert(1)>".to_owned();
+    node.labels = vec!["main<&".to_owned()];
+    let snapshot = GraphSnapshot {
+        version: 1,
+        root_id: "root".to_owned(),
+        nodes: vec![node],
+        edges: Vec::new(),
+        branches: vec![GraphBranch {
+            name: "main".to_owned(),
+            head_id: "node-\"<&".to_owned(),
+            state: SessionState::Active,
+        }],
+    };
+
+    let html = render_snapshot_page(&snapshot);
+
+    assert!(html.contains("data-node-id=\"node-&#34;&#60;&#38;\""));
+    assert!(
+        html.contains(
+            "node-&#34;&#60;&#38;: &#60;script&#62;alert(1)&#60;/script&#62; &#38; title"
+        )
+    );
+    assert!(html.contains("Text&#60;&#38;"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    assert!(!html.contains("<img src=x onerror=alert(1)>"));
+}
+
+#[test]
 fn console_store_notifies_after_successful_writes() {
     let publisher = ConsolePublisher::new();
     let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());

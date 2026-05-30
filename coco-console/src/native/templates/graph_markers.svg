@@ -1,0 +1,11 @@
+<defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+        <path class="arrowhead" d="M 0 0 L 10 4 L 0 8 z"></path>
+    </marker>
+    <marker id="merge-arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+        <path class="merge-arrowhead" d="M 0 0 L 10 4 L 0 8 z"></path>
+    </marker>
+    <marker id="fork-arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+        <path class="fork-arrowhead" d="M 0 0 L 10 4 L 0 8 z"></path>
+    </marker>
+</defs>

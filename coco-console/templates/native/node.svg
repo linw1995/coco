@@ -1,0 +1,1 @@
+<a class="node-link" href="{{ href }}" data-node-target="{{ node_target }}" data-node-id="{{ node_id }}"><g class="{{ class }}" transform="translate({{ x }} {{ y }})"><title>{{ title }}</title><circle class="core" r="26"></circle><text class="node-label" y="44">{{ label }}</text><text class="node-kind" y="58">{{ kind }}</text></g></a>

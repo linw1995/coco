@@ -2026,9 +2026,9 @@ mod tests {
         ChannelConfigs, DEFAULT_SESSION_BRANCH, LlmBackendFailureRecoveryRequested,
         PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, ProviderProfiles, SYSTEM_EVENT_QUEUE,
         SystemEvent, SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, daemon_console_config,
-        decode_telegram_message, encode_telegram_message, resolve_daemon_command_socket_path,
-        resolve_daemon_socket_path, run_daemon_command,
+        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, abort_channel_task,
+        daemon_console_config, decode_telegram_message, encode_telegram_message,
+        resolve_daemon_command_socket_path, resolve_daemon_socket_path, run_daemon_command,
     };
 
     fn daemon_command<I, T>(args: I) -> DaemonCommand
@@ -2146,6 +2146,50 @@ mod tests {
 
         assert!(matches!(error, crate::Error::BindDaemonSocket { .. }));
         assert!(store.get_session_state(DEFAULT_SESSION_BRANCH).is_ok());
+    }
+
+    #[tokio::test]
+    async fn abort_channel_task_ignores_absent_task() {
+        abort_channel_task(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_channel_task_accepts_completed_success() {
+        let task = tokio::spawn(async { Ok(()) });
+        wait_until(Duration::from_secs(1), || task.is_finished()).await;
+
+        abort_channel_task(Some(task)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_channel_task_preserves_completed_error() {
+        let task = tokio::spawn(async { Err(crate::Error::EmptyPrompt) });
+        wait_until(Duration::from_secs(1), || task.is_finished()).await;
+
+        let error = abort_channel_task(Some(task)).await.unwrap_err();
+
+        assert!(matches!(error, crate::Error::EmptyPrompt));
+    }
+
+    #[tokio::test]
+    async fn abort_channel_task_accepts_cancelled_task() {
+        let task = tokio::spawn(async { std::future::pending::<crate::Result<()>>().await });
+
+        abort_channel_task(Some(task)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_channel_task_reports_join_error() {
+        let task = tokio::spawn(async {
+            panic!("channel task panic");
+            #[allow(unreachable_code)]
+            Ok::<(), crate::Error>(())
+        });
+        wait_until(Duration::from_secs(1), || task.is_finished()).await;
+
+        let error = abort_channel_task(Some(task)).await.unwrap_err();
+
+        assert!(matches!(error, crate::Error::JoinChannelTask { .. }));
     }
 
     #[test]

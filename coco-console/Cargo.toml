@@ -16,6 +16,7 @@ serde_json.workspace = true
 coco-mem = { path = "../coco-mem" }
 
 # Native server runtime and UI rendering.
+askama = "0.16.0"
 leptos.workspace = true
 tokio.workspace = true
 
