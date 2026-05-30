@@ -699,7 +699,8 @@ async fn write_graph_event(stream: &mut tokio::net::TcpStream, version: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, handle_connection, parse_query, read_request, viewport_diff_request_from_query,
+        AppState, COCO_CONSOLE_ASSETS_BUILT, handle_connection, parse_query, read_request,
+        viewport_diff_request_from_query,
     };
     use coco_mem::MemoryStore;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1005,6 +1006,23 @@ mod tests {
             b"GET /pkg/coco_console_bg.wasm HTTP/1.1\r\nhost: localhost\r\n\r\n",
         )
         .await;
+
+        if !COCO_CONSOLE_ASSETS_BUILT {
+            assert!(js.starts_with(b"HTTP/1.1 404 Not Found"), "{js:?}");
+            assert!(contains_bytes(
+                &js,
+                b"content-type: text/plain; charset=utf-8"
+            ));
+            assert!(contains_bytes(&js, b"console wasm asset not built"));
+
+            assert!(wasm.starts_with(b"HTTP/1.1 404 Not Found"), "{wasm:?}");
+            assert!(contains_bytes(
+                &wasm,
+                b"content-type: text/plain; charset=utf-8"
+            ));
+            assert!(contains_bytes(&wasm, b"console wasm asset not built"));
+            return;
+        }
 
         assert!(js.starts_with(b"HTTP/1.1 200 OK"), "{js:?}");
         assert!(contains_bytes(
