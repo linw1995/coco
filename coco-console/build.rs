@@ -10,11 +10,7 @@ use snafu::prelude::*;
 type BuildResult<T> = Result<T, BuildError>;
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
-const SKIP_ENV: &str = "COCO_CONSOLE_SKIP_WASM_BUILD";
-const BUILDING_ENV: &str = "COCO_CONSOLE_BUILDING_WASM";
 const JS_ASSET: &str = "coco_console.js";
-const WASM_ASSET: &str = "coco_console_bg.wasm";
-const ASSET_STATE: &str = "console_asset_state.rs";
 const COVERAGE_ENV_VARS: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "LLVM_PROFILE_FILE"];
 
 #[derive(Debug, Snafu)]
@@ -51,11 +47,8 @@ fn run() -> BuildResult<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/client.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
-    println!("cargo:rerun-if-env-changed={SKIP_ENV}");
 
-    if env::var("TARGET").is_ok_and(|target| target == WASM_TARGET)
-        || env::var_os(BUILDING_ENV).is_some()
-    {
+    if env::var("TARGET").is_ok_and(|target| target == WASM_TARGET) {
         return Ok(());
     }
 
@@ -70,12 +63,6 @@ fn run() -> BuildResult<()> {
         .join("coco_console.wasm");
     let pkg_dir = out_dir.join("pkg");
 
-    if env::var_os(SKIP_ENV).is_some() {
-        prepare_skipped_package(&pkg_dir)?;
-        write_asset_state(&out_dir, false)?;
-        return Ok(());
-    }
-
     let mut wasm_build = Command::new("cargo");
     wasm_build
         .arg("build")
@@ -83,7 +70,6 @@ fn run() -> BuildResult<()> {
         .arg(manifest_dir.join("Cargo.toml"))
         .arg("--target")
         .arg(WASM_TARGET)
-        .env(BUILDING_ENV, "1")
         .env("CARGO_TARGET_DIR", &wasm_target_dir);
     // Host coverage flags require a profiler runtime that wasm32-unknown-unknown does not provide.
     // Keep coverage enabled for host tests, but build the generated wasm client without those flags.
@@ -102,39 +88,7 @@ fn run() -> BuildResult<()> {
             .arg(&wasm_file),
     )?;
     append_auto_start(&pkg_dir.join(JS_ASSET))?;
-    write_asset_state(&out_dir, true)?;
 
-    Ok(())
-}
-
-fn prepare_skipped_package(pkg_dir: &Path) -> BuildResult<()> {
-    fs::create_dir_all(pkg_dir).context(CreatePackageDirectorySnafu {
-        path: pkg_dir.to_path_buf(),
-    })?;
-    write_skipped_package_stubs(pkg_dir)?;
-    Ok(())
-}
-
-fn write_skipped_package_stubs(pkg_dir: &Path) -> BuildResult<()> {
-    let js_path = pkg_dir.join(JS_ASSET);
-    fs::write(
-        &js_path,
-        "throw new Error('coco-console wasm client was not built');\n",
-    )
-    .context(WriteGeneratedLoaderSnafu { path: js_path })?;
-    let wasm_path = pkg_dir.join(WASM_ASSET);
-    fs::write(&wasm_path, b"coco-console wasm client was not built\n")
-        .context(WriteGeneratedLoaderSnafu { path: wasm_path })?;
-    Ok(())
-}
-
-fn write_asset_state(out_dir: &Path, built: bool) -> BuildResult<()> {
-    let path = out_dir.join(ASSET_STATE);
-    fs::write(
-        &path,
-        format!("const COCO_CONSOLE_ASSETS_BUILT: bool = {built};\n"),
-    )
-    .context(WriteGeneratedLoaderSnafu { path })?;
     Ok(())
 }
 

@@ -21,7 +21,6 @@ use crate::{Error, Result};
 const REQUEST_HEADER_LIMIT: usize = 16 * 1024;
 const REQUEST_BODY_LIMIT: usize = 1024 * 1024;
 const STYLE_CSS: &str = include_str!("style.css");
-include!(concat!(env!("OUT_DIR"), "/console_asset_state.rs"));
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
 const COCO_CONSOLE_WASM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
@@ -198,9 +197,6 @@ where
         "/fragment" => write_fragment(stream, state, request.version()).await,
         "/events" => write_event_stream(stream, state.publisher).await,
         "/pkg/coco_console.js" => {
-            if !COCO_CONSOLE_ASSETS_BUILT {
-                return write_missing_console_asset(stream).await;
-            }
             write_response(
                 stream,
                 200,
@@ -212,9 +208,6 @@ where
             Ok(200)
         }
         "/pkg/coco_console_bg.wasm" => {
-            if !COCO_CONSOLE_ASSETS_BUILT {
-                return write_missing_console_asset(stream).await;
-            }
             write_response(stream, 200, "OK", "application/wasm", COCO_CONSOLE_WASM).await?;
             Ok(200)
         }
@@ -601,18 +594,6 @@ async fn write_error(stream: &mut tokio::net::TcpStream, error: Error) -> io::Re
     write_plain_error(stream, error.to_string()).await
 }
 
-async fn write_missing_console_asset(stream: &mut tokio::net::TcpStream) -> io::Result<u16> {
-    write_response(
-        stream,
-        404,
-        "Not Found",
-        "text/plain; charset=utf-8",
-        b"console wasm asset not built",
-    )
-    .await?;
-    Ok(404)
-}
-
 async fn write_plain_error(
     stream: &mut tokio::net::TcpStream,
     message: impl AsRef<str>,
@@ -699,8 +680,7 @@ async fn write_graph_event(stream: &mut tokio::net::TcpStream, version: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, COCO_CONSOLE_ASSETS_BUILT, handle_connection, parse_query, read_request,
-        viewport_diff_request_from_query,
+        AppState, handle_connection, parse_query, read_request, viewport_diff_request_from_query,
     };
     use coco_mem::MemoryStore;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1006,25 +986,6 @@ mod tests {
             b"GET /pkg/coco_console_bg.wasm HTTP/1.1\r\nhost: localhost\r\n\r\n",
         )
         .await;
-
-        // grcov: ignore-start
-        if !COCO_CONSOLE_ASSETS_BUILT {
-            assert!(js.starts_with(b"HTTP/1.1 404 Not Found"), "{js:?}");
-            assert!(contains_bytes(
-                &js,
-                b"content-type: text/plain; charset=utf-8"
-            ));
-            assert!(contains_bytes(&js, b"console wasm asset not built"));
-
-            assert!(wasm.starts_with(b"HTTP/1.1 404 Not Found"), "{wasm:?}");
-            assert!(contains_bytes(
-                &wasm,
-                b"content-type: text/plain; charset=utf-8"
-            ));
-            assert!(contains_bytes(&wasm, b"console wasm asset not built"));
-            return;
-        }
-        // grcov: ignore-end
 
         assert!(js.starts_with(b"HTTP/1.1 200 OK"), "{js:?}");
         assert!(contains_bytes(
