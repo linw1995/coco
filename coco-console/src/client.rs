@@ -590,7 +590,17 @@ async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
     let response =
         fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
             .await?;
-    graph.borrow_mut().apply_full(response)
+    let (document, refresh_shell) = {
+        let mut graph = graph.borrow_mut();
+        let refresh_shell = response.version != graph.version;
+        let document = graph.document.clone();
+        graph.apply_full(response)?;
+        (document, refresh_shell)
+    };
+    if refresh_shell {
+        refresh_server_rendered_sections(&window, &document).await?;
+    }
+    Ok(())
 }
 
 fn request_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) {
