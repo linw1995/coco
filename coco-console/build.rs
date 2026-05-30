@@ -11,6 +11,8 @@ type BuildResult<T> = Result<T, BuildError>;
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 const SKIP_ENV: &str = "COCO_CONSOLE_SKIP_WASM_BUILD";
 const BUILDING_ENV: &str = "COCO_CONSOLE_BUILDING_WASM";
+const JS_ASSET: &str = "coco_console.js";
+const WASM_ASSET: &str = "coco_console_bg.wasm";
 const COVERAGE_ENV_VARS: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "LLVM_PROFILE_FILE"];
 
 #[derive(Debug, Snafu)]
@@ -30,6 +32,13 @@ enum BuildError {
     #[snafu(display("{program} exited with {status}"))]
     CommandFailed { program: String, status: ExitStatus },
 
+    #[snafu(display("Failed to copy generated asset from {} to {}: {source}", from.display(), to.display()))]
+    CopyGeneratedAsset {
+        from: PathBuf,
+        to: PathBuf,
+        source: io::Error,
+    },
+
     #[snafu(display("Failed to read generated loader {}: {source}", path.display()))]
     ReadGeneratedLoader { path: PathBuf, source: io::Error },
 
@@ -47,9 +56,9 @@ fn run() -> BuildResult<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/client.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-env-changed={SKIP_ENV}");
 
-    if env::var_os(SKIP_ENV).is_some()
-        || env::var("TARGET").is_ok_and(|target| target == WASM_TARGET)
+    if env::var("TARGET").is_ok_and(|target| target == WASM_TARGET)
         || env::var_os(BUILDING_ENV).is_some()
     {
         return Ok(());
@@ -65,6 +74,11 @@ fn run() -> BuildResult<()> {
         .join("debug")
         .join("coco_console.wasm");
     let pkg_dir = out_dir.join("pkg");
+
+    if env::var_os(SKIP_ENV).is_some() {
+        prepare_skipped_package(&manifest_dir, &pkg_dir)?;
+        return Ok(());
+    }
 
     let mut wasm_build = Command::new("cargo");
     wasm_build
@@ -91,8 +105,42 @@ fn run() -> BuildResult<()> {
             .arg(&pkg_dir)
             .arg(&wasm_file),
     )?;
-    append_auto_start(&pkg_dir.join("coco_console.js"))?;
+    append_auto_start(&pkg_dir.join(JS_ASSET))?;
 
+    Ok(())
+}
+
+fn prepare_skipped_package(manifest_dir: &Path, pkg_dir: &Path) -> BuildResult<()> {
+    fs::create_dir_all(pkg_dir).context(CreatePackageDirectorySnafu {
+        path: pkg_dir.to_path_buf(),
+    })?;
+    let source_pkg_dir = manifest_dir.join("pkg");
+    if source_pkg_dir.join(JS_ASSET).is_file() && source_pkg_dir.join(WASM_ASSET).is_file() {
+        copy_generated_asset(&source_pkg_dir.join(JS_ASSET), &pkg_dir.join(JS_ASSET))?;
+        copy_generated_asset(&source_pkg_dir.join(WASM_ASSET), &pkg_dir.join(WASM_ASSET))?;
+    } else {
+        write_skipped_package_stubs(pkg_dir)?;
+    }
+    Ok(())
+}
+
+fn copy_generated_asset(from: &Path, to: &Path) -> BuildResult<()> {
+    fs::copy(from, to).context(CopyGeneratedAssetSnafu {
+        from: from.to_path_buf(),
+        to: to.to_path_buf(),
+    })?;
+    Ok(())
+}
+
+fn write_skipped_package_stubs(pkg_dir: &Path) -> BuildResult<()> {
+    let js_path = pkg_dir.join(JS_ASSET);
+    fs::write(
+        &js_path,
+        "throw new Error('coco-console wasm client was not built');\n",
+    )
+    .context(WriteGeneratedLoaderSnafu { path: js_path })?;
+    let wasm_path = pkg_dir.join(WASM_ASSET);
+    fs::write(&wasm_path, []).context(WriteGeneratedLoaderSnafu { path: wasm_path })?;
     Ok(())
 }
 
