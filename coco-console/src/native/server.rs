@@ -10,6 +10,10 @@ use crate::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
 };
 use crate::graph::build_graph_snapshot;
+use crate::layout::{
+    GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest, layout_graph_viewport,
+    layout_graph_viewport_diff,
+};
 use crate::publisher::ConsolePublisher;
 use crate::render::{render_fragment, render_index_page};
 use crate::{Error, Result};
@@ -130,19 +134,18 @@ where
         .await;
     }
 
-    handle_get_request(stream, request.path, request.version, state).await
+    handle_get_request(stream, request, state).await
 }
 
 async fn handle_get_request<S>(
     mut stream: tokio::net::TcpStream,
-    path: String,
-    observed_version: Option<u64>,
+    request: HttpRequest,
     state: AppState<S>,
 ) -> io::Result<()>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    match path.as_str() {
+    match request.path.as_str() {
         "/" | "/index.html" => write_index_page(&mut stream, &state).await,
         "/style.css" => {
             write_response(
@@ -155,7 +158,14 @@ where
             .await
         }
         "/api/graph" => write_graph_json(&mut stream, &state).await,
-        "/fragment" => write_fragment(&mut stream, state, observed_version).await,
+        "/api/graph/viewport" => {
+            write_graph_viewport_json(&mut stream, state, request.version(), &request.query).await
+        }
+        "/api/graph/viewport/diff" => {
+            write_graph_viewport_diff_json(&mut stream, state, request.version(), &request.query)
+                .await
+        }
+        "/fragment" => write_fragment(&mut stream, state, request.version()).await,
         "/events" => write_event_stream(stream, state.publisher).await,
         "/pkg/coco_console.js" => {
             write_asset_file(
@@ -225,11 +235,107 @@ where
     }
 }
 
+async fn write_graph_viewport_json<S>(
+    stream: &mut tokio::net::TcpStream,
+    state: AppState<S>,
+    observed_version: Option<u64>,
+    query: &QueryParams,
+) -> io::Result<()>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    wait_for_newer_version(&state.publisher, observed_version).await;
+    let snapshot = match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return write_error(stream, error).await,
+    };
+    let response = layout_graph_viewport(&snapshot, viewport_request_from_query(query));
+    match serde_json::to_vec(&response) {
+        Ok(body) => {
+            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await
+        }
+        Err(error) => {
+            write_plain_error(
+                stream,
+                format!("failed to serialize graph viewport: {error}"),
+            )
+            .await
+        }
+    }
+}
+
+async fn write_graph_viewport_diff_json<S>(
+    stream: &mut tokio::net::TcpStream,
+    state: AppState<S>,
+    observed_version: Option<u64>,
+    query: &QueryParams,
+) -> io::Result<()>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    wait_for_newer_version(&state.publisher, observed_version).await;
+    let snapshot = match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return write_error(stream, error).await,
+    };
+    let response = layout_graph_viewport_diff(&snapshot, viewport_diff_request_from_query(query));
+    match serde_json::to_vec(&response) {
+        Ok(body) => {
+            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await
+        }
+        Err(error) => {
+            write_plain_error(
+                stream,
+                format!("failed to serialize graph viewport diff: {error}"),
+            )
+            .await
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct HttpRequest {
     method: String,
     path: String,
-    version: Option<u64>,
+    query: QueryParams,
+}
+
+impl HttpRequest {
+    fn version(&self) -> Option<u64> {
+        self.query.u64("version")
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QueryParams {
+    pairs: Vec<(String, String)>,
+}
+
+impl QueryParams {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+    }
+
+    fn get_all(&self, key: &str) -> Vec<String> {
+        self.pairs
+            .iter()
+            .filter_map(|(candidate, value)| (candidate == key).then_some(value.clone()))
+            .collect()
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.pairs.iter().any(|(candidate, _)| candidate == key)
+    }
+
+    fn i32(&self, key: &str) -> Option<i32> {
+        self.get(key)?.parse().ok()
+    }
+
+    fn u64(&self, key: &str) -> Option<u64> {
+        self.get(key)?.parse().ok()
+    }
 }
 
 async fn read_request(stream: &mut tokio::net::TcpStream) -> io::Result<Option<HttpRequest>> {
@@ -264,15 +370,94 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> io::Result<Option<H
     Ok(Some(HttpRequest {
         method: method.to_owned(),
         path: path.to_owned(),
-        version: parse_version_query(query),
+        query: parse_query(query),
     }))
 }
 
-fn parse_version_query(query: &str) -> Option<u64> {
-    query.split('&').find_map(|part| {
-        let (key, value) = part.split_once('=')?;
-        (key == "version").then(|| value.parse().ok()).flatten()
-    })
+fn parse_query(query: &str) -> QueryParams {
+    QueryParams {
+        pairs: query
+            .split('&')
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                Some((percent_decode(key), percent_decode(value)))
+            })
+            .collect(),
+    }
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Some(byte) = decode_hex_pair(bytes[index + 1], bytes[index + 2])
+        {
+            decoded.push(byte);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn decode_hex_pair(high: u8, low: u8) -> Option<u8> {
+    Some(decode_hex_digit(high)? << 4 | decode_hex_digit(low)?)
+}
+
+fn decode_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn viewport_request_from_query(query: &QueryParams) -> GraphViewportRequest {
+    let default = GraphViewportRequest::default();
+    GraphViewportRequest {
+        x: query.i32("x").unwrap_or(default.x),
+        y: query.i32("y").unwrap_or(default.y),
+        width: query.i32("width").unwrap_or(default.width),
+        height: query.i32("height").unwrap_or(default.height),
+        overscan: query.i32("overscan").unwrap_or(default.overscan),
+    }
+}
+
+fn viewport_diff_request_from_query(query: &QueryParams) -> GraphViewportDiffRequest {
+    let current = viewport_request_from_query(query);
+    let known = known_items_from_query(query);
+    GraphViewportDiffRequest {
+        previous: GraphViewportRequest {
+            x: query.i32("previous_x").unwrap_or(current.x),
+            y: query.i32("previous_y").unwrap_or(current.y),
+            width: query.i32("previous_width").unwrap_or(current.width),
+            height: query.i32("previous_height").unwrap_or(current.height),
+            overscan: query.i32("previous_overscan").unwrap_or(current.overscan),
+        },
+        current,
+        known,
+    }
+}
+
+fn known_items_from_query(query: &QueryParams) -> Option<GraphViewportKnownItems> {
+    let known = GraphViewportKnownItems {
+        lanes: query.get_all("known_lane"),
+        nodes: query.get_all("known_node"),
+        edges: query.get_all("known_edge"),
+    };
+    (query.contains_key("known")
+        || !known.lanes.is_empty()
+        || !known.nodes.is_empty()
+        || !known.edges.is_empty())
+    .then_some(known)
 }
 
 async fn write_response(
@@ -417,7 +602,9 @@ async fn write_graph_event(stream: &mut tokio::net::TcpStream, version: u64) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, handle_connection, read_request};
+    use super::{
+        AppState, handle_connection, parse_query, read_request, viewport_diff_request_from_query,
+    };
     use coco_mem::MemoryStore;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -490,7 +677,7 @@ mod tests {
 
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/fragment");
-        assert_eq!(request.version, Some(42));
+        assert_eq!(request.version(), Some(42));
     }
 
     #[tokio::test]
@@ -502,8 +689,8 @@ mod tests {
             .await
             .expect("request should parse");
 
-        assert_eq!(invalid.version, None);
-        assert_eq!(missing.version, None);
+        assert_eq!(invalid.version(), None);
+        assert_eq!(missing.version(), None);
     }
 
     #[tokio::test]
@@ -572,6 +759,97 @@ mod tests {
         );
         assert!(response.contains("\"version\":0"), "{response}");
         assert!(response.contains("\"nodes\""), "{response}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_viewport_json() {
+        let response = response_from(
+            b"GET /api/graph/viewport?x=10&y=20&width=640&height=360&overscan=40 HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("content-type: application/json; charset=utf-8"),
+            "{response}"
+        );
+        assert!(response.contains("\"canvas\""), "{response}");
+        assert!(response.contains("\"viewport\""), "{response}");
+        assert!(response.contains("\"x\":10"), "{response}");
+        assert!(response.contains("\"width\":640"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_viewport_diff_json() {
+        let response = response_from(
+            b"GET /api/graph/viewport/diff?previous_x=0&previous_y=0&previous_width=320&previous_height=180&x=10&y=20&width=640&height=360&overscan=40 HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("content-type: application/json; charset=utf-8"),
+            "{response}"
+        );
+        assert!(response.contains("\"previous_viewport\""), "{response}");
+        assert!(response.contains("\"added\""), "{response}");
+        assert!(response.contains("\"updated\""), "{response}");
+        assert!(response.contains("\"removed\""), "{response}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_viewport_diff_with_known_keys() {
+        let response = response_from(
+            b"GET /api/graph/viewport/diff?x=0&y=0&width=640&height=360&known_node=node:stale&known_edge=edge:primary_parent:base:stale HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"kind\":\"node\""), "{response}");
+        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(response.contains("\"kind\":\"edge\""), "{response}");
+        assert!(
+            response.contains("\"key\":\"edge:primary_parent:base:stale\""),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_viewport_diff_with_empty_known_set() {
+        let response = response_from(
+            b"GET /api/graph/viewport/diff?x=0&y=0&width=640&height=360&known=1 HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"added\""), "{response}");
+        assert!(response.contains("\"nodes\":[]"), "{response}");
+    }
+
+    #[test]
+    fn viewport_diff_query_parses_repeated_known_keys() {
+        let query = parse_query(
+            "known_node=node%3Abase&known_node=node:merged&known_lane=lane%3Amain&known_edge=edge%3Aprimary_parent%3Abase%3Amerged",
+        );
+
+        let request = viewport_diff_request_from_query(&query);
+        let known = request.known.expect("known keys should parse");
+
+        assert_eq!(known.lanes, vec!["lane:main"]);
+        assert_eq!(known.nodes, vec!["node:base", "node:merged"]);
+        assert_eq!(known.edges, vec!["edge:primary_parent:base:merged"]);
+    }
+
+    #[test]
+    fn viewport_diff_query_parses_empty_known_set_marker() {
+        let query = parse_query("known=1");
+
+        let request = viewport_diff_request_from_query(&query);
+        let known = request.known.expect("empty known set should parse");
+
+        assert!(known.lanes.is_empty());
+        assert!(known.nodes.is_empty());
+        assert!(known.edges.is_empty());
     }
 
     #[tokio::test]

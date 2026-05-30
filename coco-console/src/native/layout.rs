@@ -1,22 +1,163 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::graph::{GraphBranch, GraphEdgeKind, GraphSnapshot, node_target_id, shorten_id};
+use serde::Serialize;
 
 const NODE_RADIUS: f64 = 26.0;
 pub const GRAPH_LEFT_X: i32 = 120;
 pub const GRAPH_TOP_Y: i32 = 90;
 pub const GRAPH_COLUMN_WIDTH: i32 = 220;
 pub const GRAPH_LANE_HEIGHT: i32 = 140;
+pub const DEFAULT_VIEWPORT_WIDTH: i32 = 1280;
+pub const DEFAULT_VIEWPORT_HEIGHT: i32 = 720;
+pub const DEFAULT_VIEWPORT_OVERSCAN: i32 = 180;
 const MAX_EDGE_COLUMN_GAP: i32 = 5;
+#[cfg(test)]
 const EDGE_NODE_EXIT: f64 = 42.0;
 const EDGE_TARGET_APPROACH: f64 = 48.0;
 const EDGE_ROUTE_STEP: f64 = 12.0;
 pub const EDGE_TARGET_PORT_STEP: f64 = 14.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphViewportRequest {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub overscan: i32,
+}
+
+impl Default for GraphViewportRequest {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: DEFAULT_VIEWPORT_WIDTH,
+            height: DEFAULT_VIEWPORT_HEIGHT,
+            overscan: DEFAULT_VIEWPORT_OVERSCAN,
+        }
+    }
+}
+
+impl GraphViewportRequest {
+    pub fn normalized(self) -> Self {
+        Self {
+            x: self.x.max(0),
+            y: self.y.max(0),
+            width: self.width.max(1),
+            height: self.height.max(1),
+            overscan: self.overscan.max(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphViewportDiffRequest {
+    pub previous: GraphViewportRequest,
+    pub current: GraphViewportRequest,
+    pub known: Option<GraphViewportKnownItems>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct GraphCanvas {
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct GraphViewport {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub overscan: i32,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct GraphViewportResponse {
+    pub version: u64,
+    pub canvas: GraphCanvas,
+    pub viewport: GraphViewport,
+    pub lanes: Vec<GraphViewportLane>,
+    pub nodes: Vec<GraphViewportNode>,
+    pub edges: Vec<GraphViewportEdge>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct GraphViewportDiffResponse {
+    pub version: u64,
+    pub canvas: GraphCanvas,
+    pub previous_viewport: GraphViewport,
+    pub viewport: GraphViewport,
+    pub added: GraphViewportItems,
+    pub updated: GraphViewportItems,
+    pub removed: Vec<GraphViewportRemovedItem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct GraphViewportItems {
+    pub lanes: Vec<GraphViewportLane>,
+    pub nodes: Vec<GraphViewportNode>,
+    pub edges: Vec<GraphViewportEdge>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphViewportKnownItems {
+    pub lanes: Vec<String>,
+    pub nodes: Vec<String>,
+    pub edges: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphViewportItemKind {
+    Lane,
+    Node,
+    Edge,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GraphViewportRemovedItem {
+    pub kind: GraphViewportItemKind,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GraphViewportLane {
+    pub key: String,
+    pub label: String,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GraphViewportNode {
+    pub key: String,
+    pub id: String,
+    pub node_target: String,
+    pub short_id: String,
+    pub kind: String,
+    pub summary: String,
+    pub labels: Vec<String>,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GraphViewportEdge {
+    pub key: String,
+    pub kind: GraphLayoutEdgeKind,
+    pub source_id: String,
+    pub target_id: String,
+    pub source: Point,
+    pub target: Point,
+    pub route_slot: i32,
+    pub target_port_offset: f64,
 }
 
 #[derive(Debug)]
@@ -45,6 +186,8 @@ pub struct GraphNodeOccurrence {
 
 #[derive(Debug)]
 pub struct GraphLayoutEdge {
+    pub source_node_id: String,
+    pub target_node_id: String,
     pub source: Point,
     pub target: Point,
     pub kind: GraphLayoutEdgeKind,
@@ -52,11 +195,51 @@ pub struct GraphLayoutEdge {
     pub target_port_offset: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum GraphLayoutEdgeKind {
     PrimaryParent,
     Fork,
     MergeParent,
+}
+
+impl GraphLayoutEdgeKind {
+    fn key_part(self) -> &'static str {
+        match self {
+            Self::PrimaryParent => "primary_parent",
+            Self::Fork => "fork",
+            Self::MergeParent => "merge_parent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewportBounds {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl ViewportBounds {
+    fn from_request(request: GraphViewportRequest) -> Self {
+        Self {
+            left: request.x.saturating_sub(request.overscan),
+            top: request.y.saturating_sub(request.overscan),
+            right: request
+                .x
+                .saturating_add(request.width)
+                .saturating_add(request.overscan),
+            bottom: request
+                .y
+                .saturating_add(request.height)
+                .saturating_add(request.overscan),
+        }
+    }
+
+    fn intersects(self, left: i32, top: i32, right: i32, bottom: i32) -> bool {
+        left <= self.right && right >= self.left && top <= self.bottom && bottom >= self.top
+    }
 }
 
 fn is_merge_like_edge(kind: GraphEdgeKind) -> bool {
@@ -78,48 +261,7 @@ struct NodeLocation {
     lane_index: usize,
     node_index: usize,
 }
-pub fn line_points(
-    source: Point,
-    target: Point,
-    target_port_offset: f64,
-) -> (String, String, String, String) {
-    let (start_x, start_y, end_x, end_y) = line_point_values(source, target, target_port_offset);
-    (
-        format!("{start_x:.1}"),
-        format!("{start_y:.1}"),
-        format!("{end_x:.1}"),
-        format!("{end_y:.1}"),
-    )
-}
-
-fn line_point_values(
-    source: Point,
-    target: Point,
-    target_port_offset: f64,
-) -> (f64, f64, f64, f64) {
-    let dx = f64::from(target.x - source.x);
-    let target_y = f64::from(target.y) + target_port_offset;
-    let dy = target_y - f64::from(source.y);
-    let distance = (dx * dx + dy * dy).sqrt();
-    if distance <= NODE_RADIUS * 2.0 {
-        return (
-            f64::from(source.x),
-            f64::from(source.y),
-            f64::from(target.x),
-            target_y,
-        );
-    }
-
-    let ux = dx / distance;
-    let uy = dy / distance;
-    let start_x = f64::from(source.x) + ux * (NODE_RADIUS + 2.0);
-    let start_y = f64::from(source.y) + uy * (NODE_RADIUS + 2.0);
-    let end_x = f64::from(target.x) - ux * (NODE_RADIUS + 8.0);
-    let end_y = target_y - uy * (NODE_RADIUS + 8.0);
-
-    (start_x, start_y, end_x, end_y)
-}
-
+#[cfg(test)]
 pub fn routed_elbow_points(
     source: Point,
     target: Point,
@@ -303,7 +445,7 @@ pub fn layout_graph(snapshot: &GraphSnapshot) -> GraphLayout {
 
     for (lane_index, lane) in lanes.iter().enumerate() {
         let y = GRAPH_TOP_Y + lane_index as i32 * GRAPH_LANE_HEIGHT;
-        let mut previous = None::<Point>;
+        let mut previous = None::<(&str, Point)>;
         let mut first_point = None;
         for (node_index, node_id) in lane.nodes.iter().enumerate() {
             let point = Point {
@@ -316,8 +458,10 @@ pub fn layout_graph(snapshot: &GraphSnapshot) -> GraphLayout {
                 node_target: node_target_id(node_id),
                 point,
             });
-            if let Some(source) = previous {
+            if let Some((source_node_id, source)) = previous {
                 primary_edges.push(GraphLayoutEdge {
+                    source_node_id: source_node_id.to_owned(),
+                    target_node_id: node_id.clone(),
                     source,
                     target: point,
                     kind: GraphLayoutEdgeKind::PrimaryParent,
@@ -328,14 +472,17 @@ pub fn layout_graph(snapshot: &GraphSnapshot) -> GraphLayout {
             first_occurrence_by_node
                 .entry(node_id.clone())
                 .or_insert(point);
-            previous = Some(point);
+            previous = Some((node_id, point));
         }
 
-        if let (Some(fork_source), Some(target)) = (&lane.fork_source, first_point)
+        if let (Some(fork_source), Some(first_node_id), Some(target)) =
+            (&lane.fork_source, lane.nodes.first(), first_point)
             && let Some(source) = first_occurrence_by_node.get(fork_source)
         {
             let route_slot = reserve_route_slot(&mut route_slots_by_corridor, *source, target);
             fork_edges.push(GraphLayoutEdge {
+                source_node_id: fork_source.clone(),
+                target_node_id: first_node_id.clone(),
                 source: *source,
                 target,
                 kind: GraphLayoutEdgeKind::Fork,
@@ -354,6 +501,8 @@ pub fn layout_graph(snapshot: &GraphSnapshot) -> GraphLayout {
             let target = *first_occurrence_by_node.get(&edge.target)?;
             let route_slot = reserve_route_slot(&mut route_slots_by_corridor, source, target);
             Some(GraphLayoutEdge {
+                source_node_id: edge.source.clone(),
+                target_node_id: edge.target.clone(),
                 source,
                 target,
                 kind: GraphLayoutEdgeKind::MergeParent,
@@ -387,6 +536,400 @@ pub fn layout_graph(snapshot: &GraphSnapshot) -> GraphLayout {
         width,
         height,
     }
+}
+
+pub fn layout_graph_viewport(
+    snapshot: &GraphSnapshot,
+    request: GraphViewportRequest,
+) -> GraphViewportResponse {
+    let layout = layout_graph(snapshot);
+    let request = request.normalized();
+    let bounds = ViewportBounds::from_request(request);
+    let nodes_by_id = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    let lanes = layout
+        .lanes
+        .iter()
+        .filter(|lane| bounds.intersects(0, lane.y - 24, GRAPH_LEFT_X, lane.y + 24))
+        .map(|lane| GraphViewportLane {
+            key: lane_key(&lane.label),
+            label: lane.label.clone(),
+            y: lane.y,
+        })
+        .collect();
+    let nodes = layout
+        .occurrences
+        .iter()
+        .filter(|occurrence| node_intersects(bounds, occurrence.point))
+        .filter_map(|occurrence| {
+            let node = nodes_by_id.get(occurrence.node_id.as_str())?;
+            Some(GraphViewportNode {
+                key: node_key(&node.id, occurrence.point),
+                id: node.id.clone(),
+                node_target: occurrence.node_target.clone(),
+                short_id: node.short_id.clone(),
+                kind: node.kind.clone(),
+                summary: node.summary.clone(),
+                labels: node.labels.clone(),
+                x: occurrence.point.x,
+                y: occurrence.point.y,
+            })
+        })
+        .collect();
+    let edges = layout
+        .primary_edges
+        .iter()
+        .chain(layout.fork_edges.iter())
+        .chain(layout.merge_edges.iter())
+        .filter(|edge| edge_intersects(bounds, edge))
+        .map(|edge| GraphViewportEdge {
+            key: edge_key(edge),
+            kind: edge.kind,
+            source_id: edge.source_node_id.clone(),
+            target_id: edge.target_node_id.clone(),
+            source: edge.source,
+            target: edge.target,
+            route_slot: edge.route_slot,
+            target_port_offset: edge.target_port_offset,
+        })
+        .collect();
+
+    GraphViewportResponse {
+        version: snapshot.version,
+        canvas: GraphCanvas {
+            width: layout.width,
+            height: layout.height,
+        },
+        viewport: GraphViewport {
+            x: request.x,
+            y: request.y,
+            width: request.width,
+            height: request.height,
+            overscan: request.overscan,
+        },
+        lanes,
+        nodes,
+        edges,
+    }
+}
+
+pub fn layout_graph_viewport_diff(
+    snapshot: &GraphSnapshot,
+    request: GraphViewportDiffRequest,
+) -> GraphViewportDiffResponse {
+    let previous = layout_graph_viewport(snapshot, request.previous);
+    let current = layout_graph_viewport(snapshot, request.current);
+    let (added, updated, removed) = if let Some(known) = &request.known {
+        diff_known_items(known, &current)
+    } else {
+        diff_viewport_responses(&previous, &current)
+    };
+
+    GraphViewportDiffResponse {
+        version: current.version,
+        canvas: current.canvas,
+        previous_viewport: previous.viewport,
+        viewport: current.viewport,
+        added,
+        updated,
+        removed,
+    }
+}
+
+fn diff_known_items(
+    known: &GraphViewportKnownItems,
+    current: &GraphViewportResponse,
+) -> (
+    GraphViewportItems,
+    GraphViewportItems,
+    Vec<GraphViewportRemovedItem>,
+) {
+    let mut added = GraphViewportItems::default();
+    let mut updated = GraphViewportItems::default();
+    let mut removed = Vec::new();
+
+    diff_known_lanes(known, current, &mut added, &mut updated, &mut removed);
+    diff_known_nodes(known, current, &mut added, &mut updated, &mut removed);
+    diff_known_edges(known, current, &mut added, &mut updated, &mut removed);
+
+    (added, updated, removed)
+}
+
+fn diff_known_lanes(
+    known: &GraphViewportKnownItems,
+    current: &GraphViewportResponse,
+    added: &mut GraphViewportItems,
+    updated: &mut GraphViewportItems,
+    removed: &mut Vec<GraphViewportRemovedItem>,
+) {
+    let known_keys = known
+        .lanes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let current_keys = current
+        .lanes
+        .iter()
+        .map(|lane| lane.key.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for lane in &current.lanes {
+        if known_keys.contains(lane.key.as_str()) {
+            updated.lanes.push(lane.clone());
+        } else {
+            added.lanes.push(lane.clone());
+        }
+    }
+    for key in known_keys {
+        if !current_keys.contains(key) {
+            removed.push(GraphViewportRemovedItem {
+                kind: GraphViewportItemKind::Lane,
+                key: key.to_owned(),
+            });
+        }
+    }
+}
+
+fn diff_known_nodes(
+    known: &GraphViewportKnownItems,
+    current: &GraphViewportResponse,
+    added: &mut GraphViewportItems,
+    updated: &mut GraphViewportItems,
+    removed: &mut Vec<GraphViewportRemovedItem>,
+) {
+    let known_keys = known
+        .nodes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let current_keys = current
+        .nodes
+        .iter()
+        .map(|node| node.key.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for node in &current.nodes {
+        if known_keys.contains(node.key.as_str()) {
+            updated.nodes.push(node.clone());
+        } else {
+            added.nodes.push(node.clone());
+        }
+    }
+    for key in known_keys {
+        if !current_keys.contains(key) {
+            removed.push(GraphViewportRemovedItem {
+                kind: GraphViewportItemKind::Node,
+                key: key.to_owned(),
+            });
+        }
+    }
+}
+
+fn diff_known_edges(
+    known: &GraphViewportKnownItems,
+    current: &GraphViewportResponse,
+    added: &mut GraphViewportItems,
+    updated: &mut GraphViewportItems,
+    removed: &mut Vec<GraphViewportRemovedItem>,
+) {
+    let known_keys = known
+        .edges
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let current_keys = current
+        .edges
+        .iter()
+        .map(|edge| edge.key.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for edge in &current.edges {
+        if known_keys.contains(edge.key.as_str()) {
+            updated.edges.push(edge.clone());
+        } else {
+            added.edges.push(edge.clone());
+        }
+    }
+    for key in known_keys {
+        if !current_keys.contains(key) {
+            removed.push(GraphViewportRemovedItem {
+                kind: GraphViewportItemKind::Edge,
+                key: key.to_owned(),
+            });
+        }
+    }
+}
+
+fn diff_viewport_responses(
+    previous: &GraphViewportResponse,
+    current: &GraphViewportResponse,
+) -> (
+    GraphViewportItems,
+    GraphViewportItems,
+    Vec<GraphViewportRemovedItem>,
+) {
+    let mut added = GraphViewportItems::default();
+    let mut updated = GraphViewportItems::default();
+    let mut removed = Vec::new();
+
+    diff_lanes(previous, current, &mut added, &mut updated, &mut removed);
+    diff_nodes(previous, current, &mut added, &mut updated, &mut removed);
+    diff_edges(previous, current, &mut added, &mut updated, &mut removed);
+
+    (added, updated, removed)
+}
+
+fn diff_lanes(
+    previous: &GraphViewportResponse,
+    current: &GraphViewportResponse,
+    added: &mut GraphViewportItems,
+    updated: &mut GraphViewportItems,
+    removed: &mut Vec<GraphViewportRemovedItem>,
+) {
+    let previous_by_key = previous
+        .lanes
+        .iter()
+        .map(|lane| (lane.key.as_str(), lane))
+        .collect::<HashMap<_, _>>();
+    let current_by_key = current
+        .lanes
+        .iter()
+        .map(|lane| (lane.key.as_str(), lane))
+        .collect::<HashMap<_, _>>();
+
+    for lane in &current.lanes {
+        match previous_by_key.get(lane.key.as_str()) {
+            None => added.lanes.push(lane.clone()),
+            Some(previous) if *previous != lane => updated.lanes.push(lane.clone()),
+            Some(_) => {}
+        }
+    }
+    for lane in &previous.lanes {
+        if !current_by_key.contains_key(lane.key.as_str()) {
+            removed.push(GraphViewportRemovedItem {
+                kind: GraphViewportItemKind::Lane,
+                key: lane.key.clone(),
+            });
+        }
+    }
+}
+
+fn diff_nodes(
+    previous: &GraphViewportResponse,
+    current: &GraphViewportResponse,
+    added: &mut GraphViewportItems,
+    updated: &mut GraphViewportItems,
+    removed: &mut Vec<GraphViewportRemovedItem>,
+) {
+    let previous_by_key = previous
+        .nodes
+        .iter()
+        .map(|node| (node.key.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    let current_by_key = current
+        .nodes
+        .iter()
+        .map(|node| (node.key.as_str(), node))
+        .collect::<HashMap<_, _>>();
+
+    for node in &current.nodes {
+        match previous_by_key.get(node.key.as_str()) {
+            None => added.nodes.push(node.clone()),
+            Some(previous) if *previous != node => updated.nodes.push(node.clone()),
+            Some(_) => {}
+        }
+    }
+    for node in &previous.nodes {
+        if !current_by_key.contains_key(node.key.as_str()) {
+            removed.push(GraphViewportRemovedItem {
+                kind: GraphViewportItemKind::Node,
+                key: node.key.clone(),
+            });
+        }
+    }
+}
+
+fn diff_edges(
+    previous: &GraphViewportResponse,
+    current: &GraphViewportResponse,
+    added: &mut GraphViewportItems,
+    updated: &mut GraphViewportItems,
+    removed: &mut Vec<GraphViewportRemovedItem>,
+) {
+    let previous_by_key = previous
+        .edges
+        .iter()
+        .map(|edge| (edge.key.as_str(), edge))
+        .collect::<HashMap<_, _>>();
+    let current_by_key = current
+        .edges
+        .iter()
+        .map(|edge| (edge.key.as_str(), edge))
+        .collect::<HashMap<_, _>>();
+
+    for edge in &current.edges {
+        match previous_by_key.get(edge.key.as_str()) {
+            None => added.edges.push(edge.clone()),
+            Some(previous) if *previous != edge => updated.edges.push(edge.clone()),
+            Some(_) => {}
+        }
+    }
+    for edge in &previous.edges {
+        if !current_by_key.contains_key(edge.key.as_str()) {
+            removed.push(GraphViewportRemovedItem {
+                kind: GraphViewportItemKind::Edge,
+                key: edge.key.clone(),
+            });
+        }
+    }
+}
+
+fn lane_key(label: &str) -> String {
+    format!("lane:{label}")
+}
+
+fn node_key(node_id: &str, point: Point) -> String {
+    format!("node:{node_id}:{}:{}", point.x, point.y)
+}
+
+fn edge_key(edge: &GraphLayoutEdge) -> String {
+    format!(
+        "edge:{}:{}:{}",
+        edge.kind.key_part(),
+        edge.source_node_id,
+        edge.target_node_id
+    )
+}
+
+fn node_intersects(bounds: ViewportBounds, point: Point) -> bool {
+    let padding = NODE_RADIUS.ceil() as i32;
+    bounds.intersects(
+        point.x - padding,
+        point.y - padding,
+        point.x + padding,
+        point.y + padding,
+    )
+}
+
+fn edge_intersects(bounds: ViewportBounds, edge: &GraphLayoutEdge) -> bool {
+    let padding = (NODE_RADIUS + EDGE_TARGET_APPROACH).ceil() as i32;
+    let mut left = edge.source.x.min(edge.target.x) - padding;
+    let mut top = edge.source.y.min(edge.target.y) - padding;
+    let mut right = edge.source.x.max(edge.target.x) + padding;
+    let mut bottom = edge.source.y.max(edge.target.y) + padding;
+    if edge.kind != GraphLayoutEdgeKind::PrimaryParent {
+        let corridor_y =
+            edge_corridor_y(edge.source.y, edge.target.y, edge.route_slot).round() as i32;
+        top = top.min(corridor_y - padding);
+        bottom = bottom.max(corridor_y + padding);
+        right = right.max(edge.source.x.max(edge.target.x) + EDGE_TARGET_APPROACH as i32);
+        left = left.min(edge.source.x.min(edge.target.x) - EDGE_TARGET_APPROACH as i32);
+    }
+
+    bounds.intersects(left, top, right, bottom)
 }
 
 fn event_order_by_node(snapshot: &GraphSnapshot) -> HashMap<&str, usize> {

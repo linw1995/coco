@@ -17,6 +17,12 @@ mod native {
     pub use graph::{
         GraphBranch, GraphEdge, GraphEdgeKind, GraphNode, GraphSnapshot, build_graph_snapshot,
     };
+    pub use layout::{
+        GraphCanvas, GraphViewport, GraphViewportDiffRequest, GraphViewportDiffResponse,
+        GraphViewportEdge, GraphViewportItemKind, GraphViewportItems, GraphViewportKnownItems,
+        GraphViewportLane, GraphViewportNode, GraphViewportRemovedItem, GraphViewportRequest,
+        GraphViewportResponse, layout_graph_viewport, layout_graph_viewport_diff,
+    };
     pub use publisher::ConsolePublisher;
     pub use server::{ConsoleServerHandle, start_console_server};
     pub use store::ConsoleStore;
@@ -28,8 +34,12 @@ mod native {
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
     ConsoleConfig, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error, GraphBranch,
-    GraphEdge, GraphEdgeKind, GraphNode, GraphSnapshot, Result, build_graph_snapshot,
-    default_console_addr, start_console_server,
+    GraphCanvas, GraphEdge, GraphEdgeKind, GraphNode, GraphSnapshot, GraphViewport,
+    GraphViewportDiffRequest, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportItemKind,
+    GraphViewportItems, GraphViewportKnownItems, GraphViewportLane, GraphViewportNode,
+    GraphViewportRemovedItem, GraphViewportRequest, GraphViewportResponse, Result,
+    build_graph_snapshot, default_console_addr, layout_graph_viewport, layout_graph_viewport_diff,
+    start_console_server,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use native::{config, error, graph, layout, publisher, render};
