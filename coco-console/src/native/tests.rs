@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use coco_mem::{
     Anchor, BranchStore, Kind, MemoryStore, MergeParent, MessageQueueStore, NewNode, NodeStore,
     PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
@@ -8,7 +10,9 @@ use serde_json::json;
 use crate::graph::{GraphBranch, GraphEdge, GraphEdgeKind, GraphNode};
 use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LANE_HEIGHT, GRAPH_LEFT_X, GRAPH_TOP_Y,
-    GraphLayoutEdgeKind, Point, layout_graph, routed_elbow_points,
+    GraphLayoutEdgeKind, GraphViewportDiffRequest, GraphViewportItemKind, GraphViewportKnownItems,
+    GraphViewportRequest, Point, layout_graph, layout_graph_viewport, layout_graph_viewport_diff,
+    routed_elbow_points,
 };
 use crate::render::{render_fragment, render_index_page, render_snapshot_page};
 use crate::{ConsolePublisher, ConsoleStore, GraphSnapshot, build_graph_snapshot};
@@ -42,6 +46,114 @@ fn graph_node(id: &str, created_at_ns: i128) -> GraphNode {
         summary: String::new(),
         labels: Vec::new(),
     }
+}
+
+fn two_node_snapshot(version: u64) -> GraphSnapshot {
+    GraphSnapshot {
+        version,
+        root_id: "root".to_owned(),
+        nodes: vec![graph_node("base", 0), graph_node("merged", 1)],
+        edges: vec![GraphEdge {
+            source: "base".to_owned(),
+            target: "merged".to_owned(),
+            kind: GraphEdgeKind::PrimaryParent,
+        }],
+        branches: vec![GraphBranch {
+            name: "main".to_owned(),
+            head_id: "merged".to_owned(),
+            state: SessionState::Active,
+        }],
+    }
+}
+
+fn empty_snapshot(version: u64) -> GraphSnapshot {
+    GraphSnapshot {
+        version,
+        root_id: "root".to_owned(),
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        branches: Vec::new(),
+    }
+}
+
+fn linear_snapshot(version: u64, node_ids: &[&str]) -> GraphSnapshot {
+    let nodes = node_ids
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| graph_node(node_id, index as i128))
+        .collect::<Vec<_>>();
+    let edges = node_ids
+        .windows(2)
+        .map(|window| GraphEdge {
+            source: window[0].to_owned(),
+            target: window[1].to_owned(),
+            kind: GraphEdgeKind::PrimaryParent,
+        })
+        .collect::<Vec<_>>();
+    let head_id = node_ids
+        .last()
+        .expect("linear snapshot should have at least one node")
+        .to_string();
+
+    GraphSnapshot {
+        version,
+        root_id: "root".to_owned(),
+        nodes,
+        edges,
+        branches: vec![GraphBranch {
+            name: "main".to_owned(),
+            head_id,
+            state: SessionState::Active,
+        }],
+    }
+}
+
+fn viewport_rendered_node_keys(
+    snapshot: &GraphSnapshot,
+    request: GraphViewportRequest,
+) -> BTreeSet<String> {
+    layout_graph_viewport(snapshot, request)
+        .nodes
+        .into_iter()
+        .map(|node| node.key)
+        .collect()
+}
+
+fn strict_viewport_node_keys(
+    snapshot: &GraphSnapshot,
+    request: GraphViewportRequest,
+) -> BTreeSet<String> {
+    viewport_rendered_node_keys(
+        snapshot,
+        GraphViewportRequest {
+            overscan: 0,
+            ..request
+        },
+    )
+}
+
+fn apply_diff_node_keys(
+    mut rendered: BTreeSet<String>,
+    snapshot: &GraphSnapshot,
+    previous: GraphViewportRequest,
+    current: GraphViewportRequest,
+) -> BTreeSet<String> {
+    let diff = layout_graph_viewport_diff(
+        snapshot,
+        GraphViewportDiffRequest {
+            previous,
+            current,
+            known: None,
+        },
+    );
+    for item in diff.removed {
+        if item.kind == GraphViewportItemKind::Node {
+            rendered.remove(&item.key);
+        }
+    }
+    rendered.extend(diff.added.nodes.into_iter().map(|node| node.key));
+    rendered.extend(diff.updated.nodes.into_iter().map(|node| node.key));
+    rendered
 }
 
 #[test]
@@ -146,13 +258,29 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
     ));
 
     let html = render_snapshot_page(&snapshot);
-    assert!(html.contains("href=\"#detail-"));
+    assert!(html.contains("class=\"graph-wrap virtual-graph\""));
+    assert!(html.contains("class=\"graph-lanes\""));
+    assert!(html.contains("class=\"graph-edges\""));
+    assert!(html.contains("class=\"graph-nodes\""));
     assert!(html.contains("body:has(#detail-"));
-    assert!(html.contains("class=\"minimap\""));
+    assert!(html.contains("class=\"viewport-map\""));
+    assert!(html.contains("Graph viewport navigator"));
     assert!(html.contains("preserveAspectRatio=\"xMidYMid meet\""));
-    assert!(html.contains("class=\"minimap-viewport\""));
+    assert!(html.contains("class=\"viewport-map-window\""));
     assert!(html.contains("data-graph-width="));
+    assert!(!html.contains("class=\"minimap-node\""));
+    assert!(!html.contains("class=\"minimap-edge\""));
     assert!(!html.contains("/?node="));
+}
+
+#[test]
+fn empty_snapshot_page_still_renders_virtual_graph_shell() {
+    let html = render_snapshot_page(&empty_snapshot(30));
+
+    assert!(html.contains("class=\"graph-wrap virtual-graph\""));
+    assert!(html.contains("class=\"graph-lanes\""));
+    assert!(html.contains("class=\"viewport-map\""));
+    assert!(html.contains("Loading graph..."));
 }
 
 #[test]
@@ -492,6 +620,801 @@ fn layout_expands_empty_columns_from_event_order() {
 }
 
 #[test]
+fn graph_viewport_response_includes_canvas_and_visible_nodes() {
+    let snapshot = GraphSnapshot {
+        version: 11,
+        root_id: "root".to_owned(),
+        nodes: vec![
+            graph_node("base", 0),
+            graph_node("side-a", 1),
+            graph_node("side-b", 2),
+            graph_node("merged", 3),
+        ],
+        edges: vec![GraphEdge {
+            source: "base".to_owned(),
+            target: "merged".to_owned(),
+            kind: GraphEdgeKind::PrimaryParent,
+        }],
+        branches: vec![GraphBranch {
+            name: "main".to_owned(),
+            head_id: "merged".to_owned(),
+            state: SessionState::Active,
+        }],
+    };
+
+    let response = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: 0,
+            y: 0,
+            width: GRAPH_LEFT_X + 80,
+            height: GRAPH_TOP_Y + 80,
+            overscan: 0,
+        },
+    );
+
+    assert_eq!(response.version, 11);
+    assert!(response.canvas.width > response.viewport.width);
+    assert!(response.canvas.height >= response.viewport.height);
+    assert_eq!(response.viewport.overscan, 0);
+    assert!(response.lanes.iter().any(|lane| lane.label == "main"));
+    assert!(
+        response
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:base:120:90")
+    );
+    assert!(!response.nodes.iter().any(|node| node.id == "merged"));
+}
+
+#[test]
+fn graph_viewport_response_uses_stable_keys_for_patchable_items() {
+    let snapshot = two_node_snapshot(12);
+
+    let response = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: 0,
+            y: 0,
+            width: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH + 80,
+            height: GRAPH_TOP_Y + 80,
+            overscan: 0,
+        },
+    );
+
+    assert!(response.lanes.iter().any(|lane| lane.key == "lane:main"));
+    assert!(
+        response
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:base:120:90")
+    );
+    assert!(
+        response
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:merged:340:90")
+    );
+    assert!(response.edges.iter().any(|edge| {
+        edge.key == "edge:primary_parent:base:120:90:merged:340:90"
+            && edge.source_id == "base"
+            && edge.target_id == "merged"
+    }));
+}
+
+#[test]
+fn graph_viewport_uses_unique_keys_for_duplicate_node_occurrences() {
+    let mut snapshot = two_node_snapshot(28);
+    snapshot.branches.push(GraphBranch {
+        name: "side".to_owned(),
+        head_id: "merged".to_owned(),
+        state: SessionState::Active,
+    });
+
+    let response = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: 0,
+            y: 0,
+            width: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH + 80,
+            height: GRAPH_TOP_Y + GRAPH_LANE_HEIGHT + 80,
+            overscan: 0,
+        },
+    );
+    let merged_keys = response
+        .nodes
+        .iter()
+        .filter(|node| node.id == "merged")
+        .map(|node| node.key.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(merged_keys.len(), 2);
+    assert_ne!(merged_keys[0], merged_keys[1]);
+    assert!(
+        merged_keys
+            .iter()
+            .all(|key| key.starts_with("node:merged:"))
+    );
+}
+
+#[test]
+fn graph_viewport_uses_unique_keys_for_duplicate_edge_occurrences() {
+    let mut snapshot = two_node_snapshot(31);
+    snapshot.branches.push(GraphBranch {
+        name: "side".to_owned(),
+        head_id: "merged".to_owned(),
+        state: SessionState::Active,
+    });
+
+    let response = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: 0,
+            y: 0,
+            width: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH + 80,
+            height: GRAPH_TOP_Y + GRAPH_LANE_HEIGHT + 80,
+            overscan: 0,
+        },
+    );
+    let edge_keys = response
+        .edges
+        .iter()
+        .filter(|edge| edge.source_id == "base" && edge.target_id == "merged")
+        .map(|edge| edge.key.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(edge_keys.len(), 2);
+    assert_ne!(edge_keys[0], edge_keys[1]);
+    assert!(
+        edge_keys
+            .iter()
+            .all(|key| key.contains(":base:") && key.contains(":merged:"))
+    );
+}
+
+#[test]
+fn graph_viewport_overscan_includes_nodes_outside_strict_viewport() {
+    let snapshot = two_node_snapshot(13);
+
+    let without_overscan = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: 0,
+            y: 0,
+            width: GRAPH_LEFT_X + 80,
+            height: GRAPH_TOP_Y + 80,
+            overscan: 0,
+        },
+    );
+    let with_overscan = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: 0,
+            y: 0,
+            width: GRAPH_LEFT_X + 80,
+            height: GRAPH_TOP_Y + 80,
+            overscan: GRAPH_COLUMN_WIDTH,
+        },
+    );
+
+    assert!(
+        !without_overscan
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:merged:340:90")
+    );
+    assert!(
+        with_overscan
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:merged:340:90")
+    );
+}
+
+#[test]
+fn graph_viewport_overscan_preloads_nodes_and_edges() {
+    let snapshot = two_node_snapshot(23);
+
+    let response = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: 0,
+            y: 0,
+            width: GRAPH_LEFT_X + 80,
+            height: GRAPH_TOP_Y + 80,
+            overscan: GRAPH_COLUMN_WIDTH,
+        },
+    );
+
+    assert!(
+        response
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:merged:340:90"),
+        "overscan should preload the neighboring endpoint node"
+    );
+    assert!(
+        response
+            .edges
+            .iter()
+            .any(|edge| edge.key == "edge:primary_parent:base:120:90:merged:340:90"),
+        "edges can render from the expanded viewport even when an endpoint is outside the strict view"
+    );
+}
+
+#[test]
+fn graph_viewport_half_view_overscan_preloads_neighbor_nodes() {
+    let snapshot = linear_snapshot(24, &["n0", "n1", "n2"]);
+    let viewport_width = GRAPH_COLUMN_WIDTH * 2;
+
+    let response = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: 0,
+            y: 0,
+            width: viewport_width,
+            height: GRAPH_TOP_Y + 80,
+            overscan: viewport_width / 2,
+        },
+    );
+
+    assert!(
+        response
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:n0:120:90")
+    );
+    assert!(
+        response
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:n1:340:90")
+    );
+    assert!(
+        response
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:n2:560:90"),
+        "half-view overscan should keep the next node ready before it enters view"
+    );
+}
+
+#[test]
+fn graph_viewport_stepwise_diff_keeps_visible_nodes_rendered() {
+    let snapshot = linear_snapshot(25, &["n0", "n1", "n2", "n3", "n4", "n5"]);
+    let width = GRAPH_COLUMN_WIDTH * 2;
+    let overscan = width / 2;
+    let viewports = [0, GRAPH_COLUMN_WIDTH / 2, GRAPH_COLUMN_WIDTH]
+        .into_iter()
+        .map(|x| GraphViewportRequest {
+            x,
+            y: 0,
+            width,
+            height: GRAPH_TOP_Y + 80,
+            overscan,
+        })
+        .collect::<Vec<_>>();
+    let mut rendered = viewport_rendered_node_keys(&snapshot, viewports[0]);
+
+    for window in viewports.windows(2) {
+        rendered = apply_diff_node_keys(rendered, &snapshot, window[0], window[1]);
+        let strict_nodes = strict_viewport_node_keys(&snapshot, window[1]);
+        assert!(
+            strict_nodes.is_subset(&rendered),
+            "applying each diff should keep visible nodes in the rendered set"
+        );
+    }
+}
+
+#[test]
+fn graph_viewport_skipped_intermediate_patch_can_leave_visible_nodes_unrendered() {
+    let snapshot = linear_snapshot(26, &["n0", "n1", "n2", "n3", "n4", "n5"]);
+    let width = GRAPH_COLUMN_WIDTH * 2;
+    let overscan = width / 2;
+    let initial = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width,
+        height: GRAPH_TOP_Y + 80,
+        overscan,
+    };
+    let current = GraphViewportRequest {
+        x: GRAPH_COLUMN_WIDTH * 2,
+        y: 0,
+        width,
+        height: GRAPH_TOP_Y + 80,
+        overscan,
+    };
+    let rendered = viewport_rendered_node_keys(&snapshot, initial);
+    let strict_nodes = strict_viewport_node_keys(&snapshot, current);
+    let missing = strict_nodes
+        .difference(&rendered)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    assert!(
+        !missing.is_empty(),
+        "if intermediate patches are skipped while viewBox keeps moving, visible nodes can outrun the rendered payload"
+    );
+}
+
+#[test]
+fn graph_viewport_coalesced_patch_catches_up_visible_nodes() {
+    let snapshot = linear_snapshot(27, &["n0", "n1", "n2", "n3", "n4", "n5"]);
+    let width = GRAPH_COLUMN_WIDTH * 2;
+    let overscan = width / 2;
+    let initial = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width,
+        height: GRAPH_TOP_Y + 80,
+        overscan,
+    };
+    let current = GraphViewportRequest {
+        x: GRAPH_COLUMN_WIDTH * 2,
+        y: 0,
+        width,
+        height: GRAPH_TOP_Y + 80,
+        overscan,
+    };
+    let rendered = apply_diff_node_keys(
+        viewport_rendered_node_keys(&snapshot, initial),
+        &snapshot,
+        initial,
+        current,
+    );
+    let strict_nodes = strict_viewport_node_keys(&snapshot, current);
+
+    assert!(
+        strict_nodes.is_subset(&rendered),
+        "a coalesced patch from the last rendered viewport to the latest target should catch up visible nodes"
+    );
+}
+
+#[test]
+fn graph_viewport_includes_edges_crossing_visible_bounds() {
+    let snapshot = two_node_snapshot(14);
+
+    let response = layout_graph_viewport(
+        &snapshot,
+        GraphViewportRequest {
+            x: GRAPH_LEFT_X + 80,
+            y: GRAPH_TOP_Y - 20,
+            width: GRAPH_COLUMN_WIDTH - 160,
+            height: 40,
+            overscan: 0,
+        },
+    );
+
+    assert!(response.nodes.is_empty());
+    assert!(
+        response
+            .edges
+            .iter()
+            .any(|edge| edge.key == "edge:primary_parent:base:120:90:merged:340:90")
+    );
+}
+
+#[test]
+fn graph_viewport_diff_reports_added_and_removed_items() {
+    let snapshot = two_node_snapshot(15);
+
+    let diff = layout_graph_viewport_diff(
+        &snapshot,
+        GraphViewportDiffRequest {
+            previous: GraphViewportRequest {
+                x: 0,
+                y: 0,
+                width: GRAPH_LEFT_X + 80,
+                height: GRAPH_TOP_Y + 80,
+                overscan: 0,
+            },
+            current: GraphViewportRequest {
+                x: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH - 80,
+                y: 0,
+                width: 180,
+                height: GRAPH_TOP_Y + 80,
+                overscan: 0,
+            },
+            known: None,
+        },
+    );
+
+    assert_eq!(diff.version, 15);
+    assert!(
+        diff.added
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:merged:340:90")
+    );
+    assert!(
+        diff.removed
+            .iter()
+            .any(|item| item.key == "node:base:120:90")
+    );
+    assert!(diff.updated.nodes.is_empty());
+}
+
+#[test]
+fn graph_viewport_diff_keeps_edges_when_only_an_endpoint_leaves_viewport() {
+    let snapshot = linear_snapshot(20, &["n0", "n1", "n2"]);
+    let previous = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+    let current = GraphViewportRequest {
+        x: GRAPH_LEFT_X + 80,
+        y: 0,
+        width: GRAPH_COLUMN_WIDTH - 160,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+
+    let diff = layout_graph_viewport_diff(
+        &snapshot,
+        GraphViewportDiffRequest {
+            previous,
+            current,
+            known: None,
+        },
+    );
+
+    assert!(
+        diff.removed
+            .iter()
+            .any(|item| item.kind == GraphViewportItemKind::Node && item.key == "node:n0:120:90")
+    );
+    assert!(
+        !diff.removed.iter().any(|item| {
+            item.kind == GraphViewportItemKind::Edge
+                && item.key == "edge:primary_parent:n0:120:90:n1:340:90"
+        }),
+        "an edge can remain visible while only one endpoint node is in the viewport payload"
+    );
+}
+
+#[test]
+fn graph_viewport_diff_sliding_window_replaces_incident_edges() {
+    let snapshot = linear_snapshot(21, &["n0", "n1", "n2", "n3"]);
+    let previous = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+    let current = GraphViewportRequest {
+        x: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH - 80,
+        y: 0,
+        width: GRAPH_COLUMN_WIDTH + 160,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+
+    let diff = layout_graph_viewport_diff(
+        &snapshot,
+        GraphViewportDiffRequest {
+            previous,
+            current,
+            known: None,
+        },
+    );
+
+    assert!(
+        diff.removed
+            .iter()
+            .any(|item| item.kind == GraphViewportItemKind::Node && item.key == "node:n0:120:90")
+    );
+    assert!(
+        diff.added
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:n2:560:90")
+    );
+    assert!(
+        diff.added
+            .edges
+            .iter()
+            .any(|edge| edge.key == "edge:primary_parent:n1:340:90:n2:560:90")
+    );
+    assert!(
+        !diff.removed.iter().any(|item| {
+            item.kind == GraphViewportItemKind::Edge
+                && item.key == "edge:primary_parent:n0:120:90:n1:340:90"
+        }),
+        "sliding the viewport should keep a crossing edge until it leaves the expanded render area"
+    );
+}
+
+#[test]
+fn graph_viewport_diff_same_viewport_is_empty_without_known_items() {
+    let snapshot = two_node_snapshot(16);
+    let viewport = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+
+    let diff = layout_graph_viewport_diff(
+        &snapshot,
+        GraphViewportDiffRequest {
+            previous: viewport,
+            current: viewport,
+            known: None,
+        },
+    );
+
+    assert!(diff.added.nodes.is_empty());
+    assert!(diff.added.edges.is_empty());
+    assert!(diff.updated.nodes.is_empty());
+    assert!(diff.updated.edges.is_empty());
+    assert!(diff.removed.is_empty());
+}
+
+#[test]
+fn graph_viewport_diff_known_items_reports_added_updated_and_removed() {
+    let snapshot = two_node_snapshot(17);
+    let viewport = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+
+    let diff = layout_graph_viewport_diff(
+        &snapshot,
+        GraphViewportDiffRequest {
+            previous: viewport,
+            current: viewport,
+            known: Some(GraphViewportKnownItems {
+                lanes: vec!["lane:main".to_owned()],
+                nodes: vec!["node:base:120:90".to_owned(), "node:stale".to_owned()],
+                edges: vec!["edge:primary_parent:base:stale".to_owned()],
+            }),
+        },
+    );
+
+    assert!(
+        diff.added
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:merged:340:90")
+    );
+    assert!(
+        diff.added
+            .edges
+            .iter()
+            .any(|edge| edge.key == "edge:primary_parent:base:120:90:merged:340:90")
+    );
+    assert!(
+        diff.updated
+            .lanes
+            .iter()
+            .any(|lane| lane.key == "lane:main")
+    );
+    assert!(
+        diff.updated
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:base:120:90")
+    );
+    assert!(
+        diff.removed
+            .iter()
+            .any(|item| { item.kind == GraphViewportItemKind::Node && item.key == "node:stale" })
+    );
+    assert!(diff.removed.iter().any(|item| {
+        item.kind == GraphViewportItemKind::Edge && item.key == "edge:primary_parent:base:stale"
+    }));
+}
+
+#[test]
+fn graph_viewport_diff_known_empty_set_reports_current_items_as_added() {
+    let snapshot = two_node_snapshot(29);
+    let viewport = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + GRAPH_COLUMN_WIDTH + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+
+    let diff = layout_graph_viewport_diff(
+        &snapshot,
+        GraphViewportDiffRequest {
+            previous: viewport,
+            current: viewport,
+            known: Some(GraphViewportKnownItems::default()),
+        },
+    );
+
+    assert!(
+        diff.added
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:base:120:90")
+    );
+    assert!(
+        diff.added
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:merged:340:90")
+    );
+    assert!(
+        diff.added
+            .edges
+            .iter()
+            .any(|edge| edge.key == "edge:primary_parent:base:120:90:merged:340:90")
+    );
+    assert!(diff.removed.is_empty());
+}
+
+#[test]
+fn graph_viewport_diff_known_items_updates_edges_without_visible_endpoint_nodes() {
+    let snapshot = linear_snapshot(22, &["n0", "n1", "n2"]);
+    let viewport = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+
+    let diff = layout_graph_viewport_diff(
+        &snapshot,
+        GraphViewportDiffRequest {
+            previous: viewport,
+            current: viewport,
+            known: Some(GraphViewportKnownItems {
+                lanes: Vec::new(),
+                nodes: vec!["node:n0:120:90".to_owned()],
+                edges: vec!["edge:primary_parent:n0:120:90:n1:340:90".to_owned()],
+            }),
+        },
+    );
+
+    assert!(
+        diff.updated
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:n0:120:90"),
+        "the visible endpoint should remain updated"
+    );
+    assert!(diff.added.edges.is_empty());
+    assert!(
+        diff.updated
+            .edges
+            .iter()
+            .any(|edge| edge.key == "edge:primary_parent:n0:120:90:n1:340:90")
+    );
+    assert!(!diff.removed.iter().any(|item| {
+        item.kind == GraphViewportItemKind::Edge
+            && item.key == "edge:primary_parent:n0:120:90:n1:340:90"
+    }));
+}
+
+#[test]
+fn graph_viewport_diff_zooming_out_adds_newly_visible_items() {
+    let snapshot = linear_snapshot(18, &["n0", "n1", "n2", "n3"]);
+    let previous = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+    let current = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + 3 * GRAPH_COLUMN_WIDTH + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+
+    let diff = layout_graph_viewport_diff(
+        &snapshot,
+        GraphViewportDiffRequest {
+            previous,
+            current,
+            known: None,
+        },
+    );
+
+    assert!(
+        diff.added
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:n2:560:90")
+    );
+    assert!(
+        diff.added
+            .nodes
+            .iter()
+            .any(|node| node.key == "node:n3:780:90")
+    );
+    assert!(
+        diff.added
+            .edges
+            .iter()
+            .any(|edge| edge.key == "edge:primary_parent:n1:340:90:n2:560:90")
+    );
+    assert!(
+        !diff
+            .removed
+            .iter()
+            .any(|item| item.kind == GraphViewportItemKind::Node)
+    );
+}
+
+#[test]
+fn graph_viewport_diff_zooming_in_removes_items_outside_new_viewport() {
+    let snapshot = linear_snapshot(19, &["n0", "n1", "n2", "n3"]);
+    let previous = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + 3 * GRAPH_COLUMN_WIDTH + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+    let current = GraphViewportRequest {
+        x: 0,
+        y: 0,
+        width: GRAPH_LEFT_X + 80,
+        height: GRAPH_TOP_Y + 80,
+        overscan: 0,
+    };
+
+    let diff = layout_graph_viewport_diff(
+        &snapshot,
+        GraphViewportDiffRequest {
+            previous,
+            current,
+            known: None,
+        },
+    );
+
+    assert!(
+        diff.removed.iter().any(|item| {
+            item.kind == GraphViewportItemKind::Node && item.key == "node:n2:560:90"
+        })
+    );
+    assert!(
+        diff.removed.iter().any(|item| {
+            item.kind == GraphViewportItemKind::Node && item.key == "node:n3:780:90"
+        })
+    );
+    assert!(diff.removed.iter().any(|item| {
+        item.kind == GraphViewportItemKind::Edge
+            && item.key == "edge:primary_parent:n1:340:90:n2:560:90"
+    }));
+    assert!(diff.added.nodes.is_empty());
+}
+
+#[test]
+fn graph_viewport_request_normalizes_negative_or_empty_dimensions() {
+    let request = GraphViewportRequest {
+        x: -50,
+        y: -10,
+        width: 0,
+        height: -1,
+        overscan: -20,
+    }
+    .normalized();
+
+    assert_eq!(request.x, 0);
+    assert_eq!(request.y, 0);
+    assert_eq!(request.width, 1);
+    assert_eq!(request.height, 1);
+    assert_eq!(request.overscan, 0);
+}
+
+#[test]
 fn routed_edges_use_inter_lane_corridors() {
     let source = Point {
         x: GRAPH_LEFT_X,
@@ -532,13 +1455,9 @@ fn streamed_graph_markup_escapes_dynamic_values() {
 
     let html = render_snapshot_page(&snapshot);
 
-    assert!(html.contains("data-node-id=\"node-&#34;&#60;&#38;\""));
-    assert!(
-        html.contains(
-            "node-&#34;&#60;&#38;: &#60;script&#62;alert(1)&#60;/script&#62; &#38; title"
-        )
-    );
-    assert!(html.contains("Text&#60;&#38;"));
+    assert!(html.contains("class=\"graph-lanes\""));
+    assert!(html.contains("class=\"graph-edges\""));
+    assert!(html.contains("class=\"graph-nodes\""));
     assert!(!html.contains("<script>alert(1)</script>"));
     assert!(!html.contains("<img src=x onerror=alert(1)>"));
 }
