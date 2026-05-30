@@ -108,6 +108,17 @@ where
         return Ok(());
     };
 
+    handle_request(stream, request, state).await
+}
+
+async fn handle_request<S>(
+    mut stream: tokio::net::TcpStream,
+    request: HttpRequest,
+    state: AppState<S>,
+) -> io::Result<()>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
     if request.method != "GET" {
         return write_response(
             &mut stream,
@@ -119,23 +130,20 @@ where
         .await;
     }
 
-    match request.path.as_str() {
-        "/" | "/index.html" => {
-            match build_graph_snapshot(&state.store, state.publisher.current_version()) {
-                Ok(snapshot) => {
-                    let body = render_index_page(&snapshot);
-                    write_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        "text/html; charset=utf-8",
-                        body.as_bytes(),
-                    )
-                    .await
-                }
-                Err(error) => write_error(&mut stream, error).await,
-            }
-        }
+    handle_get_request(stream, request.path, request.version, state).await
+}
+
+async fn handle_get_request<S>(
+    mut stream: tokio::net::TcpStream,
+    path: String,
+    observed_version: Option<u64>,
+    state: AppState<S>,
+) -> io::Result<()>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    match path.as_str() {
+        "/" | "/index.html" => write_index_page(&mut stream, &state).await,
         "/style.css" => {
             write_response(
                 &mut stream,
@@ -146,27 +154,8 @@ where
             )
             .await
         }
-        "/api/graph" => match build_graph_snapshot(&state.store, state.publisher.current_version())
-        {
-            Ok(snapshot) => match serde_json::to_vec(&snapshot) {
-                Ok(body) => {
-                    write_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        "application/json; charset=utf-8",
-                        &body,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    write_plain_error(&mut stream, format!("failed to serialize graph: {error}"))
-                        .await
-                }
-            },
-            Err(error) => write_error(&mut stream, error).await,
-        },
-        "/fragment" => write_fragment(&mut stream, state, request.version).await,
+        "/api/graph" => write_graph_json(&mut stream, &state).await,
+        "/fragment" => write_fragment(&mut stream, state, observed_version).await,
         "/events" => write_event_stream(stream, state.publisher).await,
         "/pkg/coco_console.js" => {
             write_asset_file(
@@ -188,6 +177,50 @@ where
                 b"not found",
             )
             .await
+        }
+    }
+}
+
+async fn write_index_page<S>(
+    stream: &mut tokio::net::TcpStream,
+    state: &AppState<S>,
+) -> io::Result<()>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+        Ok(snapshot) => {
+            let body = render_index_page(&snapshot);
+            write_response(
+                stream,
+                200,
+                "OK",
+                "text/html; charset=utf-8",
+                body.as_bytes(),
+            )
+            .await
+        }
+        Err(error) => write_error(stream, error).await,
+    }
+}
+
+async fn write_graph_json<S>(
+    stream: &mut tokio::net::TcpStream,
+    state: &AppState<S>,
+) -> io::Result<()>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let snapshot = match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return write_error(stream, error).await,
+    };
+    match serde_json::to_vec(&snapshot) {
+        Ok(body) => {
+            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await
+        }
+        Err(error) => {
+            write_plain_error(stream, format!("failed to serialize graph: {error}")).await
         }
     }
 }
@@ -384,8 +417,16 @@ async fn write_graph_event(stream: &mut tokio::net::TcpStream, version: u64) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::read_request;
-    use tokio::io::AsyncWriteExt;
+    use super::{AppState, handle_connection, read_request};
+    use coco_mem::MemoryStore;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_state() -> AppState<MemoryStore> {
+        AppState {
+            store: MemoryStore::new(),
+            publisher: crate::ConsolePublisher::new(),
+        }
+    }
 
     async fn read_request_from(bytes: &[u8]) -> Option<super::HttpRequest> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -402,6 +443,41 @@ mod tests {
         let request = read_request(&mut stream).await.unwrap();
         client.await.unwrap();
         request
+    }
+
+    async fn response_bytes_from(bytes: &[u8]) -> Vec<u8> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, test_state()).await.unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(bytes).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+
+        response
+    }
+
+    async fn response_from(bytes: &[u8]) -> String {
+        let response = response_bytes_from(bytes).await;
+        String::from_utf8(response).unwrap()
+    }
+
+    fn assert_response(response: &str, status: &str, content_type: &str, body: &str) {
+        assert!(response.starts_with(status), "{response}");
+        assert!(response.contains(content_type), "{response}");
+        assert!(response.ends_with(body), "{response}");
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     #[tokio::test]
@@ -434,5 +510,101 @@ mod tests {
     async fn read_request_returns_none_for_empty_or_incomplete_request_line() {
         assert_eq!(read_request_from(b"").await, None);
         assert_eq!(read_request_from(b"GET\r\n\r\n").await, None);
+    }
+
+    #[tokio::test]
+    async fn handle_connection_rejects_non_get_requests() {
+        let response = response_from(b"POST / HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+
+        assert_response(
+            &response,
+            "HTTP/1.1 405 Method Not Allowed",
+            "content-type: text/plain; charset=utf-8",
+            "method not allowed",
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_returns_not_found_for_unknown_path() {
+        let response = response_from(b"GET /missing HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+
+        assert_response(
+            &response,
+            "HTTP/1.1 404 Not Found",
+            "content-type: text/plain; charset=utf-8",
+            "not found",
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_index_page() {
+        let response = response_from(b"GET /index.html HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("content-type: text/html; charset=utf-8"),
+            "{response}"
+        );
+        assert!(response.contains("<!doctype html>"), "{response}");
+        assert!(response.contains("data-version=\"0\""), "{response}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_style_css() {
+        let response = response_from(b"GET /style.css HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("content-type: text/css; charset=utf-8"),
+            "{response}"
+        );
+        assert!(response.contains("font-family"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_json() {
+        let response = response_from(b"GET /api/graph HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("content-type: application/json; charset=utf-8"),
+            "{response}"
+        );
+        assert!(response.contains("\"version\":0"), "{response}");
+        assert!(response.contains("\"nodes\""), "{response}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_fragment() {
+        let response = response_from(b"GET /fragment HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("content-type: text/html; charset=utf-8"),
+            "{response}"
+        );
+        assert!(response.contains("data-version=\"0\""), "{response}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_assets() {
+        let js =
+            response_bytes_from(b"GET /pkg/coco_console.js HTTP/1.1\r\nhost: localhost\r\n\r\n")
+                .await;
+        let wasm = response_bytes_from(
+            b"GET /pkg/coco_console_bg.wasm HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        )
+        .await;
+
+        assert!(js.starts_with(b"HTTP/1.1 200 OK"), "{js:?}");
+        assert!(contains_bytes(
+            &js,
+            b"content-type: text/javascript; charset=utf-8"
+        ));
+        assert!(contains_bytes(&js, b"import"));
+
+        assert!(wasm.starts_with(b"HTTP/1.1 200 OK"), "{wasm:?}");
+        assert!(contains_bytes(&wasm, b"content-type: application/wasm"));
+        assert!(contains_bytes(&wasm, b"\0asm"));
     }
 }

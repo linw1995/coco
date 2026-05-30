@@ -15,7 +15,6 @@ crap_args=(
   --threshold "${crap_threshold}"
 )
 crap_allow_args=(
-  --allow "handle_connection"
 )
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
