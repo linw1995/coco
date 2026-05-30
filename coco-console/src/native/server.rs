@@ -2,7 +2,6 @@ use coco_mem::Store;
 use snafu::prelude::*;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::ConsoleConfig;
@@ -21,6 +20,9 @@ use crate::{Error, Result};
 const REQUEST_HEADER_LIMIT: usize = 16 * 1024;
 const REQUEST_BODY_LIMIT: usize = 1024 * 1024;
 const STYLE_CSS: &str = include_str!("style.css");
+const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
+const COCO_CONSOLE_WASM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
 #[derive(Clone)]
 struct AppState<S> {
     store: S,
@@ -175,15 +177,24 @@ where
         "/fragment" => write_fragment(&mut stream, state, request.version()).await,
         "/events" => write_event_stream(stream, state.publisher).await,
         "/pkg/coco_console.js" => {
-            write_asset_file(
+            write_response(
                 &mut stream,
-                "coco_console.js",
+                200,
+                "OK",
                 "text/javascript; charset=utf-8",
+                COCO_CONSOLE_JS,
             )
             .await
         }
         "/pkg/coco_console_bg.wasm" => {
-            write_asset_file(&mut stream, "coco_console_bg.wasm", "application/wasm").await
+            write_response(
+                &mut stream,
+                200,
+                "OK",
+                "application/wasm",
+                COCO_CONSOLE_WASM,
+            )
+            .await
         }
         _ => {
             write_response(
@@ -560,46 +571,6 @@ where
         }
         Err(error) => write_error(stream, error).await,
     }
-}
-
-async fn write_asset_file(
-    stream: &mut tokio::net::TcpStream,
-    name: &str,
-    content_type: &str,
-) -> io::Result<()> {
-    let Some(path) = find_asset_file(name) else {
-        return write_response(
-            stream,
-            404,
-            "Not Found",
-            "text/plain; charset=utf-8",
-            b"console wasm asset not found",
-        )
-        .await;
-    };
-
-    match std::fs::read(path) {
-        Ok(body) => write_response(stream, 200, "OK", content_type, &body).await,
-        Err(error) => {
-            write_plain_error(stream, format!("failed to read wasm asset: {error}")).await
-        }
-    }
-}
-
-fn find_asset_file(name: &str) -> Option<PathBuf> {
-    let configured = std::env::var_os("COCO_CONSOLE_ASSET_DIR")
-        .map(PathBuf::from)
-        .map(|dir| dir.join(name));
-    configured
-        .into_iter()
-        .chain(asset_candidates(name))
-        .find(|path| path.is_file())
-}
-
-fn asset_candidates(name: &str) -> impl Iterator<Item = PathBuf> + '_ {
-    [Path::new("coco-console/pkg"), Path::new("pkg")]
-        .into_iter()
-        .map(move |dir| dir.join(name))
 }
 
 async fn wait_for_newer_version(publisher: &ConsolePublisher, observed_version: Option<u64>) {

@@ -64,7 +64,7 @@ fn run() -> BuildResult<()> {
         .join(WASM_TARGET)
         .join("debug")
         .join("coco_console.wasm");
-    let pkg_dir = manifest_dir.join("pkg");
+    let pkg_dir = out_dir.join("pkg");
 
     let mut wasm_build = Command::new("cargo");
     wasm_build
