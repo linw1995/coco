@@ -306,6 +306,7 @@ impl VirtualGraph {
         self.viewport = viewport.into();
         self.zoom =
             (graph_client_width(&self.graph_wrap) / self.viewport.width).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.clamp_viewport();
         self.persist_viewport();
     }
 
@@ -325,6 +326,7 @@ impl VirtualGraph {
     }
 
     fn apply_full(&mut self, response: GraphViewportResponse) -> Result<(), JsValue> {
+        let response_viewport = ViewportState::from(response.viewport);
         clear_children(&self.lane_group);
         clear_children(&self.edge_group);
         clear_children(&self.node_group);
@@ -332,7 +334,7 @@ impl VirtualGraph {
         self.version = response.version;
         self.canvas = Some(response.canvas);
         self.set_viewport(response.viewport);
-        self.rendered_viewport = self.viewport;
+        self.rendered_viewport = response_viewport;
         self.set_root_version();
         self.apply_canvas()?;
         for lane in response.lanes {
@@ -590,15 +592,19 @@ async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
     let response =
         fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
             .await?;
-    let (document, refresh_shell) = {
+    let (document, refresh_shell, patch_needed) = {
         let mut graph = graph.borrow_mut();
         let refresh_shell = response.version != graph.version;
         let document = graph.document.clone();
         graph.apply_full(response)?;
-        (document, refresh_shell)
+        let patch_needed = !same_viewport(graph.rendered_viewport, graph.viewport);
+        (document, refresh_shell, patch_needed)
     };
     if refresh_shell {
         refresh_server_rendered_sections(&window, &document).await?;
+    }
+    if patch_needed {
+        request_viewport_patch(graph);
     }
     Ok(())
 }
