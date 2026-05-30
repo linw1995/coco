@@ -14,6 +14,7 @@ const SKIP_ENV: &str = "COCO_CONSOLE_SKIP_WASM_BUILD";
 const BUILDING_ENV: &str = "COCO_CONSOLE_BUILDING_WASM";
 const JS_ASSET: &str = "coco_console.js";
 const WASM_ASSET: &str = "coco_console_bg.wasm";
+const ASSET_STATE: &str = "console_asset_state.rs";
 const COVERAGE_ENV_VARS: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "LLVM_PROFILE_FILE"];
 
 #[derive(Debug, Snafu)]
@@ -71,6 +72,7 @@ fn run() -> BuildResult<()> {
 
     if env::var_os(SKIP_ENV).is_some() {
         prepare_skipped_package(&pkg_dir)?;
+        write_asset_state(&out_dir, false)?;
         return Ok(());
     }
 
@@ -100,6 +102,7 @@ fn run() -> BuildResult<()> {
             .arg(&wasm_file),
     )?;
     append_auto_start(&pkg_dir.join(JS_ASSET))?;
+    write_asset_state(&out_dir, true)?;
 
     Ok(())
 }
@@ -120,7 +123,18 @@ fn write_skipped_package_stubs(pkg_dir: &Path) -> BuildResult<()> {
     )
     .context(WriteGeneratedLoaderSnafu { path: js_path })?;
     let wasm_path = pkg_dir.join(WASM_ASSET);
-    fs::write(&wasm_path, []).context(WriteGeneratedLoaderSnafu { path: wasm_path })?;
+    fs::write(&wasm_path, b"coco-console wasm client was not built\n")
+        .context(WriteGeneratedLoaderSnafu { path: wasm_path })?;
+    Ok(())
+}
+
+fn write_asset_state(out_dir: &Path, built: bool) -> BuildResult<()> {
+    let path = out_dir.join(ASSET_STATE);
+    fs::write(
+        &path,
+        format!("const COCO_CONSOLE_ASSETS_BUILT: bool = {built};\n"),
+    )
+    .context(WriteGeneratedLoaderSnafu { path })?;
     Ok(())
 }
 

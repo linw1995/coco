@@ -21,6 +21,7 @@ use crate::{Error, Result};
 const REQUEST_HEADER_LIMIT: usize = 16 * 1024;
 const REQUEST_BODY_LIMIT: usize = 1024 * 1024;
 const STYLE_CSS: &str = include_str!("style.css");
+include!(concat!(env!("OUT_DIR"), "/console_asset_state.rs"));
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
 const COCO_CONSOLE_WASM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
@@ -197,6 +198,9 @@ where
         "/fragment" => write_fragment(stream, state, request.version()).await,
         "/events" => write_event_stream(stream, state.publisher).await,
         "/pkg/coco_console.js" => {
+            if !COCO_CONSOLE_ASSETS_BUILT {
+                return write_missing_console_asset(stream).await;
+            }
             write_response(
                 stream,
                 200,
@@ -208,6 +212,9 @@ where
             Ok(200)
         }
         "/pkg/coco_console_bg.wasm" => {
+            if !COCO_CONSOLE_ASSETS_BUILT {
+                return write_missing_console_asset(stream).await;
+            }
             write_response(stream, 200, "OK", "application/wasm", COCO_CONSOLE_WASM).await?;
             Ok(200)
         }
@@ -592,6 +599,18 @@ async fn write_response(
 
 async fn write_error(stream: &mut tokio::net::TcpStream, error: Error) -> io::Result<u16> {
     write_plain_error(stream, error.to_string()).await
+}
+
+async fn write_missing_console_asset(stream: &mut tokio::net::TcpStream) -> io::Result<u16> {
+    write_response(
+        stream,
+        404,
+        "Not Found",
+        "text/plain; charset=utf-8",
+        b"console wasm asset not built",
+    )
+    .await?;
+    Ok(404)
 }
 
 async fn write_plain_error(
