@@ -5,7 +5,7 @@ use std::rc::Rc;
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{Document, Element, MouseEvent, Response, WheelEvent, Window};
+use web_sys::{Document, Element, MouseEvent, RequestInit, Response, WheelEvent, Window};
 
 const ROOT_ID: &str = "console-root";
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
@@ -665,11 +665,9 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
         query.push('&');
         query.push_str(&known_query);
     }
-    let response = fetch_json::<GraphViewportDiffResponse>(
-        &window,
-        &format!("/api/graph/viewport/diff?{query}"),
-    )
-    .await?;
+    let response =
+        fetch_json_form::<GraphViewportDiffResponse>(&window, "/api/graph/viewport/diff", &query)
+            .await?;
     let (document, refresh_shell, should_continue) = {
         let mut graph = graph.borrow_mut();
         let refresh_shell = response.version != graph.version;
@@ -704,9 +702,10 @@ async fn refresh_on_graph_version(graph: Rc<RefCell<VirtualGraph>>) {
             query.push('&');
             query.push_str(&known_query);
         }
-        match fetch_json::<GraphViewportDiffResponse>(
+        match fetch_json_form::<GraphViewportDiffResponse>(
             &window,
-            &format!("/api/graph/viewport/diff?{query}"),
+            "/api/graph/viewport/diff",
+            &query,
         )
         .await
         {
@@ -913,10 +912,32 @@ where
     serde_json::from_str(&text).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
+async fn fetch_json_form<T>(window: &Window, url: &str, body: &str) -> Result<T, JsValue>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let text = fetch_text_form(window, url, body).await?;
+    serde_json::from_str(&text).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
 async fn fetch_text(window: &Window, url: &str) -> Result<String, JsValue> {
     let response = JsFuture::from(window.fetch_with_str(url))
         .await?
         .dyn_into::<Response>()?;
+    response_text(response).await
+}
+
+async fn fetch_text_form(window: &Window, url: &str, body: &str) -> Result<String, JsValue> {
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_body(&JsValue::from_str(body));
+    let response = JsFuture::from(window.fetch_with_str_and_init(url, &init))
+        .await?
+        .dyn_into::<Response>()?;
+    response_text(response).await
+}
+
+async fn response_text(response: Response) -> Result<String, JsValue> {
     if !response.ok() {
         return Err(JsValue::from_str(&format!(
             "request failed with status {}",

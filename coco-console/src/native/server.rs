@@ -19,6 +19,7 @@ use crate::render::{render_fragment, render_index_page};
 use crate::{Error, Result};
 
 const REQUEST_HEADER_LIMIT: usize = 16 * 1024;
+const REQUEST_BODY_LIMIT: usize = 1024 * 1024;
 const STYLE_CSS: &str = include_str!("style.css");
 #[derive(Clone)]
 struct AppState<S> {
@@ -123,18 +124,24 @@ async fn handle_request<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    if request.method != "GET" {
-        return write_response(
-            &mut stream,
-            405,
-            "Method Not Allowed",
-            "text/plain; charset=utf-8",
-            b"method not allowed",
-        )
-        .await;
+    if request.method == "GET" {
+        return handle_get_request(stream, request, state).await;
     }
 
-    handle_get_request(stream, request, state).await
+    if request.method == "POST" && request.path == "/api/graph/viewport/diff" {
+        let params = request.params();
+        return write_graph_viewport_diff_json(&mut stream, state, request.version(), &params)
+            .await;
+    }
+
+    write_response(
+        &mut stream,
+        405,
+        "Method Not Allowed",
+        "text/plain; charset=utf-8",
+        b"method not allowed",
+    )
+    .await
 }
 
 async fn handle_get_request<S>(
@@ -298,11 +305,20 @@ struct HttpRequest {
     method: String,
     path: String,
     query: QueryParams,
+    body: QueryParams,
 }
 
 impl HttpRequest {
     fn version(&self) -> Option<u64> {
-        self.query.u64("version")
+        self.query
+            .u64("version")
+            .or_else(|| self.body.u64("version"))
+    }
+
+    fn params(&self) -> QueryParams {
+        let mut params = self.query.clone();
+        params.pairs.extend(self.body.pairs.clone());
+        params
     }
 }
 
@@ -357,7 +373,11 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> io::Result<Option<H
         return Ok(None);
     }
 
-    let header = String::from_utf8_lossy(&buffer);
+    let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Ok(None);
+    };
+    let header_end = header_end + 4;
+    let header = String::from_utf8_lossy(&buffer[..header_end]);
     let mut parts = header.lines().next().unwrap_or_default().split_whitespace();
     let Some(method) = parts.next() else {
         return Ok(None);
@@ -366,12 +386,36 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> io::Result<Option<H
         return Ok(None);
     };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let content_length = content_length_from_header(&header).unwrap_or_default();
+    if content_length > REQUEST_BODY_LIMIT {
+        return Ok(None);
+    }
+    let mut body = buffer[header_end..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    let body = String::from_utf8_lossy(&body);
 
     Ok(Some(HttpRequest {
         method: method.to_owned(),
         path: path.to_owned(),
         query: parse_query(query),
+        body: parse_query(&body),
     }))
+}
+
+fn content_length_from_header(header: &str) -> Option<usize> {
+    header.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
 }
 
 fn parse_query(query: &str) -> QueryParams {
@@ -681,6 +725,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_request_parses_form_body() {
+        let request = read_request_from(
+            b"POST /api/graph/viewport/diff HTTP/1.1\r\nhost: localhost\r\ncontent-length: 24\r\n\r\nversion=42&known_node=n1",
+        )
+        .await
+        .expect("request should parse");
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/api/graph/viewport/diff");
+        assert_eq!(request.version(), Some(42));
+        assert_eq!(request.body.get_all("known_node"), vec!["n1"]);
+    }
+
+    #[tokio::test]
     async fn read_request_ignores_invalid_or_missing_version_query() {
         let invalid = read_request_from(b"GET /fragment?version=bad HTTP/1.1\r\n\r\n")
             .await
@@ -708,6 +766,26 @@ mod tests {
             "HTTP/1.1 405 Method Not Allowed",
             "content-type: text/plain; charset=utf-8",
             "method not allowed",
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_viewport_diff_post_body() {
+        let body = "x=0&y=0&width=640&height=360&known_node=node:stale&known_edge=edge:primary_parent:base:stale";
+        let request = format!(
+            "POST /api/graph/viewport/diff HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = response_from(request.as_bytes()).await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"kind\":\"node\""), "{response}");
+        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(response.contains("\"kind\":\"edge\""), "{response}");
+        assert!(
+            response.contains("\"key\":\"edge:primary_parent:base:stale\""),
+            "{response}"
         );
     }
 
