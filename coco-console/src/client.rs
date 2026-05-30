@@ -862,13 +862,36 @@ fn center_viewport_from_map(graph: &mut VirtualGraph, event: &MouseEvent) {
         return;
     };
     let rect = graph.viewport_map.get_bounding_client_rect();
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+    let canvas_width = f64::from(canvas.width);
+    let canvas_height = f64::from(canvas.height);
+    if rect.width() <= 0.0 || rect.height() <= 0.0 || canvas_width <= 0.0 || canvas_height <= 0.0 {
         return;
     }
-    let ratio_x = ((f64::from(event.client_x()) - rect.left()) / rect.width()).clamp(0.0, 1.0);
-    let ratio_y = ((f64::from(event.client_y()) - rect.top()) / rect.height()).clamp(0.0, 1.0);
-    graph.viewport.x = ratio_x * f64::from(canvas.width) - graph.viewport.width / 2.0;
-    graph.viewport.y = ratio_y * f64::from(canvas.height) - graph.viewport.height / 2.0;
+    let local_x = f64::from(event.client_x()) - rect.left();
+    let local_y = f64::from(event.client_y()) - rect.top();
+    let canvas_ratio = canvas_width / canvas_height;
+    let element_ratio = rect.width() / rect.height();
+    let (content_x, content_y, content_width, content_height) = if element_ratio > canvas_ratio {
+        let content_width = rect.height() * canvas_ratio;
+        (
+            (rect.width() - content_width) / 2.0,
+            0.0,
+            content_width,
+            rect.height(),
+        )
+    } else {
+        let content_height = rect.width() / canvas_ratio;
+        (
+            0.0,
+            (rect.height() - content_height) / 2.0,
+            rect.width(),
+            content_height,
+        )
+    };
+    let ratio_x = ((local_x - content_x) / content_width).clamp(0.0, 1.0);
+    let ratio_y = ((local_y - content_y) / content_height).clamp(0.0, 1.0);
+    graph.viewport.x = ratio_x * canvas_width - graph.viewport.width / 2.0;
+    graph.viewport.y = ratio_y * canvas_height - graph.viewport.height / 2.0;
     graph.clamp_viewport();
 }
 
@@ -949,7 +972,7 @@ fn clear_children(element: &Element) {
 }
 
 fn render_element_id(key: &str) -> String {
-    format!("graph-render-{}", css_token(key))
+    format!("graph-render-{}", percent_encode(key))
 }
 
 fn node_label(node: &GraphViewportNode) -> String {
