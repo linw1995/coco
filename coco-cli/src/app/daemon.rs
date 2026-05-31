@@ -2023,12 +2023,13 @@ mod tests {
     use crate::cli::{Cli, Command, DaemonCommand};
 
     use super::{
-        ChannelConfigs, DEFAULT_SESSION_BRANCH, LlmBackendFailureRecoveryRequested,
-        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, ProviderProfiles, SYSTEM_EVENT_QUEUE,
-        SystemEvent, SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, abort_channel_task,
-        daemon_console_config, decode_telegram_message, encode_telegram_message,
-        resolve_daemon_command_socket_path, resolve_daemon_socket_path, run_daemon_command,
+        ChannelConfigs, CocoCliDaemonServerHandle, DEFAULT_SESSION_BRANCH,
+        LlmBackendFailureRecoveryRequested, PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker,
+        ProviderProfiles, SYSTEM_EVENT_QUEUE, SystemEvent, SystemEventMessageQueueWorker,
+        TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher, TelegramMessageQueueWorker,
+        abort_channel_task, daemon_console_config, decode_telegram_message,
+        encode_telegram_message, resolve_daemon_command_socket_path, resolve_daemon_socket_path,
+        run_daemon_command,
     };
 
     fn daemon_command<I, T>(args: I) -> DaemonCommand
@@ -2146,6 +2147,32 @@ mod tests {
 
         assert!(matches!(error, crate::Error::BindDaemonSocket { .. }));
         assert!(store.get_session_state(DEFAULT_SESSION_BRANCH).is_ok());
+    }
+
+    #[tokio::test]
+    async fn daemon_server_handle_wait_returns_when_socket_task_finishes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("coco.sock");
+        fs::write(&socket_path, "").unwrap();
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(
+            store.clone(),
+            BlockingOnceBackend::default(),
+        ));
+        let handle = CocoCliDaemonServerHandle {
+            socket_path: socket_path.clone(),
+            llm,
+            socket_task: tokio::spawn(async {}),
+            channel_task: None,
+            message_queue_task: tokio::spawn(async {
+                std::future::pending::<crate::Result<()>>().await
+            }),
+            console: None,
+        };
+
+        handle.wait().await.unwrap();
+
+        assert!(!socket_path.exists());
     }
 
     #[tokio::test]

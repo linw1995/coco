@@ -61,6 +61,10 @@ mod tests {
         assert!(is_transport_failure(&Error::transport(
             std::io::Error::other("transport")
         )));
+        #[cfg(feature = "telegram")]
+        assert!(is_transport_failure(&Error::TelegramTransport {
+            source: crate::telegram::TelegramError::MissingResult,
+        }));
         assert!(!is_transport_failure(&Error::handler(
             std::io::Error::other("handler")
         )));
