@@ -1082,7 +1082,14 @@ fn refresh_inner_html(
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     install_node_detail_listener(graph.clone())?;
+    install_wheel_listener(graph.clone())?;
+    install_resize_listener(graph.clone())?;
+    install_viewport_map_listener(graph.clone())?;
+    install_hashchange_node_detail_listener(graph)?;
+    Ok(())
+}
 
+fn install_wheel_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let graph_wrap = graph.borrow().graph_wrap.clone();
     let wheel_graph = graph.clone();
     let wheel_closure = Closure::<dyn FnMut(WheelEvent)>::new(move |event: WheelEvent| {
@@ -1097,7 +1104,10 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     });
     graph_wrap.add_event_listener_with_callback("wheel", wheel_closure.as_ref().unchecked_ref())?;
     wheel_closure.forget();
+    Ok(())
+}
 
+fn install_resize_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let resize_graph = graph.clone();
     let resize_window = graph.borrow().window.clone();
     let resize_closure = Closure::<dyn FnMut()>::new(move || {
@@ -1108,7 +1118,10 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     resize_window
         .add_event_listener_with_callback("resize", resize_closure.as_ref().unchecked_ref())?;
     resize_closure.forget();
+    Ok(())
+}
 
+fn install_viewport_map_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let viewport_map = graph.borrow().viewport_map.clone();
     let viewport_map_graph = graph.clone();
     let viewport_map_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
@@ -1120,7 +1133,12 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     viewport_map
         .add_event_listener_with_callback("click", viewport_map_closure.as_ref().unchecked_ref())?;
     viewport_map_closure.forget();
+    Ok(())
+}
 
+fn install_hashchange_node_detail_listener(
+    graph: Rc<RefCell<VirtualGraph>>,
+) -> Result<(), JsValue> {
     let detail_graph = graph.clone();
     let detail_window = graph.borrow().window.clone();
     let detail_closure = Closure::<dyn FnMut()>::new(move || {
