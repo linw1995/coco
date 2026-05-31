@@ -400,21 +400,22 @@ impl VirtualGraph {
 
     fn routed_edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
         let element = svg_element(&self.document, "polyline")?;
-        let (class, marker) = match edge.kind {
-            GraphViewportEdgeKind::Fork => ("edge fork", "url(#fork-arrowhead)"),
-            GraphViewportEdgeKind::MergeParent => ("edge merge-parent", "url(#merge-arrowhead)"),
-            GraphViewportEdgeKind::PrimaryParent => unreachable!("primary edges use line elements"),
-        };
-        element.set_attribute("class", class)?;
-        element.set_attribute("marker-end", marker)?;
-        element.set_attribute(
-            "points",
-            &routed_elbow_points(
-                edge.source,
-                edge.target,
-                edge.route_slot,
-                edge.target_port_offset,
-            ),
+        let (class, marker) = routed_edge_style(edge.kind);
+        set_attributes(
+            &element,
+            [
+                ("class", class.to_string()),
+                ("marker-end", marker.to_string()),
+                (
+                    "points",
+                    routed_elbow_points(
+                        edge.source,
+                        edge.target,
+                        edge.route_slot,
+                        edge.target_port_offset,
+                    ),
+                ),
+            ],
         )?;
         Ok(element)
     }
@@ -580,6 +581,14 @@ where
         pending_update
     };
     request_viewport_update(graph, pending_update);
+}
+
+fn routed_edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
+    match kind {
+        GraphViewportEdgeKind::Fork => ("edge fork", "url(#fork-arrowhead)"),
+        GraphViewportEdgeKind::MergeParent => ("edge merge-parent", "url(#merge-arrowhead)"),
+        GraphViewportEdgeKind::PrimaryParent => unreachable!("primary edges use line elements"),
+    }
 }
 
 fn apply_graph_viewport(
