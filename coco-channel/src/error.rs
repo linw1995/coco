@@ -51,3 +51,19 @@ pub fn is_transport_failure(error: &Error) -> bool {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, is_transport_failure};
+
+    #[test]
+    fn detects_transport_failures() {
+        assert!(is_transport_failure(&Error::transport(
+            std::io::Error::other("transport")
+        )));
+        assert!(!is_transport_failure(&Error::handler(
+            std::io::Error::other("handler")
+        )));
+        assert!(!is_transport_failure(&Error::invalid_input("invalid")));
+    }
+}
