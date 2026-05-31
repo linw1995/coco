@@ -12,7 +12,8 @@ use crate::api::{
     GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, GraphViewportResponse, Point,
 };
 use crate::viewport::{
-    MIN_OVERSCAN, ViewportState, needs_full_viewport_fetch, rounded_i32, same_viewport,
+    MIN_OVERSCAN, ViewportState, needs_full_viewport_fetch, needs_full_viewport_jump_fetch,
+    rounded_i32, same_viewport,
 };
 
 const ROOT_ID: &str = "console-root";
@@ -104,6 +105,31 @@ impl RenderedKeys {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingViewportUpdate {
+    None,
+    Patch,
+    FullFetch,
+}
+
+impl PendingViewportUpdate {
+    fn merge(self, update: Self) -> Self {
+        match (self, update) {
+            (Self::FullFetch, _) | (_, Self::FullFetch) => Self::FullFetch,
+            (Self::Patch, _) | (_, Self::Patch) => Self::Patch,
+            (Self::None, Self::None) => Self::None,
+        }
+    }
+
+    fn needs_full_fetch(self) -> bool {
+        self == Self::FullFetch
+    }
+
+    fn is_pending(self) -> bool {
+        self != Self::None
+    }
+}
+
 struct VirtualGraph {
     window: Window,
     document: Document,
@@ -124,7 +150,7 @@ struct VirtualGraph {
     rendered: RenderedKeys,
     rendered_viewport: ViewportState,
     patch_in_flight: bool,
-    patch_requested: bool,
+    pending_viewport_update: PendingViewportUpdate,
 }
 
 impl VirtualGraph {
@@ -168,7 +194,7 @@ impl VirtualGraph {
             rendered: RenderedKeys::new(),
             rendered_viewport: viewport,
             patch_in_flight: false,
-            patch_requested: false,
+            pending_viewport_update: PendingViewportUpdate::None,
         })
     }
 
@@ -513,9 +539,13 @@ async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
 }
 
 fn request_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) {
+    request_viewport_update(graph, PendingViewportUpdate::Patch);
+}
+
+fn request_viewport_update(graph: Rc<RefCell<VirtualGraph>>, update: PendingViewportUpdate) {
     let should_spawn = {
         let mut graph = graph.borrow_mut();
-        graph.patch_requested = true;
+        graph.pending_viewport_update = graph.pending_viewport_update.merge(update);
         if graph.patch_in_flight {
             false
         } else {
@@ -527,6 +557,27 @@ fn request_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) {
     if should_spawn {
         spawn_local(drain_viewport_patches(graph));
     }
+}
+
+fn update_viewport<F>(graph: Rc<RefCell<VirtualGraph>>, update: F)
+where
+    F: FnOnce(&mut VirtualGraph),
+{
+    let pending_update = {
+        let mut graph = graph.borrow_mut();
+        let previous = graph.viewport;
+        update(&mut graph);
+        graph.clamp_viewport();
+        let pending_update = if needs_full_viewport_jump_fetch(previous, graph.viewport) {
+            PendingViewportUpdate::FullFetch
+        } else {
+            PendingViewportUpdate::Patch
+        };
+        let _ = graph.apply_canvas();
+        graph.persist_viewport();
+        pending_update
+    };
+    request_viewport_update(graph, pending_update);
 }
 
 async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
@@ -546,19 +597,20 @@ async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
 async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
     let (window, rendered, current, needs_full_fetch) = {
         let mut graph = graph.borrow_mut();
-        graph.patch_requested = false;
+        let update = graph.pending_viewport_update;
+        graph.pending_viewport_update = PendingViewportUpdate::None;
         let rendered = graph.rendered_viewport;
         let current = graph.viewport;
         (
             graph.window.clone(),
             rendered,
             current,
-            needs_full_viewport_fetch(rendered, current),
+            update.needs_full_fetch() || needs_full_viewport_fetch(rendered, current),
         )
     };
     if same_viewport(rendered, current) {
         let mut graph = graph.borrow_mut();
-        if graph.patch_requested {
+        if graph.pending_viewport_update.is_pending() {
             return Ok(true);
         }
         graph.patch_in_flight = false;
@@ -576,8 +628,8 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
             let refresh_shell = response.version != graph.version;
             let document = graph.document.clone();
             graph.apply_full(response)?;
-            let should_continue =
-                graph.patch_requested || !same_viewport(graph.rendered_viewport, graph.viewport);
+            let should_continue = graph.pending_viewport_update.is_pending()
+                || !same_viewport(graph.rendered_viewport, graph.viewport);
             if !should_continue {
                 graph.patch_in_flight = false;
             }
@@ -603,8 +655,8 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
         let refresh_shell = response.version != graph.version;
         let document = graph.document.clone();
         graph.apply_diff(response)?;
-        let should_continue =
-            graph.patch_requested || !same_viewport(graph.rendered_viewport, graph.viewport);
+        let should_continue = graph.pending_viewport_update.is_pending()
+            || !same_viewport(graph.rendered_viewport, graph.viewport);
         if !should_continue {
             graph.patch_in_flight = false;
         }
@@ -710,18 +762,13 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     let wheel_graph = graph.clone();
     let wheel_closure = Closure::<dyn FnMut(WheelEvent)>::new(move |event: WheelEvent| {
         event.prevent_default();
-        {
-            let mut graph = wheel_graph.borrow_mut();
+        update_viewport(wheel_graph.clone(), |graph| {
             if event.ctrl_key() || event.meta_key() {
-                zoom_from_wheel(&mut graph, &event);
+                zoom_from_wheel(graph, &event);
             } else {
-                pan_from_wheel(&mut graph, &event);
+                pan_from_wheel(graph, &event);
             }
-            graph.clamp_viewport();
-            let _ = graph.apply_canvas();
-            graph.persist_viewport();
-        }
-        request_viewport_patch(wheel_graph.clone());
+        });
     });
     graph_wrap.add_event_listener_with_callback("wheel", wheel_closure.as_ref().unchecked_ref())?;
     wheel_closure.forget();
@@ -729,13 +776,9 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     let resize_graph = graph.clone();
     let resize_window = graph.borrow().window.clone();
     let resize_closure = Closure::<dyn FnMut()>::new(move || {
-        {
-            let mut graph = resize_graph.borrow_mut();
+        update_viewport(resize_graph.clone(), |graph| {
             graph.resize_viewport();
-            let _ = graph.apply_canvas();
-            graph.persist_viewport();
-        }
-        request_viewport_patch(resize_graph.clone());
+        });
     });
     resize_window
         .add_event_listener_with_callback("resize", resize_closure.as_ref().unchecked_ref())?;
@@ -745,13 +788,9 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     let viewport_map_graph = graph.clone();
     let viewport_map_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
         event.prevent_default();
-        {
-            let mut graph = viewport_map_graph.borrow_mut();
-            center_viewport_from_map(&mut graph, &event);
-            let _ = graph.apply_canvas();
-            graph.persist_viewport();
-        }
-        request_viewport_patch(viewport_map_graph.clone());
+        update_viewport(viewport_map_graph.clone(), |graph| {
+            center_viewport_from_map(graph, &event);
+        });
     });
     viewport_map
         .add_event_listener_with_callback("click", viewport_map_closure.as_ref().unchecked_ref())?;
