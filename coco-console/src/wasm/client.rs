@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use serde::Deserialize;
@@ -92,34 +92,53 @@ impl From<GraphViewport> for ViewportState {
 }
 
 struct RenderedKeys {
-    lanes: BTreeSet<String>,
-    nodes: BTreeSet<String>,
-    edges: BTreeSet<String>,
+    lanes: BTreeMap<String, String>,
+    nodes: BTreeMap<String, String>,
+    edges: BTreeMap<String, String>,
 }
 
 impl RenderedKeys {
     fn new() -> Self {
         Self {
-            lanes: BTreeSet::new(),
-            nodes: BTreeSet::new(),
-            edges: BTreeSet::new(),
+            lanes: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
         }
     }
 
     fn known_query(&self) -> String {
         self.lanes
             .iter()
-            .map(|key| format!("known_lane={}", percent_encode(key)))
-            .chain(
-                self.nodes
-                    .iter()
-                    .map(|key| format!("known_node={}", percent_encode(key))),
-            )
-            .chain(
-                self.edges
-                    .iter()
-                    .map(|key| format!("known_edge={}", percent_encode(key))),
-            )
+            .flat_map(|(key, fingerprint)| {
+                [
+                    format!("known_lane={}", percent_encode(key)),
+                    format!(
+                        "known_lane_fingerprint={}:{}",
+                        percent_encode(key),
+                        fingerprint
+                    ),
+                ]
+            })
+            .chain(self.nodes.iter().flat_map(|(key, fingerprint)| {
+                [
+                    format!("known_node={}", percent_encode(key)),
+                    format!(
+                        "known_node_fingerprint={}:{}",
+                        percent_encode(key),
+                        fingerprint
+                    ),
+                ]
+            }))
+            .chain(self.edges.iter().flat_map(|(key, fingerprint)| {
+                [
+                    format!("known_edge={}", percent_encode(key)),
+                    format!(
+                        "known_edge_fingerprint={}:{}",
+                        percent_encode(key),
+                        fingerprint
+                    ),
+                ]
+            }))
             .collect::<Vec<_>>()
             .join("&")
     }
@@ -328,7 +347,9 @@ impl VirtualGraph {
         element.set_attribute("y", &lane.y.to_string())?;
         element.set_text_content(Some(&lane.label));
         self.lane_group.append_child(&element)?;
-        self.rendered.lanes.insert(lane.key);
+        self.rendered
+            .lanes
+            .insert(lane.key.clone(), lane.fingerprint());
         Ok(())
     }
 
@@ -343,7 +364,9 @@ impl VirtualGraph {
         element.set_attribute("id", &render_element_id(&edge.key))?;
         element.set_attribute("data-render-key", &edge.key)?;
         self.edge_group.append_child(&element)?;
-        self.rendered.edges.insert(edge.key);
+        self.rendered
+            .edges
+            .insert(edge.key.clone(), edge.fingerprint());
         Ok(())
     }
 
@@ -423,7 +446,9 @@ impl VirtualGraph {
         group.append_child(&kind)?;
         link.append_child(&group)?;
         self.node_group.append_child(&link)?;
-        self.rendered.nodes.insert(node.key);
+        self.rendered
+            .nodes
+            .insert(node.key.clone(), node.fingerprint());
         Ok(())
     }
 

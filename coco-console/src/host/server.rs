@@ -335,11 +335,21 @@ where
             Err(error) => return error_response(error),
         };
         let response = layout_graph_viewport_diff(&snapshot, request.clone());
-        if viewport_diff_has_key_changes(&response) || known_canvas != Some(response.canvas) {
+        if viewport_diff_has_changes(&response, request.known.as_ref())
+            || known_canvas != Some(response.canvas)
+        {
             return json_response(&response, "graph viewport items diff");
         }
         observed_version = current_version;
     }
+}
+
+fn viewport_diff_has_changes(
+    response: &crate::api::GraphViewportDiffResponse,
+    known: Option<&GraphViewportKnownItems>,
+) -> bool {
+    viewport_diff_has_key_changes(response)
+        || known.is_some_and(|known| viewport_diff_has_fingerprint_changes(response, known))
 }
 
 fn viewport_diff_has_key_changes(response: &crate::api::GraphViewportDiffResponse) -> bool {
@@ -347,6 +357,28 @@ fn viewport_diff_has_key_changes(response: &crate::api::GraphViewportDiffRespons
         || !response.added.nodes.is_empty()
         || !response.added.edges.is_empty()
         || !response.removed.is_empty()
+}
+
+fn viewport_diff_has_fingerprint_changes(
+    response: &crate::api::GraphViewportDiffResponse,
+    known: &GraphViewportKnownItems,
+) -> bool {
+    response.updated.lanes.iter().any(|lane| {
+        known
+            .lane_fingerprints
+            .get(&lane.key)
+            .is_none_or(|fingerprint| fingerprint != &lane.fingerprint())
+    }) || response.updated.nodes.iter().any(|node| {
+        known
+            .node_fingerprints
+            .get(&node.key)
+            .is_none_or(|fingerprint| fingerprint != &node.fingerprint())
+    }) || response.updated.edges.iter().any(|edge| {
+        known
+            .edge_fingerprints
+            .get(&edge.key)
+            .is_none_or(|fingerprint| fingerprint != &edge.fingerprint())
+    })
 }
 
 async fn fragment<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
@@ -551,14 +583,31 @@ fn known_canvas_from_query(query: &QueryParams) -> Option<GraphCanvas> {
 fn known_items_from_query(query: &QueryParams) -> Option<GraphViewportKnownItems> {
     let known = GraphViewportKnownItems {
         lanes: query.get_all("known_lane"),
+        lane_fingerprints: known_fingerprints_from_query(query, "known_lane_fingerprint"),
         nodes: query.get_all("known_node"),
+        node_fingerprints: known_fingerprints_from_query(query, "known_node_fingerprint"),
         edges: query.get_all("known_edge"),
+        edge_fingerprints: known_fingerprints_from_query(query, "known_edge_fingerprint"),
     };
     (query.contains_key("known")
         || !known.lanes.is_empty()
         || !known.nodes.is_empty()
         || !known.edges.is_empty())
     .then_some(known)
+}
+
+fn known_fingerprints_from_query(
+    query: &QueryParams,
+    key: &str,
+) -> std::collections::BTreeMap<String, String> {
+    query
+        .get_all(key)
+        .into_iter()
+        .filter_map(|value| {
+            let (item_key, fingerprint) = value.rsplit_once(':')?;
+            Some((item_key.to_owned(), fingerprint.to_owned()))
+        })
+        .collect()
 }
 
 async fn wait_for_newer_version(publisher: &ConsolePublisher, observed_version: Option<u64>) {
@@ -765,14 +814,26 @@ mod tests {
         for lane in rendered.lanes {
             query.push_str("&known_lane=");
             query.push_str(&lane.key);
+            query.push_str("&known_lane_fingerprint=");
+            query.push_str(&lane.key);
+            query.push(':');
+            query.push_str(&lane.fingerprint());
         }
         for node in rendered.nodes {
             query.push_str("&known_node=");
             query.push_str(&node.key);
+            query.push_str("&known_node_fingerprint=");
+            query.push_str(&node.key);
+            query.push(':');
+            query.push_str(&node.fingerprint());
         }
         for edge in rendered.edges {
             query.push_str("&known_edge=");
             query.push_str(&edge.key);
+            query.push_str("&known_edge_fingerprint=");
+            query.push_str(&edge.key);
+            query.push(':');
+            query.push_str(&edge.fingerprint());
         }
         let state = AppState {
             store: store.clone(),
@@ -866,14 +927,26 @@ mod tests {
         for lane in rendered.lanes {
             query.push_str("&known_lane=");
             query.push_str(&lane.key);
+            query.push_str("&known_lane_fingerprint=");
+            query.push_str(&lane.key);
+            query.push(':');
+            query.push_str(&lane.fingerprint());
         }
         for node in rendered.nodes {
             query.push_str("&known_node=");
             query.push_str(&node.key);
+            query.push_str("&known_node_fingerprint=");
+            query.push_str(&node.key);
+            query.push(':');
+            query.push_str(&node.fingerprint());
         }
         for edge in rendered.edges {
             query.push_str("&known_edge=");
             query.push_str(&edge.key);
+            query.push_str("&known_edge_fingerprint=");
+            query.push_str(&edge.key);
+            query.push(':');
+            query.push_str(&edge.fingerprint());
         }
         let state = AppState { store, publisher };
         let task = tokio::spawn(graph_viewport_diff_response(state, parse_query(&query)));

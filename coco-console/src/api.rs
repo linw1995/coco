@@ -70,6 +70,12 @@ pub struct GraphViewportLane {
     pub y: i32,
 }
 
+impl GraphViewportLane {
+    pub fn fingerprint(&self) -> String {
+        graph_viewport_item_fingerprint(self)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphViewportNode {
     pub key: String,
@@ -81,6 +87,12 @@ pub struct GraphViewportNode {
     pub labels: Vec<String>,
     pub x: i32,
     pub y: i32,
+}
+
+impl GraphViewportNode {
+    pub fn fingerprint(&self) -> String {
+        graph_viewport_item_fingerprint(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -101,4 +113,23 @@ pub struct GraphViewportEdge {
     pub target: Point,
     pub route_slot: i32,
     pub target_port_offset: f64,
+}
+
+impl GraphViewportEdge {
+    pub fn fingerprint(&self) -> String {
+        graph_viewport_item_fingerprint(self)
+    }
+}
+
+fn graph_viewport_item_fingerprint<T>(item: &T) -> String
+where
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec(item).expect("graph viewport items should serialize");
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
