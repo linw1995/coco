@@ -8,9 +8,82 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      lint: ${{ steps.filter.outputs.lint }}
+      rust: ${{ steps.filter.outputs.rust }}
+      builtin_skill_scripts: ${{ steps.filter.outputs.builtin_skill_scripts }}
+      nix_build: ${{ steps.filter.outputs.nix_build }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            lint:
+              - ".github/workflows/CI.yaml"
+              - ".github/actions/setup-nix/action.yaml"
+              - ".pre-commit-config.yaml"
+              - "Cargo.lock"
+              - "Cargo.toml"
+              - "**/Cargo.toml"
+              - "flake.nix"
+              - "flake.lock"
+              - "nix/**/*.nix"
+              - "*.md"
+              - "**/*.md"
+              - "**/*.py"
+              - "**/*.rs"
+              - "**/*.sh"
+              - "**/*.toml"
+              - "**/*.yaml"
+              - "**/*.yml"
+            rust:
+              - ".github/workflows/CI.yaml"
+              - ".github/actions/setup-nix/action.yaml"
+              - "Cargo.lock"
+              - "Cargo.toml"
+              - "**/Cargo.toml"
+              - "flake.nix"
+              - "flake.lock"
+              - "nix/**/*.nix"
+              - "scripts/run-cov.sh"
+              - "scripts/run-crap.sh"
+              - "coco-*/src/**"
+              - "coco-*/tests/**"
+              - "coco-console/build.rs"
+              - "coco-console/templates/**"
+              - "coco-mem/src/default_skills/**"
+            builtin_skill_scripts:
+              - ".github/workflows/CI.yaml"
+              - "scripts/test-builtin-skill-scripts.sh"
+              - "coco-mem/src/default_skills/**/*.py"
+            nix_build:
+              - ".github/workflows/CI.yaml"
+              - ".github/actions/setup-nix/action.yaml"
+              - "Cargo.lock"
+              - "Cargo.toml"
+              - "**/Cargo.toml"
+              - "flake.nix"
+              - "flake.lock"
+              - "nix/**/*.nix"
+              - "docker/**"
+              - "coco-*/src/**"
+              - "coco-*/tests/**"
+              - "coco-console/build.rs"
+              - "coco-console/templates/**"
+              - "coco-mem/src/default_skills/**"
+
   lint:
+    needs:
+      - changes
+    if: needs.changes.outputs.lint == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -21,7 +94,9 @@ jobs:
 
   test:
     needs:
+      - changes
       - lint
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -46,7 +121,9 @@ jobs:
 
   crap:
     needs:
+      - changes
       - test
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.test.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -71,7 +148,9 @@ jobs:
 
   builtin-skill-scripts:
     needs:
+      - changes
       - lint
+    if: ${{ always() && needs.changes.outputs.builtin_skill_scripts == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -81,7 +160,9 @@ jobs:
 
   nix-build:
     needs:
+      - changes
       - lint
+    if: ${{ always() && needs.changes.outputs.nix_build == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
