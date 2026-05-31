@@ -7,11 +7,17 @@
 
 ## Rust Visibility
 
-- Prefer controlling visibility at the type level.
+- Prefer controlling visibility at the module boundary first. Use private
+  parent modules and focused `pub use` exports in `lib.rs` or
+  `${module_name}.rs` to define the public surface.
+- Inside a private module boundary, prefer ordinary `pub` items over scattered
+  `pub(super)` or `pub(crate)` annotations.
+- When module boundaries are not enough, prefer controlling visibility at the
+  type level.
 - If a type is declared `pub(crate)`, its impl methods should generally use
   `pub` rather than repeating `pub(crate)` on each method.
-- Only narrow method visibility below the type when there is a specific
-  reason to do so.
+- Only narrow item or method visibility below the type when there is a
+  specific reason to do so.
 
 ## SNAFU Error Construction
 

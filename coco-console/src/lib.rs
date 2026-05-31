@@ -1,7 +1,8 @@
-pub mod api;
+mod api;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod host {
+    pub mod api;
     pub mod config;
     pub mod error;
     pub mod graph;
@@ -11,12 +12,8 @@ mod host {
     pub mod server;
     pub mod store;
 
-    pub use config::{ConsoleConfig, default_console_addr};
+    pub use config::ConsoleConfig;
     pub use error::{Error, Result};
-    pub use graph::{
-        GraphBranch, GraphEdge, GraphEdgeKind, GraphNode, GraphSnapshot, build_graph_snapshot,
-    };
-    pub use layout::{layout_graph_viewport, layout_graph_viewport_diff};
     pub use publisher::ConsolePublisher;
     pub use server::{ConsoleServerHandle, start_console_server};
     pub use store::ConsoleStore;
@@ -33,17 +30,10 @@ mod wasm {
     pub mod viewport;
 }
 
-pub use api::{
-    GraphCanvas, GraphViewport, GraphViewportDiffRequest, GraphViewportDiffResponse,
-    GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItemKind, GraphViewportItems,
-    GraphViewportKnownItems, GraphViewportLane, GraphViewportNode, GraphViewportRemovedItem,
-    GraphViewportRequest, GraphViewportResponse, Point,
-};
 #[cfg(not(target_arch = "wasm32"))]
 pub use host::{
-    ConsoleConfig, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error, GraphBranch,
-    GraphEdge, GraphEdgeKind, GraphNode, GraphSnapshot, Result, build_graph_snapshot,
-    default_console_addr, layout_graph_viewport, layout_graph_viewport_diff, start_console_server,
+    ConsoleConfig, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error, Result,
+    start_console_server,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use host::{config, error, graph, layout, publisher, render};

@@ -1,12 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::api::{
-    GraphCanvas, GraphViewport, GraphViewportDiffRequest, GraphViewportDiffResponse,
-    GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItemKind, GraphViewportItems,
-    GraphViewportKnownItems, GraphViewportLane, GraphViewportNode, GraphViewportRemovedItem,
-    GraphViewportRequest, GraphViewportResponse, Point,
+    GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
+    GraphViewportEdgeKind, GraphViewportItemKind, GraphViewportItems, GraphViewportLane,
+    GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
 use crate::graph::{GraphBranch, GraphEdgeKind, GraphSnapshot, node_target_id, shorten_id};
+use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use serde::Serialize;
 
 const NODE_RADIUS: f64 = 26.0;
@@ -114,10 +114,7 @@ impl ViewportBounds {
 }
 
 fn is_merge_like_edge(kind: GraphEdgeKind) -> bool {
-    matches!(
-        kind,
-        GraphEdgeKind::MergeParent | GraphEdgeKind::ShadowParent
-    )
+    matches!(kind, GraphEdgeKind::Merge | GraphEdgeKind::Shadow)
 }
 
 #[derive(Debug)]
@@ -177,7 +174,7 @@ pub fn layout_graph(snapshot: &GraphSnapshot) -> GraphLayout {
     for edge in snapshot
         .edges
         .iter()
-        .filter(|edge| edge.kind == GraphEdgeKind::PrimaryParent)
+        .filter(|edge| edge.kind == GraphEdgeKind::Primary)
     {
         parent_by_child.insert(edge.target.as_str(), edge.source.as_str());
     }
@@ -1036,7 +1033,7 @@ fn primary_children_by_parent(snapshot: &GraphSnapshot) -> HashMap<&str, Vec<&st
     for edge in snapshot
         .edges
         .iter()
-        .filter(|edge| edge.kind == GraphEdgeKind::PrimaryParent)
+        .filter(|edge| edge.kind == GraphEdgeKind::Primary)
     {
         children_by_parent
             .entry(edge.source.as_str())

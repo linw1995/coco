@@ -20,12 +20,11 @@ use crate::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
 };
 use crate::graph::build_graph_snapshot;
+use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
 use crate::render::{render_fragment, render_index_page};
-use crate::{
-    Error, GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest, Result,
-};
+use crate::{Error, Result};
 
 const STYLE_CSS: &str = include_str!("style.css");
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
