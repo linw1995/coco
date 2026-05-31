@@ -21,9 +21,7 @@ crap_allow_args=(
   --allow "VirtualGraph::new"
   --allow "VirtualGraph::apply_full"
   --allow "refresh_on_graph_version"
-  --allow "VirtualGraph::upsert_lane"
   --allow "VirtualGraph::upsert_edge"
-  --allow "VirtualGraph::primary_edge_element"
   --allow "render_full_viewport"
   --allow "drain_viewport_patches"
 )
