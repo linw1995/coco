@@ -346,11 +346,16 @@ impl VirtualGraph {
     fn upsert_lane(&mut self, lane: GraphViewportLane) -> Result<(), JsValue> {
         self.remove_key(&lane.key);
         let element = svg_element(&self.document, "text")?;
-        element.set_attribute("id", &render_element_id(&lane.key))?;
-        element.set_attribute("data-render-key", &lane.key)?;
-        element.set_attribute("class", "lane-label")?;
-        element.set_attribute("x", "64")?;
-        element.set_attribute("y", &lane.y.to_string())?;
+        set_attributes(
+            &element,
+            [
+                ("id", render_element_id(&lane.key)),
+                ("data-render-key", lane.key.clone()),
+                ("class", "lane-label".to_owned()),
+                ("x", "64".to_owned()),
+                ("y", lane.y.to_string()),
+            ],
+        )?;
         element.set_text_content(Some(&lane.label));
         self.lane_group.append_child(&element)?;
         self.rendered
