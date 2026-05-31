@@ -1081,6 +1081,8 @@ fn refresh_inner_html(
 }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    install_node_detail_listener(graph.clone())?;
+
     let graph_wrap = graph.borrow().graph_wrap.clone();
     let wheel_graph = graph.clone();
     let wheel_closure = Closure::<dyn FnMut(WheelEvent)>::new(move |event: WheelEvent| {
@@ -1134,6 +1136,52 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     detail_closure.forget();
 
     Ok(())
+}
+
+fn install_node_detail_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let node_group = graph.borrow().node_group.clone();
+    let detail_graph = graph.clone();
+    let detail_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        let Some(link) = node_link_from_event(&event) else {
+            return;
+        };
+        let Some(target) = link.get_attribute("data-node-target") else {
+            return;
+        };
+
+        event.prevent_default();
+        event.stop_propagation();
+        select_node_detail(detail_graph.clone(), target);
+    });
+    node_group
+        .add_event_listener_with_callback("click", detail_closure.as_ref().unchecked_ref())?;
+    detail_closure.forget();
+    Ok(())
+}
+
+fn node_link_from_event(event: &MouseEvent) -> Option<Element> {
+    let target = event.target()?.dyn_into::<Element>().ok()?;
+    target.closest(".node-link").ok().flatten()
+}
+
+fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
+    let (window, document) = {
+        let graph = graph.borrow();
+        (graph.window.clone(), graph.document.clone())
+    };
+
+    if selected_node_target(&window).as_deref() != Some(target.as_str())
+        && let Err(error) = window.location().set_hash(&target)
+    {
+        web_sys::console::error_1(&error);
+        return;
+    }
+
+    spawn_local(async move {
+        if let Err(error) = refresh_selected_node_detail(&window, &document).await {
+            web_sys::console::error_1(&error);
+        }
+    });
 }
 
 async fn refresh_selected_node_detail_from_graph(
