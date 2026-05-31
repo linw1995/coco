@@ -119,7 +119,7 @@ where
         .route("/api/graph/viewport", get(graph_viewport::<S>))
         .route(
             "/api/graph/viewport/items/diff",
-            get(graph_viewport_diff_get::<S>).post(graph_viewport_diff_post::<S>),
+            get(graph_viewport_items_diff_get::<S>).post(graph_viewport_items_diff_post::<S>),
         )
         .route(
             "/api/graph/viewport/diff",
@@ -259,20 +259,37 @@ where
     graph_viewport_diff_response(state, query).await
 }
 
+async fn graph_viewport_items_diff_get<S>(
+    State(state): State<AppState<S>>,
+    RawQuery(query): RawQuery,
+) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let query = parse_query(query.as_deref().unwrap_or_default());
+    graph_viewport_items_diff_response_from_query(state, query).await
+}
+
+async fn graph_viewport_items_diff_post<S>(
+    State(state): State<AppState<S>>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let mut query = parse_query(query.as_deref().unwrap_or_default());
+    let body = String::from_utf8_lossy(&body);
+    query.pairs.extend(parse_query(&body).pairs);
+    graph_viewport_items_diff_response_from_query(state, query).await
+}
+
 async fn graph_viewport_diff_response<S>(state: AppState<S>, query: QueryParams) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
     let observed_version = query.version();
     let request = viewport_diff_request_from_query(&query);
-    let known_canvas = known_canvas_from_query(&query);
-    if let Some(observed_version) = observed_version
-        && request.known.is_some()
-    {
-        return graph_viewport_items_diff_response(state, request, observed_version, known_canvas)
-            .await;
-    }
-
     wait_for_newer_version(&state.publisher, observed_version).await;
     let snapshot = match build_graph_snapshot(&state.store, state.publisher.current_version()) {
         Ok(snapshot) => snapshot,
@@ -280,6 +297,27 @@ where
     };
     let response = layout_graph_viewport_diff(&snapshot, request);
     json_response(&response, "graph viewport diff")
+}
+
+async fn graph_viewport_items_diff_response_from_query<S>(
+    state: AppState<S>,
+    query: QueryParams,
+) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    match query.version() {
+        Some(observed_version) => {
+            graph_viewport_items_diff_response(
+                state,
+                viewport_diff_request_from_query(&query),
+                observed_version,
+                known_canvas_from_query(&query),
+            )
+            .await
+        }
+        None => graph_viewport_diff_response(state, query).await,
+    }
 }
 
 async fn graph_viewport_items_diff_response<S>(
@@ -586,8 +624,8 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, graph_viewport_diff_response, parse_query, start_console_server,
-        viewport_diff_request_from_query,
+        AppState, graph_viewport_diff_response, graph_viewport_items_diff_response_from_query,
+        parse_query, start_console_server, viewport_diff_request_from_query,
     };
     use crate::graph::build_graph_snapshot;
     use crate::host::api::GraphViewportRequest;
@@ -736,7 +774,10 @@ mod tests {
             store: store.clone(),
             publisher: publisher.clone(),
         };
-        let mut task = tokio::spawn(graph_viewport_diff_response(state, parse_query(&query)));
+        let mut task = tokio::spawn(graph_viewport_items_diff_response_from_query(
+            state,
+            parse_query(&query),
+        ));
 
         publisher.mark_changed();
 
@@ -780,7 +821,10 @@ mod tests {
             viewport.height,
             viewport.overscan,
         );
-        let mut task = tokio::spawn(graph_viewport_diff_response(state, parse_query(&query)));
+        let mut task = tokio::spawn(graph_viewport_items_diff_response_from_query(
+            state,
+            parse_query(&query),
+        ));
 
         assert!(
             timeout(Duration::from_millis(50), &mut task).await.is_err(),
@@ -788,6 +832,53 @@ mod tests {
         );
 
         publisher.mark_changed();
+        let response = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn legacy_versioned_viewport_diff_returns_empty_known_diff() {
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+        let root = store.root_id();
+        store.fork("main", &root).unwrap();
+        let version = publisher.current_version();
+        let viewport = GraphViewportRequest::default();
+        let snapshot = build_graph_snapshot(&store, version).unwrap();
+        let rendered = layout_graph_viewport(&snapshot, viewport);
+        let mut query = format!(
+            "version={version}&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
+            viewport.x,
+            viewport.y,
+            viewport.width,
+            viewport.height,
+            viewport.overscan,
+            rendered.canvas.width,
+            rendered.canvas.height,
+        );
+        for lane in rendered.lanes {
+            query.push_str("&known_lane=");
+            query.push_str(&lane.key);
+        }
+        for node in rendered.nodes {
+            query.push_str("&known_node=");
+            query.push_str(&node.key);
+        }
+        for edge in rendered.edges {
+            query.push_str("&known_edge=");
+            query.push_str(&edge.key);
+        }
+        let state = AppState {
+            store,
+            publisher: publisher.clone(),
+        };
+        let task = tokio::spawn(graph_viewport_diff_response(state, parse_query(&query)));
+
+        publisher.mark_changed();
+
         let response = timeout(Duration::from_secs(1), task)
             .await
             .unwrap()
