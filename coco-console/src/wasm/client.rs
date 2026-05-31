@@ -17,7 +17,8 @@ use super::refresh::{
 };
 use crate::api::{
     GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
-    GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, GraphViewportResponse, Point,
+    GraphViewportEdgeKind, GraphViewportItems, GraphViewportLane, GraphViewportNode,
+    GraphViewportResponse, Point,
 };
 use crate::viewport::{MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport};
 
@@ -270,67 +271,67 @@ impl VirtualGraph {
     }
 
     fn apply_full(&mut self, response: GraphViewportResponse) -> Result<(), JsValue> {
-        let desired_viewport = self.viewport;
-        let response_viewport = ViewportState::from(response.viewport);
+        let GraphViewportResponse {
+            version,
+            canvas,
+            viewport,
+            lanes,
+            nodes,
+            edges,
+        } = response;
         clear_children(&self.lane_group);
         clear_children(&self.edge_group);
         clear_children(&self.node_group);
         self.rendered = RenderedKeys::new();
-        self.version = response.version;
-        self.canvas = Some(response.canvas);
-        if same_viewport(desired_viewport, response_viewport) {
-            self.set_viewport(response.viewport);
-        }
-        self.rendered_viewport = response_viewport;
-        self.set_root_version();
-        self.apply_canvas()?;
-        for lane in response.lanes {
-            self.upsert_lane(lane)?;
-        }
-        for edge in response.edges {
-            self.upsert_edge(edge)?;
-        }
-        for node in response.nodes {
-            self.upsert_node(node, false)?;
-        }
+        self.apply_response_viewport(version, canvas, viewport)?;
+        self.upsert_graph_items(
+            GraphViewportItems {
+                lanes,
+                nodes,
+                edges,
+            },
+            false,
+        )?;
         self.hide_status();
         Ok(())
     }
 
     fn apply_diff(&mut self, response: GraphViewportDiffResponse) -> Result<(), JsValue> {
-        let desired_viewport = self.viewport;
-        let response_viewport = ViewportState::from(response.viewport);
-        self.version = response.version;
-        self.canvas = Some(response.canvas);
-        self.rendered_viewport = response_viewport;
-        if same_viewport(desired_viewport, response_viewport) {
-            self.set_viewport(response.viewport);
-        }
-        self.set_root_version();
-        self.apply_canvas()?;
-        for item in response.removed {
+        let GraphViewportDiffResponse {
+            version,
+            canvas,
+            viewport,
+            added,
+            updated,
+            removed,
+            ..
+        } = response;
+        self.apply_response_viewport(version, canvas, viewport)?;
+        for item in removed {
             self.remove_key(&item.key);
         }
-        for lane in response.added.lanes {
-            self.upsert_lane(lane)?;
-        }
-        for edge in response.added.edges {
-            self.upsert_edge(edge)?;
-        }
-        for node in response.added.nodes {
-            self.upsert_node(node, true)?;
-        }
-        for lane in response.updated.lanes {
-            self.upsert_lane(lane)?;
-        }
-        for edge in response.updated.edges {
-            self.upsert_edge(edge)?;
-        }
-        for node in response.updated.nodes {
-            self.upsert_node(node, false)?;
-        }
+        self.upsert_graph_items(added, true)?;
+        self.upsert_graph_items(updated, false)?;
         self.hide_status();
         Ok(())
+    }
+
+    fn apply_response_viewport(
+        &mut self,
+        version: u64,
+        canvas: GraphCanvas,
+        viewport: GraphViewport,
+    ) -> Result<(), JsValue> {
+        let desired_viewport = self.viewport;
+        let response_viewport = ViewportState::from(viewport);
+        self.version = version;
+        self.canvas = Some(canvas);
+        if same_viewport(desired_viewport, response_viewport) {
+            self.set_viewport(viewport);
+        }
+        self.rendered_viewport = response_viewport;
+        self.set_root_version();
+        self.apply_canvas()
     }
 
     fn apply_canvas(&self) -> Result<(), JsValue> {
@@ -342,6 +343,46 @@ impl VirtualGraph {
             &self.viewport_map_bg,
         )?;
         apply_viewport_map_window(&self.viewport_map_window, self.viewport)
+    }
+
+    fn upsert_graph_items(
+        &mut self,
+        items: GraphViewportItems,
+        nodes_are_new: bool,
+    ) -> Result<(), JsValue> {
+        let GraphViewportItems {
+            lanes,
+            nodes,
+            edges,
+        } = items;
+        self.upsert_lanes(lanes)?;
+        self.upsert_edges(edges)?;
+        self.upsert_nodes(nodes, nodes_are_new)
+    }
+
+    fn upsert_lanes(&mut self, lanes: Vec<GraphViewportLane>) -> Result<(), JsValue> {
+        for lane in lanes {
+            self.upsert_lane(lane)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_edges(&mut self, edges: Vec<GraphViewportEdge>) -> Result<(), JsValue> {
+        for edge in edges {
+            self.upsert_edge(edge)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_nodes(
+        &mut self,
+        nodes: Vec<GraphViewportNode>,
+        nodes_are_new: bool,
+    ) -> Result<(), JsValue> {
+        for node in nodes {
+            self.upsert_node(node, nodes_are_new)?;
+        }
+        Ok(())
     }
 
     fn upsert_lane(&mut self, lane: GraphViewportLane) -> Result<(), JsValue> {

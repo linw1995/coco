@@ -18,7 +18,6 @@ crap_allow_args=(
   --allow "render_next_viewport_patch"
   --allow "VirtualGraph::apply_diff"
   --allow "VirtualGraph::new"
-  --allow "VirtualGraph::apply_full"
   --allow "refresh_on_graph_version"
   --allow "render_full_viewport"
   --allow "drain_viewport_patches"
