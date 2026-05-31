@@ -316,53 +316,14 @@ impl VirtualGraph {
     }
 
     fn apply_canvas(&self) -> Result<(), JsValue> {
-        self.graph_svg.set_attribute(
-            "viewBox",
-            &format!(
-                "{} {} {} {}",
-                rounded_i32(self.viewport.x),
-                rounded_i32(self.viewport.y),
-                rounded_i32(self.viewport.width),
-                rounded_i32(self.viewport.height)
-            ),
+        apply_graph_viewport(&self.graph_svg, &self.graph_wrap, self.viewport, self.zoom)?;
+        apply_canvas_dimensions(
+            self.canvas,
+            &self.graph_bg,
+            &self.viewport_map,
+            &self.viewport_map_bg,
         )?;
-        self.graph_wrap
-            .set_attribute("data-viewport-x", &rounded_i32(self.viewport.x).to_string())?;
-        self.graph_wrap
-            .set_attribute("data-viewport-y", &rounded_i32(self.viewport.y).to_string())?;
-        self.graph_wrap
-            .set_attribute("data-zoom", &format!("{:.3}", self.zoom))?;
-
-        if let Some(canvas) = self.canvas {
-            self.graph_bg.set_attribute("x", "0")?;
-            self.graph_bg.set_attribute("y", "0")?;
-            self.graph_bg
-                .set_attribute("width", &canvas.width.to_string())?;
-            self.graph_bg
-                .set_attribute("height", &canvas.height.to_string())?;
-            self.viewport_map.set_attribute(
-                "viewBox",
-                &format!("0 0 {} {}", canvas.width, canvas.height),
-            )?;
-            self.viewport_map
-                .set_attribute("data-graph-width", &canvas.width.to_string())?;
-            self.viewport_map
-                .set_attribute("data-graph-height", &canvas.height.to_string())?;
-            self.viewport_map_bg
-                .set_attribute("width", &canvas.width.to_string())?;
-            self.viewport_map_bg
-                .set_attribute("height", &canvas.height.to_string())?;
-        }
-
-        self.viewport_map_window
-            .set_attribute("x", &rounded_i32(self.viewport.x).to_string())?;
-        self.viewport_map_window
-            .set_attribute("y", &rounded_i32(self.viewport.y).to_string())?;
-        self.viewport_map_window
-            .set_attribute("width", &rounded_i32(self.viewport.width).to_string())?;
-        self.viewport_map_window
-            .set_attribute("height", &rounded_i32(self.viewport.height).to_string())?;
-        Ok(())
+        apply_viewport_map_window(&self.viewport_map_window, self.viewport)
     }
 
     fn upsert_lane(&mut self, lane: GraphViewportLane) -> Result<(), JsValue> {
@@ -585,6 +546,107 @@ where
         pending_update
     };
     request_viewport_update(graph, pending_update);
+}
+
+fn apply_graph_viewport(
+    graph_svg: &Element,
+    graph_wrap: &Element,
+    viewport: ViewportState,
+    zoom: f64,
+) -> Result<(), JsValue> {
+    set_attributes(
+        graph_svg,
+        [(
+            "viewBox",
+            format!(
+                "{} {} {} {}",
+                rounded_i32(viewport.x),
+                rounded_i32(viewport.y),
+                rounded_i32(viewport.width),
+                rounded_i32(viewport.height)
+            ),
+        )],
+    )?;
+    set_attributes(
+        graph_wrap,
+        [
+            ("data-viewport-x", rounded_i32(viewport.x).to_string()),
+            ("data-viewport-y", rounded_i32(viewport.y).to_string()),
+            ("data-zoom", format!("{zoom:.3}")),
+        ],
+    )
+}
+
+fn apply_canvas_dimensions(
+    canvas: Option<GraphCanvas>,
+    graph_bg: &Element,
+    viewport_map: &Element,
+    viewport_map_bg: &Element,
+) -> Result<(), JsValue> {
+    let Some(canvas) = canvas else {
+        return Ok(());
+    };
+    apply_canvas_background(graph_bg, canvas)?;
+    apply_viewport_map_canvas(viewport_map, viewport_map_bg, canvas)
+}
+
+fn apply_canvas_background(graph_bg: &Element, canvas: GraphCanvas) -> Result<(), JsValue> {
+    set_attributes(
+        graph_bg,
+        [
+            ("x", "0".to_string()),
+            ("y", "0".to_string()),
+            ("width", canvas.width.to_string()),
+            ("height", canvas.height.to_string()),
+        ],
+    )
+}
+
+fn apply_viewport_map_canvas(
+    viewport_map: &Element,
+    viewport_map_bg: &Element,
+    canvas: GraphCanvas,
+) -> Result<(), JsValue> {
+    set_attributes(
+        viewport_map,
+        [
+            ("viewBox", format!("0 0 {} {}", canvas.width, canvas.height)),
+            ("data-graph-width", canvas.width.to_string()),
+            ("data-graph-height", canvas.height.to_string()),
+        ],
+    )?;
+    set_attributes(
+        viewport_map_bg,
+        [
+            ("width", canvas.width.to_string()),
+            ("height", canvas.height.to_string()),
+        ],
+    )
+}
+
+fn apply_viewport_map_window(
+    viewport_map_window: &Element,
+    viewport: ViewportState,
+) -> Result<(), JsValue> {
+    set_attributes(
+        viewport_map_window,
+        [
+            ("x", rounded_i32(viewport.x).to_string()),
+            ("y", rounded_i32(viewport.y).to_string()),
+            ("width", rounded_i32(viewport.width).to_string()),
+            ("height", rounded_i32(viewport.height).to_string()),
+        ],
+    )
+}
+
+fn set_attributes<const N: usize>(
+    element: &Element,
+    attributes: [(&str, String); N],
+) -> Result<(), JsValue> {
+    for (name, value) in attributes {
+        element.set_attribute(name, &value)?;
+    }
+    Ok(())
 }
 
 async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
