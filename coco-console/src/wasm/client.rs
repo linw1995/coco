@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::str::{FromStr, Split};
 
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
@@ -409,21 +410,22 @@ impl VirtualGraph {
 
     fn routed_edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
         let element = svg_element(&self.document, "polyline")?;
-        let (class, marker) = match edge.kind {
-            GraphViewportEdgeKind::Fork => ("edge fork", "url(#fork-arrowhead)"),
-            GraphViewportEdgeKind::MergeParent => ("edge merge-parent", "url(#merge-arrowhead)"),
-            GraphViewportEdgeKind::PrimaryParent => unreachable!("primary edges use line elements"),
-        };
-        element.set_attribute("class", class)?;
-        element.set_attribute("marker-end", marker)?;
-        element.set_attribute(
-            "points",
-            &routed_elbow_points(
-                edge.source,
-                edge.target,
-                edge.route_slot,
-                edge.target_port_offset,
-            ),
+        let (class, marker) = routed_edge_style(edge.kind);
+        set_attributes(
+            &element,
+            [
+                ("class", class.to_string()),
+                ("marker-end", marker.to_string()),
+                (
+                    "points",
+                    routed_elbow_points(
+                        edge.source,
+                        edge.target,
+                        edge.route_slot,
+                        edge.target_port_offset,
+                    ),
+                ),
+            ],
         )?;
         Ok(element)
     }
@@ -519,17 +521,44 @@ impl VirtualGraph {
 
 impl ViewportState {
     fn load(window: &Window) -> Option<Self> {
-        let storage = session_storage(window)?;
-        let value = storage.get_item(VIEWPORT_KEY).ok().flatten()?;
-        let mut parts = value.split(',');
-        Some(Self {
-            x: parts.next()?.parse::<f64>().ok()?,
-            y: parts.next()?.parse::<f64>().ok()?,
-            width: parts.next()?.parse::<f64>().ok()?,
-            height: parts.next()?.parse::<f64>().ok()?,
-            overscan: parts.next()?.parse::<i32>().ok()?,
-        })
+        let value = stored_viewport_value(window)?;
+        parse_stored_viewport(&value)
     }
+}
+
+fn stored_viewport_value(window: &Window) -> Option<String> {
+    session_storage(window)?
+        .get_item(VIEWPORT_KEY)
+        .ok()
+        .flatten()
+}
+
+fn parse_stored_viewport(value: &str) -> Option<ViewportState> {
+    let mut parts = value.split(',');
+    let (x, y) = parse_next_viewport_pair(&mut parts)?;
+    let (width, height) = parse_next_viewport_pair(&mut parts)?;
+    let overscan = parse_next_viewport_value(&mut parts)?;
+    Some(ViewportState {
+        x,
+        y,
+        width,
+        height,
+        overscan,
+    })
+}
+
+fn parse_next_viewport_pair(parts: &mut Split<'_, char>) -> Option<(f64, f64)> {
+    Some((
+        parse_next_viewport_value(parts)?,
+        parse_next_viewport_value(parts)?,
+    ))
+}
+
+fn parse_next_viewport_value<T>(parts: &mut Split<'_, char>) -> Option<T>
+where
+    T: FromStr,
+{
+    parts.next()?.parse().ok()
 }
 
 async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
@@ -589,6 +618,14 @@ where
         pending_update
     };
     request_viewport_update(graph, pending_update);
+}
+
+fn routed_edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
+    match kind {
+        GraphViewportEdgeKind::Fork => ("edge fork", "url(#fork-arrowhead)"),
+        GraphViewportEdgeKind::MergeParent => ("edge merge-parent", "url(#merge-arrowhead)"),
+        GraphViewportEdgeKind::PrimaryParent => unreachable!("primary edges use line elements"),
+    }
 }
 
 fn apply_graph_viewport(
