@@ -367,19 +367,28 @@ impl VirtualGraph {
 
     fn upsert_edge(&mut self, edge: GraphViewportEdge) -> Result<(), JsValue> {
         self.remove_key(&edge.key);
-        let element = match edge.kind {
-            GraphViewportEdgeKind::PrimaryParent => self.primary_edge_element(&edge)?,
-            GraphViewportEdgeKind::Fork | GraphViewportEdgeKind::MergeParent => {
-                self.routed_edge_element(&edge)?
-            }
-        };
-        element.set_attribute("id", &render_element_id(&edge.key))?;
-        element.set_attribute("data-render-key", &edge.key)?;
+        let element = self.edge_element(&edge)?;
+        set_attributes(
+            &element,
+            [
+                ("id", render_element_id(&edge.key)),
+                ("data-render-key", edge.key.clone()),
+            ],
+        )?;
         self.edge_group.append_child(&element)?;
         self.rendered
             .edges
             .insert(edge.key.clone(), edge.fingerprint());
         Ok(())
+    }
+
+    fn edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
+        match edge.kind {
+            GraphViewportEdgeKind::PrimaryParent => self.primary_edge_element(edge),
+            GraphViewportEdgeKind::Fork | GraphViewportEdgeKind::MergeParent => {
+                self.routed_edge_element(edge)
+            }
+        }
     }
 
     fn primary_edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
