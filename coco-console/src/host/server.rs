@@ -869,6 +869,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn versioned_viewport_items_diff_returns_known_payload_changes() {
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+        let root = store.root_id();
+        let first = store
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("first".to_owned()),
+            })
+            .unwrap();
+        let second = store
+            .append(NewNode {
+                parent: first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("second".to_owned()),
+            })
+            .unwrap();
+        store.fork("main", &first).unwrap();
+        store.fork("draft", &second).unwrap();
+        let version = publisher.current_version();
+        let viewport = GraphViewportRequest::default();
+        let snapshot = build_graph_snapshot(&store, version).unwrap();
+        let rendered = layout_graph_viewport(&snapshot, viewport);
+        let mut query = format!(
+            "version={version}&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
+            viewport.x,
+            viewport.y,
+            viewport.width,
+            viewport.height,
+            viewport.overscan,
+            rendered.canvas.width,
+            rendered.canvas.height,
+        );
+        for node in rendered.nodes {
+            query.push_str("&known_node=");
+            query.push_str(&node.key);
+            query.push_str("&known_node_fingerprint=");
+            query.push_str(&node.key);
+            query.push(':');
+            query.push_str(&node.fingerprint());
+        }
+        let state = AppState {
+            store: store.clone(),
+            publisher: publisher.clone(),
+        };
+        let task = tokio::spawn(graph_viewport_items_diff_response_from_query(
+            state,
+            parse_query(&query),
+        ));
+
+        store.set_branch_head("main", &first, &second).unwrap();
+
+        let response = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
     async fn versioned_viewport_items_diff_waits_for_newer_version() {
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
