@@ -45,6 +45,8 @@ struct GraphItemsRefreshInput {
     query: String,
 }
 
+type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>;
+
 #[wasm_bindgen(start)]
 pub fn start() {
     spawn_local(async {
@@ -1081,11 +1083,16 @@ fn refresh_inner_html(
 }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    install_node_detail_listener(graph.clone())?;
-    install_wheel_listener(graph.clone())?;
-    install_resize_listener(graph.clone())?;
-    install_viewport_map_listener(graph.clone())?;
-    install_hashchange_node_detail_listener(graph)?;
+    let installers: [GraphListenerInstaller; 5] = [
+        install_node_detail_listener,
+        install_wheel_listener,
+        install_resize_listener,
+        install_viewport_map_listener,
+        install_hashchange_node_detail_listener,
+    ];
+    for install in installers {
+        install(graph.clone())?;
+    }
     Ok(())
 }
 
