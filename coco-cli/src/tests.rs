@@ -4709,6 +4709,15 @@ allowed_chat_ids = ["123", "-456"]
     assert!(telegram.allowed_chat_ids.contains("-456"));
 }
 
+#[test]
+fn provider_profiles_load_from_default_config() {
+    let profiles = crate::app::config::load_cwd_provider_profiles().unwrap();
+    let profile = profiles.get_provider_profile("openai-codex").unwrap();
+
+    assert_eq!(profile.provider, "chatgpt");
+    assert_eq!(profile.default_model.as_deref(), Some("gpt-5.4"));
+}
+
 #[tokio::test]
 async fn channel_secret_resolves_env_placeholder() {
     with_coco_env_async(&[("COCO_TELEGRAM_BOT_TOKEN", "secret-token")], || async {

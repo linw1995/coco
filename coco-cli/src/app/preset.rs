@@ -40,7 +40,7 @@ struct PresetDeleteResult {
     name: String,
 }
 
-pub(super) async fn run_preset_command<S>(
+pub async fn run_preset_command<S>(
     command: PresetCommand,
     store: &S,
     provider_profiles: &ProviderProfiles,

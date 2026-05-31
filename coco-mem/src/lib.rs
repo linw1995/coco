@@ -5,10 +5,8 @@ pub mod store;
 mod types;
 
 pub use error::{StoreError, StoreResult};
-pub use store::fs::FsStore;
-pub use store::memory::MemoryStore;
 pub use store::{
-    BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, ProcessShareableStore,
-    SessionStore, SkillStore, Store,
+    BranchStore, FsStore, JobStore, MemoryStore, MessageQueueStore, NodeStore, PresetStore,
+    ProcessShareableStore, SessionStore, SkillStore, Store,
 };
 pub use types::*;

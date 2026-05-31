@@ -62,7 +62,7 @@ const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const TELEGRAM_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const ACTIVE_JOB_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 
-pub(crate) struct CocoCliDaemonServerHandle<B, S> {
+pub struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
     llm: Arc<LlmService<B, S>>,
     socket_task: tokio::task::JoinHandle<()>,
@@ -71,13 +71,13 @@ pub(crate) struct CocoCliDaemonServerHandle<B, S> {
     console: Option<ConsoleServerHandle>,
 }
 
-pub(crate) struct DaemonServerOptions<'a> {
+pub struct DaemonServerOptions<'a> {
     pub channel_configs: &'a ChannelConfigs,
     pub console_config: Option<ConsoleConfig>,
     pub console_publisher: Option<ConsolePublisher>,
 }
 
-pub(super) async fn run_daemon_command<B, S>(
+pub async fn run_daemon_command<B, S>(
     command: DaemonCommand,
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
@@ -129,7 +129,7 @@ fn daemon_console_config(
     }
 }
 
-pub(crate) async fn ensure_initial_session<B, S>(
+pub async fn ensure_initial_session<B, S>(
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
     provider_profiles: &ProviderProfiles,
@@ -348,7 +348,7 @@ fn day_session_create_command() -> SessionCreateCommand {
     }
 }
 
-pub(crate) async fn resume_incomplete_jobs<B, S>(engine: &ConversationEngine<B, S>) -> Result<()>
+pub async fn resume_incomplete_jobs<B, S>(engine: &ConversationEngine<B, S>) -> Result<()>
 where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
@@ -396,14 +396,14 @@ pub fn resolve_default_daemon_socket_path() -> Result<PathBuf> {
         .join("coco-daemon.sock"))
 }
 
-pub(crate) fn resolve_daemon_socket_path(socket_path: Option<&Path>) -> Result<PathBuf> {
+pub fn resolve_daemon_socket_path(socket_path: Option<&Path>) -> Result<PathBuf> {
     match socket_path {
         Some(path) => Ok(path.to_path_buf()),
         None => resolve_default_daemon_socket_path(),
     }
 }
 
-pub(crate) fn start_daemon_server<B, S>(
+pub fn start_daemon_server<B, S>(
     socket_path: &Path,
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
@@ -1770,7 +1770,7 @@ where
 }
 
 impl<B, S> CocoCliDaemonServerHandle<B, S> {
-    pub(crate) async fn wait(self) -> Result<()> {
+    pub async fn wait(self) -> Result<()> {
         let Self {
             socket_path,
             llm,
@@ -1792,7 +1792,7 @@ impl<B, S> CocoCliDaemonServerHandle<B, S> {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(self) -> Result<()> {
         self.socket_task.abort();
         if let Some(channel_task) = &self.channel_task {
             channel_task.abort();
@@ -2023,12 +2023,13 @@ mod tests {
     use crate::cli::{Cli, Command, DaemonCommand};
 
     use super::{
-        ChannelConfigs, DEFAULT_SESSION_BRANCH, LlmBackendFailureRecoveryRequested,
-        PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker, ProviderProfiles, SYSTEM_EVENT_QUEUE,
-        SystemEvent, SystemEventMessageQueueWorker, TELEGRAM_INBOUND_QUEUE,
-        TelegramMessageQueuePublisher, TelegramMessageQueueWorker, abort_channel_task,
-        daemon_console_config, decode_telegram_message, encode_telegram_message,
-        resolve_daemon_command_socket_path, resolve_daemon_socket_path, run_daemon_command,
+        ChannelConfigs, CocoCliDaemonServerHandle, DEFAULT_SESSION_BRANCH,
+        LlmBackendFailureRecoveryRequested, PROMPT_JOB_QUEUE, PromptJobMessageQueueWorker,
+        ProviderProfiles, SYSTEM_EVENT_QUEUE, SystemEvent, SystemEventMessageQueueWorker,
+        TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher, TelegramMessageQueueWorker,
+        abort_channel_task, daemon_console_config, decode_telegram_message,
+        encode_telegram_message, resolve_daemon_command_socket_path, resolve_daemon_socket_path,
+        run_daemon_command,
     };
 
     fn daemon_command<I, T>(args: I) -> DaemonCommand
@@ -2146,6 +2147,32 @@ mod tests {
 
         assert!(matches!(error, crate::Error::BindDaemonSocket { .. }));
         assert!(store.get_session_state(DEFAULT_SESSION_BRANCH).is_ok());
+    }
+
+    #[tokio::test]
+    async fn daemon_server_handle_wait_returns_when_socket_task_finishes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("coco.sock");
+        fs::write(&socket_path, "").unwrap();
+        let store = MemoryStore::new();
+        let llm = Arc::new(LlmService::new(
+            store.clone(),
+            BlockingOnceBackend::default(),
+        ));
+        let handle = CocoCliDaemonServerHandle {
+            socket_path: socket_path.clone(),
+            llm,
+            socket_task: tokio::spawn(async {}),
+            channel_task: None,
+            message_queue_task: tokio::spawn(async {
+                std::future::pending::<crate::Result<()>>().await
+            }),
+            console: None,
+        };
+
+        handle.wait().await.unwrap();
+
+        assert!(!socket_path.exists());
     }
 
     #[tokio::test]

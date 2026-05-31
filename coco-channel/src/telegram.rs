@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
-use crate::error::TelegramTransportSnafu;
+use crate::error::{TelegramTransportSnafu, is_transport_failure};
 use crate::{
     ChannelRuntime, Error, InboundMessage, MessageHandler, Result, TelegramImageAttachment,
     TelegramInboundMessage,
@@ -129,7 +129,7 @@ where
                 );
                 Ok(response)
             }
-            Err(error) if error.is_transport_failure() => {
+            Err(error) if is_transport_failure(&error) => {
                 tracing::warn!(
                     error = %error,
                     transport_error_kind = ?transport_failure_kind(&error),
@@ -217,7 +217,7 @@ where
         loop {
             match self.run_once_with_poll_logging(handler).await {
                 Ok(_) => {}
-                Err(error) if error.is_transport_failure() => {
+                Err(error) if is_transport_failure(&error) => {
                     self.sleep_after_transport_error().await;
                 }
                 Err(error) => return Err(error),

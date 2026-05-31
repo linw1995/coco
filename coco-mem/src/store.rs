@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-pub(crate) mod fs;
-pub mod memory;
-pub(crate) mod state;
+mod fs;
+mod memory;
+mod state;
 
 #[cfg(test)]
 mod tests;
+
+pub use fs::FsStore;
+pub use memory::MemoryStore;
 
 use crate::{
     Job, JobStatus, MessageQueueItem, NewNode, Node, Preset, PresetRecord, SessionAnchorPatch,

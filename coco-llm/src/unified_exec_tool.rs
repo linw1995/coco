@@ -26,7 +26,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub(crate) struct UnifiedExecToolRuntime {
+pub struct UnifiedExecToolRuntime {
     definition: Tool,
     workspace_root: PathBuf,
     context: ToolRuntimeEnv,
@@ -35,7 +35,7 @@ pub(crate) struct UnifiedExecToolRuntime {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnifiedExecToolKind {
+pub enum UnifiedExecToolKind {
     ExecCommand,
     WriteStdin,
 }
@@ -77,7 +77,7 @@ struct CocoCliRuntimeServer {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct UnifiedExecSessionStoreHandle {
+pub struct UnifiedExecSessionStoreHandle {
     inner: Arc<Mutex<UnifiedExecSessionStore>>,
 }
 
@@ -132,7 +132,7 @@ impl UnifiedExecSessionStore {
 }
 
 impl UnifiedExecSessionStoreHandle {
-    pub(crate) async fn remove_branch(&self, branch: &str) -> usize {
+    pub async fn remove_branch(&self, branch: &str) -> usize {
         let sessions = {
             let mut store = self.inner.lock().await;
             store.remove_branch(branch)
@@ -142,7 +142,7 @@ impl UnifiedExecSessionStoreHandle {
         count
     }
 
-    pub(crate) async fn remove_all(&self) -> usize {
+    pub async fn remove_all(&self) -> usize {
         let sessions = {
             let mut store = self.inner.lock().await;
             store.remove_all()
@@ -409,7 +409,7 @@ fn runtime(
     )
 }
 
-pub(crate) fn runtime_with_sessions(
+pub fn runtime_with_sessions(
     definition: Tool,
     workspace_root: PathBuf,
     context: ToolRuntimeEnv,
@@ -426,7 +426,7 @@ pub(crate) fn runtime_with_sessions(
     }
 }
 
-pub(crate) fn session_store() -> UnifiedExecSessionStoreHandle {
+pub fn session_store() -> UnifiedExecSessionStoreHandle {
     UnifiedExecSessionStoreHandle::default()
 }
 

@@ -30,7 +30,7 @@ impl MemoryStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot_state(&self) -> StoreState {
+    pub fn snapshot_state(&self) -> StoreState {
         self.inner.read().expect("store lock poisoned").clone()
     }
 }

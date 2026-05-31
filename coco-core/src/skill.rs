@@ -47,7 +47,7 @@ struct SkillEntry {
 }
 
 #[derive(Debug, Snafu)]
-pub(crate) enum SkillError {
+pub enum SkillError {
     #[snafu(display("failed to serialize skill tool output: {source}"))]
     SerializeOutput { source: serde_json::Error },
 
