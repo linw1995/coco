@@ -190,7 +190,10 @@ pub fn layout_graph(snapshot: &GraphSnapshot) -> GraphLayout {
     let mut branches = snapshot.branches.iter().collect::<Vec<_>>();
     branches.sort_by(|left, right| branch_lane_priority(left).cmp(&branch_lane_priority(right)));
     for branch in branches {
-        let chain = collect_visible_chain(branch.head_id.as_str(), &parent_by_child, &node_ids);
+        let Some(head_id) = branch.visible_head_id.as_deref() else {
+            continue;
+        };
+        let chain = collect_visible_chain(head_id, &parent_by_child, &node_ids);
         if chain.is_empty() {
             continue;
         }
