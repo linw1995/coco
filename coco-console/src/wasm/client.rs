@@ -837,9 +837,23 @@ async fn refresh_server_rendered_sections(
     let html = fetch_text(window, "/fragment").await?;
     let container = document.create_element("div")?;
     container.set_inner_html(&html);
-    refresh_text_content(document, &container, ".stats")?;
-    refresh_text_content(document, &container, "#selection-style")?;
-    refresh_inner_html(document, &container, ".branch-section")?;
+    refresh_server_fragment_sections(document, &container)?;
+    refresh_selected_node_detail_if_needed(window, document).await
+}
+
+fn refresh_server_fragment_sections(
+    document: &Document,
+    container: &Element,
+) -> Result<(), JsValue> {
+    refresh_text_content(document, container, ".stats")?;
+    refresh_text_content(document, container, "#selection-style")?;
+    refresh_inner_html(document, container, ".branch-section")
+}
+
+async fn refresh_selected_node_detail_if_needed(
+    window: &Window,
+    document: &Document,
+) -> Result<(), JsValue> {
     if selected_node_target(window).is_some() {
         refresh_selected_node_detail(window, document).await?;
     }
