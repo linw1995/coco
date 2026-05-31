@@ -19,6 +19,7 @@ coco-mem = { path = "../coco-mem" }
 askama = "0.16.0"
 leptos.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 # Error handling.
 snafu.workspace = true
@@ -50,3 +51,7 @@ web-sys = { version = "=0.3.94", features = [
 [build-dependencies]
 # Build script error handling.
 snafu.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Native server tests.
+tracing-subscriber.workspace = true

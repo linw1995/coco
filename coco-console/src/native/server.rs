@@ -2,7 +2,7 @@ use coco_mem::Store;
 use snafu::prelude::*;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::ConsoleConfig;
@@ -21,6 +21,9 @@ use crate::{Error, Result};
 const REQUEST_HEADER_LIMIT: usize = 16 * 1024;
 const REQUEST_BODY_LIMIT: usize = 1024 * 1024;
 const STYLE_CSS: &str = include_str!("style.css");
+const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
+const COCO_CONSOLE_WASM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
 #[derive(Clone)]
 struct AppState<S> {
     store: S,
@@ -94,16 +97,17 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer_addr) = listener.accept().await?;
         let state = state.clone();
         tokio::spawn(async move {
-            let _ = handle_connection(stream, state).await;
+            let _ = handle_connection(stream, peer_addr, state).await;
         });
     }
 }
 
 async fn handle_connection<S>(
     mut stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
     state: AppState<S>,
 ) -> io::Result<()>
 where
@@ -113,14 +117,29 @@ where
         return Ok(());
     };
 
-    handle_request(stream, request, state).await
+    handle_request(stream, peer_addr, request, state).await
 }
 
 async fn handle_request<S>(
     mut stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
     request: HttpRequest,
     state: AppState<S>,
 ) -> io::Result<()>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let access_log = AccessLog::new(peer_addr, &request);
+    let result = handle_request_inner(&mut stream, request, state).await;
+    access_log.log_result(&result);
+    result.map(|_| ())
+}
+
+async fn handle_request_inner<S>(
+    stream: &mut tokio::net::TcpStream,
+    request: HttpRequest,
+    state: AppState<S>,
+) -> io::Result<u16>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
@@ -130,78 +149,130 @@ where
 
     if request.method == "POST" && request.path == "/api/graph/viewport/diff" {
         let params = request.params();
-        return write_graph_viewport_diff_json(&mut stream, state, request.version(), &params)
-            .await;
+        return write_graph_viewport_diff_json(stream, state, request.version(), &params).await;
     }
 
     write_response(
-        &mut stream,
+        stream,
         405,
         "Method Not Allowed",
         "text/plain; charset=utf-8",
         b"method not allowed",
     )
-    .await
+    .await?;
+    Ok(405)
 }
 
 async fn handle_get_request<S>(
-    mut stream: tokio::net::TcpStream,
+    stream: &mut tokio::net::TcpStream,
     request: HttpRequest,
     state: AppState<S>,
-) -> io::Result<()>
+) -> io::Result<u16>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
     match request.path.as_str() {
-        "/" | "/index.html" => write_index_page(&mut stream, &state).await,
+        "/" | "/index.html" => write_index_page(stream, &state).await,
         "/style.css" => {
             write_response(
-                &mut stream,
+                stream,
                 200,
                 "OK",
                 "text/css; charset=utf-8",
                 STYLE_CSS.as_bytes(),
             )
-            .await
+            .await?;
+            Ok(200)
         }
-        "/api/graph" => write_graph_json(&mut stream, &state).await,
+        "/api/graph" => write_graph_json(stream, &state).await,
         "/api/graph/viewport" => {
-            write_graph_viewport_json(&mut stream, state, request.version(), &request.query).await
+            write_graph_viewport_json(stream, state, request.version(), &request.query).await
         }
         "/api/graph/viewport/diff" => {
-            write_graph_viewport_diff_json(&mut stream, state, request.version(), &request.query)
-                .await
+            write_graph_viewport_diff_json(stream, state, request.version(), &request.query).await
         }
-        "/fragment" => write_fragment(&mut stream, state, request.version()).await,
+        "/fragment" => write_fragment(stream, state, request.version()).await,
         "/events" => write_event_stream(stream, state.publisher).await,
         "/pkg/coco_console.js" => {
-            write_asset_file(
-                &mut stream,
-                "coco_console.js",
+            write_response(
+                stream,
+                200,
+                "OK",
                 "text/javascript; charset=utf-8",
+                COCO_CONSOLE_JS,
             )
-            .await
+            .await?;
+            Ok(200)
         }
         "/pkg/coco_console_bg.wasm" => {
-            write_asset_file(&mut stream, "coco_console_bg.wasm", "application/wasm").await
+            write_response(stream, 200, "OK", "application/wasm", COCO_CONSOLE_WASM).await?;
+            Ok(200)
         }
         _ => {
             write_response(
-                &mut stream,
+                stream,
                 404,
                 "Not Found",
                 "text/plain; charset=utf-8",
                 b"not found",
             )
-            .await
+            .await?;
+            Ok(404)
         }
+    }
+}
+
+struct AccessLog {
+    peer_addr: SocketAddr,
+    method: String,
+    path: String,
+    started_at: Instant,
+}
+
+impl AccessLog {
+    fn new(peer_addr: SocketAddr, request: &HttpRequest) -> Self {
+        Self {
+            peer_addr,
+            method: request.method.clone(),
+            path: request.path.clone(),
+            started_at: Instant::now(),
+        }
+    }
+
+    fn log(&self, status: u16) {
+        tracing::info!(
+            peer_addr = %self.peer_addr,
+            method = %self.method,
+            path = %self.path,
+            status,
+            duration_ms = self.started_at.elapsed().as_millis(),
+            "console access"
+        );
+    }
+
+    fn log_result(&self, result: &io::Result<u16>) {
+        match result {
+            Ok(status) => self.log(*status),
+            Err(error) => self.log_error(error),
+        }
+    }
+
+    fn log_error(&self, error: &io::Error) {
+        tracing::warn!(
+            peer_addr = %self.peer_addr,
+            method = %self.method,
+            path = %self.path,
+            duration_ms = self.started_at.elapsed().as_millis(),
+            error = %error,
+            "console access failed"
+        );
     }
 }
 
 async fn write_index_page<S>(
     stream: &mut tokio::net::TcpStream,
     state: &AppState<S>,
-) -> io::Result<()>
+) -> io::Result<u16>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
@@ -215,7 +286,8 @@ where
                 "text/html; charset=utf-8",
                 body.as_bytes(),
             )
-            .await
+            .await?;
+            Ok(200)
         }
         Err(error) => write_error(stream, error).await,
     }
@@ -224,7 +296,7 @@ where
 async fn write_graph_json<S>(
     stream: &mut tokio::net::TcpStream,
     state: &AppState<S>,
-) -> io::Result<()>
+) -> io::Result<u16>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
@@ -234,7 +306,8 @@ where
     };
     match serde_json::to_vec(&snapshot) {
         Ok(body) => {
-            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await
+            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await?;
+            Ok(200)
         }
         Err(error) => {
             write_plain_error(stream, format!("failed to serialize graph: {error}")).await
@@ -247,7 +320,7 @@ async fn write_graph_viewport_json<S>(
     state: AppState<S>,
     observed_version: Option<u64>,
     query: &QueryParams,
-) -> io::Result<()>
+) -> io::Result<u16>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
@@ -259,7 +332,8 @@ where
     let response = layout_graph_viewport(&snapshot, viewport_request_from_query(query));
     match serde_json::to_vec(&response) {
         Ok(body) => {
-            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await
+            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await?;
+            Ok(200)
         }
         Err(error) => {
             write_plain_error(
@@ -276,7 +350,7 @@ async fn write_graph_viewport_diff_json<S>(
     state: AppState<S>,
     observed_version: Option<u64>,
     query: &QueryParams,
-) -> io::Result<()>
+) -> io::Result<u16>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
@@ -288,7 +362,8 @@ where
     let response = layout_graph_viewport_diff(&snapshot, viewport_diff_request_from_query(query));
     match serde_json::to_vec(&response) {
         Ok(body) => {
-            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await
+            write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await?;
+            Ok(200)
         }
         Err(error) => {
             write_plain_error(
@@ -519,14 +594,14 @@ async fn write_response(
     stream.write_all(body).await
 }
 
-async fn write_error(stream: &mut tokio::net::TcpStream, error: Error) -> io::Result<()> {
+async fn write_error(stream: &mut tokio::net::TcpStream, error: Error) -> io::Result<u16> {
     write_plain_error(stream, error.to_string()).await
 }
 
 async fn write_plain_error(
     stream: &mut tokio::net::TcpStream,
     message: impl AsRef<str>,
-) -> io::Result<()> {
+) -> io::Result<u16> {
     write_response(
         stream,
         500,
@@ -534,14 +609,15 @@ async fn write_plain_error(
         "text/plain; charset=utf-8",
         message.as_ref().as_bytes(),
     )
-    .await
+    .await?;
+    Ok(500)
 }
 
 async fn write_fragment<S>(
     stream: &mut tokio::net::TcpStream,
     state: AppState<S>,
     observed_version: Option<u64>,
-) -> io::Result<()>
+) -> io::Result<u16>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
@@ -556,50 +632,11 @@ where
                 "text/html; charset=utf-8",
                 body.as_bytes(),
             )
-            .await
+            .await?;
+            Ok(200)
         }
         Err(error) => write_error(stream, error).await,
     }
-}
-
-async fn write_asset_file(
-    stream: &mut tokio::net::TcpStream,
-    name: &str,
-    content_type: &str,
-) -> io::Result<()> {
-    let Some(path) = find_asset_file(name) else {
-        return write_response(
-            stream,
-            404,
-            "Not Found",
-            "text/plain; charset=utf-8",
-            b"console wasm asset not found",
-        )
-        .await;
-    };
-
-    match std::fs::read(path) {
-        Ok(body) => write_response(stream, 200, "OK", content_type, &body).await,
-        Err(error) => {
-            write_plain_error(stream, format!("failed to read wasm asset: {error}")).await
-        }
-    }
-}
-
-fn find_asset_file(name: &str) -> Option<PathBuf> {
-    let configured = std::env::var_os("COCO_CONSOLE_ASSET_DIR")
-        .map(PathBuf::from)
-        .map(|dir| dir.join(name));
-    configured
-        .into_iter()
-        .chain(asset_candidates(name))
-        .find(|path| path.is_file())
-}
-
-fn asset_candidates(name: &str) -> impl Iterator<Item = PathBuf> + '_ {
-    [Path::new("coco-console/pkg"), Path::new("pkg")]
-        .into_iter()
-        .map(move |dir| dir.join(name))
 }
 
 async fn wait_for_newer_version(publisher: &ConsolePublisher, observed_version: Option<u64>) {
@@ -619,23 +656,26 @@ async fn wait_for_newer_version(publisher: &ConsolePublisher, observed_version: 
 }
 
 async fn write_event_stream(
-    mut stream: tokio::net::TcpStream,
+    stream: &mut tokio::net::TcpStream,
     publisher: ConsolePublisher,
-) -> io::Result<()> {
+) -> io::Result<u16> {
+    let current_version = publisher.current_version();
+    let mut rx = publisher.subscribe();
+    drop(publisher);
+
     stream
         .write_all(
             b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-store\r\nconnection: keep-alive\r\n\r\n",
         )
         .await?;
-    write_graph_event(&mut stream, publisher.current_version()).await?;
+    write_graph_event(stream, current_version).await?;
 
-    let mut rx = publisher.subscribe();
     while rx.changed().await.is_ok() {
         let version = *rx.borrow_and_update();
-        write_graph_event(&mut stream, version).await?;
+        write_graph_event(stream, version).await?;
     }
 
-    Ok(())
+    Ok(200)
 }
 
 async fn write_graph_event(stream: &mut tokio::net::TcpStream, version: u64) -> io::Result<()> {
@@ -647,9 +687,12 @@ async fn write_graph_event(stream: &mut tokio::net::TcpStream, version: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, handle_connection, parse_query, read_request, viewport_diff_request_from_query,
+        AppState, handle_connection, parse_query, read_request, start_console_server,
+        viewport_diff_request_from_query,
     };
+    use crate::ConsoleConfig;
     use coco_mem::MemoryStore;
+    use snafu::IntoError;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_state() -> AppState<MemoryStore> {
@@ -657,6 +700,29 @@ mod tests {
             store: MemoryStore::new(),
             publisher: crate::ConsolePublisher::new(),
         }
+    }
+
+    #[test]
+    fn access_log_records_success_and_error_results() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::dispatcher::with_default(&tracing::Dispatch::new(subscriber), || {
+            let request = super::HttpRequest {
+                method: "GET".to_owned(),
+                path: "/fragment".to_owned(),
+                query: Default::default(),
+                body: Default::default(),
+            };
+            let access_log = super::AccessLog::new("127.0.0.1:12345".parse().unwrap(), &request);
+
+            access_log.log_result(&Ok(200));
+            access_log.log_result(&Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "client closed",
+            )));
+        });
     }
 
     async fn read_request_from(bytes: &[u8]) -> Option<super::HttpRequest> {
@@ -680,8 +746,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, test_state()).await.unwrap();
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            handle_connection(stream, peer_addr, test_state())
+                .await
+                .unwrap();
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -697,6 +765,113 @@ mod tests {
     async fn response_from(bytes: &[u8]) -> String {
         let response = response_bytes_from(bytes).await;
         String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn start_console_server_accepts_requests() {
+        let handle = start_console_server(
+            ConsoleConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+            },
+            MemoryStore::new(),
+            crate::ConsolePublisher::new(),
+        )
+        .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        stream
+            .write_all(b"GET /style.css HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        handle.shutdown().await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("content-type: text/css; charset=utf-8"));
+    }
+
+    #[tokio::test]
+    async fn write_plain_error_writes_internal_server_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        let status = super::write_plain_error(&mut stream, "boom").await.unwrap();
+        drop(stream);
+        let response = client.await.unwrap();
+
+        assert_eq!(status, 500);
+        assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "{response}"
+        );
+        assert!(response.contains("boom"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn write_error_writes_error_display_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let error = crate::error::ServeConsoleSnafu { addr }.into_error(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "client closed",
+        ));
+
+        let status = super::write_error(&mut stream, error).await.unwrap();
+        drop(stream);
+        let response = client.await.unwrap();
+
+        assert_eq!(status, 500);
+        assert!(response.contains("Console server"), "{response}");
+        assert!(response.contains("client closed"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn write_event_stream_writes_initial_and_changed_events() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let publisher = crate::ConsolePublisher::new();
+        let writer_publisher = publisher.clone();
+        let writer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            super::write_event_stream(&mut stream, writer_publisher).await
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut response = vec![0; 256];
+
+        let mut initial = Vec::new();
+        while !contains_bytes(&initial, b"event: graph\ndata: 0") {
+            let read = stream.read(&mut response).await.unwrap();
+            assert_ne!(read, 0);
+            initial.extend_from_slice(&response[..read]);
+        }
+        let initial = String::from_utf8_lossy(&initial);
+        assert!(initial.starts_with("HTTP/1.1 200 OK"), "{initial}");
+        assert!(initial.contains("content-type: text/event-stream; charset=utf-8"));
+
+        publisher.mark_changed();
+        let mut changed = Vec::new();
+        while !contains_bytes(&changed, b"event: graph\ndata: 1") {
+            let read = stream.read(&mut response).await.unwrap();
+            assert_ne!(read, 0);
+            changed.extend_from_slice(&response[..read]);
+        }
+
+        drop(publisher);
+        assert_eq!(writer.await.unwrap().unwrap(), 200);
     }
 
     fn assert_response(response: &str, status: &str, content_type: &str, body: &str) {

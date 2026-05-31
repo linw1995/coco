@@ -1,3 +1,4 @@
+// grcov: ignore-start
 use std::env;
 use std::fs;
 use std::io;
@@ -9,8 +10,7 @@ use snafu::prelude::*;
 type BuildResult<T> = Result<T, BuildError>;
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
-const SKIP_ENV: &str = "COCO_CONSOLE_SKIP_WASM_BUILD";
-const BUILDING_ENV: &str = "COCO_CONSOLE_BUILDING_WASM";
+const JS_ASSET: &str = "coco_console.js";
 const COVERAGE_ENV_VARS: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "LLVM_PROFILE_FILE"];
 
 #[derive(Debug, Snafu)]
@@ -48,10 +48,7 @@ fn run() -> BuildResult<()> {
     println!("cargo:rerun-if-changed=src/client.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
-    if env::var_os(SKIP_ENV).is_some()
-        || env::var("TARGET").is_ok_and(|target| target == WASM_TARGET)
-        || env::var_os(BUILDING_ENV).is_some()
-    {
+    if env::var("TARGET").is_ok_and(|target| target == WASM_TARGET) {
         return Ok(());
     }
 
@@ -64,7 +61,7 @@ fn run() -> BuildResult<()> {
         .join(WASM_TARGET)
         .join("debug")
         .join("coco_console.wasm");
-    let pkg_dir = manifest_dir.join("pkg");
+    let pkg_dir = out_dir.join("pkg");
 
     let mut wasm_build = Command::new("cargo");
     wasm_build
@@ -73,7 +70,6 @@ fn run() -> BuildResult<()> {
         .arg(manifest_dir.join("Cargo.toml"))
         .arg("--target")
         .arg(WASM_TARGET)
-        .env(BUILDING_ENV, "1")
         .env("CARGO_TARGET_DIR", &wasm_target_dir);
     // Host coverage flags require a profiler runtime that wasm32-unknown-unknown does not provide.
     // Keep coverage enabled for host tests, but build the generated wasm client without those flags.
@@ -91,7 +87,7 @@ fn run() -> BuildResult<()> {
             .arg(&pkg_dir)
             .arg(&wasm_file),
     )?;
-    append_auto_start(&pkg_dir.join("coco_console.js"))?;
+    append_auto_start(&pkg_dir.join(JS_ASSET))?;
 
     Ok(())
 }
@@ -134,3 +130,4 @@ fn append_auto_start(path: &Path) -> BuildResult<()> {
     }
     Ok(())
 }
+// grcov: ignore-end
