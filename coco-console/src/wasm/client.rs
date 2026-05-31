@@ -842,15 +842,26 @@ async fn refresh_selected_node_detail_from_graph(
 
 async fn refresh_selected_node_detail(window: &Window, document: &Document) -> Result<(), JsValue> {
     let target = selected_node_target(window);
-    let url = match &target {
-        Some(target) => format!("/api/node-detail?target={}", percent_encode(target)),
-        None => "/api/node-detail".to_owned(),
-    };
+    let url = node_detail_url(target.as_deref());
     let html = fetch_text(window, &url).await?;
-    if selected_node_target(window) != target {
-        return Ok(());
+    render_node_detail_if_current(window, document, target, &html)
+}
+
+fn node_detail_url(target: Option<&str>) -> String {
+    target
+        .map(|target| format!("/api/node-detail?target={}", percent_encode(target)))
+        .unwrap_or_else(|| "/api/node-detail".to_owned())
+}
+
+fn render_node_detail_if_current(
+    window: &Window,
+    document: &Document,
+    target: Option<String>,
+    html: &str,
+) -> Result<(), JsValue> {
+    if selected_node_target(window) == target {
+        query_required(document, ".node-detail-slot")?.set_inner_html(html);
     }
-    query_required(document, ".node-detail-slot")?.set_inner_html(&html);
     Ok(())
 }
 
