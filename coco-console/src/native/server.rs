@@ -659,14 +659,17 @@ async fn write_event_stream(
     stream: &mut tokio::net::TcpStream,
     publisher: ConsolePublisher,
 ) -> io::Result<u16> {
+    let current_version = publisher.current_version();
+    let mut rx = publisher.subscribe();
+    drop(publisher);
+
     stream
         .write_all(
             b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-store\r\nconnection: keep-alive\r\n\r\n",
         )
         .await?;
-    write_graph_event(stream, publisher.current_version()).await?;
+    write_graph_event(stream, current_version).await?;
 
-    let mut rx = publisher.subscribe();
     while rx.changed().await.is_ok() {
         let version = *rx.borrow_and_update();
         write_graph_event(stream, version).await?;
@@ -684,9 +687,12 @@ async fn write_graph_event(stream: &mut tokio::net::TcpStream, version: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, handle_connection, parse_query, read_request, viewport_diff_request_from_query,
+        AppState, handle_connection, parse_query, read_request, start_console_server,
+        viewport_diff_request_from_query,
     };
+    use crate::ConsoleConfig;
     use coco_mem::MemoryStore;
+    use snafu::IntoError;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_state() -> AppState<MemoryStore> {
@@ -759,6 +765,113 @@ mod tests {
     async fn response_from(bytes: &[u8]) -> String {
         let response = response_bytes_from(bytes).await;
         String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn start_console_server_accepts_requests() {
+        let handle = start_console_server(
+            ConsoleConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+            },
+            MemoryStore::new(),
+            crate::ConsolePublisher::new(),
+        )
+        .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        stream
+            .write_all(b"GET /style.css HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        handle.shutdown().await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("content-type: text/css; charset=utf-8"));
+    }
+
+    #[tokio::test]
+    async fn write_plain_error_writes_internal_server_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        let status = super::write_plain_error(&mut stream, "boom").await.unwrap();
+        drop(stream);
+        let response = client.await.unwrap();
+
+        assert_eq!(status, 500);
+        assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "{response}"
+        );
+        assert!(response.contains("boom"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn write_error_writes_error_display_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let error = crate::error::ServeConsoleSnafu { addr }.into_error(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "client closed",
+        ));
+
+        let status = super::write_error(&mut stream, error).await.unwrap();
+        drop(stream);
+        let response = client.await.unwrap();
+
+        assert_eq!(status, 500);
+        assert!(response.contains("Console server"), "{response}");
+        assert!(response.contains("client closed"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn write_event_stream_writes_initial_and_changed_events() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let publisher = crate::ConsolePublisher::new();
+        let writer_publisher = publisher.clone();
+        let writer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            super::write_event_stream(&mut stream, writer_publisher).await
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut response = vec![0; 256];
+
+        let mut initial = Vec::new();
+        while !contains_bytes(&initial, b"event: graph\ndata: 0") {
+            let read = stream.read(&mut response).await.unwrap();
+            assert_ne!(read, 0);
+            initial.extend_from_slice(&response[..read]);
+        }
+        let initial = String::from_utf8_lossy(&initial);
+        assert!(initial.starts_with("HTTP/1.1 200 OK"), "{initial}");
+        assert!(initial.contains("content-type: text/event-stream; charset=utf-8"));
+
+        publisher.mark_changed();
+        let mut changed = Vec::new();
+        while !contains_bytes(&changed, b"event: graph\ndata: 1") {
+            let read = stream.read(&mut response).await.unwrap();
+            assert_ne!(read, 0);
+            changed.extend_from_slice(&response[..read]);
+        }
+
+        drop(publisher);
+        assert_eq!(writer.await.unwrap().unwrap(), 200);
     }
 
     fn assert_response(response: &str, status: &str, content_type: &str, body: &str) {
