@@ -28,7 +28,6 @@ crap_allow_args=(
   --allow "VirtualGraph::routed_edge_element"
   --allow "render_full_viewport"
   --allow "refresh_server_rendered_sections"
-  --allow "center_viewport_from_map"
   --allow "drain_viewport_patches"
 )
 

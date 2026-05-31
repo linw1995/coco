@@ -26,6 +26,13 @@ const EDGE_ROUTE_STEP: f64 = 12.0;
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
 
+struct ViewportMapContentBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
 #[wasm_bindgen(start)]
 pub fn start() {
     spawn_local(async {
@@ -832,35 +839,53 @@ fn center_viewport_from_map(graph: &mut VirtualGraph, event: &MouseEvent) {
     let rect = graph.viewport_map.get_bounding_client_rect();
     let canvas_width = f64::from(canvas.width);
     let canvas_height = f64::from(canvas.height);
-    if rect.width() <= 0.0 || rect.height() <= 0.0 || canvas_width <= 0.0 || canvas_height <= 0.0 {
+    let Some(content) =
+        viewport_map_content_bounds(rect.width(), rect.height(), canvas_width, canvas_height)
+    else {
         return;
-    }
+    };
     let local_x = f64::from(event.client_x()) - rect.left();
     let local_y = f64::from(event.client_y()) - rect.top();
-    let canvas_ratio = canvas_width / canvas_height;
-    let element_ratio = rect.width() / rect.height();
-    let (content_x, content_y, content_width, content_height) = if element_ratio > canvas_ratio {
-        let content_width = rect.height() * canvas_ratio;
-        (
-            (rect.width() - content_width) / 2.0,
-            0.0,
-            content_width,
-            rect.height(),
-        )
-    } else {
-        let content_height = rect.width() / canvas_ratio;
-        (
-            0.0,
-            (rect.height() - content_height) / 2.0,
-            rect.width(),
-            content_height,
-        )
-    };
-    let ratio_x = ((local_x - content_x) / content_width).clamp(0.0, 1.0);
-    let ratio_y = ((local_y - content_y) / content_height).clamp(0.0, 1.0);
+    let ratio_x = ((local_x - content.x) / content.width).clamp(0.0, 1.0);
+    let ratio_y = ((local_y - content.y) / content.height).clamp(0.0, 1.0);
     graph.viewport.x = ratio_x * canvas_width - graph.viewport.width / 2.0;
     graph.viewport.y = ratio_y * canvas_height - graph.viewport.height / 2.0;
     graph.clamp_viewport();
+}
+
+fn viewport_map_content_bounds(
+    rect_width: f64,
+    rect_height: f64,
+    canvas_width: f64,
+    canvas_height: f64,
+) -> Option<ViewportMapContentBounds> {
+    if !positive_dimensions([rect_width, rect_height, canvas_width, canvas_height]) {
+        return None;
+    }
+
+    let canvas_ratio = canvas_width / canvas_height;
+    let element_ratio = rect_width / rect_height;
+    if element_ratio > canvas_ratio {
+        let content_width = rect_height * canvas_ratio;
+        Some(ViewportMapContentBounds {
+            x: (rect_width - content_width) / 2.0,
+            y: 0.0,
+            width: content_width,
+            height: rect_height,
+        })
+    } else {
+        let content_height = rect_width / canvas_ratio;
+        Some(ViewportMapContentBounds {
+            x: 0.0,
+            y: (rect_height - content_height) / 2.0,
+            width: rect_width,
+            height: content_height,
+        })
+    }
+}
+
+fn positive_dimensions(values: [f64; 4]) -> bool {
+    values.into_iter().all(|value| value > 0.0)
 }
 
 fn browser_window() -> Result<Window, JsValue> {
