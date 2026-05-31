@@ -11,15 +11,30 @@ crap_args=(
   --workspace
   --lcov "${CARGO_TARGET_DIR}/result/lcov.info"
   --exclude "build.rs"
-  --exclude "src/wasm/client.rs"
   --threshold "${crap_threshold}"
 )
 crap_allow_args=(
+  --allow "VirtualGraph::upsert_node"
+  --allow "VirtualGraph::apply_canvas"
+  --allow "render_next_viewport_patch"
+  --allow "VirtualGraph::apply_diff"
+  --allow "ViewportState::load"
+  --allow "VirtualGraph::new"
+  --allow "VirtualGraph::apply_full"
+  --allow "refresh_on_graph_version"
+  --allow "VirtualGraph::upsert_lane"
+  --allow "VirtualGraph::upsert_edge"
+  --allow "VirtualGraph::primary_edge_element"
+  --allow "VirtualGraph::routed_edge_element"
+  --allow "render_full_viewport"
+  --allow "refresh_server_rendered_sections"
+  --allow "center_viewport_from_map"
+  --allow "drain_viewport_patches"
 )
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-  cargo-crap "${crap_args[@]}" --format github
+  cargo-crap "${crap_args[@]}" "${crap_allow_args[@]}" --format github
 fi
 
-cargo-crap "${crap_args[@]}" --format markdown --output "${CARGO_TARGET_DIR}/result/crap.md"
+cargo-crap "${crap_args[@]}" "${crap_allow_args[@]}" --format markdown --output "${CARGO_TARGET_DIR}/result/crap.md"
 cargo-crap "${crap_args[@]}" "${crap_allow_args[@]}" --fail-above --summary
