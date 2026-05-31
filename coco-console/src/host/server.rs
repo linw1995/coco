@@ -335,20 +335,17 @@ where
             Err(error) => return error_response(error),
         };
         let response = layout_graph_viewport_diff(&snapshot, request.clone());
-        if viewport_diff_has_item_changes(&response) || known_canvas != Some(response.canvas) {
+        if viewport_diff_has_key_changes(&response) || known_canvas != Some(response.canvas) {
             return json_response(&response, "graph viewport items diff");
         }
         observed_version = current_version;
     }
 }
 
-fn viewport_diff_has_item_changes(response: &crate::api::GraphViewportDiffResponse) -> bool {
+fn viewport_diff_has_key_changes(response: &crate::api::GraphViewportDiffResponse) -> bool {
     !response.added.lanes.is_empty()
         || !response.added.nodes.is_empty()
         || !response.added.edges.is_empty()
-        || !response.updated.lanes.is_empty()
-        || !response.updated.nodes.is_empty()
-        || !response.updated.edges.is_empty()
         || !response.removed.is_empty()
 }
 
@@ -742,6 +739,15 @@ mod tests {
         let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
         let root = store.root_id();
         store.fork("main", &root).unwrap();
+        let first = store
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("visible".to_owned()),
+            })
+            .unwrap();
+        store.set_branch_head("main", &root, &first).unwrap();
         let version = publisher.current_version();
         let viewport = GraphViewportRequest::default();
         let snapshot = build_graph_snapshot(&store, version).unwrap();
@@ -781,18 +787,18 @@ mod tests {
 
         assert!(
             timeout(Duration::from_millis(50), &mut task).await.is_err(),
-            "an unrelated version bump must not complete the viewport item diff"
+            "an unrelated version bump must not complete the viewport item diff when known items are unchanged"
         );
 
         let next = store
             .append(NewNode {
-                parent: root.clone(),
+                parent: first.clone(),
                 role: Role::User,
                 metadata: None,
-                kind: Kind::Text("visible".to_owned()),
+                kind: Kind::Text("next visible".to_owned()),
             })
             .unwrap();
-        store.set_branch_head("main", &root, &next).unwrap();
+        store.set_branch_head("main", &first, &next).unwrap();
 
         let response = timeout(Duration::from_secs(1), task)
             .await
