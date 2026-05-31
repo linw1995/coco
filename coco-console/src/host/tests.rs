@@ -10,12 +10,14 @@ use serde_json::json;
 use crate::graph::{GraphBranch, GraphEdge, GraphEdgeKind, GraphNode};
 use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LANE_HEIGHT, GRAPH_LEFT_X, GRAPH_TOP_Y,
-    GraphLayoutEdgeKind, GraphViewportDiffRequest, GraphViewportItemKind, GraphViewportKnownItems,
-    GraphViewportRequest, Point, layout_graph, layout_graph_viewport, layout_graph_viewport_diff,
+    GraphLayoutEdgeKind, layout_graph, layout_graph_viewport, layout_graph_viewport_diff,
     routed_elbow_points,
 };
 use crate::render::{render_fragment, render_index_page, render_snapshot_page};
-use crate::{ConsolePublisher, ConsoleStore, GraphSnapshot, build_graph_snapshot};
+use crate::{
+    ConsolePublisher, ConsoleStore, GraphSnapshot, GraphViewportDiffRequest, GraphViewportItemKind,
+    GraphViewportKnownItems, GraphViewportRequest, Point, build_graph_snapshot,
+};
 
 fn session_anchor() -> SessionAnchor {
     SessionAnchor {
