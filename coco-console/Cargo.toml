@@ -7,7 +7,7 @@ version.workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-# Serialization shared by native and wasm builds.
+# Serialization shared by host and wasm builds.
 serde.workspace = true
 serde_json.workspace = true
 
@@ -17,6 +17,11 @@ coco-mem = { path = "../coco-mem" }
 
 # Native server runtime and UI rendering.
 askama = "0.16.0"
+axum = { version = "0.8", default-features = false, features = [
+  "http1",
+  "tokio",
+] }
+futures-util = "0.3.32"
 leptos.workspace = true
 tokio.workspace = true
 tracing.workspace = true

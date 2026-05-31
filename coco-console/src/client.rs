@@ -7,6 +7,10 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Document, Element, MouseEvent, RequestInit, Response, WheelEvent, Window};
 
+use crate::api::{
+    GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
+    GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, GraphViewportResponse, Point,
+};
 use crate::viewport::{
     MIN_OVERSCAN, ViewportState, needs_full_viewport_fetch, rounded_i32, same_viewport,
 };
@@ -43,21 +47,6 @@ async fn run() -> Result<(), JsValue> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-struct GraphCanvas {
-    width: i32,
-    height: i32,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-struct GraphViewport {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    overscan: i32,
-}
-
 impl From<GraphViewport> for ViewportState {
     fn from(value: GraphViewport) -> Self {
         Self {
@@ -68,82 +57,6 @@ impl From<GraphViewport> for ViewportState {
             overscan: value.overscan,
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphViewportResponse {
-    version: u64,
-    canvas: GraphCanvas,
-    viewport: GraphViewport,
-    lanes: Vec<GraphViewportLane>,
-    nodes: Vec<GraphViewportNode>,
-    edges: Vec<GraphViewportEdge>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphViewportDiffResponse {
-    version: u64,
-    canvas: GraphCanvas,
-    viewport: GraphViewport,
-    added: GraphViewportItems,
-    updated: GraphViewportItems,
-    removed: Vec<GraphViewportRemovedItem>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct GraphViewportItems {
-    lanes: Vec<GraphViewportLane>,
-    nodes: Vec<GraphViewportNode>,
-    edges: Vec<GraphViewportEdge>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphViewportLane {
-    key: String,
-    label: String,
-    y: i32,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphViewportNode {
-    key: String,
-    id: String,
-    node_target: String,
-    short_id: String,
-    kind: String,
-    summary: String,
-    labels: Vec<String>,
-    x: i32,
-    y: i32,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphViewportEdge {
-    key: String,
-    kind: GraphViewportEdgeKind,
-    source: Point,
-    target: Point,
-    route_slot: i32,
-    target_port_offset: f64,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum GraphViewportEdgeKind {
-    PrimaryParent,
-    Fork,
-    MergeParent,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphViewportRemovedItem {
-    key: String,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-struct Point {
-    x: i32,
-    y: i32,
 }
 
 struct RenderedKeys {

@@ -1,5 +1,11 @@
 use std::collections::{BTreeSet, HashMap};
 
+use crate::api::{
+    GraphCanvas, GraphViewport, GraphViewportDiffRequest, GraphViewportDiffResponse,
+    GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItemKind, GraphViewportItems,
+    GraphViewportKnownItems, GraphViewportLane, GraphViewportNode, GraphViewportRemovedItem,
+    GraphViewportRequest, GraphViewportResponse, Point,
+};
 use crate::graph::{GraphBranch, GraphEdgeKind, GraphSnapshot, node_target_id, shorten_id};
 use serde::Serialize;
 
@@ -8,157 +14,12 @@ pub const GRAPH_LEFT_X: i32 = 120;
 pub const GRAPH_TOP_Y: i32 = 90;
 pub const GRAPH_COLUMN_WIDTH: i32 = 220;
 pub const GRAPH_LANE_HEIGHT: i32 = 140;
-pub const DEFAULT_VIEWPORT_WIDTH: i32 = 1280;
-pub const DEFAULT_VIEWPORT_HEIGHT: i32 = 720;
-pub const DEFAULT_VIEWPORT_OVERSCAN: i32 = 180;
 const MAX_EDGE_COLUMN_GAP: i32 = 5;
 #[cfg(test)]
 const EDGE_NODE_EXIT: f64 = 42.0;
 const EDGE_TARGET_APPROACH: f64 = 48.0;
 const EDGE_ROUTE_STEP: f64 = 12.0;
 pub const EDGE_TARGET_PORT_STEP: f64 = 14.0;
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
-pub struct Point {
-    pub x: i32,
-    pub y: i32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GraphViewportRequest {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-    pub overscan: i32,
-}
-
-impl Default for GraphViewportRequest {
-    fn default() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            width: DEFAULT_VIEWPORT_WIDTH,
-            height: DEFAULT_VIEWPORT_HEIGHT,
-            overscan: DEFAULT_VIEWPORT_OVERSCAN,
-        }
-    }
-}
-
-impl GraphViewportRequest {
-    pub fn normalized(self) -> Self {
-        Self {
-            x: self.x.max(0),
-            y: self.y.max(0),
-            width: self.width.max(1),
-            height: self.height.max(1),
-            overscan: self.overscan.max(0),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GraphViewportDiffRequest {
-    pub previous: GraphViewportRequest,
-    pub current: GraphViewportRequest,
-    pub known: Option<GraphViewportKnownItems>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-pub struct GraphCanvas {
-    pub width: i32,
-    pub height: i32,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-pub struct GraphViewport {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-    pub overscan: i32,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-pub struct GraphViewportResponse {
-    pub version: u64,
-    pub canvas: GraphCanvas,
-    pub viewport: GraphViewport,
-    pub lanes: Vec<GraphViewportLane>,
-    pub nodes: Vec<GraphViewportNode>,
-    pub edges: Vec<GraphViewportEdge>,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-pub struct GraphViewportDiffResponse {
-    pub version: u64,
-    pub canvas: GraphCanvas,
-    pub previous_viewport: GraphViewport,
-    pub viewport: GraphViewport,
-    pub added: GraphViewportItems,
-    pub updated: GraphViewportItems,
-    pub removed: Vec<GraphViewportRemovedItem>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
-pub struct GraphViewportItems {
-    pub lanes: Vec<GraphViewportLane>,
-    pub nodes: Vec<GraphViewportNode>,
-    pub edges: Vec<GraphViewportEdge>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GraphViewportKnownItems {
-    pub lanes: Vec<String>,
-    pub nodes: Vec<String>,
-    pub edges: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GraphViewportItemKind {
-    Lane,
-    Node,
-    Edge,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct GraphViewportRemovedItem {
-    pub kind: GraphViewportItemKind,
-    pub key: String,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct GraphViewportLane {
-    pub key: String,
-    pub label: String,
-    pub y: i32,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct GraphViewportNode {
-    pub key: String,
-    pub id: String,
-    pub node_target: String,
-    pub short_id: String,
-    pub kind: String,
-    pub summary: String,
-    pub labels: Vec<String>,
-    pub x: i32,
-    pub y: i32,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct GraphViewportEdge {
-    pub key: String,
-    pub kind: GraphLayoutEdgeKind,
-    pub source_id: String,
-    pub target_id: String,
-    pub source: Point,
-    pub target: Point,
-    pub route_slot: i32,
-    pub target_port_offset: f64,
-}
 
 #[derive(Debug)]
 pub struct GraphLayout {
@@ -209,6 +70,16 @@ impl GraphLayoutEdgeKind {
             Self::PrimaryParent => "primary_parent",
             Self::Fork => "fork",
             Self::MergeParent => "merge_parent",
+        }
+    }
+}
+
+impl From<GraphLayoutEdgeKind> for GraphViewportEdgeKind {
+    fn from(value: GraphLayoutEdgeKind) -> Self {
+        match value {
+            GraphLayoutEdgeKind::PrimaryParent => Self::PrimaryParent,
+            GraphLayoutEdgeKind::Fork => Self::Fork,
+            GraphLayoutEdgeKind::MergeParent => Self::MergeParent,
         }
     }
 }
@@ -587,7 +458,7 @@ pub fn layout_graph_viewport(
         .filter(|edge| edge_intersects(bounds, edge))
         .map(|edge| GraphViewportEdge {
             key: edge_key(edge),
-            kind: edge.kind,
+            kind: edge.kind.into(),
             source_id: edge.source_node_id.clone(),
             target_id: edge.target_node_id.clone(),
             source: edge.source,
