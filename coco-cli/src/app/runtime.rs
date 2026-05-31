@@ -25,7 +25,7 @@ enum ForwardedRuntimeScope {
     Runner,
 }
 
-pub(crate) struct RuntimeServices<'a, B, S>
+pub struct RuntimeServices<'a, B, S>
 where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
@@ -36,7 +36,7 @@ where
     pub shared_engine: Option<&'a Arc<ConversationEngine<B, S>>>,
 }
 
-pub(crate) struct ForwardedRuntimeInputs<'a> {
+pub struct ForwardedRuntimeInputs<'a> {
     pub args: &'a [String],
     pub stdin: &'a [u8],
     pub branch_env: Option<&'a str>,

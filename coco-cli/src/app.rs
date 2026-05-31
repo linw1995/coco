@@ -24,16 +24,16 @@ use crate::{
 #[cfg(test)]
 use coco_llm::SessionConfig;
 
-pub(crate) mod config;
-pub(crate) mod daemon;
+pub mod config;
+pub mod daemon;
 mod preset;
 mod prompt;
-pub(crate) mod runtime;
+pub mod runtime;
 mod session;
 mod skill;
 
 #[cfg(test)]
-pub(crate) use session::resolve_session_config as resolve_session_config_with_store;
+pub use session::resolve_session_config as resolve_session_config_with_store;
 
 pub async fn run<R>(cli: Cli, reader: &mut R) -> Result<Option<String>>
 where

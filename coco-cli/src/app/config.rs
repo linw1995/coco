@@ -20,24 +20,24 @@ use crate::{
 const CONFIG_FILE_NAME: &str = "config.toml";
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Config {
+pub struct Config {
     pub provider_profiles: ProviderProfiles,
     pub channels: ChannelConfigs,
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ProviderProfiles {
+pub struct ProviderProfiles {
     profiles: HashMap<String, ProviderProfile>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-pub(crate) struct ChannelConfigs {
+pub struct ChannelConfigs {
     #[serde(default)]
     pub telegram: Option<TelegramChannelConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub(crate) struct TelegramChannelConfig {
+pub struct TelegramChannelConfig {
     #[serde(default)]
     pub enabled: bool,
     pub token: String,
@@ -63,7 +63,7 @@ impl ProviderProfiles {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_profiles(profiles: HashMap<String, ProviderProfile>) -> Self {
+    pub fn from_profiles(profiles: HashMap<String, ProviderProfile>) -> Self {
         Self::new(profiles)
     }
 }
@@ -89,16 +89,16 @@ impl ProviderProfileLookup for ProviderProfiles {
     }
 }
 
-pub(crate) fn load_cwd_provider_profiles() -> Result<ProviderProfiles> {
+pub fn load_cwd_provider_profiles() -> Result<ProviderProfiles> {
     Ok(load_cwd_config()?.provider_profiles)
 }
 
-pub(crate) fn load_cwd_config() -> Result<Config> {
+pub fn load_cwd_config() -> Result<Config> {
     let current_dir = std::env::current_dir().context(ResolveCurrentDirSnafu)?;
     load_config_from(current_dir.join(CONFIG_FILE_NAME))
 }
 
-pub(crate) fn load_config_from(path: impl AsRef<Path>) -> Result<Config> {
+pub fn load_config_from(path: impl AsRef<Path>) -> Result<Config> {
     let path = path.as_ref();
     let data = match fs::read_to_string(path) {
         Ok(data) => Some(data),
@@ -121,7 +121,7 @@ pub(crate) fn load_config_from(path: impl AsRef<Path>) -> Result<Config> {
     })
 }
 
-pub(crate) fn resolve_channel_secret(channel: &str, value: &str) -> Result<String> {
+pub fn resolve_channel_secret(channel: &str, value: &str) -> Result<String> {
     let name = parse_env_placeholder(value).ok_or_else(|| {
         InvalidChannelSecretReferenceSnafu {
             channel: channel.to_owned(),

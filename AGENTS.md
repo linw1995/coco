@@ -13,6 +13,11 @@
 - Only narrow method visibility below the type when there is a specific
   reason to do so.
 
+## Rust Module Layout
+
+- Prefer `${module_name}.rs` over `${module_name}/mod.rs` for module root
+  files.
+
 ## SNAFU Error Construction
 
 - If you already have a `Result<T, E>` and only need to attach extra context,
