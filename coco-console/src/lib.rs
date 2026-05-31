@@ -27,6 +27,7 @@ mod host {
 mod wasm {
     #[cfg(target_arch = "wasm32")]
     pub mod client;
+    pub mod refresh;
     pub mod viewport;
 }
 

@@ -5,16 +5,20 @@ use std::rc::Rc;
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{Document, Element, MouseEvent, RequestInit, Response, WheelEvent, Window};
+use web_sys::{
+    AbortController, AbortSignal, Document, Element, MouseEvent, RequestInit, Response, WheelEvent,
+    Window,
+};
 
+use super::refresh::{
+    PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
+    pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
+};
 use crate::api::{
     GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
     GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, GraphViewportResponse, Point,
 };
-use crate::viewport::{
-    MIN_OVERSCAN, ViewportState, needs_full_viewport_fetch, needs_full_viewport_jump_fetch,
-    rounded_i32, same_viewport,
-};
+use crate::viewport::{MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport};
 
 const ROOT_ID: &str = "console-root";
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
@@ -53,7 +57,8 @@ async fn run() -> Result<(), JsValue> {
     if has_selected_node {
         refresh_selected_node_detail_from_graph(graph.clone()).await?;
     }
-    spawn_local(refresh_on_graph_version(graph));
+    spawn_local(refresh_graph_items_on_version(graph.clone()));
+    spawn_local(refresh_server_rendered_sections_on_version(graph));
 
     Ok(())
 }
@@ -120,31 +125,6 @@ impl RenderedKeys {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingViewportUpdate {
-    None,
-    Patch,
-    FullFetch,
-}
-
-impl PendingViewportUpdate {
-    fn merge(self, update: Self) -> Self {
-        match (self, update) {
-            (Self::FullFetch, _) | (_, Self::FullFetch) => Self::FullFetch,
-            (Self::Patch, _) | (_, Self::Patch) => Self::Patch,
-            (Self::None, Self::None) => Self::None,
-        }
-    }
-
-    fn needs_full_fetch(self) -> bool {
-        self == Self::FullFetch
-    }
-
-    fn is_pending(self) -> bool {
-        self != Self::None
-    }
-}
-
 struct VirtualGraph {
     window: Window,
     document: Document,
@@ -162,10 +142,12 @@ struct VirtualGraph {
     zoom: f64,
     canvas: Option<GraphCanvas>,
     version: u64,
+    shell_version: u64,
     rendered: RenderedKeys,
     rendered_viewport: ViewportState,
     patch_in_flight: bool,
     pending_viewport_update: PendingViewportUpdate,
+    version_refresh_abort: Option<AbortController>,
 }
 
 impl VirtualGraph {
@@ -206,10 +188,12 @@ impl VirtualGraph {
             zoom,
             canvas: None,
             version,
+            shell_version: version,
             rendered: RenderedKeys::new(),
             rendered_viewport: viewport,
             patch_in_flight: false,
             pending_viewport_update: PendingViewportUpdate::None,
+            version_refresh_abort: None,
         })
     }
 
@@ -473,7 +457,13 @@ impl VirtualGraph {
     }
 
     fn viewport_update_active(&self) -> bool {
-        self.patch_in_flight || self.pending_viewport_update.is_pending()
+        viewport_update_active(self.patch_in_flight, self.pending_viewport_update)
+    }
+
+    fn abort_version_refresh(&mut self) {
+        if let Some(controller) = self.version_refresh_abort.take() {
+            controller.abort();
+        }
     }
 }
 
@@ -501,17 +491,11 @@ async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
     let response =
         fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
             .await?;
-    let (document, refresh_shell, patch_needed) = {
+    let patch_needed = {
         let mut graph = graph.borrow_mut();
-        let refresh_shell = response.version != graph.version;
-        let document = graph.document.clone();
         graph.apply_full(response)?;
-        let patch_needed = !same_viewport(graph.rendered_viewport, graph.viewport);
-        (document, refresh_shell, patch_needed)
+        !same_viewport(graph.rendered_viewport, graph.viewport)
     };
-    if refresh_shell {
-        refresh_server_rendered_sections(&window, &document).await?;
-    }
     if patch_needed {
         request_viewport_patch(graph);
     }
@@ -545,14 +529,11 @@ where
 {
     let pending_update = {
         let mut graph = graph.borrow_mut();
+        graph.abort_version_refresh();
         let previous = graph.viewport;
         update(&mut graph);
         graph.clamp_viewport();
-        let pending_update = if needs_full_viewport_jump_fetch(previous, graph.viewport) {
-            PendingViewportUpdate::FullFetch
-        } else {
-            PendingViewportUpdate::Patch
-        };
+        let pending_update = pending_update_for_viewport_change(previous, graph.viewport);
         let _ = graph.apply_canvas();
         graph.persist_viewport();
         pending_update
@@ -676,7 +657,7 @@ async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
 }
 
 async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
-    let (window, rendered, current, needs_full_fetch) = {
+    let (window, current, fetch) = {
         let mut graph = graph.borrow_mut();
         let update = graph.pending_viewport_update;
         graph.pending_viewport_update = PendingViewportUpdate::None;
@@ -684,12 +665,11 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
         let current = graph.viewport;
         (
             graph.window.clone(),
-            rendered,
             current,
-            update.needs_full_fetch() || needs_full_viewport_fetch(rendered, current),
+            next_viewport_fetch(rendered, current, update),
         )
     };
-    if !needs_full_fetch && same_viewport(rendered, current) {
+    if fetch == ViewportFetch::None {
         let mut graph = graph.borrow_mut();
         if graph.pending_viewport_update.is_pending() {
             return Ok(true);
@@ -698,27 +678,22 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
         return Ok(false);
     }
 
-    if needs_full_fetch {
+    if fetch == ViewportFetch::Full {
         let query = current.request_query();
         graph.borrow().show_loading_status();
         let response =
             fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
                 .await?;
-        let (document, refresh_shell, should_continue) = {
+        let should_continue = {
             let mut graph = graph.borrow_mut();
-            let refresh_shell = response.version != graph.version;
-            let document = graph.document.clone();
             graph.apply_full(response)?;
             let should_continue = graph.pending_viewport_update.is_pending()
                 || !same_viewport(graph.rendered_viewport, graph.viewport);
             if !should_continue {
                 graph.patch_in_flight = false;
             }
-            (document, refresh_shell, should_continue)
+            should_continue
         };
-        if refresh_shell {
-            refresh_server_rendered_sections(&window, &document).await?;
-        }
         return Ok(should_continue);
     }
 
@@ -731,32 +706,28 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
     let response =
         fetch_json_form::<GraphViewportDiffResponse>(&window, "/api/graph/viewport/diff", &query)
             .await?;
-    let (document, refresh_shell, should_continue) = {
+    let should_continue = {
         let mut graph = graph.borrow_mut();
-        let refresh_shell = response.version != graph.version;
-        let document = graph.document.clone();
         graph.apply_diff(response)?;
         let should_continue = graph.pending_viewport_update.is_pending()
             || !same_viewport(graph.rendered_viewport, graph.viewport);
         if !should_continue {
             graph.patch_in_flight = false;
         }
-        (document, refresh_shell, should_continue)
+        should_continue
     };
-    if refresh_shell {
-        refresh_server_rendered_sections(&window, &document).await?;
-    }
     Ok(should_continue)
 }
 
-async fn refresh_on_graph_version(graph: Rc<RefCell<VirtualGraph>>) {
+async fn refresh_graph_items_on_version(graph: Rc<RefCell<VirtualGraph>>) {
     loop {
-        let (window, version, viewport, known_query, viewport_update_active) = {
+        let (window, version, viewport, canvas, known_query, viewport_update_active) = {
             let graph = graph.borrow();
             (
                 graph.window.clone(),
                 graph.version,
                 graph.viewport,
+                graph.canvas,
                 graph.rendered.known_query(),
                 graph.viewport_update_active(),
             )
@@ -768,51 +739,83 @@ async fn refresh_on_graph_version(graph: Rc<RefCell<VirtualGraph>>) {
             continue;
         }
         let mut query = format!("version={version}&{}&known=1", viewport.request_query());
+        if let Some(canvas) = canvas {
+            query.push_str(&format!(
+                "&canvas_width={}&canvas_height={}",
+                canvas.width, canvas.height
+            ));
+        }
         if !known_query.is_empty() {
             query.push('&');
             query.push_str(&known_query);
         }
-        match fetch_json_form::<GraphViewportDiffResponse>(
+        let controller = match begin_version_refresh(graph.clone()) {
+            Ok(Some(controller)) => controller,
+            Ok(None) => continue,
+            Err(error) => {
+                web_sys::console::error_1(&error);
+                continue;
+            }
+        };
+        let response = fetch_json_form_with_signal::<GraphViewportDiffResponse>(
             &window,
-            "/api/graph/viewport/diff",
+            "/api/graph/viewport/items/diff",
             &query,
+            &controller.signal(),
         )
-        .await
-        {
+        .await;
+        clear_version_refresh(graph.clone());
+        match response {
             Ok(response) => {
                 let refresh = {
                     let mut graph = graph.borrow_mut();
-                    if !same_viewport(graph.viewport, viewport) {
-                        continue;
-                    }
-                    if graph.viewport_update_active() {
-                        None
-                    } else {
-                        let refresh_shell = response.version != graph.version;
-                        let window = graph.window.clone();
-                        let document = graph.document.clone();
-                        if let Err(error) = graph.apply_diff(response) {
-                            web_sys::console::error_1(&error);
+                    match version_refresh_action(
+                        viewport,
+                        graph.viewport,
+                        graph.patch_in_flight,
+                        graph.pending_viewport_update,
+                    ) {
+                        VersionRefresh::Drop => continue,
+                        VersionRefresh::Defer => None,
+                        VersionRefresh::Apply => {
+                            if let Err(error) = graph.apply_diff(response) {
+                                web_sys::console::error_1(&error);
+                            }
+                            Some(())
                         }
-                        Some((window, document, refresh_shell))
                     }
                 };
-                let Some((window, document, refresh_shell)) = refresh else {
+                if refresh.is_none() {
                     let window = graph.borrow().window.clone();
                     if let Err(error) = delay_ms(&window, VERSION_REFRESH_RETRY_MS).await {
                         web_sys::console::error_1(&error);
                     }
                     continue;
                 };
-                if refresh_shell
-                    && let Err(error) = refresh_server_rendered_sections(&window, &document).await
-                {
+            }
+            Err(error) => {
+                if !graph.borrow().viewport_update_active() {
                     web_sys::console::error_1(&error);
                 }
             }
-            Err(error) => web_sys::console::error_1(&error),
         }
     }
+}
+
+fn begin_version_refresh(
+    graph: Rc<RefCell<VirtualGraph>>,
+) -> Result<Option<AbortController>, JsValue> {
+    let mut graph = graph.borrow_mut();
+    if graph.viewport_update_active() {
+        return Ok(None);
+    }
+    let controller = AbortController::new()?;
+    graph.version_refresh_abort = Some(controller.clone());
+    Ok(Some(controller))
+}
+
+fn clear_version_refresh(graph: Rc<RefCell<VirtualGraph>>) {
+    graph.borrow_mut().version_refresh_abort = None;
 }
 
 async fn delay_ms(window: &Window, delay_ms: i32) -> Result<(), JsValue> {
@@ -830,15 +833,54 @@ async fn delay_ms(window: &Window, delay_ms: i32) -> Result<(), JsValue> {
     JsFuture::from(promise).await.map(|_| ())
 }
 
-async fn refresh_server_rendered_sections(
+async fn refresh_server_rendered_sections_on_version(graph: Rc<RefCell<VirtualGraph>>) {
+    loop {
+        let (window, document, version) = {
+            let graph = graph.borrow();
+            (
+                graph.window.clone(),
+                graph.document.clone(),
+                graph.shell_version,
+            )
+        };
+        let url = format!("/fragment?version={version}");
+        match refresh_server_rendered_sections_from_url(&window, &document, &url).await {
+            Ok(Some(version)) => {
+                graph.borrow_mut().shell_version = version;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                web_sys::console::error_1(&error);
+                if let Err(error) = delay_ms(&window, VERSION_REFRESH_RETRY_MS).await {
+                    web_sys::console::error_1(&error);
+                }
+            }
+        }
+    }
+}
+
+async fn refresh_server_rendered_sections_from_url(
     window: &Window,
     document: &Document,
-) -> Result<(), JsValue> {
-    let html = fetch_text(window, "/fragment").await?;
+    url: &str,
+) -> Result<Option<u64>, JsValue> {
+    let html = fetch_text(window, url).await?;
     let container = document.create_element("div")?;
     container.set_inner_html(&html);
+    let version = fragment_version(&container);
     refresh_server_fragment_sections(document, &container)?;
-    refresh_selected_node_detail_if_needed(window, document).await
+    refresh_selected_node_detail_if_needed(window, document).await?;
+    Ok(version)
+}
+
+fn fragment_version(container: &Element) -> Option<u64> {
+    container
+        .query_selector("#console-root")
+        .ok()
+        .flatten()?
+        .get_attribute("data-version")?
+        .parse()
+        .ok()
 }
 
 fn refresh_server_fragment_sections(
@@ -1089,7 +1131,20 @@ async fn fetch_json_form<T>(window: &Window, url: &str, body: &str) -> Result<T,
 where
     T: for<'de> Deserialize<'de>,
 {
-    let text = fetch_text_form(window, url, body).await?;
+    let text = fetch_text_form(window, url, body, None).await?;
+    serde_json::from_str(&text).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+async fn fetch_json_form_with_signal<T>(
+    window: &Window,
+    url: &str,
+    body: &str,
+    signal: &AbortSignal,
+) -> Result<T, JsValue>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let text = fetch_text_form(window, url, body, Some(signal)).await?;
     serde_json::from_str(&text).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
@@ -1100,10 +1155,18 @@ async fn fetch_text(window: &Window, url: &str) -> Result<String, JsValue> {
     response_text(response).await
 }
 
-async fn fetch_text_form(window: &Window, url: &str, body: &str) -> Result<String, JsValue> {
+async fn fetch_text_form(
+    window: &Window,
+    url: &str,
+    body: &str,
+    signal: Option<&AbortSignal>,
+) -> Result<String, JsValue> {
     let init = RequestInit::new();
     init.set_method("POST");
     init.set_body(&JsValue::from_str(body));
+    if let Some(signal) = signal {
+        init.set_signal(Some(signal));
+    }
     let response = JsFuture::from(window.fetch_with_str_and_init(url, &init))
         .await?
         .dyn_into::<Response>()?;
