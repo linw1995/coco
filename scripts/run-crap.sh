@@ -11,7 +11,7 @@ crap_args=(
   --workspace
   --lcov "${CARGO_TARGET_DIR}/result/lcov.info"
   --exclude "build.rs"
-  --exclude "src/client.rs"
+  --exclude "src/wasm/client.rs"
   --threshold "${crap_threshold}"
 )
 crap_allow_args=(
