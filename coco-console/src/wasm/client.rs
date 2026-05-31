@@ -366,12 +366,17 @@ impl VirtualGraph {
     fn primary_edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
         let element = svg_element(&self.document, "line")?;
         let (x1, y1, x2, y2) = line_points(edge.source, edge.target, edge.target_port_offset);
-        element.set_attribute("class", "edge primary-parent")?;
-        element.set_attribute("marker-end", "url(#arrowhead)")?;
-        element.set_attribute("x1", &x1)?;
-        element.set_attribute("y1", &y1)?;
-        element.set_attribute("x2", &x2)?;
-        element.set_attribute("y2", &y2)?;
+        set_attributes(
+            &element,
+            [
+                ("class", "edge primary-parent".to_string()),
+                ("marker-end", "url(#arrowhead)".to_string()),
+                ("x1", x1),
+                ("y1", y1),
+                ("x2", x2),
+                ("y2", y2),
+            ],
+        )?;
         Ok(element)
     }
 
