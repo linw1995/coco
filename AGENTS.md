@@ -7,14 +7,17 @@
 
 ## Rust Visibility
 
-- Prefer controlling visibility at module and type boundaries instead of on
-  individual items. For example, keep an implementation module private and use
-  plain `pub` for the items that its parent module needs.
-- If a type is not public outside its module boundary, its impl methods should
-  generally use `pub` rather than repeating scoped visibility on each method.
-- Only use item-level scoped visibility, such as `pub(crate)`, `pub(super)`, or
-  `pub(in ...)`, when the surrounding module/type boundary cannot express the
-  intended API.
+- Prefer controlling visibility at the module boundary first. Use private
+  parent modules and focused `pub use` exports in `lib.rs` or
+  `${module_name}.rs` to define the public surface.
+- Inside a private module boundary, prefer ordinary `pub` items over scattered
+  `pub(super)` or `pub(crate)` annotations.
+- When module boundaries are not enough, prefer controlling visibility at the
+  type level.
+- If a type is declared `pub(crate)`, its impl methods should generally use
+  `pub` rather than repeating `pub(crate)` on each method.
+- Only narrow item or method visibility below the type when there is a
+  specific reason to do so.
 
 ## Rust Module Layout
 

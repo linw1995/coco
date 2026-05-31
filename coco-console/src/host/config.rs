@@ -13,6 +13,6 @@ impl Default for ConsoleConfig {
     }
 }
 
-pub fn default_console_addr() -> SocketAddr {
+fn default_console_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 17667))
 }

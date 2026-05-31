@@ -1,1 +1,0 @@
-<line class="{{ class }}"{% if let Some(marker_end) = marker_end %} marker-end="{{ marker_end }}"{% endif %} x1="{{ x1 }}" y1="{{ y1 }}" x2="{{ x2 }}" y2="{{ y2 }}"></line>

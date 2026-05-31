@@ -45,8 +45,8 @@ fn main() {
 
 fn run() -> BuildResult<()> {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/client.rs");
-    println!("cargo:rerun-if-changed=src/viewport.rs");
+    println!("cargo:rerun-if-changed=src/wasm/client.rs");
+    println!("cargo:rerun-if-changed=src/wasm/viewport.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
     if env::var("TARGET").is_ok_and(|target| target == WASM_TARGET) {
