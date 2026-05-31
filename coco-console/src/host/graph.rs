@@ -43,11 +43,8 @@ pub struct GraphEdge {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphEdgeKind {
-    #[serde(rename = "primary_parent")]
     Primary,
-    #[serde(rename = "merge_parent")]
     Merge,
-    #[serde(rename = "shadow_parent")]
     Shadow,
 }
 
