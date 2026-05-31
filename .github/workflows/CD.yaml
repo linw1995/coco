@@ -89,16 +89,7 @@ jobs:
             exit 1
           fi
 
-          temp_refs=()
           manifest_refs=()
-
-          cleanup_temp_refs() {
-            for temp_ref in "${temp_refs[@]}"; do
-              nix run nixpkgs#crane -- delete "${temp_ref}" >/dev/null 2>&1 || true
-            done
-          }
-
-          trap cleanup_temp_refs EXIT
 
           for image_file in "${image_files[@]}"; do
             case "$(basename "${image_file}")" in
@@ -114,13 +105,11 @@ jobs:
                 ;;
             esac
 
-            temp_ref="${image}:tmp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${arch}"
             docker_tar="${image_file%.gz}"
             gzip -dc "${image_file}" > "${docker_tar}"
-            nix run nixpkgs#crane -- push "${docker_tar}" "${temp_ref}"
 
-            digest="$(nix run nixpkgs#crane -- digest "${temp_ref}")"
-            temp_refs+=("${temp_ref}")
+            digest="$(nix run nixpkgs#crane -- digest --tarball "${docker_tar}")"
+            nix run nixpkgs#crane -- push "${docker_tar}" "${image}@${digest}"
             manifest_refs+=("${image}@${digest}")
           done
 
