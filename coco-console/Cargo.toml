@@ -43,6 +43,7 @@ web-sys = { version = "=0.3.94", features = [
   "Element",
   "EventTarget",
   "HtmlElement",
+  "Location",
   "MouseEvent",
   "Node",
   "NodeList",

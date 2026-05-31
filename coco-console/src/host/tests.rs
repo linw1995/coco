@@ -17,7 +17,9 @@ use crate::layout::{
     GraphLayoutEdgeKind, layout_graph, layout_graph_viewport, layout_graph_viewport_diff,
     routed_elbow_points,
 };
-use crate::render::{render_fragment, render_index_page, render_snapshot_page};
+use crate::render::{
+    render_fragment, render_index_page, render_node_detail_fragment, render_snapshot_page,
+};
 use crate::{ConsolePublisher, ConsoleStore};
 
 fn session_anchor() -> SessionAnchor {
@@ -284,6 +286,35 @@ fn empty_snapshot_page_still_renders_virtual_graph_shell() {
     assert!(html.contains("class=\"graph-lanes\""));
     assert!(html.contains("class=\"viewport-map\""));
     assert!(html.contains("Loading graph..."));
+}
+
+#[test]
+fn snapshot_page_defers_node_detail_content_until_requested() {
+    let mut snapshot = two_node_snapshot(42);
+    snapshot.nodes[0].content = "Deferred detail payload".to_owned();
+
+    let html = render_snapshot_page(&snapshot);
+
+    assert!(html.contains("class=\"node-detail-slot\""));
+    assert!(!html.contains("Deferred detail payload"));
+    assert!(!html.contains("class=\"node-details node-detail\""));
+
+    let detail = render_node_detail_fragment(&snapshot, Some("detail-base"));
+
+    assert!(detail.contains("class=\"node-details node-detail\""));
+    assert!(detail.contains("Deferred detail payload"));
+}
+
+#[test]
+fn node_detail_fragment_renders_default_or_missing_selection() {
+    let snapshot = empty_snapshot(0);
+
+    let default_detail = render_node_detail_fragment(&snapshot, None);
+    let missing_detail = render_node_detail_fragment(&snapshot, Some("detail-missing"));
+
+    assert!(default_detail.contains("Select a node to inspect its content."));
+    assert!(missing_detail.contains("The selected node is no longer available."));
+    assert!(missing_detail.contains("detail-missing"));
 }
 
 #[test]
