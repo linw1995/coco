@@ -67,7 +67,7 @@ struct SkillVersionView {
     body: String,
 }
 
-pub(super) async fn run_skill_command<B, S>(
+pub async fn run_skill_command<B, S>(
     command: SkillCommand,
     store: &S,
     llm: &Arc<LlmService<B, S>>,

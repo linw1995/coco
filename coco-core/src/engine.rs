@@ -101,7 +101,7 @@ impl<B, S> ConversationEngine<B, S> {
         }
     }
 
-    pub(crate) fn service(&self) -> &Arc<LlmService<B, S>> {
+    pub fn service(&self) -> &Arc<LlmService<B, S>> {
         &self.service
     }
 
@@ -111,6 +111,19 @@ impl<B, S> ConversationEngine<B, S> {
 
     pub async fn lock_branch(&self, branch: &str) -> BranchLockGuard {
         self.service.lock_branch_scope(branch).await
+    }
+}
+
+impl<B, S> ConversationEngine<B, S>
+where
+    S: NodeStore,
+{
+    pub fn session_supports_tool(
+        &self,
+        branch: &str,
+        tool_name: &str,
+    ) -> std::result::Result<bool, LlmError> {
+        self.service.session_supports_tool(branch, tool_name)
     }
 }
 

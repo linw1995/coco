@@ -31,10 +31,10 @@ use crate::{
     },
 };
 
-pub(super) const PROMPT_JOB_QUEUE: &str = "prompt.job";
-pub(super) const PROMPT_JOB_BRANCH_QUEUE_PREFIX: &str = "prompt.job/";
+pub const PROMPT_JOB_QUEUE: &str = "prompt.job";
+pub const PROMPT_JOB_BRANCH_QUEUE_PREFIX: &str = "prompt.job/";
 
-pub(super) fn prompt_job_queue_for_branch(branch: &str) -> String {
+pub fn prompt_job_queue_for_branch(branch: &str) -> String {
     format!("{PROMPT_JOB_BRANCH_QUEUE_PREFIX}{branch}")
 }
 
@@ -91,7 +91,7 @@ struct PromptBaseNodeView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct QueuedPromptRequest {
+pub struct QueuedPromptRequest {
     pub job_id: String,
     pub branch: String,
     pub prompt: String,
@@ -129,7 +129,7 @@ struct PromptAnchorDetails {
     merge_parents: Vec<MergeParent>,
 }
 
-pub(super) async fn run_prompt_command<B, R, S>(
+pub async fn run_prompt_command<B, R, S>(
     command: PromptCommand,
     reader: &mut R,
     shared_store: &S,
@@ -454,7 +454,7 @@ where
     });
 }
 
-pub(super) fn queue_prompt_job_request(
+pub fn queue_prompt_job_request(
     store: &impl Store,
     request: QueuedPromptRequest,
 ) -> Result<MessageQueueItem> {
@@ -694,8 +694,8 @@ fn job_list_item_from_snapshot(snapshot: JobStatusSnapshot) -> JobListItemView {
     }
 }
 
-pub(super) const PROMPT_JOB_ID_BODY_LEN: usize = 21;
-pub(super) const PROMPT_JOB_ID_PREFIX: &str = "job-";
+pub const PROMPT_JOB_ID_BODY_LEN: usize = 21;
+pub const PROMPT_JOB_ID_PREFIX: &str = "job-";
 
 fn next_prompt_job_id() -> String {
     format!(

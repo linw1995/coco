@@ -159,7 +159,7 @@ struct NodeShowResult {
     node: Node,
 }
 
-pub(super) async fn run_session_command<B, S>(
+pub async fn run_session_command<B, S>(
     command: SessionCommand,
     store: &S,
     llm: &Arc<LlmService<B, S>>,

@@ -39,14 +39,14 @@ impl Error {
             message: message.into(),
         }
     }
+}
 
-    pub(crate) fn is_transport_failure(&self) -> bool {
-        match self {
-            Self::Transport { .. } => true,
-            #[cfg(feature = "telegram")]
-            Self::TelegramTransport { .. } => true,
-            Self::Handler { .. } | Self::InvalidInput { .. } => false,
-        }
+pub fn is_transport_failure(error: &Error) -> bool {
+    match error {
+        Error::Transport { .. } => true,
+        #[cfg(feature = "telegram")]
+        Error::TelegramTransport { .. } => true,
+        Error::Handler { .. } | Error::InvalidInput { .. } => false,
     }
 }
 

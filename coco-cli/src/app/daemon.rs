@@ -77,7 +77,7 @@ pub struct DaemonServerOptions<'a> {
     pub console_publisher: Option<ConsolePublisher>,
 }
 
-pub(super) async fn run_daemon_command<B, S>(
+pub async fn run_daemon_command<B, S>(
     command: DaemonCommand,
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
