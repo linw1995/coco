@@ -1,1 +1,0 @@
-<polyline class="{{ class }}"{% if let Some(marker_end) = marker_end %} marker-end="{{ marker_end }}"{% endif %} points="{{ points }}"></polyline>

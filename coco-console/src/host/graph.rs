@@ -43,9 +43,9 @@ pub struct GraphEdge {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphEdgeKind {
-    PrimaryParent,
-    MergeParent,
-    ShadowParent,
+    Primary,
+    Merge,
+    Shadow,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -147,7 +147,7 @@ pub fn build_graph_snapshot(
             edges.push(GraphEdge {
                 source: parent.clone(),
                 target: entry.node.id.clone(),
-                kind: GraphEdgeKind::PrimaryParent,
+                kind: GraphEdgeKind::Primary,
             });
         }
         for parent in &entry.merge_parents {
@@ -155,9 +155,9 @@ pub fn build_graph_snapshot(
                 source: parent.node_id().to_owned(),
                 target: entry.node.id.clone(),
                 kind: if parent.is_shadow() {
-                    GraphEdgeKind::ShadowParent
+                    GraphEdgeKind::Shadow
                 } else {
-                    GraphEdgeKind::MergeParent
+                    GraphEdgeKind::Merge
                 },
             });
         }

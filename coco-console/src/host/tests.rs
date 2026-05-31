@@ -7,17 +7,18 @@ use coco_mem::{
 };
 use serde_json::json;
 
-use crate::graph::{GraphBranch, GraphEdge, GraphEdgeKind, GraphNode};
+use crate::api::{GraphViewportItemKind, Point};
+use crate::graph::{
+    GraphBranch, GraphEdge, GraphEdgeKind, GraphNode, GraphSnapshot, build_graph_snapshot,
+};
+use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LANE_HEIGHT, GRAPH_LEFT_X, GRAPH_TOP_Y,
     GraphLayoutEdgeKind, layout_graph, layout_graph_viewport, layout_graph_viewport_diff,
     routed_elbow_points,
 };
 use crate::render::{render_fragment, render_index_page, render_snapshot_page};
-use crate::{
-    ConsolePublisher, ConsoleStore, GraphSnapshot, GraphViewportDiffRequest, GraphViewportItemKind,
-    GraphViewportKnownItems, GraphViewportRequest, Point, build_graph_snapshot,
-};
+use crate::{ConsolePublisher, ConsoleStore};
 
 fn session_anchor() -> SessionAnchor {
     SessionAnchor {
@@ -58,7 +59,7 @@ fn two_node_snapshot(version: u64) -> GraphSnapshot {
         edges: vec![GraphEdge {
             source: "base".to_owned(),
             target: "merged".to_owned(),
-            kind: GraphEdgeKind::PrimaryParent,
+            kind: GraphEdgeKind::Primary,
         }],
         branches: vec![GraphBranch {
             name: "main".to_owned(),
@@ -89,7 +90,7 @@ fn linear_snapshot(version: u64, node_ids: &[&str]) -> GraphSnapshot {
         .map(|window| GraphEdge {
             source: window[0].to_owned(),
             target: window[1].to_owned(),
-            kind: GraphEdgeKind::PrimaryParent,
+            kind: GraphEdgeKind::Primary,
         })
         .collect::<Vec<_>>();
     let head_id = node_ids
@@ -209,17 +210,17 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
     assert!(snapshot.edges.contains(&GraphEdge {
         source: left.clone(),
         target: merged.clone(),
-        kind: GraphEdgeKind::PrimaryParent,
+        kind: GraphEdgeKind::Primary,
     }));
     assert!(snapshot.edges.contains(&GraphEdge {
         source: left.clone(),
         target: draft,
-        kind: GraphEdgeKind::PrimaryParent,
+        kind: GraphEdgeKind::Primary,
     }));
     assert!(snapshot.edges.contains(&GraphEdge {
         source: right,
         target: merged,
-        kind: GraphEdgeKind::MergeParent,
+        kind: GraphEdgeKind::Merge,
     }));
 
     let layout = layout_graph(&snapshot);
@@ -327,7 +328,7 @@ fn graph_snapshot_contains_shadow_parent_edges() {
     assert!(snapshot.edges.contains(&GraphEdge {
         source: shadow_parent,
         target: prompt,
-        kind: GraphEdgeKind::ShadowParent,
+        kind: GraphEdgeKind::Shadow,
     }));
 }
 
@@ -402,12 +403,12 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     assert!(snapshot.edges.contains(&GraphEdge {
         source: tool_use,
         target: invocation.clone(),
-        kind: GraphEdgeKind::PrimaryParent,
+        kind: GraphEdgeKind::Primary,
     }));
     assert!(snapshot.edges.contains(&GraphEdge {
         source: invocation,
         target: invocation_child,
-        kind: GraphEdgeKind::PrimaryParent,
+        kind: GraphEdgeKind::Primary,
     }));
 }
 
@@ -603,7 +604,7 @@ fn layout_expands_empty_columns_from_event_order() {
         edges: vec![GraphEdge {
             source: "base".to_owned(),
             target: "merged".to_owned(),
-            kind: GraphEdgeKind::PrimaryParent,
+            kind: GraphEdgeKind::Primary,
         }],
         branches: vec![GraphBranch {
             name: "main".to_owned(),
@@ -635,7 +636,7 @@ fn graph_viewport_response_includes_canvas_and_visible_nodes() {
         edges: vec![GraphEdge {
             source: "base".to_owned(),
             target: "merged".to_owned(),
-            kind: GraphEdgeKind::PrimaryParent,
+            kind: GraphEdgeKind::Primary,
         }],
         branches: vec![GraphBranch {
             name: "main".to_owned(),

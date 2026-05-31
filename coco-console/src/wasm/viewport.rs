@@ -1,16 +1,16 @@
-pub(super) const MIN_OVERSCAN: i32 = 180;
+pub const MIN_OVERSCAN: i32 = 180;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ViewportState {
-    pub(super) x: f64,
-    pub(super) y: f64,
-    pub(super) width: f64,
-    pub(super) height: f64,
-    pub(super) overscan: i32,
+pub struct ViewportState {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub overscan: i32,
 }
 
 impl ViewportState {
-    pub(super) fn request_query(self) -> String {
+    pub fn request_query(self) -> String {
         format!(
             "x={}&y={}&width={}&height={}&overscan={}",
             rounded_i32(self.x),
@@ -21,11 +21,11 @@ impl ViewportState {
         )
     }
 
-    pub(super) fn refresh_render_overscan(&mut self) {
+    pub fn refresh_render_overscan(&mut self) {
         self.overscan = self.render_overscan();
     }
 
-    pub(super) fn render_overscan(self) -> i32 {
+    pub fn render_overscan(self) -> i32 {
         ((self.width.max(self.height) / 2.0).ceil() as i32).max(MIN_OVERSCAN)
     }
 }
@@ -66,7 +66,7 @@ impl ViewportBounds {
     }
 }
 
-pub(super) fn same_viewport(left: ViewportState, right: ViewportState) -> bool {
+pub fn same_viewport(left: ViewportState, right: ViewportState) -> bool {
     rounded_i32(left.x) == rounded_i32(right.x)
         && rounded_i32(left.y) == rounded_i32(right.y)
         && rounded_i32(left.width) == rounded_i32(right.width)
@@ -74,11 +74,11 @@ pub(super) fn same_viewport(left: ViewportState, right: ViewportState) -> bool {
         && left.overscan == right.overscan
 }
 
-pub(super) fn needs_full_viewport_fetch(rendered: ViewportState, current: ViewportState) -> bool {
+pub fn needs_full_viewport_fetch(rendered: ViewportState, current: ViewportState) -> bool {
     !ViewportBounds::rendered(rendered).intersects(ViewportBounds::strict(current))
 }
 
-pub(super) fn rounded_i32(value: f64) -> i32 {
+pub fn rounded_i32(value: f64) -> i32 {
     value.round().clamp(0.0, f64::from(i32::MAX)) as i32
 }
 
