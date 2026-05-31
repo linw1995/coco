@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::str::{FromStr, Split};
 
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
@@ -479,17 +480,44 @@ impl VirtualGraph {
 
 impl ViewportState {
     fn load(window: &Window) -> Option<Self> {
-        let storage = session_storage(window)?;
-        let value = storage.get_item(VIEWPORT_KEY).ok().flatten()?;
-        let mut parts = value.split(',');
-        Some(Self {
-            x: parts.next()?.parse::<f64>().ok()?,
-            y: parts.next()?.parse::<f64>().ok()?,
-            width: parts.next()?.parse::<f64>().ok()?,
-            height: parts.next()?.parse::<f64>().ok()?,
-            overscan: parts.next()?.parse::<i32>().ok()?,
-        })
+        let value = stored_viewport_value(window)?;
+        parse_stored_viewport(&value)
     }
+}
+
+fn stored_viewport_value(window: &Window) -> Option<String> {
+    session_storage(window)?
+        .get_item(VIEWPORT_KEY)
+        .ok()
+        .flatten()
+}
+
+fn parse_stored_viewport(value: &str) -> Option<ViewportState> {
+    let mut parts = value.split(',');
+    let (x, y) = parse_next_viewport_pair(&mut parts)?;
+    let (width, height) = parse_next_viewport_pair(&mut parts)?;
+    let overscan = parse_next_viewport_value(&mut parts)?;
+    Some(ViewportState {
+        x,
+        y,
+        width,
+        height,
+        overscan,
+    })
+}
+
+fn parse_next_viewport_pair(parts: &mut Split<'_, char>) -> Option<(f64, f64)> {
+    Some((
+        parse_next_viewport_value(parts)?,
+        parse_next_viewport_value(parts)?,
+    ))
+}
+
+fn parse_next_viewport_value<T>(parts: &mut Split<'_, char>) -> Option<T>
+where
+    T: FromStr,
+{
+    parts.next()?.parse().ok()
 }
 
 async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
