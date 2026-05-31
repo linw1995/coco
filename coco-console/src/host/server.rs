@@ -669,13 +669,19 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 mod tests {
     use super::{
         AppState, graph_viewport_diff_response, graph_viewport_items_diff_response_from_query,
-        parse_query, start_console_server, viewport_diff_request_from_query,
+        parse_query, start_console_server, viewport_diff_has_changes,
+        viewport_diff_request_from_query,
+    };
+    use crate::api::{
+        GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
+        GraphViewportItems, GraphViewportRemovedItem, Point,
     };
     use crate::graph::build_graph_snapshot;
-    use crate::host::api::GraphViewportRequest;
+    use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
     use crate::layout::layout_graph_viewport;
     use crate::{ConsoleConfig, ConsolePublisher, ConsoleStore};
     use coco_mem::{BranchStore, Kind, MemoryStore, NewNode, NodeStore, Role};
+    use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
 
@@ -687,6 +693,46 @@ mod tests {
 
     fn get_request(path: &str) -> String {
         format!("GET {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+    }
+
+    fn known_viewport_query(
+        version: u64,
+        viewport: GraphViewportRequest,
+        rendered: &crate::api::GraphViewportResponse,
+    ) -> String {
+        let mut query = format!(
+            "version={version}&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
+            viewport.x,
+            viewport.y,
+            viewport.width,
+            viewport.height,
+            viewport.overscan,
+            rendered.canvas.width,
+            rendered.canvas.height,
+        );
+        for lane in &rendered.lanes {
+            append_known_item(&mut query, "lane", &lane.key, &lane.fingerprint());
+        }
+        for node in &rendered.nodes {
+            append_known_item(&mut query, "node", &node.key, &node.fingerprint());
+        }
+        for edge in &rendered.edges {
+            append_known_item(&mut query, "edge", &edge.key, &edge.fingerprint());
+        }
+        query
+    }
+
+    fn append_known_item(query: &mut String, kind: &str, key: &str, fingerprint: &str) {
+        query.push_str("&known_");
+        query.push_str(kind);
+        query.push('=');
+        query.push_str(key);
+        query.push_str("&known_");
+        query.push_str(kind);
+        query.push_str("_fingerprint=");
+        query.push_str(key);
+        query.push(':');
+        query.push_str(fingerprint);
     }
 
     async fn response_bytes_from(bytes: &[u8]) -> Vec<u8> {
@@ -801,40 +847,7 @@ mod tests {
         let viewport = GraphViewportRequest::default();
         let snapshot = build_graph_snapshot(&store, version).unwrap();
         let rendered = layout_graph_viewport(&snapshot, viewport);
-        let mut query = format!(
-            "version={version}&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
-            viewport.x,
-            viewport.y,
-            viewport.width,
-            viewport.height,
-            viewport.overscan,
-            rendered.canvas.width,
-            rendered.canvas.height,
-        );
-        for lane in rendered.lanes {
-            query.push_str("&known_lane=");
-            query.push_str(&lane.key);
-            query.push_str("&known_lane_fingerprint=");
-            query.push_str(&lane.key);
-            query.push(':');
-            query.push_str(&lane.fingerprint());
-        }
-        for node in rendered.nodes {
-            query.push_str("&known_node=");
-            query.push_str(&node.key);
-            query.push_str("&known_node_fingerprint=");
-            query.push_str(&node.key);
-            query.push(':');
-            query.push_str(&node.fingerprint());
-        }
-        for edge in rendered.edges {
-            query.push_str("&known_edge=");
-            query.push_str(&edge.key);
-            query.push_str("&known_edge_fingerprint=");
-            query.push_str(&edge.key);
-            query.push(':');
-            query.push_str(&edge.fingerprint());
-        }
+        let query = known_viewport_query(version, viewport, &rendered);
         let state = AppState {
             store: store.clone(),
             publisher: publisher.clone(),
@@ -895,24 +908,7 @@ mod tests {
         let viewport = GraphViewportRequest::default();
         let snapshot = build_graph_snapshot(&store, version).unwrap();
         let rendered = layout_graph_viewport(&snapshot, viewport);
-        let mut query = format!(
-            "version={version}&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
-            viewport.x,
-            viewport.y,
-            viewport.width,
-            viewport.height,
-            viewport.overscan,
-            rendered.canvas.width,
-            rendered.canvas.height,
-        );
-        for node in rendered.nodes {
-            query.push_str("&known_node=");
-            query.push_str(&node.key);
-            query.push_str("&known_node_fingerprint=");
-            query.push_str(&node.key);
-            query.push(':');
-            query.push_str(&node.fingerprint());
-        }
+        let query = known_viewport_query(version, viewport, &rendered);
         let state = AppState {
             store: store.clone(),
             publisher: publisher.clone(),
@@ -977,40 +973,7 @@ mod tests {
         let viewport = GraphViewportRequest::default();
         let snapshot = build_graph_snapshot(&store, version).unwrap();
         let rendered = layout_graph_viewport(&snapshot, viewport);
-        let mut query = format!(
-            "version={version}&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
-            viewport.x,
-            viewport.y,
-            viewport.width,
-            viewport.height,
-            viewport.overscan,
-            rendered.canvas.width,
-            rendered.canvas.height,
-        );
-        for lane in rendered.lanes {
-            query.push_str("&known_lane=");
-            query.push_str(&lane.key);
-            query.push_str("&known_lane_fingerprint=");
-            query.push_str(&lane.key);
-            query.push(':');
-            query.push_str(&lane.fingerprint());
-        }
-        for node in rendered.nodes {
-            query.push_str("&known_node=");
-            query.push_str(&node.key);
-            query.push_str("&known_node_fingerprint=");
-            query.push_str(&node.key);
-            query.push(':');
-            query.push_str(&node.fingerprint());
-        }
-        for edge in rendered.edges {
-            query.push_str("&known_edge=");
-            query.push_str(&edge.key);
-            query.push_str("&known_edge_fingerprint=");
-            query.push_str(&edge.key);
-            query.push(':');
-            query.push_str(&edge.fingerprint());
-        }
+        let query = known_viewport_query(version, viewport, &rendered);
         let state = AppState { store, publisher };
         let task = tokio::spawn(graph_viewport_diff_response(state, parse_query(&query)));
 
@@ -1019,6 +982,83 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_viewport_items_diff_get_without_version() {
+        let response = response_from(
+            b"GET /api/graph/viewport/items/diff?x=0&y=0&width=640&height=360&known_node=node:stale HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"kind\":\"node\""), "{response}");
+        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_viewport_items_diff_post_without_version() {
+        let body = "x=0&y=0&width=640&height=360&known_node=node:stale";
+        let request = format!(
+            "POST /api/graph/viewport/items/diff HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = response_from(request.as_bytes()).await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"kind\":\"node\""), "{response}");
+        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+    }
+
+    #[test]
+    fn viewport_diff_detects_updated_edge_payload_changes() {
+        let edge = GraphViewportEdge {
+            key: "edge:primary_parent:root:child".to_owned(),
+            kind: GraphViewportEdgeKind::PrimaryParent,
+            source_id: "root".to_owned(),
+            target_id: "child".to_owned(),
+            source: Point { x: 0, y: 0 },
+            target: Point { x: 100, y: 100 },
+            route_slot: 0,
+            target_port_offset: 0.0,
+        };
+        let response = GraphViewportDiffResponse {
+            version: 1,
+            canvas: GraphCanvas {
+                width: 100,
+                height: 100,
+            },
+            previous_viewport: crate::api::GraphViewport {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                overscan: 0,
+            },
+            viewport: crate::api::GraphViewport {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                overscan: 0,
+            },
+            added: GraphViewportItems::default(),
+            updated: GraphViewportItems {
+                lanes: Vec::new(),
+                nodes: Vec::new(),
+                edges: vec![edge.clone()],
+            },
+            removed: Vec::<GraphViewportRemovedItem>::new(),
+        };
+        let mut edge_fingerprints = BTreeMap::new();
+        edge_fingerprints.insert(edge.key.clone(), "stale".to_owned());
+        let known = GraphViewportKnownItems {
+            edge_fingerprints,
+            ..GraphViewportKnownItems::default()
+        };
+
+        assert!(viewport_diff_has_changes(&response, Some(&known)));
     }
 
     #[tokio::test]

@@ -143,6 +143,42 @@ mod tests {
     }
 
     #[test]
+    fn patch_update_is_not_dropped_when_merged_with_none() {
+        assert_eq!(
+            PendingViewportUpdate::None.merge(PendingViewportUpdate::Patch),
+            PendingViewportUpdate::Patch
+        );
+    }
+
+    #[test]
+    fn empty_update_merge_stays_empty() {
+        assert_eq!(
+            PendingViewportUpdate::None.merge(PendingViewportUpdate::None),
+            PendingViewportUpdate::None
+        );
+    }
+
+    #[test]
+    fn far_rendered_viewport_selects_full_fetch() {
+        assert_eq!(
+            next_viewport_fetch(
+                viewport(0.0),
+                viewport(1_000.0),
+                PendingViewportUpdate::None
+            ),
+            ViewportFetch::Full
+        );
+    }
+
+    #[test]
+    fn nearby_rendered_viewport_selects_patch_fetch() {
+        assert_eq!(
+            next_viewport_fetch(viewport(0.0), viewport(300.0), PendingViewportUpdate::None),
+            ViewportFetch::Patch
+        );
+    }
+
+    #[test]
     fn viewport_update_stays_active_after_pending_update_is_consumed() {
         assert!(viewport_update_active(true, PendingViewportUpdate::None));
     }
