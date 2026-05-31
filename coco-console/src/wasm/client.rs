@@ -35,16 +35,27 @@ pub fn start() {
 }
 
 async fn run() -> Result<(), JsValue> {
-    let window = browser_window()?;
-    let document = browser_document(&window)?;
-    let graph = VirtualGraph::new(window.clone(), document.clone())?;
-    let graph = Rc::new(RefCell::new(graph));
-
-    install_graph_listeners(graph.clone())?;
+    let graph = setup_graph()?;
     render_full_viewport(graph.clone()).await?;
     spawn_local(refresh_on_graph_version(graph));
 
     Ok(())
+}
+
+fn setup_graph() -> Result<Rc<RefCell<VirtualGraph>>, JsValue> {
+    let (window, document) = browser_context()?;
+    let graph = VirtualGraph::new(window.clone(), document.clone())?;
+    let graph = Rc::new(RefCell::new(graph));
+
+    install_graph_listeners(graph.clone())?;
+
+    Ok(graph)
+}
+
+fn browser_context() -> Result<(Window, Document), JsValue> {
+    let window = browser_window()?;
+    let document = browser_document(&window)?;
+    Ok((window, document))
 }
 
 impl From<GraphViewport> for ViewportState {
