@@ -509,17 +509,40 @@ async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
         let patch_needed = !same_viewport(graph.rendered_viewport, graph.viewport);
         (document, refresh_shell, patch_needed)
     };
-    if refresh_shell {
-        refresh_server_rendered_sections(&window, &document).await?;
-    }
-    if patch_needed {
-        request_viewport_patch(graph);
-    }
+    finish_full_viewport_render(graph, &window, &document, refresh_shell, patch_needed).await
+}
+
+async fn finish_full_viewport_render(
+    graph: Rc<RefCell<VirtualGraph>>,
+    window: &Window,
+    document: &Document,
+    refresh_shell: bool,
+    patch_needed: bool,
+) -> Result<(), JsValue> {
+    refresh_render_shell_if_needed(window, document, refresh_shell).await?;
+    request_viewport_patch_if_needed(graph, patch_needed);
     Ok(())
 }
 
 fn request_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) {
     request_viewport_update(graph, PendingViewportUpdate::Patch);
+}
+
+fn request_viewport_patch_if_needed(graph: Rc<RefCell<VirtualGraph>>, patch_needed: bool) {
+    if patch_needed {
+        request_viewport_patch(graph);
+    }
+}
+
+async fn refresh_render_shell_if_needed(
+    window: &Window,
+    document: &Document,
+    refresh_shell: bool,
+) -> Result<(), JsValue> {
+    if refresh_shell {
+        refresh_server_rendered_sections(window, document).await?;
+    }
+    Ok(())
 }
 
 fn request_viewport_update(graph: Rc<RefCell<VirtualGraph>>, update: PendingViewportUpdate) {
