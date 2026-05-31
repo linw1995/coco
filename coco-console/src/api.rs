@@ -70,6 +70,12 @@ pub struct GraphViewportLane {
     pub y: i32,
 }
 
+impl GraphViewportLane {
+    pub fn fingerprint(&self) -> String {
+        graph_viewport_item_fingerprint(self)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphViewportNode {
     pub key: String,
@@ -81,6 +87,12 @@ pub struct GraphViewportNode {
     pub labels: Vec<String>,
     pub x: i32,
     pub y: i32,
+}
+
+impl GraphViewportNode {
+    pub fn fingerprint(&self) -> String {
+        graph_viewport_item_fingerprint(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -101,4 +113,70 @@ pub struct GraphViewportEdge {
     pub target: Point,
     pub route_slot: i32,
     pub target_port_offset: f64,
+}
+
+impl GraphViewportEdge {
+    pub fn fingerprint(&self) -> String {
+        graph_viewport_item_fingerprint(self)
+    }
+}
+
+fn graph_viewport_item_fingerprint<T>(item: &T) -> String
+where
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec(item).expect("graph viewport items should serialize");
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GraphViewportEdge, GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, Point,
+    };
+
+    #[test]
+    fn fingerprints_change_when_item_payload_changes() {
+        let lane = GraphViewportLane {
+            key: "lane:main".to_owned(),
+            label: "main".to_owned(),
+            y: 0,
+        };
+        let mut node = GraphViewportNode {
+            key: "node:1".to_owned(),
+            id: "1".to_owned(),
+            node_target: "node:1".to_owned(),
+            short_id: "1".to_owned(),
+            kind: "text".to_owned(),
+            summary: "first".to_owned(),
+            labels: vec!["main".to_owned()],
+            x: 0,
+            y: 0,
+        };
+        let mut edge = GraphViewportEdge {
+            key: "edge:primary:1:2".to_owned(),
+            kind: GraphViewportEdgeKind::PrimaryParent,
+            source_id: "1".to_owned(),
+            target_id: "2".to_owned(),
+            source: Point { x: 0, y: 0 },
+            target: Point { x: 100, y: 100 },
+            route_slot: 0,
+            target_port_offset: 0.0,
+        };
+
+        let lane_fingerprint = lane.fingerprint();
+        let node_fingerprint = node.fingerprint();
+        let edge_fingerprint = edge.fingerprint();
+        node.labels.push("draft".to_owned());
+        edge.route_slot = 1;
+
+        assert_eq!(lane_fingerprint, lane.fingerprint());
+        assert_ne!(node_fingerprint, node.fingerprint());
+        assert_ne!(edge_fingerprint, edge.fingerprint());
+    }
 }
