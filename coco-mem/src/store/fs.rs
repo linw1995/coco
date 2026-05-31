@@ -2747,18 +2747,18 @@ impl FsStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot_state(&self) -> StoreState {
+    pub fn snapshot_state(&self) -> StoreState {
         self.inner.read().expect("store lock poisoned").clone()
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_next_skill_history_append(&self) {
+    pub fn fail_next_skill_history_append(&self) {
         self.persistence
             .arm_failpoint(SkillPersistenceFailpoint::NextHistoryAppend);
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_next_skill_snapshot_write(&self) {
+    pub fn fail_next_skill_snapshot_write(&self) {
         self.persistence
             .arm_failpoint(SkillPersistenceFailpoint::NextSnapshotWrite);
     }
