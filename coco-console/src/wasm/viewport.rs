@@ -75,7 +75,15 @@ pub fn same_viewport(left: ViewportState, right: ViewportState) -> bool {
 }
 
 pub fn needs_full_viewport_fetch(rendered: ViewportState, current: ViewportState) -> bool {
-    !ViewportBounds::rendered(rendered).intersects(ViewportBounds::strict(current))
+    needs_full_fetch(ViewportBounds::rendered(rendered), current)
+}
+
+pub fn needs_full_viewport_jump_fetch(rendered: ViewportState, current: ViewportState) -> bool {
+    needs_full_fetch(ViewportBounds::strict(rendered), current)
+}
+
+fn needs_full_fetch(rendered: ViewportBounds, current: ViewportState) -> bool {
+    !rendered.intersects(ViewportBounds::strict(current))
 }
 
 pub fn rounded_i32(value: f64) -> i32 {
@@ -84,7 +92,9 @@ pub fn rounded_i32(value: f64) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ViewportState, needs_full_viewport_fetch, same_viewport};
+    use super::{
+        ViewportState, needs_full_viewport_fetch, needs_full_viewport_jump_fetch, same_viewport,
+    };
 
     fn viewport(x: f64, y: f64) -> ViewportState {
         ViewportState {
@@ -117,6 +127,22 @@ mod tests {
         assert!(needs_full_viewport_fetch(
             viewport(0.0, 0.0),
             viewport(0.0, 440.0)
+        ));
+    }
+
+    #[test]
+    fn overlapping_jump_can_use_diff_patch() {
+        assert!(!needs_full_viewport_jump_fetch(
+            viewport(0.0, 0.0),
+            viewport(300.0, 0.0)
+        ));
+    }
+
+    #[test]
+    fn non_overlapping_jump_needs_full_fetch() {
+        assert!(needs_full_viewport_jump_fetch(
+            viewport(0.0, 0.0),
+            viewport(400.0, 0.0)
         ));
     }
 
