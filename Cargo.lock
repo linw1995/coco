@@ -496,6 +496,7 @@ dependencies = [
  "axum",
  "coco-mem",
  "futures-util",
+ "js-sys",
  "leptos",
  "serde",
  "serde_json",

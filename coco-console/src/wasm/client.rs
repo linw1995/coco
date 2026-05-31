@@ -25,6 +25,7 @@ const EDGE_TARGET_APPROACH: f64 = 48.0;
 const EDGE_ROUTE_STEP: f64 = 12.0;
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
+const VERSION_REFRESH_RETRY_MS: i32 = 50;
 
 struct ViewportMapContentBounds {
     x: f64,
@@ -470,6 +471,10 @@ impl VirtualGraph {
             let _ = root.set_attribute("data-version", &self.version.to_string());
         }
     }
+
+    fn viewport_update_active(&self) -> bool {
+        self.patch_in_flight || self.pending_viewport_update.is_pending()
+    }
 }
 
 impl ViewportState {
@@ -684,7 +689,7 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
             update.needs_full_fetch() || needs_full_viewport_fetch(rendered, current),
         )
     };
-    if same_viewport(rendered, current) {
+    if !needs_full_fetch && same_viewport(rendered, current) {
         let mut graph = graph.borrow_mut();
         if graph.pending_viewport_update.is_pending() {
             return Ok(true);
@@ -746,15 +751,22 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
 
 async fn refresh_on_graph_version(graph: Rc<RefCell<VirtualGraph>>) {
     loop {
-        let (window, version, viewport, known_query) = {
+        let (window, version, viewport, known_query, viewport_update_active) = {
             let graph = graph.borrow();
             (
                 graph.window.clone(),
                 graph.version,
                 graph.viewport,
                 graph.rendered.known_query(),
+                graph.viewport_update_active(),
             )
         };
+        if viewport_update_active {
+            if let Err(error) = delay_ms(&window, VERSION_REFRESH_RETRY_MS).await {
+                web_sys::console::error_1(&error);
+            }
+            continue;
+        }
         let mut query = format!("version={version}&{}&known=1", viewport.request_query());
         if !known_query.is_empty() {
             query.push('&');
@@ -768,18 +780,29 @@ async fn refresh_on_graph_version(graph: Rc<RefCell<VirtualGraph>>) {
         .await
         {
             Ok(response) => {
-                let (window, document, refresh_shell) = {
+                let refresh = {
                     let mut graph = graph.borrow_mut();
                     if !same_viewport(graph.viewport, viewport) {
                         continue;
                     }
-                    let refresh_shell = response.version != graph.version;
-                    let window = graph.window.clone();
-                    let document = graph.document.clone();
-                    if let Err(error) = graph.apply_diff(response) {
+                    if graph.viewport_update_active() {
+                        None
+                    } else {
+                        let refresh_shell = response.version != graph.version;
+                        let window = graph.window.clone();
+                        let document = graph.document.clone();
+                        if let Err(error) = graph.apply_diff(response) {
+                            web_sys::console::error_1(&error);
+                        }
+                        Some((window, document, refresh_shell))
+                    }
+                };
+                let Some((window, document, refresh_shell)) = refresh else {
+                    let window = graph.borrow().window.clone();
+                    if let Err(error) = delay_ms(&window, VERSION_REFRESH_RETRY_MS).await {
                         web_sys::console::error_1(&error);
                     }
-                    (window, document, refresh_shell)
+                    continue;
                 };
                 if refresh_shell
                     && let Err(error) = refresh_server_rendered_sections(&window, &document).await
@@ -790,6 +813,21 @@ async fn refresh_on_graph_version(graph: Rc<RefCell<VirtualGraph>>) {
             Err(error) => web_sys::console::error_1(&error),
         }
     }
+}
+
+async fn delay_ms(window: &Window, delay_ms: i32) -> Result<(), JsValue> {
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        let callback = Closure::once_into_js(move || {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        });
+        if let Err(error) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback.unchecked_ref(),
+            delay_ms,
+        ) {
+            let _ = reject.call1(&JsValue::UNDEFINED, &error);
+        }
+    });
+    JsFuture::from(promise).await.map(|_| ())
 }
 
 async fn refresh_server_rendered_sections(
