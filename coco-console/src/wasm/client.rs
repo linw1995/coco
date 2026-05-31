@@ -662,15 +662,16 @@ fn set_attributes<const N: usize>(
 }
 
 async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
-    loop {
-        match render_next_viewport_patch(graph.clone()).await {
-            Ok(should_continue) if should_continue => {}
-            Ok(_) => break,
-            Err(error) => {
-                web_sys::console::error_1(&error);
-                graph.borrow_mut().patch_in_flight = false;
-                break;
-            }
+    while render_next_viewport_patch_or_stop(graph.clone()).await {}
+}
+
+async fn render_next_viewport_patch_or_stop(graph: Rc<RefCell<VirtualGraph>>) -> bool {
+    match render_next_viewport_patch(graph.clone()).await {
+        Ok(should_continue) => should_continue,
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            graph.borrow_mut().patch_in_flight = false;
+            false
         }
     }
 }

@@ -26,7 +26,6 @@ crap_allow_args=(
   --allow "VirtualGraph::primary_edge_element"
   --allow "VirtualGraph::routed_edge_element"
   --allow "render_full_viewport"
-  --allow "drain_viewport_patches"
 )
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
