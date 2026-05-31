@@ -38,6 +38,7 @@ in
 
       devShells = import ./dev-shells.nix {
         inherit pkgs;
+        rustCrapToolchainFor = rust.crapToolchainFor;
         rustDevToolchainFor = rust.devToolchainFor;
       };
     }
