@@ -31,6 +31,7 @@ snafu.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Wasm bindings.
+js-sys = "=0.3.94"
 wasm-bindgen = "=0.2.117"
 wasm-bindgen-futures = "=0.4.67"
 
