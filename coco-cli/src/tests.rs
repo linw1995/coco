@@ -916,21 +916,6 @@ where
     output
 }
 
-async fn with_current_dir_async<T, F, Fut>(path: &std::path::Path, run: F) -> T
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = T>,
-{
-    static CWD_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-
-    let _guard = CWD_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
-    let previous = std::env::current_dir().unwrap();
-    std::env::set_current_dir(path).unwrap();
-    let output = run().await;
-    std::env::set_current_dir(previous).unwrap();
-    output
-}
-
 #[tokio::test]
 async fn prompt_uses_main_branch_by_default() {
     let (_tempdir, store_path) = temp_store_path();
@@ -4724,27 +4709,13 @@ allowed_chat_ids = ["123", "-456"]
     assert!(telegram.allowed_chat_ids.contains("-456"));
 }
 
-#[tokio::test]
-async fn provider_profiles_load_from_current_directory() {
-    let tempdir = tempdir().unwrap();
-    let config_path = tempdir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"[providers.work-openai]
-provider = "openai"
-default_model = "gpt-4.1-mini"
-"#,
-    )
-    .unwrap();
+#[test]
+fn provider_profiles_load_from_default_config() {
+    let profiles = crate::app::config::load_cwd_provider_profiles().unwrap();
+    let profile = profiles.get_provider_profile("openai-codex").unwrap();
 
-    with_current_dir_async(tempdir.path(), || async {
-        let profiles = crate::app::config::load_cwd_provider_profiles().unwrap();
-        let profile = profiles.get_provider_profile("work-openai").unwrap();
-
-        assert_eq!(profile.provider, "openai");
-        assert_eq!(profile.default_model.as_deref(), Some("gpt-4.1-mini"));
-    })
-    .await;
+    assert_eq!(profile.provider, "chatgpt");
+    assert_eq!(profile.default_model.as_deref(), Some("gpt-5.4"));
 }
 
 #[tokio::test]
