@@ -46,6 +46,12 @@ struct GraphItemsRefreshInput {
     query: String,
 }
 
+struct ViewportPatchInput {
+    window: Window,
+    current: ViewportState,
+    fetch: ViewportFetch,
+}
+
 #[wasm_bindgen(start)]
 pub fn start() {
     spawn_local(async {
@@ -785,66 +791,80 @@ async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
 }
 
 async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
-    let (window, current, fetch) = {
-        let mut graph = graph.borrow_mut();
-        let update = graph.pending_viewport_update;
-        graph.pending_viewport_update = PendingViewportUpdate::None;
-        let rendered = graph.rendered_viewport;
-        let current = graph.viewport;
-        (
-            graph.window.clone(),
-            current,
-            next_viewport_fetch(rendered, current, update),
-        )
-    };
-    if fetch == ViewportFetch::None {
-        let mut graph = graph.borrow_mut();
-        if graph.pending_viewport_update.is_pending() {
-            return Ok(true);
-        }
-        graph.patch_in_flight = false;
-        return Ok(false);
+    let input = next_viewport_patch_input(graph.clone());
+    match input.fetch {
+        ViewportFetch::None => finish_idle_viewport_patch(graph),
+        ViewportFetch::Full => render_full_viewport_patch(graph, input).await,
+        ViewportFetch::Patch => render_diff_viewport_patch(graph, input).await,
     }
+}
 
-    if fetch == ViewportFetch::Full {
-        let query = current.request_query();
-        graph.borrow().show_loading_status();
-        let response =
-            fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
-                .await?;
-        let should_continue = {
-            let mut graph = graph.borrow_mut();
-            graph.apply_full(response)?;
-            let should_continue = graph.pending_viewport_update.is_pending()
-                || !same_viewport(graph.rendered_viewport, graph.viewport);
-            if !should_continue {
-                graph.patch_in_flight = false;
-            }
-            should_continue
-        };
-        return Ok(should_continue);
+fn next_viewport_patch_input(graph: Rc<RefCell<VirtualGraph>>) -> ViewportPatchInput {
+    let mut graph = graph.borrow_mut();
+    let update = graph.pending_viewport_update;
+    graph.pending_viewport_update = PendingViewportUpdate::None;
+    let rendered = graph.rendered_viewport;
+    let current = graph.viewport;
+    ViewportPatchInput {
+        window: graph.window.clone(),
+        current,
+        fetch: next_viewport_fetch(rendered, current, update),
     }
+}
 
-    let known_query = graph.borrow().rendered.known_query();
-    let mut query = format!("{}&known=1", current.request_query());
-    if !known_query.is_empty() {
-        query.push('&');
-        query.push_str(&known_query);
+fn finish_idle_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
+    let mut graph = graph.borrow_mut();
+    if graph.pending_viewport_update.is_pending() {
+        return Ok(true);
     }
+    graph.patch_in_flight = false;
+    Ok(false)
+}
+
+async fn render_full_viewport_patch(
+    graph: Rc<RefCell<VirtualGraph>>,
+    input: ViewportPatchInput,
+) -> Result<bool, JsValue> {
+    graph.borrow().show_loading_status();
+    let query = input.current.request_query();
     let response =
-        fetch_json_form::<GraphViewportDiffResponse>(&window, "/api/graph/viewport/diff", &query)
+        fetch_json::<GraphViewportResponse>(&input.window, &format!("/api/graph/viewport?{query}"))
             .await?;
-    let should_continue = {
-        let mut graph = graph.borrow_mut();
-        graph.apply_diff(response)?;
-        let should_continue = graph.pending_viewport_update.is_pending()
-            || !same_viewport(graph.rendered_viewport, graph.viewport);
-        if !should_continue {
-            graph.patch_in_flight = false;
-        }
-        should_continue
-    };
-    Ok(should_continue)
+    let mut graph = graph.borrow_mut();
+    graph.apply_full(response)?;
+    Ok(finish_applied_viewport_patch(&mut graph))
+}
+
+async fn render_diff_viewport_patch(
+    graph: Rc<RefCell<VirtualGraph>>,
+    input: ViewportPatchInput,
+) -> Result<bool, JsValue> {
+    let query = viewport_patch_diff_query(&graph.borrow(), input.current);
+    let response = fetch_json_form::<GraphViewportDiffResponse>(
+        &input.window,
+        "/api/graph/viewport/diff",
+        &query,
+    )
+    .await?;
+    let mut graph = graph.borrow_mut();
+    graph.apply_diff(response)?;
+    Ok(finish_applied_viewport_patch(&mut graph))
+}
+
+fn viewport_patch_diff_query(graph: &VirtualGraph, current: ViewportState) -> String {
+    let known_query = graph.rendered.known_query();
+    let mut query = format!("{}&known=1", current.request_query());
+    append_known_query(&mut query, &known_query);
+    query
+}
+
+fn finish_applied_viewport_patch(graph: &mut VirtualGraph) -> bool {
+    let should_continue = graph.pending_viewport_update.is_pending()
+        || !same_viewport(graph.rendered_viewport, graph.viewport);
+    if !should_continue {
+        graph.patch_in_flight = false;
+    }
+    should_continue
 }
 
 async fn refresh_graph_items_on_version(graph: Rc<RefCell<VirtualGraph>>) {
