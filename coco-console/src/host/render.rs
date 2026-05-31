@@ -21,6 +21,19 @@ pub fn render_fragment(snapshot: &GraphSnapshot) -> String {
     render_root(snapshot).to_html()
 }
 
+pub fn render_node_detail_fragment(snapshot: &GraphSnapshot, target: Option<&str>) -> String {
+    match target {
+        Some(target) => snapshot
+            .nodes
+            .iter()
+            .find(|node| node_target_id(&node.id) == target)
+            .map(render_node_details)
+            .unwrap_or_else(|| render_missing_node_details(target))
+            .to_html(),
+        None => render_default_node_details().to_html(),
+    }
+}
+
 fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> String {
     let root = render_root(snapshot);
     let client_script = include_client
@@ -106,7 +119,20 @@ fn render_selection_style(snapshot: &GraphSnapshot) -> String {
 }
 
 fn render_side(snapshot: &GraphSnapshot) -> AnyView {
-    let default_details = view! {
+    let default_details = render_default_node_details();
+    let branches = render_branches(snapshot);
+
+    view! {
+        <aside class="side">
+            <div class="node-detail-slot">{default_details}</div>
+            {branches}
+        </aside>
+    }
+    .into_any()
+}
+
+fn render_default_node_details() -> AnyView {
+    view! {
         <section class="node-details node-details-default">
             <h2>"Node"</h2>
             <dl class="detail-list">
@@ -116,20 +142,6 @@ fn render_side(snapshot: &GraphSnapshot) -> AnyView {
                 </div>
             </dl>
         </section>
-    };
-    let detail_views = snapshot
-        .nodes
-        .iter()
-        .map(render_node_details)
-        .collect::<Vec<_>>();
-    let branches = render_branches(snapshot);
-
-    view! {
-        <aside class="side">
-            {default_details}
-            {detail_views}
-            {branches}
-        </aside>
     }
     .into_any()
 }
@@ -181,6 +193,27 @@ fn render_node_details(node: &GraphNode) -> AnyView {
     .into_any()
 }
 
+fn render_missing_node_details(target: &str) -> AnyView {
+    let target = target.to_owned();
+
+    view! {
+        <section class="node-details node-details-default">
+            <h2>"Node"</h2>
+            <dl class="detail-list">
+                <div>
+                    <dt>"Selection"</dt>
+                    <dd>"The selected node is no longer available."</dd>
+                </div>
+                <div>
+                    <dt>"Target"</dt>
+                    <dd>{target}</dd>
+                </div>
+            </dl>
+        </section>
+    }
+    .into_any()
+}
+
 fn render_branches(snapshot: &GraphSnapshot) -> AnyView {
     let items = snapshot
         .branches
@@ -199,7 +232,7 @@ fn render_branches(snapshot: &GraphSnapshot) -> AnyView {
         })
         .collect::<Vec<_>>();
 
-    view! { <section><h2>"Branches"</h2><ul class="branch-list">{items}</ul></section> }.into_any()
+    view! { <section class="branch-section"><h2>"Branches"</h2><ul class="branch-list">{items}</ul></section> }.into_any()
 }
 
 fn format_session_state(state: &SessionState) -> String {

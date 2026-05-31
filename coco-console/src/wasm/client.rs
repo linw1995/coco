@@ -45,6 +45,13 @@ pub fn start() {
 async fn run() -> Result<(), JsValue> {
     let graph = setup_graph()?;
     render_full_viewport(graph.clone()).await?;
+    let has_selected_node = {
+        let graph = graph.borrow();
+        selected_node_target(&graph.window).is_some()
+    };
+    if has_selected_node {
+        refresh_selected_node_detail_from_graph(graph.clone()).await?;
+    }
     spawn_local(refresh_on_graph_version(graph));
 
     Ok(())
@@ -732,7 +739,10 @@ async fn refresh_server_rendered_sections(
     container.set_inner_html(&html);
     refresh_text_content(document, &container, ".stats")?;
     refresh_text_content(document, &container, "#selection-style")?;
-    refresh_inner_html(document, &container, ".side")?;
+    refresh_inner_html(document, &container, ".branch-section")?;
+    if selected_node_target(window).is_some() {
+        refresh_selected_node_detail(window, document).await?;
+    }
     Ok(())
 }
 
@@ -803,7 +813,51 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
         .add_event_listener_with_callback("click", viewport_map_closure.as_ref().unchecked_ref())?;
     viewport_map_closure.forget();
 
+    let detail_graph = graph.clone();
+    let detail_window = graph.borrow().window.clone();
+    let detail_closure = Closure::<dyn FnMut()>::new(move || {
+        let graph = detail_graph.clone();
+        spawn_local(async move {
+            if let Err(error) = refresh_selected_node_detail_from_graph(graph).await {
+                web_sys::console::error_1(&error);
+            }
+        });
+    });
+    detail_window
+        .add_event_listener_with_callback("hashchange", detail_closure.as_ref().unchecked_ref())?;
+    detail_closure.forget();
+
     Ok(())
+}
+
+async fn refresh_selected_node_detail_from_graph(
+    graph: Rc<RefCell<VirtualGraph>>,
+) -> Result<(), JsValue> {
+    let (window, document) = {
+        let graph = graph.borrow();
+        (graph.window.clone(), graph.document.clone())
+    };
+    refresh_selected_node_detail(&window, &document).await
+}
+
+async fn refresh_selected_node_detail(window: &Window, document: &Document) -> Result<(), JsValue> {
+    let target = selected_node_target(window);
+    let url = match &target {
+        Some(target) => format!("/api/node-detail?target={}", percent_encode(target)),
+        None => "/api/node-detail".to_owned(),
+    };
+    let html = fetch_text(window, &url).await?;
+    if selected_node_target(window) != target {
+        return Ok(());
+    }
+    query_required(document, ".node-detail-slot")?.set_inner_html(&html);
+    Ok(())
+}
+
+fn selected_node_target(window: &Window) -> Option<String> {
+    let hash = window.location().hash().ok()?;
+    let target = hash.strip_prefix('#')?;
+    (!target.is_empty() && target.starts_with("detail-")).then(|| target.to_owned())
 }
 
 fn pan_from_wheel(graph: &mut VirtualGraph, event: &WheelEvent) {
