@@ -7,10 +7,13 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Document, Element, MouseEvent, RequestInit, Response, WheelEvent, Window};
 
+use crate::viewport::{
+    MIN_OVERSCAN, ViewportState, needs_full_viewport_fetch, rounded_i32, same_viewport,
+};
+
 const ROOT_ID: &str = "console-root";
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const VIEWPORT_KEY: &str = "coco-console:viewport";
-const MIN_OVERSCAN: i32 = 180;
 const NODE_RADIUS: f64 = 26.0;
 const EDGE_NODE_EXIT: f64 = 42.0;
 const EDGE_TARGET_APPROACH: f64 = 48.0;
@@ -38,40 +41,6 @@ async fn run() -> Result<(), JsValue> {
     spawn_local(refresh_on_graph_version(graph));
 
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ViewportState {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    overscan: i32,
-}
-
-impl ViewportState {
-    fn request_query(self) -> String {
-        self.request_query_with_prefix("")
-    }
-
-    fn request_query_with_prefix(self, prefix: &str) -> String {
-        format!(
-            "{prefix}x={}&{prefix}y={}&{prefix}width={}&{prefix}height={}&{prefix}overscan={}",
-            rounded_i32(self.x),
-            rounded_i32(self.y),
-            rounded_i32(self.width),
-            rounded_i32(self.height),
-            self.render_overscan()
-        )
-    }
-
-    fn refresh_render_overscan(&mut self) {
-        self.overscan = self.render_overscan();
-    }
-
-    fn render_overscan(self) -> i32 {
-        ((self.width.max(self.height) / 2.0).ceil() as i32).max(MIN_OVERSCAN)
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -326,6 +295,7 @@ impl VirtualGraph {
     }
 
     fn apply_full(&mut self, response: GraphViewportResponse) -> Result<(), JsValue> {
+        let desired_viewport = self.viewport;
         let response_viewport = ViewportState::from(response.viewport);
         clear_children(&self.lane_group);
         clear_children(&self.edge_group);
@@ -333,7 +303,9 @@ impl VirtualGraph {
         self.rendered = RenderedKeys::new();
         self.version = response.version;
         self.canvas = Some(response.canvas);
-        self.set_viewport(response.viewport);
+        if same_viewport(desired_viewport, response_viewport) {
+            self.set_viewport(response.viewport);
+        }
         self.rendered_viewport = response_viewport;
         self.set_root_version();
         self.apply_canvas()?;
@@ -561,6 +533,13 @@ impl VirtualGraph {
         }
     }
 
+    fn show_loading_status(&self) {
+        if let Some(status) = &self.status {
+            status.set_text_content(Some("Loading graph..."));
+            let _ = status.remove_attribute("hidden");
+        }
+    }
+
     fn set_root_version(&self) {
         if let Some(root) = self.document.get_element_by_id(ROOT_ID) {
             let _ = root.set_attribute("data-version", &self.version.to_string());
@@ -641,14 +620,16 @@ async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
 }
 
 async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
-    let (window, rendered, current, known_query) = {
+    let (window, rendered, current, needs_full_fetch) = {
         let mut graph = graph.borrow_mut();
         graph.patch_requested = false;
+        let rendered = graph.rendered_viewport;
+        let current = graph.viewport;
         (
             graph.window.clone(),
-            graph.rendered_viewport,
-            graph.viewport,
-            graph.rendered.known_query(),
+            rendered,
+            current,
+            needs_full_viewport_fetch(rendered, current),
         )
     };
     if same_viewport(rendered, current) {
@@ -660,6 +641,31 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
         return Ok(false);
     }
 
+    if needs_full_fetch {
+        let query = current.request_query();
+        graph.borrow().show_loading_status();
+        let response =
+            fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
+                .await?;
+        let (document, refresh_shell, should_continue) = {
+            let mut graph = graph.borrow_mut();
+            let refresh_shell = response.version != graph.version;
+            let document = graph.document.clone();
+            graph.apply_full(response)?;
+            let should_continue =
+                graph.patch_requested || !same_viewport(graph.rendered_viewport, graph.viewport);
+            if !should_continue {
+                graph.patch_in_flight = false;
+            }
+            (document, refresh_shell, should_continue)
+        };
+        if refresh_shell {
+            refresh_server_rendered_sections(&window, &document).await?;
+        }
+        return Ok(should_continue);
+    }
+
+    let known_query = graph.borrow().rendered.known_query();
     let mut query = format!("{}&known=1", current.request_query());
     if !known_query.is_empty() {
         query.push('&');
@@ -1068,18 +1074,6 @@ fn edge_corridor_y(source_y: i32, target_y: i32, route_slot: i32) -> f64 {
     let magnitude = (route_slot + 1) / 2;
     let direction = if route_slot % 2 == 0 { 1.0 } else { -1.0 };
     (f64::from(base_y) + f64::from(magnitude.min(4)) * EDGE_ROUTE_STEP * direction).max(16.0)
-}
-
-fn rounded_i32(value: f64) -> i32 {
-    value.round().clamp(0.0, f64::from(i32::MAX)) as i32
-}
-
-fn same_viewport(left: ViewportState, right: ViewportState) -> bool {
-    rounded_i32(left.x) == rounded_i32(right.x)
-        && rounded_i32(left.y) == rounded_i32(right.y)
-        && rounded_i32(left.width) == rounded_i32(right.width)
-        && rounded_i32(left.height) == rounded_i32(right.height)
-        && left.overscan == right.overscan
 }
 
 fn css_token(value: &str) -> String {

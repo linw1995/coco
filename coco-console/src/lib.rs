@@ -1,6 +1,9 @@
 #[cfg(target_arch = "wasm32")]
 mod client;
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod viewport;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     pub mod config;
