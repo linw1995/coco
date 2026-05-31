@@ -38,6 +38,12 @@ struct ViewportMapContentBounds {
     height: f64,
 }
 
+struct GraphItemsRefreshInput {
+    window: Window,
+    viewport: ViewportState,
+    query: String,
+}
+
 #[wasm_bindgen(start)]
 pub fn start() {
     spawn_local(async {
@@ -746,84 +752,133 @@ async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<
 
 async fn refresh_graph_items_on_version(graph: Rc<RefCell<VirtualGraph>>) {
     loop {
-        let (window, version, viewport, canvas, known_query, viewport_update_active) = {
-            let graph = graph.borrow();
-            (
-                graph.window.clone(),
-                graph.version,
-                graph.viewport,
-                graph.canvas,
-                graph.rendered.known_query(),
-                graph.viewport_update_active(),
-            )
-        };
-        if viewport_update_active {
-            if let Err(error) = delay_ms(&window, VERSION_REFRESH_RETRY_MS).await {
-                web_sys::console::error_1(&error);
-            }
-            continue;
+        refresh_graph_items_once(graph.clone()).await;
+    }
+}
+
+async fn refresh_graph_items_once(graph: Rc<RefCell<VirtualGraph>>) {
+    let Some(input) = graph_items_refresh_input(graph.clone()) else {
+        delay_graph_items_retry(graph).await;
+        return;
+    };
+    let Some(controller) = begin_graph_items_refresh(graph.clone()) else {
+        return;
+    };
+    let response = fetch_graph_items_diff(&input, &controller).await;
+    clear_version_refresh(graph.clone());
+    handle_graph_items_response(graph, input.viewport, response).await;
+}
+
+fn graph_items_refresh_input(graph: Rc<RefCell<VirtualGraph>>) -> Option<GraphItemsRefreshInput> {
+    let graph = graph.borrow();
+    (!graph.viewport_update_active()).then(|| GraphItemsRefreshInput {
+        window: graph.window.clone(),
+        viewport: graph.viewport,
+        query: graph_items_refresh_query(
+            graph.version,
+            graph.viewport,
+            graph.canvas,
+            graph.rendered.known_query(),
+        ),
+    })
+}
+
+fn graph_items_refresh_query(
+    version: u64,
+    viewport: ViewportState,
+    canvas: Option<GraphCanvas>,
+    known_query: String,
+) -> String {
+    let mut query = format!("version={version}&{}&known=1", viewport.request_query());
+    append_canvas_query(&mut query, canvas);
+    append_known_query(&mut query, &known_query);
+    query
+}
+
+fn append_canvas_query(query: &mut String, canvas: Option<GraphCanvas>) {
+    if let Some(canvas) = canvas {
+        query.push_str(&format!(
+            "&canvas_width={}&canvas_height={}",
+            canvas.width, canvas.height
+        ));
+    }
+}
+
+fn append_known_query(query: &mut String, known_query: &str) {
+    if !known_query.is_empty() {
+        query.push('&');
+        query.push_str(known_query);
+    }
+}
+
+fn begin_graph_items_refresh(graph: Rc<RefCell<VirtualGraph>>) -> Option<AbortController> {
+    match begin_version_refresh(graph) {
+        Ok(controller) => controller,
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            None
         }
-        let mut query = format!("version={version}&{}&known=1", viewport.request_query());
-        if let Some(canvas) = canvas {
-            query.push_str(&format!(
-                "&canvas_width={}&canvas_height={}",
-                canvas.width, canvas.height
-            ));
-        }
-        if !known_query.is_empty() {
-            query.push('&');
-            query.push_str(&known_query);
-        }
-        let controller = match begin_version_refresh(graph.clone()) {
-            Ok(Some(controller)) => controller,
-            Ok(None) => continue,
-            Err(error) => {
-                web_sys::console::error_1(&error);
-                continue;
-            }
-        };
-        let response = fetch_json_form_with_signal::<GraphViewportDiffResponse>(
-            &window,
-            "/api/graph/viewport/items/diff",
-            &query,
-            &controller.signal(),
-        )
-        .await;
-        clear_version_refresh(graph.clone());
-        match response {
-            Ok(response) => {
-                let refresh = {
-                    let mut graph = graph.borrow_mut();
-                    match version_refresh_action(
-                        viewport,
-                        graph.viewport,
-                        graph.patch_in_flight,
-                        graph.pending_viewport_update,
-                    ) {
-                        VersionRefresh::Drop => continue,
-                        VersionRefresh::Defer => None,
-                        VersionRefresh::Apply => {
-                            if let Err(error) = graph.apply_diff(response) {
-                                web_sys::console::error_1(&error);
-                            }
-                            Some(())
-                        }
-                    }
-                };
-                if refresh.is_none() {
-                    let window = graph.borrow().window.clone();
-                    if let Err(error) = delay_ms(&window, VERSION_REFRESH_RETRY_MS).await {
-                        web_sys::console::error_1(&error);
-                    }
-                    continue;
-                };
-            }
-            Err(error) => {
-                if !graph.borrow().viewport_update_active() {
-                    web_sys::console::error_1(&error);
-                }
-            }
-        }
+    }
+}
+
+async fn fetch_graph_items_diff(
+    input: &GraphItemsRefreshInput,
+    controller: &AbortController,
+) -> Result<GraphViewportDiffResponse, JsValue> {
+    fetch_json_form_with_signal::<GraphViewportDiffResponse>(
+        &input.window,
+        "/api/graph/viewport/items/diff",
+        &input.query,
+        &controller.signal(),
+    )
+    .await
+}
+
+async fn handle_graph_items_response(
+    graph: Rc<RefCell<VirtualGraph>>,
+    viewport: ViewportState,
+    response: Result<GraphViewportDiffResponse, JsValue>,
+) {
+    match response {
+        Ok(response) => handle_graph_items_success(graph, viewport, response).await,
+        Err(error) => handle_graph_items_error(graph, error),
+    }
+}
+
+async fn handle_graph_items_success(
+    graph: Rc<RefCell<VirtualGraph>>,
+    viewport: ViewportState,
+    response: GraphViewportDiffResponse,
+) {
+    match graph_items_refresh_action(graph.clone(), viewport) {
+        VersionRefresh::Drop => {}
+        VersionRefresh::Defer => delay_graph_items_retry(graph).await,
+        VersionRefresh::Apply => apply_graph_items_diff(graph, response),
+    }
+}
+
+fn graph_items_refresh_action(
+    graph: Rc<RefCell<VirtualGraph>>,
+    viewport: ViewportState,
+) -> VersionRefresh {
+    let graph = graph.borrow();
+    version_refresh_action(
+        viewport,
+        graph.viewport,
+        graph.patch_in_flight,
+        graph.pending_viewport_update,
+    )
+}
+
+fn apply_graph_items_diff(graph: Rc<RefCell<VirtualGraph>>, response: GraphViewportDiffResponse) {
+    if let Err(error) = graph.borrow_mut().apply_diff(response) {
+        web_sys::console::error_1(&error);
+    }
+}
+
+fn handle_graph_items_error(graph: Rc<RefCell<VirtualGraph>>, error: JsValue) {
+    if !graph.borrow().viewport_update_active() {
+        web_sys::console::error_1(&error);
     }
 }
 
@@ -860,27 +915,50 @@ async fn delay_ms(window: &Window, delay_ms: i32) -> Result<(), JsValue> {
 
 async fn refresh_server_rendered_sections_on_version(graph: Rc<RefCell<VirtualGraph>>) {
     loop {
-        let (window, document, version) = {
-            let graph = graph.borrow();
-            (
-                graph.window.clone(),
-                graph.document.clone(),
-                graph.shell_version,
-            )
-        };
-        let url = format!("/fragment?version={version}");
-        match refresh_server_rendered_sections_from_url(&window, &document, &url).await {
-            Ok(Some(version)) => {
-                graph.borrow_mut().shell_version = version;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                web_sys::console::error_1(&error);
-                if let Err(error) = delay_ms(&window, VERSION_REFRESH_RETRY_MS).await {
-                    web_sys::console::error_1(&error);
-                }
-            }
+        refresh_server_rendered_sections_once(graph.clone()).await;
+    }
+}
+
+async fn refresh_server_rendered_sections_once(graph: Rc<RefCell<VirtualGraph>>) {
+    let (window, document, url) = server_rendered_sections_request(&graph);
+    let response = refresh_server_rendered_sections_from_url(&window, &document, &url).await;
+    handle_server_rendered_sections_response(graph, &window, response).await;
+}
+
+fn server_rendered_sections_request(
+    graph: &Rc<RefCell<VirtualGraph>>,
+) -> (Window, Document, String) {
+    let graph = graph.borrow();
+    (
+        graph.window.clone(),
+        graph.document.clone(),
+        format!("/fragment?version={}", graph.shell_version),
+    )
+}
+
+async fn handle_server_rendered_sections_response(
+    graph: Rc<RefCell<VirtualGraph>>,
+    window: &Window,
+    response: Result<Option<u64>, JsValue>,
+) {
+    match response {
+        Ok(Some(version)) => graph.borrow_mut().shell_version = version,
+        Ok(None) => {}
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            delay_window_retry(window).await;
         }
+    }
+}
+
+async fn delay_graph_items_retry(graph: Rc<RefCell<VirtualGraph>>) {
+    let window = graph.borrow().window.clone();
+    delay_window_retry(&window).await;
+}
+
+async fn delay_window_retry(window: &Window) {
+    if let Err(error) = delay_ms(window, VERSION_REFRESH_RETRY_MS).await {
+        web_sys::console::error_1(&error);
     }
 }
 
