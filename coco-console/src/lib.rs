@@ -1,11 +1,5 @@
 pub mod api;
 
-#[cfg(target_arch = "wasm32")]
-mod client;
-
-#[cfg(any(target_arch = "wasm32", test))]
-mod viewport;
-
 #[cfg(not(target_arch = "wasm32"))]
 mod host {
     pub mod config;
@@ -31,6 +25,14 @@ mod host {
     mod tests;
 }
 
+// Host tests compile viewport so its pure geometry logic stays covered without a wasm test runner.
+#[cfg(any(target_arch = "wasm32", test))]
+mod wasm {
+    #[cfg(target_arch = "wasm32")]
+    pub mod client;
+    pub mod viewport;
+}
+
 pub use api::{
     GraphCanvas, GraphViewport, GraphViewportDiffRequest, GraphViewportDiffResponse,
     GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItemKind, GraphViewportItems,
@@ -45,3 +47,5 @@ pub use host::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use host::{config, error, graph, layout, publisher, render};
+#[cfg(target_arch = "wasm32")]
+use wasm::viewport;
