@@ -426,8 +426,8 @@ fn merge_json_value(target: &mut Value, override_value: Value) {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ToolInvocationContext {
-    pub(crate) persisted_tool_use_node_id: Option<String>,
+struct ToolInvocationContext {
+    persisted_tool_use_node_id: Option<String>,
 }
 
 #[derive(Debug)]

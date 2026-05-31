@@ -7,7 +7,7 @@ use snafu::prelude::*;
 use crate::{SkillSearchRequest, ToolInvocationContext, ToolRuntimeEnv};
 
 #[derive(Debug, Clone)]
-pub(crate) struct SkillToolRuntime {
+pub struct SkillToolRuntime {
     definition: Tool,
     workspace_root: PathBuf,
     context: ToolRuntimeEnv,
@@ -37,7 +37,7 @@ impl From<SkillToolError> for rig::tool::ToolError {
     }
 }
 
-pub(crate) fn search_runtime(
+pub fn search_runtime(
     definition: Tool,
     workspace_root: PathBuf,
     context: ToolRuntimeEnv,

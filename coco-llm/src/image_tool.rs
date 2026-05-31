@@ -10,7 +10,7 @@ use crate::ToolInvocationContext;
 const MAX_LOCAL_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ImageToolRuntime {
+pub struct ImageToolRuntime {
     definition: Tool,
     workspace_root: PathBuf,
 }
@@ -73,7 +73,7 @@ struct LoadImageArgs {
     media_type: Option<String>,
 }
 
-pub(crate) fn load_runtime(definition: Tool, workspace_root: PathBuf) -> ImageToolRuntime {
+pub fn load_runtime(definition: Tool, workspace_root: PathBuf) -> ImageToolRuntime {
     ImageToolRuntime {
         definition,
         workspace_root,
