@@ -288,9 +288,7 @@ async fn graph_viewport_diff_response<S>(state: AppState<S>, query: QueryParams)
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let observed_version = query.version();
     let request = viewport_diff_request_from_query(&query);
-    wait_for_newer_version(&state.publisher, observed_version).await;
     let snapshot = match build_graph_snapshot(&state.store, state.publisher.current_version()) {
         Ok(snapshot) => snapshot,
         Err(error) => return error_response(error),
@@ -840,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_versioned_viewport_diff_returns_empty_known_diff() {
+    async fn viewport_diff_returns_immediate_patch_even_with_version_query() {
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
         let root = store.root_id();
@@ -871,15 +869,10 @@ mod tests {
             query.push_str("&known_edge=");
             query.push_str(&edge.key);
         }
-        let state = AppState {
-            store,
-            publisher: publisher.clone(),
-        };
+        let state = AppState { store, publisher };
         let task = tokio::spawn(graph_viewport_diff_response(state, parse_query(&query)));
 
-        publisher.mark_changed();
-
-        let response = timeout(Duration::from_secs(1), task)
+        let response = timeout(Duration::from_millis(50), task)
             .await
             .unwrap()
             .unwrap();
