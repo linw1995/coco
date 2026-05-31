@@ -1525,6 +1525,26 @@ fn console_store_notifies_after_successful_writes() {
 }
 
 #[test]
+fn console_store_notifies_only_when_dequeue_removes_message() {
+    let publisher = ConsolePublisher::new();
+    let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+
+    assert_eq!(store.dequeue_message("system").unwrap(), None);
+    assert_eq!(publisher.current_version(), 0);
+
+    let item = store
+        .enqueue_message("system", json!({"ok": true}))
+        .unwrap();
+    assert_eq!(publisher.current_version(), 1);
+
+    assert_eq!(store.dequeue_message("system").unwrap(), Some(item));
+    assert_eq!(publisher.current_version(), 2);
+
+    assert_eq!(store.dequeue_message("system").unwrap(), None);
+    assert_eq!(publisher.current_version(), 2);
+}
+
+#[test]
 fn console_store_lists_message_queues() {
     let store = ConsoleStore::new(MemoryStore::new(), ConsolePublisher::new());
 
