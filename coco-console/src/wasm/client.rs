@@ -406,6 +406,15 @@ impl VirtualGraph {
         )
     }
 
+    fn refresh_time_scale_elements(&mut self) -> Result<(), JsValue> {
+        let elements = query_time_scale_elements(&self.document)?;
+        self.time_scale = elements.time_scale;
+        self.time_scale_track = elements.time_scale_track;
+        self.time_scale_cursor = elements.time_scale_cursor;
+        self.time_scale_label = elements.time_scale_label;
+        self.apply_canvas()
+    }
+
     fn upsert_graph_items(
         &mut self,
         items: GraphViewportItems,
@@ -1450,7 +1459,12 @@ where
 
 async fn refresh_server_rendered_sections_once(graph: Rc<RefCell<VirtualGraph>>) {
     let (window, document, url) = server_rendered_sections_request(&graph);
-    let response = refresh_server_rendered_sections_from_url(&window, &document, &url).await;
+    let response = refresh_server_rendered_sections_from_url(&window, &document, &url)
+        .await
+        .and_then(|version| {
+            graph.borrow_mut().refresh_time_scale_elements()?;
+            Ok(version)
+        });
     handle_server_rendered_sections_response(graph, &window, response).await;
 }
 
@@ -1524,7 +1538,39 @@ fn refresh_server_fragment_sections(
 ) -> Result<(), JsValue> {
     refresh_text_content(document, container, ".stats")?;
     refresh_text_content(document, container, "#selection-style")?;
-    refresh_inner_html(document, container, ".branch-section")
+    refresh_inner_html(document, container, ".branch-section")?;
+    refresh_time_scale_fragment(document, container)
+}
+
+fn refresh_time_scale_fragment(document: &Document, container: &Element) -> Result<(), JsValue> {
+    refresh_attributes(
+        document,
+        container,
+        ".time-scale",
+        &["class", "tabindex", "aria-label"],
+    )?;
+    refresh_inner_html(document, container, ".time-scale-track")?;
+    refresh_inner_html(document, container, ".time-scale-extents")
+}
+
+fn refresh_attributes(
+    document: &Document,
+    container: &Element,
+    selector: &str,
+    names: &[&str],
+) -> Result<(), JsValue> {
+    let Some(source) = container.query_selector(selector)? else {
+        return Ok(());
+    };
+    if let Some(target) = document.query_selector(selector)? {
+        for name in names {
+            match source.get_attribute(name) {
+                Some(value) => target.set_attribute(name, &value)?,
+                None => target.remove_attribute(name)?,
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn refresh_selected_node_detail_if_needed(
@@ -2271,6 +2317,70 @@ mod tests {
         handle_graph_items_error(fixture.graph.clone(), JsValue::from_str("network failed"));
 
         assert_eq!(console_error_calls.get(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn server_fragment_refreshes_time_scale_without_replacing_track() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+        let original_track = fixture.graph.borrow().time_scale_track.clone();
+        let container = document
+            .create_element("div")
+            .expect_throw("fragment container should be created");
+        container.set_inner_html(
+            r#"
+            <main id="console-root" data-version="1">
+              <nav class="time-scale" aria-label="Graph time navigator" tabindex="0">
+                <div class="time-scale-track">
+                  <span class="time-scale-tick" data-position="0" data-graph-x="10" data-time-label="new-start"></span>
+                  <span class="time-scale-tick" data-position="50" data-graph-x="20" data-time-label="new-middle"></span>
+                  <span class="time-scale-tick" data-position="100" data-graph-x="30" data-time-label="new-end"></span>
+                  <div class="time-scale-cursor"><span class="time-scale-label"></span></div>
+                </div>
+                <div class="time-scale-extents">
+                  <span>new-start</span>
+                  <span>new-end</span>
+                </div>
+              </nav>
+            </main>
+            "#,
+        );
+
+        refresh_time_scale_fragment(&document, &container)
+            .expect_throw("time scale fragment should refresh");
+        fixture
+            .graph
+            .borrow_mut()
+            .refresh_time_scale_elements()
+            .expect_throw("time scale elements should refresh");
+
+        let graph = fixture.graph.borrow();
+        assert!(original_track.is_same_node(Some(&graph.time_scale_track)));
+        assert_eq!(
+            graph
+                .time_scale
+                .get_attribute("tabindex")
+                .expect_throw("time scale should remain focusable"),
+            "0",
+        );
+        assert_eq!(
+            graph
+                .time_scale_track
+                .query_selector_all(".time-scale-tick")
+                .expect_throw("time scale ticks should be queryable")
+                .length(),
+            3,
+        );
+        assert_eq!(
+            graph
+                .time_scale
+                .query_selector(".time-scale-extents span:last-child")
+                .expect_throw("time scale extent should be queryable")
+                .expect_throw("time scale max extent should exist")
+                .text_content()
+                .expect_throw("time scale max extent should have text"),
+            "new-end",
+        );
     }
 
     impl GraphFixture {
