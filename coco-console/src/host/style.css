@@ -358,13 +358,10 @@ body:has(.node-detail.node-detail-selected) .node-details-default {
   border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 8px;
   margin-bottom: 0.62rem;
-  max-height: 8rem;
   opacity: 1;
-  overflow: hidden;
   padding: 0.68rem 0.72rem;
   transform: translateY(0);
   transition:
-    max-height 220ms cubic-bezier(0.16, 1, 0.3, 1),
     margin-bottom 220ms cubic-bezier(0.16, 1, 0.3, 1),
     opacity 180ms ease,
     padding 220ms cubic-bezier(0.16, 1, 0.3, 1),
@@ -377,6 +374,7 @@ body:has(.node-detail.node-detail-selected) .node-details-default {
   margin-bottom: 0;
   max-height: 0;
   opacity: 0;
+  overflow: hidden;
   padding-bottom: 0;
   padding-top: 0;
   pointer-events: none;
