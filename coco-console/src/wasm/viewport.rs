@@ -84,6 +84,17 @@ pub fn needs_full_viewport_jump_fetch(rendered: ViewportState, current: Viewport
     needs_full_fetch(ViewportBounds::strict(rendered), current)
 }
 
+pub fn lane_visible_in_viewport(
+    viewport: ViewportState,
+    lane_y: f64,
+    lane_half_height: f64,
+) -> bool {
+    let top = lane_y - lane_half_height;
+    let bottom = lane_y + lane_half_height;
+
+    top < viewport.y + viewport.height && bottom > viewport.y
+}
+
 fn needs_full_fetch(rendered: ViewportBounds, current: ViewportState) -> bool {
     !rendered.intersects(ViewportBounds::strict(current))
 }
@@ -142,8 +153,8 @@ fn short_axis_zoom(
 #[cfg(test)]
 mod tests {
     use super::{
-        ViewportState, needs_full_viewport_fetch, needs_full_viewport_jump_fetch, same_viewport,
-        short_canvas_auto_zoom,
+        ViewportState, lane_visible_in_viewport, needs_full_viewport_fetch,
+        needs_full_viewport_jump_fetch, same_viewport, short_canvas_auto_zoom,
     };
 
     fn viewport(x: f64, y: f64) -> ViewportState {
@@ -194,6 +205,13 @@ mod tests {
             viewport(0.0, 0.0),
             viewport(400.0, 0.0)
         ));
+    }
+
+    #[test]
+    fn branch_lane_visibility_uses_current_viewport_bounds() {
+        assert!(lane_visible_in_viewport(viewport(0.0, 0.0), 90.0, 70.0));
+        assert!(lane_visible_in_viewport(viewport(0.0, 200.0), 150.0, 70.0));
+        assert!(!lane_visible_in_viewport(viewport(0.0, 240.0), 90.0, 70.0));
     }
 
     #[test]

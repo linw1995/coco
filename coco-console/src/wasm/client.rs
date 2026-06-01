@@ -28,6 +28,7 @@ use crate::viewport::{
 const ROOT_ID: &str = "console-root";
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const VIEWPORT_KEY: &str = "coco-console:viewport";
+const AUTO_FOLLOW_KEY: &str = "coco-console:auto-follow";
 const NODE_RADIUS: f64 = 26.0;
 const EDGE_NODE_EXIT: f64 = 42.0;
 const EDGE_TARGET_APPROACH: f64 = 48.0;
@@ -50,6 +51,7 @@ struct GraphRootElements {
     graph_wrap: Element,
     graph_svg: Element,
     graph_bg: Element,
+    follow_toggle: Element,
 }
 
 struct GraphLayerElements {
@@ -191,6 +193,7 @@ struct VirtualGraph {
     graph_wrap: Element,
     graph_svg: Element,
     graph_bg: Element,
+    follow_toggle: Element,
     lane_group: Element,
     edge_group: Element,
     node_group: Element,
@@ -201,6 +204,7 @@ struct VirtualGraph {
     status: Option<Element>,
     viewport: ViewportState,
     zoom: f64,
+    auto_follow: bool,
     canvas: Option<GraphCanvas>,
     auto_fit_short_canvas: bool,
     version: u64,
@@ -221,15 +225,17 @@ impl VirtualGraph {
         let auto_fit_short_canvas = stored_viewport.is_none();
         let viewport = stored_viewport
             .unwrap_or_else(|| viewport_from_element(&elements.root.graph_wrap, 0.0, 0.0, zoom));
+        let auto_follow = initial_auto_follow(&window);
         let version = current_version(&document).unwrap_or_default();
 
-        Ok(Self {
+        let graph = Self {
             window,
             document,
             graph_mode,
             graph_wrap: elements.root.graph_wrap,
             graph_svg: elements.root.graph_svg,
             graph_bg: elements.root.graph_bg,
+            follow_toggle: elements.root.follow_toggle,
             lane_group: elements.layers.lane_group,
             edge_group: elements.layers.edge_group,
             node_group: elements.layers.node_group,
@@ -240,6 +246,7 @@ impl VirtualGraph {
             status: elements.status,
             viewport,
             zoom,
+            auto_follow,
             canvas: None,
             auto_fit_short_canvas,
             version,
@@ -249,7 +256,9 @@ impl VirtualGraph {
             patch_in_flight: false,
             pending_viewport_update: PendingViewportUpdate::None,
             version_refresh_abort: None,
-        })
+        };
+        graph.apply_follow_toggle_state()?;
+        Ok(graph)
     }
 
     fn resize_viewport(&mut self) {
@@ -273,6 +282,47 @@ impl VirtualGraph {
             self.viewport.x = self.viewport.x.max(0.0);
             self.viewport.y = self.viewport.y.max(0.0);
         }
+    }
+
+    fn follow_top_right(&mut self) {
+        let Some(canvas) = self.canvas else {
+            self.viewport.x = 0.0;
+            self.viewport.y = 0.0;
+            return;
+        };
+        self.viewport.x = (f64::from(canvas.width) - self.viewport.width).max(0.0);
+        self.viewport.y = 0.0;
+        self.clamp_viewport();
+    }
+
+    fn set_auto_follow(&mut self, enabled: bool) -> Result<(), JsValue> {
+        self.auto_follow = enabled;
+        self.persist_auto_follow();
+        self.apply_follow_toggle_state()?;
+        if self.auto_follow {
+            self.follow_top_right();
+        }
+        Ok(())
+    }
+
+    fn persist_auto_follow(&self) {
+        let Some(storage) = session_storage(&self.window) else {
+            return;
+        };
+        let value = if self.auto_follow { "1" } else { "0" };
+        let _ = storage.set_item(AUTO_FOLLOW_KEY, value);
+    }
+
+    fn apply_follow_toggle_state(&self) -> Result<(), JsValue> {
+        let pressed = if self.auto_follow { "true" } else { "false" };
+        let label = if self.auto_follow {
+            "Following"
+        } else {
+            "Follow"
+        };
+        self.follow_toggle.set_attribute("aria-pressed", pressed)?;
+        self.follow_toggle.set_text_content(Some(label));
+        Ok(())
     }
 
     fn set_viewport(&mut self, viewport: GraphViewport) {
@@ -351,7 +401,10 @@ impl VirtualGraph {
         let response_viewport = ViewportState::from(viewport);
         self.version = version;
         self.canvas = Some(canvas);
-        if same_viewport(desired_viewport, response_viewport) {
+        if self.auto_follow {
+            self.follow_top_right();
+            self.persist_viewport();
+        } else if same_viewport(desired_viewport, response_viewport) {
             self.set_viewport(viewport);
         }
         self.fit_short_canvas_once();
@@ -403,7 +456,9 @@ impl VirtualGraph {
             &self.time_scale_cursor,
             &self.time_scale_label,
             self.viewport,
-        )
+        )?;
+        self.sync_branch_visibility();
+        Ok(())
     }
 
     fn refresh_time_scale_elements(&mut self) -> Result<(), JsValue> {
@@ -726,6 +781,12 @@ impl VirtualGraph {
         }
     }
 
+    #[rustfmt::skip]
+    fn apply_shell_version(&mut self, version: u64) { self.shell_version = version; self.sync_branch_visibility(); }
+
+    #[rustfmt::skip]
+    fn sync_branch_visibility(&self) { if let Err(error) = sync_branch_visibility(&self.document, self.viewport) { web_sys::console::error_1(&error); } }
+
     fn viewport_update_active(&self) -> bool {
         viewport_update_active(self.patch_in_flight, self.pending_viewport_update)
     }
@@ -778,6 +839,7 @@ fn query_graph_root_elements(document: &Document) -> Result<GraphRootElements, J
         graph_wrap: query_required(document, ".graph-wrap")?,
         graph_svg: query_required(document, ".graph")?,
         graph_bg: query_required(document, ".graph-bg")?,
+        follow_toggle: query_required(document, ".follow-toggle")?,
     })
 }
 
@@ -804,6 +866,17 @@ fn initial_zoom(graph_wrap: &Element) -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(1.0)
         .clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn initial_auto_follow(window: &Window) -> bool {
+    stored_auto_follow_value(window).is_some_and(|value| value == "1" || value == "true")
+}
+
+fn stored_auto_follow_value(window: &Window) -> Option<String> {
+    session_storage(window)?
+        .get_item(AUTO_FOLLOW_KEY)
+        .ok()
+        .flatten()
 }
 
 impl ViewportState {
@@ -902,6 +975,26 @@ where
         let previous = graph.viewport;
         update(&mut graph);
         graph.clamp_viewport();
+        if graph.auto_follow {
+            graph.follow_top_right();
+        }
+        let pending_update = pending_update_for_viewport_change(previous, graph.viewport);
+        let _ = graph.apply_canvas();
+        graph.persist_viewport();
+        pending_update
+    };
+    request_viewport_update(graph, pending_update);
+}
+
+fn update_auto_follow(graph: Rc<RefCell<VirtualGraph>>, enabled: bool) {
+    let pending_update = {
+        let mut graph = graph.borrow_mut();
+        graph.abort_version_refresh();
+        let previous = graph.viewport;
+        if let Err(error) = graph.set_auto_follow(enabled) {
+            web_sys::console::error_1(&error);
+            return;
+        }
         let pending_update = pending_update_for_viewport_change(previous, graph.viewport);
         let _ = graph.apply_canvas();
         graph.persist_viewport();
@@ -1391,8 +1484,16 @@ fn graph_items_refresh_action(
 }
 
 fn apply_graph_items_diff(graph: Rc<RefCell<VirtualGraph>>, response: GraphViewportDiffResponse) {
-    if let Err(error) = graph.borrow_mut().apply_diff(response) {
-        web_sys::console::error_1(&error);
+    let patch_needed = {
+        let mut graph = graph.borrow_mut();
+        if let Err(error) = graph.apply_diff(response) {
+            web_sys::console::error_1(&error);
+            return;
+        }
+        !same_viewport(graph.rendered_viewport, graph.viewport)
+    };
+    if patch_needed {
+        request_viewport_patch(graph);
     }
 }
 
@@ -1488,7 +1589,7 @@ async fn handle_server_rendered_sections_response(
     response: Result<Option<u64>, JsValue>,
 ) {
     match response {
-        Ok(Some(version)) => graph.borrow_mut().shell_version = version,
+        Ok(Some(version)) => graph.borrow_mut().apply_shell_version(version),
         Ok(None) => {}
         Err(error) => {
             web_sys::console::error_1(&error);
@@ -1611,9 +1712,27 @@ fn refresh_inner_html(
     Ok(())
 }
 
+#[rustfmt::skip]
+fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> { let branches = document.query_selector_all(".branch[data-lane-y]")?; for index in 0..branches.length() { sync_branch_visibility_element(&branches.item(index).expect("query selector index should exist").unchecked_into::<Element>(), viewport)?; } Ok(()) }
+
+#[rustfmt::skip]
+fn sync_branch_visibility_element(branch: &Element, viewport: ViewportState) -> Result<(), JsValue> {
+    branch_lane_y(branch).map(|lane_y| apply_branch_visibility(branch, crate::viewport::lane_visible_in_viewport(viewport, lane_y, 70.0))).unwrap_or(Ok(()))
+}
+
+#[rustfmt::skip]
+fn branch_lane_y(branch: &Element) -> Option<f64> { branch.get_attribute("data-lane-y")?.parse().ok() }
+
+#[rustfmt::skip]
+fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> { branch.class_list().toggle_with_force("branch-viewport-hidden", !visible)?; set_branch_aria_hidden(branch, !visible) }
+
+#[rustfmt::skip]
+fn set_branch_aria_hidden(branch: &Element, hidden: bool) -> Result<(), JsValue> { if hidden { branch.set_attribute("aria-hidden", "true") } else { branch.remove_attribute("aria-hidden") } }
+
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let installers: [GraphListenerInstaller; 6] = [
+    let installers: [GraphListenerInstaller; 7] = [
         install_node_detail_listener,
+        install_follow_toggle_listener,
         install_wheel_listener,
         install_resize_listener,
         install_time_scale_listener,
@@ -1623,6 +1742,20 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     for install in installers {
         install(graph.clone())?;
     }
+    Ok(())
+}
+
+fn install_follow_toggle_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let follow_toggle = graph.borrow().follow_toggle.clone();
+    let follow_graph = graph.clone();
+    let follow_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        event.prevent_default();
+        let enabled = !follow_graph.borrow().auto_follow;
+        update_auto_follow(follow_graph.clone(), enabled);
+    });
+    follow_toggle
+        .add_event_listener_with_callback("click", follow_closure.as_ref().unchecked_ref())?;
+    follow_closure.forget();
     Ok(())
 }
 
@@ -2294,6 +2427,12 @@ mod tests {
 
     impl Drop for GraphFixture {
         fn drop(&mut self) {
+            if let Some(window) = web_sys::window()
+                && let Some(storage) = session_storage(&window)
+            {
+                let _ = storage.remove_item(AUTO_FOLLOW_KEY);
+                let _ = storage.remove_item(VIEWPORT_KEY);
+            }
             self.root.remove();
         }
     }
@@ -2383,6 +2522,68 @@ mod tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    fn graph_items_auto_follow_pins_to_top_right() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = ViewportState {
+                x: 25.0,
+                y: 40.0,
+                width: 320.0,
+                height: 180.0,
+                overscan: MIN_OVERSCAN,
+            };
+            graph.canvas = Some(GraphCanvas {
+                width: 1000,
+                height: 600,
+            });
+        }
+
+        update_auto_follow(fixture.graph.clone(), true);
+
+        let graph = fixture.graph.borrow();
+        assert!(graph.auto_follow);
+        assert_eq!(rounded_i32(graph.viewport.x), 680);
+        assert_eq!(rounded_i32(graph.viewport.y), 0);
+        assert_eq!(
+            graph.follow_toggle.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            graph.follow_toggle.text_content().as_deref(),
+            Some("Following")
+        );
+        assert_eq!(
+            session_storage(&graph.window)
+                .and_then(|storage| storage.get_item(AUTO_FOLLOW_KEY).ok().flatten())
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_auto_follow_loads_stored_state() {
+        let window = web_sys::window().expect_throw("window should be available");
+        session_storage(&window)
+            .expect_throw("session storage should be available")
+            .set_item(AUTO_FOLLOW_KEY, "1")
+            .expect_throw("auto follow state should be stored");
+
+        let fixture = GraphFixture::new();
+        let graph = fixture.graph.borrow();
+
+        assert!(graph.auto_follow);
+        assert_eq!(
+            graph.follow_toggle.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            graph.follow_toggle.text_content().as_deref(),
+            Some("Following")
+        );
+    }
+
     impl GraphFixture {
         fn new() -> Self {
             let window = web_sys::window().expect_throw("window should be available");
@@ -2396,6 +2597,7 @@ mod tests {
                 r#"
                 <main id="console-root" data-version="0">
                   <div class="graph-wrap" data-zoom="1">
+                    <button class="follow-toggle" type="button" aria-pressed="false">Follow</button>
                     <svg class="graph">
                       <rect class="graph-bg"></rect>
                       <g class="graph-lanes"></g>

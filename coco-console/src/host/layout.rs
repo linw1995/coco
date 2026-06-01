@@ -758,7 +758,7 @@ fn diff_edges(
     }
 }
 
-fn lane_key(label: &str) -> String {
+pub(crate) fn lane_key(label: &str) -> String {
     format!("lane:{label}")
 }
 

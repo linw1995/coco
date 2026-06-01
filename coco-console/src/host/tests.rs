@@ -270,6 +270,8 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
 
     let html = render_snapshot_page(&snapshot);
     assert!(html.contains("class=\"graph-wrap virtual-graph\""));
+    assert!(html.contains("class=\"follow-toggle\""));
+    assert!(html.contains("Keep the graph pinned to the top-right edge"));
     assert!(html.contains("class=\"graph-lanes\""));
     assert!(html.contains("class=\"graph-edges\""));
     assert!(html.contains("class=\"graph-nodes\""));
@@ -899,6 +901,16 @@ fn graph_viewport_response_uses_stable_keys_for_patchable_items() {
             && edge.source_id == "base"
             && edge.target_id == "merged"
     }));
+}
+
+#[test]
+fn rendered_branch_items_include_lane_metadata() {
+    let snapshot = two_node_snapshot(12);
+    let html = render_snapshot_page(&snapshot);
+
+    assert!(html.contains("class=\"branch\""));
+    assert!(html.contains("data-lane-key=\"lane:main\""));
+    assert!(html.contains("data-lane-y=\"90\""));
 }
 
 #[test]
