@@ -75,6 +75,7 @@ jobs:
               - "scripts/run-wasm-cov.sh"
               - "scripts/merge-cov.sh"
               - "coco-console/src/api.rs"
+              - "coco-console/src/lib.rs"
               - "coco-console/src/wasm/**"
             builtin_skill_scripts:
               - ".github/workflows/CI.yaml"
