@@ -2051,10 +2051,12 @@ fn apply_node_display_visibility(node: &Element, visible: bool) -> Result<(), Js
         .toggle_with_force("node-viewport-hidden", !visible)?;
     if visible {
         node.remove_attribute("aria-hidden")?;
-        node.remove_attribute("tabindex")
+        node.remove_attribute("tabindex")?;
+        node.remove_attribute("focusable")
     } else {
         node.set_attribute("aria-hidden", "true")?;
-        node.set_attribute("tabindex", "-1")
+        node.set_attribute("tabindex", "-1")?;
+        node.set_attribute("focusable", "false")
     }
 }
 
@@ -3210,6 +3212,25 @@ mod tests {
         assert_node_display(&fixture.root, "node:c3", 90, false);
     }
 
+    #[wasm_bindgen_test]
+    fn graph_items_canvas_lane_visibility_keeps_shifted_lanes_in_viewbox_after_scroll() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 300, 1000, 300).into();
+            graph
+                .apply_full(lane_shift_response(viewport(1780, 300, 1000, 300)))
+                .expect_throw("graph payload should render");
+        }
+
+        assert_graph_viewbox(&fixture.root, "1780 20 1000 300");
+        assert_branch_hidden(&fixture.root, "A", true);
+        assert_branch_hidden(&fixture.root, "B", true);
+        assert_branch_hidden(&fixture.root, "C", false);
+        assert_branch_hidden(&fixture.root, "day", true);
+        assert_node_display(&fixture.root, "node:c3", 90, false);
+    }
+
     impl GraphFixture {
         fn new() -> Self {
             let window = web_sys::window().expect_throw("window should be available");
@@ -3414,9 +3435,11 @@ mod tests {
         if hidden {
             assert_eq!(node.get_attribute("aria-hidden").as_deref(), Some("true"));
             assert_eq!(node.get_attribute("tabindex").as_deref(), Some("-1"));
+            assert_eq!(node.get_attribute("focusable").as_deref(), Some("false"));
         } else {
             assert!(node.get_attribute("aria-hidden").is_none());
             assert!(node.get_attribute("tabindex").is_none());
+            assert!(node.get_attribute("focusable").is_none());
         }
     }
 
