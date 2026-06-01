@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::rc::Rc;
 use std::str::{FromStr, Split};
 
@@ -993,15 +994,16 @@ fn node_title_text(node: &GraphViewportNode) -> String {
 }
 
 async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
-    loop {
-        match render_next_viewport_patch(graph.clone()).await {
-            Ok(should_continue) if should_continue => {}
-            Ok(_) => break,
-            Err(error) => {
-                web_sys::console::error_1(&error);
-                graph.borrow_mut().patch_in_flight = false;
-                break;
-            }
+    while render_next_viewport_patch_or_stop(graph.clone()).await {}
+}
+
+async fn render_next_viewport_patch_or_stop(graph: Rc<RefCell<VirtualGraph>>) -> bool {
+    match render_next_viewport_patch(graph.clone()).await {
+        Ok(should_continue) => should_continue,
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            graph.borrow_mut().patch_in_flight = false;
+            false
         }
     }
 }
@@ -1084,9 +1086,7 @@ fn finish_applied_viewport_patch(graph: &mut VirtualGraph) -> bool {
 }
 
 async fn refresh_graph_items_on_version(graph: Rc<RefCell<VirtualGraph>>) {
-    loop {
-        refresh_graph_items_once(graph.clone()).await;
-    }
+    refresh_on_version(graph, refresh_graph_items_once).await;
 }
 
 async fn refresh_graph_items_once(graph: Rc<RefCell<VirtualGraph>>) {
@@ -1247,8 +1247,16 @@ async fn delay_ms(window: &Window, delay_ms: i32) -> Result<(), JsValue> {
 }
 
 async fn refresh_server_rendered_sections_on_version(graph: Rc<RefCell<VirtualGraph>>) {
+    refresh_on_version(graph, refresh_server_rendered_sections_once).await;
+}
+
+async fn refresh_on_version<F, Fut>(graph: Rc<RefCell<VirtualGraph>>, refresh_once: F)
+where
+    F: Fn(Rc<RefCell<VirtualGraph>>) -> Fut,
+    Fut: Future<Output = ()>,
+{
     loop {
-        refresh_server_rendered_sections_once(graph.clone()).await;
+        refresh_once(graph.clone()).await;
     }
 }
 
