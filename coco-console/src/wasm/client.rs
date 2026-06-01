@@ -189,6 +189,7 @@ impl RenderedKeys {
 struct VirtualGraph {
     window: Window,
     document: Document,
+    graph_mode: String,
     graph_wrap: Element,
     graph_svg: Element,
     graph_bg: Element,
@@ -214,6 +215,7 @@ struct VirtualGraph {
 impl VirtualGraph {
     fn new(window: Window, document: Document) -> Result<Self, JsValue> {
         let elements = VirtualGraphElements::query(&document)?;
+        let graph_mode = current_graph_mode(&document);
         let zoom = initial_zoom(&elements.root.graph_wrap);
         let viewport = initial_viewport(&window, &elements.root.graph_wrap, zoom);
         let version = current_version(&document).unwrap_or_default();
@@ -221,6 +223,7 @@ impl VirtualGraph {
         Ok(Self {
             window,
             document,
+            graph_mode,
             graph_wrap: elements.root.graph_wrap,
             graph_svg: elements.root.graph_svg,
             graph_bg: elements.root.graph_bg,
@@ -682,6 +685,27 @@ impl VirtualGraph {
             controller.abort();
         }
     }
+
+    fn graph_query(&self, query: String) -> String {
+        append_graph_mode_query(query, &self.graph_mode)
+    }
+}
+
+fn current_graph_mode(document: &Document) -> String {
+    document
+        .get_element_by_id(ROOT_ID)
+        .and_then(|root| root.get_attribute("data-graph-mode"))
+        .filter(|mode| mode == "all" || mode == "anchors")
+        .unwrap_or_else(|| "anchors".to_owned())
+}
+
+fn append_graph_mode_query(mut query: String, mode: &str) -> String {
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str("mode=");
+    query.push_str(mode);
+    query
 }
 
 impl VirtualGraphElements {
@@ -781,7 +805,10 @@ async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
     let (window, query) = {
         let mut graph = graph.borrow_mut();
         graph.resize_viewport();
-        (graph.window.clone(), graph.viewport.request_query())
+        (
+            graph.window.clone(),
+            graph.graph_query(graph.viewport.request_query()),
+        )
     };
     let response =
         fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
@@ -1044,7 +1071,7 @@ async fn render_full_viewport_patch(
     input: ViewportPatchInput,
 ) -> Result<bool, JsValue> {
     graph.borrow().show_loading_status();
-    let query = input.current.request_query();
+    let query = graph.borrow().graph_query(input.current.request_query());
     let response =
         fetch_json::<GraphViewportResponse>(&input.window, &format!("/api/graph/viewport?{query}"))
             .await?;
@@ -1071,7 +1098,7 @@ async fn render_diff_viewport_patch(
 
 fn viewport_patch_diff_query(graph: &VirtualGraph, current: ViewportState) -> String {
     let known_query = graph.rendered.known_query();
-    let mut query = format!("{}&known=1", current.request_query());
+    let mut query = format!("{}&known=1", graph.graph_query(current.request_query()));
     append_known_query(&mut query, &known_query);
     query
 }
@@ -1112,6 +1139,7 @@ fn graph_items_refresh_input(graph: Rc<RefCell<VirtualGraph>>) -> Option<GraphIt
             graph.viewport,
             graph.canvas,
             graph.rendered.known_query(),
+            &graph.graph_mode,
         ),
     })
 }
@@ -1121,8 +1149,12 @@ fn graph_items_refresh_query(
     viewport: ViewportState,
     canvas: Option<GraphCanvas>,
     known_query: String,
+    graph_mode: &str,
 ) -> String {
-    let mut query = format!("version={version}&{}&known=1", viewport.request_query());
+    let mut query = format!(
+        "version={version}&{}&known=1",
+        append_graph_mode_query(viewport.request_query(), graph_mode)
+    );
     append_canvas_query(&mut query, canvas);
     append_known_query(&mut query, &known_query);
     query
@@ -1273,7 +1305,10 @@ fn server_rendered_sections_request(
     (
         graph.window.clone(),
         graph.document.clone(),
-        format!("/fragment?version={}", graph.shell_version),
+        format!(
+            "/fragment?version={}&mode={}",
+            graph.shell_version, graph.graph_mode
+        ),
     )
 }
 
@@ -1514,15 +1549,21 @@ async fn refresh_selected_node_detail_from_graph(
 async fn refresh_selected_node_detail(window: &Window, document: &Document) -> Result<(), JsValue> {
     let target = selected_node_target(window);
     render_loading_node_detail_if_current(window, document, target.as_deref())?;
-    let url = node_detail_url(target.as_deref());
+    let url = node_detail_url(target.as_deref(), &current_graph_mode(document));
     let html = fetch_text(window, &url).await?;
     render_node_detail_if_current(window, document, target, &html)
 }
 
-fn node_detail_url(target: Option<&str>) -> String {
+fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
     target
-        .map(|target| format!("/api/node-detail?target={}", percent_encode(target)))
-        .unwrap_or_else(|| "/api/node-detail".to_owned())
+        .map(|target| {
+            format!(
+                "/api/node-detail?target={}&mode={}",
+                percent_encode(target),
+                graph_mode
+            )
+        })
+        .unwrap_or_else(|| format!("/api/node-detail?mode={graph_mode}"))
 }
 
 fn render_node_detail_if_current(

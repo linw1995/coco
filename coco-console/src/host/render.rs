@@ -2,7 +2,7 @@ use askama::Template;
 use coco_mem::{PauseReason, SessionState};
 use leptos::{html::HtmlElement, prelude::*};
 
-use crate::graph::{GraphNode, GraphSnapshot, node_target_id, shorten_id};
+use crate::graph::{GraphMode, GraphNode, GraphSnapshot, node_target_id, shorten_id};
 
 #[derive(Template)]
 #[template(path = "graph_shell.html")]
@@ -60,29 +60,56 @@ fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> S
 
 fn render_root(snapshot: &GraphSnapshot) -> AnyView {
     let stats = format!(
-        "{} nodes / {} edges / version {}",
+        "{} nodes / {} edges / {} / version {}",
         snapshot.nodes.len(),
         snapshot.edges.len(),
+        snapshot.mode.label(),
         snapshot.version
     );
     let selection_style = render_selection_style(snapshot);
     let content = render_content(snapshot);
     let version = snapshot.version.to_string();
+    let mode = snapshot.mode.as_query_value();
+    let mode_switch = render_mode_switch(snapshot.mode);
 
     view! {
-        <main id="console-root" class="shell" data-version=version>
+        <main id="console-root" class="shell" data-version=version data-graph-mode=mode>
             <style id="selection-style">{selection_style}</style>
             <header class="topbar">
                 <section class="brand">
                     <h1>"CoCo Console"</h1>
                     <p>"Live node relationship graph from the daemon store."</p>
                 </section>
-                <p class="stats">{stats}</p>
+                <section class="topbar-actions">
+                    {mode_switch}
+                    <p class="stats">{stats}</p>
+                </section>
             </header>
             {content}
         </main>
     }
     .into_any()
+}
+
+fn render_mode_switch(mode: GraphMode) -> AnyView {
+    let anchors_class = mode_switch_class(mode == GraphMode::Anchors);
+    let all_class = mode_switch_class(mode == GraphMode::All);
+
+    view! {
+        <nav class="mode-switch" aria-label="Graph mode">
+            <a class=anchors_class href="/?mode=anchors">"Anchors"</a>
+            <a class=all_class href="/?mode=all">"All"</a>
+        </nav>
+    }
+    .into_any()
+}
+
+fn mode_switch_class(active: bool) -> &'static str {
+    if active {
+        "mode-switch-item active"
+    } else {
+        "mode-switch-item"
+    }
 }
 
 fn render_content(snapshot: &GraphSnapshot) -> AnyView {
