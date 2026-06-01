@@ -1545,7 +1545,7 @@ fn render_loading_node_detail_if_current(
     target: Option<&str>,
 ) -> Result<(), JsValue> {
     let Some(target) = target else {
-        return Ok(());
+        return clear_selected_node_detail(document);
     };
     if selected_node_target(window).as_deref() != Some(target) {
         return Ok(());
@@ -1559,6 +1559,13 @@ fn replace_node_detail_slot(document: &Document, detail: &Element) -> Result<(),
     slot.set_inner_html("");
     slot.append_child(detail)?;
     Ok(())
+}
+
+fn clear_selected_node_detail(document: &Document) -> Result<(), JsValue> {
+    let Some(detail) = document.query_selector(".node-detail.node-detail-selected")? else {
+        return Ok(());
+    };
+    detail.class_list().remove_1("node-detail-selected")
 }
 
 fn loading_node_detail(document: &Document, target: &str) -> Result<Element, JsValue> {
