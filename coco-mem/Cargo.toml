@@ -13,7 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Hashing and platform integration.
-libc = "0.2.178"
+libc = "0.2.186"
 sha2 = "0.10.9"
 
 # Error handling.
