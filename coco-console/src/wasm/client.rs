@@ -681,11 +681,7 @@ impl VirtualGraph {
     fn apply_shell_version(&mut self, version: u64) { self.shell_version = version; self.sync_branch_visibility(); }
 
     #[rustfmt::skip]
-    fn sync_branch_visibility(&self) {
-        if let Err(error) = sync_branch_visibility(&self.document, self.viewport) {
-            web_sys::console::error_1(&error);
-        }
-    }
+    fn sync_branch_visibility(&self) { if let Err(error) = sync_branch_visibility(&self.document, self.viewport) { web_sys::console::error_1(&error); } }
 
     fn viewport_update_active(&self) -> bool {
         viewport_update_active(self.patch_in_flight, self.pending_viewport_update)
