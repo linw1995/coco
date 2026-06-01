@@ -2659,6 +2659,36 @@ mod tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    fn graph_items_canvas_lane_visibility_reflows_when_branch_enters_and_exits_viewport() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 0, 1000, 600).into();
+            graph
+                .apply_full(lane_visibility_response(viewport(1780, 0, 1000, 600)))
+                .expect_throw("graph payload should render");
+        }
+
+        assert_branch_hidden(&fixture.root, "B", true);
+        assert_branch_hidden(&fixture.root, "day", true);
+        assert_node_display(&fixture.root, "node:b2", 230, true);
+        assert_node_display(&fixture.root, "node:c3", 230, false);
+        assert_edge_display(&fixture.root, "edge:merge:a5:c3", 90, 230, false);
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1100, 0, 1000, 600).into();
+            graph.sync_branch_visibility();
+        }
+
+        assert_branch_hidden(&fixture.root, "B", false);
+        assert_branch_hidden(&fixture.root, "day", true);
+        assert_node_display(&fixture.root, "node:b2", 230, false);
+        assert_node_display(&fixture.root, "node:c3", 370, false);
+        assert_edge_display(&fixture.root, "edge:merge:a5:c3", 90, 370, false);
+    }
+
     impl GraphFixture {
         fn new() -> Self {
             let window = web_sys::window().expect_throw("window should be available");
@@ -2685,6 +2715,14 @@ mod tests {
                     </svg>
                   </div>
                   <div class="graph-status" hidden></div>
+                  <aside class="side">
+                    <ul class="branch-list">
+                      <li class="branch" data-lane-key="lane:A" data-lane-y="90"><strong>A</strong></li>
+                      <li class="branch" data-lane-key="lane:B" data-lane-y="230"><strong>B</strong></li>
+                      <li class="branch" data-lane-key="lane:C" data-lane-y="370"><strong>C</strong></li>
+                      <li class="branch" data-lane-key="lane:day" data-lane-y="510"><strong>day</strong></li>
+                    </ul>
+                  </aside>
                 </main>
                 "#,
             );
@@ -2701,6 +2739,152 @@ mod tests {
                 root,
             }
         }
+    }
+
+    fn lane_visibility_response(viewport: GraphViewport) -> GraphViewportResponse {
+        GraphViewportResponse {
+            version: 1,
+            canvas: GraphCanvas {
+                width: 4200,
+                height: 720,
+            },
+            viewport,
+            lanes: vec![
+                lane("A", 90),
+                lane("B", 230),
+                lane("C", 370),
+                lane("day", 510),
+            ],
+            nodes: vec![
+                node("node:a5", "a5", 1000, 90),
+                node("node:a7", "a7", 1440, 90),
+                node("node:b1", "b1", 1220, 230),
+                node("node:b2", "b2", 1440, 230),
+                node("node:c2", "c2", 1440, 370),
+                node("node:c3", "c3", 2100, 370),
+                node("node:day", "day", 120, 510),
+            ],
+            edges: vec![
+                primary_edge("edge:primary:b1:b2", "b1", "b2", 1220, 230, 1440, 230),
+                primary_edge("edge:primary:c2:c3", "c2", "c3", 1440, 370, 2100, 370),
+                GraphViewportEdge {
+                    key: "edge:merge:a5:c3".to_owned(),
+                    kind: GraphViewportEdgeKind::MergeParent,
+                    source_id: "a5".to_owned(),
+                    target_id: "c3".to_owned(),
+                    source: Point { x: 1000, y: 90 },
+                    target: Point { x: 2100, y: 370 },
+                    route_slot: 0,
+                    target_port_offset: 0.0,
+                },
+            ],
+        }
+    }
+
+    fn lane(label: &str, y: i32) -> GraphViewportLane {
+        GraphViewportLane {
+            key: format!("lane:{label}"),
+            label: label.to_owned(),
+            y,
+        }
+    }
+
+    fn node(key: &str, id: &str, x: i32, y: i32) -> GraphViewportNode {
+        GraphViewportNode {
+            key: key.to_owned(),
+            id: id.to_owned(),
+            node_target: id.to_owned(),
+            short_id: id.to_owned(),
+            kind: "prompt".to_owned(),
+            summary: id.to_owned(),
+            labels: Vec::new(),
+            x,
+            y,
+        }
+    }
+
+    fn primary_edge(
+        key: &str,
+        source_id: &str,
+        target_id: &str,
+        source_x: i32,
+        source_y: i32,
+        target_x: i32,
+        target_y: i32,
+    ) -> GraphViewportEdge {
+        GraphViewportEdge {
+            key: key.to_owned(),
+            kind: GraphViewportEdgeKind::PrimaryParent,
+            source_id: source_id.to_owned(),
+            target_id: target_id.to_owned(),
+            source: Point {
+                x: source_x,
+                y: source_y,
+            },
+            target: Point {
+                x: target_x,
+                y: target_y,
+            },
+            route_slot: 0,
+            target_port_offset: 0.0,
+        }
+    }
+
+    fn viewport(x: i32, y: i32, width: i32, height: i32) -> GraphViewport {
+        GraphViewport {
+            x,
+            y,
+            width,
+            height,
+            overscan: MIN_OVERSCAN,
+        }
+    }
+
+    fn assert_branch_hidden(root: &Element, name: &str, hidden: bool) {
+        let branch = root
+            .query_selector(&format!(".branch[data-lane-key=\"lane:{name}\"]"))
+            .expect_throw("branch query should succeed")
+            .expect_throw("branch should exist");
+        assert_eq!(
+            branch.class_list().contains("branch-viewport-hidden"),
+            hidden
+        );
+    }
+
+    fn assert_node_display(root: &Element, key: &str, display_y: i32, hidden: bool) {
+        let node = root
+            .query_selector(&format!("[data-render-key=\"{key}\"]"))
+            .expect_throw("node query should succeed")
+            .expect_throw("node should exist");
+        assert_eq!(
+            node.get_attribute("data-display-y"),
+            Some(display_y.to_string())
+        );
+        assert_eq!(node.class_list().contains("node-viewport-hidden"), hidden);
+        assert!(
+            node.query_selector("g")
+                .expect_throw("node group query should succeed")
+                .expect_throw("node group should exist")
+                .get_attribute("transform")
+                .expect_throw("node group should have a transform")
+                .ends_with(&format!(" {display_y})"))
+        );
+    }
+
+    fn assert_edge_display(root: &Element, key: &str, source_y: i32, target_y: i32, hidden: bool) {
+        let edge = root
+            .query_selector(&format!("[data-render-key=\"{key}\"]"))
+            .expect_throw("edge query should succeed")
+            .expect_throw("edge should exist");
+        assert_eq!(
+            edge.get_attribute("data-display-source-y"),
+            Some(source_y.to_string())
+        );
+        assert_eq!(
+            edge.get_attribute("data-display-target-y"),
+            Some(target_y.to_string())
+        );
+        assert_eq!(edge.class_list().contains("edge-viewport-hidden"), hidden);
     }
 
     async fn aborted_fetch_error() -> JsValue {
