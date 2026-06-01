@@ -1653,9 +1653,34 @@ fn sync_canvas_lane_visibility(
     viewport: ViewportState,
     lane_display: &BTreeMap<i32, LaneDisplay>,
 ) -> Result<(), JsValue> {
+    sync_canvas_viewport(document, viewport, lane_display)?;
     sync_canvas_lane_labels(document, lane_display)?;
     sync_canvas_nodes(document, lane_display)?;
     sync_canvas_edges(document, viewport, lane_display)
+}
+
+fn sync_canvas_viewport(
+    document: &Document,
+    viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    let Some(graph_svg) = document.query_selector(".graph")? else {
+        return Ok(());
+    };
+    let display_y = collapsed_viewport_y(viewport.y, lane_display);
+    set_attributes(
+        &graph_svg,
+        [(
+            "viewBox",
+            format!(
+                "{} {} {} {}",
+                rounded_i32(viewport.x),
+                rounded_i32(display_y),
+                rounded_i32(viewport.width),
+                rounded_i32(viewport.height)
+            ),
+        )],
+    )
 }
 
 fn sync_canvas_lane_labels(
@@ -1706,8 +1731,7 @@ fn sync_canvas_nodes(
                 [("transform", format!("translate({x} {})", display.y))],
             )?;
         }
-        node.class_list()
-            .toggle_with_force("node-viewport-hidden", !display.visible)?;
+        apply_node_display_visibility(&node, display.visible)?;
         node.set_attribute("data-display-y", &display.y.to_string())?;
     }
     Ok(())
@@ -1736,7 +1760,7 @@ fn sync_canvas_edges(
         let source = lane_display_for_y(lane_display, source_y);
         let target = lane_display_for_y(lane_display, target_y);
         let visible =
-            graph_edge_visible_in_viewport(viewport, source_x, source_y, target_x, target_y);
+            graph_edge_visible_in_viewport(&edge, viewport, source_x, source_y, target_x, target_y);
         set_edge_display_geometry(&edge, source_x, source.y, target_x, target.y)?;
         edge.class_list()
             .toggle_with_force("edge-viewport-hidden", !visible)?;
@@ -1806,6 +1830,18 @@ fn set_routed_edge_display_geometry(
     )
 }
 
+fn apply_node_display_visibility(node: &Element, visible: bool) -> Result<(), JsValue> {
+    node.class_list()
+        .toggle_with_force("node-viewport-hidden", !visible)?;
+    if visible {
+        node.remove_attribute("aria-hidden")?;
+        node.remove_attribute("tabindex")
+    } else {
+        node.set_attribute("aria-hidden", "true")?;
+        node.set_attribute("tabindex", "-1")
+    }
+}
+
 fn visible_graph_item_lanes(
     document: &Document,
     viewport: ViewportState,
@@ -1857,7 +1893,7 @@ fn collect_visible_edge_lanes(
         else {
             continue;
         };
-        if graph_edge_visible_in_viewport(viewport, source_x, source_y, target_x, target_y) {
+        if graph_edge_visible_in_viewport(&edge, viewport, source_x, source_y, target_x, target_y) {
             lanes.insert(source_y);
             lanes.insert(target_y);
         }
@@ -1887,6 +1923,58 @@ fn lane_display_for_y(lane_display: &BTreeMap<i32, LaneDisplay>, y: i32) -> Lane
         .unwrap_or(LaneDisplay { y, visible: true })
 }
 
+fn collapsed_viewport_y(viewport_y: f64, lane_display: &BTreeMap<i32, LaneDisplay>) -> f64 {
+    let hidden_lanes_before_viewport = lane_display
+        .iter()
+        .filter(|(lane_y, display)| f64::from(**lane_y) < viewport_y && !display.visible)
+        .count() as i32;
+    viewport_y - f64::from(hidden_lanes_before_viewport * GRAPH_LANE_HEIGHT)
+}
+
+fn graph_edge_bounds(
+    edge: &Element,
+    source_x: i32,
+    source_y: i32,
+    target_x: i32,
+    target_y: i32,
+) -> (f64, f64, f64, f64) {
+    let source = Point {
+        x: source_x,
+        y: source_y,
+    };
+    let target = Point {
+        x: target_x,
+        y: target_y,
+    };
+    let target_port_offset = graph_item_f64(edge, "data-target-port-offset").unwrap_or_default();
+    let points = match edge.get_attribute("data-edge-kind").as_deref() {
+        Some("fork") | Some("merge_parent") => {
+            let route_slot = graph_item_i32(edge, "data-route-slot").unwrap_or_default();
+            routed_elbow_point_values(source, target, route_slot, target_port_offset)
+        }
+        _ => {
+            let (start_x, start_y, end_x, end_y) =
+                line_point_values(source, target, target_port_offset);
+            vec![(start_x, start_y), (end_x, end_y)]
+        }
+    };
+    point_bounds(&points)
+}
+
+fn point_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+    let mut left = f64::INFINITY;
+    let mut top = f64::INFINITY;
+    let mut right = f64::NEG_INFINITY;
+    let mut bottom = f64::NEG_INFINITY;
+    for (x, y) in points {
+        left = left.min(*x);
+        top = top.min(*y);
+        right = right.max(*x);
+        bottom = bottom.max(*y);
+    }
+    (left, top, right, bottom)
+}
+
 fn graph_node_visible_in_viewport(viewport: ViewportState, x: i32, y: i32) -> bool {
     let padding = NODE_RADIUS.ceil();
     crate::viewport::bounds_visible_in_viewport(
@@ -1899,6 +1987,7 @@ fn graph_node_visible_in_viewport(viewport: ViewportState, x: i32, y: i32) -> bo
 }
 
 fn graph_edge_visible_in_viewport(
+    edge: &Element,
     viewport: ViewportState,
     source_x: i32,
     source_y: i32,
@@ -1906,12 +1995,14 @@ fn graph_edge_visible_in_viewport(
     target_y: i32,
 ) -> bool {
     let padding = (NODE_RADIUS + EDGE_TARGET_APPROACH).ceil();
+    let (left, top, right, bottom) =
+        graph_edge_bounds(edge, source_x, source_y, target_x, target_y);
     crate::viewport::bounds_visible_in_viewport(
         viewport,
-        f64::from(source_x.min(target_x)) - padding,
-        f64::from(source_y.min(target_y)) - padding,
-        f64::from(source_x.max(target_x)) + padding,
-        f64::from(source_y.max(target_y)) + padding,
+        left - padding,
+        top - padding,
+        right + padding,
+        bottom + padding,
     )
 }
 
@@ -2447,16 +2538,30 @@ fn line_points(
     target: Point,
     target_port_offset: f64,
 ) -> (String, String, String, String) {
+    let (start_x, start_y, end_x, end_y) = line_point_values(source, target, target_port_offset);
+    (
+        format!("{start_x:.1}"),
+        format!("{start_y:.1}"),
+        format!("{end_x:.1}"),
+        format!("{end_y:.1}"),
+    )
+}
+
+fn line_point_values(
+    source: Point,
+    target: Point,
+    target_port_offset: f64,
+) -> (f64, f64, f64, f64) {
     let dx = f64::from(target.x - source.x);
     let target_y = f64::from(target.y) + target_port_offset;
     let dy = target_y - f64::from(source.y);
     let distance = (dx * dx + dy * dy).sqrt();
     if distance <= NODE_RADIUS * 2.0 {
         return (
-            f64::from(source.x).to_string(),
-            f64::from(source.y).to_string(),
-            f64::from(target.x).to_string(),
-            target_y.to_string(),
+            f64::from(source.x),
+            f64::from(source.y),
+            f64::from(target.x),
+            target_y,
         );
     }
 
@@ -2467,12 +2572,7 @@ fn line_points(
     let end_x = f64::from(target.x) - ux * (NODE_RADIUS + 8.0);
     let end_y = target_y - uy * (NODE_RADIUS + 8.0);
 
-    (
-        format!("{start_x:.1}"),
-        format!("{start_y:.1}"),
-        format!("{end_x:.1}"),
-        format!("{end_y:.1}"),
-    )
+    (start_x, start_y, end_x, end_y)
 }
 
 fn routed_elbow_points(
@@ -2481,6 +2581,19 @@ fn routed_elbow_points(
     route_slot: i32,
     target_port_offset: f64,
 ) -> String {
+    routed_elbow_point_values(source, target, route_slot, target_port_offset)
+        .into_iter()
+        .map(|(x, y)| format!("{x:.1},{y:.1}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn routed_elbow_point_values(
+    source: Point,
+    target: Point,
+    route_slot: i32,
+    target_port_offset: f64,
+) -> Vec<(f64, f64)> {
     let start_x = f64::from(source.x) + NODE_RADIUS + 2.0;
     let start_y = f64::from(source.y);
     let end_x = if target.x > source.x {
@@ -2493,9 +2606,14 @@ fn routed_elbow_points(
     let approach_x = (end_x - EDGE_TARGET_APPROACH).max(exit_x + EDGE_TARGET_APPROACH);
     let corridor_y = edge_corridor_y(source.y, target.y, route_slot);
 
-    format!(
-        "{start_x:.1},{start_y:.1} {exit_x:.1},{start_y:.1} {exit_x:.1},{corridor_y:.1} {approach_x:.1},{corridor_y:.1} {approach_x:.1},{end_y:.1} {end_x:.1},{end_y:.1}"
-    )
+    vec![
+        (start_x, start_y),
+        (exit_x, start_y),
+        (exit_x, corridor_y),
+        (approach_x, corridor_y),
+        (approach_x, end_y),
+        (end_x, end_y),
+    ]
 }
 
 fn edge_corridor_y(source_y: i32, target_y: i32, route_slot: i32) -> f64 {
@@ -2675,6 +2793,15 @@ mod tests {
         assert_node_display(&fixture.root, "node:b2", 230, true);
         assert_node_display(&fixture.root, "node:c3", 230, false);
         assert_edge_display(&fixture.root, "edge:merge:a5:c3", 90, 230, false);
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 300, 1000, 300).into();
+            graph.sync_branch_visibility();
+        }
+
+        assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
+        assert_node_display(&fixture.root, "node:c3", 230, false);
 
         {
             let mut graph = fixture.graph.borrow_mut();
@@ -2869,6 +2996,13 @@ mod tests {
                 .expect_throw("node group should have a transform")
                 .ends_with(&format!(" {display_y})"))
         );
+        if hidden {
+            assert_eq!(node.get_attribute("aria-hidden").as_deref(), Some("true"));
+            assert_eq!(node.get_attribute("tabindex").as_deref(), Some("-1"));
+        } else {
+            assert!(node.get_attribute("aria-hidden").is_none());
+            assert!(node.get_attribute("tabindex").is_none());
+        }
     }
 
     fn assert_edge_display(root: &Element, key: &str, source_y: i32, target_y: i32, hidden: bool) {
@@ -2885,6 +3019,14 @@ mod tests {
             Some(target_y.to_string())
         );
         assert_eq!(edge.class_list().contains("edge-viewport-hidden"), hidden);
+    }
+
+    fn assert_graph_viewbox(root: &Element, viewbox: &str) {
+        let graph = root
+            .query_selector(".graph")
+            .expect_throw("graph query should succeed")
+            .expect_throw("graph should exist");
+        assert_eq!(graph.get_attribute("viewBox").as_deref(), Some(viewbox));
     }
 
     async fn aborted_fetch_error() -> JsValue {
