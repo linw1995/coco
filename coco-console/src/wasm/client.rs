@@ -2459,7 +2459,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn server_fragment_refreshes_time_scale_without_replacing_track() {
+    fn graph_items_server_fragment_refreshes_time_scale_without_replacing_track() {
         let fixture = GraphFixture::new();
         let document = fixture.graph.borrow().document.clone();
         let original_track = fixture.graph.borrow().time_scale_track.clone();
