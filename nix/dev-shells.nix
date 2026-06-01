@@ -1,5 +1,6 @@
 {
   pkgs,
+  rustCrapToolchainFor,
   rustDevToolchainFor,
 }: let
   cargo-crap = pkgs.rustPlatform.buildRustPackage rec {
@@ -16,6 +17,21 @@
     doCheck = false;
   };
 in {
+  builtin-skill-scripts = pkgs.mkShell {
+    packages = with pkgs; [
+      python3
+    ];
+  };
+
+  crap = pkgs.mkShell {
+    nativeBuildInputs = [
+      (rustCrapToolchainFor pkgs)
+    ];
+    packages = [
+      cargo-crap
+    ];
+  };
+
   default = pkgs.mkShell {
     nativeBuildInputs = [
       (rustDevToolchainFor pkgs)
@@ -24,7 +40,6 @@ in {
       prek
       grcov
 
-      cargo-crap
       cargo-nextest
       wasm-bindgen-cli
 

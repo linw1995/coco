@@ -1208,8 +1208,11 @@ fn graph_viewport_diff_known_items_reports_added_updated_and_removed() {
             current: viewport,
             known: Some(GraphViewportKnownItems {
                 lanes: vec!["lane:main".to_owned()],
+                lane_fingerprints: Default::default(),
                 nodes: vec!["node:base:120:90".to_owned(), "node:stale".to_owned()],
+                node_fingerprints: Default::default(),
                 edges: vec!["edge:primary_parent:base:stale".to_owned()],
+                edge_fingerprints: Default::default(),
             }),
         },
     );
@@ -1307,8 +1310,11 @@ fn graph_viewport_diff_known_items_updates_edges_without_visible_endpoint_nodes(
             current: viewport,
             known: Some(GraphViewportKnownItems {
                 lanes: Vec::new(),
+                lane_fingerprints: Default::default(),
                 nodes: vec!["node:n0:120:90".to_owned()],
+                node_fingerprints: Default::default(),
                 edges: vec!["edge:primary_parent:n0:120:90:n1:340:90".to_owned()],
+                edge_fingerprints: Default::default(),
             }),
         },
     );
@@ -1516,6 +1522,26 @@ fn console_store_notifies_after_successful_writes() {
         .unwrap();
 
     assert_eq!(publisher.current_version(), 1);
+}
+
+#[test]
+fn console_store_notifies_only_when_dequeue_removes_message() {
+    let publisher = ConsolePublisher::new();
+    let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+
+    assert_eq!(store.dequeue_message("system").unwrap(), None);
+    assert_eq!(publisher.current_version(), 0);
+
+    let item = store
+        .enqueue_message("system", json!({"ok": true}))
+        .unwrap();
+    assert_eq!(publisher.current_version(), 1);
+
+    assert_eq!(store.dequeue_message("system").unwrap(), Some(item));
+    assert_eq!(publisher.current_version(), 2);
+
+    assert_eq!(store.dequeue_message("system").unwrap(), None);
+    assert_eq!(publisher.current_version(), 2);
 }
 
 #[test]

@@ -1,4 +1,10 @@
 {
+  crapToolchainFor = p:
+    with p.fenix;
+      combine [
+        stable.cargo
+      ];
+
   toolchainFor = p:
     with p.fenix;
       combine [

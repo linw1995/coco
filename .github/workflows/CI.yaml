@@ -23,7 +23,7 @@ jobs:
 
       - name: Detect changed paths
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             lint:
@@ -62,6 +62,10 @@ jobs:
               - "coco-mem/src/default_skills/**"
             builtin_skill_scripts:
               - ".github/workflows/CI.yaml"
+              - ".github/actions/setup-nix/action.yaml"
+              - "flake.nix"
+              - "flake.lock"
+              - "nix/**/*.nix"
               - "scripts/test-builtin-skill-scripts.sh"
               - "coco-mem/src/default_skills/**/*.py"
             nix_build:
@@ -129,16 +133,17 @@ jobs:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
         with:
-          cache-key-name: test
+          cache-key-name: crap
+          dev-shell: crap
 
       - name: Download coverage artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: coverage
           path: target/coverage/result/
 
       - name: Run CRAP metric check
-        run: nix develop --command bash scripts/run-crap.sh
+        run: nix develop .#crap --command bash scripts/run-crap.sh
 
       - name: Upload CRAP metric artifact
         uses: actions/upload-artifact@v7
@@ -154,9 +159,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+        with:
+          cache-key-name: builtin-skill-scripts
+          dev-shell: builtin-skill-scripts
 
       - name: Run builtin skill script tests
-        run: bash scripts/test-builtin-skill-scripts.sh
+        run: nix develop .#builtin-skill-scripts --command bash scripts/test-builtin-skill-scripts.sh
 
   nix-build:
     needs:

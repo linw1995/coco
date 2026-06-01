@@ -37,11 +37,14 @@ wasm-bindgen-futures = "=0.4.67"
 
 # Browser APIs.
 web-sys = { version = "=0.3.94", features = [
+  "AbortController",
+  "AbortSignal",
   "console",
   "Document",
   "DomRect",
   "DomTokenList",
   "Element",
+  "Event",
   "EventTarget",
   "HtmlElement",
   "Location",

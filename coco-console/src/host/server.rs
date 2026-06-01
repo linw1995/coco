@@ -15,6 +15,7 @@ use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::time::Instant;
 
+use crate::api::GraphCanvas;
 use crate::config::ConsoleConfig;
 use crate::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
@@ -116,6 +117,10 @@ where
         .route("/style.css", get(style_css))
         .route("/api/graph", get(graph_json::<S>))
         .route("/api/graph/viewport", get(graph_viewport::<S>))
+        .route(
+            "/api/graph/viewport/items/diff",
+            get(graph_viewport_items_diff_get::<S>).post(graph_viewport_items_diff_post::<S>),
+        )
         .route(
             "/api/graph/viewport/diff",
             get(graph_viewport_diff_get::<S>).post(graph_viewport_diff_post::<S>),
@@ -254,17 +259,126 @@ where
     graph_viewport_diff_response(state, query).await
 }
 
+async fn graph_viewport_items_diff_get<S>(
+    State(state): State<AppState<S>>,
+    RawQuery(query): RawQuery,
+) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let query = parse_query(query.as_deref().unwrap_or_default());
+    graph_viewport_items_diff_response_from_query(state, query).await
+}
+
+async fn graph_viewport_items_diff_post<S>(
+    State(state): State<AppState<S>>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let mut query = parse_query(query.as_deref().unwrap_or_default());
+    let body = String::from_utf8_lossy(&body);
+    query.pairs.extend(parse_query(&body).pairs);
+    graph_viewport_items_diff_response_from_query(state, query).await
+}
+
 async fn graph_viewport_diff_response<S>(state: AppState<S>, query: QueryParams) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    wait_for_newer_version(&state.publisher, query.version()).await;
+    let request = viewport_diff_request_from_query(&query);
     let snapshot = match build_graph_snapshot(&state.store, state.publisher.current_version()) {
         Ok(snapshot) => snapshot,
         Err(error) => return error_response(error),
     };
-    let response = layout_graph_viewport_diff(&snapshot, viewport_diff_request_from_query(&query));
+    let response = layout_graph_viewport_diff(&snapshot, request);
     json_response(&response, "graph viewport diff")
+}
+
+async fn graph_viewport_items_diff_response_from_query<S>(
+    state: AppState<S>,
+    query: QueryParams,
+) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    match query.version() {
+        Some(observed_version) => {
+            graph_viewport_items_diff_response(
+                state,
+                viewport_diff_request_from_query(&query),
+                observed_version,
+                known_canvas_from_query(&query),
+            )
+            .await
+        }
+        None => graph_viewport_diff_response(state, query).await,
+    }
+}
+
+async fn graph_viewport_items_diff_response<S>(
+    state: AppState<S>,
+    request: GraphViewportDiffRequest,
+    mut observed_version: u64,
+    known_canvas: Option<GraphCanvas>,
+) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    loop {
+        wait_for_newer_version(&state.publisher, Some(observed_version)).await;
+        let current_version = state.publisher.current_version();
+        let snapshot = match build_graph_snapshot(&state.store, current_version) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_response(error),
+        };
+        let response = layout_graph_viewport_diff(&snapshot, request.clone());
+        if viewport_diff_has_changes(&response, request.known.as_ref())
+            || known_canvas != Some(response.canvas)
+        {
+            return json_response(&response, "graph viewport items diff");
+        }
+        observed_version = current_version;
+    }
+}
+
+fn viewport_diff_has_changes(
+    response: &crate::api::GraphViewportDiffResponse,
+    known: Option<&GraphViewportKnownItems>,
+) -> bool {
+    viewport_diff_has_key_changes(response)
+        || known.is_some_and(|known| viewport_diff_has_fingerprint_changes(response, known))
+}
+
+fn viewport_diff_has_key_changes(response: &crate::api::GraphViewportDiffResponse) -> bool {
+    !response.added.lanes.is_empty()
+        || !response.added.nodes.is_empty()
+        || !response.added.edges.is_empty()
+        || !response.removed.is_empty()
+}
+
+fn viewport_diff_has_fingerprint_changes(
+    response: &crate::api::GraphViewportDiffResponse,
+    known: &GraphViewportKnownItems,
+) -> bool {
+    response.updated.lanes.iter().any(|lane| {
+        known
+            .lane_fingerprints
+            .get(&lane.key)
+            .is_none_or(|fingerprint| fingerprint != &lane.fingerprint())
+    }) || response.updated.nodes.iter().any(|node| {
+        known
+            .node_fingerprints
+            .get(&node.key)
+            .is_none_or(|fingerprint| fingerprint != &node.fingerprint())
+    }) || response.updated.edges.iter().any(|edge| {
+        known
+            .edge_fingerprints
+            .get(&edge.key)
+            .is_none_or(|fingerprint| fingerprint != &edge.fingerprint())
+    })
 }
 
 async fn fragment<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
@@ -459,17 +573,41 @@ fn viewport_diff_request_from_query(query: &QueryParams) -> GraphViewportDiffReq
     }
 }
 
+fn known_canvas_from_query(query: &QueryParams) -> Option<GraphCanvas> {
+    Some(GraphCanvas {
+        width: query.i32("canvas_width")?,
+        height: query.i32("canvas_height")?,
+    })
+}
+
 fn known_items_from_query(query: &QueryParams) -> Option<GraphViewportKnownItems> {
     let known = GraphViewportKnownItems {
         lanes: query.get_all("known_lane"),
+        lane_fingerprints: known_fingerprints_from_query(query, "known_lane_fingerprint"),
         nodes: query.get_all("known_node"),
+        node_fingerprints: known_fingerprints_from_query(query, "known_node_fingerprint"),
         edges: query.get_all("known_edge"),
+        edge_fingerprints: known_fingerprints_from_query(query, "known_edge_fingerprint"),
     };
     (query.contains_key("known")
         || !known.lanes.is_empty()
         || !known.nodes.is_empty()
         || !known.edges.is_empty())
     .then_some(known)
+}
+
+fn known_fingerprints_from_query(
+    query: &QueryParams,
+    key: &str,
+) -> std::collections::BTreeMap<String, String> {
+    query
+        .get_all(key)
+        .into_iter()
+        .filter_map(|value| {
+            let (item_key, fingerprint) = value.rsplit_once(':')?;
+            Some((item_key.to_owned(), fingerprint.to_owned()))
+        })
+        .collect()
 }
 
 async fn wait_for_newer_version(publisher: &ConsolePublisher, observed_version: Option<u64>) {
@@ -529,10 +667,23 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_query, start_console_server, viewport_diff_request_from_query};
-    use crate::{ConsoleConfig, ConsolePublisher};
-    use coco_mem::MemoryStore;
+    use super::{
+        AppState, graph_viewport_diff_response, graph_viewport_items_diff_response_from_query,
+        parse_query, start_console_server, viewport_diff_has_changes,
+        viewport_diff_request_from_query,
+    };
+    use crate::api::{
+        GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
+        GraphViewportItems, GraphViewportRemovedItem, Point,
+    };
+    use crate::graph::build_graph_snapshot;
+    use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
+    use crate::layout::layout_graph_viewport;
+    use crate::{ConsoleConfig, ConsolePublisher, ConsoleStore};
+    use coco_mem::{BranchStore, Kind, MemoryStore, NewNode, NodeStore, Role};
+    use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{Duration, timeout};
 
     fn test_config() -> ConsoleConfig {
         ConsoleConfig {
@@ -542,6 +693,46 @@ mod tests {
 
     fn get_request(path: &str) -> String {
         format!("GET {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+    }
+
+    fn known_viewport_query(
+        version: u64,
+        viewport: GraphViewportRequest,
+        rendered: &crate::api::GraphViewportResponse,
+    ) -> String {
+        let mut query = format!(
+            "version={version}&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
+            viewport.x,
+            viewport.y,
+            viewport.width,
+            viewport.height,
+            viewport.overscan,
+            rendered.canvas.width,
+            rendered.canvas.height,
+        );
+        for lane in &rendered.lanes {
+            append_known_item(&mut query, "lane", &lane.key, &lane.fingerprint());
+        }
+        for node in &rendered.nodes {
+            append_known_item(&mut query, "node", &node.key, &node.fingerprint());
+        }
+        for edge in &rendered.edges {
+            append_known_item(&mut query, "edge", &edge.key, &edge.fingerprint());
+        }
+        query
+    }
+
+    fn append_known_item(query: &mut String, kind: &str, key: &str, fingerprint: &str) {
+        query.push_str("&known_");
+        query.push_str(kind);
+        query.push('=');
+        query.push_str(key);
+        query.push_str("&known_");
+        query.push_str(kind);
+        query.push_str("_fingerprint=");
+        query.push_str(key);
+        query.push(':');
+        query.push_str(fingerprint);
     }
 
     async fn response_bytes_from(bytes: &[u8]) -> Vec<u8> {
@@ -634,6 +825,268 @@ mod tests {
             changed.extend_from_slice(&response[..read]);
         }
 
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn versioned_viewport_items_diff_waits_past_empty_known_diff() {
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+        let root = store.root_id();
+        store.fork("main", &root).unwrap();
+        let first = store
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("visible".to_owned()),
+            })
+            .unwrap();
+        store.set_branch_head("main", &root, &first).unwrap();
+        let version = publisher.current_version();
+        let viewport = GraphViewportRequest::default();
+        let snapshot = build_graph_snapshot(&store, version).unwrap();
+        let rendered = layout_graph_viewport(&snapshot, viewport);
+        let query = known_viewport_query(version, viewport, &rendered);
+        let state = AppState {
+            store: store.clone(),
+            publisher: publisher.clone(),
+        };
+        let mut task = tokio::spawn(graph_viewport_items_diff_response_from_query(
+            state,
+            parse_query(&query),
+        ));
+
+        publisher.mark_changed();
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut task).await.is_err(),
+            "an unrelated version bump must not complete the viewport item diff when known items are unchanged"
+        );
+
+        let next = store
+            .append(NewNode {
+                parent: first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("next visible".to_owned()),
+            })
+            .unwrap();
+        store.set_branch_head("main", &first, &next).unwrap();
+
+        let response = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn versioned_viewport_items_diff_returns_known_payload_changes() {
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+        let root = store.root_id();
+        let first = store
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("first".to_owned()),
+            })
+            .unwrap();
+        let second = store
+            .append(NewNode {
+                parent: first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("second".to_owned()),
+            })
+            .unwrap();
+        store.fork("main", &first).unwrap();
+        store.fork("draft", &second).unwrap();
+        let version = publisher.current_version();
+        let viewport = GraphViewportRequest::default();
+        let snapshot = build_graph_snapshot(&store, version).unwrap();
+        let rendered = layout_graph_viewport(&snapshot, viewport);
+        let query = known_viewport_query(version, viewport, &rendered);
+        let state = AppState {
+            store: store.clone(),
+            publisher: publisher.clone(),
+        };
+        let task = tokio::spawn(graph_viewport_items_diff_response_from_query(
+            state,
+            parse_query(&query),
+        ));
+
+        store.set_branch_head("main", &first, &second).unwrap();
+
+        let response = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn versioned_viewport_items_diff_waits_for_newer_version() {
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+        let viewport = GraphViewportRequest::default();
+        let state = AppState {
+            store,
+            publisher: publisher.clone(),
+        };
+        let query = format!(
+            "version={}&x={}&y={}&width={}&height={}&overscan={}&known=1",
+            publisher.current_version(),
+            viewport.x,
+            viewport.y,
+            viewport.width,
+            viewport.height,
+            viewport.overscan,
+        );
+        let mut task = tokio::spawn(graph_viewport_items_diff_response_from_query(
+            state,
+            parse_query(&query),
+        ));
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut task).await.is_err(),
+            "a matching observed version must keep the viewport item diff pending"
+        );
+
+        publisher.mark_changed();
+        let response = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn viewport_diff_returns_immediate_patch_even_with_version_query() {
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+        let root = store.root_id();
+        store.fork("main", &root).unwrap();
+        let version = publisher.current_version();
+        let viewport = GraphViewportRequest::default();
+        let snapshot = build_graph_snapshot(&store, version).unwrap();
+        let rendered = layout_graph_viewport(&snapshot, viewport);
+        let query = known_viewport_query(version, viewport, &rendered);
+        let state = AppState { store, publisher };
+        let task = tokio::spawn(graph_viewport_diff_response(state, parse_query(&query)));
+
+        let response = timeout(Duration::from_millis(50), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_viewport_items_diff_get_without_version() {
+        let response = response_from(
+            b"GET /api/graph/viewport/items/diff?x=0&y=0&width=640&height=360&known_node=node:stale HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"kind\":\"node\""), "{response}");
+        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_graph_viewport_items_diff_post_without_version() {
+        let body = "x=0&y=0&width=640&height=360&known_node=node:stale";
+        let request = format!(
+            "POST /api/graph/viewport/items/diff HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = response_from(request.as_bytes()).await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"kind\":\"node\""), "{response}");
+        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+    }
+
+    #[test]
+    fn viewport_diff_detects_updated_edge_payload_changes() {
+        let edge = GraphViewportEdge {
+            key: "edge:primary_parent:root:child".to_owned(),
+            kind: GraphViewportEdgeKind::PrimaryParent,
+            source_id: "root".to_owned(),
+            target_id: "child".to_owned(),
+            source: Point { x: 0, y: 0 },
+            target: Point { x: 100, y: 100 },
+            route_slot: 0,
+            target_port_offset: 0.0,
+        };
+        let response = GraphViewportDiffResponse {
+            version: 1,
+            canvas: GraphCanvas {
+                width: 100,
+                height: 100,
+            },
+            previous_viewport: crate::api::GraphViewport {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                overscan: 0,
+            },
+            viewport: crate::api::GraphViewport {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                overscan: 0,
+            },
+            added: GraphViewportItems::default(),
+            updated: GraphViewportItems {
+                lanes: Vec::new(),
+                nodes: Vec::new(),
+                edges: vec![edge.clone()],
+            },
+            removed: Vec::<GraphViewportRemovedItem>::new(),
+        };
+        let mut edge_fingerprints = BTreeMap::new();
+        edge_fingerprints.insert(edge.key.clone(), "stale".to_owned());
+        let known = GraphViewportKnownItems {
+            edge_fingerprints,
+            ..GraphViewportKnownItems::default()
+        };
+
+        assert!(viewport_diff_has_changes(&response, Some(&known)));
+    }
+
+    #[tokio::test]
+    async fn versioned_fragment_waits_for_newer_version() {
+        let publisher = ConsolePublisher::new();
+        let handle =
+            start_console_server(test_config(), MemoryStore::new(), publisher.clone()).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        stream
+            .write_all(b"GET /fragment?version=0 HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = vec![0; 256];
+
+        assert!(
+            timeout(Duration::from_millis(50), stream.read(&mut response))
+                .await
+                .is_err(),
+            "a matching observed version must keep the fragment request pending"
+        );
+
+        publisher.mark_changed();
+        let read = timeout(Duration::from_secs(1), stream.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..read]);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         handle.shutdown().await.unwrap();
     }
 

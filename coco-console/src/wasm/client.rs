@@ -1,20 +1,27 @@
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::rc::Rc;
+use std::str::{FromStr, Split};
 
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{Document, Element, MouseEvent, RequestInit, Response, WheelEvent, Window};
+use web_sys::{
+    AbortController, AbortSignal, Document, Element, MouseEvent, RequestInit, Response, WheelEvent,
+    Window,
+};
 
+use super::refresh::{
+    PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
+    pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
+};
 use crate::api::{
     GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
-    GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, GraphViewportResponse, Point,
+    GraphViewportEdgeKind, GraphViewportItems, GraphViewportLane, GraphViewportNode,
+    GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
-use crate::viewport::{
-    MIN_OVERSCAN, ViewportState, needs_full_viewport_fetch, needs_full_viewport_jump_fetch,
-    rounded_i32, same_viewport,
-};
+use crate::viewport::{MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport};
 
 const ROOT_ID: &str = "console-root";
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
@@ -32,6 +39,45 @@ struct ViewportMapContentBounds {
     y: f64,
     width: f64,
     height: f64,
+}
+
+struct GraphItemsRefreshInput {
+    window: Window,
+    viewport: ViewportState,
+    query: String,
+}
+
+type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>;
+
+struct GraphRootElements {
+    graph_wrap: Element,
+    graph_svg: Element,
+    graph_bg: Element,
+}
+
+struct GraphLayerElements {
+    lane_group: Element,
+    edge_group: Element,
+    node_group: Element,
+}
+
+struct ViewportMapElements {
+    viewport_map: Element,
+    viewport_map_bg: Element,
+    viewport_map_window: Element,
+}
+
+struct VirtualGraphElements {
+    root: GraphRootElements,
+    layers: GraphLayerElements,
+    viewport_map: ViewportMapElements,
+    status: Option<Element>,
+}
+
+struct ViewportPatchInput {
+    window: Window,
+    current: ViewportState,
+    fetch: ViewportFetch,
 }
 
 #[wasm_bindgen(start)]
@@ -53,7 +99,8 @@ async fn run() -> Result<(), JsValue> {
     if has_selected_node {
         refresh_selected_node_detail_from_graph(graph.clone()).await?;
     }
-    spawn_local(refresh_on_graph_version(graph));
+    spawn_local(refresh_graph_items_on_version(graph.clone()));
+    spawn_local(refresh_server_rendered_sections_on_version(graph));
 
     Ok(())
 }
@@ -87,61 +134,55 @@ impl From<GraphViewport> for ViewportState {
 }
 
 struct RenderedKeys {
-    lanes: BTreeSet<String>,
-    nodes: BTreeSet<String>,
-    edges: BTreeSet<String>,
+    lanes: BTreeMap<String, String>,
+    nodes: BTreeMap<String, String>,
+    edges: BTreeMap<String, String>,
 }
 
 impl RenderedKeys {
     fn new() -> Self {
         Self {
-            lanes: BTreeSet::new(),
-            nodes: BTreeSet::new(),
-            edges: BTreeSet::new(),
+            lanes: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
         }
     }
 
     fn known_query(&self) -> String {
         self.lanes
             .iter()
-            .map(|key| format!("known_lane={}", percent_encode(key)))
-            .chain(
-                self.nodes
-                    .iter()
-                    .map(|key| format!("known_node={}", percent_encode(key))),
-            )
-            .chain(
-                self.edges
-                    .iter()
-                    .map(|key| format!("known_edge={}", percent_encode(key))),
-            )
+            .flat_map(|(key, fingerprint)| {
+                [
+                    format!("known_lane={}", percent_encode(key)),
+                    format!(
+                        "known_lane_fingerprint={}:{}",
+                        percent_encode(key),
+                        fingerprint
+                    ),
+                ]
+            })
+            .chain(self.nodes.iter().flat_map(|(key, fingerprint)| {
+                [
+                    format!("known_node={}", percent_encode(key)),
+                    format!(
+                        "known_node_fingerprint={}:{}",
+                        percent_encode(key),
+                        fingerprint
+                    ),
+                ]
+            }))
+            .chain(self.edges.iter().flat_map(|(key, fingerprint)| {
+                [
+                    format!("known_edge={}", percent_encode(key)),
+                    format!(
+                        "known_edge_fingerprint={}:{}",
+                        percent_encode(key),
+                        fingerprint
+                    ),
+                ]
+            }))
             .collect::<Vec<_>>()
             .join("&")
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingViewportUpdate {
-    None,
-    Patch,
-    FullFetch,
-}
-
-impl PendingViewportUpdate {
-    fn merge(self, update: Self) -> Self {
-        match (self, update) {
-            (Self::FullFetch, _) | (_, Self::FullFetch) => Self::FullFetch,
-            (Self::Patch, _) | (_, Self::Patch) => Self::Patch,
-            (Self::None, Self::None) => Self::None,
-        }
-    }
-
-    fn needs_full_fetch(self) -> bool {
-        self == Self::FullFetch
-    }
-
-    fn is_pending(self) -> bool {
-        self != Self::None
     }
 }
 
@@ -162,54 +203,44 @@ struct VirtualGraph {
     zoom: f64,
     canvas: Option<GraphCanvas>,
     version: u64,
+    shell_version: u64,
     rendered: RenderedKeys,
     rendered_viewport: ViewportState,
     patch_in_flight: bool,
     pending_viewport_update: PendingViewportUpdate,
+    version_refresh_abort: Option<AbortController>,
 }
 
 impl VirtualGraph {
     fn new(window: Window, document: Document) -> Result<Self, JsValue> {
-        let graph_wrap = query_required(&document, ".graph-wrap")?;
-        let graph_svg = query_required(&document, ".graph")?;
-        let graph_bg = query_required(&document, ".graph-bg")?;
-        let lane_group = query_required(&document, ".graph-lanes")?;
-        let edge_group = query_required(&document, ".graph-edges")?;
-        let node_group = query_required(&document, ".graph-nodes")?;
-        let viewport_map = query_required(&document, ".viewport-map")?;
-        let viewport_map_bg = query_required(&document, ".viewport-map-bg")?;
-        let viewport_map_window = query_required(&document, ".viewport-map-window")?;
-        let status = document.query_selector(".graph-status")?;
-        let zoom = graph_wrap
-            .get_attribute("data-zoom")
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .clamp(MIN_ZOOM, MAX_ZOOM);
-        let viewport = ViewportState::load(&window)
-            .unwrap_or_else(|| viewport_from_element(&graph_wrap, 0.0, 0.0, zoom));
+        let elements = VirtualGraphElements::query(&document)?;
+        let zoom = initial_zoom(&elements.root.graph_wrap);
+        let viewport = initial_viewport(&window, &elements.root.graph_wrap, zoom);
         let version = current_version(&document).unwrap_or_default();
 
         Ok(Self {
             window,
             document,
-            graph_wrap,
-            graph_svg,
-            graph_bg,
-            lane_group,
-            edge_group,
-            node_group,
-            viewport_map,
-            viewport_map_bg,
-            viewport_map_window,
-            status,
+            graph_wrap: elements.root.graph_wrap,
+            graph_svg: elements.root.graph_svg,
+            graph_bg: elements.root.graph_bg,
+            lane_group: elements.layers.lane_group,
+            edge_group: elements.layers.edge_group,
+            node_group: elements.layers.node_group,
+            viewport_map: elements.viewport_map.viewport_map,
+            viewport_map_bg: elements.viewport_map.viewport_map_bg,
+            viewport_map_window: elements.viewport_map.viewport_map_window,
+            status: elements.status,
             viewport,
             zoom,
             canvas: None,
             version,
+            shell_version: version,
             rendered: RenderedKeys::new(),
             rendered_viewport: viewport,
             patch_in_flight: false,
             pending_viewport_update: PendingViewportUpdate::None,
+            version_refresh_abort: None,
         })
     }
 
@@ -260,67 +291,64 @@ impl VirtualGraph {
     }
 
     fn apply_full(&mut self, response: GraphViewportResponse) -> Result<(), JsValue> {
-        let desired_viewport = self.viewport;
-        let response_viewport = ViewportState::from(response.viewport);
+        let GraphViewportResponse {
+            version,
+            canvas,
+            viewport,
+            lanes,
+            nodes,
+            edges,
+        } = response;
         clear_children(&self.lane_group);
         clear_children(&self.edge_group);
         clear_children(&self.node_group);
         self.rendered = RenderedKeys::new();
-        self.version = response.version;
-        self.canvas = Some(response.canvas);
-        if same_viewport(desired_viewport, response_viewport) {
-            self.set_viewport(response.viewport);
-        }
-        self.rendered_viewport = response_viewport;
-        self.set_root_version();
-        self.apply_canvas()?;
-        for lane in response.lanes {
-            self.upsert_lane(lane)?;
-        }
-        for edge in response.edges {
-            self.upsert_edge(edge)?;
-        }
-        for node in response.nodes {
-            self.upsert_node(node, false)?;
-        }
+        self.apply_response_viewport(version, canvas, viewport)?;
+        self.upsert_graph_items(
+            GraphViewportItems {
+                lanes,
+                nodes,
+                edges,
+            },
+            false,
+        )?;
         self.hide_status();
         Ok(())
     }
 
     fn apply_diff(&mut self, response: GraphViewportDiffResponse) -> Result<(), JsValue> {
-        let desired_viewport = self.viewport;
-        let response_viewport = ViewportState::from(response.viewport);
-        self.version = response.version;
-        self.canvas = Some(response.canvas);
-        self.rendered_viewport = response_viewport;
-        if same_viewport(desired_viewport, response_viewport) {
-            self.set_viewport(response.viewport);
-        }
-        self.set_root_version();
-        self.apply_canvas()?;
-        for item in response.removed {
-            self.remove_key(&item.key);
-        }
-        for lane in response.added.lanes {
-            self.upsert_lane(lane)?;
-        }
-        for edge in response.added.edges {
-            self.upsert_edge(edge)?;
-        }
-        for node in response.added.nodes {
-            self.upsert_node(node, true)?;
-        }
-        for lane in response.updated.lanes {
-            self.upsert_lane(lane)?;
-        }
-        for edge in response.updated.edges {
-            self.upsert_edge(edge)?;
-        }
-        for node in response.updated.nodes {
-            self.upsert_node(node, false)?;
-        }
+        let GraphViewportDiffResponse {
+            version,
+            canvas,
+            viewport,
+            added,
+            updated,
+            removed,
+            ..
+        } = response;
+        self.apply_response_viewport(version, canvas, viewport)?;
+        self.remove_graph_items(removed);
+        self.upsert_diff_items(added, updated)?;
         self.hide_status();
         Ok(())
+    }
+
+    fn apply_response_viewport(
+        &mut self,
+        version: u64,
+        canvas: GraphCanvas,
+        viewport: GraphViewport,
+    ) -> Result<(), JsValue> {
+        let desired_viewport = self.viewport;
+        let response_viewport = ViewportState::from(viewport);
+        self.version = version;
+        self.canvas = Some(canvas);
+        if same_viewport(desired_viewport, response_viewport) {
+            self.set_viewport(viewport);
+        }
+        self.rendered_viewport = response_viewport;
+        self.set_root_version();
+        self.apply_canvas()
     }
 
     fn apply_canvas(&self) -> Result<(), JsValue> {
@@ -334,112 +362,285 @@ impl VirtualGraph {
         apply_viewport_map_window(&self.viewport_map_window, self.viewport)
     }
 
+    fn upsert_graph_items(
+        &mut self,
+        items: GraphViewportItems,
+        nodes_are_new: bool,
+    ) -> Result<(), JsValue> {
+        let GraphViewportItems {
+            lanes,
+            nodes,
+            edges,
+        } = items;
+        self.upsert_lanes(lanes)?;
+        self.upsert_edges(edges)?;
+        self.upsert_nodes(nodes, nodes_are_new)
+    }
+
+    fn upsert_lanes(&mut self, lanes: Vec<GraphViewportLane>) -> Result<(), JsValue> {
+        for lane in lanes {
+            self.upsert_lane(lane)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_edges(&mut self, edges: Vec<GraphViewportEdge>) -> Result<(), JsValue> {
+        for edge in edges {
+            self.upsert_edge(edge)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_nodes(
+        &mut self,
+        nodes: Vec<GraphViewportNode>,
+        nodes_are_new: bool,
+    ) -> Result<(), JsValue> {
+        for node in nodes {
+            self.upsert_node(node, nodes_are_new)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_diff_items(
+        &mut self,
+        added: GraphViewportItems,
+        updated: GraphViewportItems,
+    ) -> Result<(), JsValue> {
+        self.upsert_graph_items(added, true)?;
+        self.upsert_graph_items(updated, false)
+    }
+
+    fn remove_graph_items(&mut self, items: Vec<GraphViewportRemovedItem>) {
+        for item in items {
+            self.remove_key(&item.key);
+        }
+    }
+
     fn upsert_lane(&mut self, lane: GraphViewportLane) -> Result<(), JsValue> {
         self.remove_key(&lane.key);
         let element = svg_element(&self.document, "text")?;
-        element.set_attribute("id", &render_element_id(&lane.key))?;
-        element.set_attribute("data-render-key", &lane.key)?;
-        element.set_attribute("class", "lane-label")?;
-        element.set_attribute("x", "64")?;
-        element.set_attribute("y", &lane.y.to_string())?;
+        set_attributes(
+            &element,
+            [
+                ("id", render_element_id(&lane.key)),
+                ("data-render-key", lane.key.clone()),
+                ("class", "lane-label".to_owned()),
+                ("x", "64".to_owned()),
+                ("y", lane.y.to_string()),
+            ],
+        )?;
         element.set_text_content(Some(&lane.label));
         self.lane_group.append_child(&element)?;
-        self.rendered.lanes.insert(lane.key);
+        self.rendered
+            .lanes
+            .insert(lane.key.clone(), lane.fingerprint());
         Ok(())
     }
 
     fn upsert_edge(&mut self, edge: GraphViewportEdge) -> Result<(), JsValue> {
         self.remove_key(&edge.key);
-        let element = match edge.kind {
-            GraphViewportEdgeKind::PrimaryParent => self.primary_edge_element(&edge)?,
-            GraphViewportEdgeKind::Fork | GraphViewportEdgeKind::MergeParent => {
-                self.routed_edge_element(&edge)?
-            }
-        };
-        element.set_attribute("id", &render_element_id(&edge.key))?;
-        element.set_attribute("data-render-key", &edge.key)?;
+        let element = self.edge_element(&edge)?;
+        set_attributes(
+            &element,
+            [
+                ("id", render_element_id(&edge.key)),
+                ("data-render-key", edge.key.clone()),
+            ],
+        )?;
         self.edge_group.append_child(&element)?;
-        self.rendered.edges.insert(edge.key);
+        self.rendered
+            .edges
+            .insert(edge.key.clone(), edge.fingerprint());
         Ok(())
+    }
+
+    fn edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
+        match edge.kind {
+            GraphViewportEdgeKind::PrimaryParent => self.primary_edge_element(edge),
+            GraphViewportEdgeKind::Fork | GraphViewportEdgeKind::MergeParent => {
+                self.routed_edge_element(edge)
+            }
+        }
     }
 
     fn primary_edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
         let element = svg_element(&self.document, "line")?;
         let (x1, y1, x2, y2) = line_points(edge.source, edge.target, edge.target_port_offset);
-        element.set_attribute("class", "edge primary-parent")?;
-        element.set_attribute("marker-end", "url(#arrowhead)")?;
-        element.set_attribute("x1", &x1)?;
-        element.set_attribute("y1", &y1)?;
-        element.set_attribute("x2", &x2)?;
-        element.set_attribute("y2", &y2)?;
+        set_attributes(
+            &element,
+            [
+                ("class", "edge primary-parent".to_string()),
+                ("marker-end", "url(#arrowhead)".to_string()),
+                ("x1", x1),
+                ("y1", y1),
+                ("x2", x2),
+                ("y2", y2),
+            ],
+        )?;
         Ok(element)
     }
 
     fn routed_edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
         let element = svg_element(&self.document, "polyline")?;
-        let (class, marker) = match edge.kind {
-            GraphViewportEdgeKind::Fork => ("edge fork", "url(#fork-arrowhead)"),
-            GraphViewportEdgeKind::MergeParent => ("edge merge-parent", "url(#merge-arrowhead)"),
-            GraphViewportEdgeKind::PrimaryParent => unreachable!("primary edges use line elements"),
-        };
-        element.set_attribute("class", class)?;
-        element.set_attribute("marker-end", marker)?;
-        element.set_attribute(
-            "points",
-            &routed_elbow_points(
-                edge.source,
-                edge.target,
-                edge.route_slot,
-                edge.target_port_offset,
-            ),
+        let (class, marker) = routed_edge_style(edge.kind);
+        set_attributes(
+            &element,
+            [
+                ("class", class.to_string()),
+                ("marker-end", marker.to_string()),
+                (
+                    "points",
+                    routed_elbow_points(
+                        edge.source,
+                        edge.target,
+                        edge.route_slot,
+                        edge.target_port_offset,
+                    ),
+                ),
+            ],
         )?;
         Ok(element)
     }
 
     fn upsert_node(&mut self, node: GraphViewportNode, is_new: bool) -> Result<(), JsValue> {
         self.remove_key(&node.key);
+        let fingerprint = node.fingerprint();
+        let link = self.node_link_element(&node, is_new)?;
+        self.append_node(&node.key, &link, fingerprint)
+    }
+
+    fn node_link_element(
+        &self,
+        node: &GraphViewportNode,
+        is_new: bool,
+    ) -> Result<Element, JsValue> {
+        let link = self.empty_node_link_element(node, is_new)?;
+        self.append_node_group_to_link(&link, node)?;
+        Ok(link)
+    }
+
+    fn empty_node_link_element(
+        &self,
+        node: &GraphViewportNode,
+        is_new: bool,
+    ) -> Result<Element, JsValue> {
         let link = svg_element(&self.document, "a")?;
-        let class = if is_new {
-            "node-link node-new"
-        } else {
-            "node-link"
-        };
-        link.set_attribute("id", &render_element_id(&node.key))?;
-        link.set_attribute("data-render-key", &node.key)?;
-        link.set_attribute("class", class)?;
-        link.set_attribute("href", &format!("#{}", node.node_target))?;
-        link.set_attribute("data-node-target", &node.node_target)?;
-        link.set_attribute("data-node-id", &node.id)?;
+        set_node_link_attributes(&link, node, is_new)?;
+        Ok(link)
+    }
 
-        let group = svg_element(&self.document, "g")?;
-        let mut group_class = format!("node {}", css_token(&node.kind));
-        if !node.labels.is_empty() {
-            group_class.push_str(" active");
-        }
-        group.set_attribute("class", &group_class)?;
-        group.set_attribute("transform", &format!("translate({} {})", node.x, node.y))?;
-
-        let title = svg_element(&self.document, "title")?;
-        title.set_text_content(Some(&format!("{}: {}", node.short_id, node.summary)));
-        let core = svg_element(&self.document, "circle")?;
-        core.set_attribute("class", "core")?;
-        core.set_attribute("r", "26")?;
-        let label = svg_element(&self.document, "text")?;
-        label.set_attribute("class", "node-label")?;
-        label.set_attribute("y", "44")?;
-        label.set_text_content(Some(&node_label(&node)));
-        let kind = svg_element(&self.document, "text")?;
-        kind.set_attribute("class", "node-kind")?;
-        kind.set_attribute("y", "58")?;
-        kind.set_text_content(Some(&node.kind));
-
-        group.append_child(&title)?;
-        group.append_child(&core)?;
-        group.append_child(&label)?;
-        group.append_child(&kind)?;
+    fn append_node_group_to_link(
+        &self,
+        link: &Element,
+        node: &GraphViewportNode,
+    ) -> Result<(), JsValue> {
+        let group = self.node_group_element(node)?;
         link.append_child(&group)?;
-        self.node_group.append_child(&link)?;
-        self.rendered.nodes.insert(node.key);
+        Ok(())
+    }
+
+    fn node_group_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        let group = self.empty_node_group_element(node)?;
+        self.append_node_group_content(&group, node)?;
+        Ok(group)
+    }
+
+    fn empty_node_group_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        let group = svg_element(&self.document, "g")?;
+        set_node_group_attributes(&group, node)?;
+        Ok(group)
+    }
+
+    fn append_node_group_content(
+        &self,
+        group: &Element,
+        node: &GraphViewportNode,
+    ) -> Result<(), JsValue> {
+        self.append_node_identity_content(group, node)?;
+        self.append_node_text_content(group, node)
+    }
+
+    fn append_node_identity_content(
+        &self,
+        group: &Element,
+        node: &GraphViewportNode,
+    ) -> Result<(), JsValue> {
+        self.append_node_title(group, node)?;
+        self.append_node_core(group)
+    }
+
+    fn append_node_text_content(
+        &self,
+        group: &Element,
+        node: &GraphViewportNode,
+    ) -> Result<(), JsValue> {
+        self.append_node_label(group, node)?;
+        self.append_node_kind(group, node)
+    }
+
+    fn append_node_title(&self, group: &Element, node: &GraphViewportNode) -> Result<(), JsValue> {
+        let title = self.node_title_element(node)?;
+        group.append_child(&title)?;
+        Ok(())
+    }
+
+    fn node_title_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        let title = svg_element(&self.document, "title")?;
+        title.set_text_content(Some(&node_title_text(node)));
+        Ok(title)
+    }
+
+    fn append_node_core(&self, group: &Element) -> Result<(), JsValue> {
+        let core = self.node_core_element()?;
+        group.append_child(&core)?;
+        Ok(())
+    }
+
+    fn node_core_element(&self) -> Result<Element, JsValue> {
+        let core = svg_element(&self.document, "circle")?;
+        set_attributes(
+            &core,
+            [("class", "core".to_owned()), ("r", NODE_RADIUS.to_string())],
+        )?;
+        Ok(core)
+    }
+
+    fn append_node_label(&self, group: &Element, node: &GraphViewportNode) -> Result<(), JsValue> {
+        let label = self.node_label_element(node)?;
+        group.append_child(&label)?;
+        Ok(())
+    }
+
+    fn node_label_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        self.node_text_element("node-label", "44", node_label(node))
+    }
+
+    fn append_node_kind(&self, group: &Element, node: &GraphViewportNode) -> Result<(), JsValue> {
+        let kind = self.node_kind_element(node)?;
+        group.append_child(&kind)?;
+        Ok(())
+    }
+
+    fn node_kind_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        self.node_text_element("node-kind", "58", node.kind.clone())
+    }
+
+    fn node_text_element(&self, class: &str, y: &str, text: String) -> Result<Element, JsValue> {
+        let element = svg_element(&self.document, "text")?;
+        set_attributes(&element, [("class", class.to_owned()), ("y", y.to_owned())])?;
+        element.set_text_content(Some(&text));
+        Ok(element)
+    }
+
+    fn append_node(
+        &mut self,
+        key: &str,
+        link: &Element,
+        fingerprint: String,
+    ) -> Result<(), JsValue> {
+        self.node_group.append_child(link)?;
+        self.rendered.nodes.insert(key.to_owned(), fingerprint);
         Ok(())
     }
 
@@ -473,23 +674,107 @@ impl VirtualGraph {
     }
 
     fn viewport_update_active(&self) -> bool {
-        self.patch_in_flight || self.pending_viewport_update.is_pending()
+        viewport_update_active(self.patch_in_flight, self.pending_viewport_update)
     }
+
+    fn abort_version_refresh(&mut self) {
+        if let Some(controller) = self.version_refresh_abort.take() {
+            controller.abort();
+        }
+    }
+}
+
+impl VirtualGraphElements {
+    fn query(document: &Document) -> Result<Self, JsValue> {
+        Ok(Self {
+            root: query_graph_root_elements(document)?,
+            layers: query_graph_layer_elements(document)?,
+            viewport_map: query_viewport_map_elements(document)?,
+            status: query_optional(document, ".graph-status"),
+        })
+    }
+}
+
+fn query_optional(document: &Document, selector: &str) -> Option<Element> {
+    document.query_selector(selector).ok().flatten()
+}
+
+fn query_graph_root_elements(document: &Document) -> Result<GraphRootElements, JsValue> {
+    Ok(GraphRootElements {
+        graph_wrap: query_required(document, ".graph-wrap")?,
+        graph_svg: query_required(document, ".graph")?,
+        graph_bg: query_required(document, ".graph-bg")?,
+    })
+}
+
+fn query_graph_layer_elements(document: &Document) -> Result<GraphLayerElements, JsValue> {
+    Ok(GraphLayerElements {
+        lane_group: query_required(document, ".graph-lanes")?,
+        edge_group: query_required(document, ".graph-edges")?,
+        node_group: query_required(document, ".graph-nodes")?,
+    })
+}
+
+fn query_viewport_map_elements(document: &Document) -> Result<ViewportMapElements, JsValue> {
+    Ok(ViewportMapElements {
+        viewport_map: query_required(document, ".viewport-map")?,
+        viewport_map_bg: query_required(document, ".viewport-map-bg")?,
+        viewport_map_window: query_required(document, ".viewport-map-window")?,
+    })
+}
+
+fn initial_zoom(graph_wrap: &Element) -> f64 {
+    graph_wrap
+        .get_attribute("data-zoom")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn initial_viewport(window: &Window, graph_wrap: &Element, zoom: f64) -> ViewportState {
+    ViewportState::load(window).unwrap_or_else(|| viewport_from_element(graph_wrap, 0.0, 0.0, zoom))
 }
 
 impl ViewportState {
     fn load(window: &Window) -> Option<Self> {
-        let storage = session_storage(window)?;
-        let value = storage.get_item(VIEWPORT_KEY).ok().flatten()?;
-        let mut parts = value.split(',');
-        Some(Self {
-            x: parts.next()?.parse::<f64>().ok()?,
-            y: parts.next()?.parse::<f64>().ok()?,
-            width: parts.next()?.parse::<f64>().ok()?,
-            height: parts.next()?.parse::<f64>().ok()?,
-            overscan: parts.next()?.parse::<i32>().ok()?,
-        })
+        let value = stored_viewport_value(window)?;
+        parse_stored_viewport(&value)
     }
+}
+
+fn stored_viewport_value(window: &Window) -> Option<String> {
+    session_storage(window)?
+        .get_item(VIEWPORT_KEY)
+        .ok()
+        .flatten()
+}
+
+fn parse_stored_viewport(value: &str) -> Option<ViewportState> {
+    let mut parts = value.split(',');
+    let (x, y) = parse_next_viewport_pair(&mut parts)?;
+    let (width, height) = parse_next_viewport_pair(&mut parts)?;
+    let overscan = parse_next_viewport_value(&mut parts)?;
+    Some(ViewportState {
+        x,
+        y,
+        width,
+        height,
+        overscan,
+    })
+}
+
+fn parse_next_viewport_pair(parts: &mut Split<'_, char>) -> Option<(f64, f64)> {
+    Some((
+        parse_next_viewport_value(parts)?,
+        parse_next_viewport_value(parts)?,
+    ))
+}
+
+fn parse_next_viewport_value<T>(parts: &mut Split<'_, char>) -> Option<T>
+where
+    T: FromStr,
+{
+    parts.next()?.parse().ok()
 }
 
 async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
@@ -501,48 +786,19 @@ async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
     let response =
         fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
             .await?;
-    let (document, refresh_shell, patch_needed) = {
+    let patch_needed = {
         let mut graph = graph.borrow_mut();
-        let refresh_shell = response.version != graph.version;
-        let document = graph.document.clone();
         graph.apply_full(response)?;
-        let patch_needed = !same_viewport(graph.rendered_viewport, graph.viewport);
-        (document, refresh_shell, patch_needed)
+        !same_viewport(graph.rendered_viewport, graph.viewport)
     };
-    finish_full_viewport_render(graph, &window, &document, refresh_shell, patch_needed).await
-}
-
-async fn finish_full_viewport_render(
-    graph: Rc<RefCell<VirtualGraph>>,
-    window: &Window,
-    document: &Document,
-    refresh_shell: bool,
-    patch_needed: bool,
-) -> Result<(), JsValue> {
-    refresh_render_shell_if_needed(window, document, refresh_shell).await?;
-    request_viewport_patch_if_needed(graph, patch_needed);
+    if patch_needed {
+        request_viewport_patch(graph);
+    }
     Ok(())
 }
 
 fn request_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) {
     request_viewport_update(graph, PendingViewportUpdate::Patch);
-}
-
-fn request_viewport_patch_if_needed(graph: Rc<RefCell<VirtualGraph>>, patch_needed: bool) {
-    if patch_needed {
-        request_viewport_patch(graph);
-    }
-}
-
-async fn refresh_render_shell_if_needed(
-    window: &Window,
-    document: &Document,
-    refresh_shell: bool,
-) -> Result<(), JsValue> {
-    if refresh_shell {
-        refresh_server_rendered_sections(window, document).await?;
-    }
-    Ok(())
 }
 
 fn request_viewport_update(graph: Rc<RefCell<VirtualGraph>>, update: PendingViewportUpdate) {
@@ -568,19 +824,24 @@ where
 {
     let pending_update = {
         let mut graph = graph.borrow_mut();
+        graph.abort_version_refresh();
         let previous = graph.viewport;
         update(&mut graph);
         graph.clamp_viewport();
-        let pending_update = if needs_full_viewport_jump_fetch(previous, graph.viewport) {
-            PendingViewportUpdate::FullFetch
-        } else {
-            PendingViewportUpdate::Patch
-        };
+        let pending_update = pending_update_for_viewport_change(previous, graph.viewport);
         let _ = graph.apply_canvas();
         graph.persist_viewport();
         pending_update
     };
     request_viewport_update(graph, pending_update);
+}
+
+fn routed_edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
+    match kind {
+        GraphViewportEdgeKind::Fork => ("edge fork", "url(#fork-arrowhead)"),
+        GraphViewportEdgeKind::MergeParent => ("edge merge-parent", "url(#merge-arrowhead)"),
+        GraphViewportEdgeKind::PrimaryParent => unreachable!("primary edges use line elements"),
+    }
 }
 
 fn apply_graph_viewport(
@@ -684,158 +945,290 @@ fn set_attributes<const N: usize>(
     Ok(())
 }
 
+fn set_node_link_attributes(
+    link: &Element,
+    node: &GraphViewportNode,
+    is_new: bool,
+) -> Result<(), JsValue> {
+    set_attributes(
+        link,
+        [
+            ("id", render_element_id(&node.key)),
+            ("data-render-key", node.key.clone()),
+            ("class", node_link_class(is_new).to_owned()),
+            ("href", format!("#{}", node.node_target)),
+            ("data-node-target", node.node_target.clone()),
+            ("data-node-id", node.id.clone()),
+        ],
+    )
+}
+
+fn node_link_class(is_new: bool) -> &'static str {
+    if is_new {
+        "node-link node-new"
+    } else {
+        "node-link"
+    }
+}
+
+fn set_node_group_attributes(group: &Element, node: &GraphViewportNode) -> Result<(), JsValue> {
+    set_attributes(
+        group,
+        [
+            ("class", node_group_class(node)),
+            ("transform", format!("translate({} {})", node.x, node.y)),
+        ],
+    )
+}
+
+fn node_group_class(node: &GraphViewportNode) -> String {
+    let mut class = format!("node {}", css_token(&node.kind));
+    if !node.labels.is_empty() {
+        class.push_str(" active");
+    }
+    class
+}
+
+fn node_title_text(node: &GraphViewportNode) -> String {
+    format!("{}: {}", node.short_id, node.summary)
+}
+
 async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
-    loop {
-        match render_next_viewport_patch(graph.clone()).await {
-            Ok(should_continue) if should_continue => {}
-            Ok(_) => break,
-            Err(error) => {
-                web_sys::console::error_1(&error);
-                graph.borrow_mut().patch_in_flight = false;
-                break;
-            }
+    while render_next_viewport_patch_or_stop(graph.clone()).await {}
+}
+
+async fn render_next_viewport_patch_or_stop(graph: Rc<RefCell<VirtualGraph>>) -> bool {
+    match render_next_viewport_patch(graph.clone()).await {
+        Ok(should_continue) => should_continue,
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            graph.borrow_mut().patch_in_flight = false;
+            false
         }
     }
 }
 
 async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
-    let (window, rendered, current, needs_full_fetch) = {
-        let mut graph = graph.borrow_mut();
-        let update = graph.pending_viewport_update;
-        graph.pending_viewport_update = PendingViewportUpdate::None;
-        let rendered = graph.rendered_viewport;
-        let current = graph.viewport;
-        (
-            graph.window.clone(),
-            rendered,
-            current,
-            update.needs_full_fetch() || needs_full_viewport_fetch(rendered, current),
-        )
-    };
-    if !needs_full_fetch && same_viewport(rendered, current) {
-        let mut graph = graph.borrow_mut();
-        if graph.pending_viewport_update.is_pending() {
-            return Ok(true);
-        }
-        graph.patch_in_flight = false;
-        return Ok(false);
+    let input = next_viewport_patch_input(graph.clone());
+    match input.fetch {
+        ViewportFetch::None => finish_idle_viewport_patch(graph),
+        ViewportFetch::Full => render_full_viewport_patch(graph, input).await,
+        ViewportFetch::Patch => render_diff_viewport_patch(graph, input).await,
     }
-
-    if needs_full_fetch {
-        let query = current.request_query();
-        graph.borrow().show_loading_status();
-        let response =
-            fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
-                .await?;
-        let (document, refresh_shell, should_continue) = {
-            let mut graph = graph.borrow_mut();
-            let refresh_shell = response.version != graph.version;
-            let document = graph.document.clone();
-            graph.apply_full(response)?;
-            let should_continue = graph.pending_viewport_update.is_pending()
-                || !same_viewport(graph.rendered_viewport, graph.viewport);
-            if !should_continue {
-                graph.patch_in_flight = false;
-            }
-            (document, refresh_shell, should_continue)
-        };
-        if refresh_shell {
-            refresh_server_rendered_sections(&window, &document).await?;
-        }
-        return Ok(should_continue);
-    }
-
-    let known_query = graph.borrow().rendered.known_query();
-    let mut query = format!("{}&known=1", current.request_query());
-    if !known_query.is_empty() {
-        query.push('&');
-        query.push_str(&known_query);
-    }
-    let response =
-        fetch_json_form::<GraphViewportDiffResponse>(&window, "/api/graph/viewport/diff", &query)
-            .await?;
-    let (document, refresh_shell, should_continue) = {
-        let mut graph = graph.borrow_mut();
-        let refresh_shell = response.version != graph.version;
-        let document = graph.document.clone();
-        graph.apply_diff(response)?;
-        let should_continue = graph.pending_viewport_update.is_pending()
-            || !same_viewport(graph.rendered_viewport, graph.viewport);
-        if !should_continue {
-            graph.patch_in_flight = false;
-        }
-        (document, refresh_shell, should_continue)
-    };
-    if refresh_shell {
-        refresh_server_rendered_sections(&window, &document).await?;
-    }
-    Ok(should_continue)
 }
 
-async fn refresh_on_graph_version(graph: Rc<RefCell<VirtualGraph>>) {
-    loop {
-        let (window, version, viewport, known_query, viewport_update_active) = {
-            let graph = graph.borrow();
-            (
-                graph.window.clone(),
-                graph.version,
-                graph.viewport,
-                graph.rendered.known_query(),
-                graph.viewport_update_active(),
-            )
-        };
-        if viewport_update_active {
-            if let Err(error) = delay_ms(&window, VERSION_REFRESH_RETRY_MS).await {
-                web_sys::console::error_1(&error);
-            }
-            continue;
-        }
-        let mut query = format!("version={version}&{}&known=1", viewport.request_query());
-        if !known_query.is_empty() {
-            query.push('&');
-            query.push_str(&known_query);
-        }
-        match fetch_json_form::<GraphViewportDiffResponse>(
-            &window,
-            "/api/graph/viewport/diff",
-            &query,
-        )
-        .await
-        {
-            Ok(response) => {
-                let refresh = {
-                    let mut graph = graph.borrow_mut();
-                    if !same_viewport(graph.viewport, viewport) {
-                        continue;
-                    }
-                    if graph.viewport_update_active() {
-                        None
-                    } else {
-                        let refresh_shell = response.version != graph.version;
-                        let window = graph.window.clone();
-                        let document = graph.document.clone();
-                        if let Err(error) = graph.apply_diff(response) {
-                            web_sys::console::error_1(&error);
-                        }
-                        Some((window, document, refresh_shell))
-                    }
-                };
-                let Some((window, document, refresh_shell)) = refresh else {
-                    let window = graph.borrow().window.clone();
-                    if let Err(error) = delay_ms(&window, VERSION_REFRESH_RETRY_MS).await {
-                        web_sys::console::error_1(&error);
-                    }
-                    continue;
-                };
-                if refresh_shell
-                    && let Err(error) = refresh_server_rendered_sections(&window, &document).await
-                {
-                    web_sys::console::error_1(&error);
-                }
-            }
-            Err(error) => web_sys::console::error_1(&error),
+fn next_viewport_patch_input(graph: Rc<RefCell<VirtualGraph>>) -> ViewportPatchInput {
+    let mut graph = graph.borrow_mut();
+    let update = graph.pending_viewport_update;
+    graph.pending_viewport_update = PendingViewportUpdate::None;
+    let rendered = graph.rendered_viewport;
+    let current = graph.viewport;
+    ViewportPatchInput {
+        window: graph.window.clone(),
+        current,
+        fetch: next_viewport_fetch(rendered, current, update),
+    }
+}
+
+fn finish_idle_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
+    let mut graph = graph.borrow_mut();
+    if graph.pending_viewport_update.is_pending() {
+        return Ok(true);
+    }
+    graph.patch_in_flight = false;
+    Ok(false)
+}
+
+async fn render_full_viewport_patch(
+    graph: Rc<RefCell<VirtualGraph>>,
+    input: ViewportPatchInput,
+) -> Result<bool, JsValue> {
+    graph.borrow().show_loading_status();
+    let query = input.current.request_query();
+    let response =
+        fetch_json::<GraphViewportResponse>(&input.window, &format!("/api/graph/viewport?{query}"))
+            .await?;
+    let mut graph = graph.borrow_mut();
+    graph.apply_full(response)?;
+    Ok(finish_applied_viewport_patch(&mut graph))
+}
+
+async fn render_diff_viewport_patch(
+    graph: Rc<RefCell<VirtualGraph>>,
+    input: ViewportPatchInput,
+) -> Result<bool, JsValue> {
+    let query = viewport_patch_diff_query(&graph.borrow(), input.current);
+    let response = fetch_json_form::<GraphViewportDiffResponse>(
+        &input.window,
+        "/api/graph/viewport/diff",
+        &query,
+    )
+    .await?;
+    let mut graph = graph.borrow_mut();
+    graph.apply_diff(response)?;
+    Ok(finish_applied_viewport_patch(&mut graph))
+}
+
+fn viewport_patch_diff_query(graph: &VirtualGraph, current: ViewportState) -> String {
+    let known_query = graph.rendered.known_query();
+    let mut query = format!("{}&known=1", current.request_query());
+    append_known_query(&mut query, &known_query);
+    query
+}
+
+fn finish_applied_viewport_patch(graph: &mut VirtualGraph) -> bool {
+    let should_continue = graph.pending_viewport_update.is_pending()
+        || !same_viewport(graph.rendered_viewport, graph.viewport);
+    if !should_continue {
+        graph.patch_in_flight = false;
+    }
+    should_continue
+}
+
+async fn refresh_graph_items_on_version(graph: Rc<RefCell<VirtualGraph>>) {
+    refresh_on_version(graph, refresh_graph_items_once).await;
+}
+
+async fn refresh_graph_items_once(graph: Rc<RefCell<VirtualGraph>>) {
+    let Some(input) = graph_items_refresh_input(graph.clone()) else {
+        delay_graph_items_retry(graph).await;
+        return;
+    };
+    let Some(controller) = begin_graph_items_refresh(graph.clone()) else {
+        return;
+    };
+    let response = fetch_graph_items_diff(&input, &controller).await;
+    clear_version_refresh(graph.clone());
+    handle_graph_items_response(graph, input.viewport, response).await;
+}
+
+fn graph_items_refresh_input(graph: Rc<RefCell<VirtualGraph>>) -> Option<GraphItemsRefreshInput> {
+    let graph = graph.borrow();
+    (!graph.viewport_update_active()).then(|| GraphItemsRefreshInput {
+        window: graph.window.clone(),
+        viewport: graph.viewport,
+        query: graph_items_refresh_query(
+            graph.version,
+            graph.viewport,
+            graph.canvas,
+            graph.rendered.known_query(),
+        ),
+    })
+}
+
+fn graph_items_refresh_query(
+    version: u64,
+    viewport: ViewportState,
+    canvas: Option<GraphCanvas>,
+    known_query: String,
+) -> String {
+    let mut query = format!("version={version}&{}&known=1", viewport.request_query());
+    append_canvas_query(&mut query, canvas);
+    append_known_query(&mut query, &known_query);
+    query
+}
+
+fn append_canvas_query(query: &mut String, canvas: Option<GraphCanvas>) {
+    if let Some(canvas) = canvas {
+        query.push_str(&format!(
+            "&canvas_width={}&canvas_height={}",
+            canvas.width, canvas.height
+        ));
+    }
+}
+
+fn append_known_query(query: &mut String, known_query: &str) {
+    if !known_query.is_empty() {
+        query.push('&');
+        query.push_str(known_query);
+    }
+}
+
+fn begin_graph_items_refresh(graph: Rc<RefCell<VirtualGraph>>) -> Option<AbortController> {
+    match begin_version_refresh(graph) {
+        Ok(controller) => controller,
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            None
         }
     }
+}
+
+async fn fetch_graph_items_diff(
+    input: &GraphItemsRefreshInput,
+    controller: &AbortController,
+) -> Result<GraphViewportDiffResponse, JsValue> {
+    fetch_json_form_with_signal::<GraphViewportDiffResponse>(
+        &input.window,
+        "/api/graph/viewport/items/diff",
+        &input.query,
+        &controller.signal(),
+    )
+    .await
+}
+
+async fn handle_graph_items_response(
+    graph: Rc<RefCell<VirtualGraph>>,
+    viewport: ViewportState,
+    response: Result<GraphViewportDiffResponse, JsValue>,
+) {
+    match response {
+        Ok(response) => handle_graph_items_success(graph, viewport, response).await,
+        Err(error) => handle_graph_items_error(graph, error),
+    }
+}
+
+async fn handle_graph_items_success(
+    graph: Rc<RefCell<VirtualGraph>>,
+    viewport: ViewportState,
+    response: GraphViewportDiffResponse,
+) {
+    match graph_items_refresh_action(graph.clone(), viewport) {
+        VersionRefresh::Drop => {}
+        VersionRefresh::Defer => delay_graph_items_retry(graph).await,
+        VersionRefresh::Apply => apply_graph_items_diff(graph, response),
+    }
+}
+
+fn graph_items_refresh_action(
+    graph: Rc<RefCell<VirtualGraph>>,
+    viewport: ViewportState,
+) -> VersionRefresh {
+    let graph = graph.borrow();
+    version_refresh_action(
+        viewport,
+        graph.viewport,
+        graph.patch_in_flight,
+        graph.pending_viewport_update,
+    )
+}
+
+fn apply_graph_items_diff(graph: Rc<RefCell<VirtualGraph>>, response: GraphViewportDiffResponse) {
+    if let Err(error) = graph.borrow_mut().apply_diff(response) {
+        web_sys::console::error_1(&error);
+    }
+}
+
+fn handle_graph_items_error(graph: Rc<RefCell<VirtualGraph>>, error: JsValue) {
+    if !graph.borrow().viewport_update_active() {
+        web_sys::console::error_1(&error);
+    }
+}
+
+fn begin_version_refresh(
+    graph: Rc<RefCell<VirtualGraph>>,
+) -> Result<Option<AbortController>, JsValue> {
+    let mut graph = graph.borrow_mut();
+    if graph.viewport_update_active() {
+        return Ok(None);
+    }
+    let controller = AbortController::new()?;
+    graph.version_refresh_abort = Some(controller.clone());
+    Ok(Some(controller))
+}
+
+fn clear_version_refresh(graph: Rc<RefCell<VirtualGraph>>) {
+    graph.borrow_mut().version_refresh_abort = None;
 }
 
 async fn delay_ms(window: &Window, delay_ms: i32) -> Result<(), JsValue> {
@@ -853,15 +1246,85 @@ async fn delay_ms(window: &Window, delay_ms: i32) -> Result<(), JsValue> {
     JsFuture::from(promise).await.map(|_| ())
 }
 
-async fn refresh_server_rendered_sections(
+async fn refresh_server_rendered_sections_on_version(graph: Rc<RefCell<VirtualGraph>>) {
+    refresh_on_version(graph, refresh_server_rendered_sections_once).await;
+}
+
+async fn refresh_on_version<F, Fut>(graph: Rc<RefCell<VirtualGraph>>, refresh_once: F)
+where
+    F: Fn(Rc<RefCell<VirtualGraph>>) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    loop {
+        refresh_once(graph.clone()).await;
+    }
+}
+
+async fn refresh_server_rendered_sections_once(graph: Rc<RefCell<VirtualGraph>>) {
+    let (window, document, url) = server_rendered_sections_request(&graph);
+    let response = refresh_server_rendered_sections_from_url(&window, &document, &url).await;
+    handle_server_rendered_sections_response(graph, &window, response).await;
+}
+
+fn server_rendered_sections_request(
+    graph: &Rc<RefCell<VirtualGraph>>,
+) -> (Window, Document, String) {
+    let graph = graph.borrow();
+    (
+        graph.window.clone(),
+        graph.document.clone(),
+        format!("/fragment?version={}", graph.shell_version),
+    )
+}
+
+async fn handle_server_rendered_sections_response(
+    graph: Rc<RefCell<VirtualGraph>>,
+    window: &Window,
+    response: Result<Option<u64>, JsValue>,
+) {
+    match response {
+        Ok(Some(version)) => graph.borrow_mut().shell_version = version,
+        Ok(None) => {}
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            delay_window_retry(window).await;
+        }
+    }
+}
+
+async fn delay_graph_items_retry(graph: Rc<RefCell<VirtualGraph>>) {
+    let window = graph.borrow().window.clone();
+    delay_window_retry(&window).await;
+}
+
+async fn delay_window_retry(window: &Window) {
+    if let Err(error) = delay_ms(window, VERSION_REFRESH_RETRY_MS).await {
+        web_sys::console::error_1(&error);
+    }
+}
+
+async fn refresh_server_rendered_sections_from_url(
     window: &Window,
     document: &Document,
-) -> Result<(), JsValue> {
-    let html = fetch_text(window, "/fragment").await?;
+    url: &str,
+) -> Result<Option<u64>, JsValue> {
+    let html = fetch_text(window, url).await?;
     let container = document.create_element("div")?;
     container.set_inner_html(&html);
+    let version = fragment_version(&container);
     refresh_server_fragment_sections(document, &container)?;
-    refresh_selected_node_detail_if_needed(window, document).await
+    refresh_selected_node_detail_if_needed(window, document).await?;
+    Ok(version)
+}
+
+fn fragment_version(container: &Element) -> Option<u64> {
+    container
+        .query_selector("#console-root")
+        .ok()
+        .flatten()?
+        .get_attribute("data-version")?
+        .parse()
+        .ok()
 }
 
 fn refresh_server_fragment_sections(
@@ -912,6 +1375,20 @@ fn refresh_inner_html(
 }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let installers: [GraphListenerInstaller; 5] = [
+        install_node_detail_listener,
+        install_wheel_listener,
+        install_resize_listener,
+        install_viewport_map_listener,
+        install_hashchange_node_detail_listener,
+    ];
+    for install in installers {
+        install(graph.clone())?;
+    }
+    Ok(())
+}
+
+fn install_wheel_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let graph_wrap = graph.borrow().graph_wrap.clone();
     let wheel_graph = graph.clone();
     let wheel_closure = Closure::<dyn FnMut(WheelEvent)>::new(move |event: WheelEvent| {
@@ -926,7 +1403,10 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     });
     graph_wrap.add_event_listener_with_callback("wheel", wheel_closure.as_ref().unchecked_ref())?;
     wheel_closure.forget();
+    Ok(())
+}
 
+fn install_resize_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let resize_graph = graph.clone();
     let resize_window = graph.borrow().window.clone();
     let resize_closure = Closure::<dyn FnMut()>::new(move || {
@@ -937,7 +1417,10 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     resize_window
         .add_event_listener_with_callback("resize", resize_closure.as_ref().unchecked_ref())?;
     resize_closure.forget();
+    Ok(())
+}
 
+fn install_viewport_map_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let viewport_map = graph.borrow().viewport_map.clone();
     let viewport_map_graph = graph.clone();
     let viewport_map_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
@@ -949,7 +1432,12 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     viewport_map
         .add_event_listener_with_callback("click", viewport_map_closure.as_ref().unchecked_ref())?;
     viewport_map_closure.forget();
+    Ok(())
+}
 
+fn install_hashchange_node_detail_listener(
+    graph: Rc<RefCell<VirtualGraph>>,
+) -> Result<(), JsValue> {
     let detail_graph = graph.clone();
     let detail_window = graph.borrow().window.clone();
     let detail_closure = Closure::<dyn FnMut()>::new(move || {
@@ -965,6 +1453,52 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     detail_closure.forget();
 
     Ok(())
+}
+
+fn install_node_detail_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let node_group = graph.borrow().node_group.clone();
+    let detail_graph = graph.clone();
+    let detail_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        let Some(link) = node_link_from_event(&event) else {
+            return;
+        };
+        let Some(target) = link.get_attribute("data-node-target") else {
+            return;
+        };
+
+        event.prevent_default();
+        event.stop_propagation();
+        select_node_detail(detail_graph.clone(), target);
+    });
+    node_group
+        .add_event_listener_with_callback("click", detail_closure.as_ref().unchecked_ref())?;
+    detail_closure.forget();
+    Ok(())
+}
+
+fn node_link_from_event(event: &MouseEvent) -> Option<Element> {
+    let target = event.target()?.dyn_into::<Element>().ok()?;
+    target.closest(".node-link").ok().flatten()
+}
+
+fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
+    let (window, document) = {
+        let graph = graph.borrow();
+        (graph.window.clone(), graph.document.clone())
+    };
+
+    if selected_node_target(&window).as_deref() != Some(target.as_str())
+        && let Err(error) = window.location().set_hash(&target)
+    {
+        web_sys::console::error_1(&error);
+        return;
+    }
+
+    spawn_local(async move {
+        if let Err(error) = refresh_selected_node_detail(&window, &document).await {
+            web_sys::console::error_1(&error);
+        }
+    });
 }
 
 async fn refresh_selected_node_detail_from_graph(
@@ -1112,7 +1646,20 @@ async fn fetch_json_form<T>(window: &Window, url: &str, body: &str) -> Result<T,
 where
     T: for<'de> Deserialize<'de>,
 {
-    let text = fetch_text_form(window, url, body).await?;
+    let text = fetch_text_form(window, url, body, None).await?;
+    serde_json::from_str(&text).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+async fn fetch_json_form_with_signal<T>(
+    window: &Window,
+    url: &str,
+    body: &str,
+    signal: &AbortSignal,
+) -> Result<T, JsValue>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let text = fetch_text_form(window, url, body, Some(signal)).await?;
     serde_json::from_str(&text).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
@@ -1123,10 +1670,18 @@ async fn fetch_text(window: &Window, url: &str) -> Result<String, JsValue> {
     response_text(response).await
 }
 
-async fn fetch_text_form(window: &Window, url: &str, body: &str) -> Result<String, JsValue> {
+async fn fetch_text_form(
+    window: &Window,
+    url: &str,
+    body: &str,
+    signal: Option<&AbortSignal>,
+) -> Result<String, JsValue> {
     let init = RequestInit::new();
     init.set_method("POST");
     init.set_body(&JsValue::from_str(body));
+    if let Some(signal) = signal {
+        init.set_signal(Some(signal));
+    }
     let response = JsFuture::from(window.fetch_with_str_and_init(url, &init))
         .await?
         .dyn_into::<Response>()?;

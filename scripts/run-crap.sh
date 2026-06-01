@@ -13,20 +13,7 @@ crap_args=(
   --exclude "build.rs"
   --threshold "${crap_threshold}"
 )
-crap_allow_args=(
-  --allow "VirtualGraph::upsert_node"
-  --allow "render_next_viewport_patch"
-  --allow "VirtualGraph::apply_diff"
-  --allow "ViewportState::load"
-  --allow "VirtualGraph::new"
-  --allow "VirtualGraph::apply_full"
-  --allow "refresh_on_graph_version"
-  --allow "VirtualGraph::upsert_lane"
-  --allow "VirtualGraph::upsert_edge"
-  --allow "VirtualGraph::primary_edge_element"
-  --allow "VirtualGraph::routed_edge_element"
-  --allow "drain_viewport_patches"
-)
+crap_allow_args=()
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   cargo-crap "${crap_args[@]}" "${crap_allow_args[@]}" --format github

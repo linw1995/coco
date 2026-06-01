@@ -5,6 +5,10 @@ inputs:
     description: "Cache key namespace. Defaults to the current GitHub job name."
     required: false
     default: ""
+  dev-shell:
+    description: "Flake dev shell to load through direnv."
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -35,6 +39,10 @@ runs:
     - name: Setup nix develop env
       shell: bash
       run: |
-        echo 'use flake' > .envrc
+        if [[ -n "${{ inputs.dev-shell }}" ]]; then
+          echo 'use flake .#${{ inputs.dev-shell }}' > .envrc
+        else
+          echo 'use flake' > .envrc
+        fi
 
     - uses: HatsuneMiku3939/direnv-action@v1
