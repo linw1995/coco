@@ -2117,11 +2117,18 @@ fn lane_display_for_y(lane_display: &BTreeMap<i32, LaneDisplay>, y: i32) -> Lane
 }
 
 fn collapsed_viewport_y(viewport_y: f64, lane_display: &BTreeMap<i32, LaneDisplay>) -> f64 {
-    let hidden_lanes_before_viewport = lane_display
+    let collapsed_offset = lane_display
         .iter()
-        .filter(|(lane_y, display)| f64::from(**lane_y) < viewport_y && !display.visible)
-        .count() as i32;
-    viewport_y - f64::from(hidden_lanes_before_viewport * GRAPH_LANE_HEIGHT)
+        .filter(|(_, display)| !display.visible)
+        .map(|(lane_y, _)| collapsed_lane_offset(viewport_y, *lane_y))
+        .sum::<f64>();
+    viewport_y - collapsed_offset
+}
+
+fn collapsed_lane_offset(viewport_y: f64, lane_y: i32) -> f64 {
+    let lane_height = f64::from(GRAPH_LANE_HEIGHT);
+    let lane_top = f64::from(lane_y) - lane_height / 2.0;
+    (viewport_y - lane_top).clamp(0.0, lane_height)
 }
 
 fn graph_edge_bounds(
@@ -3126,6 +3133,22 @@ mod tests {
 
         assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
         assert_node_display(&fixture.root, "node:c3", 230, false);
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 229, 1000, 300).into();
+            graph.sync_branch_visibility();
+        }
+
+        assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 231, 1000, 300).into();
+            graph.sync_branch_visibility();
+        }
+
+        assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
 
         {
             let mut graph = fixture.graph.borrow_mut();
