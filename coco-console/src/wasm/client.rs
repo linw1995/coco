@@ -2513,8 +2513,9 @@ mod tests {
         assert_eq!(
             graph
                 .time_scale
-                .query_selector(".time-scale-extents span:last-child")
-                .expect_throw("time scale extent should be queryable")
+                .query_selector_all(".time-scale-extents span")
+                .expect_throw("time scale extents should be queryable")
+                .item(1)
                 .expect_throw("time scale max extent should exist")
                 .text_content()
                 .expect_throw("time scale max extent should have text"),
@@ -2610,6 +2611,10 @@ mod tests {
                       <span class="time-scale-tick" data-position="0" data-graph-x="120" data-time-label="start"></span>
                       <span class="time-scale-tick" data-position="100" data-graph-x="340" data-time-label="end"></span>
                       <div class="time-scale-cursor"><span class="time-scale-label"></span></div>
+                    </div>
+                    <div class="time-scale-extents">
+                      <span>start</span>
+                      <span>end</span>
                     </div>
                   </nav>
                   <div class="graph-status" hidden></div>
