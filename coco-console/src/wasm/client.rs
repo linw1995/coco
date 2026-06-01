@@ -1427,11 +1427,7 @@ fn refresh_inner_html(
 }
 
 #[rustfmt::skip]
-fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
-    let branches = document.query_selector_all(".branch[data-lane-y]")?;
-    for index in 0..branches.length() { sync_branch_visibility_element(&branches.item(index).expect("query selector index should exist").unchecked_into::<Element>(), viewport)?; }
-    Ok(())
-}
+fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> { let branches = document.query_selector_all(".branch[data-lane-y]")?; for index in 0..branches.length() { sync_branch_visibility_element(&branches.item(index).expect("query selector index should exist").unchecked_into::<Element>(), viewport)?; } Ok(()) }
 
 #[rustfmt::skip]
 fn sync_branch_visibility_element(branch: &Element, viewport: ViewportState) -> Result<(), JsValue> {
@@ -1442,15 +1438,10 @@ fn sync_branch_visibility_element(branch: &Element, viewport: ViewportState) -> 
 fn branch_lane_y(branch: &Element) -> Option<f64> { branch.get_attribute("data-lane-y")?.parse().ok() }
 
 #[rustfmt::skip]
-fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> {
-    branch.class_list().toggle_with_force("branch-viewport-hidden", !visible)?;
-    set_branch_aria_hidden(branch, !visible)
-}
+fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> { branch.class_list().toggle_with_force("branch-viewport-hidden", !visible)?; set_branch_aria_hidden(branch, !visible) }
 
 #[rustfmt::skip]
-fn set_branch_aria_hidden(branch: &Element, hidden: bool) -> Result<(), JsValue> {
-    if hidden { branch.set_attribute("aria-hidden", "true") } else { branch.remove_attribute("aria-hidden") }
-}
+fn set_branch_aria_hidden(branch: &Element, hidden: bool) -> Result<(), JsValue> { if hidden { branch.set_attribute("aria-hidden", "true") } else { branch.remove_attribute("aria-hidden") } }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let installers: [GraphListenerInstaller; 5] = [
