@@ -31,6 +31,7 @@ const NODE_RADIUS: f64 = 26.0;
 const EDGE_NODE_EXIT: f64 = 42.0;
 const EDGE_TARGET_APPROACH: f64 = 48.0;
 const EDGE_ROUTE_STEP: f64 = 12.0;
+const GRAPH_LANE_HEIGHT: i32 = 140;
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
 const VERSION_REFRESH_RETRY_MS: i32 = 50;
@@ -46,6 +47,12 @@ struct GraphItemsRefreshInput {
     window: Window,
     viewport: ViewportState,
     query: String,
+}
+
+#[derive(Clone, Copy)]
+struct LaneDisplay {
+    y: i32,
+    visible: bool,
 }
 
 type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>;
@@ -484,6 +491,7 @@ impl VirtualGraph {
             [
                 ("id", render_element_id(&lane.key)),
                 ("data-render-key", lane.key.clone()),
+                ("data-lane-y", lane.y.to_string()),
                 ("class", "lane-label".to_owned()),
                 ("x", "64".to_owned()),
                 ("y", lane.y.to_string()),
@@ -509,6 +517,12 @@ impl VirtualGraph {
                 ("data-source-y", edge.source.y.to_string()),
                 ("data-target-x", edge.target.x.to_string()),
                 ("data-target-y", edge.target.y.to_string()),
+                ("data-edge-kind", edge_kind_data(edge.kind).to_owned()),
+                ("data-route-slot", edge.route_slot.to_string()),
+                (
+                    "data-target-port-offset",
+                    edge.target_port_offset.to_string(),
+                ),
             ],
         )?;
         self.edge_group.append_child(&element)?;
@@ -966,6 +980,14 @@ fn routed_edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str
         GraphViewportEdgeKind::Fork => ("edge fork", "url(#fork-arrowhead)"),
         GraphViewportEdgeKind::MergeParent => ("edge merge-parent", "url(#merge-arrowhead)"),
         GraphViewportEdgeKind::PrimaryParent => unreachable!("primary edges use line elements"),
+    }
+}
+
+fn edge_kind_data(kind: GraphViewportEdgeKind) -> &'static str {
+    match kind {
+        GraphViewportEdgeKind::PrimaryParent => "primary_parent",
+        GraphViewportEdgeKind::Fork => "fork",
+        GraphViewportEdgeKind::MergeParent => "merge_parent",
     }
 }
 
@@ -1529,15 +1551,259 @@ fn refresh_inner_html(
 
 fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
     let visible_lanes = visible_graph_item_lanes(document, viewport)?;
+    let lane_display = graph_lane_display_map(document, &visible_lanes)?;
+    sync_canvas_lane_visibility(document, viewport, &lane_display)?;
     let branches = document.query_selector_all(".branch[data-lane-y]")?;
     for index in 0..branches.length() {
         let branch = branches
             .item(index)
             .expect("query selector index should exist")
             .unchecked_into::<Element>();
-        sync_branch_visibility_element(&branch, &visible_lanes)?;
+        sync_branch_visibility_element(&branch, &lane_display)?;
     }
     Ok(())
+}
+
+fn graph_lane_display_map(
+    document: &Document,
+    visible_lanes: &BTreeSet<i32>,
+) -> Result<BTreeMap<i32, LaneDisplay>, JsValue> {
+    let mut lane_ys = graph_lane_ys(document)?;
+    if lane_ys.is_empty() {
+        lane_ys = visible_lanes.clone();
+    }
+    Ok(compact_lane_display_map(&lane_ys, visible_lanes))
+}
+
+fn graph_lane_ys(document: &Document) -> Result<BTreeSet<i32>, JsValue> {
+    let mut lane_ys = BTreeSet::new();
+    collect_lane_y_attributes(document, ".branch[data-lane-y]", &mut lane_ys)?;
+    collect_lane_y_attributes(document, ".lane-label[data-lane-y]", &mut lane_ys)?;
+    collect_item_lane_y_attributes(
+        document,
+        ".node-link[data-node-y]",
+        "data-node-y",
+        &mut lane_ys,
+    )?;
+    collect_item_lane_y_attributes(
+        document,
+        ".edge[data-source-y]",
+        "data-source-y",
+        &mut lane_ys,
+    )?;
+    collect_item_lane_y_attributes(
+        document,
+        ".edge[data-target-y]",
+        "data-target-y",
+        &mut lane_ys,
+    )?;
+    Ok(lane_ys)
+}
+
+fn collect_lane_y_attributes(
+    document: &Document,
+    selector: &str,
+    lane_ys: &mut BTreeSet<i32>,
+) -> Result<(), JsValue> {
+    collect_item_lane_y_attributes(document, selector, "data-lane-y", lane_ys)
+}
+
+fn collect_item_lane_y_attributes(
+    document: &Document,
+    selector: &str,
+    attribute: &str,
+    lane_ys: &mut BTreeSet<i32>,
+) -> Result<(), JsValue> {
+    let items = document.query_selector_all(selector)?;
+    for index in 0..items.length() {
+        let item = items
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        if let Some(y) = graph_item_i32(&item, attribute) {
+            lane_ys.insert(y);
+        }
+    }
+    Ok(())
+}
+
+fn compact_lane_display_map(
+    lane_ys: &BTreeSet<i32>,
+    visible_lanes: &BTreeSet<i32>,
+) -> BTreeMap<i32, LaneDisplay> {
+    let mut hidden_before = 0;
+    lane_ys
+        .iter()
+        .map(|lane_y| {
+            let visible = visible_lanes.contains(lane_y);
+            let display = LaneDisplay {
+                y: *lane_y - hidden_before * GRAPH_LANE_HEIGHT,
+                visible,
+            };
+            if !visible {
+                hidden_before += 1;
+            }
+            (*lane_y, display)
+        })
+        .collect()
+}
+
+fn sync_canvas_lane_visibility(
+    document: &Document,
+    viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    sync_canvas_lane_labels(document, lane_display)?;
+    sync_canvas_nodes(document, lane_display)?;
+    sync_canvas_edges(document, viewport, lane_display)
+}
+
+fn sync_canvas_lane_labels(
+    document: &Document,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    let labels = document.query_selector_all(".lane-label[data-lane-y]")?;
+    for index in 0..labels.length() {
+        let label = labels
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some(y) = graph_item_i32(&label, "data-lane-y") else {
+            continue;
+        };
+        let display = lane_display_for_y(lane_display, y);
+        set_attributes(
+            &label,
+            [
+                ("y", display.y.to_string()),
+                ("data-display-y", display.y.to_string()),
+            ],
+        )?;
+        label
+            .class_list()
+            .toggle_with_force("lane-viewport-hidden", !display.visible)?;
+    }
+    Ok(())
+}
+
+fn sync_canvas_nodes(
+    document: &Document,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    let nodes = document.query_selector_all(".node-link[data-node-x][data-node-y]")?;
+    for index in 0..nodes.length() {
+        let node = nodes
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some((x, y)) = graph_item_point(&node, "data-node-x", "data-node-y") else {
+            continue;
+        };
+        let display = lane_display_for_y(lane_display, y);
+        if let Some(group) = node.query_selector("g")? {
+            set_attributes(
+                &group,
+                [("transform", format!("translate({x} {})", display.y))],
+            )?;
+        }
+        node.class_list()
+            .toggle_with_force("node-viewport-hidden", !display.visible)?;
+        node.set_attribute("data-display-y", &display.y.to_string())?;
+    }
+    Ok(())
+}
+
+fn sync_canvas_edges(
+    document: &Document,
+    viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    let edges = document
+        .query_selector_all(".edge[data-source-x][data-source-y][data-target-x][data-target-y]")?;
+    for index in 0..edges.length() {
+        let edge = edges
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some((source_x, source_y)) = graph_item_point(&edge, "data-source-x", "data-source-y")
+        else {
+            continue;
+        };
+        let Some((target_x, target_y)) = graph_item_point(&edge, "data-target-x", "data-target-y")
+        else {
+            continue;
+        };
+        let source = lane_display_for_y(lane_display, source_y);
+        let target = lane_display_for_y(lane_display, target_y);
+        let visible =
+            graph_edge_visible_in_viewport(viewport, source_x, source_y, target_x, target_y);
+        set_edge_display_geometry(&edge, source_x, source.y, target_x, target.y)?;
+        edge.class_list()
+            .toggle_with_force("edge-viewport-hidden", !visible)?;
+        edge.set_attribute("data-display-source-y", &source.y.to_string())?;
+        edge.set_attribute("data-display-target-y", &target.y.to_string())?;
+    }
+    Ok(())
+}
+
+fn set_edge_display_geometry(
+    edge: &Element,
+    source_x: i32,
+    source_y: i32,
+    target_x: i32,
+    target_y: i32,
+) -> Result<(), JsValue> {
+    match edge.get_attribute("data-edge-kind").as_deref() {
+        Some("primary_parent") => set_primary_edge_display_geometry(
+            edge,
+            Point {
+                x: source_x,
+                y: source_y,
+            },
+            Point {
+                x: target_x,
+                y: target_y,
+            },
+        ),
+        Some("fork") | Some("merge_parent") => set_routed_edge_display_geometry(
+            edge,
+            Point {
+                x: source_x,
+                y: source_y,
+            },
+            Point {
+                x: target_x,
+                y: target_y,
+            },
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn set_primary_edge_display_geometry(
+    edge: &Element,
+    source: Point,
+    target: Point,
+) -> Result<(), JsValue> {
+    let target_port_offset = graph_item_f64(edge, "data-target-port-offset").unwrap_or_default();
+    let (x1, y1, x2, y2) = line_points(source, target, target_port_offset);
+    set_attributes(edge, [("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2)])
+}
+
+fn set_routed_edge_display_geometry(
+    edge: &Element,
+    source: Point,
+    target: Point,
+) -> Result<(), JsValue> {
+    let route_slot = graph_item_i32(edge, "data-route-slot").unwrap_or_default();
+    let target_port_offset = graph_item_f64(edge, "data-target-port-offset").unwrap_or_default();
+    set_attributes(
+        edge,
+        [(
+            "points",
+            routed_elbow_points(source, target, route_slot, target_port_offset),
+        )],
+    )
 }
 
 fn visible_graph_item_lanes(
@@ -1601,9 +1867,24 @@ fn collect_visible_edge_lanes(
 
 fn graph_item_point(element: &Element, x_attr: &str, y_attr: &str) -> Option<(i32, i32)> {
     Some((
-        element.get_attribute(x_attr)?.parse().ok()?,
-        element.get_attribute(y_attr)?.parse().ok()?,
+        graph_item_i32(element, x_attr)?,
+        graph_item_i32(element, y_attr)?,
     ))
+}
+
+fn graph_item_i32(element: &Element, attr: &str) -> Option<i32> {
+    element.get_attribute(attr)?.parse().ok()
+}
+
+fn graph_item_f64(element: &Element, attr: &str) -> Option<f64> {
+    element.get_attribute(attr)?.parse().ok()
+}
+
+fn lane_display_for_y(lane_display: &BTreeMap<i32, LaneDisplay>, y: i32) -> LaneDisplay {
+    lane_display
+        .get(&y)
+        .copied()
+        .unwrap_or(LaneDisplay { y, visible: true })
 }
 
 fn graph_node_visible_in_viewport(viewport: ViewportState, x: i32, y: i32) -> bool {
@@ -1636,12 +1917,12 @@ fn graph_edge_visible_in_viewport(
 
 fn sync_branch_visibility_element(
     branch: &Element,
-    visible_lanes: &BTreeSet<i32>,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
 ) -> Result<(), JsValue> {
     let Some(lane_y) = branch_lane_y(branch) else {
         return Ok(());
     };
-    apply_branch_visibility(branch, visible_lanes.contains(&lane_y))
+    apply_branch_visibility(branch, lane_display_for_y(lane_display, lane_y).visible)
 }
 
 #[rustfmt::skip]
