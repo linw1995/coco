@@ -1434,37 +1434,33 @@ fn refresh_inner_html(
     Ok(())
 }
 
+#[rustfmt::skip]
 fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
     let branches = document.query_selector_all(".branch[data-lane-y]")?;
-    for index in 0..branches.length() {
-        if let Some(branch) = branches
-            .item(index)
-            .and_then(|node| node.dyn_into::<Element>().ok())
-            && let Some(lane_y) = branch_lane_y(&branch)
-        {
-            apply_branch_visibility(
-                &branch,
-                lane_visible_in_viewport(viewport, lane_y, BRANCH_LANE_HALF_HEIGHT),
-            )?;
-        }
-    }
+    for index in 0..branches.length() { sync_branch_visibility_node(branches.item(index), viewport)?; }
     Ok(())
 }
 
-fn branch_lane_y(branch: &Element) -> Option<f64> {
-    branch.get_attribute("data-lane-y")?.parse().ok()
+#[rustfmt::skip]
+fn sync_branch_visibility_node(node: Option<web_sys::Node>, viewport: ViewportState) -> Result<(), JsValue> {
+    let Some(branch) = node.and_then(|node| node.dyn_into::<Element>().ok()) else { return Ok(()); };
+    let Some(lane_y) = branch_lane_y(&branch) else { return Ok(()); };
+    apply_branch_visibility(&branch, lane_visible_in_viewport(viewport, lane_y, BRANCH_LANE_HALF_HEIGHT))
 }
 
+#[rustfmt::skip]
+fn branch_lane_y(branch: &Element) -> Option<f64> { branch.get_attribute("data-lane-y")?.parse().ok() }
+
+#[rustfmt::skip]
 fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> {
-    if visible {
-        branch.class_list().remove_1("branch-viewport-hidden")?;
-        branch.remove_attribute("aria-hidden")?;
-    } else {
-        branch.class_list().add_1("branch-viewport-hidden")?;
-        branch.set_attribute("aria-hidden", "true")?;
-    }
-    Ok(())
+    if visible { show_branch(branch) } else { hide_branch(branch) }
 }
+
+#[rustfmt::skip]
+fn show_branch(branch: &Element) -> Result<(), JsValue> { branch.class_list().remove_1("branch-viewport-hidden")?; branch.remove_attribute("aria-hidden") }
+
+#[rustfmt::skip]
+fn hide_branch(branch: &Element) -> Result<(), JsValue> { branch.class_list().add_1("branch-viewport-hidden")?; branch.set_attribute("aria-hidden", "true") }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let installers: [GraphListenerInstaller; 5] = [
