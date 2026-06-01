@@ -21,12 +21,15 @@ use crate::api::{
     GraphViewportEdgeKind, GraphViewportItems, GraphViewportLane, GraphViewportNode,
     GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
-use crate::viewport::{MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport};
+use crate::viewport::{
+    MIN_OVERSCAN, ViewportState, lane_visible_in_viewport, rounded_i32, same_viewport,
+};
 
 const ROOT_ID: &str = "console-root";
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const VIEWPORT_KEY: &str = "coco-console:viewport";
 const NODE_RADIUS: f64 = 26.0;
+const BRANCH_LANE_HALF_HEIGHT: f64 = 70.0;
 const EDGE_NODE_EXIT: f64 = 42.0;
 const EDGE_TARGET_APPROACH: f64 = 48.0;
 const EDGE_ROUTE_STEP: f64 = 12.0;
@@ -359,7 +362,9 @@ impl VirtualGraph {
             &self.viewport_map,
             &self.viewport_map_bg,
         )?;
-        apply_viewport_map_window(&self.viewport_map_window, self.viewport)
+        apply_viewport_map_window(&self.viewport_map_window, self.viewport)?;
+        self.sync_branch_visibility();
+        Ok(())
     }
 
     fn upsert_graph_items(
@@ -670,6 +675,12 @@ impl VirtualGraph {
     fn set_root_version(&self) {
         if let Some(root) = self.document.get_element_by_id(ROOT_ID) {
             let _ = root.set_attribute("data-version", &self.version.to_string());
+        }
+    }
+
+    fn sync_branch_visibility(&self) {
+        if let Err(error) = sync_branch_visibility(&self.document, self.viewport) {
+            web_sys::console::error_1(&error);
         }
     }
 
@@ -1283,7 +1294,11 @@ async fn handle_server_rendered_sections_response(
     response: Result<Option<u64>, JsValue>,
 ) {
     match response {
-        Ok(Some(version)) => graph.borrow_mut().shell_version = version,
+        Ok(Some(version)) => {
+            let mut graph = graph.borrow_mut();
+            graph.shell_version = version;
+            graph.sync_branch_visibility();
+        }
         Ok(None) => {}
         Err(error) => {
             web_sys::console::error_1(&error);
@@ -1370,6 +1385,44 @@ fn refresh_inner_html(
     };
     if let Some(target) = document.query_selector(selector)? {
         target.set_inner_html(&source.inner_html());
+    }
+    Ok(())
+}
+
+fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
+    let branches = document.query_selector_all(".branch[data-lane-y]")?;
+    for index in 0..branches.length() {
+        let Some(node) = branches.item(index) else {
+            continue;
+        };
+        let Ok(branch) = node.dyn_into::<Element>() else {
+            continue;
+        };
+        let Some(lane_y) = branch_lane_y(&branch) else {
+            continue;
+        };
+        apply_branch_visibility(
+            &branch,
+            lane_visible_in_viewport(viewport, lane_y, BRANCH_LANE_HALF_HEIGHT),
+        )?;
+    }
+    Ok(())
+}
+
+fn branch_lane_y(branch: &Element) -> Option<f64> {
+    branch.get_attribute("data-lane-y")?.parse().ok()
+}
+
+fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> {
+    let class_list = branch.class_list();
+    if visible {
+        class_list.remove_1("branch-viewport-hidden")?;
+        class_list.add_1("branch-viewport-visible")?;
+        branch.remove_attribute("aria-hidden")?;
+    } else {
+        class_list.remove_1("branch-viewport-visible")?;
+        class_list.add_1("branch-viewport-hidden")?;
+        branch.set_attribute("aria-hidden", "true")?;
     }
     Ok(())
 }

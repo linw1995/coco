@@ -3,6 +3,7 @@ use coco_mem::{PauseReason, SessionState};
 use leptos::{html::HtmlElement, prelude::*};
 
 use crate::graph::{GraphNode, GraphSnapshot, node_target_id, shorten_id};
+use crate::layout::{lane_key, layout_graph};
 
 #[derive(Template)]
 #[template(path = "graph_shell.html")]
@@ -215,15 +216,25 @@ fn render_missing_node_details(target: &str) -> AnyView {
 }
 
 fn render_branches(snapshot: &GraphSnapshot) -> AnyView {
+    let lane_y_by_label = layout_graph(snapshot)
+        .lanes
+        .into_iter()
+        .map(|lane| (lane.label, lane.y))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let items = snapshot
         .branches
         .iter()
         .map(|branch| {
             let name = branch.name.clone();
+            let key = lane_key(&name);
+            let lane_y = lane_y_by_label
+                .get(&name)
+                .map(i32::to_string)
+                .unwrap_or_default();
             let head = format!("head {}", shorten_id(&branch.head_id));
             let state = format_session_state(&branch.state);
             view! {
-                <li class="branch">
+                <li class="branch" data-lane-key=key data-lane-y=lane_y>
                     <strong>{name}</strong>
                     <span>{head}</span>
                     <span>{state}</span>

@@ -737,6 +737,16 @@ fn graph_viewport_response_uses_stable_keys_for_patchable_items() {
 }
 
 #[test]
+fn rendered_branch_items_include_lane_metadata() {
+    let snapshot = two_node_snapshot(12);
+    let html = render_snapshot_page(&snapshot);
+
+    assert!(html.contains("class=\"branch\""));
+    assert!(html.contains("data-lane-key=\"lane:main\""));
+    assert!(html.contains("data-lane-y=\"90\""));
+}
+
+#[test]
 fn graph_viewport_uses_unique_keys_for_duplicate_node_occurrences() {
     let mut snapshot = two_node_snapshot(28);
     snapshot.branches.push(GraphBranch {
