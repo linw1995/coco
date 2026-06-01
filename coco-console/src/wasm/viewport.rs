@@ -82,15 +82,17 @@ pub fn needs_full_viewport_jump_fetch(rendered: ViewportState, current: Viewport
     needs_full_fetch(ViewportBounds::strict(rendered), current)
 }
 
-pub fn lane_visible_in_viewport(
+pub fn bounds_visible_in_viewport(
     viewport: ViewportState,
-    lane_y: f64,
-    lane_half_height: f64,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
 ) -> bool {
-    let top = lane_y - lane_half_height;
-    let bottom = lane_y + lane_half_height;
-
-    top < viewport.y + viewport.height && bottom > viewport.y
+    left < viewport.x + viewport.width
+        && right > viewport.x
+        && top < viewport.y + viewport.height
+        && bottom > viewport.y
 }
 
 fn needs_full_fetch(rendered: ViewportBounds, current: ViewportState) -> bool {
@@ -104,7 +106,7 @@ pub fn rounded_i32(value: f64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ViewportState, lane_visible_in_viewport, needs_full_viewport_fetch,
+        ViewportState, bounds_visible_in_viewport, needs_full_viewport_fetch,
         needs_full_viewport_jump_fetch, same_viewport,
     };
 
@@ -159,10 +161,18 @@ mod tests {
     }
 
     #[test]
-    fn branch_lane_visibility_uses_current_viewport_bounds() {
-        assert!(lane_visible_in_viewport(viewport(0.0, 0.0), 90.0, 70.0));
-        assert!(lane_visible_in_viewport(viewport(0.0, 200.0), 150.0, 70.0));
-        assert!(!lane_visible_in_viewport(viewport(0.0, 240.0), 90.0, 70.0));
+    fn graph_item_bounds_visibility_uses_strict_viewport() {
+        let current = viewport(200.0, 140.0);
+
+        assert!(bounds_visible_in_viewport(
+            current, 180.0, 130.0, 230.0, 190.0
+        ));
+        assert!(!bounds_visible_in_viewport(
+            current, 10.0, 130.0, 180.0, 190.0
+        ));
+        assert!(!bounds_visible_in_viewport(
+            current, 180.0, 10.0, 230.0, 120.0
+        ));
     }
 
     #[test]

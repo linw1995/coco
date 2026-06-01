@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::rc::Rc;
 use std::str::{FromStr, Split};
@@ -365,6 +365,7 @@ impl VirtualGraph {
             },
             false,
         )?;
+        self.sync_branch_visibility();
         self.hide_status();
         Ok(())
     }
@@ -382,6 +383,7 @@ impl VirtualGraph {
         self.apply_response_viewport(version, canvas, viewport)?;
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
+        self.sync_branch_visibility();
         self.hide_status();
         Ok(())
     }
@@ -503,6 +505,10 @@ impl VirtualGraph {
             [
                 ("id", render_element_id(&edge.key)),
                 ("data-render-key", edge.key.clone()),
+                ("data-source-x", edge.source.x.to_string()),
+                ("data-source-y", edge.source.y.to_string()),
+                ("data-target-x", edge.target.x.to_string()),
+                ("data-target-y", edge.target.y.to_string()),
             ],
         )?;
         self.edge_group.append_child(&element)?;
@@ -1078,6 +1084,8 @@ fn set_node_link_attributes(
             ("href", format!("#{}", node.node_target)),
             ("data-node-target", node.node_target.clone()),
             ("data-node-id", node.id.clone()),
+            ("data-node-x", node.x.to_string()),
+            ("data-node-y", node.y.to_string()),
         ],
     )
 }
@@ -1519,16 +1527,125 @@ fn refresh_inner_html(
     Ok(())
 }
 
-#[rustfmt::skip]
-fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> { let branches = document.query_selector_all(".branch[data-lane-y]")?; for index in 0..branches.length() { sync_branch_visibility_element(&branches.item(index).expect("query selector index should exist").unchecked_into::<Element>(), viewport)?; } Ok(()) }
+fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
+    let visible_lanes = visible_graph_item_lanes(document, viewport)?;
+    let branches = document.query_selector_all(".branch[data-lane-y]")?;
+    for index in 0..branches.length() {
+        let branch = branches
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        sync_branch_visibility_element(&branch, &visible_lanes)?;
+    }
+    Ok(())
+}
 
-#[rustfmt::skip]
-fn sync_branch_visibility_element(branch: &Element, viewport: ViewportState) -> Result<(), JsValue> {
-    branch_lane_y(branch).map(|lane_y| apply_branch_visibility(branch, crate::viewport::lane_visible_in_viewport(viewport, lane_y, 70.0))).unwrap_or(Ok(()))
+fn visible_graph_item_lanes(
+    document: &Document,
+    viewport: ViewportState,
+) -> Result<BTreeSet<i32>, JsValue> {
+    let mut lanes = BTreeSet::new();
+    collect_visible_node_lanes(document, viewport, &mut lanes)?;
+    collect_visible_edge_lanes(document, viewport, &mut lanes)?;
+    Ok(lanes)
+}
+
+fn collect_visible_node_lanes(
+    document: &Document,
+    viewport: ViewportState,
+    lanes: &mut BTreeSet<i32>,
+) -> Result<(), JsValue> {
+    let nodes = document.query_selector_all(".node-link[data-node-x][data-node-y]")?;
+    for index in 0..nodes.length() {
+        let node = nodes
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some((x, y)) = graph_item_point(&node, "data-node-x", "data-node-y") else {
+            continue;
+        };
+        if graph_node_visible_in_viewport(viewport, x, y) {
+            lanes.insert(y);
+        }
+    }
+    Ok(())
+}
+
+fn collect_visible_edge_lanes(
+    document: &Document,
+    viewport: ViewportState,
+    lanes: &mut BTreeSet<i32>,
+) -> Result<(), JsValue> {
+    let edges = document
+        .query_selector_all(".edge[data-source-x][data-source-y][data-target-x][data-target-y]")?;
+    for index in 0..edges.length() {
+        let edge = edges
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some((source_x, source_y)) = graph_item_point(&edge, "data-source-x", "data-source-y")
+        else {
+            continue;
+        };
+        let Some((target_x, target_y)) = graph_item_point(&edge, "data-target-x", "data-target-y")
+        else {
+            continue;
+        };
+        if graph_edge_visible_in_viewport(viewport, source_x, source_y, target_x, target_y) {
+            lanes.insert(source_y);
+            lanes.insert(target_y);
+        }
+    }
+    Ok(())
+}
+
+fn graph_item_point(element: &Element, x_attr: &str, y_attr: &str) -> Option<(i32, i32)> {
+    Some((
+        element.get_attribute(x_attr)?.parse().ok()?,
+        element.get_attribute(y_attr)?.parse().ok()?,
+    ))
+}
+
+fn graph_node_visible_in_viewport(viewport: ViewportState, x: i32, y: i32) -> bool {
+    let padding = NODE_RADIUS.ceil();
+    crate::viewport::bounds_visible_in_viewport(
+        viewport,
+        f64::from(x) - padding,
+        f64::from(y) - padding,
+        f64::from(x) + padding,
+        f64::from(y) + padding,
+    )
+}
+
+fn graph_edge_visible_in_viewport(
+    viewport: ViewportState,
+    source_x: i32,
+    source_y: i32,
+    target_x: i32,
+    target_y: i32,
+) -> bool {
+    let padding = (NODE_RADIUS + EDGE_TARGET_APPROACH).ceil();
+    crate::viewport::bounds_visible_in_viewport(
+        viewport,
+        f64::from(source_x.min(target_x)) - padding,
+        f64::from(source_y.min(target_y)) - padding,
+        f64::from(source_x.max(target_x)) + padding,
+        f64::from(source_y.max(target_y)) + padding,
+    )
+}
+
+fn sync_branch_visibility_element(
+    branch: &Element,
+    visible_lanes: &BTreeSet<i32>,
+) -> Result<(), JsValue> {
+    let Some(lane_y) = branch_lane_y(branch) else {
+        return Ok(());
+    };
+    apply_branch_visibility(branch, visible_lanes.contains(&lane_y))
 }
 
 #[rustfmt::skip]
-fn branch_lane_y(branch: &Element) -> Option<f64> { branch.get_attribute("data-lane-y")?.parse().ok() }
+fn branch_lane_y(branch: &Element) -> Option<i32> { branch.get_attribute("data-lane-y")?.parse().ok() }
 
 #[rustfmt::skip]
 fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> { branch.class_list().toggle_with_force("branch-viewport-hidden", !visible)?; set_branch_aria_hidden(branch, !visible) }
