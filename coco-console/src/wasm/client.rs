@@ -2144,6 +2144,12 @@ mod tests {
 
     impl Drop for GraphFixture {
         fn drop(&mut self) {
+            if let Some(window) = web_sys::window()
+                && let Some(storage) = session_storage(&window)
+            {
+                let _ = storage.remove_item(AUTO_FOLLOW_KEY);
+                let _ = storage.remove_item(VIEWPORT_KEY);
+            }
             self.root.remove();
         }
     }
@@ -2167,6 +2173,68 @@ mod tests {
         handle_graph_items_error(fixture.graph.clone(), JsValue::from_str("network failed"));
 
         assert_eq!(console_error_calls.get(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_auto_follow_pins_to_top_right() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = ViewportState {
+                x: 25.0,
+                y: 40.0,
+                width: 320.0,
+                height: 180.0,
+                overscan: MIN_OVERSCAN,
+            };
+            graph.canvas = Some(GraphCanvas {
+                width: 1000,
+                height: 600,
+            });
+        }
+
+        update_auto_follow(fixture.graph.clone(), true);
+
+        let graph = fixture.graph.borrow();
+        assert!(graph.auto_follow);
+        assert_eq!(rounded_i32(graph.viewport.x), 680);
+        assert_eq!(rounded_i32(graph.viewport.y), 0);
+        assert_eq!(
+            graph.follow_toggle.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            graph.follow_toggle.text_content().as_deref(),
+            Some("Following")
+        );
+        assert_eq!(
+            session_storage(&graph.window)
+                .and_then(|storage| storage.get_item(AUTO_FOLLOW_KEY).ok().flatten())
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_auto_follow_loads_stored_state() {
+        let window = web_sys::window().expect_throw("window should be available");
+        session_storage(&window)
+            .expect_throw("session storage should be available")
+            .set_item(AUTO_FOLLOW_KEY, "1")
+            .expect_throw("auto follow state should be stored");
+
+        let fixture = GraphFixture::new();
+        let graph = fixture.graph.borrow();
+
+        assert!(graph.auto_follow);
+        assert_eq!(
+            graph.follow_toggle.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            graph.follow_toggle.text_content().as_deref(),
+            Some("Following")
+        );
     }
 
     impl GraphFixture {
