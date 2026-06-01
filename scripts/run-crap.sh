@@ -15,7 +15,6 @@ crap_args=(
 )
 crap_allow_args=(
   --allow "render_full_viewport"
-  --allow "drain_viewport_patches"
 )
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
