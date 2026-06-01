@@ -5,7 +5,9 @@ coco-console/pkg
 # Ignore scripts by default
 *.sh
 !docker/coco-docker-entrypoint.sh
+!scripts/merge-cov.sh
 !scripts/run-cov.sh
+!scripts/run-wasm-cov.sh
 !scripts/test-builtin-skill-scripts.sh
 
 # CoCo

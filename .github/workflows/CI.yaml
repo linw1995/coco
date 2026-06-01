@@ -16,6 +16,7 @@ jobs:
     outputs:
       lint: ${{ steps.filter.outputs.lint }}
       rust: ${{ steps.filter.outputs.rust }}
+      wasm_coverage: ${{ steps.filter.outputs.wasm_coverage }}
       builtin_skill_scripts: ${{ steps.filter.outputs.builtin_skill_scripts }}
       nix_build: ${{ steps.filter.outputs.nix_build }}
     steps:
@@ -54,12 +55,28 @@ jobs:
               - "flake.lock"
               - "nix/**/*.nix"
               - "scripts/run-cov.sh"
+              - "scripts/run-wasm-cov.sh"
+              - "scripts/merge-cov.sh"
               - "scripts/run-crap.sh"
               - "coco-*/src/**"
               - "coco-*/tests/**"
               - "coco-console/build.rs"
               - "coco-console/templates/**"
               - "coco-mem/src/default_skills/**"
+            wasm_coverage:
+              - ".github/workflows/CI.yaml"
+              - ".github/actions/setup-nix/action.yaml"
+              - "Cargo.lock"
+              - "Cargo.toml"
+              - "**/Cargo.toml"
+              - "flake.nix"
+              - "flake.lock"
+              - "nix/**/*.nix"
+              - "scripts/run-wasm-cov.sh"
+              - "scripts/merge-cov.sh"
+              - "coco-console/src/api.rs"
+              - "coco-console/src/lib.rs"
+              - "coco-console/src/wasm/**"
             builtin_skill_scripts:
               - ".github/workflows/CI.yaml"
               - ".github/actions/setup-nix/action.yaml"
@@ -92,11 +109,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
+        with:
+          dev-shell: ci-lint
 
       - name: Run repository checks
-        run: nix develop --command prek -a
+        run: nix develop .#ci-lint --command prek -a
 
-  test:
+  coverage_native:
     needs:
       - changes
       - lint
@@ -105,9 +124,66 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
+        with:
+          cache-key-name: coverage
+          dev-shell: ci-coverage
 
-      - name: Run workspace tests with coverage
-        run: nix develop --command bash scripts/run-cov.sh
+      - name: Run native coverage
+        run: nix develop .#ci-coverage --command bash scripts/run-cov.sh
+
+      - name: Upload native coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-native
+          path: target/coverage/result/
+
+  coverage_wasm:
+    needs:
+      - changes
+      - lint
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.wasm_coverage == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+        with:
+          cache-key-name: wasm-coverage
+          dev-shell: ci-wasm-coverage
+
+      - name: Run wasm browser coverage
+        run: nix develop .#ci-wasm-coverage --command bash scripts/run-wasm-cov.sh
+
+      - name: Upload wasm coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-wasm
+          path: target/wasm-coverage/result/wasm.lcov.info
+
+  coverage:
+    needs:
+      - changes
+      - coverage_native
+      - coverage_wasm
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.coverage_native.result == 'success' && (needs.coverage_wasm.result == 'success' || needs.coverage_wasm.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download native coverage artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-native
+          path: target/coverage/result/
+
+      - name: Download wasm coverage artifact
+        if: needs.coverage_wasm.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-wasm
+          path: target/wasm-coverage/result/
+
+      - name: Merge coverage reports
+        run: bash scripts/merge-cov.sh
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7
@@ -126,8 +202,8 @@ jobs:
   crap:
     needs:
       - changes
-      - test
-    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.test.result == 'success' }}
+      - coverage
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.coverage.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

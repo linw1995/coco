@@ -65,3 +65,7 @@ snafu.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Host server tests.
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+# Browser-backed wasm tests.
+wasm-bindgen-test = "=0.3.67"

@@ -2,6 +2,7 @@
   pkgs,
   rustCrapToolchainFor,
   rustDevToolchainFor,
+  rustWasmCoverageToolchainFor,
 }: let
   cargo-crap = pkgs.rustPlatform.buildRustPackage rec {
     pname = "cargo-crap";
@@ -42,11 +43,51 @@ in {
 
       cargo-nextest
       wasm-bindgen-cli
+      chromedriver
 
       nono
       ruff
       taplo
       uv
     ];
+  };
+
+  ci-lint = pkgs.mkShell {
+    nativeBuildInputs = [
+      (rustDevToolchainFor pkgs)
+    ];
+    packages = with pkgs; [
+      prek
+      wasm-bindgen-cli
+      ruff
+      taplo
+      uv
+    ];
+  };
+
+  ci-coverage = pkgs.mkShell {
+    nativeBuildInputs = [
+      (rustDevToolchainFor pkgs)
+    ];
+    packages = with pkgs; [
+      cargo-nextest
+      grcov
+      wasm-bindgen-cli
+    ];
+  };
+
+  ci-wasm-coverage = pkgs.mkShell {
+    nativeBuildInputs = [
+      (rustWasmCoverageToolchainFor pkgs)
+    ];
+    packages = with pkgs; [
+      llvmPackages.clang-unwrapped
+      chromedriver
+      wasm-bindgen-cli
+    ];
+    shellHook = ''
+      export CC_wasm32_unknown_unknown="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
+      export WASM_COVERAGE_CLANG="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
+    '';
   };
 }

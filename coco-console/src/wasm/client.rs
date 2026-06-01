@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::str::{FromStr, Split};
 
 use serde::Deserialize;
-use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     AbortController, AbortSignal, Document, Element, MouseEvent, RequestInit, Response, WheelEvent,
@@ -80,7 +80,7 @@ struct ViewportPatchInput {
     fetch: ViewportFetch,
 }
 
-#[wasm_bindgen(start)]
+#[cfg_attr(not(test), wasm_bindgen::prelude::wasm_bindgen(start))]
 pub fn start() {
     spawn_local(async {
         if let Err(error) = run().await {
@@ -1242,9 +1242,19 @@ fn apply_graph_items_diff(graph: Rc<RefCell<VirtualGraph>>, response: GraphViewp
 }
 
 fn handle_graph_items_error(graph: Rc<RefCell<VirtualGraph>>, error: JsValue) {
+    if is_abort_error(&error) {
+        return;
+    }
     if !graph.borrow().viewport_update_active() {
         web_sys::console::error_1(&error);
     }
+}
+
+fn is_abort_error(error: &JsValue) -> bool {
+    js_sys::Reflect::get(error, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|name| name.as_string())
+        .is_some_and(|name| name == "AbortError")
 }
 
 fn begin_version_refresh(
@@ -1995,4 +2005,143 @@ fn percent_encode(value: &str) -> String {
 
 fn session_storage(window: &Window) -> Option<web_sys::Storage> {
     window.session_storage().ok().flatten()
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use wasm_bindgen::UnwrapThrowExt;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    struct ConsoleErrorGuard {
+        console: JsValue,
+        original: JsValue,
+        _closure: Closure<dyn FnMut(JsValue)>,
+    }
+
+    impl Drop for ConsoleErrorGuard {
+        fn drop(&mut self) {
+            let _ =
+                js_sys::Reflect::set(&self.console, &JsValue::from_str("error"), &self.original);
+        }
+    }
+
+    struct GraphFixture {
+        graph: Rc<RefCell<VirtualGraph>>,
+        root: Element,
+    }
+
+    impl Drop for GraphFixture {
+        fn drop(&mut self) {
+            self.root.remove();
+        }
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn graph_items_abort_error_does_not_log_to_console() {
+        let fixture = GraphFixture::new();
+        let (console_error_calls, _guard) = install_console_error_counter();
+        let error = aborted_fetch_error().await;
+
+        handle_graph_items_error(fixture.graph.clone(), error);
+
+        assert_eq!(console_error_calls.get(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_non_abort_error_logs_to_console_when_idle() {
+        let fixture = GraphFixture::new();
+        let (console_error_calls, _guard) = install_console_error_counter();
+
+        handle_graph_items_error(fixture.graph.clone(), JsValue::from_str("network failed"));
+
+        assert_eq!(console_error_calls.get(), 1);
+    }
+
+    impl GraphFixture {
+        fn new() -> Self {
+            let window = web_sys::window().expect_throw("window should be available");
+            let document = window
+                .document()
+                .expect_throw("document should be available");
+            let root = document
+                .create_element("div")
+                .expect_throw("test root should be created");
+            root.set_inner_html(
+                r#"
+                <main id="console-root" data-version="0">
+                  <div class="graph-wrap" data-zoom="1">
+                    <svg class="graph">
+                      <rect class="graph-bg"></rect>
+                      <g class="graph-lanes"></g>
+                      <g class="graph-edges"></g>
+                      <g class="graph-nodes"></g>
+                    </svg>
+                    <svg class="viewport-map">
+                      <rect class="viewport-map-bg"></rect>
+                      <rect class="viewport-map-window"></rect>
+                    </svg>
+                  </div>
+                  <div class="graph-status" hidden></div>
+                </main>
+                "#,
+            );
+            document
+                .body()
+                .expect_throw("document body should be available")
+                .append_child(&root)
+                .expect_throw("test root should be mounted");
+            let graph =
+                VirtualGraph::new(window, document).expect_throw("test graph should be created");
+
+            Self {
+                graph: Rc::new(RefCell::new(graph)),
+                root,
+            }
+        }
+    }
+
+    async fn aborted_fetch_error() -> JsValue {
+        let window = web_sys::window().expect_throw("window should be available");
+        let controller = AbortController::new().expect_throw("abort controller should be created");
+        let init = RequestInit::new();
+        init.set_signal(Some(&controller.signal()));
+        controller.abort();
+
+        match JsFuture::from(
+            window.fetch_with_str_and_init("/api/graph/viewport/items/diff", &init),
+        )
+        .await
+        {
+            Ok(_) => panic!("aborted fetch should reject"),
+            Err(error) => error,
+        }
+    }
+
+    fn install_console_error_counter() -> (Rc<Cell<u32>>, ConsoleErrorGuard) {
+        let console = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("console"))
+            .expect_throw("console should be available");
+        let original = js_sys::Reflect::get(&console, &JsValue::from_str("error"))
+            .expect_throw("console.error should be available");
+        let calls = Rc::new(Cell::new(0));
+        let calls_for_closure = calls.clone();
+        let closure = Closure::<dyn FnMut(JsValue)>::new(move |_| {
+            calls_for_closure.set(calls_for_closure.get() + 1);
+        });
+
+        js_sys::Reflect::set(&console, &JsValue::from_str("error"), closure.as_ref())
+            .expect_throw("console.error should be replaceable");
+
+        (
+            calls,
+            ConsoleErrorGuard {
+                console,
+                original,
+                _closure: closure,
+            },
+        )
+    }
 }
