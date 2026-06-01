@@ -46,7 +46,6 @@ struct GraphItemsRefreshInput {
     query: String,
 }
 
-
 type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>;
 
 struct ViewportPatchInput {
