@@ -251,7 +251,11 @@ where
     }
 
     fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
-        self.notify_if_ok(self.inner.dequeue_message(queue))
+        let item = self.inner.dequeue_message(queue)?;
+        if item.is_some() {
+            self.publisher.mark_changed();
+        }
+        Ok(item)
     }
 
     fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
