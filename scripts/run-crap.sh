@@ -14,7 +14,6 @@ crap_args=(
   --threshold "${crap_threshold}"
 )
 crap_allow_args=(
-  --allow "VirtualGraph::upsert_node"
   --allow "VirtualGraph::new"
   --allow "refresh_on_graph_version"
   --allow "render_full_viewport"
