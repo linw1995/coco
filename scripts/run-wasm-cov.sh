@@ -58,7 +58,11 @@ for llvm_ir in "${llvm_ir_files[@]}"; do
   object="${objects_dir}/$(basename "${llvm_ir}" .ll).o"
   "${coverage_clang}" --target="${coverage_object_target}" -Wno-override-module -c "${llvm_ir}" -o "${object}"
   if [[ "$(basename "${llvm_ir}")" == coco_console-* ]]; then
-    llvm_cov_main_object="${object}"
+    if [[ -z "${llvm_cov_main_object}" ]]; then
+      llvm_cov_main_object="${object}"
+    else
+      llvm_cov_extra_objects+=("-object" "${object}")
+    fi
   else
     llvm_cov_extra_objects+=("-object" "${object}")
   fi
