@@ -2182,6 +2182,7 @@ mod tests {
                 r#"
                 <main id="console-root" data-version="0">
                   <div class="graph-wrap" data-zoom="1">
+                    <button class="follow-toggle" type="button" aria-pressed="false">Follow</button>
                     <svg class="graph">
                       <rect class="graph-bg"></rect>
                       <g class="graph-lanes"></g>
