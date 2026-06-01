@@ -1505,6 +1505,7 @@ async fn refresh_selected_node_detail_from_graph(
 
 async fn refresh_selected_node_detail(window: &Window, document: &Document) -> Result<(), JsValue> {
     let target = selected_node_target(window);
+    render_loading_node_detail_if_current(window, document, target.as_deref())?;
     let url = node_detail_url(target.as_deref());
     let html = fetch_text(window, &url).await?;
     render_node_detail_if_current(window, document, target, &html)
@@ -1523,7 +1524,78 @@ fn render_node_detail_if_current(
     html: &str,
 ) -> Result<(), JsValue> {
     if selected_node_target(window) == target {
-        query_required(document, ".node-detail-slot")?.set_inner_html(html);
+        let slot = query_required(document, ".node-detail-slot")?;
+        slot.set_inner_html(html);
+        mark_selected_node_detail(&slot)?;
+    }
+    Ok(())
+}
+
+fn render_loading_node_detail_if_current(
+    window: &Window,
+    document: &Document,
+    target: Option<&str>,
+) -> Result<(), JsValue> {
+    if selected_node_target(window).as_deref() == target
+        && let Some(target) = target
+    {
+        let slot = query_required(document, ".node-detail-slot")?;
+        let detail = loading_node_detail(document, target)?;
+        slot.set_inner_html("");
+        slot.append_child(&detail)?;
+    }
+    Ok(())
+}
+
+fn loading_node_detail(document: &Document, target: &str) -> Result<Element, JsValue> {
+    let section = document.create_element("section")?;
+    set_attributes(
+        &section,
+        [
+            ("id", target.to_owned()),
+            (
+                "class",
+                "node-details node-detail node-detail-selected".to_owned(),
+            ),
+        ],
+    )?;
+
+    let heading = text_element(document, "h2", "Node")?;
+    section.append_child(&heading)?;
+    let list = document.create_element("dl")?;
+    list.set_attribute("class", "detail-list")?;
+    let loading_row = detail_row(document, "Selection", "Loading node detail...")?;
+    list.append_child(&loading_row)?;
+    section.append_child(&list)?;
+
+    Ok(section)
+}
+
+fn detail_row(document: &Document, term: &str, detail: &str) -> Result<Element, JsValue> {
+    let row = document.create_element("div")?;
+    let term = text_element(document, "dt", term)?;
+    let detail = text_element(document, "dd", detail)?;
+    row.append_child(&term)?;
+    row.append_child(&detail)?;
+    Ok(row)
+}
+
+fn text_element(document: &Document, tag: &str, text: &str) -> Result<Element, JsValue> {
+    let element = document.create_element(tag)?;
+    element.set_text_content(Some(text));
+    Ok(element)
+}
+
+fn mark_selected_node_detail(slot: &Element) -> Result<(), JsValue> {
+    let Some(detail) = slot.query_selector(".node-detail")? else {
+        return Ok(());
+    };
+    let class = detail.get_attribute("class").unwrap_or_default();
+    if !class
+        .split_ascii_whitespace()
+        .any(|part| part == "node-detail-selected")
+    {
+        detail.set_attribute("class", &format!("{class} node-detail-selected"))?;
     }
     Ok(())
 }

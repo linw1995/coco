@@ -1195,6 +1195,14 @@ mod tests {
             "{response}"
         );
         assert!(response.contains("font-family"), "{response}");
+        assert!(
+            response.contains(".node-detail.node-detail-selected"),
+            "{response}"
+        );
+        assert!(
+            response.contains("body:has(.node-detail.node-detail-selected)"),
+            "{response}"
+        );
     }
 
     #[tokio::test]
