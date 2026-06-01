@@ -270,6 +270,8 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
 
     let html = render_snapshot_page(&snapshot);
     assert!(html.contains("class=\"graph-wrap virtual-graph\""));
+    assert!(html.contains("class=\"follow-toggle\""));
+    assert!(html.contains("Keep the graph pinned to the top-right edge"));
     assert!(html.contains("class=\"graph-lanes\""));
     assert!(html.contains("class=\"graph-edges\""));
     assert!(html.contains("class=\"graph-nodes\""));

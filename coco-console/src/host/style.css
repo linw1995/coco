@@ -132,6 +132,40 @@ body {
   top: 1rem;
 }
 
+.follow-toggle {
+  align-items: center;
+  background: rgba(8, 11, 18, 0.82);
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 7px;
+  color: #dbeafe;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 650;
+  height: 2rem;
+  justify-content: center;
+  min-width: 5.5rem;
+  padding: 0 0.78rem;
+  position: absolute;
+  right: 1rem;
+  top: 1rem;
+  user-select: none;
+  -webkit-user-select: none;
+  z-index: 5;
+}
+
+.follow-toggle:hover {
+  border-color: rgba(191, 219, 254, 0.42);
+  color: #f8fafc;
+}
+
+.follow-toggle[aria-pressed="true"] {
+  background: rgba(37, 99, 235, 0.28);
+  border-color: rgba(96, 165, 250, 0.74);
+  color: #bfdbfe;
+}
+
 .viewport-map {
   background: rgba(8, 11, 18, 0.82);
   border: 1px solid rgba(148, 163, 184, 0.22);
