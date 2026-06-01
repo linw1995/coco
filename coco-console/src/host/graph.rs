@@ -95,6 +95,30 @@ struct GraphNodeEntry {
     labels: Vec<GraphBranchLabel>,
 }
 
+struct GraphBuildState {
+    mode: GraphMode,
+    visible_node_ids: BTreeSet<String>,
+    visible_nodes: HashMap<String, Node>,
+    visible_node_scopes: HashMap<String, BTreeSet<String>>,
+    labels_by_node: HashMap<String, Vec<GraphBranchLabel>>,
+    branches: Vec<GraphBranch>,
+}
+
+struct BranchGraphScope {
+    node_ids: BTreeSet<String>,
+}
+
+struct VisibleGraphCollector<'a, S: NodeStore> {
+    store: &'a S,
+    mode: GraphMode,
+    scope_node_ids: &'a mut BTreeSet<String>,
+    visible_node_ids: &'a mut BTreeSet<String>,
+    visible_nodes: &'a mut HashMap<String, Node>,
+    branch_visible_node_ids: &'a mut BTreeSet<String>,
+    pending: Vec<String>,
+    visited: BTreeSet<String>,
+}
+
 #[cfg(test)]
 pub fn build_graph_snapshot(
     store: &(impl BranchStore + NodeStore + SessionStore),
@@ -108,141 +132,9 @@ pub fn build_graph_snapshot_with_mode(
     version: u64,
     mode: GraphMode,
 ) -> Result<GraphSnapshot> {
-    let states = store.list_session_states().context(StoreSnafu)?;
-    let mut branches = states.into_iter().collect::<Vec<_>>();
-    branches.sort_by(|(left, _), (right, _)| left.cmp(right));
-
-    let mut visible_node_ids = BTreeSet::new();
-    let mut visible_nodes = HashMap::new();
-    let mut visible_node_scopes = HashMap::<String, BTreeSet<String>>::new();
-    let mut labels_by_node = HashMap::<String, Vec<GraphBranchLabel>>::new();
-    let mut graph_branches = Vec::with_capacity(branches.len());
-
-    for (branch, state) in branches {
-        let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
-        let mut scope_node_ids = initial_graph_scope(store, &head_id, mode)?;
-        let mut branch_visible_node_ids = BTreeSet::new();
-        collect_visible_graph_nodes(
-            store,
-            &head_id,
-            &mut scope_node_ids,
-            mode,
-            &mut visible_node_ids,
-            &mut visible_nodes,
-            &mut branch_visible_node_ids,
-        )?;
-        for node_id in branch_visible_node_ids {
-            visible_node_scopes
-                .entry(node_id)
-                .or_default()
-                .extend(scope_node_ids.iter().cloned());
-        }
-
-        let visible_head_id =
-            resolve_visible_parent(store, &visible_node_ids, &scope_node_ids, &head_id)?;
-        if let Some(label_node_id) = &visible_head_id {
-            labels_by_node
-                .entry(label_node_id.clone())
-                .or_default()
-                .push(GraphBranchLabel {
-                    branch: branch.clone(),
-                    state: state.clone(),
-                });
-        }
-        graph_branches.push(GraphBranch {
-            name: branch,
-            head_id,
-            visible_head_id,
-            state,
-        });
-    }
-
-    let mut entries = visible_nodes
-        .into_values()
-        .map(|node| {
-            let scope_node_ids = visible_node_scopes.remove(&node.id).unwrap_or_default();
-            let primary_parent = resolve_visible_parent(
-                store,
-                &visible_node_ids,
-                &scope_node_ids,
-                node.parent.as_str(),
-            )?;
-            let merge_parents = match &node.kind {
-                Kind::Anchor(anchor) => {
-                    let mut parents = Vec::new();
-                    for merge_parent in anchor.merge_parents() {
-                        let Some(parent_id) = resolve_visible_parent(
-                            store,
-                            &visible_node_ids,
-                            &scope_node_ids,
-                            merge_parent.node_id(),
-                        )?
-                        else {
-                            continue;
-                        };
-                        if primary_parent.as_ref() == Some(&parent_id)
-                            || parents
-                                .iter()
-                                .any(|existing: &MergeParent| existing.node_id() == parent_id)
-                        {
-                            continue;
-                        }
-                        parents.push(visible_merge_parent(merge_parent, parent_id));
-                    }
-                    parents
-                }
-                _ => Vec::new(),
-            };
-
-            Ok(GraphNodeEntry {
-                labels: labels_by_node.remove(&node.id).unwrap_or_default(),
-                node,
-                primary_parent,
-                merge_parents,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    entries.sort_by(|left, right| {
-        left.node
-            .created_at
-            .to_string()
-            .cmp(&right.node.created_at.to_string())
-            .then_with(|| left.node.id.cmp(&right.node.id))
-    });
-
-    let mut edges = Vec::new();
-    let mut nodes = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if let Some(parent) = &entry.primary_parent {
-            edges.push(GraphEdge {
-                source: parent.clone(),
-                target: entry.node.id.clone(),
-                kind: GraphEdgeKind::Primary,
-            });
-        }
-        for parent in &entry.merge_parents {
-            edges.push(GraphEdge {
-                source: parent.node_id().to_owned(),
-                target: entry.node.id.clone(),
-                kind: if parent.is_shadow() {
-                    GraphEdgeKind::Shadow
-                } else {
-                    GraphEdgeKind::Merge
-                },
-            });
-        }
-        nodes.push(GraphNode {
-            id: entry.node.id.clone(),
-            short_id: shorten_id(&entry.node.id),
-            kind: graph_kind_name(&entry.node).to_owned(),
-            role: format!("{:?}", entry.node.role),
-            created_at: entry.node.created_at.to_string(),
-            created_at_ns: entry.node.created_at.as_nanosecond(),
-            content: render_node_content(&entry.node),
-            summary: summarize_node(&entry.node),
-            labels: render_graph_labels(&entry.labels),
-        });
-    }
+    let mut state = collect_graph_state(store, mode)?;
+    let entries = sorted_graph_entries(&mut state, store)?;
+    let (nodes, edges) = graph_items_from_entries(entries);
 
     Ok(GraphSnapshot {
         version,
@@ -250,12 +142,373 @@ pub fn build_graph_snapshot_with_mode(
         root_id: store.root_id(),
         nodes,
         edges,
-        branches: graph_branches,
+        branches: state.branches,
     })
 }
 
-fn collect_visible_graph_nodes(
+fn collect_graph_state(
+    store: &(impl BranchStore + NodeStore + SessionStore),
+    mode: GraphMode,
+) -> Result<GraphBuildState> {
+    let mut state = GraphBuildState::new(mode);
+    for (branch, session_state) in sorted_session_states(store)? {
+        state.collect_branch(store, branch, session_state)?;
+    }
+    Ok(state)
+}
+
+fn sorted_graph_entries(
+    state: &mut GraphBuildState,
     store: &impl NodeStore,
+) -> Result<Vec<GraphNodeEntry>> {
+    let mut entries = state.node_entries(store)?;
+    entries.sort_by(graph_entry_order);
+    Ok(entries)
+}
+
+fn graph_entry_order(left: &GraphNodeEntry, right: &GraphNodeEntry) -> std::cmp::Ordering {
+    left.node
+        .created_at
+        .to_string()
+        .cmp(&right.node.created_at.to_string())
+        .then_with(|| left.node.id.cmp(&right.node.id))
+}
+
+fn graph_items_from_entries(entries: Vec<GraphNodeEntry>) -> (Vec<GraphNode>, Vec<GraphEdge>) {
+    let mut nodes = Vec::with_capacity(entries.len());
+    let mut edges = Vec::new();
+    for entry in entries {
+        edges.extend(graph_edges_from_entry(&entry));
+        nodes.push(graph_node_from_entry(entry));
+    }
+    (nodes, edges)
+}
+
+fn graph_edges_from_entry(entry: &GraphNodeEntry) -> Vec<GraphEdge> {
+    let mut edges = primary_graph_edge(entry).into_iter().collect::<Vec<_>>();
+    edges.extend(
+        entry
+            .merge_parents
+            .iter()
+            .map(|parent| merge_graph_edge(parent, &entry.node.id)),
+    );
+    edges
+}
+
+fn primary_graph_edge(entry: &GraphNodeEntry) -> Option<GraphEdge> {
+    entry.primary_parent.as_ref().map(|parent| GraphEdge {
+        source: parent.clone(),
+        target: entry.node.id.clone(),
+        kind: GraphEdgeKind::Primary,
+    })
+}
+
+fn merge_graph_edge(parent: &MergeParent, target: &str) -> GraphEdge {
+    GraphEdge {
+        source: parent.node_id().to_owned(),
+        target: target.to_owned(),
+        kind: graph_merge_edge_kind(parent),
+    }
+}
+
+fn graph_merge_edge_kind(parent: &MergeParent) -> GraphEdgeKind {
+    if parent.is_shadow() {
+        GraphEdgeKind::Shadow
+    } else {
+        GraphEdgeKind::Merge
+    }
+}
+
+fn graph_node_from_entry(entry: GraphNodeEntry) -> GraphNode {
+    GraphNode {
+        id: entry.node.id.clone(),
+        short_id: shorten_id(&entry.node.id),
+        kind: graph_kind_name(&entry.node).to_owned(),
+        role: format!("{:?}", entry.node.role),
+        created_at: entry.node.created_at.to_string(),
+        created_at_ns: entry.node.created_at.as_nanosecond(),
+        content: render_node_content(&entry.node),
+        summary: summarize_node(&entry.node),
+        labels: render_graph_labels(&entry.labels),
+    }
+}
+
+impl GraphBuildState {
+    fn new(mode: GraphMode) -> Self {
+        Self {
+            mode,
+            visible_node_ids: BTreeSet::new(),
+            visible_nodes: HashMap::new(),
+            visible_node_scopes: HashMap::new(),
+            labels_by_node: HashMap::new(),
+            branches: Vec::new(),
+        }
+    }
+
+    fn collect_branch(
+        &mut self,
+        store: &(impl BranchStore + NodeStore),
+        branch: String,
+        state: SessionState,
+    ) -> Result<()> {
+        let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
+        let scope = self.collect_branch_scope(store, &head_id)?;
+        let visible_head_id = self.resolve_visible_parent(store, &scope.node_ids, &head_id)?;
+        self.add_branch_label(&branch, &state, visible_head_id.as_deref());
+        self.branches.push(GraphBranch {
+            name: branch,
+            head_id,
+            visible_head_id,
+            state,
+        });
+        Ok(())
+    }
+
+    fn collect_branch_scope(
+        &mut self,
+        store: &impl NodeStore,
+        head_id: &str,
+    ) -> Result<BranchGraphScope> {
+        let mut scope_node_ids = initial_graph_scope(store, head_id, self.mode)?;
+        let mut branch_visible_node_ids = BTreeSet::new();
+        collect_visible_graph_nodes(
+            store,
+            head_id,
+            &mut scope_node_ids,
+            self.mode,
+            &mut self.visible_node_ids,
+            &mut self.visible_nodes,
+            &mut branch_visible_node_ids,
+        )?;
+        self.merge_visible_node_scopes(&scope_node_ids, &branch_visible_node_ids);
+        Ok(BranchGraphScope {
+            node_ids: scope_node_ids,
+        })
+    }
+
+    fn merge_visible_node_scopes(
+        &mut self,
+        scope_node_ids: &BTreeSet<String>,
+        visible_node_ids: &BTreeSet<String>,
+    ) {
+        for node_id in visible_node_ids {
+            self.visible_node_scopes
+                .entry(node_id.clone())
+                .or_default()
+                .extend(scope_node_ids.iter().cloned());
+        }
+    }
+
+    fn add_branch_label(
+        &mut self,
+        branch: &str,
+        state: &SessionState,
+        visible_head_id: Option<&str>,
+    ) {
+        let Some(label_node_id) = visible_head_id else {
+            return;
+        };
+        self.labels_by_node
+            .entry(label_node_id.to_owned())
+            .or_default()
+            .push(GraphBranchLabel {
+                branch: branch.to_owned(),
+                state: state.clone(),
+            });
+    }
+
+    fn node_entries(&mut self, store: &impl NodeStore) -> Result<Vec<GraphNodeEntry>> {
+        std::mem::take(&mut self.visible_nodes)
+            .into_values()
+            .map(|node| self.node_entry(store, node))
+            .collect()
+    }
+
+    fn node_entry(&mut self, store: &impl NodeStore, node: Node) -> Result<GraphNodeEntry> {
+        let scope_node_ids = self
+            .visible_node_scopes
+            .remove(&node.id)
+            .unwrap_or_default();
+        let primary_parent = self.resolve_visible_parent(store, &scope_node_ids, &node.parent)?;
+        let merge_parents =
+            self.visible_merge_parents(store, &node, &scope_node_ids, &primary_parent)?;
+        let labels = self.labels_by_node.remove(&node.id).unwrap_or_default();
+        Ok(GraphNodeEntry {
+            node,
+            primary_parent,
+            merge_parents,
+            labels,
+        })
+    }
+
+    fn visible_merge_parents(
+        &self,
+        store: &impl NodeStore,
+        node: &Node,
+        scope_node_ids: &BTreeSet<String>,
+        primary_parent: &Option<String>,
+    ) -> Result<Vec<MergeParent>> {
+        let Some(anchor) = node_anchor(node) else {
+            return Ok(Vec::new());
+        };
+
+        let mut parents = Vec::new();
+        for merge_parent in anchor.merge_parents() {
+            self.push_visible_merge_parent(
+                store,
+                scope_node_ids,
+                primary_parent,
+                merge_parent,
+                &mut parents,
+            )?;
+        }
+        Ok(parents)
+    }
+
+    fn push_visible_merge_parent(
+        &self,
+        store: &impl NodeStore,
+        scope_node_ids: &BTreeSet<String>,
+        primary_parent: &Option<String>,
+        merge_parent: &MergeParent,
+        parents: &mut Vec<MergeParent>,
+    ) -> Result<()> {
+        let Some(parent_id) =
+            self.resolve_visible_parent(store, scope_node_ids, merge_parent.node_id())?
+        else {
+            return Ok(());
+        };
+        if is_duplicate_visible_merge_parent(primary_parent, parents, &parent_id) {
+            return Ok(());
+        }
+        parents.push(visible_merge_parent(merge_parent, parent_id));
+        Ok(())
+    }
+
+    fn resolve_visible_parent(
+        &self,
+        store: &impl NodeStore,
+        scope_node_ids: &BTreeSet<String>,
+        start_id: &str,
+    ) -> Result<Option<String>> {
+        resolve_visible_parent(store, &self.visible_node_ids, scope_node_ids, start_id)
+    }
+}
+
+impl<S: NodeStore> VisibleGraphCollector<'_, S> {
+    fn collect(&mut self) -> Result<()> {
+        while let Some(node_id) = self.next_node_id() {
+            self.visit(node_id)?;
+        }
+        Ok(())
+    }
+
+    fn next_node_id(&mut self) -> Option<String> {
+        while let Some(node_id) = self.pending.pop() {
+            if self.should_visit(&node_id) {
+                return Some(node_id);
+            }
+        }
+        None
+    }
+
+    fn should_visit(&mut self, node_id: &str) -> bool {
+        !node_id.is_empty()
+            && self.scope_node_ids.contains(node_id)
+            && self.visited.insert(node_id.to_owned())
+    }
+
+    fn visit(&mut self, node_id: String) -> Result<()> {
+        let node = self.store.get_node(&node_id).context(StoreSnafu)?;
+        if node.is_root() {
+            return Ok(());
+        }
+        self.enqueue_traversal_targets(&node)?;
+        self.record_if_visible(node);
+        Ok(())
+    }
+
+    fn enqueue_traversal_targets(&mut self, node: &Node) -> Result<()> {
+        self.enqueue_primary_parent(node);
+        self.enqueue_merge_parents(node);
+        self.enqueue_skill_invocation_subtrees(node)
+    }
+
+    fn enqueue_primary_parent(&mut self, node: &Node) {
+        if should_follow_primary_parent(node, self.mode) {
+            self.push_node(node.parent.clone());
+        }
+    }
+
+    fn enqueue_merge_parents(&mut self, node: &Node) {
+        let Some(anchor) = node_anchor(node) else {
+            return;
+        };
+        for merge_parent in anchor.merge_parents() {
+            self.push_node(merge_parent.node_id().to_owned());
+        }
+    }
+
+    fn enqueue_skill_invocation_subtrees(&mut self, node: &Node) -> Result<()> {
+        if node.kind.as_tool_uses().is_none() {
+            return Ok(());
+        }
+        collect_visible_skill_invocation_subtrees(
+            self.store,
+            &node.id,
+            self.scope_node_ids,
+            &mut self.pending,
+        )
+    }
+
+    fn record_if_visible(&mut self, node: Node) {
+        if !is_visible_graph_node(&node, self.mode) {
+            return;
+        }
+        self.visible_node_ids.insert(node.id.clone());
+        self.branch_visible_node_ids.insert(node.id.clone());
+        self.visible_nodes.insert(node.id.clone(), node);
+    }
+
+    fn push_node(&mut self, node_id: String) {
+        push_scoped_graph_node(self.scope_node_ids, &mut self.pending, node_id);
+    }
+}
+
+fn sorted_session_states(store: &impl SessionStore) -> Result<Vec<(String, SessionState)>> {
+    let mut branches = store
+        .list_session_states()
+        .context(StoreSnafu)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    branches.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(branches)
+}
+
+fn node_anchor(node: &Node) -> Option<&Anchor> {
+    match &node.kind {
+        Kind::Anchor(anchor) => Some(anchor),
+        _ => None,
+    }
+}
+
+fn should_follow_primary_parent(node: &Node, mode: GraphMode) -> bool {
+    mode == GraphMode::All || !is_provider_context_start(node)
+}
+
+fn is_duplicate_visible_merge_parent(
+    primary_parent: &Option<String>,
+    parents: &[MergeParent],
+    parent_id: &str,
+) -> bool {
+    primary_parent.as_deref() == Some(parent_id)
+        || parents
+            .iter()
+            .any(|existing| existing.node_id() == parent_id)
+}
+
+fn collect_visible_graph_nodes<S: NodeStore>(
+    store: &S,
     head_id: &str,
     scope_node_ids: &mut BTreeSet<String>,
     mode: GraphMode,
@@ -263,51 +516,17 @@ fn collect_visible_graph_nodes(
     visible_nodes: &mut HashMap<String, Node>,
     branch_visible_node_ids: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let mut pending = vec![head_id.to_owned()];
-    let mut visited = BTreeSet::new();
-
-    while let Some(node_id) = pending.pop() {
-        if node_id.is_empty() || !visited.insert(node_id.clone()) {
-            continue;
-        }
-        if !scope_node_ids.contains(&node_id) {
-            continue;
-        }
-
-        let node = store.get_node(&node_id).context(StoreSnafu)?;
-        if node.is_root() {
-            continue;
-        }
-
-        if mode == GraphMode::All || !is_provider_context_start(&node) {
-            push_scoped_graph_node(scope_node_ids, &mut pending, node.parent.clone());
-        }
-        if let Kind::Anchor(anchor) = &node.kind {
-            for merge_parent in anchor.merge_parents() {
-                push_scoped_graph_node(
-                    scope_node_ids,
-                    &mut pending,
-                    merge_parent.node_id().to_owned(),
-                );
-            }
-        }
-        if node.kind.as_tool_uses().is_some() {
-            collect_visible_skill_invocation_subtrees(
-                store,
-                &node.id,
-                scope_node_ids,
-                &mut pending,
-            )?;
-        }
-
-        if is_visible_graph_node(&node, mode) {
-            visible_node_ids.insert(node.id.clone());
-            branch_visible_node_ids.insert(node.id.clone());
-            visible_nodes.insert(node.id.clone(), node);
-        }
+    VisibleGraphCollector {
+        store,
+        mode,
+        scope_node_ids,
+        visible_node_ids,
+        visible_nodes,
+        branch_visible_node_ids,
+        pending: vec![head_id.to_owned()],
+        visited: BTreeSet::new(),
     }
-
-    Ok(())
+    .collect()
 }
 
 fn initial_graph_scope(
@@ -338,21 +557,24 @@ fn collect_provider_context_node_ids(
     store: &impl NodeStore,
     head_id: &str,
 ) -> Result<BTreeSet<String>> {
-    let mut node_ids = BTreeSet::new();
+    let ancestry = store.ancestry(head_id).context(StoreSnafu)?;
+    Ok(provider_context_node_ids(ancestry))
+}
 
-    for node in store.ancestry(head_id).context(StoreSnafu)? {
-        if node.is_root() {
-            break;
-        }
+fn provider_context_node_ids(ancestry: Vec<Node>) -> BTreeSet<String> {
+    ancestry
+        .into_iter()
+        .take_while(|node| !node.is_root())
+        .scan(false, provider_context_node_id)
+        .collect()
+}
 
-        let is_context_start = is_provider_context_start(&node);
-        node_ids.insert(node.id);
-        if is_context_start {
-            break;
-        }
+fn provider_context_node_id(done: &mut bool, node: Node) -> Option<String> {
+    if *done {
+        return None;
     }
-
-    Ok(node_ids)
+    *done = is_provider_context_start(&node);
+    Some(node.id)
 }
 
 fn is_provider_context_start(node: &Node) -> bool {
@@ -437,25 +659,36 @@ fn resolve_visible_parent(
     scope_node_ids: &BTreeSet<String>,
     start_id: &str,
 ) -> Result<Option<String>> {
-    if start_id.is_empty() {
+    let Some(start_id) = non_empty_node_id(start_id) else {
         return Ok(None);
-    }
+    };
 
-    let mut current_id = start_id.to_owned();
-    loop {
-        if !scope_node_ids.contains(&current_id) {
-            return Ok(None);
-        }
-        if visible_node_ids.contains(&current_id) {
-            return Ok(Some(current_id));
-        }
+    let ancestry = store.ancestry(start_id).context(StoreSnafu)?;
+    Ok(visible_parent_in_ancestry(
+        ancestry,
+        visible_node_ids,
+        scope_node_ids,
+    ))
+}
 
-        let node = store.get_node(&current_id).context(StoreSnafu)?;
-        if node.is_root() {
-            return Ok(None);
-        }
-        current_id = node.parent;
-    }
+fn non_empty_node_id(node_id: &str) -> Option<&str> {
+    (!node_id.is_empty()).then_some(node_id)
+}
+
+fn visible_parent_in_ancestry(
+    ancestry: Vec<Node>,
+    visible_node_ids: &BTreeSet<String>,
+    scope_node_ids: &BTreeSet<String>,
+) -> Option<String> {
+    ancestry
+        .into_iter()
+        .take_while(|node| is_scoped_non_root(node, scope_node_ids))
+        .find(|node| visible_node_ids.contains(&node.id))
+        .map(|node| node.id)
+}
+
+fn is_scoped_non_root(node: &Node, scope_node_ids: &BTreeSet<String>) -> bool {
+    scope_node_ids.contains(&node.id) && !node.is_root()
 }
 
 fn visible_merge_parent(parent: &MergeParent, node_id: String) -> MergeParent {
