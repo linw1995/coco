@@ -14,7 +14,6 @@ crap_args=(
   --threshold "${crap_threshold}"
 )
 crap_allow_args=(
-  --allow "refresh_on_graph_version"
   --allow "render_full_viewport"
   --allow "drain_viewport_patches"
 )
