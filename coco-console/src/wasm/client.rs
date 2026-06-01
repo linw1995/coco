@@ -136,6 +136,7 @@ impl From<GraphViewport> for ViewportState {
             height: f64::from(value.height),
             overscan: value.overscan,
         }
+        .with_render_overscan()
     }
 }
 
@@ -898,7 +899,7 @@ fn stored_auto_follow_value(window: &Window) -> Option<String> {
 impl ViewportState {
     fn load(window: &Window) -> Option<Self> {
         let value = stored_viewport_value(window)?;
-        parse_stored_viewport(&value)
+        parse_stored_viewport(&value).map(ViewportState::with_render_overscan)
     }
 }
 
@@ -3119,6 +3120,25 @@ mod tests {
             graph.follow_toggle.text_content().as_deref(),
             Some("Following")
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_normalizes_stored_viewport_overscan() {
+        let window = web_sys::window().expect_throw("window should be available");
+        session_storage(&window)
+            .expect_throw("session storage should be available")
+            .set_item(VIEWPORT_KEY, "10,20,1000,600,200")
+            .expect_throw("stored viewport should be written");
+
+        let fixture = GraphFixture::new();
+        let graph = fixture.graph.borrow();
+
+        assert_eq!(rounded_i32(graph.viewport.x), 10);
+        assert_eq!(rounded_i32(graph.viewport.y), 20);
+        assert_eq!(rounded_i32(graph.viewport.width), 1000);
+        assert_eq!(rounded_i32(graph.viewport.height), 600);
+        assert_eq!(graph.viewport.overscan, graph.viewport.render_overscan());
+        assert_eq!(graph.viewport.overscan, 1800);
     }
 
     #[wasm_bindgen_test]

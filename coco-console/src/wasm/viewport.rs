@@ -28,6 +28,11 @@ impl ViewportState {
         self.overscan = self.render_overscan();
     }
 
+    pub fn with_render_overscan(mut self) -> Self {
+        self.refresh_render_overscan();
+        self
+    }
+
     pub fn render_overscan(self) -> i32 {
         ((self.width.max(self.height) / 2.0)
             .max(self.height * COLLAPSED_LANE_OVERSCAN_HEIGHT_MULTIPLIER)
@@ -256,6 +261,20 @@ mod tests {
         };
 
         assert_eq!(viewport.render_overscan(), 1800);
+    }
+
+    #[test]
+    fn with_render_overscan_normalizes_stale_values() {
+        let viewport = ViewportState {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 600.0,
+            overscan: 200,
+        }
+        .with_render_overscan();
+
+        assert_eq!(viewport.overscan, 1800);
     }
 
     #[test]
