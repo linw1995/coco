@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::rc::Rc;
 use std::str::{FromStr, Split};
 
@@ -1084,9 +1085,7 @@ fn finish_applied_viewport_patch(graph: &mut VirtualGraph) -> bool {
 }
 
 async fn refresh_graph_items_on_version(graph: Rc<RefCell<VirtualGraph>>) {
-    loop {
-        refresh_graph_items_once(graph.clone()).await;
-    }
+    refresh_on_version(graph, refresh_graph_items_once).await;
 }
 
 async fn refresh_graph_items_once(graph: Rc<RefCell<VirtualGraph>>) {
@@ -1247,8 +1246,16 @@ async fn delay_ms(window: &Window, delay_ms: i32) -> Result<(), JsValue> {
 }
 
 async fn refresh_server_rendered_sections_on_version(graph: Rc<RefCell<VirtualGraph>>) {
+    refresh_on_version(graph, refresh_server_rendered_sections_once).await;
+}
+
+async fn refresh_on_version<F, Fut>(graph: Rc<RefCell<VirtualGraph>>, refresh_once: F)
+where
+    F: Fn(Rc<RefCell<VirtualGraph>>) -> Fut,
+    Fut: Future<Output = ()>,
+{
     loop {
-        refresh_server_rendered_sections_once(graph.clone()).await;
+        refresh_once(graph.clone()).await;
     }
 }
 
