@@ -20,6 +20,7 @@ logs
 .agents/
 .coco-workspace/
 .coco-store/
+.coco-store-*/
 .codex
 skills-lock.json
 .ml-cache/

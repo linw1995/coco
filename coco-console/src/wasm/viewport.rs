@@ -1,4 +1,6 @@
 pub const MIN_OVERSCAN: i32 = 180;
+const SHORT_CANVAS_VISIBLE_WIDTH_FRACTION: f64 = 0.74;
+const SHORT_CANVAS_VISIBLE_HEIGHT_FRACTION: f64 = 0.82;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ViewportState {
@@ -101,11 +103,58 @@ pub fn rounded_i32(value: f64) -> i32 {
     value.round().clamp(0.0, f64::from(i32::MAX)) as i32
 }
 
+pub fn short_canvas_auto_zoom(
+    client_width: f64,
+    client_height: f64,
+    canvas_width: f64,
+    canvas_height: f64,
+    current_zoom: f64,
+) -> f64 {
+    if [
+        client_width,
+        client_height,
+        canvas_width,
+        canvas_height,
+        current_zoom,
+    ]
+    .into_iter()
+    .any(|value| value <= 0.0)
+    {
+        return current_zoom;
+    }
+
+    let width_zoom = short_axis_zoom(
+        client_width,
+        canvas_width,
+        current_zoom,
+        SHORT_CANVAS_VISIBLE_WIDTH_FRACTION,
+    );
+    let height_zoom = short_axis_zoom(
+        client_height,
+        canvas_height,
+        current_zoom,
+        SHORT_CANVAS_VISIBLE_HEIGHT_FRACTION,
+    );
+    width_zoom.max(height_zoom)
+}
+
+fn short_axis_zoom(
+    client_size: f64,
+    canvas_size: f64,
+    current_zoom: f64,
+    visible_fraction: f64,
+) -> f64 {
+    if canvas_size >= client_size {
+        return current_zoom;
+    }
+    (client_size / (canvas_size * visible_fraction)).max(current_zoom)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ViewportState, lane_visible_in_viewport, needs_full_viewport_fetch,
-        needs_full_viewport_jump_fetch, same_viewport,
+        needs_full_viewport_jump_fetch, same_viewport, short_canvas_auto_zoom,
     };
 
     fn viewport(x: f64, y: f64) -> ViewportState {
@@ -200,5 +249,22 @@ mod tests {
                 overscan: 200,
             }
         ));
+    }
+
+    #[test]
+    fn short_canvas_auto_zoom_shows_a_partial_enlarged_canvas() {
+        let zoom = short_canvas_auto_zoom(1000.0, 600.0, 720.0, 420.0, 1.0);
+
+        assert!(zoom > 1.0);
+        assert!(1000.0 / zoom < 720.0);
+        assert!(600.0 / zoom < 420.0);
+    }
+
+    #[test]
+    fn short_canvas_auto_zoom_keeps_large_canvas_zoom() {
+        assert_eq!(
+            short_canvas_auto_zoom(1000.0, 600.0, 1600.0, 900.0, 1.25),
+            1.25
+        );
     }
 }

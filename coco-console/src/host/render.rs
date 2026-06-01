@@ -115,11 +115,15 @@ fn mode_switch_class(active: bool) -> &'static str {
 
 fn render_content(snapshot: &GraphSnapshot) -> AnyView {
     let graph_shell = render_graph_shell();
+    let time_scale = render_time_scale(snapshot);
     let side = render_side(snapshot);
 
     view! {
         <section class="content">
-            <div class="graph-shell" inner_html=graph_shell></div>
+            <div class="graph-shell">
+                <div class="graph-surface" inner_html=graph_shell></div>
+                {time_scale}
+            </div>
             {side}
         </section>
     }
@@ -132,18 +136,122 @@ fn render_graph_shell() -> String {
         .expect("graph shell template should render")
 }
 
-fn render_selection_style(snapshot: &GraphSnapshot) -> String {
-    snapshot
+fn render_time_scale(snapshot: &GraphSnapshot) -> AnyView {
+    let ticks = time_scale_ticks(snapshot);
+    let Some(first) = ticks.first() else {
+        return view! {
+            <nav class="time-scale time-scale-empty" aria-label="Graph time navigator">
+                <div class="time-scale-track">
+                    <div class="time-scale-cursor" style="left: 50%;">
+                        <span class="time-scale-label">"No time data"</span>
+                    </div>
+                </div>
+                <div class="time-scale-extents">
+                    <span>"-"</span>
+                    <span>"-"</span>
+                </div>
+            </nav>
+        }
+        .into_any();
+    };
+    let cursor_label = first.label.clone();
+    let tick_views = ticks
+        .iter()
+        .map(|tick| {
+            let style = format!("left: {:.4}%;", tick.position);
+            let graph_x = format!("{:.3}", tick.graph_x);
+            let position = format!("{:.6}", tick.position);
+            let time_ns = tick.time_ns.to_string();
+            let label = tick.label.clone();
+            let title = tick.label.clone();
+            view! {
+                <span
+                    class="time-scale-tick"
+                    style=style
+                    data-graph-x=graph_x
+                    data-position=position
+                    data-time-ns=time_ns
+                    data-time-label=label
+                    title=title
+                ></span>
+            }
+        })
+        .collect::<Vec<_>>();
+    let min_label = first.label.clone();
+    let max_label = ticks
+        .last()
+        .map(|tick| tick.label.clone())
+        .unwrap_or_else(|| first.label.clone());
+
+    view! {
+        <nav class="time-scale" aria-label="Graph time navigator" tabindex="0">
+            <div class="time-scale-track">
+                {tick_views}
+                <div class="time-scale-cursor" style="left: 0%;">
+                    <span class="time-scale-label">{cursor_label}</span>
+                </div>
+            </div>
+            <div class="time-scale-extents">
+                <span>{min_label}</span>
+                <span>{max_label}</span>
+            </div>
+        </nav>
+    }
+    .into_any()
+}
+
+#[derive(Debug)]
+struct TimeScaleTick {
+    time_ns: i128,
+    label: String,
+    graph_x: f64,
+    position: f64,
+}
+
+fn time_scale_ticks(snapshot: &GraphSnapshot) -> Vec<TimeScaleTick> {
+    let layout = layout_graph(snapshot);
+    let mut graph_x_by_node = std::collections::BTreeMap::<&str, i32>::new();
+    for occurrence in &layout.occurrences {
+        graph_x_by_node
+            .entry(occurrence.node_id.as_str())
+            .or_insert(occurrence.point.x);
+    }
+
+    let mut ticks = snapshot
         .nodes
         .iter()
-        .map(|node| {
-            let target = node_target_id(&node.id);
-            format!(
-                "body:has(#{target}:target) [data-node-target=\"{target}\"] .core {{ stroke: #facc15; stroke-width: 3.2; }}"
-            )
+        .filter_map(|node| {
+            let graph_x = graph_x_by_node.get(node.id.as_str())?;
+            Some(TimeScaleTick {
+                time_ns: node.created_at_ns,
+                label: node.created_at.clone(),
+                graph_x: f64::from(*graph_x),
+                position: 0.0,
+            })
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Vec<_>>();
+    ticks.sort_by(|left, right| {
+        left.time_ns
+            .cmp(&right.time_ns)
+            .then_with(|| left.graph_x.total_cmp(&right.graph_x))
+    });
+    let tick_count = ticks.len();
+    for (index, tick) in ticks.iter_mut().enumerate() {
+        tick.position = time_scale_position_for_index(index, tick_count);
+    }
+    ticks
+}
+
+fn time_scale_position_for_index(index: usize, tick_count: usize) -> f64 {
+    if tick_count <= 1 {
+        50.0
+    } else {
+        index as f64 / (tick_count - 1) as f64 * 100.0
+    }
+}
+
+fn render_selection_style(_snapshot: &GraphSnapshot) -> String {
+    String::new()
 }
 
 fn render_side(snapshot: &GraphSnapshot) -> AnyView {
