@@ -27,14 +27,12 @@
       ];
 
   wasmCoverageToolchainFor = p: let
-    nightly = p.fenix.fromToolchainName {
-      name = "nightly-2026-01-01";
+    manifest = builtins.fetchurl {
+      url = "https://static.rust-lang.org/dist/2026-01-01/channel-rust-nightly.toml";
       sha256 = "sha256-KTCPimYDgP3en6gZzClSIezJ75wuFRnhhja93KsVxA0=";
     };
-    wasmTarget = p.fenix.targets.wasm32-unknown-unknown.fromToolchainName {
-      name = "nightly-2026-01-01";
-      sha256 = "sha256-KTCPimYDgP3en6gZzClSIezJ75wuFRnhhja93KsVxA0=";
-    };
+    nightly = p.fenix.fromManifestFile manifest;
+    wasmTarget = p.fenix.targets.wasm32-unknown-unknown.fromManifestFile manifest;
   in
     p.fenix.combine [
       nightly.cargo
