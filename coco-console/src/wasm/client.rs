@@ -18,7 +18,7 @@ use super::refresh::{
 use crate::api::{
     GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
     GraphViewportEdgeKind, GraphViewportItems, GraphViewportLane, GraphViewportNode,
-    GraphViewportResponse, Point,
+    GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
 use crate::viewport::{MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport};
 
@@ -47,6 +47,31 @@ struct GraphItemsRefreshInput {
 }
 
 type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>;
+
+struct GraphRootElements {
+    graph_wrap: Element,
+    graph_svg: Element,
+    graph_bg: Element,
+}
+
+struct GraphLayerElements {
+    lane_group: Element,
+    edge_group: Element,
+    node_group: Element,
+}
+
+struct ViewportMapElements {
+    viewport_map: Element,
+    viewport_map_bg: Element,
+    viewport_map_window: Element,
+}
+
+struct VirtualGraphElements {
+    root: GraphRootElements,
+    layers: GraphLayerElements,
+    viewport_map: ViewportMapElements,
+    status: Option<Element>,
+}
 
 struct ViewportPatchInput {
     window: Window,
@@ -187,38 +212,24 @@ struct VirtualGraph {
 
 impl VirtualGraph {
     fn new(window: Window, document: Document) -> Result<Self, JsValue> {
-        let graph_wrap = query_required(&document, ".graph-wrap")?;
-        let graph_svg = query_required(&document, ".graph")?;
-        let graph_bg = query_required(&document, ".graph-bg")?;
-        let lane_group = query_required(&document, ".graph-lanes")?;
-        let edge_group = query_required(&document, ".graph-edges")?;
-        let node_group = query_required(&document, ".graph-nodes")?;
-        let viewport_map = query_required(&document, ".viewport-map")?;
-        let viewport_map_bg = query_required(&document, ".viewport-map-bg")?;
-        let viewport_map_window = query_required(&document, ".viewport-map-window")?;
-        let status = document.query_selector(".graph-status")?;
-        let zoom = graph_wrap
-            .get_attribute("data-zoom")
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .clamp(MIN_ZOOM, MAX_ZOOM);
-        let viewport = ViewportState::load(&window)
-            .unwrap_or_else(|| viewport_from_element(&graph_wrap, 0.0, 0.0, zoom));
+        let elements = VirtualGraphElements::query(&document)?;
+        let zoom = initial_zoom(&elements.root.graph_wrap);
+        let viewport = initial_viewport(&window, &elements.root.graph_wrap, zoom);
         let version = current_version(&document).unwrap_or_default();
 
         Ok(Self {
             window,
             document,
-            graph_wrap,
-            graph_svg,
-            graph_bg,
-            lane_group,
-            edge_group,
-            node_group,
-            viewport_map,
-            viewport_map_bg,
-            viewport_map_window,
-            status,
+            graph_wrap: elements.root.graph_wrap,
+            graph_svg: elements.root.graph_svg,
+            graph_bg: elements.root.graph_bg,
+            lane_group: elements.layers.lane_group,
+            edge_group: elements.layers.edge_group,
+            node_group: elements.layers.node_group,
+            viewport_map: elements.viewport_map.viewport_map,
+            viewport_map_bg: elements.viewport_map.viewport_map_bg,
+            viewport_map_window: elements.viewport_map.viewport_map_window,
+            status: elements.status,
             viewport,
             zoom,
             canvas: None,
@@ -315,11 +326,8 @@ impl VirtualGraph {
             ..
         } = response;
         self.apply_response_viewport(version, canvas, viewport)?;
-        for item in removed {
-            self.remove_key(&item.key);
-        }
-        self.upsert_graph_items(added, true)?;
-        self.upsert_graph_items(updated, false)?;
+        self.remove_graph_items(removed);
+        self.upsert_diff_items(added, updated)?;
         self.hide_status();
         Ok(())
     }
@@ -391,6 +399,21 @@ impl VirtualGraph {
             self.upsert_node(node, nodes_are_new)?;
         }
         Ok(())
+    }
+
+    fn upsert_diff_items(
+        &mut self,
+        added: GraphViewportItems,
+        updated: GraphViewportItems,
+    ) -> Result<(), JsValue> {
+        self.upsert_graph_items(added, true)?;
+        self.upsert_graph_items(updated, false)
+    }
+
+    fn remove_graph_items(&mut self, items: Vec<GraphViewportRemovedItem>) {
+        for item in items {
+            self.remove_key(&item.key);
+        }
     }
 
     fn upsert_lane(&mut self, lane: GraphViewportLane) -> Result<(), JsValue> {
@@ -566,6 +589,57 @@ impl VirtualGraph {
             controller.abort();
         }
     }
+}
+
+impl VirtualGraphElements {
+    fn query(document: &Document) -> Result<Self, JsValue> {
+        Ok(Self {
+            root: query_graph_root_elements(document)?,
+            layers: query_graph_layer_elements(document)?,
+            viewport_map: query_viewport_map_elements(document)?,
+            status: query_optional(document, ".graph-status"),
+        })
+    }
+}
+
+fn query_optional(document: &Document, selector: &str) -> Option<Element> {
+    document.query_selector(selector).ok().flatten()
+}
+
+fn query_graph_root_elements(document: &Document) -> Result<GraphRootElements, JsValue> {
+    Ok(GraphRootElements {
+        graph_wrap: query_required(document, ".graph-wrap")?,
+        graph_svg: query_required(document, ".graph")?,
+        graph_bg: query_required(document, ".graph-bg")?,
+    })
+}
+
+fn query_graph_layer_elements(document: &Document) -> Result<GraphLayerElements, JsValue> {
+    Ok(GraphLayerElements {
+        lane_group: query_required(document, ".graph-lanes")?,
+        edge_group: query_required(document, ".graph-edges")?,
+        node_group: query_required(document, ".graph-nodes")?,
+    })
+}
+
+fn query_viewport_map_elements(document: &Document) -> Result<ViewportMapElements, JsValue> {
+    Ok(ViewportMapElements {
+        viewport_map: query_required(document, ".viewport-map")?,
+        viewport_map_bg: query_required(document, ".viewport-map-bg")?,
+        viewport_map_window: query_required(document, ".viewport-map-window")?,
+    })
+}
+
+fn initial_zoom(graph_wrap: &Element) -> f64 {
+    graph_wrap
+        .get_attribute("data-zoom")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn initial_viewport(window: &Window, graph_wrap: &Element, zoom: f64) -> ViewportState {
+    ViewportState::load(window).unwrap_or_else(|| viewport_from_element(graph_wrap, 0.0, 0.0, zoom))
 }
 
 impl ViewportState {

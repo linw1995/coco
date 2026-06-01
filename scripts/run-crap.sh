@@ -15,8 +15,6 @@ crap_args=(
 )
 crap_allow_args=(
   --allow "VirtualGraph::upsert_node"
-  --allow "VirtualGraph::apply_diff"
-  --allow "VirtualGraph::new"
   --allow "refresh_on_graph_version"
   --allow "render_full_viewport"
   --allow "drain_viewport_patches"
