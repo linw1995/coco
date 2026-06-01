@@ -18,7 +18,7 @@ use super::refresh::{
 use crate::api::{
     GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
     GraphViewportEdgeKind, GraphViewportItems, GraphViewportLane, GraphViewportNode,
-    GraphViewportResponse, Point,
+    GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
 use crate::viewport::{MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport};
 
@@ -324,11 +324,8 @@ impl VirtualGraph {
             ..
         } = response;
         self.apply_response_viewport(version, canvas, viewport)?;
-        for item in removed {
-            self.remove_key(&item.key);
-        }
-        self.upsert_graph_items(added, true)?;
-        self.upsert_graph_items(updated, false)?;
+        self.remove_graph_items(removed);
+        self.upsert_diff_items(added, updated)?;
         self.hide_status();
         Ok(())
     }
@@ -400,6 +397,21 @@ impl VirtualGraph {
             self.upsert_node(node, nodes_are_new)?;
         }
         Ok(())
+    }
+
+    fn upsert_diff_items(
+        &mut self,
+        added: GraphViewportItems,
+        updated: GraphViewportItems,
+    ) -> Result<(), JsValue> {
+        self.upsert_graph_items(added, true)?;
+        self.upsert_graph_items(updated, false)
+    }
+
+    fn remove_graph_items(&mut self, items: Vec<GraphViewportRemovedItem>) {
+        for item in items {
+            self.remove_key(&item.key);
+        }
     }
 
     fn upsert_lane(&mut self, lane: GraphViewportLane) -> Result<(), JsValue> {
