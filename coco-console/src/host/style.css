@@ -55,6 +55,34 @@ body {
   margin: 0;
 }
 
+.topbar-actions {
+  align-items: center;
+  display: flex;
+  gap: 0.85rem;
+}
+
+.mode-switch {
+  background: rgba(15, 23, 42, 0.78);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  display: inline-flex;
+  padding: 0.15rem;
+}
+
+.mode-switch-item {
+  border-radius: 6px;
+  color: #94a3b8;
+  font-size: 0.78rem;
+  line-height: 1;
+  padding: 0.42rem 0.58rem;
+  text-decoration: none;
+}
+
+.mode-switch-item.active {
+  background: #e7edf7;
+  color: #111827;
+}
+
 .content {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);

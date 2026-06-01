@@ -9,7 +9,8 @@ use serde_json::json;
 
 use crate::api::{GraphViewportItemKind, Point};
 use crate::graph::{
-    GraphBranch, GraphEdge, GraphEdgeKind, GraphNode, GraphSnapshot, build_graph_snapshot,
+    GraphBranch, GraphEdge, GraphEdgeKind, GraphMode, GraphNode, GraphSnapshot,
+    build_graph_snapshot, build_graph_snapshot_with_mode,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::layout::{
@@ -56,6 +57,7 @@ fn graph_node(id: &str, created_at_ns: i128) -> GraphNode {
 fn two_node_snapshot(version: u64) -> GraphSnapshot {
     GraphSnapshot {
         version,
+        mode: GraphMode::All,
         root_id: "root".to_owned(),
         nodes: vec![graph_node("base", 0), graph_node("merged", 1)],
         edges: vec![GraphEdge {
@@ -66,6 +68,7 @@ fn two_node_snapshot(version: u64) -> GraphSnapshot {
         branches: vec![GraphBranch {
             name: "main".to_owned(),
             head_id: "merged".to_owned(),
+            visible_head_id: Some("merged".to_owned()),
             state: SessionState::Active,
         }],
     }
@@ -74,6 +77,7 @@ fn two_node_snapshot(version: u64) -> GraphSnapshot {
 fn empty_snapshot(version: u64) -> GraphSnapshot {
     GraphSnapshot {
         version,
+        mode: GraphMode::All,
         root_id: "root".to_owned(),
         nodes: Vec::new(),
         edges: Vec::new(),
@@ -102,12 +106,14 @@ fn linear_snapshot(version: u64, node_ids: &[&str]) -> GraphSnapshot {
 
     GraphSnapshot {
         version,
+        mode: GraphMode::All,
         root_id: "root".to_owned(),
         nodes,
         edges,
         branches: vec![GraphBranch {
             name: "main".to_owned(),
             head_id,
+            visible_head_id: node_ids.last().map(|node_id| (*node_id).to_owned()),
             state: SessionState::Active,
         }],
     }
@@ -361,6 +367,121 @@ fn graph_snapshot_contains_shadow_parent_edges() {
         target: prompt,
         kind: GraphEdgeKind::Shadow,
     }));
+}
+
+#[test]
+fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &session).unwrap();
+    store.fork("draft", &session).unwrap();
+
+    let main_anchor = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "main anchor".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    let main_hidden = store
+        .append(NewNode {
+            parent: main_anchor.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("main hidden".to_owned()),
+        })
+        .unwrap();
+    let draft_anchor = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "draft anchor".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    let draft_hidden = store
+        .append(NewNode {
+            parent: draft_anchor.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("draft hidden".to_owned()),
+        })
+        .unwrap();
+    let merge_anchor = store
+        .append(NewNode {
+            parent: main_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                vec![MergeParent::merge(draft_hidden.clone())],
+                PromptAnchor {
+                    prompt: "merge anchor".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &session, &merge_anchor)
+        .unwrap();
+    store
+        .set_branch_head("draft", &session, &draft_hidden)
+        .unwrap();
+
+    let snapshot = build_graph_snapshot_with_mode(&store, 11, GraphMode::Anchors).unwrap();
+    let node_ids = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(snapshot.mode, GraphMode::Anchors);
+    assert!(snapshot.nodes.iter().all(|node| node.kind != "text"));
+    assert!(!node_ids.contains(&main_hidden.as_str()));
+    assert!(!node_ids.contains(&draft_hidden.as_str()));
+    assert!(snapshot.edges.contains(&GraphEdge {
+        source: main_anchor.clone(),
+        target: merge_anchor.clone(),
+        kind: GraphEdgeKind::Primary,
+    }));
+    assert!(snapshot.edges.contains(&GraphEdge {
+        source: draft_anchor.clone(),
+        target: merge_anchor.clone(),
+        kind: GraphEdgeKind::Merge,
+    }));
+    assert!(snapshot.branches.iter().any(|branch| branch.name == "draft"
+        && branch.head_id == draft_hidden
+        && branch.visible_head_id.as_deref() == Some(draft_anchor.as_str())));
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == merge_anchor)
+            .expect("merge anchor should be visible")
+            .labels
+            .contains(&"main".to_owned())
+    );
 }
 
 #[test]
@@ -625,6 +746,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
 fn layout_expands_empty_columns_from_event_order() {
     let snapshot = GraphSnapshot {
         version: 1,
+        mode: GraphMode::All,
         root_id: "root".to_owned(),
         nodes: vec![
             graph_node("base", 0),
@@ -640,6 +762,7 @@ fn layout_expands_empty_columns_from_event_order() {
         branches: vec![GraphBranch {
             name: "main".to_owned(),
             head_id: "merged".to_owned(),
+            visible_head_id: Some("merged".to_owned()),
             state: SessionState::Active,
         }],
     };
@@ -657,6 +780,7 @@ fn layout_expands_empty_columns_from_event_order() {
 fn graph_viewport_response_includes_canvas_and_visible_nodes() {
     let snapshot = GraphSnapshot {
         version: 11,
+        mode: GraphMode::All,
         root_id: "root".to_owned(),
         nodes: vec![
             graph_node("base", 0),
@@ -672,6 +796,7 @@ fn graph_viewport_response_includes_canvas_and_visible_nodes() {
         branches: vec![GraphBranch {
             name: "main".to_owned(),
             head_id: "merged".to_owned(),
+            visible_head_id: Some("merged".to_owned()),
             state: SessionState::Active,
         }],
     };
@@ -752,6 +877,7 @@ fn graph_viewport_uses_unique_keys_for_duplicate_node_occurrences() {
     snapshot.branches.push(GraphBranch {
         name: "side".to_owned(),
         head_id: "merged".to_owned(),
+        visible_head_id: Some("merged".to_owned()),
         state: SessionState::Active,
     });
 
@@ -787,6 +913,7 @@ fn graph_viewport_uses_unique_keys_for_duplicate_edge_occurrences() {
     snapshot.branches.push(GraphBranch {
         name: "side".to_owned(),
         head_id: "merged".to_owned(),
+        visible_head_id: Some("merged".to_owned()),
         state: SessionState::Active,
     });
 
@@ -1493,12 +1620,14 @@ fn streamed_graph_markup_escapes_dynamic_values() {
     node.labels = vec!["main<&".to_owned()];
     let snapshot = GraphSnapshot {
         version: 1,
+        mode: GraphMode::All,
         root_id: "root".to_owned(),
         nodes: vec![node],
         edges: Vec::new(),
         branches: vec![GraphBranch {
             name: "main".to_owned(),
             head_id: "node-\"<&".to_owned(),
+            visible_head_id: Some("node-\"<&".to_owned()),
             state: SessionState::Active,
         }],
     };
@@ -1569,6 +1698,7 @@ fn console_store_lists_message_queues() {
 fn rendered_page_does_not_embed_javascript() {
     let snapshot = GraphSnapshot {
         version: 0,
+        mode: GraphMode::All,
         root_id: "root".to_owned(),
         nodes: Vec::new(),
         edges: Vec::new(),
@@ -1585,6 +1715,7 @@ fn rendered_page_does_not_embed_javascript() {
 fn fragment_renders_refresh_free_console_root() {
     let snapshot = GraphSnapshot {
         version: 0,
+        mode: GraphMode::All,
         root_id: "root".to_owned(),
         nodes: Vec::new(),
         edges: Vec::new(),
@@ -1604,6 +1735,7 @@ fn fragment_renders_refresh_free_console_root() {
 fn index_page_loads_wasm_client_without_document_refresh() {
     let snapshot = GraphSnapshot {
         version: 0,
+        mode: GraphMode::All,
         root_id: "root".to_owned(),
         nodes: Vec::new(),
         edges: Vec::new(),

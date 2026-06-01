@@ -20,7 +20,7 @@ use crate::config::ConsoleConfig;
 use crate::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
 };
-use crate::graph::build_graph_snapshot;
+use crate::graph::{GraphMode, build_graph_snapshot_with_mode};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
@@ -192,11 +192,13 @@ impl AccessLog {
     }
 }
 
-async fn index_page<S>(State(state): State<AppState<S>>) -> Response
+async fn index_page<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+    let query = parse_query(query.as_deref().unwrap_or_default());
+    let mode = graph_mode_from_query(&query);
+    match build_graph_snapshot_with_mode(&state.store, state.publisher.current_version(), mode) {
         Ok(snapshot) => html_response(render_index_page(&snapshot)),
         Err(error) => error_response(error),
     }
@@ -210,11 +212,16 @@ async fn style_css() -> Response {
     )
 }
 
-async fn graph_json<S>(State(state): State<AppState<S>>) -> Response
+async fn graph_json<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+    let query = parse_query(query.as_deref().unwrap_or_default());
+    match build_graph_snapshot_with_mode(
+        &state.store,
+        state.publisher.current_version(),
+        graph_mode_from_query(&query),
+    ) {
         Ok(snapshot) => json_response(&snapshot, "graph"),
         Err(error) => error_response(error),
     }
@@ -226,7 +233,11 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     wait_for_newer_version(&state.publisher, query.version()).await;
-    let snapshot = match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+    let snapshot = match build_graph_snapshot_with_mode(
+        &state.store,
+        state.publisher.current_version(),
+        graph_mode_from_query(&query),
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => return error_response(error),
     };
@@ -289,7 +300,11 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let request = viewport_diff_request_from_query(&query);
-    let snapshot = match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+    let snapshot = match build_graph_snapshot_with_mode(
+        &state.store,
+        state.publisher.current_version(),
+        graph_mode_from_query(&query),
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => return error_response(error),
     };
@@ -311,6 +326,7 @@ where
                 viewport_diff_request_from_query(&query),
                 observed_version,
                 known_canvas_from_query(&query),
+                graph_mode_from_query(&query),
             )
             .await
         }
@@ -323,6 +339,7 @@ async fn graph_viewport_items_diff_response<S>(
     request: GraphViewportDiffRequest,
     mut observed_version: u64,
     known_canvas: Option<GraphCanvas>,
+    mode: GraphMode,
 ) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -330,7 +347,7 @@ where
     loop {
         wait_for_newer_version(&state.publisher, Some(observed_version)).await;
         let current_version = state.publisher.current_version();
-        let snapshot = match build_graph_snapshot(&state.store, current_version) {
+        let snapshot = match build_graph_snapshot_with_mode(&state.store, current_version, mode) {
             Ok(snapshot) => snapshot,
             Err(error) => return error_response(error),
         };
@@ -387,7 +404,11 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     wait_for_newer_version(&state.publisher, query.version()).await;
-    match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+    match build_graph_snapshot_with_mode(
+        &state.store,
+        state.publisher.current_version(),
+        graph_mode_from_query(&query),
+    ) {
         Ok(snapshot) => html_response(render_fragment(&snapshot)),
         Err(error) => error_response(error),
     }
@@ -399,7 +420,11 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     wait_for_newer_version(&state.publisher, query.version()).await;
-    match build_graph_snapshot(&state.store, state.publisher.current_version()) {
+    match build_graph_snapshot_with_mode(
+        &state.store,
+        state.publisher.current_version(),
+        graph_mode_from_query(&query),
+    ) {
         Ok(snapshot) => html_response(render_node_detail_fragment(&snapshot, query.get("target"))),
         Err(error) => error_response(error),
     }
@@ -573,6 +598,18 @@ fn viewport_diff_request_from_query(query: &QueryParams) -> GraphViewportDiffReq
     }
 }
 
+fn graph_mode_from_query(query: &QueryParams) -> GraphMode {
+    if query.get("mode") == Some("all") || query.get("all").is_some_and(is_truthy_query_value) {
+        GraphMode::All
+    } else {
+        GraphMode::Anchors
+    }
+}
+
+fn is_truthy_query_value(value: &str) -> bool {
+    matches!(value, "1" | "true" | "yes" | "on")
+}
+
 fn known_canvas_from_query(query: &QueryParams) -> Option<GraphCanvas> {
     Some(GraphCanvas {
         width: query.i32("canvas_width")?,
@@ -701,7 +738,7 @@ mod tests {
         rendered: &crate::api::GraphViewportResponse,
     ) -> String {
         let mut query = format!(
-            "version={version}&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
+            "version={version}&mode=all&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
             viewport.x,
             viewport.y,
             viewport.width,
