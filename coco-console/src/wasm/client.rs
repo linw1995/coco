@@ -1437,19 +1437,16 @@ fn refresh_inner_html(
 fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
     let branches = document.query_selector_all(".branch[data-lane-y]")?;
     for index in 0..branches.length() {
-        let Some(node) = branches.item(index) else {
-            continue;
-        };
-        let Ok(branch) = node.dyn_into::<Element>() else {
-            continue;
-        };
-        let Some(lane_y) = branch_lane_y(&branch) else {
-            continue;
-        };
-        apply_branch_visibility(
-            &branch,
-            lane_visible_in_viewport(viewport, lane_y, BRANCH_LANE_HALF_HEIGHT),
-        )?;
+        if let Some(branch) = branches
+            .item(index)
+            .and_then(|node| node.dyn_into::<Element>().ok())
+            && let Some(lane_y) = branch_lane_y(&branch)
+        {
+            apply_branch_visibility(
+                &branch,
+                lane_visible_in_viewport(viewport, lane_y, BRANCH_LANE_HALF_HEIGHT),
+            )?;
+        }
     }
     Ok(())
 }
@@ -1459,14 +1456,11 @@ fn branch_lane_y(branch: &Element) -> Option<f64> {
 }
 
 fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> {
-    let class_list = branch.class_list();
     if visible {
-        class_list.remove_1("branch-viewport-hidden")?;
-        class_list.add_1("branch-viewport-visible")?;
+        branch.class_list().remove_1("branch-viewport-hidden")?;
         branch.remove_attribute("aria-hidden")?;
     } else {
-        class_list.remove_1("branch-viewport-visible")?;
-        class_list.add_1("branch-viewport-hidden")?;
+        branch.class_list().add_1("branch-viewport-hidden")?;
         branch.set_attribute("aria-hidden", "true")?;
     }
     Ok(())
