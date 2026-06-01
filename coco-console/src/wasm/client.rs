@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::rc::Rc;
 use std::str::{FromStr, Split};
@@ -33,6 +33,7 @@ const NODE_RADIUS: f64 = 26.0;
 const EDGE_NODE_EXIT: f64 = 42.0;
 const EDGE_TARGET_APPROACH: f64 = 48.0;
 const EDGE_ROUTE_STEP: f64 = 12.0;
+const GRAPH_LANE_HEIGHT: i32 = 140;
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
 const MAX_SHORT_CANVAS_AUTO_ZOOM: f64 = 2.6;
@@ -45,11 +46,16 @@ struct GraphItemsRefreshInput {
     query: String,
 }
 
+#[derive(Clone, Copy)]
+struct LaneDisplay {
+    y: i32,
+    visible: bool,
+}
+
 type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>;
 
 struct GraphRootElements {
     graph_wrap: Element,
-    graph_svg: Element,
     graph_bg: Element,
     follow_toggle: Element,
 }
@@ -130,6 +136,7 @@ impl From<GraphViewport> for ViewportState {
             height: f64::from(value.height),
             overscan: value.overscan,
         }
+        .with_render_overscan()
     }
 }
 
@@ -191,7 +198,6 @@ struct VirtualGraph {
     document: Document,
     graph_mode: String,
     graph_wrap: Element,
-    graph_svg: Element,
     graph_bg: Element,
     follow_toggle: Element,
     lane_group: Element,
@@ -233,7 +239,6 @@ impl VirtualGraph {
             document,
             graph_mode,
             graph_wrap: elements.root.graph_wrap,
-            graph_svg: elements.root.graph_svg,
             graph_bg: elements.root.graph_bg,
             follow_toggle: elements.root.follow_toggle,
             lane_group: elements.layers.lane_group,
@@ -370,6 +375,7 @@ impl VirtualGraph {
             },
             false,
         )?;
+        self.sync_branch_visibility();
         self.hide_status();
         Ok(())
     }
@@ -387,6 +393,7 @@ impl VirtualGraph {
         self.apply_response_viewport(version, canvas, viewport)?;
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
+        self.sync_branch_visibility();
         self.hide_status();
         Ok(())
     }
@@ -449,7 +456,7 @@ impl VirtualGraph {
     }
 
     fn apply_canvas(&self) -> Result<(), JsValue> {
-        apply_graph_viewport(&self.graph_svg, &self.graph_wrap, self.viewport, self.zoom)?;
+        apply_graph_viewport_metadata(&self.graph_wrap, self.viewport, self.zoom)?;
         apply_canvas_dimensions(self.canvas, &self.graph_bg)?;
         apply_time_scale_cursor(
             &self.time_scale,
@@ -533,6 +540,7 @@ impl VirtualGraph {
             [
                 ("id", render_element_id(&lane.key)),
                 ("data-render-key", lane.key.clone()),
+                ("data-lane-y", lane.y.to_string()),
                 ("class", "lane-label".to_owned()),
                 ("x", "64".to_owned()),
                 ("y", lane.y.to_string()),
@@ -554,6 +562,16 @@ impl VirtualGraph {
             [
                 ("id", render_element_id(&edge.key)),
                 ("data-render-key", edge.key.clone()),
+                ("data-source-x", edge.source.x.to_string()),
+                ("data-source-y", edge.source.y.to_string()),
+                ("data-target-x", edge.target.x.to_string()),
+                ("data-target-y", edge.target.y.to_string()),
+                ("data-edge-kind", edge_kind_data(edge.kind).to_owned()),
+                ("data-route-slot", edge.route_slot.to_string()),
+                (
+                    "data-target-port-offset",
+                    edge.target_port_offset.to_string(),
+                ),
             ],
         )?;
         self.edge_group.append_child(&element)?;
@@ -837,7 +855,6 @@ fn query_optional(document: &Document, selector: &str) -> Option<Element> {
 fn query_graph_root_elements(document: &Document) -> Result<GraphRootElements, JsValue> {
     Ok(GraphRootElements {
         graph_wrap: query_required(document, ".graph-wrap")?,
-        graph_svg: query_required(document, ".graph")?,
         graph_bg: query_required(document, ".graph-bg")?,
         follow_toggle: query_required(document, ".follow-toggle")?,
     })
@@ -882,7 +899,7 @@ fn stored_auto_follow_value(window: &Window) -> Option<String> {
 impl ViewportState {
     fn load(window: &Window) -> Option<Self> {
         let value = stored_viewport_value(window)?;
-        parse_stored_viewport(&value)
+        parse_stored_viewport(&value).map(ViewportState::with_render_overscan)
     }
 }
 
@@ -1011,25 +1028,19 @@ fn routed_edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str
     }
 }
 
-fn apply_graph_viewport(
-    graph_svg: &Element,
+fn edge_kind_data(kind: GraphViewportEdgeKind) -> &'static str {
+    match kind {
+        GraphViewportEdgeKind::PrimaryParent => "primary_parent",
+        GraphViewportEdgeKind::Fork => "fork",
+        GraphViewportEdgeKind::MergeParent => "merge_parent",
+    }
+}
+
+fn apply_graph_viewport_metadata(
     graph_wrap: &Element,
     viewport: ViewportState,
     zoom: f64,
 ) -> Result<(), JsValue> {
-    set_attributes(
-        graph_svg,
-        [(
-            "viewBox",
-            format!(
-                "{} {} {} {}",
-                rounded_i32(viewport.x),
-                rounded_i32(viewport.y),
-                rounded_i32(viewport.width),
-                rounded_i32(viewport.height)
-            ),
-        )],
-    )?;
     set_attributes(
         graph_wrap,
         [
@@ -1234,6 +1245,8 @@ fn set_node_link_attributes(
             ("href", format!("#{}", node.node_target)),
             ("data-node-target", node.node_target.clone()),
             ("data-node-id", node.id.clone()),
+            ("data-node-x", node.x.to_string()),
+            ("data-node-y", node.y.to_string()),
         ],
     )
 }
@@ -1712,16 +1725,513 @@ fn refresh_inner_html(
     Ok(())
 }
 
-#[rustfmt::skip]
-fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> { let branches = document.query_selector_all(".branch[data-lane-y]")?; for index in 0..branches.length() { sync_branch_visibility_element(&branches.item(index).expect("query selector index should exist").unchecked_into::<Element>(), viewport)?; } Ok(()) }
+fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
+    let lane_ys = graph_lane_ys(document)?;
+    let visible_lanes = stabilized_visible_graph_item_lanes(document, viewport, &lane_ys)?;
+    let lane_display = compact_lane_display_map(&lane_ys, &visible_lanes);
+    sync_canvas_lane_visibility(document, viewport, &lane_display)?;
+    let branches = document.query_selector_all(".branch[data-lane-y]")?;
+    for index in 0..branches.length() {
+        let branch = branches
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        sync_branch_visibility_element(&branch, &lane_display)?;
+    }
+    Ok(())
+}
 
-#[rustfmt::skip]
-fn sync_branch_visibility_element(branch: &Element, viewport: ViewportState) -> Result<(), JsValue> {
-    branch_lane_y(branch).map(|lane_y| apply_branch_visibility(branch, crate::viewport::lane_visible_in_viewport(viewport, lane_y, 70.0))).unwrap_or(Ok(()))
+fn stabilized_visible_graph_item_lanes(
+    document: &Document,
+    viewport: ViewportState,
+    lane_ys: &BTreeSet<i32>,
+) -> Result<BTreeSet<i32>, JsValue> {
+    let identity_display = BTreeMap::new();
+    let mut visible_lanes = visible_graph_item_lanes(document, viewport, &identity_display)?;
+    for _ in 0..=lane_ys.len() {
+        let lane_display = compact_lane_display_map(lane_ys, &visible_lanes);
+        let display_viewport = ViewportState {
+            y: collapsed_viewport_y(viewport.y, &lane_display),
+            ..viewport
+        };
+        let next_visible_lanes =
+            visible_graph_item_lanes(document, display_viewport, &lane_display)?;
+        if next_visible_lanes == visible_lanes {
+            return Ok(visible_lanes);
+        }
+        visible_lanes = next_visible_lanes;
+    }
+    Ok(visible_lanes)
+}
+
+fn graph_lane_ys(document: &Document) -> Result<BTreeSet<i32>, JsValue> {
+    let mut lane_ys = BTreeSet::new();
+    collect_lane_y_attributes(document, ".branch[data-lane-y]", &mut lane_ys)?;
+    collect_lane_y_attributes(document, ".lane-label[data-lane-y]", &mut lane_ys)?;
+    collect_item_lane_y_attributes(
+        document,
+        ".node-link[data-node-y]",
+        "data-node-y",
+        &mut lane_ys,
+    )?;
+    collect_item_lane_y_attributes(
+        document,
+        ".edge[data-source-y]",
+        "data-source-y",
+        &mut lane_ys,
+    )?;
+    collect_item_lane_y_attributes(
+        document,
+        ".edge[data-target-y]",
+        "data-target-y",
+        &mut lane_ys,
+    )?;
+    Ok(lane_ys)
+}
+
+fn collect_lane_y_attributes(
+    document: &Document,
+    selector: &str,
+    lane_ys: &mut BTreeSet<i32>,
+) -> Result<(), JsValue> {
+    collect_item_lane_y_attributes(document, selector, "data-lane-y", lane_ys)
+}
+
+fn collect_item_lane_y_attributes(
+    document: &Document,
+    selector: &str,
+    attribute: &str,
+    lane_ys: &mut BTreeSet<i32>,
+) -> Result<(), JsValue> {
+    let items = document.query_selector_all(selector)?;
+    for index in 0..items.length() {
+        let item = items
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        if let Some(y) = graph_item_i32(&item, attribute) {
+            lane_ys.insert(y);
+        }
+    }
+    Ok(())
+}
+
+fn compact_lane_display_map(
+    lane_ys: &BTreeSet<i32>,
+    visible_lanes: &BTreeSet<i32>,
+) -> BTreeMap<i32, LaneDisplay> {
+    let mut hidden_before = 0;
+    lane_ys
+        .iter()
+        .map(|lane_y| {
+            let visible = visible_lanes.contains(lane_y);
+            let display = LaneDisplay {
+                y: *lane_y - hidden_before * GRAPH_LANE_HEIGHT,
+                visible,
+            };
+            if !visible {
+                hidden_before += 1;
+            }
+            (*lane_y, display)
+        })
+        .collect()
+}
+
+fn sync_canvas_lane_visibility(
+    document: &Document,
+    viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    sync_canvas_viewport(document, viewport, lane_display)?;
+    sync_canvas_lane_labels(document, lane_display)?;
+    sync_canvas_nodes(document, lane_display)?;
+    sync_canvas_edges(document, viewport, lane_display)
+}
+
+fn sync_canvas_viewport(
+    document: &Document,
+    viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    let Some(graph_svg) = document.query_selector(".graph")? else {
+        return Ok(());
+    };
+    let display_y = collapsed_viewport_y(viewport.y, lane_display);
+    set_attributes(
+        &graph_svg,
+        [(
+            "viewBox",
+            format!(
+                "{} {} {} {}",
+                rounded_i32(viewport.x),
+                rounded_i32(display_y),
+                rounded_i32(viewport.width),
+                rounded_i32(viewport.height)
+            ),
+        )],
+    )
+}
+
+fn sync_canvas_lane_labels(
+    document: &Document,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    let labels = document.query_selector_all(".lane-label[data-lane-y]")?;
+    for index in 0..labels.length() {
+        let label = labels
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some(y) = graph_item_i32(&label, "data-lane-y") else {
+            continue;
+        };
+        let display = lane_display_for_y(lane_display, y);
+        set_attributes(
+            &label,
+            [
+                ("y", display.y.to_string()),
+                ("data-display-y", display.y.to_string()),
+            ],
+        )?;
+        label
+            .class_list()
+            .toggle_with_force("lane-viewport-hidden", !display.visible)?;
+    }
+    Ok(())
+}
+
+fn sync_canvas_nodes(
+    document: &Document,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    let nodes = document.query_selector_all(".node-link[data-node-x][data-node-y]")?;
+    for index in 0..nodes.length() {
+        let node = nodes
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some((x, y)) = graph_item_point(&node, "data-node-x", "data-node-y") else {
+            continue;
+        };
+        let display = lane_display_for_y(lane_display, y);
+        if let Some(group) = node.query_selector("g")? {
+            set_attributes(
+                &group,
+                [("transform", format!("translate({x} {})", display.y))],
+            )?;
+        }
+        apply_node_display_visibility(&node, display.visible)?;
+        node.set_attribute("data-display-y", &display.y.to_string())?;
+    }
+    Ok(())
+}
+
+fn sync_canvas_edges(
+    document: &Document,
+    viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    let display_viewport = ViewportState {
+        y: collapsed_viewport_y(viewport.y, lane_display),
+        ..viewport
+    };
+    let edges = document
+        .query_selector_all(".edge[data-source-x][data-source-y][data-target-x][data-target-y]")?;
+    for index in 0..edges.length() {
+        let edge = edges
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some((source_x, source_y)) = graph_item_point(&edge, "data-source-x", "data-source-y")
+        else {
+            continue;
+        };
+        let Some((target_x, target_y)) = graph_item_point(&edge, "data-target-x", "data-target-y")
+        else {
+            continue;
+        };
+        let source = lane_display_for_y(lane_display, source_y);
+        let target = lane_display_for_y(lane_display, target_y);
+        let visible = graph_edge_visible_in_viewport(
+            &edge,
+            display_viewport,
+            source_x,
+            source.y,
+            target_x,
+            target.y,
+        );
+        set_edge_display_geometry(&edge, source_x, source.y, target_x, target.y)?;
+        edge.class_list()
+            .toggle_with_force("edge-viewport-hidden", !visible)?;
+        edge.set_attribute("data-display-source-y", &source.y.to_string())?;
+        edge.set_attribute("data-display-target-y", &target.y.to_string())?;
+    }
+    Ok(())
+}
+
+fn set_edge_display_geometry(
+    edge: &Element,
+    source_x: i32,
+    source_y: i32,
+    target_x: i32,
+    target_y: i32,
+) -> Result<(), JsValue> {
+    match edge.get_attribute("data-edge-kind").as_deref() {
+        Some("primary_parent") => set_primary_edge_display_geometry(
+            edge,
+            Point {
+                x: source_x,
+                y: source_y,
+            },
+            Point {
+                x: target_x,
+                y: target_y,
+            },
+        ),
+        Some("fork") | Some("merge_parent") => set_routed_edge_display_geometry(
+            edge,
+            Point {
+                x: source_x,
+                y: source_y,
+            },
+            Point {
+                x: target_x,
+                y: target_y,
+            },
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn set_primary_edge_display_geometry(
+    edge: &Element,
+    source: Point,
+    target: Point,
+) -> Result<(), JsValue> {
+    let target_port_offset = graph_item_f64(edge, "data-target-port-offset").unwrap_or_default();
+    let (x1, y1, x2, y2) = line_points(source, target, target_port_offset);
+    set_attributes(edge, [("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2)])
+}
+
+fn set_routed_edge_display_geometry(
+    edge: &Element,
+    source: Point,
+    target: Point,
+) -> Result<(), JsValue> {
+    let route_slot = graph_item_i32(edge, "data-route-slot").unwrap_or_default();
+    let target_port_offset = graph_item_f64(edge, "data-target-port-offset").unwrap_or_default();
+    set_attributes(
+        edge,
+        [(
+            "points",
+            routed_elbow_points(source, target, route_slot, target_port_offset),
+        )],
+    )
+}
+
+fn apply_node_display_visibility(node: &Element, visible: bool) -> Result<(), JsValue> {
+    node.class_list()
+        .toggle_with_force("node-viewport-hidden", !visible)?;
+    if visible {
+        node.remove_attribute("aria-hidden")?;
+        node.remove_attribute("tabindex")?;
+        node.remove_attribute("focusable")
+    } else {
+        node.set_attribute("aria-hidden", "true")?;
+        node.set_attribute("tabindex", "-1")?;
+        node.set_attribute("focusable", "false")
+    }
+}
+
+fn visible_graph_item_lanes(
+    document: &Document,
+    viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<BTreeSet<i32>, JsValue> {
+    let mut lanes = BTreeSet::new();
+    collect_visible_node_lanes(document, viewport, lane_display, &mut lanes)?;
+    collect_visible_edge_lanes(document, viewport, lane_display, &mut lanes)?;
+    Ok(lanes)
+}
+
+fn collect_visible_node_lanes(
+    document: &Document,
+    viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+    lanes: &mut BTreeSet<i32>,
+) -> Result<(), JsValue> {
+    let nodes = document.query_selector_all(".node-link[data-node-x][data-node-y]")?;
+    for index in 0..nodes.length() {
+        let node = nodes
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some((x, y)) = graph_item_point(&node, "data-node-x", "data-node-y") else {
+            continue;
+        };
+        let display = lane_display_for_y(lane_display, y);
+        if graph_node_visible_in_viewport(viewport, x, display.y) {
+            lanes.insert(y);
+        }
+    }
+    Ok(())
+}
+
+fn collect_visible_edge_lanes(
+    document: &Document,
+    viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+    lanes: &mut BTreeSet<i32>,
+) -> Result<(), JsValue> {
+    let edges = document
+        .query_selector_all(".edge[data-source-x][data-source-y][data-target-x][data-target-y]")?;
+    for index in 0..edges.length() {
+        let edge = edges
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some((source_x, source_y)) = graph_item_point(&edge, "data-source-x", "data-source-y")
+        else {
+            continue;
+        };
+        let Some((target_x, target_y)) = graph_item_point(&edge, "data-target-x", "data-target-y")
+        else {
+            continue;
+        };
+        let source = lane_display_for_y(lane_display, source_y);
+        let target = lane_display_for_y(lane_display, target_y);
+        if graph_edge_visible_in_viewport(&edge, viewport, source_x, source.y, target_x, target.y) {
+            lanes.insert(source_y);
+            lanes.insert(target_y);
+        }
+    }
+    Ok(())
+}
+
+fn graph_item_point(element: &Element, x_attr: &str, y_attr: &str) -> Option<(i32, i32)> {
+    Some((
+        graph_item_i32(element, x_attr)?,
+        graph_item_i32(element, y_attr)?,
+    ))
+}
+
+fn graph_item_i32(element: &Element, attr: &str) -> Option<i32> {
+    element.get_attribute(attr)?.parse().ok()
+}
+
+fn graph_item_f64(element: &Element, attr: &str) -> Option<f64> {
+    element.get_attribute(attr)?.parse().ok()
+}
+
+fn lane_display_for_y(lane_display: &BTreeMap<i32, LaneDisplay>, y: i32) -> LaneDisplay {
+    lane_display
+        .get(&y)
+        .copied()
+        .unwrap_or(LaneDisplay { y, visible: true })
+}
+
+fn collapsed_viewport_y(viewport_y: f64, lane_display: &BTreeMap<i32, LaneDisplay>) -> f64 {
+    let collapsed_offset = lane_display
+        .iter()
+        .filter(|(_, display)| !display.visible)
+        .map(|(lane_y, _)| collapsed_lane_offset(viewport_y, *lane_y))
+        .sum::<f64>();
+    viewport_y - collapsed_offset
+}
+
+fn collapsed_lane_offset(viewport_y: f64, lane_y: i32) -> f64 {
+    let lane_height = f64::from(GRAPH_LANE_HEIGHT);
+    let lane_top = f64::from(lane_y) - lane_height / 2.0;
+    (viewport_y - lane_top).clamp(0.0, lane_height)
+}
+
+fn graph_edge_bounds(
+    edge: &Element,
+    source_x: i32,
+    source_y: i32,
+    target_x: i32,
+    target_y: i32,
+) -> (f64, f64, f64, f64) {
+    let source = Point {
+        x: source_x,
+        y: source_y,
+    };
+    let target = Point {
+        x: target_x,
+        y: target_y,
+    };
+    let target_port_offset = graph_item_f64(edge, "data-target-port-offset").unwrap_or_default();
+    let points = match edge.get_attribute("data-edge-kind").as_deref() {
+        Some("fork") | Some("merge_parent") => {
+            let route_slot = graph_item_i32(edge, "data-route-slot").unwrap_or_default();
+            routed_elbow_point_values(source, target, route_slot, target_port_offset)
+        }
+        _ => {
+            let (start_x, start_y, end_x, end_y) =
+                line_point_values(source, target, target_port_offset);
+            vec![(start_x, start_y), (end_x, end_y)]
+        }
+    };
+    point_bounds(&points)
+}
+
+fn point_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+    let mut left = f64::INFINITY;
+    let mut top = f64::INFINITY;
+    let mut right = f64::NEG_INFINITY;
+    let mut bottom = f64::NEG_INFINITY;
+    for (x, y) in points {
+        left = left.min(*x);
+        top = top.min(*y);
+        right = right.max(*x);
+        bottom = bottom.max(*y);
+    }
+    (left, top, right, bottom)
+}
+
+fn graph_node_visible_in_viewport(viewport: ViewportState, x: i32, y: i32) -> bool {
+    let padding = NODE_RADIUS.ceil();
+    crate::viewport::bounds_visible_in_viewport(
+        viewport,
+        f64::from(x) - padding,
+        f64::from(y) - padding,
+        f64::from(x) + padding,
+        f64::from(y) + padding,
+    )
+}
+
+fn graph_edge_visible_in_viewport(
+    edge: &Element,
+    viewport: ViewportState,
+    source_x: i32,
+    source_y: i32,
+    target_x: i32,
+    target_y: i32,
+) -> bool {
+    let padding = (NODE_RADIUS + EDGE_TARGET_APPROACH).ceil();
+    let (left, top, right, bottom) =
+        graph_edge_bounds(edge, source_x, source_y, target_x, target_y);
+    crate::viewport::bounds_visible_in_viewport(
+        viewport,
+        left - padding,
+        top - padding,
+        right + padding,
+        bottom + padding,
+    )
+}
+
+fn sync_branch_visibility_element(
+    branch: &Element,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
+) -> Result<(), JsValue> {
+    let Some(lane_y) = branch_lane_y(branch) else {
+        return Ok(());
+    };
+    apply_branch_visibility(branch, lane_display_for_y(lane_display, lane_y).visible)
 }
 
 #[rustfmt::skip]
-fn branch_lane_y(branch: &Element) -> Option<f64> { branch.get_attribute("data-lane-y")?.parse().ok() }
+fn branch_lane_y(branch: &Element) -> Option<i32> { branch.get_attribute("data-lane-y")?.parse().ok() }
 
 #[rustfmt::skip]
 fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> { branch.class_list().toggle_with_force("branch-viewport-hidden", !visible)?; set_branch_aria_hidden(branch, !visible) }
@@ -2308,16 +2818,30 @@ fn line_points(
     target: Point,
     target_port_offset: f64,
 ) -> (String, String, String, String) {
+    let (start_x, start_y, end_x, end_y) = line_point_values(source, target, target_port_offset);
+    (
+        format!("{start_x:.1}"),
+        format!("{start_y:.1}"),
+        format!("{end_x:.1}"),
+        format!("{end_y:.1}"),
+    )
+}
+
+fn line_point_values(
+    source: Point,
+    target: Point,
+    target_port_offset: f64,
+) -> (f64, f64, f64, f64) {
     let dx = f64::from(target.x - source.x);
     let target_y = f64::from(target.y) + target_port_offset;
     let dy = target_y - f64::from(source.y);
     let distance = (dx * dx + dy * dy).sqrt();
     if distance <= NODE_RADIUS * 2.0 {
         return (
-            f64::from(source.x).to_string(),
-            f64::from(source.y).to_string(),
-            f64::from(target.x).to_string(),
-            target_y.to_string(),
+            f64::from(source.x),
+            f64::from(source.y),
+            f64::from(target.x),
+            target_y,
         );
     }
 
@@ -2328,12 +2852,7 @@ fn line_points(
     let end_x = f64::from(target.x) - ux * (NODE_RADIUS + 8.0);
     let end_y = target_y - uy * (NODE_RADIUS + 8.0);
 
-    (
-        format!("{start_x:.1}"),
-        format!("{start_y:.1}"),
-        format!("{end_x:.1}"),
-        format!("{end_y:.1}"),
-    )
+    (start_x, start_y, end_x, end_y)
 }
 
 fn routed_elbow_points(
@@ -2342,6 +2861,19 @@ fn routed_elbow_points(
     route_slot: i32,
     target_port_offset: f64,
 ) -> String {
+    routed_elbow_point_values(source, target, route_slot, target_port_offset)
+        .into_iter()
+        .map(|(x, y)| format!("{x:.1},{y:.1}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn routed_elbow_point_values(
+    source: Point,
+    target: Point,
+    route_slot: i32,
+    target_port_offset: f64,
+) -> Vec<(f64, f64)> {
     let start_x = f64::from(source.x) + NODE_RADIUS + 2.0;
     let start_y = f64::from(source.y);
     let end_x = if target.x > source.x {
@@ -2354,9 +2886,14 @@ fn routed_elbow_points(
     let approach_x = (end_x - EDGE_TARGET_APPROACH).max(exit_x + EDGE_TARGET_APPROACH);
     let corridor_y = edge_corridor_y(source.y, target.y, route_slot);
 
-    format!(
-        "{start_x:.1},{start_y:.1} {exit_x:.1},{start_y:.1} {exit_x:.1},{corridor_y:.1} {approach_x:.1},{corridor_y:.1} {approach_x:.1},{end_y:.1} {end_x:.1},{end_y:.1}"
-    )
+    vec![
+        (start_x, start_y),
+        (exit_x, start_y),
+        (exit_x, corridor_y),
+        (approach_x, corridor_y),
+        (approach_x, end_y),
+        (end_x, end_y),
+    ]
 }
 
 fn edge_corridor_y(source_y: i32, target_y: i32, route_slot: i32) -> f64 {
@@ -2585,6 +3122,117 @@ mod tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    fn graph_items_normalizes_stored_viewport_overscan() {
+        let window = web_sys::window().expect_throw("window should be available");
+        session_storage(&window)
+            .expect_throw("session storage should be available")
+            .set_item(VIEWPORT_KEY, "10,20,1000,600,200")
+            .expect_throw("stored viewport should be written");
+
+        let fixture = GraphFixture::new();
+        let graph = fixture.graph.borrow();
+
+        assert_eq!(rounded_i32(graph.viewport.x), 10);
+        assert_eq!(rounded_i32(graph.viewport.y), 20);
+        assert_eq!(rounded_i32(graph.viewport.width), 1000);
+        assert_eq!(rounded_i32(graph.viewport.height), 600);
+        assert_eq!(graph.viewport.overscan, graph.viewport.render_overscan());
+        assert_eq!(graph.viewport.overscan, 1800);
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_canvas_lane_visibility_reflows_when_branch_enters_and_exits_viewport() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 0, 1000, 600).into();
+            graph
+                .apply_full(lane_visibility_response(viewport(1780, 0, 1000, 600)))
+                .expect_throw("graph payload should render");
+        }
+
+        assert_branch_hidden(&fixture.root, "B", true);
+        assert_branch_hidden(&fixture.root, "day", true);
+        assert_node_display(&fixture.root, "node:b2", 230, true);
+        assert_node_display(&fixture.root, "node:c3", 230, false);
+        assert_edge_display(&fixture.root, "edge:merge:a5:c3", 90, 230, false);
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 300, 1000, 300).into();
+            graph.sync_branch_visibility();
+        }
+
+        assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
+        assert_node_display(&fixture.root, "node:c3", 230, false);
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 229, 1000, 300).into();
+            graph.sync_branch_visibility();
+        }
+
+        assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 231, 1000, 300).into();
+            graph.sync_branch_visibility();
+        }
+
+        assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1100, 0, 1000, 600).into();
+            graph.sync_branch_visibility();
+        }
+
+        assert_branch_hidden(&fixture.root, "B", false);
+        assert_branch_hidden(&fixture.root, "day", true);
+        assert_node_display(&fixture.root, "node:b2", 230, false);
+        assert_node_display(&fixture.root, "node:c3", 370, false);
+        assert_edge_display(&fixture.root, "edge:merge:a5:c3", 90, 370, false);
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_canvas_lane_visibility_expands_lanes_shifted_into_viewport() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 0, 1000, 300).into();
+            graph
+                .apply_full(lane_shift_response(viewport(1780, 0, 1000, 300)))
+                .expect_throw("graph payload should render");
+        }
+
+        assert_branch_hidden(&fixture.root, "A", true);
+        assert_branch_hidden(&fixture.root, "B", true);
+        assert_branch_hidden(&fixture.root, "C", false);
+        assert_branch_hidden(&fixture.root, "day", true);
+        assert_node_display(&fixture.root, "node:c3", 90, false);
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_canvas_lane_visibility_keeps_shifted_lanes_in_viewbox_after_scroll() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 300, 1000, 300).into();
+            graph
+                .apply_full(lane_shift_response(viewport(1780, 300, 1000, 300)))
+                .expect_throw("graph payload should render");
+        }
+
+        assert_graph_viewbox(&fixture.root, "1780 20 1000 300");
+        assert_branch_hidden(&fixture.root, "A", true);
+        assert_branch_hidden(&fixture.root, "B", true);
+        assert_branch_hidden(&fixture.root, "C", false);
+        assert_branch_hidden(&fixture.root, "day", true);
+        assert_node_display(&fixture.root, "node:c3", 90, false);
+    }
+
     impl GraphFixture {
         fn new() -> Self {
             let window = web_sys::window().expect_throw("window should be available");
@@ -2618,6 +3266,14 @@ mod tests {
                     </div>
                   </nav>
                   <div class="graph-status" hidden></div>
+                  <aside class="side">
+                    <ul class="branch-list">
+                      <li class="branch" data-lane-key="lane:A" data-lane-y="90"><strong>A</strong></li>
+                      <li class="branch" data-lane-key="lane:B" data-lane-y="230"><strong>B</strong></li>
+                      <li class="branch" data-lane-key="lane:C" data-lane-y="370"><strong>C</strong></li>
+                      <li class="branch" data-lane-key="lane:day" data-lane-y="510"><strong>day</strong></li>
+                    </ul>
+                  </aside>
                 </main>
                 "#,
             );
@@ -2634,6 +3290,183 @@ mod tests {
                 root,
             }
         }
+    }
+
+    fn lane_shift_response(viewport: GraphViewport) -> GraphViewportResponse {
+        GraphViewportResponse {
+            version: 1,
+            canvas: GraphCanvas {
+                width: 4200,
+                height: 720,
+            },
+            viewport,
+            lanes: vec![lane("A", 90), lane("B", 230), lane("C", 370)],
+            nodes: vec![node("node:c3", "c3", 2100, 370)],
+            edges: Vec::new(),
+        }
+    }
+
+    fn lane_visibility_response(viewport: GraphViewport) -> GraphViewportResponse {
+        GraphViewportResponse {
+            version: 1,
+            canvas: GraphCanvas {
+                width: 4200,
+                height: 720,
+            },
+            viewport,
+            lanes: vec![
+                lane("A", 90),
+                lane("B", 230),
+                lane("C", 370),
+                lane("day", 510),
+            ],
+            nodes: vec![
+                node("node:a5", "a5", 1000, 90),
+                node("node:a7", "a7", 1440, 90),
+                node("node:b1", "b1", 1220, 230),
+                node("node:b2", "b2", 1440, 230),
+                node("node:c2", "c2", 1440, 370),
+                node("node:c3", "c3", 2100, 370),
+                node("node:day", "day", 120, 510),
+            ],
+            edges: vec![
+                primary_edge("edge:primary:b1:b2", "b1", "b2", 1220, 230, 1440, 230),
+                primary_edge("edge:primary:c2:c3", "c2", "c3", 1440, 370, 2100, 370),
+                GraphViewportEdge {
+                    key: "edge:merge:a5:c3".to_owned(),
+                    kind: GraphViewportEdgeKind::MergeParent,
+                    source_id: "a5".to_owned(),
+                    target_id: "c3".to_owned(),
+                    source: Point { x: 1000, y: 90 },
+                    target: Point { x: 2100, y: 370 },
+                    route_slot: 0,
+                    target_port_offset: 0.0,
+                },
+            ],
+        }
+    }
+
+    fn lane(label: &str, y: i32) -> GraphViewportLane {
+        GraphViewportLane {
+            key: format!("lane:{label}"),
+            label: label.to_owned(),
+            y,
+        }
+    }
+
+    fn node(key: &str, id: &str, x: i32, y: i32) -> GraphViewportNode {
+        GraphViewportNode {
+            key: key.to_owned(),
+            id: id.to_owned(),
+            node_target: id.to_owned(),
+            short_id: id.to_owned(),
+            kind: "prompt".to_owned(),
+            summary: id.to_owned(),
+            labels: Vec::new(),
+            x,
+            y,
+        }
+    }
+
+    fn primary_edge(
+        key: &str,
+        source_id: &str,
+        target_id: &str,
+        source_x: i32,
+        source_y: i32,
+        target_x: i32,
+        target_y: i32,
+    ) -> GraphViewportEdge {
+        GraphViewportEdge {
+            key: key.to_owned(),
+            kind: GraphViewportEdgeKind::PrimaryParent,
+            source_id: source_id.to_owned(),
+            target_id: target_id.to_owned(),
+            source: Point {
+                x: source_x,
+                y: source_y,
+            },
+            target: Point {
+                x: target_x,
+                y: target_y,
+            },
+            route_slot: 0,
+            target_port_offset: 0.0,
+        }
+    }
+
+    fn viewport(x: i32, y: i32, width: i32, height: i32) -> GraphViewport {
+        GraphViewport {
+            x,
+            y,
+            width,
+            height,
+            overscan: MIN_OVERSCAN,
+        }
+    }
+
+    fn assert_branch_hidden(root: &Element, name: &str, hidden: bool) {
+        let branch = root
+            .query_selector(&format!(".branch[data-lane-key=\"lane:{name}\"]"))
+            .expect_throw("branch query should succeed")
+            .expect_throw("branch should exist");
+        assert_eq!(
+            branch.class_list().contains("branch-viewport-hidden"),
+            hidden
+        );
+    }
+
+    fn assert_node_display(root: &Element, key: &str, display_y: i32, hidden: bool) {
+        let node = root
+            .query_selector(&format!("[data-render-key=\"{key}\"]"))
+            .expect_throw("node query should succeed")
+            .expect_throw("node should exist");
+        assert_eq!(
+            node.get_attribute("data-display-y"),
+            Some(display_y.to_string())
+        );
+        assert_eq!(node.class_list().contains("node-viewport-hidden"), hidden);
+        assert!(
+            node.query_selector("g")
+                .expect_throw("node group query should succeed")
+                .expect_throw("node group should exist")
+                .get_attribute("transform")
+                .expect_throw("node group should have a transform")
+                .ends_with(&format!(" {display_y})"))
+        );
+        if hidden {
+            assert_eq!(node.get_attribute("aria-hidden").as_deref(), Some("true"));
+            assert_eq!(node.get_attribute("tabindex").as_deref(), Some("-1"));
+            assert_eq!(node.get_attribute("focusable").as_deref(), Some("false"));
+        } else {
+            assert!(node.get_attribute("aria-hidden").is_none());
+            assert!(node.get_attribute("tabindex").is_none());
+            assert!(node.get_attribute("focusable").is_none());
+        }
+    }
+
+    fn assert_edge_display(root: &Element, key: &str, source_y: i32, target_y: i32, hidden: bool) {
+        let edge = root
+            .query_selector(&format!("[data-render-key=\"{key}\"]"))
+            .expect_throw("edge query should succeed")
+            .expect_throw("edge should exist");
+        assert_eq!(
+            edge.get_attribute("data-display-source-y"),
+            Some(source_y.to_string())
+        );
+        assert_eq!(
+            edge.get_attribute("data-display-target-y"),
+            Some(target_y.to_string())
+        );
+        assert_eq!(edge.class_list().contains("edge-viewport-hidden"), hidden);
+    }
+
+    fn assert_graph_viewbox(root: &Element, viewbox: &str) {
+        let graph = root
+            .query_selector(".graph")
+            .expect_throw("graph query should succeed")
+            .expect_throw("graph should exist");
+        assert_eq!(graph.get_attribute("viewBox").as_deref(), Some(viewbox));
     }
 
     async fn aborted_fetch_error() -> JsValue {

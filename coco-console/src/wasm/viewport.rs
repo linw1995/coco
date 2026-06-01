@@ -1,4 +1,5 @@
 pub const MIN_OVERSCAN: i32 = 180;
+const COLLAPSED_LANE_OVERSCAN_HEIGHT_MULTIPLIER: f64 = 3.0;
 const SHORT_CANVAS_VISIBLE_WIDTH_FRACTION: f64 = 0.74;
 const SHORT_CANVAS_VISIBLE_HEIGHT_FRACTION: f64 = 0.82;
 
@@ -27,8 +28,16 @@ impl ViewportState {
         self.overscan = self.render_overscan();
     }
 
+    pub fn with_render_overscan(mut self) -> Self {
+        self.refresh_render_overscan();
+        self
+    }
+
     pub fn render_overscan(self) -> i32 {
-        ((self.width.max(self.height) / 2.0).ceil() as i32).max(MIN_OVERSCAN)
+        ((self.width.max(self.height) / 2.0)
+            .max(self.height * COLLAPSED_LANE_OVERSCAN_HEIGHT_MULTIPLIER)
+            .ceil() as i32)
+            .max(MIN_OVERSCAN)
     }
 }
 
@@ -84,15 +93,17 @@ pub fn needs_full_viewport_jump_fetch(rendered: ViewportState, current: Viewport
     needs_full_fetch(ViewportBounds::strict(rendered), current)
 }
 
-pub fn lane_visible_in_viewport(
+pub fn bounds_visible_in_viewport(
     viewport: ViewportState,
-    lane_y: f64,
-    lane_half_height: f64,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
 ) -> bool {
-    let top = lane_y - lane_half_height;
-    let bottom = lane_y + lane_half_height;
-
-    top < viewport.y + viewport.height && bottom > viewport.y
+    left < viewport.x + viewport.width
+        && right > viewport.x
+        && top < viewport.y + viewport.height
+        && bottom > viewport.y
 }
 
 fn needs_full_fetch(rendered: ViewportBounds, current: ViewportState) -> bool {
@@ -153,7 +164,7 @@ fn short_axis_zoom(
 #[cfg(test)]
 mod tests {
     use super::{
-        ViewportState, lane_visible_in_viewport, needs_full_viewport_fetch,
+        ViewportState, bounds_visible_in_viewport, needs_full_viewport_fetch,
         needs_full_viewport_jump_fetch, same_viewport, short_canvas_auto_zoom,
     };
 
@@ -208,10 +219,18 @@ mod tests {
     }
 
     #[test]
-    fn branch_lane_visibility_uses_current_viewport_bounds() {
-        assert!(lane_visible_in_viewport(viewport(0.0, 0.0), 90.0, 70.0));
-        assert!(lane_visible_in_viewport(viewport(0.0, 200.0), 150.0, 70.0));
-        assert!(!lane_visible_in_viewport(viewport(0.0, 240.0), 90.0, 70.0));
+    fn graph_item_bounds_visibility_uses_strict_viewport() {
+        let current = viewport(200.0, 140.0);
+
+        assert!(bounds_visible_in_viewport(
+            current, 180.0, 130.0, 230.0, 190.0
+        ));
+        assert!(!bounds_visible_in_viewport(
+            current, 10.0, 130.0, 180.0, 190.0
+        ));
+        assert!(!bounds_visible_in_viewport(
+            current, 180.0, 10.0, 230.0, 120.0
+        ));
     }
 
     #[test]
@@ -227,8 +246,35 @@ mod tests {
 
         assert_eq!(
             viewport.request_query(),
-            "x=1&y=3&width=401&height=240&overscan=201"
+            "x=1&y=3&width=401&height=240&overscan=720"
         );
+    }
+
+    #[test]
+    fn render_overscan_prefetches_collapsed_lane_space() {
+        let viewport = ViewportState {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 600.0,
+            overscan: 0,
+        };
+
+        assert_eq!(viewport.render_overscan(), 1800);
+    }
+
+    #[test]
+    fn with_render_overscan_normalizes_stale_values() {
+        let viewport = ViewportState {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 600.0,
+            overscan: 200,
+        }
+        .with_render_overscan();
+
+        assert_eq!(viewport.overscan, 1800);
     }
 
     #[test]
