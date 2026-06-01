@@ -502,50 +502,142 @@ impl VirtualGraph {
 
     fn upsert_node(&mut self, node: GraphViewportNode, is_new: bool) -> Result<(), JsValue> {
         self.remove_key(&node.key);
+        let fingerprint = node.fingerprint();
+        let link = self.node_link_element(&node, is_new)?;
+        self.append_node(&node.key, &link, fingerprint)
+    }
+
+    fn node_link_element(
+        &self,
+        node: &GraphViewportNode,
+        is_new: bool,
+    ) -> Result<Element, JsValue> {
+        let link = self.empty_node_link_element(node, is_new)?;
+        self.append_node_group_to_link(&link, node)?;
+        Ok(link)
+    }
+
+    fn empty_node_link_element(
+        &self,
+        node: &GraphViewportNode,
+        is_new: bool,
+    ) -> Result<Element, JsValue> {
         let link = svg_element(&self.document, "a")?;
-        let class = if is_new {
-            "node-link node-new"
-        } else {
-            "node-link"
-        };
-        link.set_attribute("id", &render_element_id(&node.key))?;
-        link.set_attribute("data-render-key", &node.key)?;
-        link.set_attribute("class", class)?;
-        link.set_attribute("href", &format!("#{}", node.node_target))?;
-        link.set_attribute("data-node-target", &node.node_target)?;
-        link.set_attribute("data-node-id", &node.id)?;
+        set_node_link_attributes(&link, node, is_new)?;
+        Ok(link)
+    }
 
-        let group = svg_element(&self.document, "g")?;
-        let mut group_class = format!("node {}", css_token(&node.kind));
-        if !node.labels.is_empty() {
-            group_class.push_str(" active");
-        }
-        group.set_attribute("class", &group_class)?;
-        group.set_attribute("transform", &format!("translate({} {})", node.x, node.y))?;
-
-        let title = svg_element(&self.document, "title")?;
-        title.set_text_content(Some(&format!("{}: {}", node.short_id, node.summary)));
-        let core = svg_element(&self.document, "circle")?;
-        core.set_attribute("class", "core")?;
-        core.set_attribute("r", "26")?;
-        let label = svg_element(&self.document, "text")?;
-        label.set_attribute("class", "node-label")?;
-        label.set_attribute("y", "44")?;
-        label.set_text_content(Some(&node_label(&node)));
-        let kind = svg_element(&self.document, "text")?;
-        kind.set_attribute("class", "node-kind")?;
-        kind.set_attribute("y", "58")?;
-        kind.set_text_content(Some(&node.kind));
-
-        group.append_child(&title)?;
-        group.append_child(&core)?;
-        group.append_child(&label)?;
-        group.append_child(&kind)?;
+    fn append_node_group_to_link(
+        &self,
+        link: &Element,
+        node: &GraphViewportNode,
+    ) -> Result<(), JsValue> {
+        let group = self.node_group_element(node)?;
         link.append_child(&group)?;
-        self.node_group.append_child(&link)?;
-        self.rendered
-            .nodes
-            .insert(node.key.clone(), node.fingerprint());
+        Ok(())
+    }
+
+    fn node_group_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        let group = self.empty_node_group_element(node)?;
+        self.append_node_group_content(&group, node)?;
+        Ok(group)
+    }
+
+    fn empty_node_group_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        let group = svg_element(&self.document, "g")?;
+        set_node_group_attributes(&group, node)?;
+        Ok(group)
+    }
+
+    fn append_node_group_content(
+        &self,
+        group: &Element,
+        node: &GraphViewportNode,
+    ) -> Result<(), JsValue> {
+        self.append_node_identity_content(group, node)?;
+        self.append_node_text_content(group, node)
+    }
+
+    fn append_node_identity_content(
+        &self,
+        group: &Element,
+        node: &GraphViewportNode,
+    ) -> Result<(), JsValue> {
+        self.append_node_title(group, node)?;
+        self.append_node_core(group)
+    }
+
+    fn append_node_text_content(
+        &self,
+        group: &Element,
+        node: &GraphViewportNode,
+    ) -> Result<(), JsValue> {
+        self.append_node_label(group, node)?;
+        self.append_node_kind(group, node)
+    }
+
+    fn append_node_title(&self, group: &Element, node: &GraphViewportNode) -> Result<(), JsValue> {
+        let title = self.node_title_element(node)?;
+        group.append_child(&title)?;
+        Ok(())
+    }
+
+    fn node_title_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        let title = svg_element(&self.document, "title")?;
+        title.set_text_content(Some(&node_title_text(node)));
+        Ok(title)
+    }
+
+    fn append_node_core(&self, group: &Element) -> Result<(), JsValue> {
+        let core = self.node_core_element()?;
+        group.append_child(&core)?;
+        Ok(())
+    }
+
+    fn node_core_element(&self) -> Result<Element, JsValue> {
+        let core = svg_element(&self.document, "circle")?;
+        set_attributes(
+            &core,
+            [("class", "core".to_owned()), ("r", NODE_RADIUS.to_string())],
+        )?;
+        Ok(core)
+    }
+
+    fn append_node_label(&self, group: &Element, node: &GraphViewportNode) -> Result<(), JsValue> {
+        let label = self.node_label_element(node)?;
+        group.append_child(&label)?;
+        Ok(())
+    }
+
+    fn node_label_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        self.node_text_element("node-label", "44", node_label(node))
+    }
+
+    fn append_node_kind(&self, group: &Element, node: &GraphViewportNode) -> Result<(), JsValue> {
+        let kind = self.node_kind_element(node)?;
+        group.append_child(&kind)?;
+        Ok(())
+    }
+
+    fn node_kind_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
+        self.node_text_element("node-kind", "58", node.kind.clone())
+    }
+
+    fn node_text_element(&self, class: &str, y: &str, text: String) -> Result<Element, JsValue> {
+        let element = svg_element(&self.document, "text")?;
+        set_attributes(&element, [("class", class.to_owned()), ("y", y.to_owned())])?;
+        element.set_text_content(Some(&text));
+        Ok(element)
+    }
+
+    fn append_node(
+        &mut self,
+        key: &str,
+        link: &Element,
+        fingerprint: String,
+    ) -> Result<(), JsValue> {
+        self.node_group.append_child(link)?;
+        self.rendered.nodes.insert(key.to_owned(), fingerprint);
         Ok(())
     }
 
@@ -848,6 +940,54 @@ fn set_attributes<const N: usize>(
         element.set_attribute(name, &value)?;
     }
     Ok(())
+}
+
+fn set_node_link_attributes(
+    link: &Element,
+    node: &GraphViewportNode,
+    is_new: bool,
+) -> Result<(), JsValue> {
+    set_attributes(
+        link,
+        [
+            ("id", render_element_id(&node.key)),
+            ("data-render-key", node.key.clone()),
+            ("class", node_link_class(is_new).to_owned()),
+            ("href", format!("#{}", node.node_target)),
+            ("data-node-target", node.node_target.clone()),
+            ("data-node-id", node.id.clone()),
+        ],
+    )
+}
+
+fn node_link_class(is_new: bool) -> &'static str {
+    if is_new {
+        "node-link node-new"
+    } else {
+        "node-link"
+    }
+}
+
+fn set_node_group_attributes(group: &Element, node: &GraphViewportNode) -> Result<(), JsValue> {
+    set_attributes(
+        group,
+        [
+            ("class", node_group_class(node)),
+            ("transform", format!("translate({} {})", node.x, node.y)),
+        ],
+    )
+}
+
+fn node_group_class(node: &GraphViewportNode) -> String {
+    let mut class = format!("node {}", css_token(&node.kind));
+    if !node.labels.is_empty() {
+        class.push_str(" active");
+    }
+    class
+}
+
+fn node_title_text(node: &GraphViewportNode) -> String {
+    format!("{}: {}", node.short_id, node.summary)
 }
 
 async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
