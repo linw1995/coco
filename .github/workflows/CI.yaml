@@ -193,7 +193,7 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:
-          files: target/coverage/result/native.lcov.info
+          files: target/coverage/result/lcov.info
           flags: rust
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
