@@ -21,15 +21,12 @@ use crate::api::{
     GraphViewportEdgeKind, GraphViewportItems, GraphViewportLane, GraphViewportNode,
     GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
-use crate::viewport::{
-    MIN_OVERSCAN, ViewportState, lane_visible_in_viewport, rounded_i32, same_viewport,
-};
+use crate::viewport::{MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport};
 
 const ROOT_ID: &str = "console-root";
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const VIEWPORT_KEY: &str = "coco-console:viewport";
 const NODE_RADIUS: f64 = 26.0;
-const BRANCH_LANE_HALF_HEIGHT: f64 = 70.0;
 const EDGE_NODE_EXIT: f64 = 42.0;
 const EDGE_TARGET_APPROACH: f64 = 48.0;
 const EDGE_ROUTE_STEP: f64 = 12.0;
@@ -365,9 +362,8 @@ impl VirtualGraph {
             &self.viewport_map,
             &self.viewport_map_bg,
         )?;
-        apply_viewport_map_window(&self.viewport_map_window, self.viewport)?;
-        self.sync_branch_visibility();
-        Ok(())
+        apply_viewport_map_window(&self.viewport_map_window, self.viewport)
+            .inspect(|_| self.sync_branch_visibility())
     }
 
     fn upsert_graph_items(
@@ -681,6 +677,10 @@ impl VirtualGraph {
         }
     }
 
+    #[rustfmt::skip]
+    fn apply_shell_version(&mut self, version: u64) { self.shell_version = version; self.sync_branch_visibility(); }
+
+    #[rustfmt::skip]
     fn sync_branch_visibility(&self) {
         if let Err(error) = sync_branch_visibility(&self.document, self.viewport) {
             web_sys::console::error_1(&error);
@@ -1339,11 +1339,7 @@ async fn handle_server_rendered_sections_response(
     response: Result<Option<u64>, JsValue>,
 ) {
     match response {
-        Ok(Some(version)) => {
-            let mut graph = graph.borrow_mut();
-            graph.shell_version = version;
-            graph.sync_branch_visibility();
-        }
+        Ok(Some(version)) => graph.borrow_mut().apply_shell_version(version),
         Ok(None) => {}
         Err(error) => {
             web_sys::console::error_1(&error);
@@ -1437,15 +1433,13 @@ fn refresh_inner_html(
 #[rustfmt::skip]
 fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
     let branches = document.query_selector_all(".branch[data-lane-y]")?;
-    for index in 0..branches.length() { sync_branch_visibility_node(branches.item(index), viewport)?; }
+    for index in 0..branches.length() { sync_branch_visibility_element(&branches.item(index).expect("query selector index should exist").unchecked_into::<Element>(), viewport)?; }
     Ok(())
 }
 
 #[rustfmt::skip]
-fn sync_branch_visibility_node(node: Option<web_sys::Node>, viewport: ViewportState) -> Result<(), JsValue> {
-    let Some(branch) = node.and_then(|node| node.dyn_into::<Element>().ok()) else { return Ok(()); };
-    let Some(lane_y) = branch_lane_y(&branch) else { return Ok(()); };
-    apply_branch_visibility(&branch, lane_visible_in_viewport(viewport, lane_y, BRANCH_LANE_HALF_HEIGHT))
+fn sync_branch_visibility_element(branch: &Element, viewport: ViewportState) -> Result<(), JsValue> {
+    branch_lane_y(branch).map(|lane_y| apply_branch_visibility(branch, crate::viewport::lane_visible_in_viewport(viewport, lane_y, 70.0))).unwrap_or(Ok(()))
 }
 
 #[rustfmt::skip]
@@ -1453,14 +1447,14 @@ fn branch_lane_y(branch: &Element) -> Option<f64> { branch.get_attribute("data-l
 
 #[rustfmt::skip]
 fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> {
-    if visible { show_branch(branch) } else { hide_branch(branch) }
+    branch.class_list().toggle_with_force("branch-viewport-hidden", !visible)?;
+    set_branch_aria_hidden(branch, !visible)
 }
 
 #[rustfmt::skip]
-fn show_branch(branch: &Element) -> Result<(), JsValue> { branch.class_list().remove_1("branch-viewport-hidden")?; branch.remove_attribute("aria-hidden") }
-
-#[rustfmt::skip]
-fn hide_branch(branch: &Element) -> Result<(), JsValue> { branch.class_list().add_1("branch-viewport-hidden")?; branch.set_attribute("aria-hidden", "true") }
+fn set_branch_aria_hidden(branch: &Element, hidden: bool) -> Result<(), JsValue> {
+    if hidden { branch.set_attribute("aria-hidden", "true") } else { branch.remove_attribute("aria-hidden") }
+}
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let installers: [GraphListenerInstaller; 5] = [
