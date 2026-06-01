@@ -81,7 +81,7 @@ in {
       (rustWasmCoverageToolchainFor pkgs)
     ];
     packages = with pkgs; [
-      clang
+      llvmPackages.clang-unwrapped
       chromedriver
       wasm-bindgen-cli
     ];

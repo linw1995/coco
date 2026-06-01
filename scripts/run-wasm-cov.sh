@@ -21,6 +21,8 @@ export WASM_BINDGEN_USE_BROWSER=1
 export LLVM_PROFILE_FILE="${profraw_dir}/coco-console-%m-%p.profraw"
 export RUSTFLAGS="-Cinstrument-coverage -Zno-profiler-runtime --emit=llvm-ir --cfg=wasm_bindgen_unstable_test_coverage"
 export CC="${CC_wasm32_unknown_unknown:-${coverage_clang}}"
+export CC_wasm32_unknown_unknown="${CC}"
+export TARGET_CC="${CC}"
 export NIX_HARDENING_ENABLE="${WASM_COVERAGE_NIX_HARDENING_ENABLE:-}"
 
 if command -v chromedriver >/dev/null 2>&1 || [[ -n "${CHROMEDRIVER:-}" ]]; then
