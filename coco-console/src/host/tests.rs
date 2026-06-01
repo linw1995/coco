@@ -273,12 +273,14 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
     assert!(html.contains("class=\"graph-lanes\""));
     assert!(html.contains("class=\"graph-edges\""));
     assert!(html.contains("class=\"graph-nodes\""));
-    assert!(html.contains("body:has(#detail-"));
-    assert!(html.contains("class=\"viewport-map\""));
-    assert!(html.contains("Graph viewport navigator"));
-    assert!(html.contains("preserveAspectRatio=\"xMidYMid meet\""));
-    assert!(html.contains("class=\"viewport-map-window\""));
-    assert!(html.contains("data-graph-width="));
+    assert!(html.contains("id=\"selection-style\""));
+    assert!(!html.contains("stroke: #facc15"));
+    assert!(html.contains("class=\"time-scale\""));
+    assert!(html.contains("Graph time navigator"));
+    assert!(html.contains("class=\"time-scale-tick\""));
+    assert!(html.contains("class=\"time-scale-cursor\""));
+    assert!(html.contains("data-graph-x="));
+    assert!(!html.contains("class=\"viewport-map\""));
     assert!(!html.contains("class=\"minimap-node\""));
     assert!(!html.contains("class=\"minimap-edge\""));
     assert!(!html.contains("/?node="));
@@ -290,8 +292,46 @@ fn empty_snapshot_page_still_renders_virtual_graph_shell() {
 
     assert!(html.contains("class=\"graph-wrap virtual-graph\""));
     assert!(html.contains("class=\"graph-lanes\""));
-    assert!(html.contains("class=\"viewport-map\""));
+    assert!(html.contains("class=\"time-scale time-scale-empty\""));
+    assert!(html.contains("No time data"));
     assert!(html.contains("Loading graph..."));
+}
+
+#[test]
+fn time_scale_tick_positions_are_evenly_spaced() {
+    let html = render_snapshot_page(&GraphSnapshot {
+        version: 31,
+        mode: GraphMode::All,
+        root_id: "root".to_owned(),
+        nodes: vec![
+            graph_node("first", 0),
+            graph_node("near", 10),
+            graph_node("far", 100),
+        ],
+        edges: vec![
+            GraphEdge {
+                source: "first".to_owned(),
+                target: "near".to_owned(),
+                kind: GraphEdgeKind::Primary,
+            },
+            GraphEdge {
+                source: "near".to_owned(),
+                target: "far".to_owned(),
+                kind: GraphEdgeKind::Primary,
+            },
+        ],
+        branches: vec![GraphBranch {
+            name: "main".to_owned(),
+            head_id: "far".to_owned(),
+            visible_head_id: Some("far".to_owned()),
+            state: SessionState::Active,
+        }],
+    });
+
+    assert!(html.contains("data-position=\"0.000000\""));
+    assert!(html.contains("data-position=\"50.000000\""));
+    assert!(html.contains("data-position=\"100.000000\""));
+    assert!(!html.contains("data-position=\"10.000000\""));
 }
 
 #[test]

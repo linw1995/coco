@@ -8,8 +8,8 @@ use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    AbortController, AbortSignal, Document, Element, MouseEvent, RequestInit, Response, WheelEvent,
-    Window,
+    AbortController, AbortSignal, Document, Element, KeyboardEvent, MouseEvent, RequestInit,
+    Response, WheelEvent, Window,
 };
 
 use super::refresh::{
@@ -21,7 +21,9 @@ use crate::api::{
     GraphViewportEdgeKind, GraphViewportItems, GraphViewportLane, GraphViewportNode,
     GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
-use crate::viewport::{MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport};
+use crate::viewport::{
+    MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport, short_canvas_auto_zoom,
+};
 
 const ROOT_ID: &str = "console-root";
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
@@ -32,14 +34,9 @@ const EDGE_TARGET_APPROACH: f64 = 48.0;
 const EDGE_ROUTE_STEP: f64 = 12.0;
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
+const MAX_SHORT_CANVAS_AUTO_ZOOM: f64 = 2.6;
+const TIME_SCALE_FOCUS_SIGMA: f64 = 6.4;
 const VERSION_REFRESH_RETRY_MS: i32 = 50;
-
-struct ViewportMapContentBounds {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
 
 struct GraphItemsRefreshInput {
     window: Window,
@@ -61,16 +58,17 @@ struct GraphLayerElements {
     node_group: Element,
 }
 
-struct ViewportMapElements {
-    viewport_map: Element,
-    viewport_map_bg: Element,
-    viewport_map_window: Element,
+struct TimeScaleElements {
+    time_scale: Element,
+    time_scale_track: Element,
+    time_scale_cursor: Element,
+    time_scale_label: Element,
 }
 
 struct VirtualGraphElements {
     root: GraphRootElements,
     layers: GraphLayerElements,
-    viewport_map: ViewportMapElements,
+    time_scale: TimeScaleElements,
     status: Option<Element>,
 }
 
@@ -196,13 +194,15 @@ struct VirtualGraph {
     lane_group: Element,
     edge_group: Element,
     node_group: Element,
-    viewport_map: Element,
-    viewport_map_bg: Element,
-    viewport_map_window: Element,
+    time_scale: Element,
+    time_scale_track: Element,
+    time_scale_cursor: Element,
+    time_scale_label: Element,
     status: Option<Element>,
     viewport: ViewportState,
     zoom: f64,
     canvas: Option<GraphCanvas>,
+    auto_fit_short_canvas: bool,
     version: u64,
     shell_version: u64,
     rendered: RenderedKeys,
@@ -217,7 +217,10 @@ impl VirtualGraph {
         let elements = VirtualGraphElements::query(&document)?;
         let graph_mode = current_graph_mode(&document);
         let zoom = initial_zoom(&elements.root.graph_wrap);
-        let viewport = initial_viewport(&window, &elements.root.graph_wrap, zoom);
+        let stored_viewport = ViewportState::load(&window);
+        let auto_fit_short_canvas = stored_viewport.is_none();
+        let viewport = stored_viewport
+            .unwrap_or_else(|| viewport_from_element(&elements.root.graph_wrap, 0.0, 0.0, zoom));
         let version = current_version(&document).unwrap_or_default();
 
         Ok(Self {
@@ -230,13 +233,15 @@ impl VirtualGraph {
             lane_group: elements.layers.lane_group,
             edge_group: elements.layers.edge_group,
             node_group: elements.layers.node_group,
-            viewport_map: elements.viewport_map.viewport_map,
-            viewport_map_bg: elements.viewport_map.viewport_map_bg,
-            viewport_map_window: elements.viewport_map.viewport_map_window,
+            time_scale: elements.time_scale.time_scale,
+            time_scale_track: elements.time_scale.time_scale_track,
+            time_scale_cursor: elements.time_scale.time_scale_cursor,
+            time_scale_label: elements.time_scale.time_scale_label,
             status: elements.status,
             viewport,
             zoom,
             canvas: None,
+            auto_fit_short_canvas,
             version,
             shell_version: version,
             rendered: RenderedKeys::new(),
@@ -349,20 +354,56 @@ impl VirtualGraph {
         if same_viewport(desired_viewport, response_viewport) {
             self.set_viewport(viewport);
         }
+        self.fit_short_canvas_once();
         self.rendered_viewport = response_viewport;
         self.set_root_version();
         self.apply_canvas()
     }
 
+    fn fit_short_canvas_once(&mut self) {
+        if !self.auto_fit_short_canvas {
+            return;
+        }
+        self.auto_fit_short_canvas = false;
+        let Some(canvas) = self.canvas else {
+            return;
+        };
+        let client_width = graph_client_width(&self.graph_wrap);
+        let client_height = graph_client_height(&self.graph_wrap);
+        let next_zoom = short_canvas_auto_zoom(
+            client_width,
+            client_height,
+            f64::from(canvas.width),
+            f64::from(canvas.height),
+            self.zoom,
+        )
+        .clamp(MIN_ZOOM, MAX_SHORT_CANVAS_AUTO_ZOOM.min(MAX_ZOOM));
+        if next_zoom <= self.zoom {
+            return;
+        }
+        let center_x =
+            viewport_center_for_short_canvas(self.viewport.x, self.viewport.width, canvas.width);
+        let center_y =
+            viewport_center_for_short_canvas(self.viewport.y, self.viewport.height, canvas.height);
+        self.zoom = next_zoom;
+        self.viewport.width = client_width / self.zoom;
+        self.viewport.height = client_height / self.zoom;
+        self.viewport.refresh_render_overscan();
+        self.viewport.x = center_x - self.viewport.width / 2.0;
+        self.viewport.y = center_y - self.viewport.height / 2.0;
+        self.clamp_viewport();
+        self.persist_viewport();
+    }
+
     fn apply_canvas(&self) -> Result<(), JsValue> {
         apply_graph_viewport(&self.graph_svg, &self.graph_wrap, self.viewport, self.zoom)?;
-        apply_canvas_dimensions(
-            self.canvas,
-            &self.graph_bg,
-            &self.viewport_map,
-            &self.viewport_map_bg,
-        )?;
-        apply_viewport_map_window(&self.viewport_map_window, self.viewport)
+        apply_canvas_dimensions(self.canvas, &self.graph_bg)?;
+        apply_time_scale_cursor(
+            &self.time_scale,
+            &self.time_scale_cursor,
+            &self.time_scale_label,
+            self.viewport,
+        )
     }
 
     fn upsert_graph_items(
@@ -713,7 +754,7 @@ impl VirtualGraphElements {
         Ok(Self {
             root: query_graph_root_elements(document)?,
             layers: query_graph_layer_elements(document)?,
-            viewport_map: query_viewport_map_elements(document)?,
+            time_scale: query_time_scale_elements(document)?,
             status: query_optional(document, ".graph-status"),
         })
     }
@@ -739,11 +780,12 @@ fn query_graph_layer_elements(document: &Document) -> Result<GraphLayerElements,
     })
 }
 
-fn query_viewport_map_elements(document: &Document) -> Result<ViewportMapElements, JsValue> {
-    Ok(ViewportMapElements {
-        viewport_map: query_required(document, ".viewport-map")?,
-        viewport_map_bg: query_required(document, ".viewport-map-bg")?,
-        viewport_map_window: query_required(document, ".viewport-map-window")?,
+fn query_time_scale_elements(document: &Document) -> Result<TimeScaleElements, JsValue> {
+    Ok(TimeScaleElements {
+        time_scale: query_required(document, ".time-scale")?,
+        time_scale_track: query_required(document, ".time-scale-track")?,
+        time_scale_cursor: query_required(document, ".time-scale-cursor")?,
+        time_scale_label: query_required(document, ".time-scale-label")?,
     })
 }
 
@@ -753,10 +795,6 @@ fn initial_zoom(graph_wrap: &Element) -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(1.0)
         .clamp(MIN_ZOOM, MAX_ZOOM)
-}
-
-fn initial_viewport(window: &Window, graph_wrap: &Element, zoom: f64) -> ViewportState {
-    ViewportState::load(window).unwrap_or_else(|| viewport_from_element(graph_wrap, 0.0, 0.0, zoom))
 }
 
 impl ViewportState {
@@ -900,17 +938,11 @@ fn apply_graph_viewport(
     )
 }
 
-fn apply_canvas_dimensions(
-    canvas: Option<GraphCanvas>,
-    graph_bg: &Element,
-    viewport_map: &Element,
-    viewport_map_bg: &Element,
-) -> Result<(), JsValue> {
+fn apply_canvas_dimensions(canvas: Option<GraphCanvas>, graph_bg: &Element) -> Result<(), JsValue> {
     let Some(canvas) = canvas else {
         return Ok(());
     };
-    apply_canvas_background(graph_bg, canvas)?;
-    apply_viewport_map_canvas(viewport_map, viewport_map_bg, canvas)
+    apply_canvas_background(graph_bg, canvas)
 }
 
 fn apply_canvas_background(graph_bg: &Element, canvas: GraphCanvas) -> Result<(), JsValue> {
@@ -925,41 +957,155 @@ fn apply_canvas_background(graph_bg: &Element, canvas: GraphCanvas) -> Result<()
     )
 }
 
-fn apply_viewport_map_canvas(
-    viewport_map: &Element,
-    viewport_map_bg: &Element,
-    canvas: GraphCanvas,
-) -> Result<(), JsValue> {
-    set_attributes(
-        viewport_map,
-        [
-            ("viewBox", format!("0 0 {} {}", canvas.width, canvas.height)),
-            ("data-graph-width", canvas.width.to_string()),
-            ("data-graph-height", canvas.height.to_string()),
-        ],
-    )?;
-    set_attributes(
-        viewport_map_bg,
-        [
-            ("width", canvas.width.to_string()),
-            ("height", canvas.height.to_string()),
-        ],
-    )
-}
-
-fn apply_viewport_map_window(
-    viewport_map_window: &Element,
+fn apply_time_scale_cursor(
+    time_scale: &Element,
+    time_scale_cursor: &Element,
+    time_scale_label: &Element,
     viewport: ViewportState,
 ) -> Result<(), JsValue> {
+    let ticks = time_scale_ticks(time_scale)?;
+    if ticks.is_empty() {
+        return Ok(());
+    }
+    let graph_x = viewport.x + viewport.width / 2.0;
+    let cursor = time_scale_cursor_for_graph_x(&ticks, graph_x);
+    let label_shift = time_scale_label_shift(cursor.position);
     set_attributes(
-        viewport_map_window,
+        time_scale_cursor,
         [
-            ("x", rounded_i32(viewport.x).to_string()),
-            ("y", rounded_i32(viewport.y).to_string()),
-            ("width", rounded_i32(viewport.width).to_string()),
-            ("height", rounded_i32(viewport.height).to_string()),
+            ("style", format!("left: {:.4}%;", cursor.position)),
+            ("data-time-label", cursor.label.clone()),
         ],
-    )
+    )?;
+    time_scale_label.set_text_content(Some(&cursor.label));
+    time_scale_label.set_attribute("style", &format!("--label-shift: {label_shift};"))?;
+    apply_time_scale_tick_focus(&ticks, cursor.position)
+}
+
+#[derive(Clone)]
+struct TimeScaleTick {
+    element: Element,
+    position: f64,
+    graph_x: f64,
+    label: String,
+}
+
+struct TimeScaleCursor {
+    position: f64,
+    label: String,
+}
+
+fn time_scale_ticks(time_scale: &Element) -> Result<Vec<TimeScaleTick>, JsValue> {
+    let nodes = time_scale.query_selector_all(".time-scale-tick")?;
+    let mut ticks = Vec::with_capacity(nodes.length() as usize);
+    for index in 0..nodes.length() {
+        let Some(node) = nodes.item(index) else {
+            continue;
+        };
+        let Ok(element) = node.dyn_into::<Element>() else {
+            continue;
+        };
+        let Some(position) = numeric_attribute(&element, "data-position") else {
+            continue;
+        };
+        let Some(graph_x) = numeric_attribute(&element, "data-graph-x") else {
+            continue;
+        };
+        let label = element
+            .get_attribute("data-time-label")
+            .unwrap_or_else(|| "-".to_owned());
+        ticks.push(TimeScaleTick {
+            element,
+            position,
+            graph_x,
+            label,
+        });
+    }
+    Ok(ticks)
+}
+
+fn numeric_attribute(element: &Element, name: &str) -> Option<f64> {
+    element.get_attribute(name)?.parse::<f64>().ok()
+}
+
+fn time_scale_cursor_for_graph_x(ticks: &[TimeScaleTick], graph_x: f64) -> TimeScaleCursor {
+    let mut by_graph_x = ticks.to_vec();
+    by_graph_x.sort_by(|left, right| left.graph_x.total_cmp(&right.graph_x));
+    let position = interpolate_timeline_position(&by_graph_x, graph_x);
+    let label = nearest_tick_label(&by_graph_x, graph_x);
+    TimeScaleCursor { position, label }
+}
+
+fn interpolate_timeline_position(ticks: &[TimeScaleTick], graph_x: f64) -> f64 {
+    let Some(first) = ticks.first() else {
+        return 0.0;
+    };
+    if graph_x <= first.graph_x {
+        return first.position;
+    }
+    for window in ticks.windows(2) {
+        let left = &window[0];
+        let right = &window[1];
+        if graph_x <= right.graph_x {
+            let span = right.graph_x - left.graph_x;
+            if span.abs() < f64::EPSILON {
+                return right.position;
+            }
+            let ratio = ((graph_x - left.graph_x) / span).clamp(0.0, 1.0);
+            return left.position + (right.position - left.position) * ratio;
+        }
+    }
+    ticks
+        .last()
+        .map(|tick| tick.position)
+        .unwrap_or(first.position)
+}
+
+fn nearest_tick_label(ticks: &[TimeScaleTick], graph_x: f64) -> String {
+    ticks
+        .iter()
+        .min_by(|left, right| {
+            (left.graph_x - graph_x)
+                .abs()
+                .total_cmp(&(right.graph_x - graph_x).abs())
+        })
+        .map(|tick| tick.label.clone())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn apply_time_scale_tick_focus(
+    ticks: &[TimeScaleTick],
+    cursor_position: f64,
+) -> Result<(), JsValue> {
+    for tick in ticks {
+        let distance = (tick.position - cursor_position).abs();
+        let focus = time_scale_wave_focus(distance);
+        let opacity = 0.38 + focus * 0.62;
+        tick.element.set_attribute(
+            "style",
+            &format!(
+                "left: {:.4}%; --tick-focus: {:.3}; --tick-opacity: {:.3};",
+                tick.position, focus, opacity
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn time_scale_wave_focus(distance: f64) -> f64 {
+    let focus =
+        (-(distance * distance) / (2.0 * TIME_SCALE_FOCUS_SIGMA * TIME_SCALE_FOCUS_SIGMA)).exp();
+    if focus < 0.02 { 0.0 } else { focus }
+}
+
+fn time_scale_label_shift(position: f64) -> &'static str {
+    if position < 8.0 {
+        "0%"
+    } else if position > 92.0 {
+        "-100%"
+    } else {
+        "-50%"
+    }
 }
 
 fn set_attributes<const N: usize>(
@@ -1420,11 +1566,12 @@ fn refresh_inner_html(
 }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let installers: [GraphListenerInstaller; 5] = [
+    let installers: [GraphListenerInstaller; 6] = [
         install_node_detail_listener,
         install_wheel_listener,
         install_resize_listener,
-        install_viewport_map_listener,
+        install_time_scale_listener,
+        install_time_scale_keyboard_listener,
         install_hashchange_node_detail_listener,
     ];
     for install in installers {
@@ -1465,18 +1612,38 @@ fn install_resize_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     Ok(())
 }
 
-fn install_viewport_map_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let viewport_map = graph.borrow().viewport_map.clone();
-    let viewport_map_graph = graph.clone();
-    let viewport_map_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+fn install_time_scale_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let time_scale_track = graph.borrow().time_scale_track.clone();
+    let time_scale_graph = graph.clone();
+    let time_scale_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
         event.prevent_default();
-        update_viewport(viewport_map_graph.clone(), |graph| {
-            center_viewport_from_map(graph, &event);
+        update_viewport(time_scale_graph.clone(), |graph| {
+            center_viewport_from_time_scale(graph, &event);
         });
     });
-    viewport_map
-        .add_event_listener_with_callback("click", viewport_map_closure.as_ref().unchecked_ref())?;
-    viewport_map_closure.forget();
+    time_scale_track
+        .add_event_listener_with_callback("click", time_scale_closure.as_ref().unchecked_ref())?;
+    time_scale_closure.forget();
+    Ok(())
+}
+
+fn install_time_scale_keyboard_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let time_scale = graph.borrow().time_scale.clone();
+    let keyboard_graph = graph.clone();
+    let keyboard_closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |event: KeyboardEvent| {
+        let direction = match event.key().as_str() {
+            "ArrowLeft" => -1,
+            "ArrowRight" => 1,
+            _ => return,
+        };
+        event.prevent_default();
+        update_viewport(keyboard_graph.clone(), |graph| {
+            center_viewport_from_time_scale_key(graph, direction);
+        });
+    });
+    time_scale
+        .add_event_listener_with_callback("keydown", keyboard_closure.as_ref().unchecked_ref())?;
+    keyboard_closure.forget();
     Ok(())
 }
 
@@ -1725,60 +1892,92 @@ fn zoom_from_wheel(graph: &mut VirtualGraph, event: &WheelEvent) {
     graph.viewport.y = anchor_y - local_y / graph.zoom;
 }
 
-fn center_viewport_from_map(graph: &mut VirtualGraph, event: &MouseEvent) {
-    let Some(canvas) = graph.canvas else {
+fn center_viewport_from_time_scale(graph: &mut VirtualGraph, event: &MouseEvent) {
+    let Ok(ticks) = time_scale_ticks(&graph.time_scale) else {
         return;
     };
-    let rect = graph.viewport_map.get_bounding_client_rect();
-    let canvas_width = f64::from(canvas.width);
-    let canvas_height = f64::from(canvas.height);
-    let Some(content) =
-        viewport_map_content_bounds(rect.width(), rect.height(), canvas_width, canvas_height)
-    else {
+    if ticks.is_empty() {
         return;
-    };
+    }
+    let rect = graph.time_scale_track.get_bounding_client_rect();
+    if rect.width() <= 0.0 {
+        return;
+    }
     let local_x = f64::from(event.client_x()) - rect.left();
-    let local_y = f64::from(event.client_y()) - rect.top();
-    let ratio_x = ((local_x - content.x) / content.width).clamp(0.0, 1.0);
-    let ratio_y = ((local_y - content.y) / content.height).clamp(0.0, 1.0);
-    graph.viewport.x = ratio_x * canvas_width - graph.viewport.width / 2.0;
-    graph.viewport.y = ratio_y * canvas_height - graph.viewport.height / 2.0;
+    let position = (local_x / rect.width() * 100.0).clamp(0.0, 100.0);
+    let graph_x = graph_x_for_time_scale_position(&ticks, position);
+    graph.viewport.x = graph_x - graph.viewport.width / 2.0;
     graph.clamp_viewport();
 }
 
-fn viewport_map_content_bounds(
-    rect_width: f64,
-    rect_height: f64,
-    canvas_width: f64,
-    canvas_height: f64,
-) -> Option<ViewportMapContentBounds> {
-    if !positive_dimensions([rect_width, rect_height, canvas_width, canvas_height]) {
-        return None;
+fn center_viewport_from_time_scale_key(graph: &mut VirtualGraph, direction: i32) {
+    let Ok(ticks) = time_scale_ticks(&graph.time_scale) else {
+        return;
+    };
+    if ticks.is_empty() {
+        return;
     }
+    let graph_x = graph.viewport.x + graph.viewport.width / 2.0;
+    let cursor = time_scale_cursor_for_graph_x(&ticks, graph_x);
+    let Some(tick) = adjacent_time_scale_tick(&ticks, cursor.position, direction) else {
+        return;
+    };
+    graph.viewport.x = tick.graph_x - graph.viewport.width / 2.0;
+    graph.clamp_viewport();
+}
 
-    let canvas_ratio = canvas_width / canvas_height;
-    let element_ratio = rect_width / rect_height;
-    if element_ratio > canvas_ratio {
-        let content_width = rect_height * canvas_ratio;
-        Some(ViewportMapContentBounds {
-            x: (rect_width - content_width) / 2.0,
-            y: 0.0,
-            width: content_width,
-            height: rect_height,
-        })
+fn adjacent_time_scale_tick(
+    ticks: &[TimeScaleTick],
+    position: f64,
+    direction: i32,
+) -> Option<&TimeScaleTick> {
+    let mut by_position = ticks.iter().collect::<Vec<_>>();
+    by_position.sort_by(|left, right| left.position.total_cmp(&right.position));
+    if direction < 0 {
+        by_position
+            .iter()
+            .rev()
+            .copied()
+            .find(|tick| tick.position < position - f64::EPSILON)
+            .or_else(|| by_position.first().copied())
     } else {
-        let content_height = rect_width / canvas_ratio;
-        Some(ViewportMapContentBounds {
-            x: 0.0,
-            y: (rect_height - content_height) / 2.0,
-            width: rect_width,
-            height: content_height,
-        })
+        by_position
+            .iter()
+            .copied()
+            .find(|tick| tick.position > position + f64::EPSILON)
+            .or_else(|| by_position.last().copied())
     }
 }
 
-fn positive_dimensions(values: [f64; 4]) -> bool {
-    values.into_iter().all(|value| value > 0.0)
+fn graph_x_for_time_scale_position(ticks: &[TimeScaleTick], position: f64) -> f64 {
+    let mut by_position = ticks.to_vec();
+    by_position.sort_by(|left, right| {
+        left.position
+            .total_cmp(&right.position)
+            .then_with(|| left.graph_x.total_cmp(&right.graph_x))
+    });
+    let Some(first) = by_position.first() else {
+        return 0.0;
+    };
+    if position <= first.position {
+        return first.graph_x;
+    }
+    for window in by_position.windows(2) {
+        let left = &window[0];
+        let right = &window[1];
+        if position <= right.position {
+            let span = right.position - left.position;
+            if span.abs() < f64::EPSILON {
+                return right.graph_x;
+            }
+            let ratio = ((position - left.position) / span).clamp(0.0, 1.0);
+            return left.graph_x + (right.graph_x - left.graph_x) * ratio;
+        }
+    }
+    by_position
+        .last()
+        .map(|tick| tick.graph_x)
+        .unwrap_or(first.graph_x)
 }
 
 fn browser_window() -> Result<Window, JsValue> {
@@ -1882,6 +2081,19 @@ fn viewport_from_element(element: &Element, x: f64, y: f64, zoom: f64) -> Viewpo
     };
     viewport.refresh_render_overscan();
     viewport
+}
+
+fn viewport_center_for_short_canvas(
+    viewport_start: f64,
+    viewport_size: f64,
+    canvas_size: i32,
+) -> f64 {
+    let canvas_size = f64::from(canvas_size);
+    if viewport_size >= canvas_size {
+        canvas_size / 2.0
+    } else {
+        (viewport_start + viewport_size / 2.0).clamp(0.0, canvas_size)
+    }
 }
 
 fn graph_client_width(element: &Element) -> f64 {
@@ -2080,11 +2292,14 @@ mod tests {
                       <g class="graph-edges"></g>
                       <g class="graph-nodes"></g>
                     </svg>
-                    <svg class="viewport-map">
-                      <rect class="viewport-map-bg"></rect>
-                      <rect class="viewport-map-window"></rect>
-                    </svg>
                   </div>
+                  <nav class="time-scale">
+                    <div class="time-scale-track">
+                      <span class="time-scale-tick" data-position="0" data-graph-x="120" data-time-label="start"></span>
+                      <span class="time-scale-tick" data-position="100" data-graph-x="340" data-time-label="end"></span>
+                      <div class="time-scale-cursor"><span class="time-scale-label"></span></div>
+                    </div>
+                  </nav>
                   <div class="graph-status" hidden></div>
                 </main>
                 "#,
