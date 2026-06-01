@@ -1743,8 +1743,9 @@ fn refresh_inner_html(
 }
 
 fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
-    let visible_lanes = visible_graph_item_lanes(document, viewport)?;
-    let lane_display = graph_lane_display_map(document, &visible_lanes)?;
+    let lane_ys = graph_lane_ys(document)?;
+    let visible_lanes = stabilized_visible_graph_item_lanes(document, viewport, &lane_ys)?;
+    let lane_display = compact_lane_display_map(&lane_ys, &visible_lanes);
     sync_canvas_lane_visibility(document, viewport, &lane_display)?;
     let branches = document.query_selector_all(".branch[data-lane-y]")?;
     for index in 0..branches.length() {
@@ -1757,15 +1758,27 @@ fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Resul
     Ok(())
 }
 
-fn graph_lane_display_map(
+fn stabilized_visible_graph_item_lanes(
     document: &Document,
-    visible_lanes: &BTreeSet<i32>,
-) -> Result<BTreeMap<i32, LaneDisplay>, JsValue> {
-    let mut lane_ys = graph_lane_ys(document)?;
-    if lane_ys.is_empty() {
-        lane_ys = visible_lanes.clone();
+    viewport: ViewportState,
+    lane_ys: &BTreeSet<i32>,
+) -> Result<BTreeSet<i32>, JsValue> {
+    let identity_display = BTreeMap::new();
+    let mut visible_lanes = visible_graph_item_lanes(document, viewport, &identity_display)?;
+    for _ in 0..=lane_ys.len() {
+        let lane_display = compact_lane_display_map(lane_ys, &visible_lanes);
+        let display_viewport = ViewportState {
+            y: collapsed_viewport_y(viewport.y, &lane_display),
+            ..viewport
+        };
+        let next_visible_lanes =
+            visible_graph_item_lanes(document, display_viewport, &lane_display)?;
+        if next_visible_lanes == visible_lanes {
+            return Ok(visible_lanes);
+        }
+        visible_lanes = next_visible_lanes;
     }
-    Ok(compact_lane_display_map(&lane_ys, visible_lanes))
+    Ok(visible_lanes)
 }
 
 fn graph_lane_ys(document: &Document) -> Result<BTreeSet<i32>, JsValue> {
@@ -1935,6 +1948,10 @@ fn sync_canvas_edges(
     viewport: ViewportState,
     lane_display: &BTreeMap<i32, LaneDisplay>,
 ) -> Result<(), JsValue> {
+    let display_viewport = ViewportState {
+        y: collapsed_viewport_y(viewport.y, lane_display),
+        ..viewport
+    };
     let edges = document
         .query_selector_all(".edge[data-source-x][data-source-y][data-target-x][data-target-y]")?;
     for index in 0..edges.length() {
@@ -1952,8 +1969,14 @@ fn sync_canvas_edges(
         };
         let source = lane_display_for_y(lane_display, source_y);
         let target = lane_display_for_y(lane_display, target_y);
-        let visible =
-            graph_edge_visible_in_viewport(&edge, viewport, source_x, source_y, target_x, target_y);
+        let visible = graph_edge_visible_in_viewport(
+            &edge,
+            display_viewport,
+            source_x,
+            source.y,
+            target_x,
+            target.y,
+        );
         set_edge_display_geometry(&edge, source_x, source.y, target_x, target.y)?;
         edge.class_list()
             .toggle_with_force("edge-viewport-hidden", !visible)?;
@@ -2038,16 +2061,18 @@ fn apply_node_display_visibility(node: &Element, visible: bool) -> Result<(), Js
 fn visible_graph_item_lanes(
     document: &Document,
     viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
 ) -> Result<BTreeSet<i32>, JsValue> {
     let mut lanes = BTreeSet::new();
-    collect_visible_node_lanes(document, viewport, &mut lanes)?;
-    collect_visible_edge_lanes(document, viewport, &mut lanes)?;
+    collect_visible_node_lanes(document, viewport, lane_display, &mut lanes)?;
+    collect_visible_edge_lanes(document, viewport, lane_display, &mut lanes)?;
     Ok(lanes)
 }
 
 fn collect_visible_node_lanes(
     document: &Document,
     viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
     lanes: &mut BTreeSet<i32>,
 ) -> Result<(), JsValue> {
     let nodes = document.query_selector_all(".node-link[data-node-x][data-node-y]")?;
@@ -2059,7 +2084,8 @@ fn collect_visible_node_lanes(
         let Some((x, y)) = graph_item_point(&node, "data-node-x", "data-node-y") else {
             continue;
         };
-        if graph_node_visible_in_viewport(viewport, x, y) {
+        let display = lane_display_for_y(lane_display, y);
+        if graph_node_visible_in_viewport(viewport, x, display.y) {
             lanes.insert(y);
         }
     }
@@ -2069,6 +2095,7 @@ fn collect_visible_node_lanes(
 fn collect_visible_edge_lanes(
     document: &Document,
     viewport: ViewportState,
+    lane_display: &BTreeMap<i32, LaneDisplay>,
     lanes: &mut BTreeSet<i32>,
 ) -> Result<(), JsValue> {
     let edges = document
@@ -2086,7 +2113,9 @@ fn collect_visible_edge_lanes(
         else {
             continue;
         };
-        if graph_edge_visible_in_viewport(&edge, viewport, source_x, source_y, target_x, target_y) {
+        let source = lane_display_for_y(lane_display, source_y);
+        let target = lane_display_for_y(lane_display, target_y);
+        if graph_edge_visible_in_viewport(&edge, viewport, source_x, source.y, target_x, target.y) {
             lanes.insert(source_y);
             lanes.insert(target_y);
         }
@@ -3163,6 +3192,24 @@ mod tests {
         assert_edge_display(&fixture.root, "edge:merge:a5:c3", 90, 370, false);
     }
 
+    #[wasm_bindgen_test]
+    fn graph_items_canvas_lane_visibility_expands_lanes_shifted_into_viewport() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = viewport(1780, 0, 1000, 300).into();
+            graph
+                .apply_full(lane_shift_response(viewport(1780, 0, 1000, 300)))
+                .expect_throw("graph payload should render");
+        }
+
+        assert_branch_hidden(&fixture.root, "A", true);
+        assert_branch_hidden(&fixture.root, "B", true);
+        assert_branch_hidden(&fixture.root, "C", false);
+        assert_branch_hidden(&fixture.root, "day", true);
+        assert_node_display(&fixture.root, "node:c3", 90, false);
+    }
+
     impl GraphFixture {
         fn new() -> Self {
             let window = web_sys::window().expect_throw("window should be available");
@@ -3219,6 +3266,20 @@ mod tests {
                 graph: Rc::new(RefCell::new(graph)),
                 root,
             }
+        }
+    }
+
+    fn lane_shift_response(viewport: GraphViewport) -> GraphViewportResponse {
+        GraphViewportResponse {
+            version: 1,
+            canvas: GraphCanvas {
+                width: 4200,
+                height: 720,
+            },
+            viewport,
+            lanes: vec![lane("A", 90), lane("B", 230), lane("C", 370)],
+            nodes: vec![node("node:c3", "c3", 2100, 370)],
+            edges: Vec::new(),
         }
     }
 
