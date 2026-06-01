@@ -279,11 +279,13 @@ body {
   display: none;
 }
 
-.node-detail:target {
+.node-detail:target,
+.node-detail.node-detail-selected {
   display: block;
 }
 
-body:has(.node-detail:target) .node-details-default {
+body:has(.node-detail:target) .node-details-default,
+body:has(.node-detail.node-detail-selected) .node-details-default {
   display: none;
 }
 

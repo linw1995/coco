@@ -1513,6 +1513,7 @@ async fn refresh_selected_node_detail_from_graph(
 
 async fn refresh_selected_node_detail(window: &Window, document: &Document) -> Result<(), JsValue> {
     let target = selected_node_target(window);
+    render_loading_node_detail_if_current(window, document, target.as_deref())?;
     let url = node_detail_url(target.as_deref());
     let html = fetch_text(window, &url).await?;
     render_node_detail_if_current(window, document, target, &html)
@@ -1531,7 +1532,112 @@ fn render_node_detail_if_current(
     html: &str,
 ) -> Result<(), JsValue> {
     if selected_node_target(window) == target {
-        query_required(document, ".node-detail-slot")?.set_inner_html(html);
+        let slot = query_required(document, ".node-detail-slot")?;
+        slot.set_inner_html(html);
+        mark_selected_node_detail(&slot)?;
+    }
+    Ok(())
+}
+
+fn render_loading_node_detail_if_current(
+    window: &Window,
+    document: &Document,
+    target: Option<&str>,
+) -> Result<(), JsValue> {
+    let Some(target) = target else {
+        return clear_selected_node_detail(document);
+    };
+    if selected_node_target(window).as_deref() != Some(target) {
+        return Ok(());
+    }
+    let detail = loading_node_detail(document, target)?;
+    replace_node_detail_slot(document, &detail)
+}
+
+fn replace_node_detail_slot(document: &Document, detail: &Element) -> Result<(), JsValue> {
+    let slot = query_required(document, ".node-detail-slot")?;
+    slot.set_inner_html("");
+    slot.append_child(detail)?;
+    Ok(())
+}
+
+fn clear_selected_node_detail(document: &Document) -> Result<(), JsValue> {
+    let Some(detail) = document.query_selector(".node-detail.node-detail-selected")? else {
+        return Ok(());
+    };
+    detail.class_list().remove_1("node-detail-selected")
+}
+
+fn loading_node_detail(document: &Document, target: &str) -> Result<Element, JsValue> {
+    let section = node_detail_section(document, target)?;
+    append_text_child(document, &section, "h2", "Node")?;
+    let list = loading_detail_list(document)?;
+    section.append_child(&list)?;
+    Ok(section)
+}
+
+fn node_detail_section(document: &Document, target: &str) -> Result<Element, JsValue> {
+    let section = document.create_element("section")?;
+    set_attributes(
+        &section,
+        [
+            ("id", target.to_owned()),
+            (
+                "class",
+                "node-details node-detail node-detail-selected".to_owned(),
+            ),
+        ],
+    )?;
+    Ok(section)
+}
+
+fn loading_detail_list(document: &Document) -> Result<Element, JsValue> {
+    let list = classed_element(document, "dl", "detail-list")?;
+    let row = detail_row(document, "Selection", "Loading node detail...")?;
+    list.append_child(&row)?;
+    Ok(list)
+}
+
+fn detail_row(document: &Document, term: &str, detail: &str) -> Result<Element, JsValue> {
+    let row = document.create_element("div")?;
+    append_text_child(document, &row, "dt", term)?;
+    append_text_child(document, &row, "dd", detail)?;
+    Ok(row)
+}
+
+fn classed_element(document: &Document, tag: &str, class: &str) -> Result<Element, JsValue> {
+    let element = document.create_element(tag)?;
+    element.set_attribute("class", class)?;
+    Ok(element)
+}
+
+fn append_text_child(
+    document: &Document,
+    parent: &Element,
+    tag: &str,
+    text: &str,
+) -> Result<(), JsValue> {
+    let child = text_element(document, tag, text)?;
+    parent.append_child(&child)?;
+    Ok(())
+}
+
+fn text_element(document: &Document, tag: &str, text: &str) -> Result<Element, JsValue> {
+    let element = document.create_element(tag)?;
+    element.set_text_content(Some(text));
+    Ok(element)
+}
+
+fn mark_selected_node_detail(slot: &Element) -> Result<(), JsValue> {
+    let Some(detail) = slot.query_selector(".node-detail")? else {
+        return Ok(());
+    };
+    let class = detail.get_attribute("class").unwrap_or_default();
+    if !class
+        .split_ascii_whitespace()
+        .any(|part| part == "node-detail-selected")
+    {
+        detail.set_attribute("class", &format!("{class} node-detail-selected"))?;
     }
     Ok(())
 }
