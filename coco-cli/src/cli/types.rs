@@ -88,3 +88,23 @@ impl From<CliSessionRole> for SessionRole {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_provider_parse_accepts_known_values() {
+        assert_eq!(CliProvider::parse("openai"), Some(CliProvider::Openai));
+        assert_eq!(
+            CliProvider::parse("anthropic"),
+            Some(CliProvider::Anthropic)
+        );
+        assert_eq!(CliProvider::parse("chatgpt"), Some(CliProvider::Chatgpt));
+    }
+
+    #[test]
+    fn cli_provider_parse_rejects_unknown_values() {
+        assert_eq!(CliProvider::parse("unknown"), None);
+    }
+}

@@ -13,9 +13,7 @@ crap_args=(
   --exclude "build.rs"
   --threshold "${crap_threshold}"
 )
-crap_allow_args=(
-  --allow "render_full_viewport"
-)
+crap_allow_args=()
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   cargo-crap "${crap_args[@]}" "${crap_allow_args[@]}" --format github
