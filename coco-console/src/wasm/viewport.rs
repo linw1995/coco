@@ -1,4 +1,5 @@
 pub const MIN_OVERSCAN: i32 = 180;
+const COLLAPSED_LANE_OVERSCAN_HEIGHT_MULTIPLIER: f64 = 3.0;
 const SHORT_CANVAS_VISIBLE_WIDTH_FRACTION: f64 = 0.74;
 const SHORT_CANVAS_VISIBLE_HEIGHT_FRACTION: f64 = 0.82;
 
@@ -28,7 +29,10 @@ impl ViewportState {
     }
 
     pub fn render_overscan(self) -> i32 {
-        ((self.width.max(self.height) / 2.0).ceil() as i32).max(MIN_OVERSCAN)
+        ((self.width.max(self.height) / 2.0)
+            .max(self.height * COLLAPSED_LANE_OVERSCAN_HEIGHT_MULTIPLIER)
+            .ceil() as i32)
+            .max(MIN_OVERSCAN)
     }
 }
 
@@ -237,8 +241,21 @@ mod tests {
 
         assert_eq!(
             viewport.request_query(),
-            "x=1&y=3&width=401&height=240&overscan=201"
+            "x=1&y=3&width=401&height=240&overscan=720"
         );
+    }
+
+    #[test]
+    fn render_overscan_prefetches_collapsed_lane_space() {
+        let viewport = ViewportState {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 600.0,
+            overscan: 0,
+        };
+
+        assert_eq!(viewport.render_overscan(), 1800);
     }
 
     #[test]
