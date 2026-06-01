@@ -46,6 +46,8 @@ struct GraphItemsRefreshInput {
     query: String,
 }
 
+type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>;
+
 struct GraphRootElements {
     graph_wrap: Element,
     graph_svg: Element,
@@ -1365,6 +1367,20 @@ fn refresh_inner_html(
 }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let installers: [GraphListenerInstaller; 5] = [
+        install_node_detail_listener,
+        install_wheel_listener,
+        install_resize_listener,
+        install_viewport_map_listener,
+        install_hashchange_node_detail_listener,
+    ];
+    for install in installers {
+        install(graph.clone())?;
+    }
+    Ok(())
+}
+
+fn install_wheel_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let graph_wrap = graph.borrow().graph_wrap.clone();
     let wheel_graph = graph.clone();
     let wheel_closure = Closure::<dyn FnMut(WheelEvent)>::new(move |event: WheelEvent| {
@@ -1379,7 +1395,10 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     });
     graph_wrap.add_event_listener_with_callback("wheel", wheel_closure.as_ref().unchecked_ref())?;
     wheel_closure.forget();
+    Ok(())
+}
 
+fn install_resize_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let resize_graph = graph.clone();
     let resize_window = graph.borrow().window.clone();
     let resize_closure = Closure::<dyn FnMut()>::new(move || {
@@ -1390,7 +1409,10 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     resize_window
         .add_event_listener_with_callback("resize", resize_closure.as_ref().unchecked_ref())?;
     resize_closure.forget();
+    Ok(())
+}
 
+fn install_viewport_map_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let viewport_map = graph.borrow().viewport_map.clone();
     let viewport_map_graph = graph.clone();
     let viewport_map_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
@@ -1402,7 +1424,12 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     viewport_map
         .add_event_listener_with_callback("click", viewport_map_closure.as_ref().unchecked_ref())?;
     viewport_map_closure.forget();
+    Ok(())
+}
 
+fn install_hashchange_node_detail_listener(
+    graph: Rc<RefCell<VirtualGraph>>,
+) -> Result<(), JsValue> {
     let detail_graph = graph.clone();
     let detail_window = graph.borrow().window.clone();
     let detail_closure = Closure::<dyn FnMut()>::new(move || {
@@ -1418,6 +1445,52 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     detail_closure.forget();
 
     Ok(())
+}
+
+fn install_node_detail_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let node_group = graph.borrow().node_group.clone();
+    let detail_graph = graph.clone();
+    let detail_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        let Some(link) = node_link_from_event(&event) else {
+            return;
+        };
+        let Some(target) = link.get_attribute("data-node-target") else {
+            return;
+        };
+
+        event.prevent_default();
+        event.stop_propagation();
+        select_node_detail(detail_graph.clone(), target);
+    });
+    node_group
+        .add_event_listener_with_callback("click", detail_closure.as_ref().unchecked_ref())?;
+    detail_closure.forget();
+    Ok(())
+}
+
+fn node_link_from_event(event: &MouseEvent) -> Option<Element> {
+    let target = event.target()?.dyn_into::<Element>().ok()?;
+    target.closest(".node-link").ok().flatten()
+}
+
+fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
+    let (window, document) = {
+        let graph = graph.borrow();
+        (graph.window.clone(), graph.document.clone())
+    };
+
+    if selected_node_target(&window).as_deref() != Some(target.as_str())
+        && let Err(error) = window.location().set_hash(&target)
+    {
+        web_sys::console::error_1(&error);
+        return;
+    }
+
+    spawn_local(async move {
+        if let Err(error) = refresh_selected_node_detail(&window, &document).await {
+            web_sys::console::error_1(&error);
+        }
+    });
 }
 
 async fn refresh_selected_node_detail_from_graph(
