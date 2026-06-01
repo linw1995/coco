@@ -56,7 +56,6 @@ type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValu
 
 struct GraphRootElements {
     graph_wrap: Element,
-    graph_svg: Element,
     graph_bg: Element,
     follow_toggle: Element,
 }
@@ -198,7 +197,6 @@ struct VirtualGraph {
     document: Document,
     graph_mode: String,
     graph_wrap: Element,
-    graph_svg: Element,
     graph_bg: Element,
     follow_toggle: Element,
     lane_group: Element,
@@ -240,7 +238,6 @@ impl VirtualGraph {
             document,
             graph_mode,
             graph_wrap: elements.root.graph_wrap,
-            graph_svg: elements.root.graph_svg,
             graph_bg: elements.root.graph_bg,
             follow_toggle: elements.root.follow_toggle,
             lane_group: elements.layers.lane_group,
@@ -458,7 +455,7 @@ impl VirtualGraph {
     }
 
     fn apply_canvas(&self) -> Result<(), JsValue> {
-        apply_graph_viewport(&self.graph_svg, &self.graph_wrap, self.viewport, self.zoom)?;
+        apply_graph_viewport_metadata(&self.graph_wrap, self.viewport, self.zoom)?;
         apply_canvas_dimensions(self.canvas, &self.graph_bg)?;
         apply_time_scale_cursor(
             &self.time_scale,
@@ -857,7 +854,6 @@ fn query_optional(document: &Document, selector: &str) -> Option<Element> {
 fn query_graph_root_elements(document: &Document) -> Result<GraphRootElements, JsValue> {
     Ok(GraphRootElements {
         graph_wrap: query_required(document, ".graph-wrap")?,
-        graph_svg: query_required(document, ".graph")?,
         graph_bg: query_required(document, ".graph-bg")?,
         follow_toggle: query_required(document, ".follow-toggle")?,
     })
@@ -1039,25 +1035,11 @@ fn edge_kind_data(kind: GraphViewportEdgeKind) -> &'static str {
     }
 }
 
-fn apply_graph_viewport(
-    graph_svg: &Element,
+fn apply_graph_viewport_metadata(
     graph_wrap: &Element,
     viewport: ViewportState,
     zoom: f64,
 ) -> Result<(), JsValue> {
-    set_attributes(
-        graph_svg,
-        [(
-            "viewBox",
-            format!(
-                "{} {} {} {}",
-                rounded_i32(viewport.x),
-                rounded_i32(viewport.y),
-                rounded_i32(viewport.width),
-                rounded_i32(viewport.height)
-            ),
-        )],
-    )?;
     set_attributes(
         graph_wrap,
         [
