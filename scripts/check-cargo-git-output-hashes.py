@@ -18,6 +18,7 @@ def cargo_git_sources() -> set[str]:
     for package in lock.get("package", []):
         source = package.get("source")
         if source is not None and source.startswith("git+"):
+            # Crane percent-decodes Cargo.lock git sources before outputHashes lookup.
             sources.add(unquote(source))
 
     return sources
