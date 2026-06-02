@@ -64,6 +64,13 @@ repos:
         language: system
         types: [toml]
 
+      - id: cargo-git-output-hashes
+        name: cargo-git-output-hashes
+        entry: python3 scripts/check-cargo-git-output-hashes.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
 # Configuration for specific hooks
 default_stages: [pre-commit]
 fail_fast: false

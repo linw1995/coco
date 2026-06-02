@@ -30,9 +30,7 @@
 
     cargoExtraArgs = "--package coco-cli";
 
-    outputHashes = {
-      "git+https://github.com/0xPlaygrounds/rig?branch=main#327e4d447f233ef5c27ba16cc0e66b76d71bed34" = "sha256-Bt97w3yNwVY/0T5p5Ju6HygFnlDdWm0a8V40s9D19Fk=";
-    };
+    outputHashes = builtins.fromJSON (builtins.readFile (root + /nix/cargo-git-output-hashes.json));
 
     nativeBuildInputs = with packagePkgs; [
       wasm-bindgen-cli
