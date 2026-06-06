@@ -14,6 +14,9 @@ crap_args=(
   --threshold "${crap_threshold}"
 )
 crap_allow_args=()
+if ! grep -q "SF:.*coco-console/src/wasm/client.rs" "${CARGO_TARGET_DIR}/result/lcov.info"; then
+  crap_allow_args+=(--allow "coco-console/src/wasm/**")
+fi
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   cargo-crap "${crap_args[@]}" "${crap_allow_args[@]}" --format github
