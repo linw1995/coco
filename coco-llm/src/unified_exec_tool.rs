@@ -707,6 +707,39 @@ fn command_fingerprint(command: &str) -> String {
     format!("{hash:016x}")
 }
 
+fn command_template(execution: &ExecutionSpec) -> String {
+    let command_arg_index = shell_command_arg_index(&execution.args);
+    std::iter::once(shell_log_token(execution.program.as_os_str()))
+        .chain(execution.args.iter().enumerate().map(|(index, arg)| {
+            if Some(index) == command_arg_index {
+                "<cmd>".to_owned()
+            } else {
+                shell_log_token(arg)
+            }
+        }))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_command_arg_index(args: &[OsString]) -> Option<usize> {
+    let command_index = args.len().checked_sub(1)?;
+    let flag_index = args.len().checked_sub(2)?;
+    (args[flag_index] == OsStr::new("-c")).then_some(command_index)
+}
+
+fn shell_log_token(value: &OsStr) -> String {
+    let value = value.to_string_lossy();
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':' | b'=')
+    }) {
+        return value.into_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn shell_execution_spec(request: &ExecCommandRequest) -> ExecutionSpec {
     ExecutionSpec {
         program: PathBuf::from(&request.shell),
@@ -1539,11 +1572,13 @@ async fn execute_command(
         .as_ref()
         .map(|nono| nono.display().to_string())
         .unwrap_or_default();
+    let command_template = command_template(&execution);
     tracing::info!(
         cmd_hash = %command_fingerprint(&request.cmd),
         cmd_len = request.cmd.len(),
         shell = %request.shell.to_string_lossy(),
         nono = %nono,
+        command_template = %command_template,
         arg_count = execution.args.len(),
         workdir = %request.workdir.display(),
         yield_time_ms = request.yield_time_ms,
@@ -2243,6 +2278,56 @@ mod tests {
         assert_eq!(fingerprint.len(), 16);
         assert!(!fingerprint.contains("secret"));
         assert_ne!(fingerprint, command);
+    }
+
+    #[test]
+    fn command_template_redacts_nono_command_text() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let request = ExecCommandRequest {
+            cmd: "curl -H 'Authorization: Bearer secret' https://example.com".to_owned(),
+            workdir: temp_root.path().to_path_buf(),
+            workspace_root: temp_root.path().to_path_buf(),
+            sandbox_mode: ExecSandboxMode::Off,
+            shell: OsString::from("bash"),
+            tty: false,
+            yield_time_ms: DEFAULT_YIELD_TIME_MS,
+            max_output_tokens: None,
+            context: test_context(),
+            parent_tool_use_id: None,
+        };
+        let runtime_dir = temp_root.path().join(".coco-runtime").join("socket-dir");
+        let spec = nono_execution_spec(PathBuf::from("/bin/nono"), &request, &[runtime_dir]);
+
+        let template = command_template(&spec);
+
+        assert!(template.starts_with("/bin/nono run --silent --allow "));
+        assert!(template.contains(" -- bash -c <cmd>"));
+        assert!(!template.contains("Bearer secret"));
+        assert!(!template.contains("https://example.com"));
+    }
+
+    #[test]
+    fn command_template_redacts_shell_command_text() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let request = ExecCommandRequest {
+            cmd: "curl -H 'Authorization: Bearer secret' https://example.com".to_owned(),
+            workdir: temp_root.path().to_path_buf(),
+            workspace_root: temp_root.path().to_path_buf(),
+            sandbox_mode: ExecSandboxMode::Off,
+            shell: OsString::from("bash"),
+            tty: false,
+            yield_time_ms: DEFAULT_YIELD_TIME_MS,
+            max_output_tokens: None,
+            context: test_context(),
+            parent_tool_use_id: None,
+        };
+        let spec = shell_execution_spec(&request);
+
+        let template = command_template(&spec);
+
+        assert_eq!(template, "bash -c <cmd>");
+        assert!(!template.contains("Bearer secret"));
+        assert!(!template.contains("https://example.com"));
     }
 
     #[test]
