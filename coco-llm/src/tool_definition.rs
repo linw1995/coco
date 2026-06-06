@@ -4,9 +4,13 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
     match name {
         "exec_command" => Some(Tool {
             name: "exec_command".to_owned(),
-            description:
-                "Runs a command, returning output or a session_id for ongoing interaction."
-                    .to_owned(),
+            description: concat!(
+                "Runs a command, returning output or a session_id for ongoing interaction. ",
+                "Filesystem access is scoped by the runtime context; when active_skill is set, ",
+                "the active skill directory and persistent data directory are included in the ",
+                "allowed filesystem scope."
+            )
+            .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -115,5 +119,20 @@ pub fn builtin_tool_definition(name: &str) -> Option<Tool> {
             }),
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_command_description_mentions_active_skill_filesystem_scope() {
+        let tool = builtin_tool_definition("exec_command").expect("tool should exist");
+
+        assert!(tool.description.contains("runtime context"));
+        assert!(tool.description.contains("active_skill"));
+        assert!(tool.description.contains("active skill directory"));
+        assert!(tool.description.contains("persistent data directory"));
     }
 }
