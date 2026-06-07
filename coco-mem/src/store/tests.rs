@@ -250,7 +250,7 @@ fn downgrade_cronjob_skill_to_prompt_command_builtin(path: &Path) {
     write_jsonl_values(&history_path, &history);
 }
 
-fn downgrade_handoff_skills_to_system_prompt_builtin(path: &Path) {
+fn downgrade_recovery_skill_to_system_prompt_builtin(path: &Path) {
     fn downgrade_snapshot(
         snapshot: &mut serde_json::Value,
         old_revision_id: &str,
@@ -273,9 +273,6 @@ fn downgrade_handoff_skills_to_system_prompt_builtin(path: &Path) {
         r#"coco session handoff --branch <branch> --prompt "<recovered context>""#,
         r#"coco session handoff --branch <branch> --system-prompt "<recovered context>""#,
     );
-    skills["orchestrator"]["compact"]["id"] =
-        json!("d035938926144776ca4341aaa57eaa3ed28a76234222f1ff06fe06cf5d8ab9ff");
-    skills["orchestrator"]["compact"]["body"] = json!(compact_body_before_handoff_prompt());
     fs::write(
         path.join("skills.json"),
         serde_json::to_string_pretty(&skills).unwrap(),
@@ -291,30 +288,6 @@ fn downgrade_handoff_skills_to_system_prompt_builtin(path: &Path) {
         r#"coco session handoff --branch <branch> --system-prompt "<recovered context>""#,
     );
     write_jsonl_values(&recovery_history_path, &recovery_history);
-
-    let compact_history_path = path.join("skill-history/orchestrator/compact.jsonl");
-    let mut compact_history = read_jsonl_values(&compact_history_path);
-    compact_history[0]["id"] =
-        json!("d035938926144776ca4341aaa57eaa3ed28a76234222f1ff06fe06cf5d8ab9ff");
-    compact_history[0]["body"] = json!(compact_body_before_handoff_prompt());
-    write_jsonl_values(&compact_history_path, &compact_history);
-}
-
-fn compact_body_before_handoff_prompt() -> String {
-    include_str!("../default_skills/compact.md")
-        .trim()
-        .replace(
-            r#"coco session handoff --branch <branch> --prompt "<compacted handoff>""#,
-            r#"coco session handoff --branch <branch> --system-prompt "<compacted system prompt>""#,
-        )
-        .replace(
-            "Write the compacted content as the handoff prompt for the next turn on this\n  branch.",
-            "Write the compacted content as a procedural system prompt for the next turn on\n  this branch.",
-        )
-        .replace(
-            "Apply the result with `coco session handoff --branch <branch> --prompt\n  \"<compacted handoff>\"`.",
-            "Apply the result with `coco session handoff --branch <branch> --system-prompt\n  \"<compacted system prompt>\"`.",
-        )
 }
 
 fn temp_store_path() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -2329,6 +2302,34 @@ where
             .contains("Do not use `session rebase` for compaction")
     );
     assert!(
+        compact
+            .current()
+            .unwrap()
+            .body
+            .contains("Self-compaction delegation")
+    );
+    assert!(
+        compact
+            .current()
+            .unwrap()
+            .body
+            .contains("do not run `coco session handoff`")
+    );
+    assert!(
+        compact
+            .current()
+            .unwrap()
+            .body
+            .contains("coco job --async --json --branch <worker-branch>")
+    );
+    assert!(
+        compact
+            .current()
+            .unwrap()
+            .body
+            .contains("wait until the target branch has no active prompt jobs")
+    );
+    assert!(
         cronjob
             .current()
             .unwrap()
@@ -3388,7 +3389,7 @@ fn open_migrates_current_version_builtin_skills_to_current() {
     let (_tempdir, path) = temp_store_path();
     FsStore::open(&path).unwrap();
     downgrade_cronjob_skill_to_prompt_command_builtin(&path);
-    downgrade_handoff_skills_to_system_prompt_builtin(&path);
+    downgrade_recovery_skill_to_system_prompt_builtin(&path);
     let mut meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
     meta["version"] = json!("2026-05-29");
@@ -3421,20 +3422,6 @@ fn open_migrates_current_version_builtin_skills_to_current() {
             .unwrap()
             .body
             .contains(r#"--prompt "<recovered context>""#)
-    );
-    let compact = reopened
-        .get_skill(SessionRole::Orchestrator, "compact")
-        .unwrap();
-    assert_eq!(
-        compact.current().unwrap().id,
-        "6a260a4377c10fe227c4957db8a63ebfb8b6b292a9e3862c21402a1c1b73d14e"
-    );
-    assert!(
-        compact
-            .current()
-            .unwrap()
-            .body
-            .contains(r#"--prompt "<compacted handoff>""#)
     );
 }
 
