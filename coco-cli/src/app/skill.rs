@@ -259,14 +259,10 @@ where
         }
     );
 
-    let mode = match command.handoff {
-        Some(handoff) => {
-            let prompt = handoff.trim().to_owned();
-            ensure!(!prompt.is_empty(), InvalidSkillRunHandoffSnafu);
-            SkillInvocationMode::Handoff { prompt }
-        }
-        None => SkillInvocationMode::InheritContext,
-    };
+    let prompt = command.handoff.trim().to_owned();
+    ensure!(!prompt.is_empty(), InvalidSkillRunHandoffSnafu);
+    let handoff = Some(prompt.clone());
+    let mode = SkillInvocationMode::Handoff { prompt };
     let skill_name = command.name;
     let session_role = resolve_parent_session_role(store, &parent_tool_use_id)?;
     let invocation_node_id = store
@@ -283,10 +279,6 @@ where
             )),
         })
         .context(StoreSnafu)?;
-    let handoff = match &mode {
-        SkillInvocationMode::InheritContext => None,
-        SkillInvocationMode::Handoff { prompt } => Some(prompt.clone()),
-    };
     let workspace_root = std::env::current_dir().context(ResolveCurrentDirSnafu)?;
     let result = ConversationEngine::new(llm.clone())
         .execute_skill_invocation(
