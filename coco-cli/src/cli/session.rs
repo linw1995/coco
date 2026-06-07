@@ -1,4 +1,4 @@
-use clap::{Args, Subcommand};
+use clap::{ArgAction, Args, Subcommand};
 
 use super::{CliProvider, CliSessionRole, CliTool};
 
@@ -173,6 +173,9 @@ pub struct SessionRebaseCommand {
 pub struct SessionHandoffCommand {
     #[command(flatten)]
     pub rebase: SessionRebaseCommand,
+
+    #[arg(long = "no-refresh-tools", action = ArgAction::SetFalse, default_value_t = true)]
+    pub refresh_tools: bool,
 
     #[arg(long)]
     pub prompt: String,

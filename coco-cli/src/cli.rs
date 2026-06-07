@@ -15,12 +15,12 @@ pub use prompt::{
 pub use session::{SessionBranchCommand, SessionGraphCommand, SessionShowCommand};
 #[cfg(test)]
 pub use session::{
-    SessionCloseCommand, SessionFeedbackCommand, SessionForkCommand, SessionHandoffCommand,
-    SessionMergeCommand, SessionPrCommand,
+    SessionCloseCommand, SessionFeedbackCommand, SessionForkCommand, SessionMergeCommand,
+    SessionPrCommand,
 };
 pub use session::{
-    SessionCommand, SessionCreateCommand, SessionListCommand, SessionRebaseCommand,
-    SessionSubcommand,
+    SessionCommand, SessionCreateCommand, SessionHandoffCommand, SessionListCommand,
+    SessionRebaseCommand, SessionSubcommand,
 };
 pub use skill::{
     SkillAddCommand, SkillCommand, SkillListCommand, SkillRollbackCommand, SkillRunCommand,

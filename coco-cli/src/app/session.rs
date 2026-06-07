@@ -16,7 +16,10 @@ use snafu::prelude::*;
 use crate::{
     Result,
     app::config::{ProviderProfileLookup, ProviderProfiles},
-    cli::{CliTool, SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand},
+    cli::{
+        CliTool, SessionCommand, SessionCreateCommand, SessionHandoffCommand, SessionRebaseCommand,
+        SessionSubcommand,
+    },
     env::resolve_env_tools,
     error::{
         AmbiguousNodePrefixSnafu, EmptyPromptSnafu, LlmSnafu, MissingProviderProfileModelSnafu,
@@ -193,14 +196,7 @@ where
             run_session_rebase_command(command, store, llm, provider_profiles).await
         }
         SessionSubcommand::Handoff(command) => {
-            run_session_handoff_command(
-                command.rebase,
-                command.prompt,
-                store,
-                llm,
-                provider_profiles,
-            )
-            .await
+            run_session_handoff_command(command, store, llm, provider_profiles).await
         }
         SessionSubcommand::Reopen(command) => {
             run_session_reopen_command(command.branch, command.json, store)
@@ -374,8 +370,7 @@ where
 }
 
 async fn run_session_handoff_command<B, S>(
-    rebase_command: SessionRebaseCommand,
-    prompt: String,
+    command: SessionHandoffCommand,
     store: &S,
     llm: &Arc<LlmService<B, S>>,
     provider_profiles: &ProviderProfiles,
@@ -384,11 +379,28 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
+    let SessionHandoffCommand {
+        rebase: rebase_command,
+        prompt,
+        refresh_tools,
+    } = command;
     let branch = rebase_command.branch.clone();
     let json = rebase_command.json;
     let prompt = prompt.trim().to_owned();
     ensure!(!prompt.is_empty(), EmptyPromptSnafu);
-    let handoff = resolve_session_rebase(rebase_command, store, provider_profiles)?;
+    let refresh_tools_from_current_session =
+        refresh_tools && !rebase_command.clear_tools && !rebase_command.enable_all_tools;
+    let refresh_tools_from_current_session =
+        refresh_tools_from_current_session && rebase_command.tools.is_empty();
+    let mut handoff = resolve_session_rebase(rebase_command, store, provider_profiles)?;
+    if refresh_tools {
+        refresh_handoff_tools(
+            &mut handoff.patch,
+            store,
+            &branch,
+            refresh_tools_from_current_session,
+        )?;
+    }
     let head = llm
         .handoff_session(&branch, handoff.patch, &prompt)
         .await
@@ -1924,6 +1936,32 @@ fn resolve_session_rebase(
     }
 
     Ok(ResolvedSessionRebase { patch })
+}
+
+fn refresh_handoff_tools(
+    patch: &mut SessionConfigPatch,
+    store: &impl NodeStore,
+    branch: &str,
+    refresh_from_current_session: bool,
+) -> Result<()> {
+    if let Some(tools) = patch.tools.take() {
+        patch.tools = Some(refresh_builtin_tool_definitions(tools));
+        return Ok(());
+    }
+
+    if refresh_from_current_session {
+        let (_, session_anchor) = resolve_visible_session_anchor(store, branch)?;
+        patch.tools = Some(refresh_builtin_tool_definitions(session_anchor.tools));
+    }
+
+    Ok(())
+}
+
+fn refresh_builtin_tool_definitions(tools: Vec<Tool>) -> Vec<Tool> {
+    tools
+        .into_iter()
+        .map(|tool| coco_llm::builtin_tool_definition(&tool.name).unwrap_or(tool))
+        .collect()
 }
 
 fn preset_to_session_anchor_patch(

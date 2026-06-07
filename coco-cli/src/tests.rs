@@ -17,7 +17,7 @@ use coco_llm::{
 };
 use coco_mem::{
     MessageQueueStore, PresetStore, ProcessShareableStore, ProviderProfile, SessionState,
-    SkillStore, SkillVersionSpec,
+    SkillStore, SkillVersionSpec, Tool,
 };
 use indoc::formatdoc;
 use serde_json::{Value, json};
@@ -61,6 +61,22 @@ fn tool_names(tools: &[coco_mem::Tool]) -> Vec<&str> {
 
 fn all_builtin_tool_names() -> Vec<&'static str> {
     vec!["exec_command", "write_stdin", "search_skill", "load_image"]
+}
+
+fn stale_exec_command_tool() -> Tool {
+    Tool {
+        name: "exec_command".to_owned(),
+        description: "Old exec command description.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "cmd": {
+                    "type": "string"
+                }
+            },
+            "required": ["cmd"]
+        }),
+    }
 }
 
 #[test]
@@ -496,6 +512,7 @@ fn session_handoff_cli(store_path: std::path::PathBuf, branch: Option<&str>) -> 
                     disable_coco_shim: false,
                     json: true,
                 },
+                refresh_tools: true,
                 prompt: "handoff prompt".to_owned(),
             }),
         }),
@@ -2384,6 +2401,122 @@ async fn session_handoff_appends_inherited_session_anchor() {
     assert_eq!(session.prompt, "handoff prompt");
     assert_eq!(session.temperature, Some(0.2));
     assert_eq!(session.max_tokens, Some(256));
+}
+
+#[tokio::test]
+async fn session_handoff_refreshes_inherited_builtin_tool_definitions_by_default() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let stale_tool = stale_exec_command_tool();
+    open_store(&store_path)
+        .unwrap()
+        .rebase_session(
+            "main",
+            &SessionAnchorPatch {
+                tools: Some(vec![stale_tool]),
+                ..SessionAnchorPatch::default()
+            },
+        )
+        .unwrap();
+
+    run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "handoff",
+            "--branch",
+            "main",
+            "--prompt",
+            "handoff prompt",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let store = open_store(&store_path).unwrap();
+    let ancestry = store.ancestry("main").unwrap();
+    let Kind::Anchor(anchor) = &ancestry[0].kind else {
+        panic!("expected session anchor");
+    };
+    let session = anchor.as_session().expect("expected session anchor");
+    let expected_tool = coco_llm::builtin_tool_definition("exec_command").unwrap();
+    assert_eq!(session.tools, vec![expected_tool]);
+}
+
+#[tokio::test]
+async fn session_handoff_can_preserve_inherited_tool_definitions() {
+    let (_tempdir, store_path) = temp_store_path();
+    with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            run_with_backend(
+                session_create_cli(store_path.clone(), Some("main")),
+                &mut Cursor::new(""),
+                FakeBackend::with_responses(&[]),
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await;
+
+    let stale_tool = stale_exec_command_tool();
+    open_store(&store_path)
+        .unwrap()
+        .rebase_session(
+            "main",
+            &SessionAnchorPatch {
+                tools: Some(vec![stale_tool.clone()]),
+                ..SessionAnchorPatch::default()
+            },
+        )
+        .unwrap();
+
+    run_with_backend(
+        Cli::try_parse_from([
+            "coco-cli",
+            "--store-path",
+            store_path.to_str().unwrap(),
+            "session",
+            "handoff",
+            "--branch",
+            "main",
+            "--no-refresh-tools",
+            "--prompt",
+            "handoff prompt",
+        ])
+        .unwrap(),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap();
+
+    let store = open_store(&store_path).unwrap();
+    let ancestry = store.ancestry("main").unwrap();
+    let Kind::Anchor(anchor) = &ancestry[0].kind else {
+        panic!("expected session anchor");
+    };
+    let session = anchor.as_session().expect("expected session anchor");
+    assert_eq!(session.tools, vec![stale_tool]);
 }
 
 #[tokio::test]
