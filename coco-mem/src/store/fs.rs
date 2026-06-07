@@ -3672,6 +3672,8 @@ mod load_tests {
 
 #[cfg(test)]
 mod builtin_skill_migration_tests {
+    use sha2::{Digest, Sha256};
+
     use super::{
         BUILTIN_SKILL_MIGRATIONS, BuiltinSkillMigration, BuiltinSkillMigrationAction,
         STORE_FORMAT_VERSION, STORE_MIGRATIONS, SessionRole, SkillVersion, SkillVersionSpec,
@@ -3681,54 +3683,13 @@ mod builtin_skill_migration_tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct BuiltinSkillRevision {
         role: SessionRole,
-        name: &'static str,
+        name: String,
         revision_id: String,
     }
 
-    struct HistoricalBuiltinSkillRevision {
-        role: SessionRole,
-        name: &'static str,
-        revision_id: &'static str,
-    }
-
     const PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION: &str = "2026-05-30";
-    const PREVIOUS_BUILTIN_SKILL_REVISIONS: &[HistoricalBuiltinSkillRevision] = &[
-        HistoricalBuiltinSkillRevision {
-            role: SessionRole::Orchestrator,
-            name: "coco-orchestrator",
-            revision_id: "1df4b89775b27c799b4f6b80b32b75c0cccd837dd574048484b38c13a5aff146",
-        },
-        HistoricalBuiltinSkillRevision {
-            role: SessionRole::Orchestrator,
-            name: "new-skill",
-            revision_id: "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad",
-        },
-        HistoricalBuiltinSkillRevision {
-            role: SessionRole::Orchestrator,
-            name: "cronjob",
-            revision_id: "872b8f90c21af69be61fe7d90085dbd4491ca6dedd0aeae08feeee65db3aae5a",
-        },
-        HistoricalBuiltinSkillRevision {
-            role: SessionRole::Orchestrator,
-            name: "recovery",
-            revision_id: "91adf3f8b4e2fb11008b58db4d0c62c21b1b76cbe13b53a58e81fdeca1548b3b",
-        },
-        HistoricalBuiltinSkillRevision {
-            role: SessionRole::Orchestrator,
-            name: "compact",
-            revision_id: "6a260a4377c10fe227c4957db8a63ebfb8b6b292a9e3862c21402a1c1b73d14e",
-        },
-        HistoricalBuiltinSkillRevision {
-            role: SessionRole::Runner,
-            name: "coco-runner",
-            revision_id: "dcf88bdb5caaa2c8e4702cd5dfaa3e20919e08ce367ab7965e1f0d62710a60f4",
-        },
-        HistoricalBuiltinSkillRevision {
-            role: SessionRole::Runner,
-            name: "telegram",
-            revision_id: "1b3f4dcf9b56400edb41ba960e6743b2e938ee58800e5dbb7fc02b11a8d432a0",
-        },
-    ];
+    const PREVIOUS_BUILTIN_SKILL_REVISIONS_FINGERPRINT: &str =
+        "cde0b9aca21fc594fc60607c56e635ca32e263396b4c92bad6f08c5a7583282a";
 
     #[test]
     fn store_migration_builtin_targets_match_current_defaults() {
@@ -3756,25 +3717,9 @@ mod builtin_skill_migration_tests {
     #[test]
     fn builtin_skill_revision_changes_require_store_format_migration() {
         let current_revisions = current_builtin_skill_revisions();
-        let changed_revisions = PREVIOUS_BUILTIN_SKILL_REVISIONS
-            .iter()
-            .filter_map(|previous| {
-                let current = current_revisions
-                    .iter()
-                    .find(|revision| {
-                        revision.role == previous.role && revision.name == previous.name
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "missing current builtin skill revision for {:?} {}",
-                            previous.role, previous.name
-                        )
-                    });
-                (current.revision_id != previous.revision_id).then_some((previous, current))
-            })
-            .collect::<Vec<_>>();
+        let current_fingerprint = builtin_skill_revisions_fingerprint(&current_revisions);
 
-        if changed_revisions.is_empty() {
+        if current_fingerprint == PREVIOUS_BUILTIN_SKILL_REVISIONS_FINGERPRINT {
             assert_eq!(
                 STORE_FORMAT_VERSION, PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION,
                 "unchanged builtin skill revisions should not require a store format bump"
@@ -3799,34 +3744,12 @@ mod builtin_skill_migration_tests {
             })
             .expect("builtin skill revision changes must add a store migration");
 
-        for (previous, current) in changed_revisions {
-            let builtin_migration = migration
-                .builtin_skills
+        assert!(
+            previous_builtin_skill_fingerprint_candidates(&current_revisions, migration)
                 .iter()
-                .find(|migration| {
-                    migration.role == previous.role && migration.name == previous.name
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing builtin migration for changed skill {:?} {}",
-                        previous.role, previous.name
-                    )
-                });
-            assert!(
-                builtin_migration
-                    .from_revision_ids
-                    .contains(&previous.revision_id),
-                "builtin migration for {:?} {} must include previous revision {}",
-                previous.role,
-                previous.name,
-                previous.revision_id
-            );
-            assert_eq!(
-                builtin_migration.target_revision_id, current.revision_id,
-                "builtin migration for {:?} {} must target the computed current revision",
-                previous.role, previous.name
-            );
-        }
+                .any(|fingerprint| fingerprint == PREVIOUS_BUILTIN_SKILL_REVISIONS_FINGERPRINT),
+            "builtin skill revision changes must be recoverable from the migration source revisions"
+        );
     }
 
     #[test]
@@ -3974,26 +3897,111 @@ mod builtin_skill_migration_tests {
     fn current_builtin_skill_revisions() -> Vec<BuiltinSkillRevision> {
         let defaults = default_skill_groups();
         let mut revisions = Vec::new();
-        for historical in PREVIOUS_BUILTIN_SKILL_REVISIONS {
-            let default_record = defaults
-                .for_role(historical.role)
-                .get(historical.name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing default builtin skill for {:?} {}",
-                        historical.role, historical.name
-                    )
+        for (role, records) in [
+            (SessionRole::Orchestrator, &defaults.orchestrator),
+            (SessionRole::Runner, &defaults.runner),
+        ] {
+            for (name, record) in records {
+                revisions.push(BuiltinSkillRevision {
+                    role,
+                    name: name.clone(),
+                    revision_id: record
+                        .current()
+                        .expect("default builtin skill should have a current version")
+                        .id
+                        .clone(),
                 });
-            revisions.push(BuiltinSkillRevision {
-                role: historical.role,
-                name: historical.name,
-                revision_id: default_record
-                    .current()
-                    .expect("default builtin skill should have a current version")
-                    .id
-                    .clone(),
-            });
+            }
         }
+        revisions.sort_by(|left, right| {
+            (
+                left.role.as_str(),
+                left.name.as_str(),
+                left.revision_id.as_str(),
+            )
+                .cmp(&(
+                    right.role.as_str(),
+                    right.name.as_str(),
+                    right.revision_id.as_str(),
+                ))
+        });
         revisions
+    }
+
+    fn previous_builtin_skill_fingerprint_candidates(
+        current: &[BuiltinSkillRevision],
+        migration: &super::StoreMigration,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+        collect_previous_builtin_skill_fingerprint_candidates(
+            current.to_vec(),
+            migration.builtin_skills,
+            0,
+            &mut candidates,
+        );
+        candidates
+    }
+
+    fn collect_previous_builtin_skill_fingerprint_candidates(
+        revisions: Vec<BuiltinSkillRevision>,
+        migrations: &[BuiltinSkillMigration],
+        index: usize,
+        candidates: &mut Vec<String>,
+    ) {
+        let Some(migration) = migrations.get(index) else {
+            candidates.push(builtin_skill_revisions_fingerprint(&revisions));
+            return;
+        };
+
+        collect_previous_builtin_skill_fingerprint_candidates(
+            revisions.clone(),
+            migrations,
+            index + 1,
+            candidates,
+        );
+
+        for source_revision_id in migration.from_revision_ids {
+            let mut source_revisions = revisions.clone();
+            if let Some(revision) = source_revisions.iter_mut().find(|revision| {
+                revision.role == migration.role
+                    && revision.name == migration.name
+                    && revision.revision_id == migration.target_revision_id
+            }) {
+                revision.revision_id = (*source_revision_id).to_owned();
+                collect_previous_builtin_skill_fingerprint_candidates(
+                    source_revisions,
+                    migrations,
+                    index + 1,
+                    candidates,
+                );
+            }
+        }
+    }
+
+    fn builtin_skill_revisions_fingerprint(revisions: &[BuiltinSkillRevision]) -> String {
+        let mut lines = revisions
+            .iter()
+            .map(|revision| {
+                format!(
+                    "{}:{}:{}",
+                    revision.role.as_str(),
+                    revision.name,
+                    revision.revision_id
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.sort();
+
+        let mut hasher = Sha256::new();
+        for line in lines {
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+        }
+
+        hex_encode(&hasher.finalize())
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
