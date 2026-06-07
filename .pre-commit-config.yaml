@@ -71,13 +71,6 @@ repos:
         pass_filenames: false
         always_run: true
 
-      - id: builtin-skill-store-version
-        name: builtin-skill-store-version
-        entry: cargo run --quiet --manifest-path scripts/check-builtin-skill-store-version/Cargo.toml --
-        language: system
-        pass_filenames: false
-        always_run: true
-
 # Configuration for specific hooks
 default_stages: [pre-commit]
 fail_fast: false

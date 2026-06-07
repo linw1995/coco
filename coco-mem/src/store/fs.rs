@@ -3674,9 +3674,61 @@ mod load_tests {
 mod builtin_skill_migration_tests {
     use super::{
         BUILTIN_SKILL_MIGRATIONS, BuiltinSkillMigration, BuiltinSkillMigrationAction,
-        STORE_MIGRATIONS, SessionRole, SkillVersion, SkillVersionSpec,
-        builtin_skill_migration_action, default_skill_groups,
+        STORE_FORMAT_VERSION, STORE_MIGRATIONS, SessionRole, SkillVersion, SkillVersionSpec,
+        StoreFormatVersion, builtin_skill_migration_action, default_skill_groups,
     };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BuiltinSkillRevision {
+        role: SessionRole,
+        name: &'static str,
+        revision_id: String,
+    }
+
+    struct HistoricalBuiltinSkillRevision {
+        role: SessionRole,
+        name: &'static str,
+        revision_id: &'static str,
+    }
+
+    const PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION: &str = "2026-05-30";
+    const PREVIOUS_BUILTIN_SKILL_REVISIONS: &[HistoricalBuiltinSkillRevision] = &[
+        HistoricalBuiltinSkillRevision {
+            role: SessionRole::Orchestrator,
+            name: "coco-orchestrator",
+            revision_id: "1df4b89775b27c799b4f6b80b32b75c0cccd837dd574048484b38c13a5aff146",
+        },
+        HistoricalBuiltinSkillRevision {
+            role: SessionRole::Orchestrator,
+            name: "new-skill",
+            revision_id: "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad",
+        },
+        HistoricalBuiltinSkillRevision {
+            role: SessionRole::Orchestrator,
+            name: "cronjob",
+            revision_id: "872b8f90c21af69be61fe7d90085dbd4491ca6dedd0aeae08feeee65db3aae5a",
+        },
+        HistoricalBuiltinSkillRevision {
+            role: SessionRole::Orchestrator,
+            name: "recovery",
+            revision_id: "91adf3f8b4e2fb11008b58db4d0c62c21b1b76cbe13b53a58e81fdeca1548b3b",
+        },
+        HistoricalBuiltinSkillRevision {
+            role: SessionRole::Orchestrator,
+            name: "compact",
+            revision_id: "6a260a4377c10fe227c4957db8a63ebfb8b6b292a9e3862c21402a1c1b73d14e",
+        },
+        HistoricalBuiltinSkillRevision {
+            role: SessionRole::Runner,
+            name: "coco-runner",
+            revision_id: "dcf88bdb5caaa2c8e4702cd5dfaa3e20919e08ce367ab7965e1f0d62710a60f4",
+        },
+        HistoricalBuiltinSkillRevision {
+            role: SessionRole::Runner,
+            name: "telegram",
+            revision_id: "1b3f4dcf9b56400edb41ba960e6743b2e938ee58800e5dbb7fc02b11a8d432a0",
+        },
+    ];
 
     #[test]
     fn store_migration_builtin_targets_match_current_defaults() {
@@ -3698,6 +3750,82 @@ mod builtin_skill_migration_tests {
                     builtin_migration.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn builtin_skill_revision_changes_require_store_format_migration() {
+        let current_revisions = current_builtin_skill_revisions();
+        let changed_revisions = PREVIOUS_BUILTIN_SKILL_REVISIONS
+            .iter()
+            .filter_map(|previous| {
+                let current = current_revisions
+                    .iter()
+                    .find(|revision| {
+                        revision.role == previous.role && revision.name == previous.name
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing current builtin skill revision for {:?} {}",
+                            previous.role, previous.name
+                        )
+                    });
+                (current.revision_id != previous.revision_id).then_some((previous, current))
+            })
+            .collect::<Vec<_>>();
+
+        if changed_revisions.is_empty() {
+            assert_eq!(
+                STORE_FORMAT_VERSION, PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION,
+                "unchanged builtin skill revisions should not require a store format bump"
+            );
+            return;
+        }
+
+        assert_ne!(
+            STORE_FORMAT_VERSION, PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION,
+            "builtin skill revision changes must bump STORE_FORMAT_VERSION"
+        );
+        let migration = STORE_MIGRATIONS
+            .iter()
+            .find(|migration| {
+                matches!(
+                    migration.from,
+                    StoreFormatVersion::Chronicle(PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION)
+                ) && matches!(
+                    migration.to,
+                    StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION)
+                )
+            })
+            .expect("builtin skill revision changes must add a store migration");
+
+        for (previous, current) in changed_revisions {
+            let builtin_migration = migration
+                .builtin_skills
+                .iter()
+                .find(|migration| {
+                    migration.role == previous.role && migration.name == previous.name
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing builtin migration for changed skill {:?} {}",
+                        previous.role, previous.name
+                    )
+                });
+            assert!(
+                builtin_migration
+                    .from_revision_ids
+                    .contains(&previous.revision_id),
+                "builtin migration for {:?} {} must include previous revision {}",
+                previous.role,
+                previous.name,
+                previous.revision_id
+            );
+            assert_eq!(
+                builtin_migration.target_revision_id, current.revision_id,
+                "builtin migration for {:?} {} must target the computed current revision",
+                previous.role, previous.name
+            );
         }
     }
 
@@ -3841,5 +3969,31 @@ mod builtin_skill_migration_tests {
             .iter()
             .find(|migration| migration.role == role && migration.name == name)
             .expect("builtin migration should exist")
+    }
+
+    fn current_builtin_skill_revisions() -> Vec<BuiltinSkillRevision> {
+        let defaults = default_skill_groups();
+        let mut revisions = Vec::new();
+        for historical in PREVIOUS_BUILTIN_SKILL_REVISIONS {
+            let default_record = defaults
+                .for_role(historical.role)
+                .get(historical.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing default builtin skill for {:?} {}",
+                        historical.role, historical.name
+                    )
+                });
+            revisions.push(BuiltinSkillRevision {
+                role: historical.role,
+                name: historical.name,
+                revision_id: default_record
+                    .current()
+                    .expect("default builtin skill should have a current version")
+                    .id
+                    .clone(),
+            });
+        }
+        revisions
     }
 }

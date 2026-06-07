@@ -2809,7 +2809,7 @@ fn open_creates_jsonl_store_directory_with_root_node() {
 
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["version"], "2026-05-30");
+    assert_eq!(meta["version"], "2026-06-07");
 }
 
 #[test]
@@ -3034,7 +3034,7 @@ fn open_migrates_numeric_store_format_version_to_chronicle_version() {
 
     let migrated: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated["version"], "2026-05-30");
+    assert_eq!(migrated["version"], "2026-06-07");
     let migrated_skills: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("skills.json")).unwrap()).unwrap();
     let snapshot_id = migrated_skills["orchestrator"]["coco-orchestrator"]["id"]
@@ -3337,7 +3337,7 @@ fn open_migrates_legacy_jobs_json_to_snapshot_with_empty_wal() {
     assert_eq!(reopened.get_job(&job.job_id).unwrap(), job);
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-30");
+    assert_eq!(migrated_meta["version"], "2026-06-07");
 }
 
 #[test]
@@ -3357,7 +3357,7 @@ fn open_migrates_previous_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-30");
+    assert_eq!(migrated_meta["version"], "2026-06-07");
 }
 
 #[test]
@@ -3378,7 +3378,7 @@ fn open_migrates_previous_cronjob_builtin_skill_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-30");
+    assert_eq!(migrated_meta["version"], "2026-06-07");
     let cronjob = reopened
         .get_skill(SessionRole::Orchestrator, "cronjob")
         .unwrap();
@@ -3400,7 +3400,6 @@ fn open_migrates_previous_cronjob_builtin_skill_to_current() {
     let history = read_jsonl_values(&path.join("skill-history/orchestrator/cronjob.jsonl"));
     assert_eq!(history.len(), 2);
 }
-
 #[test]
 fn open_migrates_current_version_builtin_skills_to_current() {
     let (_tempdir, path) = temp_store_path();
@@ -3420,7 +3419,7 @@ fn open_migrates_current_version_builtin_skills_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-30");
+    assert_eq!(migrated_meta["version"], "2026-06-07");
     let cronjob = reopened
         .get_skill(SessionRole::Orchestrator, "cronjob")
         .unwrap();
@@ -3476,7 +3475,7 @@ fn open_migrates_console_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-30");
+    assert_eq!(migrated_meta["version"], "2026-06-07");
 }
 
 #[test]
@@ -3496,7 +3495,7 @@ fn open_migrates_recovery_store_format_version_to_current() {
 
     let migrated_meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(migrated_meta["version"], "2026-05-30");
+    assert_eq!(migrated_meta["version"], "2026-06-07");
 }
 
 #[test]
