@@ -1228,6 +1228,57 @@ where
 
 impl<B, S> LlmService<B, S>
 where
+    S: NodeStore + SessionStore,
+{
+    pub async fn handoff_session_refreshing_tools(
+        &self,
+        branch: &str,
+        mut patch: SessionConfigPatch,
+        prompt: &str,
+    ) -> Result<String> {
+        let _guard = self.lock_branch(branch).await;
+        refresh_handoff_tool_patch(&mut patch, || {
+            self.resolve_context(branch)
+                .map(|context| context.session_anchor.tools)
+        })?;
+        let has_tool_patch = patch.tools.is_some();
+        let has_model_patch = patch.model.is_some();
+        let anchor_id = self
+            .store
+            .handoff_session(branch, &patch, prompt)
+            .context(MemorySnafu)?;
+        tracing::info!(
+            branch = %branch,
+            anchor_id = %anchor_id,
+            has_tool_patch,
+            has_model_patch,
+            "handed off session"
+        );
+        Ok(anchor_id)
+    }
+}
+
+fn refresh_handoff_tool_patch(
+    patch: &mut SessionConfigPatch,
+    inherited_tools: impl FnOnce() -> Result<Vec<Tool>>,
+) -> Result<()> {
+    let tools = match patch.tools.take() {
+        Some(tools) => tools,
+        None => inherited_tools()?,
+    };
+    patch.tools = Some(refresh_builtin_tool_definitions(tools));
+    Ok(())
+}
+
+fn refresh_builtin_tool_definitions(tools: Vec<Tool>) -> Vec<Tool> {
+    tools
+        .into_iter()
+        .map(|tool| builtin_tool_definition(&tool.name).unwrap_or(tool))
+        .collect()
+}
+
+impl<B, S> LlmService<B, S>
+where
     S: NodeStore + BranchStore,
 {
     pub async fn create_session(&self, config: SessionConfig) -> Result<BranchSession> {
@@ -6078,6 +6129,47 @@ mod tests {
                 (Role::User, "Compacted context.".to_owned()),
                 (Role::LLM, "continued".to_owned()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_session_refreshing_tools_refreshes_inherited_builtin_definitions() {
+        let store = MemoryStore::new();
+        let backend = FakeBackend::with_responses(&[]);
+        let service = LlmService::new(store.clone(), backend);
+        let mut config = session_config("main");
+        config.tools = vec![Tool {
+            name: "exec_command".to_owned(),
+            description: "Old exec command description.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "cmd": {
+                        "type": "string"
+                    }
+                },
+                "required": ["cmd"]
+            }),
+        }];
+        service.create_session(config).await.unwrap();
+
+        let anchor_id = service
+            .handoff_session_refreshing_tools(
+                "main",
+                SessionConfigPatch::default(),
+                "Compacted context.",
+            )
+            .await
+            .unwrap();
+
+        let node = store.get_node(&anchor_id).unwrap();
+        let Kind::Anchor(anchor) = node.kind else {
+            panic!("expected anchor node");
+        };
+        let session = anchor.as_session().expect("expected session anchor");
+        assert_eq!(
+            session.tools,
+            vec![builtin_tool_definition("exec_command").unwrap()]
         );
     }
 

@@ -388,23 +388,14 @@ where
     let json = rebase_command.json;
     let prompt = prompt.trim().to_owned();
     ensure!(!prompt.is_empty(), EmptyPromptSnafu);
-    let refresh_tools_from_current_session =
-        refresh_tools && !rebase_command.clear_tools && !rebase_command.enable_all_tools;
-    let refresh_tools_from_current_session =
-        refresh_tools_from_current_session && rebase_command.tools.is_empty();
-    let mut handoff = resolve_session_rebase(rebase_command, store, provider_profiles)?;
-    if refresh_tools {
-        refresh_handoff_tools(
-            &mut handoff.patch,
-            store,
-            &branch,
-            refresh_tools_from_current_session,
-        )?;
+    let handoff = resolve_session_rebase(rebase_command, store, provider_profiles)?;
+    let head = if refresh_tools {
+        llm.handoff_session_refreshing_tools(&branch, handoff.patch, &prompt)
+            .await
+    } else {
+        llm.handoff_session(&branch, handoff.patch, &prompt).await
     }
-    let head = llm
-        .handoff_session(&branch, handoff.patch, &prompt)
-        .await
-        .context(LlmSnafu)?;
+    .context(LlmSnafu)?;
     let result = SessionHandoffResult { head };
     Ok(Some(render_session_result(
         result,
@@ -1936,32 +1927,6 @@ fn resolve_session_rebase(
     }
 
     Ok(ResolvedSessionRebase { patch })
-}
-
-fn refresh_handoff_tools(
-    patch: &mut SessionConfigPatch,
-    store: &impl NodeStore,
-    branch: &str,
-    refresh_from_current_session: bool,
-) -> Result<()> {
-    if let Some(tools) = patch.tools.take() {
-        patch.tools = Some(refresh_builtin_tool_definitions(tools));
-        return Ok(());
-    }
-
-    if refresh_from_current_session {
-        let (_, session_anchor) = resolve_visible_session_anchor(store, branch)?;
-        patch.tools = Some(refresh_builtin_tool_definitions(session_anchor.tools));
-    }
-
-    Ok(())
-}
-
-fn refresh_builtin_tool_definitions(tools: Vec<Tool>) -> Vec<Tool> {
-    tools
-        .into_iter()
-        .map(|tool| coco_llm::builtin_tool_definition(&tool.name).unwrap_or(tool))
-        .collect()
 }
 
 fn preset_to_session_anchor_patch(
