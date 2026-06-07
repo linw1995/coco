@@ -120,8 +120,8 @@ pub struct SkillShowCommand {
 pub struct SkillRunCommand {
     pub name: String,
 
-    #[arg(long)]
-    pub handoff: Option<String>,
+    #[arg(long, required = true)]
+    pub handoff: String,
 
     #[arg(long, hide = true)]
     pub parent_tool_use_id: Option<String>,

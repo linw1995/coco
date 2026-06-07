@@ -46,7 +46,7 @@ const SHARED_SKILL_HISTORY_DIR_NAME: &str = "shared";
 const ORCHESTRATOR_SKILL_HISTORY_DIR_NAME: &str = "orchestrator";
 const RUNNER_SKILL_HISTORY_DIR_NAME: &str = "runner";
 const BUILTIN_COCO_ORCHESTRATOR_REVISION_ID: &str =
-    "1df4b89775b27c799b4f6b80b32b75c0cccd837dd574048484b38c13a5aff146";
+    "eafe15f4db18391cbc6abee65a874317f6b350bed013272dea152e6285c18952";
 const BUILTIN_NEW_SKILL_REVISION_ID: &str =
     "f6ede23518a575c8d87472a189b71dedf4fbc92b26403db2af748a00d481dbad";
 const BUILTIN_CRONJOB_REVISION_ID: &str =
@@ -72,6 +72,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
             "cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438",
             // Before the prompt command was renamed to job.
             "79a81ed8e48dc4bac77d8d87ad5566d3b25c1aa1c6fd63cf89aec1efbc0ea6b9",
+            // Before skill run required an explicit handoff.
+            "1df4b89775b27c799b4f6b80b32b75c0cccd837dd574048484b38c13a5aff146",
         ],
         target_revision_id: BUILTIN_COCO_ORCHESTRATOR_REVISION_ID,
     },
@@ -3700,6 +3702,11 @@ mod builtin_skill_migration_tests {
                 .from_revision_ids
                 .contains(&"cbc625296d083943949e2255e848aec2c439d4573a3386cd39a63e71726c2438")
         );
+        assert!(
+            orchestrator
+                .from_revision_ids
+                .contains(&"1df4b89775b27c799b4f6b80b32b75c0cccd837dd574048484b38c13a5aff146")
+        );
 
         let cronjob = builtin_migration(SessionRole::Orchestrator, "cronjob");
         assert!(
@@ -3776,7 +3783,7 @@ mod builtin_skill_migration_tests {
             name: "coco-orchestrator",
             from_revision_ids: &[
                 // Current default in this test before the synthetic target update.
-                "1df4b89775b27c799b4f6b80b32b75c0cccd837dd574048484b38c13a5aff146",
+                "eafe15f4db18391cbc6abee65a874317f6b350bed013272dea152e6285c18952",
             ],
             target_revision_id: "new-target-revision",
         };

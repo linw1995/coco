@@ -4005,8 +4005,19 @@ fn skill_run_parses_handoff_and_json_flags() {
     };
 
     assert_eq!(command.name, "fast-rust");
-    assert_eq!(command.handoff.as_deref(), Some("Review the diff."));
+    assert_eq!(command.handoff, "Review the diff.");
     assert!(command.json);
+}
+
+#[test]
+fn skill_run_requires_handoff() {
+    let error = Cli::try_parse_from(["coco-cli", "skill", "run", "fast-rust"]).unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+    assert!(error.to_string().contains("--handoff <HANDOFF>"));
 }
 
 #[tokio::test]
@@ -5596,6 +5607,8 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
                 "skill".to_owned(),
                 "run".to_owned(),
                 "fast-rust".to_owned(),
+                "--handoff".to_owned(),
+                "Review the diff.".to_owned(),
                 "--json".to_owned(),
             ],
             stdin: &[],

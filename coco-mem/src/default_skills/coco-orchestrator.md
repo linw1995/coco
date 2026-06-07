@@ -22,15 +22,13 @@ coco session rebase --preset <preset> --branch <branch>
 coco job --branch <branch> "<text>"
 coco job list
 coco job status --job <job>
-coco skill run <skill>
 coco skill run <skill> --handoff "<task>"
 ```
 
 Rules:
 
 - Prefer `coco` commands over direct store edits.
-- Use `coco skill run <skill> --handoff "<task>"` for bounded skill handoff.
-  Omit `--handoff` only when the skill should inherit the current context.
+- Use `coco skill run <skill> --handoff "<task>"` for skill handoff.
 - On a `*/skill/*` branch, fork from the node before the `SkillInvocation`
   anchor that invoked this skill, not from the skill session anchor.
 - After forking, apply the runner role and restricted tools on the runner
