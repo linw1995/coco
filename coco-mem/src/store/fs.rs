@@ -27,7 +27,7 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-06-07";
+const STORE_FORMAT_VERSION: &str = "2026-06-07.1";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -54,7 +54,7 @@ const BUILTIN_CRONJOB_REVISION_ID: &str =
 const BUILTIN_RECOVERY_REVISION_ID: &str =
     "91adf3f8b4e2fb11008b58db4d0c62c21b1b76cbe13b53a58e81fdeca1548b3b";
 const BUILTIN_COMPACT_REVISION_ID: &str =
-    "6a260a4377c10fe227c4957db8a63ebfb8b6b292a9e3862c21402a1c1b73d14e";
+    "b6db92669aaa86c89d354469cfb395d1fba5f1e96b73f1e4228e1f0188b016df";
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "dcf88bdb5caaa2c8e4702cd5dfaa3e20919e08ce367ab7965e1f0d62710a60f4";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
@@ -113,6 +113,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
             "3abb36a6333215088666cb168fef445430d19e19e19232e9e703286e3be3b9c6",
             // Before session handoff required an explicit prompt.
             "d035938926144776ca4341aaa57eaa3ed28a76234222f1ff06fe06cf5d8ab9ff",
+            // Before self-compaction delegated to a durable worker branch.
+            "6a260a4377c10fe227c4957db8a63ebfb8b6b292a9e3862c21402a1c1b73d14e",
         ],
         target_revision_id: BUILTIN_COMPACT_REVISION_ID,
     },
@@ -216,6 +218,13 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-30-to-2026-06-07",
         from: StoreFormatVersion::Chronicle("2026-05-30"),
+        to: StoreFormatVersion::Chronicle("2026-06-07"),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-06-07-to-2026-06-07.1",
+        from: StoreFormatVersion::Chronicle("2026-06-07"),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
@@ -3701,6 +3710,12 @@ mod builtin_skill_migration_tests {
             store_format_version: "2026-06-07",
             fingerprint: "867b441ba34791d6c2cec413031436004a4957f9cec01441c8790a804e3ab84a",
         },
+        BuiltinSkillRevisionFingerprint {
+            store_format_version: "2026-06-07.1",
+            fingerprint: "5665269f4350175d02ffb81e560c0d8d33cdf9822f633b9bb68a028f2389f539",
+        },
+        // Append builtin skill body updates here with a new store format
+        // version, instead of only changing the recorded revision fingerprint.
     ];
 
     #[test]
