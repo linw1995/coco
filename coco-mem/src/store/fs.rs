@@ -27,7 +27,7 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-05-30";
+const STORE_FORMAT_VERSION: &str = "2026-06-07";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -209,6 +209,13 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-05-29-to-2026-05-30",
         from: StoreFormatVersion::Chronicle("2026-05-29"),
+        to: StoreFormatVersion::Chronicle("2026-05-30"),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-05-30-to-2026-06-07",
+        from: StoreFormatVersion::Chronicle("2026-05-30"),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
