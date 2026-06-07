@@ -3687,9 +3687,21 @@ mod builtin_skill_migration_tests {
         revision_id: String,
     }
 
-    const PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION: &str = "2026-05-30";
-    const PREVIOUS_BUILTIN_SKILL_REVISIONS_FINGERPRINT: &str =
-        "cde0b9aca21fc594fc60607c56e635ca32e263396b4c92bad6f08c5a7583282a";
+    struct BuiltinSkillRevisionFingerprint {
+        store_format_version: &'static str,
+        fingerprint: &'static str,
+    }
+
+    const BUILTIN_SKILL_REVISION_FINGERPRINTS: &[BuiltinSkillRevisionFingerprint] = &[
+        BuiltinSkillRevisionFingerprint {
+            store_format_version: "2026-05-30",
+            fingerprint: "cde0b9aca21fc594fc60607c56e635ca32e263396b4c92bad6f08c5a7583282a",
+        },
+        BuiltinSkillRevisionFingerprint {
+            store_format_version: "2026-06-07",
+            fingerprint: "867b441ba34791d6c2cec413031436004a4957f9cec01441c8790a804e3ab84a",
+        },
+    ];
 
     #[test]
     fn store_migration_builtin_targets_match_current_defaults() {
@@ -3718,28 +3730,36 @@ mod builtin_skill_migration_tests {
     fn builtin_skill_revision_changes_require_store_format_migration() {
         let current_revisions = current_builtin_skill_revisions();
         let current_fingerprint = builtin_skill_revisions_fingerprint(&current_revisions);
+        let [previous_fingerprint, current_recorded_fingerprint] =
+            latest_builtin_skill_revision_fingerprint_pair();
 
-        if current_fingerprint == PREVIOUS_BUILTIN_SKILL_REVISIONS_FINGERPRINT {
-            assert_eq!(
-                STORE_FORMAT_VERSION, PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION,
-                "unchanged builtin skill revisions should not require a store format bump"
-            );
+        assert_eq!(
+            current_recorded_fingerprint.store_format_version, STORE_FORMAT_VERSION,
+            "current builtin skill revision fingerprint must be recorded for the current store format version"
+        );
+        assert_eq!(
+            current_recorded_fingerprint.fingerprint, current_fingerprint,
+            "current builtin skill revision fingerprint must match computed default skill revisions"
+        );
+
+        if current_recorded_fingerprint.fingerprint == previous_fingerprint.fingerprint {
             return;
         }
 
         assert_ne!(
-            STORE_FORMAT_VERSION, PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION,
+            current_recorded_fingerprint.store_format_version,
+            previous_fingerprint.store_format_version,
             "builtin skill revision changes must bump STORE_FORMAT_VERSION"
         );
         let migration = STORE_MIGRATIONS
             .iter()
             .find(|migration| {
-                matches!(
+                store_migration_version_matches(
                     migration.from,
-                    StoreFormatVersion::Chronicle(PREVIOUS_BUILTIN_SKILL_STORE_FORMAT_VERSION)
-                ) && matches!(
+                    previous_fingerprint.store_format_version,
+                ) && store_migration_version_matches(
                     migration.to,
-                    StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION)
+                    current_recorded_fingerprint.store_format_version,
                 )
             })
             .expect("builtin skill revision changes must add a store migration");
@@ -3747,7 +3767,7 @@ mod builtin_skill_migration_tests {
         assert!(
             previous_builtin_skill_fingerprint_candidates(&current_revisions, migration)
                 .iter()
-                .any(|fingerprint| fingerprint == PREVIOUS_BUILTIN_SKILL_REVISIONS_FINGERPRINT),
+                .any(|fingerprint| fingerprint == previous_fingerprint.fingerprint),
             "builtin skill revision changes must be recoverable from the migration source revisions"
         );
     }
@@ -3892,6 +3912,21 @@ mod builtin_skill_migration_tests {
             .iter()
             .find(|migration| migration.role == role && migration.name == name)
             .expect("builtin migration should exist")
+    }
+
+    fn latest_builtin_skill_revision_fingerprint_pair()
+    -> [&'static BuiltinSkillRevisionFingerprint; 2] {
+        let [.., previous, current] = BUILTIN_SKILL_REVISION_FINGERPRINTS else {
+            panic!("builtin skill revision fingerprint history must include at least two entries");
+        };
+        [previous, current]
+    }
+
+    fn store_migration_version_matches(
+        version: StoreFormatVersion<&'static str>,
+        expected: &str,
+    ) -> bool {
+        matches!(version, StoreFormatVersion::Chronicle(version) if version == expected)
     }
 
     fn current_builtin_skill_revisions() -> Vec<BuiltinSkillRevision> {
