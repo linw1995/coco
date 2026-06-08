@@ -16,7 +16,10 @@ use snafu::prelude::*;
 use crate::{
     Result,
     app::config::{ProviderProfileLookup, ProviderProfiles},
-    cli::{CliTool, SessionCommand, SessionCreateCommand, SessionRebaseCommand, SessionSubcommand},
+    cli::{
+        CliTool, SessionCommand, SessionCreateCommand, SessionHandoffCommand, SessionRebaseCommand,
+        SessionSubcommand,
+    },
     env::resolve_env_tools,
     error::{
         AmbiguousNodePrefixSnafu, EmptyPromptSnafu, LlmSnafu, MissingProviderProfileModelSnafu,
@@ -193,14 +196,7 @@ where
             run_session_rebase_command(command, store, llm, provider_profiles).await
         }
         SessionSubcommand::Handoff(command) => {
-            run_session_handoff_command(
-                command.rebase,
-                command.prompt,
-                store,
-                llm,
-                provider_profiles,
-            )
-            .await
+            run_session_handoff_command(command, store, llm, provider_profiles).await
         }
         SessionSubcommand::Reopen(command) => {
             run_session_reopen_command(command.branch, command.json, store)
@@ -374,8 +370,7 @@ where
 }
 
 async fn run_session_handoff_command<B, S>(
-    rebase_command: SessionRebaseCommand,
-    prompt: String,
+    command: SessionHandoffCommand,
     store: &S,
     llm: &Arc<LlmService<B, S>>,
     provider_profiles: &ProviderProfiles,
@@ -384,15 +379,23 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
+    let SessionHandoffCommand {
+        rebase: rebase_command,
+        prompt,
+        refresh_tools,
+    } = command;
     let branch = rebase_command.branch.clone();
     let json = rebase_command.json;
     let prompt = prompt.trim().to_owned();
     ensure!(!prompt.is_empty(), EmptyPromptSnafu);
     let handoff = resolve_session_rebase(rebase_command, store, provider_profiles)?;
-    let head = llm
-        .handoff_session(&branch, handoff.patch, &prompt)
-        .await
-        .context(LlmSnafu)?;
+    let head = if refresh_tools {
+        llm.handoff_session_refreshing_tools(&branch, handoff.patch, &prompt)
+            .await
+    } else {
+        llm.handoff_session(&branch, handoff.patch, &prompt).await
+    }
+    .context(LlmSnafu)?;
     let result = SessionHandoffResult { head };
     Ok(Some(render_session_result(
         result,
