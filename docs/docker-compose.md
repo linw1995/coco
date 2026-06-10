@@ -23,6 +23,8 @@ Deploy from the repository root:
 └── docs/
 ```
 
+Do not commit `.env`. The repository only tracks `.env.example`.
+
 ## Prepare `.env`
 
 Copy the template and write the current host uid/gid into it:
