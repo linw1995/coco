@@ -23,8 +23,6 @@ Deploy from the repository root:
 └── docs/
 ```
 
-Do not commit `.env`. The repository only tracks `.env.example`.
-
 ## Prepare `.env`
 
 Copy the template and write the current host uid/gid into it:
@@ -72,13 +70,14 @@ Compose reads `.env`, mounts `${COCO_DATA_DIR}` to `/data`, and mounts
 
 ## Configure ChatGPT Provider
 
-Create a provider profile:
+Create the default provider profile before starting Compose or generating
+credentials:
 
 ```bash
 cat > .coco-data/config.toml <<'EOF'
 [providers.gpt-subscription]
 provider = "chatgpt"
-default_model = "gpt-5.4"
+default_model = "gpt-5.5"
 reasoning_level = "high"
 service_tier = "fast"
 EOF
@@ -91,10 +90,25 @@ and `xhigh`. `service_tier = "fast"` requests the priority GPT tier.
 
 ## Get ChatGPT OAuth Cache
 
-Create the session anchor first:
+Generate credentials in a throwaway Compose data directory, then copy only the
+OAuth cache into the persistent data directory. This keeps temporary auth
+sessions, prompt jobs, and workspace files out of the long-lived Compose
+environment.
+
+Run the following commands in the same shell:
 
 ```bash
-docker compose run --rm \
+auth_data_dir="$(mktemp -d)"
+auth_workspace_dir="$(mktemp -d)"
+cp .coco-data/config.toml "${auth_data_dir}/config.toml"
+```
+
+Create the session anchor in the temporary data directory:
+
+```bash
+COCO_DATA_DIR="${auth_data_dir}" \
+COCO_WORKSPACE_DIR="${auth_workspace_dir}" \
+docker compose run --rm --no-deps \
   -e COCO_START_CRON=0 \
   coco \
   coco session create \
@@ -105,14 +119,26 @@ docker compose run --rm \
 Then trigger the first provider request:
 
 ```bash
-docker compose run --rm \
+COCO_DATA_DIR="${auth_data_dir}" \
+COCO_WORKSPACE_DIR="${auth_workspace_dir}" \
+docker compose run --rm --no-deps \
   -e COCO_START_CRON=0 \
   coco \
   coco job --branch main "Reply with OK after authentication succeeds."
 ```
 
 When the command prints the verification URL and device code, finish the login
-flow in the browser. The OAuth cache is persisted at:
+flow in the browser. Then install the OAuth cache into the persistent data
+directory and remove the temporary directories:
+
+```bash
+mkdir -p .coco-data/.config/chatgpt
+cp "${auth_data_dir}/.config/chatgpt/auth.json" \
+  .coco-data/.config/chatgpt/auth.json
+rm -rf "${auth_data_dir}" "${auth_workspace_dir}"
+```
+
+The persistent OAuth cache is stored at:
 
 ```text
 .coco-data/.config/chatgpt/auth.json

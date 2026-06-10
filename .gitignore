@@ -15,6 +15,7 @@ config.toml
 logs
 .env
 !.env.example
+.coco-data/
 
 # Agent artifacts
 .agents/

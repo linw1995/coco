@@ -15,6 +15,13 @@ Docker Compose is the recommended deployment path:
 cp .env.example .env
 ${EDITOR:-vi} .env
 mkdir -p .coco-data .coco-workspace
+cat > .coco-data/config.toml <<'EOF'
+[providers.gpt-subscription]
+provider = "chatgpt"
+default_model = "gpt-5.5"
+reasoning_level = "high"
+service_tier = "fast"
+EOF
 docker compose up -d
 ```
 
