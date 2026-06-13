@@ -2350,6 +2350,8 @@ where
             .body
             .contains("COCO_EXEC_WORKSPACE/telegram-downloads")
     );
+    assert!(telegram.current().unwrap().body.contains("--photo"));
+    assert!(telegram.current().unwrap().body.contains("--document"));
     assert!(!telegram.current().unwrap().body.contains("/tmp/telegram"));
 }
 

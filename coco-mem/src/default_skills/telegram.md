@@ -2,9 +2,10 @@
 
 Agent-facing execution guide for Telegram communication.
 
-Use this skill whenever you need to send, reply to, edit Telegram messages, or
-download inbound Telegram attachments. Assume a Telegram bot token is available
-from `COCO_TELEGRAM_BOT_TOKEN` unless an explicit `--token` is provided.
+Use this skill whenever you need to send, reply to, edit Telegram messages,
+send local images or files, or download inbound Telegram attachments. Assume a
+Telegram bot token is available from `COCO_TELEGRAM_BOT_TOKEN` unless an
+explicit `--token` is provided.
 
 ## Required Inputs
 
@@ -14,7 +15,8 @@ Collect these before execution:
 - `message_id` is required for edit operations.
 - `reply_to_message_id` is required when replying to an inbound message.
 - `file_id` is required when downloading an inbound attachment.
-- Message content is required for send, reply, and edit operations.
+- Message content is required for text send, reply, and edit operations.
+- A local file path is required when sending an image or file attachment.
 
 ## Execution Policy
 
@@ -26,7 +28,13 @@ Collect these before execution:
 4. For multi-line text, pass the content via heredoc command substitution
    instead of embedding raw line breaks in quoted strings.
 5. Avoid emitting HTML tags in message content; use Markdown-style plain text.
-6. If an inbound Telegram prompt includes image attachment metadata, use
+6. To send a generated or downloaded image, pass its local path with
+   `--photo`. To send any other local file, pass its local path with
+   `--document`. `--image` and `--file` are accepted aliases.
+7. Attachment captions use `--message`. If a caption exceeds Telegram's limit,
+   the script sends the attachment with the first caption segment and then sends
+   the remaining text as normal messages.
+8. If an inbound Telegram prompt includes image attachment metadata, use
    `file_id` with `telegram_download.py` before answering image-dependent
    requests. Download attachments into the current workspace so downstream
    tools can load the saved files.
@@ -63,6 +71,18 @@ Summary:
 EOF
 )"
 
+# Send an image with an optional caption.
+uv run --script "$COCO_SKILL_DIR/scripts/telegram_send.py" \
+  --chat-id "<chat_id>" \
+  --photo "path/to/image.png" \
+  --message "Caption text"
+
+# Send a file with an optional caption.
+uv run --script "$COCO_SKILL_DIR/scripts/telegram_send.py" \
+  --chat-id "<chat_id>" \
+  --document "path/to/report.pdf" \
+  --message "Report attached"
+
 # Edit an existing Telegram message.
 uv run --script "$COCO_SKILL_DIR/scripts/telegram_edit.py" \
   --chat-id "<chat_id>" \
@@ -79,8 +99,10 @@ uv run --script "$COCO_SKILL_DIR/scripts/telegram_download.py" \
 ### `telegram_send.py`
 
 - `--chat-id`, `-c`: required, supports comma-separated ids
-- `--message`, `-m`: required
+- `--message`, `-m`: required for text-only sends, optional caption for attachments
 - `--reply-to`, `-r`: optional
+- `--photo`, `--image`: optional local image path
+- `--document`, `--file`: optional local file path
 - `--token`, `-t`: optional
 
 ### `telegram_edit.py`

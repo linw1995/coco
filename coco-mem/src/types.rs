@@ -539,7 +539,7 @@ pub fn default_skill_groups() -> SkillGroups {
             "telegram",
             SkillVersionSpec {
                 description:
-                    "Send, reply to, edit, and download Telegram messages through the Telegram Bot API."
+                    "Send, reply to, edit, download, and attach files/images through the Telegram Bot API."
                         .to_owned(),
                 body: include_str!("default_skills/telegram.md").trim().to_owned(),
                 scripts: vec![
