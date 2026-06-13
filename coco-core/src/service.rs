@@ -43,7 +43,7 @@ where
     pub async fn handle_message(&self, message: InboundMessage) -> Result<OutboundMessage> {
         let text = message.text().trim();
         ensure!(
-            !text.is_empty() || message.has_image_attachments(),
+            !text.is_empty() || message.has_attachments(),
             InvalidInputSnafu {
                 message: "message content is empty".to_owned(),
             }
@@ -149,6 +149,7 @@ fn telegram_prompt(
     let reply_to_message_id = message.source_message_id().unwrap_or("unknown");
     let image_context = telegram_image_context(message);
     let image_policy = telegram_image_policy(supports_load_image);
+    let voice_context = telegram_voice_context(message);
     let incoming_text = if text.is_empty() {
         "No text caption was provided."
     } else {
@@ -174,10 +175,14 @@ fn telegram_prompt(
         - Do not finish after an acknowledgement-only Telegram reply unless the incoming message only asked for acknowledgement.
         - Do not put the user-facing Telegram reply only in plain final text; the Telegram reply itself must be sent by the skill.
         - {image_policy}
+        - If the request depends on a voice attachment, use the `telegram` skill's `telegram_download.py` script with the attachment file_id to download the voice file into the workspace, then inspect or transcribe it only with tools available in this session. If no available tool can inspect it, explain that limitation in the final Telegram reply.
         - After the final Telegram skill call completes, return a local completion note. If you handled multiple distinct tasks, include a concise multi-task summary in that final text that lists each task and its outcome.
 
         Incoming image attachments:
         {image_context}
+
+        Incoming voice attachments:
+        {voice_context}
 
         Incoming message:
         {incoming_text}
@@ -186,11 +191,42 @@ fn telegram_prompt(
         image_context = image_context,
         image_policy = image_policy,
         incoming_text = incoming_text,
+        voice_context = voice_context,
     );
     ChannelPrompt {
         text,
         attachments: vec![],
     }
+}
+
+fn telegram_voice_context(message: &TelegramInboundMessage) -> String {
+    if message.voice_attachments().is_empty() {
+        return "None.".to_owned();
+    }
+
+    message
+        .voice_attachments()
+        .iter()
+        .enumerate()
+        .map(|(index, voice)| {
+            format!(
+                "- voice {index}: file_id={file_id}, file_unique_id={file_unique_id}, duration_secs={duration_secs}, mime_type={mime_type}, file_size={file_size}",
+                index = index + 1,
+                file_id = voice.file_id(),
+                file_unique_id = voice.file_unique_id().unwrap_or("unknown"),
+                duration_secs = voice
+                    .duration_secs()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                mime_type = voice.mime_type().unwrap_or("unknown"),
+                file_size = voice
+                    .file_size()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn telegram_image_policy(supports_load_image: bool) -> &'static str {

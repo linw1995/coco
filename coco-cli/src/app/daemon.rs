@@ -6,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use coco_channel::{
     ChannelRuntime, InboundMessage, MessageHandler, OutboundMessage, TelegramImageAttachment,
+    TelegramVoiceAttachment,
 };
 use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{ConsoleConfig, ConsolePublisher, ConsoleServerHandle, start_console_server};
@@ -579,6 +580,8 @@ struct QueuedTelegramMessage {
     text: String,
     #[serde(default)]
     image_attachments: Vec<QueuedTelegramImageAttachment>,
+    #[serde(default)]
+    voice_attachments: Vec<QueuedTelegramVoiceAttachment>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -587,6 +590,15 @@ struct QueuedTelegramImageAttachment {
     file_unique_id: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    file_size: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct QueuedTelegramVoiceAttachment {
+    file_id: String,
+    file_unique_id: Option<String>,
+    duration_secs: Option<u32>,
+    mime_type: Option<String>,
     file_size: Option<u64>,
 }
 
@@ -1557,6 +1569,19 @@ fn encode_telegram_message(message: &InboundMessage) -> serde_json::Value {
                 })
             })
             .collect::<Vec<_>>(),
+        "voice_attachments": message
+            .voice_attachments()
+            .iter()
+            .map(|voice| {
+                json!({
+                    "file_id": voice.file_id(),
+                    "file_unique_id": voice.file_unique_id(),
+                    "duration_secs": voice.duration_secs(),
+                    "mime_type": voice.mime_type(),
+                    "file_size": voice.file_size(),
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -1577,14 +1602,30 @@ fn decode_telegram_message(
             )
         })
         .collect::<Vec<_>>();
+    let voice_attachments = message
+        .voice_attachments
+        .into_iter()
+        .map(|voice| {
+            TelegramVoiceAttachment::from_parts(
+                voice.file_id,
+                voice.file_unique_id,
+                voice.duration_secs,
+                voice.mime_type,
+                voice.file_size,
+            )
+        })
+        .collect::<Vec<_>>();
     Ok(match message.source_message_id {
-        Some(source_message_id) if !image_attachments.is_empty() => {
-            InboundMessage::telegram_with_message_id_and_images(
+        Some(source_message_id)
+            if !image_attachments.is_empty() || !voice_attachments.is_empty() =>
+        {
+            InboundMessage::telegram_with_message_id_and_attachments(
                 message.chat_id,
                 message.sender_id,
                 source_message_id,
                 message.text,
                 image_attachments,
+                voice_attachments,
             )
         }
         Some(source_message_id) => InboundMessage::telegram_with_message_id(
@@ -1593,12 +1634,15 @@ fn decode_telegram_message(
             source_message_id,
             message.text,
         ),
-        None if !image_attachments.is_empty() => InboundMessage::telegram_with_images(
-            message.chat_id,
-            message.sender_id,
-            message.text,
-            image_attachments,
-        ),
+        None if !image_attachments.is_empty() || !voice_attachments.is_empty() => {
+            InboundMessage::telegram_with_attachments(
+                message.chat_id,
+                message.sender_id,
+                message.text,
+                image_attachments,
+                voice_attachments,
+            )
+        }
         None => InboundMessage::telegram(message.chat_id, message.sender_id, message.text),
     })
 }
@@ -2002,7 +2046,9 @@ mod tests {
 
     use async_trait::async_trait;
     use clap::Parser;
-    use coco_channel::{InboundMessage, MessageHandler, TelegramImageAttachment};
+    use coco_channel::{
+        InboundMessage, MessageHandler, TelegramImageAttachment, TelegramVoiceAttachment,
+    };
     use coco_console::ConsolePublisher;
     use coco_core::ConversationEngine;
     use coco_llm::{
@@ -2242,6 +2288,28 @@ mod tests {
                 Some(1280),
                 Some(960),
                 Some(200_000),
+            )],
+        );
+
+        let decoded = decode_telegram_message(encode_telegram_message(&message)).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn telegram_queue_payload_round_trips_voice_attachments() {
+        let message = InboundMessage::telegram_with_message_id_and_attachments(
+            "chat-1",
+            "sender-1",
+            "message-1",
+            "",
+            vec![],
+            vec![TelegramVoiceAttachment::from_parts(
+                "voice-file-id",
+                Some("voice-unique-id".to_owned()),
+                Some(12),
+                Some("audio/ogg".to_owned()),
+                Some(50_000),
             )],
         );
 

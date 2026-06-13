@@ -27,7 +27,7 @@ use crate::{
 
 type VersionMap<V> = BTreeMap<u64, V>;
 
-const STORE_FORMAT_VERSION: &str = "2026-06-13";
+const STORE_FORMAT_VERSION: &str = "2026-06-13.1";
 const LEGACY_STORE_FORMAT_VERSION: u64 = 10;
 const META_FILE_NAME: &str = "meta.json";
 const NODES_FILE_NAME: &str = "nodes.jsonl";
@@ -58,7 +58,7 @@ const BUILTIN_COMPACT_REVISION_ID: &str =
 const BUILTIN_COCO_RUNNER_REVISION_ID: &str =
     "dcf88bdb5caaa2c8e4702cd5dfaa3e20919e08ce367ab7965e1f0d62710a60f4";
 const BUILTIN_TELEGRAM_REVISION_ID: &str =
-    "5430febd6787debefdd86ed2830c7665483f0a02416e714288595f1850b4a2ee";
+    "00f872655a1ca169ac3a5d1f21cbfa757346d33c5bd2fa8b4e72d0114b97a0d3";
 const BRANCHES_DIR_NAME: &str = "branches";
 const LOCK_FILE_NAME: &str = "store.lock";
 const JOB_COMPACT_MIN_LOG_ENTRIES: usize = 64;
@@ -139,6 +139,8 @@ const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
             "a86a9cb4ec5d5b8f6284970aa7c9feb53ddfbe7d1b984e9210dda7d1801edfd1",
             // Telegram default before send supported local images and files.
             "1b3f4dcf9b56400edb41ba960e6743b2e938ee58800e5dbb7fc02b11a8d432a0",
+            // Telegram default before voice messages were supported.
+            "5430febd6787debefdd86ed2830c7665483f0a02416e714288595f1850b4a2ee",
         ],
         target_revision_id: BUILTIN_TELEGRAM_REVISION_ID,
     },
@@ -234,6 +236,13 @@ const STORE_MIGRATIONS: &[StoreMigration] = &[
     StoreMigration {
         name: "2026-06-07.1-to-2026-06-13",
         from: StoreFormatVersion::Chronicle("2026-06-07.1"),
+        to: StoreFormatVersion::Chronicle("2026-06-13"),
+        run: Persistence::migrate_store_format_without_structural_changes,
+        builtin_skills: BUILTIN_SKILL_MIGRATIONS,
+    },
+    StoreMigration {
+        name: "2026-06-13-to-2026-06-13.1",
+        from: StoreFormatVersion::Chronicle("2026-06-13"),
         to: StoreFormatVersion::Chronicle(STORE_FORMAT_VERSION),
         run: Persistence::migrate_store_format_without_structural_changes,
         builtin_skills: BUILTIN_SKILL_MIGRATIONS,
@@ -3727,6 +3736,10 @@ mod builtin_skill_migration_tests {
             store_format_version: "2026-06-13",
             fingerprint: "2a2df05cda7085c5d1349e24c8b840ae5b7de7ec145825b1182e7beea1b1044e",
         },
+        BuiltinSkillRevisionFingerprint {
+            store_format_version: "2026-06-13.1",
+            fingerprint: "641b438f77c834171bc4ae3ce002b06f6fd637fbc48ae1bfe0ef6e83c74c9254",
+        },
         // Append builtin skill body updates here with a new store format
         // version, instead of only changing the recorded revision fingerprint.
     ];
@@ -3855,6 +3868,11 @@ mod builtin_skill_migration_tests {
             telegram
                 .from_revision_ids
                 .contains(&"1b3f4dcf9b56400edb41ba960e6743b2e938ee58800e5dbb7fc02b11a8d432a0")
+        );
+        assert!(
+            telegram
+                .from_revision_ids
+                .contains(&"5430febd6787debefdd86ed2830c7665483f0a02416e714288595f1850b4a2ee")
         );
     }
 

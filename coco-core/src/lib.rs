@@ -7,6 +7,7 @@ mod skill;
 
 pub use coco_channel::{
     ChannelKind, InboundMessage, OutboundMessage, TelegramImageAttachment, TelegramInboundMessage,
+    TelegramVoiceAttachment,
 };
 pub use coco_llm::coco_mem::JobStatus;
 pub use engine::{BranchLockGuard, ConversationEngine, JobStatusSnapshot, SYSTEM_EVENT_QUEUE};

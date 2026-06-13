@@ -8,7 +8,7 @@ use snafu::prelude::*;
 use crate::error::{TelegramTransportSnafu, is_transport_failure};
 use crate::{
     ChannelRuntime, Error, InboundMessage, MessageHandler, Result, TelegramImageAttachment,
-    TelegramInboundMessage,
+    TelegramInboundMessage, TelegramVoiceAttachment,
 };
 
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 30;
@@ -406,7 +406,8 @@ impl TelegramUpdate {
             .or(message.caption.as_deref())
             .unwrap_or_default();
         let image_attachments = message.image_attachments();
-        if text.is_empty() && image_attachments.is_empty() {
+        let voice_attachments = message.voice_attachments();
+        if text.is_empty() && image_attachments.is_empty() && voice_attachments.is_empty() {
             return None;
         }
         let sender_id = message
@@ -416,12 +417,13 @@ impl TelegramUpdate {
             .unwrap_or_else(|| message.chat.id.to_string());
 
         Some(InboundMessage::Telegram(
-            TelegramInboundMessage::with_message_id_and_images(
+            TelegramInboundMessage::with_message_id_and_attachments(
                 message.chat.id.to_string(),
                 sender_id,
                 message.message_id.to_string(),
                 text.to_owned(),
                 image_attachments,
+                voice_attachments,
             ),
         ))
     }
@@ -436,6 +438,7 @@ pub struct TelegramMessage {
     pub caption: Option<String>,
     #[serde(default)]
     pub photo: Vec<TelegramPhotoSize>,
+    pub voice: Option<TelegramVoice>,
 }
 
 impl TelegramMessage {
@@ -460,6 +463,22 @@ impl TelegramMessage {
             .into_iter()
             .collect()
     }
+
+    fn voice_attachments(&self) -> Vec<TelegramVoiceAttachment> {
+        self.voice
+            .as_ref()
+            .map(|voice| {
+                TelegramVoiceAttachment::from_parts(
+                    voice.file_id.clone(),
+                    Some(voice.file_unique_id.clone()),
+                    Some(voice.duration),
+                    voice.mime_type.clone(),
+                    voice.file_size,
+                )
+            })
+            .into_iter()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -468,6 +487,15 @@ pub struct TelegramPhotoSize {
     pub file_unique_id: String,
     pub width: u32,
     pub height: u32,
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct TelegramVoice {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub duration: u32,
+    pub mime_type: Option<String>,
     pub file_size: Option<u64>,
 }
 
@@ -614,6 +642,7 @@ mod tests {
                 text: None,
                 caption: None,
                 photo: Vec::new(),
+                voice: None,
             }),
         }]);
         let mut channel = TelegramChannel::new(transport, 30, BTreeSet::new());
@@ -652,6 +681,7 @@ mod tests {
                 text: Some("hello".to_owned()),
                 caption: None,
                 photo: Vec::new(),
+                voice: None,
             }),
         };
 
@@ -702,6 +732,47 @@ mod tests {
             panic!("expected telegram inbound message");
         };
         assert_eq!(message.image_attachments().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_once_maps_voice_update_without_text() {
+        let transport = FakeTransport::with_updates(vec![voice_update(100, 42, 7, None)]);
+        let mut channel = TelegramChannel::new(transport, 30, BTreeSet::new());
+        let handler = RecordingHandler::default();
+
+        let handled = channel.run_once(&handler).await.unwrap();
+
+        assert_eq!(handled, 1);
+        assert_eq!(channel.offset(), Some(101));
+        let messages = handler.messages();
+        assert_eq!(messages.len(), 1);
+        let InboundMessage::Telegram(message) = &messages[0] else {
+            panic!("expected telegram inbound message");
+        };
+        assert_eq!(message.chat_id(), "42");
+        assert_eq!(message.sender_id(), "7");
+        assert_eq!(message.source_message_id(), Some("1000"));
+        assert_eq!(message.text(), "");
+        assert_eq!(message.voice_attachments().len(), 1);
+        let voice = &message.voice_attachments()[0];
+        assert_eq!(voice.file_id(), "voice-file-id");
+        assert_eq!(voice.file_unique_id(), Some("voice-unique-id"));
+        assert_eq!(voice.duration_secs(), Some(12));
+        assert_eq!(voice.mime_type(), Some("audio/ogg"));
+        assert_eq!(voice.file_size(), Some(50_000));
+    }
+
+    #[test]
+    fn update_maps_voice_caption_as_text() {
+        let update = voice_update(100, 42, 7, Some("please transcribe this"));
+
+        let message = update.to_inbound_message().unwrap();
+
+        assert_eq!(message.text(), "please transcribe this");
+        let InboundMessage::Telegram(message) = message else {
+            panic!("expected telegram inbound message");
+        };
+        assert_eq!(message.voice_attachments().len(), 1);
     }
 
     #[tokio::test]
@@ -814,6 +885,7 @@ mod tests {
                 text: Some(text.to_owned()),
                 caption: None,
                 photo: Vec::new(),
+                voice: None,
             }),
         }
     }
@@ -848,6 +920,33 @@ mod tests {
                         file_size: Some(200_000),
                     },
                 ],
+                voice: None,
+            }),
+        }
+    }
+
+    fn voice_update(
+        update_id: i64,
+        chat_id: i64,
+        user_id: i64,
+        caption: Option<&str>,
+    ) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id,
+            message: Some(TelegramMessage {
+                message_id: 1000,
+                chat: TelegramChat { id: chat_id },
+                from: Some(TelegramUser { id: user_id }),
+                text: None,
+                caption: caption.map(str::to_owned),
+                photo: Vec::new(),
+                voice: Some(TelegramVoice {
+                    file_id: "voice-file-id".to_owned(),
+                    file_unique_id: "voice-unique-id".to_owned(),
+                    duration: 12,
+                    mime_type: Some("audio/ogg".to_owned()),
+                    file_size: Some(50_000),
+                }),
             }),
         }
     }

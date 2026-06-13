@@ -146,11 +146,19 @@ def main() -> int:
     attachment = parser.add_mutually_exclusive_group()
     attachment.add_argument("--photo", "--image", dest="photo")
     attachment.add_argument("--document", "--file", dest="document")
+    attachment.add_argument("--voice")
     parser.add_argument("--token", "-t")
     args = parser.parse_args()
 
-    if args.message is None and args.photo is None and args.document is None:
-        parser.error("--message is required when no --photo or --document is provided")
+    if (
+        args.message is None
+        and args.photo is None
+        and args.document is None
+        and args.voice is None
+    ):
+        parser.error(
+            "--message is required when no --photo, --document, or --voice is provided"
+        )
 
     token = resolve_token(args.token)
     sent = []
@@ -158,10 +166,19 @@ def main() -> int:
         value.strip() for value in args.chat_id.split(",") if value.strip()
     ]:
         reply_to = args.reply_to
-        if args.photo or args.document:
-            file_field = "photo" if args.photo else "document"
-            method = "sendPhoto" if args.photo else "sendDocument"
-            file_path = Path(args.photo or args.document)
+        if args.photo or args.document or args.voice:
+            if args.photo:
+                file_field = "photo"
+                method = "sendPhoto"
+                file_path = Path(args.photo)
+            elif args.document:
+                file_field = "document"
+                method = "sendDocument"
+                file_path = Path(args.document)
+            else:
+                file_field = "voice"
+                method = "sendVoice"
+                file_path = Path(args.voice)
             if not file_path.is_file():
                 raise SystemExit(f"Telegram attachment does not exist: {file_path}")
             caption, text_chunks = split_caption(args.message or "")

@@ -7,7 +7,7 @@ pub mod telegram;
 pub use error::{BoxError, Error, Result};
 pub use message::{
     ChannelInboundMessage, ChannelKind, InboundMessage, OutboundMessage, TelegramImageAttachment,
-    TelegramInboundMessage,
+    TelegramInboundMessage, TelegramVoiceAttachment,
 };
 pub use runtime::{ChannelRuntime, MessageHandler};
 
