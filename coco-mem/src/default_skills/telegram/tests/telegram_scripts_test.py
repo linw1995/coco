@@ -251,6 +251,68 @@ class TelegramSendScriptTests(unittest.TestCase):
             },
         )
 
+    def test_main_sends_voice_with_caption_without_network(self) -> None:
+        module = load_script(SEND_SCRIPT)
+        calls = []
+        voice_path = Path(__file__)
+
+        def fake_post_multipart(
+            token: str,
+            method: str,
+            fields: dict[str, str],
+            file_field: str,
+            file_path: Path,
+        ) -> dict:
+            calls.append(
+                {
+                    "token": token,
+                    "method": method,
+                    "fields": fields,
+                    "file_field": file_field,
+                    "file_path": file_path,
+                }
+            )
+            return {"chat": {"id": int(fields["chat_id"])}, "message_id": 10}
+
+        argv = [
+            "telegram_send.py",
+            "--chat-id",
+            "100",
+            "--message",
+            "Voice caption",
+            "--voice",
+            str(voice_path),
+            "--token",
+            "test-token",
+        ]
+        stdout = io.StringIO()
+
+        with mock.patch.object(sys, "argv", argv):
+            with mock.patch.object(module, "post_multipart", fake_post_multipart):
+                with contextlib.redirect_stdout(stdout):
+                    result = module.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "token": "test-token",
+                    "method": "sendVoice",
+                    "fields": {
+                        "chat_id": "100",
+                        "caption": "Voice caption",
+                    },
+                    "file_field": "voice",
+                    "file_path": voice_path,
+                }
+            ],
+        )
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"sent": [{"chat_id": 100, "message_id": 10}]},
+        )
+
     def test_main_rejects_missing_attachment_path(self) -> None:
         module = load_script(SEND_SCRIPT)
         argv = [

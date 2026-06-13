@@ -23,7 +23,7 @@ use crate::engine::SYSTEM_EVENT_QUEUE;
 use crate::{
     BatchPromptRequest, BranchPromptRequest, BranchPromptStatus, BranchResolveError,
     BranchResolver, ChannelKind, ConversationEngine, CoreService, EngineError, Error,
-    FixedBranchResolver, InboundMessage, TelegramImageAttachment,
+    FixedBranchResolver, InboundMessage, TelegramImageAttachment, TelegramVoiceAttachment,
 };
 
 type FakeResponseQueue =
@@ -431,6 +431,50 @@ async fn core_service_telegram_prompt_omits_load_image_when_tool_is_unavailable(
     assert!(prompt.contains("telegram_download.py"));
     assert!(prompt.contains("tools available in this session"));
     assert!(!prompt.contains("load_image"));
+}
+
+#[tokio::test]
+async fn core_service_telegram_prompt_includes_voice_attachments() {
+    let store = MemoryStore::new();
+    let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let service = CoreService::new(
+        FixedBranchResolver::new("main"),
+        ConversationEngine::new(llm),
+    );
+
+    service
+        .handle_message(InboundMessage::telegram_with_message_id_and_attachments(
+            "chat-1",
+            "user-1",
+            "message-1",
+            "",
+            vec![],
+            vec![TelegramVoiceAttachment::from_parts(
+                "voice-file-id",
+                Some("voice-unique-id".to_owned()),
+                Some(12),
+                Some("audio/ogg".to_owned()),
+                Some(50_000),
+            )],
+        ))
+        .await
+        .unwrap();
+
+    let ancestry = store.ancestry("main").unwrap();
+    let prompt = match &ancestry[1].kind {
+        Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
+        _ => panic!("expected prompt anchor"),
+    };
+    assert!(prompt.contains("Incoming voice attachments:"));
+    assert!(prompt.contains("file_id=voice-file-id"));
+    assert!(prompt.contains("file_unique_id=voice-unique-id"));
+    assert!(prompt.contains("duration_secs=12"));
+    assert!(prompt.contains("mime_type=audio/ogg"));
+    assert!(prompt.contains("file_size=50000"));
+    assert!(prompt.contains("telegram_download.py"));
+    assert!(prompt.contains("No text caption was provided."));
 }
 
 #[tokio::test]

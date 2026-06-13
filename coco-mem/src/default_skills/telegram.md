@@ -3,9 +3,9 @@
 Agent-facing execution guide for Telegram communication.
 
 Use this skill whenever you need to send, reply to, edit Telegram messages,
-send local images or files, or download inbound Telegram attachments. Assume a
-Telegram bot token is available from `COCO_TELEGRAM_BOT_TOKEN` unless an
-explicit `--token` is provided.
+send local images, files, or voice messages, or download inbound Telegram
+attachments. Assume a Telegram bot token is available from
+`COCO_TELEGRAM_BOT_TOKEN` unless an explicit `--token` is provided.
 
 ## Required Inputs
 
@@ -16,7 +16,7 @@ Collect these before execution:
 - `reply_to_message_id` is required when replying to an inbound message.
 - `file_id` is required when downloading an inbound attachment.
 - Message content is required for text send, reply, and edit operations.
-- A local file path is required when sending an image or file attachment.
+- A local file path is required when sending an image, file, or voice attachment.
 
 ## Execution Policy
 
@@ -29,15 +29,16 @@ Collect these before execution:
    instead of embedding raw line breaks in quoted strings.
 5. Avoid emitting HTML tags in message content; use Markdown-style plain text.
 6. To send a generated or downloaded image, pass its local path with
-   `--photo`. To send any other local file, pass its local path with
-   `--document`. `--image` and `--file` are accepted aliases.
+   `--photo`. To send a voice message, pass its local path with `--voice`. To
+   send any other local file, pass its local path with `--document`. `--image`
+   and `--file` are accepted aliases.
 7. Attachment captions use `--message`. If a caption exceeds Telegram's limit,
    the script sends the attachment with the first caption segment and then sends
    the remaining text as normal messages.
-8. If an inbound Telegram prompt includes image attachment metadata, use
-   `file_id` with `telegram_download.py` before answering image-dependent
-   requests. Download attachments into the current workspace so downstream
-   tools can load the saved files.
+8. If an inbound Telegram prompt includes image or voice attachment metadata,
+   use `file_id` with `telegram_download.py` before answering attachment-
+   dependent requests. Download attachments into the current workspace so
+   downstream tools can load the saved files.
 
 ## Command Templates
 
@@ -83,13 +84,19 @@ uv run --script "$COCO_SKILL_DIR/scripts/telegram_send.py" \
   --document "path/to/report.pdf" \
   --message "Report attached"
 
+# Send a voice message with an optional caption.
+uv run --script "$COCO_SKILL_DIR/scripts/telegram_send.py" \
+  --chat-id "<chat_id>" \
+  --voice "path/to/voice.ogg" \
+  --message "Voice note"
+
 # Edit an existing Telegram message.
 uv run --script "$COCO_SKILL_DIR/scripts/telegram_edit.py" \
   --chat-id "<chat_id>" \
   --message-id "<message_id>" \
   --text "Updated text"
 
-# Download an inbound image attachment by file_id.
+# Download an inbound attachment by file_id.
 uv run --script "$COCO_SKILL_DIR/scripts/telegram_download.py" \
   --file-id "<file_id>"
 ```
@@ -103,6 +110,7 @@ uv run --script "$COCO_SKILL_DIR/scripts/telegram_download.py" \
 - `--reply-to`, `-r`: optional
 - `--photo`, `--image`: optional local image path
 - `--document`, `--file`: optional local file path
+- `--voice`: optional local voice file path
 - `--token`, `-t`: optional
 
 ### `telegram_edit.py`
