@@ -36,6 +36,16 @@ class TelegramSendScriptTests(unittest.TestCase):
             module.split_message(message), ["a" * module.MESSAGE_LIMIT, "b"]
         )
 
+    def test_split_caption_uses_caption_limit_then_message_chunks(self) -> None:
+        module = load_script(SEND_SCRIPT)
+        message = ("a" * module.CAPTION_LIMIT) + ("b" * module.MESSAGE_LIMIT) + "c"
+
+        self.assertEqual(module.split_caption(""), (None, []))
+        self.assertEqual(
+            module.split_caption(message),
+            ("a" * module.CAPTION_LIMIT, ["b" * module.MESSAGE_LIMIT, "c"]),
+        )
+
     def test_resolve_token_prefers_explicit_token_then_environment(self) -> None:
         module = load_script(SEND_SCRIPT)
 
@@ -103,6 +113,159 @@ class TelegramSendScriptTests(unittest.TestCase):
                 ]
             },
         )
+
+    def test_main_sends_photo_with_caption_without_network(self) -> None:
+        module = load_script(SEND_SCRIPT)
+        calls = []
+        photo_path = Path(__file__)
+
+        def fake_post_multipart(
+            token: str,
+            method: str,
+            fields: dict[str, str],
+            file_field: str,
+            file_path: Path,
+        ) -> dict:
+            calls.append(
+                {
+                    "token": token,
+                    "method": method,
+                    "fields": fields,
+                    "file_field": file_field,
+                    "file_path": file_path,
+                }
+            )
+            return {"chat": {"id": int(fields["chat_id"])}, "message_id": 10}
+
+        argv = [
+            "telegram_send.py",
+            "--chat-id",
+            "100",
+            "--reply-to",
+            "123",
+            "--message",
+            "Caption",
+            "--photo",
+            str(photo_path),
+            "--token",
+            "test-token",
+        ]
+        stdout = io.StringIO()
+
+        with mock.patch.object(sys, "argv", argv):
+            with mock.patch.object(module, "post_multipart", fake_post_multipart):
+                with contextlib.redirect_stdout(stdout):
+                    result = module.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "token": "test-token",
+                    "method": "sendPhoto",
+                    "fields": {
+                        "chat_id": "100",
+                        "caption": "Caption",
+                        "reply_parameters": json.dumps({"message_id": 123}),
+                    },
+                    "file_field": "photo",
+                    "file_path": photo_path,
+                }
+            ],
+        )
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"sent": [{"chat_id": 100, "message_id": 10}]},
+        )
+
+    def test_main_sends_document_then_caption_overflow_as_text(self) -> None:
+        module = load_script(SEND_SCRIPT)
+        calls = []
+        document_path = Path(__file__)
+
+        def fake_post_multipart(
+            token: str,
+            method: str,
+            fields: dict[str, str],
+            file_field: str,
+            file_path: Path,
+        ) -> dict:
+            calls.append(
+                {
+                    "token": token,
+                    "method": method,
+                    "fields": fields,
+                    "file_field": file_field,
+                    "file_path": file_path,
+                }
+            )
+            return {"chat": {"id": int(fields["chat_id"])}, "message_id": 10}
+
+        def fake_post_api(token: str, method: str, payload: dict) -> dict:
+            calls.append({"token": token, "method": method, "payload": payload})
+            return {
+                "chat": {"id": int(payload["chat_id"])},
+                "message_id": len(calls) + 10,
+            }
+
+        message = ("a" * module.CAPTION_LIMIT) + "overflow"
+        argv = [
+            "telegram_send.py",
+            "--chat-id",
+            "100",
+            "--message",
+            message,
+            "--file",
+            str(document_path),
+            "--token",
+            "test-token",
+        ]
+        stdout = io.StringIO()
+
+        with mock.patch.object(sys, "argv", argv):
+            with mock.patch.object(module, "post_multipart", fake_post_multipart):
+                with mock.patch.object(module, "post_api", fake_post_api):
+                    with contextlib.redirect_stdout(stdout):
+                        result = module.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls[0]["method"], "sendDocument")
+        self.assertEqual(calls[0]["file_field"], "document")
+        self.assertEqual(calls[0]["fields"]["caption"], "a" * module.CAPTION_LIMIT)
+        self.assertEqual(
+            calls[1],
+            {
+                "token": "test-token",
+                "method": "sendMessage",
+                "payload": {"chat_id": "100", "text": "overflow"},
+            },
+        )
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "sent": [
+                    {"chat_id": 100, "message_id": 10},
+                    {"chat_id": 100, "message_id": 12},
+                ]
+            },
+        )
+
+    def test_main_rejects_missing_attachment_path(self) -> None:
+        module = load_script(SEND_SCRIPT)
+        argv = [
+            "telegram_send.py",
+            "--chat-id",
+            "100",
+            "--photo",
+            "missing.jpg",
+            "--token",
+            "test-token",
+        ]
+
+        with mock.patch.object(sys, "argv", argv):
+            with self.assertRaisesRegex(SystemExit, "attachment does not exist"):
+                module.main()
 
 
 class TelegramEditScriptTests(unittest.TestCase):
