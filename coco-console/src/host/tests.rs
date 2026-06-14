@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::api::{GraphViewportItemKind, Point};
 use crate::graph::{
     GraphBranch, GraphEdge, GraphEdgeKind, GraphMode, GraphNode, GraphSnapshot,
-    build_graph_snapshot, build_graph_snapshot_with_mode,
+    build_graph_snapshot, build_graph_snapshot_with_mode, node_target_id,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::layout::{
@@ -19,7 +19,8 @@ use crate::layout::{
     routed_elbow_points,
 };
 use crate::render::{
-    render_fragment, render_index_page, render_node_detail_fragment, render_snapshot_page,
+    render_fragment, render_index_page, render_node_detail_fragment,
+    render_provider_context_fragment, render_snapshot_page,
 };
 use crate::{ConsolePublisher, ConsoleStore};
 
@@ -40,6 +41,23 @@ fn session_anchor() -> SessionAnchor {
     }
 }
 
+fn provider_context_target(context_start: &str, branch: &str) -> String {
+    format!(
+        "{}-context-{}",
+        node_target_id(context_start),
+        branch
+            .bytes()
+            .flat_map(|byte| {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                [
+                    HEX[(byte >> 4) as usize] as char,
+                    HEX[(byte & 0x0f) as usize] as char,
+                ]
+            })
+            .collect::<String>()
+    )
+}
+
 fn graph_node(id: &str, created_at_ns: i128) -> GraphNode {
     GraphNode {
         id: id.to_owned(),
@@ -51,6 +69,7 @@ fn graph_node(id: &str, created_at_ns: i128) -> GraphNode {
         content: String::new(),
         summary: String::new(),
         labels: Vec::new(),
+        provider_context_ids: Vec::new(),
     }
 }
 
@@ -71,6 +90,7 @@ fn two_node_snapshot(version: u64) -> GraphSnapshot {
             visible_head_id: Some("merged".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     }
 }
 
@@ -82,6 +102,7 @@ fn empty_snapshot(version: u64) -> GraphSnapshot {
         nodes: Vec::new(),
         edges: Vec::new(),
         branches: Vec::new(),
+        provider_contexts: Vec::new(),
     }
 }
 
@@ -116,6 +137,7 @@ fn linear_snapshot(version: u64, node_ids: &[&str]) -> GraphSnapshot {
             visible_head_id: node_ids.last().map(|node_id| (*node_id).to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     }
 }
 
@@ -328,6 +350,7 @@ fn time_scale_tick_positions_are_evenly_spaced() {
             visible_head_id: Some("far".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     });
 
     assert!(html.contains("data-position=\"0.000000\""));
@@ -344,6 +367,7 @@ fn snapshot_page_defers_node_detail_content_until_requested() {
     let html = render_snapshot_page(&snapshot);
 
     assert!(html.contains("class=\"node-detail-slot\""));
+    assert!(html.contains("class=\"provider-context-slot\""));
     assert!(!html.contains("Deferred detail payload"));
     assert!(!html.contains("class=\"node-details node-detail\""));
 
@@ -351,6 +375,7 @@ fn snapshot_page_defers_node_detail_content_until_requested() {
 
     assert!(detail.contains("class=\"node-details node-detail\""));
     assert!(detail.contains("Deferred detail payload"));
+    assert!(!detail.contains("Provider Context"));
 }
 
 #[test]
@@ -363,6 +388,18 @@ fn node_detail_fragment_renders_default_or_missing_selection() {
     assert!(default_detail.contains("Select a node to inspect its content."));
     assert!(missing_detail.contains("The selected node is no longer available."));
     assert!(missing_detail.contains("detail-missing"));
+}
+
+#[test]
+fn provider_context_fragment_renders_default_or_missing_selection() {
+    let snapshot = empty_snapshot(0);
+
+    let default_context = render_provider_context_fragment(&snapshot, None, None);
+    let missing_context = render_provider_context_fragment(&snapshot, Some("detail-missing"), None);
+
+    assert!(default_context.contains("Select a node to inspect its provider context."));
+    assert!(missing_context.contains("The selected node is no longer available."));
+    assert!(missing_context.contains("detail-missing"));
 }
 
 #[test]
@@ -595,15 +632,561 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     assert!(node_ids.contains(&invocation_child.as_str()));
     assert!(!node_ids.contains(&ignored_child.as_str()));
     assert!(snapshot.edges.contains(&GraphEdge {
-        source: tool_use,
+        source: tool_use.clone(),
         target: invocation.clone(),
         kind: GraphEdgeKind::Primary,
     }));
     assert!(snapshot.edges.contains(&GraphEdge {
-        source: invocation,
-        target: invocation_child,
+        source: invocation.clone(),
+        target: invocation_child.clone(),
         kind: GraphEdgeKind::Primary,
     }));
+
+    let invocation_context =
+        render_provider_context_fragment(&snapshot, Some(&node_target_id(&invocation_child)), None);
+
+    assert!(invocation_context.contains("Provider Context"));
+    assert!(invocation_context.contains("No provider context nodes."));
+    assert!(!invocation_context.contains("The selected node is no longer available."));
+
+    store.fork("skill", &invocation_child).unwrap();
+    let skill_snapshot = build_graph_snapshot(&store, 10).unwrap();
+    let skill_context = skill_snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == provider_context_target(&session, "skill"))
+        .expect("skill provider context should exist");
+    let skill_context_ids = skill_context
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        skill_context_ids,
+        vec![
+            invocation_child.as_str(),
+            invocation.as_str(),
+            session.as_str()
+        ]
+    );
+    assert!(!skill_context.nodes.iter().any(|node| node.id == tool_use));
+}
+
+#[test]
+fn node_details_include_nodes_from_same_provider_context() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let first_session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &first_session).unwrap();
+    let previous_text = store
+        .append(NewNode {
+            parent: first_session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("previous provider context".to_owned()),
+        })
+        .unwrap();
+    let next_session = store
+        .append(NewNode {
+            parent: previous_text,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    let hidden_text = store
+        .append(NewNode {
+            parent: next_session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("hidden node inside current provider context".to_owned()),
+        })
+        .unwrap();
+    let prompt = store
+        .append(NewNode {
+            parent: hidden_text.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "visible prompt in current provider context".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &first_session, &prompt)
+        .unwrap();
+
+    let snapshot = build_graph_snapshot_with_mode(&store, 32, GraphMode::Anchors).unwrap();
+    let context = snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == provider_context_target(&next_session, "main"))
+        .expect("provider context should exist");
+    let context_ids = context
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        context_ids,
+        vec![prompt.as_str(), hidden_text.as_str(), next_session.as_str()]
+    );
+    assert!(
+        context
+            .nodes
+            .iter()
+            .any(|node| node.id == hidden_text && !node.visible)
+    );
+    assert!(!snapshot.nodes.iter().any(|node| node.id == hidden_text));
+
+    let provider_context = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&next_session)),
+        Some(&context.id),
+    );
+
+    assert!(provider_context.contains("Provider Context"));
+    assert!(provider_context.contains("hidden node inside current provider context"));
+    assert!(provider_context.contains("class=\"provider-context-node-link\""));
+    assert!(provider_context.contains(&format!(
+        "#{}?context={}",
+        node_target_id(&hidden_text),
+        context.id
+    )));
+    assert!(provider_context.contains("class=\"provider-context-node-graph-point\""));
+    assert!(provider_context.contains("data-node-x="));
+    assert!(provider_context.contains("data-node-y="));
+    assert!(provider_context.contains("class=\"provider-context-node\""));
+    assert!(provider_context.contains("class=\"provider-context-node visible selected\""));
+
+    let hidden_detail = render_node_detail_fragment(&snapshot, Some(&node_target_id(&hidden_text)));
+    let hidden_context = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&hidden_text)),
+        Some(&context.id),
+    );
+
+    assert!(hidden_detail.contains("class=\"node-details node-detail\""));
+    assert!(hidden_detail.contains(&hidden_text));
+    assert!(hidden_detail.contains("Kind"));
+    assert!(hidden_detail.contains("text"));
+    assert!(hidden_detail.contains("hidden node inside current provider context"));
+    assert!(hidden_context.contains("class=\"provider-context-node selected\""));
+}
+
+#[test]
+fn provider_context_list_uses_one_head_to_context_start_path() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &session).unwrap();
+    let shared_hidden = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("shared hidden context".to_owned()),
+        })
+        .unwrap();
+    let shared_prompt = store
+        .append(NewNode {
+            parent: shared_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "shared prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    let main_hidden = store
+        .append(NewNode {
+            parent: shared_prompt.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("main hidden context".to_owned()),
+        })
+        .unwrap();
+    let main_prompt = store
+        .append(NewNode {
+            parent: main_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "main head prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &session, &main_prompt)
+        .unwrap();
+
+    store.fork("review", &shared_prompt).unwrap();
+    let review_hidden = store
+        .append(NewNode {
+            parent: shared_prompt.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("review hidden context".to_owned()),
+        })
+        .unwrap();
+    let review_prompt = store
+        .append(NewNode {
+            parent: review_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "review head prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("review", &shared_prompt, &review_prompt)
+        .unwrap();
+
+    let snapshot = build_graph_snapshot_with_mode(&store, 33, GraphMode::Anchors).unwrap();
+    let review_context = snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == provider_context_target(&session, "review"))
+        .expect("review context should exist");
+    let review_context_ids = review_context
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        review_context_ids,
+        vec![
+            review_prompt.as_str(),
+            review_hidden.as_str(),
+            shared_prompt.as_str(),
+            shared_hidden.as_str(),
+            session.as_str()
+        ]
+    );
+
+    let review_context_html = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&review_hidden)),
+        Some(&review_context.id),
+    );
+
+    assert!(review_context_html.contains("review hidden context"));
+    assert!(review_context_html.contains("shared hidden context"));
+    assert!(!review_context_html.contains("main hidden context"));
+    assert!(review_context_html.contains("class=\"provider-context-node selected\""));
+    assert!(review_context_html.contains(&format!(
+        "#{}?context={}",
+        node_target_id(&shared_hidden),
+        review_context.id
+    )));
+
+    let shared_hidden_context_from_review = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&shared_hidden)),
+        Some(&review_context.id),
+    );
+    assert!(shared_hidden_context_from_review.contains("review hidden context"));
+    assert!(!shared_hidden_context_from_review.contains("main hidden context"));
+}
+
+#[test]
+fn provider_context_id_stays_stable_when_branch_head_moves() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &session).unwrap();
+    let first_prompt = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "first prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &session, &first_prompt)
+        .unwrap();
+
+    let first_snapshot = build_graph_snapshot_with_mode(&store, 35, GraphMode::Anchors).unwrap();
+    let first_context = first_snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.nodes.iter().any(|node| node.id == first_prompt))
+        .expect("initial provider context should exist");
+    let first_context_id = first_context.id.clone();
+
+    let next_prompt = store
+        .append(NewNode {
+            parent: first_prompt.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "next prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &first_prompt, &next_prompt)
+        .unwrap();
+
+    let next_snapshot = build_graph_snapshot_with_mode(&store, 36, GraphMode::Anchors).unwrap();
+    let next_context = next_snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.nodes.iter().any(|node| node.id == first_prompt))
+        .expect("updated provider context should exist");
+
+    assert_eq!(first_context_id, provider_context_target(&session, "main"));
+    assert_eq!(next_context.id, first_context_id);
+    assert!(next_context.nodes.iter().any(|node| node.id == next_prompt));
+}
+
+#[test]
+fn provider_context_ids_preserve_unique_branch_names() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+
+    store.fork("draft/review", &session).unwrap();
+    let slash_hidden = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("slash branch context".to_owned()),
+        })
+        .unwrap();
+    let slash_prompt = store
+        .append(NewNode {
+            parent: slash_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "slash branch prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("draft/review", &session, &slash_prompt)
+        .unwrap();
+
+    store.fork("draft-review", &session).unwrap();
+    let dash_hidden = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("dash branch context".to_owned()),
+        })
+        .unwrap();
+    let dash_prompt = store
+        .append(NewNode {
+            parent: dash_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "dash branch prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("draft-review", &session, &dash_prompt)
+        .unwrap();
+
+    let snapshot = build_graph_snapshot_with_mode(&store, 37, GraphMode::Anchors).unwrap();
+    let slash_context_id = provider_context_target(&session, "draft/review");
+    let dash_context_id = provider_context_target(&session, "draft-review");
+    let slash_context = snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == slash_context_id)
+        .expect("slash branch provider context should exist");
+    let dash_context = snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == dash_context_id)
+        .expect("dash branch provider context should exist");
+
+    assert_ne!(slash_context.id, dash_context.id);
+    assert!(
+        slash_context
+            .nodes
+            .iter()
+            .any(|node| node.id == slash_hidden)
+    );
+    assert!(
+        !slash_context
+            .nodes
+            .iter()
+            .any(|node| node.id == dash_hidden)
+    );
+    assert!(dash_context.nodes.iter().any(|node| node.id == dash_hidden));
+    assert!(
+        !dash_context
+            .nodes
+            .iter()
+            .any(|node| node.id == slash_hidden)
+    );
+}
+
+#[test]
+fn all_mode_provider_contexts_cover_older_visible_segments() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let first_session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &first_session).unwrap();
+    let old_hidden = store
+        .append(NewNode {
+            parent: first_session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("old hidden context".to_owned()),
+        })
+        .unwrap();
+    let old_prompt = store
+        .append(NewNode {
+            parent: old_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "old prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    let next_session = store
+        .append(NewNode {
+            parent: old_prompt.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    let new_prompt = store
+        .append(NewNode {
+            parent: next_session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "new prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &first_session, &new_prompt)
+        .unwrap();
+
+    let snapshot = build_graph_snapshot_with_mode(&store, 34, GraphMode::All).unwrap();
+    let old_context = snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == provider_context_target(&first_session, "main"))
+        .expect("old provider context should be retained in all mode");
+    let old_context_ids = old_context
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        old_context_ids,
+        vec![
+            old_prompt.as_str(),
+            old_hidden.as_str(),
+            first_session.as_str()
+        ]
+    );
+
+    let old_hidden_context = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&old_hidden)),
+        Some(&old_context.id),
+    );
+
+    assert!(old_hidden_context.contains("old hidden context"));
+    assert!(old_hidden_context.contains("old prompt"));
+    assert!(!old_hidden_context.contains("new prompt"));
+    assert!(old_hidden_context.contains("class=\"provider-context-node visible selected\""));
 }
 
 fn snapshot_content<'a>(snapshot: &'a GraphSnapshot, node_id: &str) -> &'a str {
@@ -807,6 +1390,7 @@ fn layout_expands_empty_columns_from_event_order() {
             visible_head_id: Some("merged".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     };
 
     let layout = layout_graph(&snapshot);
@@ -841,6 +1425,7 @@ fn graph_viewport_response_includes_canvas_and_visible_nodes() {
             visible_head_id: Some("merged".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     };
 
     let response = layout_graph_viewport(
@@ -1672,6 +2257,7 @@ fn streamed_graph_markup_escapes_dynamic_values() {
             visible_head_id: Some("node-\"<&".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     };
 
     let html = render_snapshot_page(&snapshot);
@@ -1745,6 +2331,7 @@ fn rendered_page_does_not_embed_javascript() {
         nodes: Vec::new(),
         edges: Vec::new(),
         branches: Vec::new(),
+        provider_contexts: Vec::new(),
     };
     let html = render_snapshot_page(&snapshot);
 
@@ -1762,6 +2349,7 @@ fn fragment_renders_refresh_free_console_root() {
         nodes: Vec::new(),
         edges: Vec::new(),
         branches: Vec::new(),
+        provider_contexts: Vec::new(),
     };
     let html = render_fragment(&snapshot);
 
@@ -1782,6 +2370,7 @@ fn index_page_loads_wasm_client_without_document_refresh() {
         nodes: Vec::new(),
         edges: Vec::new(),
         branches: Vec::new(),
+        provider_contexts: Vec::new(),
     };
     let html = render_index_page(&snapshot);
 
