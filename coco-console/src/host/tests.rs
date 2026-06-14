@@ -42,7 +42,20 @@ fn session_anchor() -> SessionAnchor {
 }
 
 fn provider_context_target(context_start: &str, branch: &str) -> String {
-    format!("{}-context-{branch}", node_target_id(context_start))
+    format!(
+        "{}-context-{}",
+        node_target_id(context_start),
+        branch
+            .bytes()
+            .flat_map(|byte| {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                [
+                    HEX[(byte >> 4) as usize] as char,
+                    HEX[(byte & 0x0f) as usize] as char,
+                ]
+            })
+            .collect::<String>()
+    )
 }
 
 fn graph_node(id: &str, created_at_ns: i128) -> GraphNode {
@@ -947,6 +960,109 @@ fn provider_context_id_stays_stable_when_branch_head_moves() {
     assert_eq!(first_context_id, provider_context_target(&session, "main"));
     assert_eq!(next_context.id, first_context_id);
     assert!(next_context.nodes.iter().any(|node| node.id == next_prompt));
+}
+
+#[test]
+fn provider_context_ids_preserve_unique_branch_names() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+
+    store.fork("draft/review", &session).unwrap();
+    let slash_hidden = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("slash branch context".to_owned()),
+        })
+        .unwrap();
+    let slash_prompt = store
+        .append(NewNode {
+            parent: slash_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "slash branch prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("draft/review", &session, &slash_prompt)
+        .unwrap();
+
+    store.fork("draft-review", &session).unwrap();
+    let dash_hidden = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("dash branch context".to_owned()),
+        })
+        .unwrap();
+    let dash_prompt = store
+        .append(NewNode {
+            parent: dash_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "dash branch prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("draft-review", &session, &dash_prompt)
+        .unwrap();
+
+    let snapshot = build_graph_snapshot_with_mode(&store, 37, GraphMode::Anchors).unwrap();
+    let slash_context_id = provider_context_target(&session, "draft/review");
+    let dash_context_id = provider_context_target(&session, "draft-review");
+    let slash_context = snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == slash_context_id)
+        .expect("slash branch provider context should exist");
+    let dash_context = snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == dash_context_id)
+        .expect("dash branch provider context should exist");
+
+    assert_ne!(slash_context.id, dash_context.id);
+    assert!(
+        slash_context
+            .nodes
+            .iter()
+            .any(|node| node.id == slash_hidden)
+    );
+    assert!(
+        !slash_context
+            .nodes
+            .iter()
+            .any(|node| node.id == dash_hidden)
+    );
+    assert!(dash_context.nodes.iter().any(|node| node.id == dash_hidden));
+    assert!(
+        !dash_context
+            .nodes
+            .iter()
+            .any(|node| node.id == slash_hidden)
+    );
 }
 
 #[test]

@@ -701,8 +701,21 @@ fn provider_context_id(branch_name: &str, context: &[Node]) -> Option<String> {
     Some(format!(
         "{}-context-{}",
         node_target_id(&context_start.id),
-        css_token(branch_name)
+        stable_token(branch_name)
     ))
+}
+
+fn stable_token(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    value
+        .bytes()
+        .flat_map(|byte| {
+            [
+                HEX[(byte >> 4) as usize] as char,
+                HEX[(byte & 0x0f) as usize] as char,
+            ]
+        })
+        .collect()
 }
 
 fn provider_context_order(
