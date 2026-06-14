@@ -876,6 +876,100 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
     assert!(!shared_hidden_context_from_review.contains("main hidden context"));
 }
 
+#[test]
+fn all_mode_provider_contexts_cover_older_visible_segments() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let first_session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &first_session).unwrap();
+    let old_hidden = store
+        .append(NewNode {
+            parent: first_session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("old hidden context".to_owned()),
+        })
+        .unwrap();
+    let old_prompt = store
+        .append(NewNode {
+            parent: old_hidden.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "old prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    let next_session = store
+        .append(NewNode {
+            parent: old_prompt.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    let new_prompt = store
+        .append(NewNode {
+            parent: next_session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "new prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &first_session, &new_prompt)
+        .unwrap();
+
+    let snapshot = build_graph_snapshot_with_mode(&store, 34, GraphMode::All).unwrap();
+    let old_context = snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == node_target_id(&old_prompt))
+        .expect("old provider context should be retained in all mode");
+    let old_context_ids = old_context
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        old_context_ids,
+        vec![
+            old_prompt.as_str(),
+            old_hidden.as_str(),
+            first_session.as_str()
+        ]
+    );
+
+    let old_hidden_context = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&old_hidden)),
+        Some(&old_context.id),
+    );
+
+    assert!(old_hidden_context.contains("old hidden context"));
+    assert!(old_hidden_context.contains("old prompt"));
+    assert!(!old_hidden_context.contains("new prompt"));
+    assert!(old_hidden_context.contains("class=\"provider-context-node visible selected\""));
+}
+
 fn snapshot_content<'a>(snapshot: &'a GraphSnapshot, node_id: &str) -> &'a str {
     snapshot
         .nodes

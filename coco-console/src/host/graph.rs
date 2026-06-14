@@ -386,8 +386,9 @@ impl GraphBuildState {
         let mut contexts = HashMap::<String, GraphProviderContext>::new();
         for branch in &self.branches {
             let ancestry = store.ancestry(&branch.head_id).context(StoreSnafu)?;
-            let context_nodes = provider_context_from_head(ancestry);
-            self.insert_provider_context(&mut contexts, &branch.head_id, context_nodes);
+            for context_nodes in provider_contexts_from_head(ancestry) {
+                self.insert_provider_context(&mut contexts, context_nodes);
+            }
         }
 
         let mut contexts = contexts.into_values().collect::<Vec<_>>();
@@ -398,7 +399,6 @@ impl GraphBuildState {
     fn insert_provider_context(
         &self,
         contexts: &mut HashMap<String, GraphProviderContext>,
-        head_id: &str,
         context: Vec<Node>,
     ) {
         if !context
@@ -412,7 +412,9 @@ impl GraphBuildState {
             .iter()
             .map(|node| graph_provider_context_node(node, self.visible_node_ids.contains(&node.id)))
             .collect::<Vec<_>>();
-        let id = provider_context_id(head_id);
+        let Some(id) = context.first().map(|head| provider_context_id(&head.id)) else {
+            return;
+        };
         contexts.entry(id.clone()).or_insert(GraphProviderContext {
             id,
             nodes: context_nodes,
@@ -655,12 +657,22 @@ fn provider_context_node_id(done: &mut bool, node: Node) -> Option<String> {
     Some(node.id)
 }
 
-fn provider_context_from_head(ancestry: Vec<Node>) -> Vec<Node> {
-    ancestry
-        .into_iter()
-        .take_while(|node| !node.is_root())
-        .scan(false, provider_context_node)
-        .collect()
+fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
+    let mut contexts = Vec::new();
+    let mut current = Vec::new();
+
+    for node in ancestry.into_iter().take_while(|node| !node.is_root()) {
+        let is_start = is_provider_context_start(&node);
+        current.push(node);
+        if is_start {
+            contexts.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        contexts.push(current);
+    }
+
+    contexts
 }
 
 fn provider_context_ids_by_node(
@@ -702,14 +714,6 @@ fn provider_context_head_time_ns(context: &GraphProviderContext) -> i128 {
         .first()
         .map(|node| node.created_at_ns)
         .unwrap_or_default()
-}
-
-fn provider_context_node(done: &mut bool, node: Node) -> Option<Node> {
-    if *done {
-        return None;
-    }
-    *done = is_provider_context_start(&node);
-    Some(node)
 }
 
 fn graph_provider_context_node(node: &Node, visible: bool) -> GraphProviderContextNode {
