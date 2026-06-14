@@ -2423,7 +2423,31 @@ async fn refresh_selected_node_detail_from_graph(
     Ok(())
 }
 
+struct SelectedNodeDetailRequest {
+    target: Option<String>,
+    context: Option<String>,
+    detail_url: String,
+    provider_context_url: String,
+}
+
 async fn refresh_selected_node_detail(window: &Window, document: &Document) -> Result<(), JsValue> {
+    let request = selected_node_detail_request(window, document)?;
+    let detail_html = fetch_text(window, &request.detail_url).await?;
+    let provider_context_html = fetch_text(window, &request.provider_context_url).await?;
+    render_node_detail_if_current(window, document, request.target.clone(), &detail_html)?;
+    render_provider_context_if_current(
+        window,
+        document,
+        request.target,
+        request.context,
+        &provider_context_html,
+    )
+}
+
+fn selected_node_detail_request(
+    window: &Window,
+    document: &Document,
+) -> Result<SelectedNodeDetailRequest, JsValue> {
     let target = selected_node_target(window);
     let context = selected_provider_context_target(window);
     render_loading_node_detail_if_current(window, document, target.as_deref())?;
@@ -2435,12 +2459,14 @@ async fn refresh_selected_node_detail(window: &Window, document: &Document) -> R
     )?;
     let graph_mode = current_graph_mode(document);
     let detail_url = node_detail_url(target.as_deref(), &graph_mode);
-    let provider_context_fragment_url =
+    let provider_context_url =
         provider_context_url(target.as_deref(), context.as_deref(), &graph_mode);
-    let detail_html = fetch_text(window, &detail_url).await?;
-    let provider_context_html = fetch_text(window, &provider_context_fragment_url).await?;
-    render_node_detail_if_current(window, document, target.clone(), &detail_html)?;
-    render_provider_context_if_current(window, document, target, context, &provider_context_html)
+    Ok(SelectedNodeDetailRequest {
+        target,
+        context,
+        detail_url,
+        provider_context_url,
+    })
 }
 
 fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
@@ -3223,8 +3249,8 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test(async)]
-    async fn graph_items_selected_node_detail_refresh_uses_context_hash() {
+    #[wasm_bindgen_test]
+    fn graph_items_selected_node_detail_request_uses_context_hash() {
         let fixture = GraphFixture::new();
         let (window, document) = {
             let graph = fixture.graph.borrow();
@@ -3248,13 +3274,31 @@ mod tests {
             .set_hash("detail-node?context=detail-head")
             .expect_throw("hash should be set");
 
-        let result = refresh_selected_node_detail(&window, &document).await;
+        let request = selected_node_detail_request(&window, &document)
+            .expect_throw("selected node detail request should be created");
         window
             .location()
             .set_hash("")
             .expect_throw("hash should be cleared");
 
-        assert!(result.is_ok());
+        assert_eq!(request.target.as_deref(), Some("detail-node"));
+        assert_eq!(request.context.as_deref(), Some("detail-head"));
+        assert_eq!(
+            request.detail_url,
+            "/api/node-detail?target=detail-node&mode=anchors"
+        );
+        assert_eq!(
+            request.provider_context_url,
+            "/api/provider-context?mode=anchors&target=detail-node&context=detail-head"
+        );
+        assert_eq!(
+            detail_slot.text_content().as_deref(),
+            Some("NodeSelectionLoading node detail...")
+        );
+        assert_eq!(
+            provider_context_slot.text_content().as_deref(),
+            Some("Provider ContextLoading provider context...")
+        );
         assert_eq!(selected_node_target(&window), None);
     }
 
