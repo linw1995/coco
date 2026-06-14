@@ -451,6 +451,7 @@ where
         Ok(snapshot) => html_response(render_provider_context_fragment(
             &snapshot,
             query.get("target"),
+            query.get("context"),
         )),
         Err(error) => error_response(error),
     }

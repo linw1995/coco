@@ -43,6 +43,7 @@ pub struct GraphSnapshot {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub branches: Vec<GraphBranch>,
+    pub provider_contexts: Vec<GraphProviderContext>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -56,7 +57,13 @@ pub struct GraphNode {
     pub content: String,
     pub summary: String,
     pub labels: Vec<String>,
-    pub provider_context_nodes: Vec<GraphProviderContextNode>,
+    pub provider_context_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GraphProviderContext {
+    pub id: String,
+    pub nodes: Vec<GraphProviderContextNode>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -107,7 +114,7 @@ struct GraphNodeEntry {
     primary_parent: Option<String>,
     merge_parents: Vec<MergeParent>,
     labels: Vec<GraphBranchLabel>,
-    provider_context_nodes: Vec<GraphProviderContextNode>,
+    provider_context_ids: Vec<String>,
 }
 
 struct GraphBuildState {
@@ -148,7 +155,8 @@ pub fn build_graph_snapshot_with_mode(
     mode: GraphMode,
 ) -> Result<GraphSnapshot> {
     let mut state = collect_graph_state(store, mode)?;
-    let entries = sorted_graph_entries(&mut state, store)?;
+    let contexts = state.provider_contexts(store)?;
+    let entries = sorted_graph_entries(&mut state, store, &contexts)?;
     let (nodes, edges) = graph_items_from_entries(entries);
 
     Ok(GraphSnapshot {
@@ -158,6 +166,7 @@ pub fn build_graph_snapshot_with_mode(
         nodes,
         edges,
         branches: state.branches,
+        provider_contexts: contexts,
     })
 }
 
@@ -175,8 +184,9 @@ fn collect_graph_state(
 fn sorted_graph_entries(
     state: &mut GraphBuildState,
     store: &impl NodeStore,
+    contexts: &[GraphProviderContext],
 ) -> Result<Vec<GraphNodeEntry>> {
-    let mut entries = state.node_entries(store)?;
+    let mut entries = state.node_entries(store, contexts)?;
     entries.sort_by(graph_entry_order);
     Ok(entries)
 }
@@ -245,7 +255,7 @@ fn graph_node_from_entry(entry: GraphNodeEntry) -> GraphNode {
         content: render_node_content(&entry.node),
         summary: summarize_node(&entry.node),
         labels: render_graph_labels(&entry.labels),
-        provider_context_nodes: entry.provider_context_nodes,
+        provider_context_ids: entry.provider_context_ids,
     }
 }
 
@@ -333,11 +343,15 @@ impl GraphBuildState {
             });
     }
 
-    fn node_entries(&mut self, store: &impl NodeStore) -> Result<Vec<GraphNodeEntry>> {
-        let mut provider_context_nodes_by_node = self.provider_context_nodes_by_node(store)?;
+    fn node_entries(
+        &mut self,
+        store: &impl NodeStore,
+        contexts: &[GraphProviderContext],
+    ) -> Result<Vec<GraphNodeEntry>> {
+        let context_ids_by_node = provider_context_ids_by_node(contexts, &self.visible_node_ids);
         std::mem::take(&mut self.visible_nodes)
             .into_values()
-            .map(|node| self.node_entry(store, node, &mut provider_context_nodes_by_node))
+            .map(|node| self.node_entry(store, node, &context_ids_by_node))
             .collect()
     }
 
@@ -345,7 +359,7 @@ impl GraphBuildState {
         &mut self,
         store: &impl NodeStore,
         node: Node,
-        provider_context_nodes_by_node: &mut HashMap<String, Vec<GraphProviderContextNode>>,
+        context_ids_by_node: &HashMap<String, Vec<String>>,
     ) -> Result<GraphNodeEntry> {
         let scope_node_ids = self
             .visible_node_scopes
@@ -355,35 +369,36 @@ impl GraphBuildState {
         let merge_parents =
             self.visible_merge_parents(store, &node, &scope_node_ids, &primary_parent)?;
         let labels = self.labels_by_node.remove(&node.id).unwrap_or_default();
-        let provider_context_nodes = provider_context_nodes_by_node
-            .remove(&node.id)
-            .unwrap_or_else(|| vec![graph_provider_context_node(&node, true)]);
+        let provider_context_ids = context_ids_by_node
+            .get(&node.id)
+            .cloned()
+            .unwrap_or_default();
         Ok(GraphNodeEntry {
             node,
             primary_parent,
             merge_parents,
             labels,
-            provider_context_nodes,
+            provider_context_ids,
         })
     }
 
-    fn provider_context_nodes_by_node(
-        &self,
-        store: &impl NodeStore,
-    ) -> Result<HashMap<String, Vec<GraphProviderContextNode>>> {
-        let mut contexts_by_node = HashMap::<String, Vec<GraphProviderContextNode>>::new();
+    fn provider_contexts(&self, store: &impl NodeStore) -> Result<Vec<GraphProviderContext>> {
+        let mut contexts = HashMap::<String, GraphProviderContext>::new();
         for branch in &self.branches {
             let ancestry = store.ancestry(&branch.head_id).context(StoreSnafu)?;
-            let context = provider_context_from_head(ancestry);
-            self.insert_provider_context(&mut contexts_by_node, context);
+            let context_nodes = provider_context_from_head(ancestry);
+            self.insert_provider_context(&mut contexts, &branch.head_id, context_nodes);
         }
 
-        Ok(contexts_by_node)
+        let mut contexts = contexts.into_values().collect::<Vec<_>>();
+        contexts.sort_by(provider_context_order);
+        Ok(contexts)
     }
 
     fn insert_provider_context(
         &self,
-        contexts_by_node: &mut HashMap<String, Vec<GraphProviderContextNode>>,
+        contexts: &mut HashMap<String, GraphProviderContext>,
+        head_id: &str,
         context: Vec<Node>,
     ) {
         if !context
@@ -397,14 +412,11 @@ impl GraphBuildState {
             .iter()
             .map(|node| graph_provider_context_node(node, self.visible_node_ids.contains(&node.id)))
             .collect::<Vec<_>>();
-        for node in context
-            .iter()
-            .filter(|node| self.visible_node_ids.contains(&node.id))
-        {
-            contexts_by_node
-                .entry(node.id.clone())
-                .or_insert_with(|| context_nodes.clone());
-        }
+        let id = provider_context_id(head_id);
+        contexts.entry(id.clone()).or_insert(GraphProviderContext {
+            id,
+            nodes: context_nodes,
+        });
     }
 
     fn visible_merge_parents(
@@ -649,6 +661,47 @@ fn provider_context_from_head(ancestry: Vec<Node>) -> Vec<Node> {
         .take_while(|node| !node.is_root())
         .scan(false, provider_context_node)
         .collect()
+}
+
+fn provider_context_ids_by_node(
+    contexts: &[GraphProviderContext],
+    visible_node_ids: &BTreeSet<String>,
+) -> HashMap<String, Vec<String>> {
+    let mut ids_by_node = HashMap::<String, Vec<String>>::new();
+    for context in contexts {
+        for node in context
+            .nodes
+            .iter()
+            .filter(|node| visible_node_ids.contains(&node.id))
+        {
+            ids_by_node
+                .entry(node.id.clone())
+                .or_default()
+                .push(context.id.clone());
+        }
+    }
+    ids_by_node
+}
+
+fn provider_context_id(head_id: &str) -> String {
+    node_target_id(head_id)
+}
+
+fn provider_context_order(
+    left: &GraphProviderContext,
+    right: &GraphProviderContext,
+) -> std::cmp::Ordering {
+    provider_context_head_time_ns(left)
+        .cmp(&provider_context_head_time_ns(right))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn provider_context_head_time_ns(context: &GraphProviderContext) -> i128 {
+    context
+        .nodes
+        .first()
+        .map(|node| node.created_at_ns)
+        .unwrap_or_default()
 }
 
 fn provider_context_node(done: &mut bool, node: Node) -> Option<Node> {

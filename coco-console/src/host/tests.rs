@@ -52,7 +52,7 @@ fn graph_node(id: &str, created_at_ns: i128) -> GraphNode {
         content: String::new(),
         summary: String::new(),
         labels: Vec::new(),
-        provider_context_nodes: Vec::new(),
+        provider_context_ids: Vec::new(),
     }
 }
 
@@ -73,6 +73,7 @@ fn two_node_snapshot(version: u64) -> GraphSnapshot {
             visible_head_id: Some("merged".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     }
 }
 
@@ -84,6 +85,7 @@ fn empty_snapshot(version: u64) -> GraphSnapshot {
         nodes: Vec::new(),
         edges: Vec::new(),
         branches: Vec::new(),
+        provider_contexts: Vec::new(),
     }
 }
 
@@ -118,6 +120,7 @@ fn linear_snapshot(version: u64, node_ids: &[&str]) -> GraphSnapshot {
             visible_head_id: node_ids.last().map(|node_id| (*node_id).to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     }
 }
 
@@ -330,6 +333,7 @@ fn time_scale_tick_positions_are_evenly_spaced() {
             visible_head_id: Some("far".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     });
 
     assert!(html.contains("data-position=\"0.000000\""));
@@ -373,8 +377,8 @@ fn node_detail_fragment_renders_default_or_missing_selection() {
 fn provider_context_fragment_renders_default_or_missing_selection() {
     let snapshot = empty_snapshot(0);
 
-    let default_context = render_provider_context_fragment(&snapshot, None);
-    let missing_context = render_provider_context_fragment(&snapshot, Some("detail-missing"));
+    let default_context = render_provider_context_fragment(&snapshot, None, None);
+    let missing_context = render_provider_context_fragment(&snapshot, Some("detail-missing"), None);
 
     assert!(default_context.contains("Select a node to inspect its provider context."));
     assert!(missing_context.contains("The selected node is no longer available."));
@@ -678,13 +682,13 @@ fn node_details_include_nodes_from_same_provider_context() {
         .unwrap();
 
     let snapshot = build_graph_snapshot_with_mode(&store, 32, GraphMode::Anchors).unwrap();
-    let node = snapshot
-        .nodes
+    let context = snapshot
+        .provider_contexts
         .iter()
-        .find(|node| node.id == next_session)
-        .expect("session should be visible");
-    let context_ids = node
-        .provider_context_nodes
+        .find(|context| context.id == node_target_id(&prompt))
+        .expect("provider context should exist");
+    let context_ids = context
+        .nodes
         .iter()
         .map(|node| node.id.as_str())
         .collect::<Vec<_>>();
@@ -694,19 +698,27 @@ fn node_details_include_nodes_from_same_provider_context() {
         vec![prompt.as_str(), hidden_text.as_str(), next_session.as_str()]
     );
     assert!(
-        node.provider_context_nodes
+        context
+            .nodes
             .iter()
             .any(|node| node.id == hidden_text && !node.visible)
     );
     assert!(!snapshot.nodes.iter().any(|node| node.id == hidden_text));
 
-    let provider_context =
-        render_provider_context_fragment(&snapshot, Some(&node_target_id(&next_session)));
+    let provider_context = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&next_session)),
+        Some(&context.id),
+    );
 
     assert!(provider_context.contains("Provider Context"));
     assert!(provider_context.contains("hidden node inside current provider context"));
     assert!(provider_context.contains("class=\"provider-context-node-link\""));
-    assert!(provider_context.contains(&format!("#{}", node_target_id(&hidden_text))));
+    assert!(provider_context.contains(&format!(
+        "#{}?context={}",
+        node_target_id(&hidden_text),
+        context.id
+    )));
     assert!(provider_context.contains("class=\"provider-context-node-graph-point\""));
     assert!(provider_context.contains("data-node-x="));
     assert!(provider_context.contains("data-node-y="));
@@ -714,8 +726,11 @@ fn node_details_include_nodes_from_same_provider_context() {
     assert!(provider_context.contains("class=\"provider-context-node visible selected\""));
 
     let hidden_detail = render_node_detail_fragment(&snapshot, Some(&node_target_id(&hidden_text)));
-    let hidden_context =
-        render_provider_context_fragment(&snapshot, Some(&node_target_id(&hidden_text)));
+    let hidden_context = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&hidden_text)),
+        Some(&context.id),
+    );
 
     assert!(hidden_detail.contains("class=\"node-details node-detail\""));
     assert!(hidden_detail.contains(&hidden_text));
@@ -814,13 +829,13 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
         .unwrap();
 
     let snapshot = build_graph_snapshot_with_mode(&store, 33, GraphMode::Anchors).unwrap();
-    let review_node = snapshot
-        .nodes
+    let review_context = snapshot
+        .provider_contexts
         .iter()
-        .find(|node| node.id == review_prompt)
-        .expect("review head should be visible");
-    let review_context_ids = review_node
-        .provider_context_nodes
+        .find(|context| context.id == node_target_id(&review_prompt))
+        .expect("review context should exist");
+    let review_context_ids = review_context
+        .nodes
         .iter()
         .map(|node| node.id.as_str())
         .collect::<Vec<_>>();
@@ -836,13 +851,29 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
         ]
     );
 
-    let review_context =
-        render_provider_context_fragment(&snapshot, Some(&node_target_id(&review_hidden)));
+    let review_context_html = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&review_hidden)),
+        Some(&review_context.id),
+    );
 
-    assert!(review_context.contains("review hidden context"));
-    assert!(review_context.contains("shared hidden context"));
-    assert!(!review_context.contains("main hidden context"));
-    assert!(review_context.contains("class=\"provider-context-node selected\""));
+    assert!(review_context_html.contains("review hidden context"));
+    assert!(review_context_html.contains("shared hidden context"));
+    assert!(!review_context_html.contains("main hidden context"));
+    assert!(review_context_html.contains("class=\"provider-context-node selected\""));
+    assert!(review_context_html.contains(&format!(
+        "#{}?context={}",
+        node_target_id(&shared_hidden),
+        review_context.id
+    )));
+
+    let shared_hidden_context_from_review = render_provider_context_fragment(
+        &snapshot,
+        Some(&node_target_id(&shared_hidden)),
+        Some(&review_context.id),
+    );
+    assert!(shared_hidden_context_from_review.contains("review hidden context"));
+    assert!(!shared_hidden_context_from_review.contains("main hidden context"));
 }
 
 fn snapshot_content<'a>(snapshot: &'a GraphSnapshot, node_id: &str) -> &'a str {
@@ -1046,6 +1077,7 @@ fn layout_expands_empty_columns_from_event_order() {
             visible_head_id: Some("merged".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     };
 
     let layout = layout_graph(&snapshot);
@@ -1080,6 +1112,7 @@ fn graph_viewport_response_includes_canvas_and_visible_nodes() {
             visible_head_id: Some("merged".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     };
 
     let response = layout_graph_viewport(
@@ -1911,6 +1944,7 @@ fn streamed_graph_markup_escapes_dynamic_values() {
             visible_head_id: Some("node-\"<&".to_owned()),
             state: SessionState::Active,
         }],
+        provider_contexts: Vec::new(),
     };
 
     let html = render_snapshot_page(&snapshot);
@@ -1984,6 +2018,7 @@ fn rendered_page_does_not_embed_javascript() {
         nodes: Vec::new(),
         edges: Vec::new(),
         branches: Vec::new(),
+        provider_contexts: Vec::new(),
     };
     let html = render_snapshot_page(&snapshot);
 
@@ -2001,6 +2036,7 @@ fn fragment_renders_refresh_free_console_root() {
         nodes: Vec::new(),
         edges: Vec::new(),
         branches: Vec::new(),
+        provider_contexts: Vec::new(),
     };
     let html = render_fragment(&snapshot);
 
@@ -2021,6 +2057,7 @@ fn index_page_loads_wasm_client_without_document_refresh() {
         nodes: Vec::new(),
         edges: Vec::new(),
         branches: Vec::new(),
+        provider_contexts: Vec::new(),
     };
     let html = render_index_page(&snapshot);
 

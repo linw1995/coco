@@ -4,7 +4,8 @@ use leptos::{html::HtmlElement, prelude::*};
 
 use crate::api::Point;
 use crate::graph::{
-    GraphMode, GraphNode, GraphProviderContextNode, GraphSnapshot, node_target_id, shorten_id,
+    GraphMode, GraphNode, GraphProviderContext, GraphProviderContextNode, GraphSnapshot,
+    node_target_id, shorten_id,
 };
 use crate::layout::{lane_key, layout_graph};
 
@@ -35,11 +36,15 @@ pub fn render_node_detail_fragment(snapshot: &GraphSnapshot, target: Option<&str
     }
 }
 
-pub fn render_provider_context_fragment(snapshot: &GraphSnapshot, target: Option<&str>) -> String {
+pub fn render_provider_context_fragment(
+    snapshot: &GraphSnapshot,
+    target: Option<&str>,
+    context: Option<&str>,
+) -> String {
     match target {
-        Some(target) => provider_context_for_target(snapshot, target)
+        Some(target) => provider_context_for_target(snapshot, target, context)
             .map(|context| {
-                let items = provider_context_items(snapshot, context.nodes, context.selected_id);
+                let items = provider_context_items(snapshot, context.context, context.selected_id);
                 view! { <ProviderContextList items=items/> }.to_html()
             })
             .unwrap_or_else(|| {
@@ -99,12 +104,13 @@ impl FocusedNode<'_> {
 }
 
 struct ProviderContextSelection<'a> {
-    nodes: &'a [GraphProviderContextNode],
+    context: &'a GraphProviderContext,
     selected_id: &'a str,
 }
 
 #[derive(Clone)]
 struct ProviderContextItem {
+    context_target: String,
     node: GraphProviderContextNode,
     selected: bool,
     point: Option<Point>,
@@ -375,9 +381,9 @@ fn focused_node<'a>(snapshot: &'a GraphSnapshot, target: &str) -> Option<Focused
         .map(FocusedNode::Graph)
         .or_else(|| {
             snapshot
-                .nodes
+                .provider_contexts
                 .iter()
-                .flat_map(|node| node.provider_context_nodes.iter())
+                .flat_map(|context| context.nodes.iter())
                 .find(|node| node_target_id(&node.id) == target)
                 .map(FocusedNode::ProviderContext)
         })
@@ -386,16 +392,33 @@ fn focused_node<'a>(snapshot: &'a GraphSnapshot, target: &str) -> Option<Focused
 fn provider_context_for_target<'a>(
     snapshot: &'a GraphSnapshot,
     target: &str,
+    context: Option<&str>,
 ) -> Option<ProviderContextSelection<'a>> {
-    snapshot.nodes.iter().find_map(|node| {
-        let selected = node
-            .provider_context_nodes
+    if let Some(context) = context {
+        return snapshot
+            .provider_contexts
             .iter()
-            .find(|context_node| node_target_id(&context_node.id) == target)?;
-        Some(ProviderContextSelection {
-            nodes: &node.provider_context_nodes,
-            selected_id: &selected.id,
-        })
+            .find(|provider_context| provider_context.id == context)
+            .and_then(|provider_context| provider_context_selection(provider_context, target));
+    }
+
+    snapshot
+        .provider_contexts
+        .iter()
+        .find_map(|context| provider_context_selection(context, target))
+}
+
+fn provider_context_selection<'a>(
+    context: &'a GraphProviderContext,
+    target: &str,
+) -> Option<ProviderContextSelection<'a>> {
+    let selected = context
+        .nodes
+        .iter()
+        .find(|context_node| node_target_id(&context_node.id) == target)?;
+    Some(ProviderContextSelection {
+        context,
+        selected_id: &selected.id,
     })
 }
 
@@ -454,13 +477,16 @@ fn ProviderContextDefault() -> impl IntoView {
 
 fn provider_context_items(
     snapshot: &GraphSnapshot,
-    nodes: &[GraphProviderContextNode],
+    context: &GraphProviderContext,
     selected_id: &str,
 ) -> Vec<ProviderContextItem> {
     let graph_points = graph_points_by_node(snapshot);
-    nodes
+    let context_target = context.id.clone();
+    context
+        .nodes
         .iter()
         .map(|node| ProviderContextItem {
+            context_target: context_target.clone(),
             node: node.clone(),
             selected: node.id == selected_id,
             point: graph_points.get(&node.id).copied(),
@@ -508,7 +534,7 @@ fn ProviderContextRow(item: ProviderContextItem) -> impl IntoView {
     let summary = item.node.summary;
     let id = item.node.short_id;
     let node_target = node_target_id(&item.node.id);
-    let target = format!("#{node_target}");
+    let target = format!("#{node_target}?context={}", item.context_target);
     let graph_point = item
         .point
         .map(|point| {

@@ -2396,7 +2396,8 @@ fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
         graph.window.clone()
     };
 
-    if selected_node_target(&window).as_deref() != Some(target.as_str())
+    if (selected_node_target(&window).as_deref() != Some(target.as_str())
+        || selected_provider_context_target(&window).is_some())
         && let Err(error) = window.location().set_hash(&target)
     {
         web_sys::console::error_1(&error);
@@ -2424,15 +2425,22 @@ async fn refresh_selected_node_detail_from_graph(
 
 async fn refresh_selected_node_detail(window: &Window, document: &Document) -> Result<(), JsValue> {
     let target = selected_node_target(window);
+    let context = selected_provider_context_target(window);
     render_loading_node_detail_if_current(window, document, target.as_deref())?;
-    render_loading_provider_context_if_current(window, document, target.as_deref())?;
+    render_loading_provider_context_if_current(
+        window,
+        document,
+        target.as_deref(),
+        context.as_deref(),
+    )?;
     let graph_mode = current_graph_mode(document);
     let detail_url = node_detail_url(target.as_deref(), &graph_mode);
-    let provider_context_fragment_url = provider_context_url(target.as_deref(), &graph_mode);
+    let provider_context_fragment_url =
+        provider_context_url(target.as_deref(), context.as_deref(), &graph_mode);
     let detail_html = fetch_text(window, &detail_url).await?;
     let provider_context_html = fetch_text(window, &provider_context_fragment_url).await?;
     render_node_detail_if_current(window, document, target.clone(), &detail_html)?;
-    render_provider_context_if_current(window, document, target, &provider_context_html)
+    render_provider_context_if_current(window, document, target, context, &provider_context_html)
 }
 
 fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
@@ -2447,16 +2455,17 @@ fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
         .unwrap_or_else(|| format!("/api/node-detail?mode={graph_mode}"))
 }
 
-fn provider_context_url(target: Option<&str>, graph_mode: &str) -> String {
-    target
-        .map(|target| {
-            format!(
-                "/api/provider-context?target={}&mode={}",
-                percent_encode(target),
-                graph_mode
-            )
-        })
-        .unwrap_or_else(|| format!("/api/provider-context?mode={graph_mode}"))
+fn provider_context_url(target: Option<&str>, context: Option<&str>, graph_mode: &str) -> String {
+    let mut query = format!("mode={graph_mode}");
+    if let Some(target) = target {
+        query.push_str("&target=");
+        query.push_str(&percent_encode(target));
+    }
+    if let Some(context) = context {
+        query.push_str("&context=");
+        query.push_str(&percent_encode(context));
+    }
+    format!("/api/provider-context?{query}")
 }
 
 fn render_node_detail_if_current(
@@ -2477,9 +2486,11 @@ fn render_provider_context_if_current(
     window: &Window,
     document: &Document,
     target: Option<String>,
+    context: Option<String>,
     html: &str,
 ) -> Result<(), JsValue> {
-    if selected_node_target(window) == target {
+    if selected_node_target(window) == target && selected_provider_context_target(window) == context
+    {
         let slot = query_required(document, ".provider-context-slot")?;
         slot.set_inner_html(html);
     }
@@ -2505,8 +2516,11 @@ fn render_loading_provider_context_if_current(
     window: &Window,
     document: &Document,
     target: Option<&str>,
+    context: Option<&str>,
 ) -> Result<(), JsValue> {
-    if selected_node_target(window).as_deref() != target {
+    if selected_node_target(window).as_deref() != target
+        || selected_provider_context_target(window).as_deref() != context
+    {
         return Ok(());
     }
     let provider_context = loading_provider_context(document, target)?;
@@ -2719,9 +2733,28 @@ fn graph_focus_point_from_rendered_node(
 }
 
 fn selected_node_target(window: &Window) -> Option<String> {
-    let hash = window.location().hash().ok()?;
-    let target = hash.strip_prefix('#')?;
+    let hash = selected_hash(window)?;
+    let target = hash
+        .split_once('?')
+        .map(|(target, _)| target)
+        .unwrap_or(&hash);
     (!target.is_empty() && target.starts_with("detail-")).then(|| target.to_owned())
+}
+
+fn selected_provider_context_target(window: &Window) -> Option<String> {
+    let hash = selected_hash(window)?;
+    let (_, query) = hash.split_once('?')?;
+    query.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        (name == "context" && value.starts_with("detail-")).then(|| value.to_owned())
+    })
+}
+
+fn selected_hash(window: &Window) -> Option<String> {
+    let hash = window.location().hash().ok()?;
+    hash.strip_prefix('#')
+        .filter(|target| !target.is_empty())
+        .map(str::to_owned)
 }
 
 fn pan_from_wheel(graph: &mut VirtualGraph, event: &WheelEvent) {
