@@ -3149,11 +3149,11 @@ mod tests {
         }
     }
 
-    #[wasm_bindgen_test(async)]
-    async fn graph_items_abort_error_does_not_log_to_console() {
+    #[wasm_bindgen_test]
+    fn graph_items_abort_error_does_not_log_to_console() {
         let fixture = GraphFixture::new();
         let (console_error_calls, _guard) = install_console_error_counter();
-        let error = aborted_fetch_error().await;
+        let error = abort_error();
 
         handle_graph_items_error(fixture.graph.clone(), error);
 
@@ -3644,21 +3644,15 @@ mod tests {
         assert_eq!(graph.get_attribute("viewBox").as_deref(), Some(viewbox));
     }
 
-    async fn aborted_fetch_error() -> JsValue {
-        let window = web_sys::window().expect_throw("window should be available");
-        let controller = AbortController::new().expect_throw("abort controller should be created");
-        let init = RequestInit::new();
-        init.set_signal(Some(&controller.signal()));
-        controller.abort();
-
-        match JsFuture::from(
-            window.fetch_with_str_and_init("/api/graph/viewport/items/diff", &init),
+    fn abort_error() -> JsValue {
+        let error = js_sys::Error::new("aborted");
+        js_sys::Reflect::set(
+            error.as_ref(),
+            &JsValue::from_str("name"),
+            &JsValue::from_str("AbortError"),
         )
-        .await
-        {
-            Ok(_) => panic!("aborted fetch should reject"),
-            Err(error) => error,
-        }
+        .expect_throw("abort error name should be set");
+        error.into()
     }
 
     fn install_console_error_counter() -> (Rc<Cell<u32>>, ConsoleErrorGuard) {
