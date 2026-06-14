@@ -41,6 +41,10 @@ fn session_anchor() -> SessionAnchor {
     }
 }
 
+fn provider_context_target(context_start: &str, branch: &str) -> String {
+    format!("{}-context-{branch}", node_target_id(context_start))
+}
+
 fn graph_node(id: &str, created_at_ns: i128) -> GraphNode {
     GraphNode {
         id: id.to_owned(),
@@ -685,7 +689,7 @@ fn node_details_include_nodes_from_same_provider_context() {
     let context = snapshot
         .provider_contexts
         .iter()
-        .find(|context| context.id == node_target_id(&prompt))
+        .find(|context| context.id == provider_context_target(&next_session, "main"))
         .expect("provider context should exist");
     let context_ids = context
         .nodes
@@ -832,7 +836,7 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
     let review_context = snapshot
         .provider_contexts
         .iter()
-        .find(|context| context.id == node_target_id(&review_prompt))
+        .find(|context| context.id == provider_context_target(&session, "review"))
         .expect("review context should exist");
     let review_context_ids = review_context
         .nodes
@@ -874,6 +878,75 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
     );
     assert!(shared_hidden_context_from_review.contains("review hidden context"));
     assert!(!shared_hidden_context_from_review.contains("main hidden context"));
+}
+
+#[test]
+fn provider_context_id_stays_stable_when_branch_head_moves() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    store.fork("main", &session).unwrap();
+    let first_prompt = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "first prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &session, &first_prompt)
+        .unwrap();
+
+    let first_snapshot = build_graph_snapshot_with_mode(&store, 35, GraphMode::Anchors).unwrap();
+    let first_context = first_snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.nodes.iter().any(|node| node.id == first_prompt))
+        .expect("initial provider context should exist");
+    let first_context_id = first_context.id.clone();
+
+    let next_prompt = store
+        .append(NewNode {
+            parent: first_prompt.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "next prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )),
+        })
+        .unwrap();
+    store
+        .set_branch_head("main", &first_prompt, &next_prompt)
+        .unwrap();
+
+    let next_snapshot = build_graph_snapshot_with_mode(&store, 36, GraphMode::Anchors).unwrap();
+    let next_context = next_snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.nodes.iter().any(|node| node.id == first_prompt))
+        .expect("updated provider context should exist");
+
+    assert_eq!(first_context_id, provider_context_target(&session, "main"));
+    assert_eq!(next_context.id, first_context_id);
+    assert!(next_context.nodes.iter().any(|node| node.id == next_prompt));
 }
 
 #[test]
@@ -941,7 +1014,7 @@ fn all_mode_provider_contexts_cover_older_visible_segments() {
     let old_context = snapshot
         .provider_contexts
         .iter()
-        .find(|context| context.id == node_target_id(&old_prompt))
+        .find(|context| context.id == provider_context_target(&first_session, "main"))
         .expect("old provider context should be retained in all mode");
     let old_context_ids = old_context
         .nodes

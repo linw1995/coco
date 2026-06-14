@@ -387,7 +387,7 @@ impl GraphBuildState {
         for branch in &self.branches {
             let ancestry = store.ancestry(&branch.head_id).context(StoreSnafu)?;
             for context_nodes in provider_contexts_from_head(ancestry) {
-                self.insert_provider_context(&mut contexts, context_nodes);
+                self.insert_provider_context(&mut contexts, &branch.name, context_nodes);
             }
         }
 
@@ -399,6 +399,7 @@ impl GraphBuildState {
     fn insert_provider_context(
         &self,
         contexts: &mut HashMap<String, GraphProviderContext>,
+        branch_name: &str,
         context: Vec<Node>,
     ) {
         if !context
@@ -412,7 +413,7 @@ impl GraphBuildState {
             .iter()
             .map(|node| graph_provider_context_node(node, self.visible_node_ids.contains(&node.id)))
             .collect::<Vec<_>>();
-        let Some(id) = context.first().map(|head| provider_context_id(&head.id)) else {
+        let Some(id) = provider_context_id(branch_name, &context) else {
             return;
         };
         contexts.entry(id.clone()).or_insert(GraphProviderContext {
@@ -695,8 +696,13 @@ fn provider_context_ids_by_node(
     ids_by_node
 }
 
-fn provider_context_id(head_id: &str) -> String {
-    node_target_id(head_id)
+fn provider_context_id(branch_name: &str, context: &[Node]) -> Option<String> {
+    let context_start = context.last()?;
+    Some(format!(
+        "{}-context-{}",
+        node_target_id(&context_start.id),
+        css_token(branch_name)
+    ))
 }
 
 fn provider_context_order(
