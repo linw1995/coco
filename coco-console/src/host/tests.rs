@@ -638,9 +638,16 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     }));
     assert!(snapshot.edges.contains(&GraphEdge {
         source: invocation,
-        target: invocation_child,
+        target: invocation_child.clone(),
         kind: GraphEdgeKind::Primary,
     }));
+
+    let invocation_context =
+        render_provider_context_fragment(&snapshot, Some(&node_target_id(&invocation_child)), None);
+
+    assert!(invocation_context.contains("Provider Context"));
+    assert!(invocation_context.contains("No provider context nodes."));
+    assert!(!invocation_context.contains("The selected node is no longer available."));
 }
 
 #[test]

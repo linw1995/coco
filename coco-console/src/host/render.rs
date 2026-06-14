@@ -42,14 +42,16 @@ pub fn render_provider_context_fragment(
     context: Option<&str>,
 ) -> String {
     match target {
-        Some(target) => provider_context_for_target(snapshot, target, context)
-            .map(|context| {
+        Some(target) => match provider_context_for_target(snapshot, target, context) {
+            Some(context) => {
                 let items = provider_context_items(snapshot, context.context, context.selected_id);
                 view! { <ProviderContextList items=items/> }.to_html()
-            })
-            .unwrap_or_else(|| {
-                view! { <ProviderContextMissing target=target.to_owned()/> }.to_html()
-            }),
+            }
+            None if graph_node_exists(snapshot, target) => {
+                view! { <ProviderContextList items=Vec::new()/> }.to_html()
+            }
+            None => view! { <ProviderContextMissing target=target.to_owned()/> }.to_html(),
+        },
         None => view! { <ProviderContextDefault/> }.to_html(),
     }
 }
@@ -387,6 +389,13 @@ fn focused_node<'a>(snapshot: &'a GraphSnapshot, target: &str) -> Option<Focused
                 .find(|node| node_target_id(&node.id) == target)
                 .map(FocusedNode::ProviderContext)
         })
+}
+
+fn graph_node_exists(snapshot: &GraphSnapshot, target: &str) -> bool {
+    snapshot
+        .nodes
+        .iter()
+        .any(|node| node_target_id(&node.id) == target)
 }
 
 fn provider_context_for_target<'a>(
