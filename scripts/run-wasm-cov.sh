@@ -13,6 +13,18 @@ llvm_profdata="${rustlib_bin}/llvm-profdata"
 llvm_cov="${rustlib_bin}/llvm-cov"
 coverage_clang="${WASM_COVERAGE_CLANG:-clang}"
 coverage_object_target="${WASM_COVERAGE_OBJECT_TARGET:-x86_64-unknown-linux-gnu}"
+local_no_proxy="127.0.0.1,localhost,::1"
+
+if [[ -n "${NO_PROXY:-}" ]]; then
+  export NO_PROXY="${NO_PROXY},${local_no_proxy}"
+else
+  export NO_PROXY="${local_no_proxy}"
+fi
+if [[ -n "${no_proxy:-}" ]]; then
+  export no_proxy="${no_proxy},${local_no_proxy}"
+else
+  export no_proxy="${local_no_proxy}"
+fi
 
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR="${coverage_root}"
@@ -25,12 +37,13 @@ export CC_wasm32_unknown_unknown="${CC}"
 export TARGET_CC="${CC}"
 export NIX_HARDENING_ENABLE="${WASM_COVERAGE_NIX_HARDENING_ENABLE:-}"
 
-if command -v chromedriver >/dev/null 2>&1 || [[ -n "${CHROMEDRIVER:-}" ]]; then
+if command -v geckodriver >/dev/null 2>&1 || [[ -n "${GECKODRIVER:-}" ]]; then
+  export GECKODRIVER="${GECKODRIVER:-$(command -v geckodriver)}"
+  unset CHROMEDRIVER
+  unset SAFARIDRIVER
+elif command -v chromedriver >/dev/null 2>&1 || [[ -n "${CHROMEDRIVER:-}" ]]; then
   export CHROMEDRIVER="${CHROMEDRIVER:-$(command -v chromedriver)}"
   unset GECKODRIVER
-  unset SAFARIDRIVER
-elif command -v geckodriver >/dev/null 2>&1 || [[ -n "${GECKODRIVER:-}" ]]; then
-  export GECKODRIVER="${GECKODRIVER:-$(command -v geckodriver)}"
   unset SAFARIDRIVER
 elif command -v safaridriver >/dev/null 2>&1 || [[ -n "${SAFARIDRIVER:-}" ]]; then
   export SAFARIDRIVER="${SAFARIDRIVER:-$(command -v safaridriver)}"
@@ -44,6 +57,11 @@ rm -rf "${profraw_dir}" "${objects_dir}" "${result_dir}"
 mkdir -p "${profraw_dir}" "${objects_dir}" "${result_dir}"
 
 env "CC_wasm32-unknown-unknown=${CC}" \
+  cargo test -p coco-console --target wasm32-unknown-unknown graph_items_ --no-run
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  "CC_wasm32-unknown-unknown=${CC}" \
   cargo test -p coco-console --target wasm32-unknown-unknown graph_items_
 
 mapfile -d "" llvm_ir_files < <(find "${wasm_deps_dir}" -name "*.ll" -print0)

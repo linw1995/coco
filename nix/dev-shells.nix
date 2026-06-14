@@ -80,11 +80,16 @@ in {
     nativeBuildInputs = [
       (rustWasmCoverageToolchainFor pkgs)
     ];
-    packages = with pkgs; [
-      llvmPackages.clang-unwrapped
-      chromedriver
-      wasm-bindgen-cli
-    ];
+    packages = with pkgs;
+      [
+        llvmPackages.clang-unwrapped
+        chromedriver
+        wasm-bindgen-cli
+      ]
+      ++ lib.optionals stdenv.isLinux [
+        firefox
+        geckodriver
+      ];
     shellHook = ''
       export CC_wasm32_unknown_unknown="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
       export WASM_COVERAGE_CLANG="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
