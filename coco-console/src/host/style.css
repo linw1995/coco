@@ -85,7 +85,7 @@ body {
 
 .content {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);
+  grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem) minmax(18rem, 24rem);
   min-height: 0;
   overflow: hidden;
 }
@@ -235,6 +235,15 @@ body {
 .node.text .core { fill: #1f2937; stroke: #94a3b8; }
 .node.failure .core { fill: #b91c1c; stroke: #fecaca; }
 .node.active .core { stroke: #7dd3fc; stroke-width: 2.4; }
+
+.node-link.node-link-selected .core {
+  stroke: #facc15;
+  stroke-width: 3.8;
+}
+
+.node-link.node-link-selected .node-label {
+  fill: #fef3c7;
+}
 
 .node-link.node-new .core {
   animation: node-grow 680ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -407,17 +416,31 @@ body {
   white-space: nowrap;
 }
 
+.provider-context-panel,
 .side {
   background: rgba(8, 11, 18, 0.48);
   border-left: 1px solid rgba(255, 255, 255, 0.08);
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
   height: calc(100vh - 4.45rem);
   min-height: 0;
   overflow: hidden;
   padding: 1rem;
 }
 
+.provider-context-panel {
+  display: block;
+}
+
+.provider-context-slot {
+  height: 100%;
+  min-height: 0;
+}
+
+.side {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.provider-context-section h2,
 .side h2,
 .node-details h2 {
   color: #dbeafe;
@@ -430,7 +453,7 @@ body {
 .node-details {
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   margin-bottom: 1rem;
-  max-height: min(52vh, 34rem);
+  max-height: min(48vh, 32rem);
   overflow: auto;
   padding-bottom: 1rem;
 }
@@ -477,6 +500,110 @@ body:has(.node-detail.node-detail-selected) .node-details-default {
   margin: 0;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+.provider-context-section {
+  display: grid;
+  gap: 0.6rem;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+}
+
+.provider-context-empty {
+  color: #94a3b8;
+  font-size: 0.78rem;
+  margin: 0;
+}
+
+.provider-context-target {
+  color: #64748b;
+  font-size: 0.72rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.provider-context-list {
+  display: grid;
+  gap: 0;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.provider-context-node {
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+  min-width: 0;
+  position: relative;
+}
+
+.provider-context-node-link {
+  color: inherit;
+  cursor: pointer;
+  display: grid;
+  gap: 0.22rem;
+  min-width: 0;
+  padding: 0.58rem 0 0.62rem 0.72rem;
+  text-decoration: none;
+}
+
+.provider-context-node-graph-point {
+  display: none;
+}
+
+.provider-context-node::before {
+  background: rgba(148, 163, 184, 0.30);
+  bottom: 0.62rem;
+  content: "";
+  left: 0;
+  position: absolute;
+  top: 0.62rem;
+  width: 2px;
+}
+
+.provider-context-node.selected::before {
+  background: #facc15;
+}
+
+.provider-context-node:not(.visible) {
+  color: #94a3b8;
+}
+
+.provider-context-node:hover {
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.provider-context-node-head {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.36rem;
+  min-width: 0;
+}
+
+.provider-context-node-head > span:first-child {
+  color: #f8fafc;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.provider-context-node-head span:not(:first-child),
+.provider-context-node time {
+  color: #94a3b8;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+}
+
+.provider-context-node p {
+  color: #e7edf7;
+  font-size: 0.76rem;
+  line-height: 1.38;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.provider-context-node:not(.visible) p {
+  color: #94a3b8;
 }
 
 .branch-list {
@@ -538,6 +665,7 @@ body:has(.node-detail.node-detail-selected) .node-details-default {
     grid-template-columns: 1fr;
   }
 
+  .provider-context-panel,
   .side {
     border-left: 0;
     border-top: 1px solid rgba(255, 255, 255, 0.08);

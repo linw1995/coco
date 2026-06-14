@@ -2,7 +2,10 @@ use askama::Template;
 use coco_mem::{PauseReason, SessionState};
 use leptos::{html::HtmlElement, prelude::*};
 
-use crate::graph::{GraphMode, GraphNode, GraphSnapshot, node_target_id, shorten_id};
+use crate::api::Point;
+use crate::graph::{
+    GraphMode, GraphNode, GraphProviderContextNode, GraphSnapshot, node_target_id, shorten_id,
+};
 use crate::layout::{lane_key, layout_graph};
 
 #[derive(Template)]
@@ -24,15 +27,87 @@ pub fn render_fragment(snapshot: &GraphSnapshot) -> String {
 
 pub fn render_node_detail_fragment(snapshot: &GraphSnapshot, target: Option<&str>) -> String {
     match target {
-        Some(target) => snapshot
-            .nodes
-            .iter()
-            .find(|node| node_target_id(&node.id) == target)
+        Some(target) => focused_node(snapshot, target)
             .map(render_node_details)
             .unwrap_or_else(|| render_missing_node_details(target))
             .to_html(),
         None => render_default_node_details().to_html(),
     }
+}
+
+pub fn render_provider_context_fragment(snapshot: &GraphSnapshot, target: Option<&str>) -> String {
+    match target {
+        Some(target) => provider_context_for_target(snapshot, target)
+            .map(|context| {
+                let items = provider_context_items(snapshot, context.nodes, context.selected_id);
+                view! { <ProviderContextList items=items/> }.to_html()
+            })
+            .unwrap_or_else(|| {
+                view! { <ProviderContextMissing target=target.to_owned()/> }.to_html()
+            }),
+        None => view! { <ProviderContextDefault/> }.to_html(),
+    }
+}
+
+enum FocusedNode<'a> {
+    Graph(&'a GraphNode),
+    ProviderContext(&'a GraphProviderContextNode),
+}
+
+impl FocusedNode<'_> {
+    fn id(&self) -> &str {
+        match self {
+            Self::Graph(node) => &node.id,
+            Self::ProviderContext(node) => &node.id,
+        }
+    }
+
+    fn kind(&self) -> &str {
+        match self {
+            Self::Graph(node) => &node.kind,
+            Self::ProviderContext(node) => &node.kind,
+        }
+    }
+
+    fn role(&self) -> &str {
+        match self {
+            Self::Graph(node) => &node.role,
+            Self::ProviderContext(node) => &node.role,
+        }
+    }
+
+    fn created_at(&self) -> &str {
+        match self {
+            Self::Graph(node) => &node.created_at,
+            Self::ProviderContext(node) => &node.created_at,
+        }
+    }
+
+    fn content(&self) -> &str {
+        match self {
+            Self::Graph(node) => &node.content,
+            Self::ProviderContext(node) => &node.content,
+        }
+    }
+
+    fn labels(&self) -> String {
+        match self {
+            Self::Graph(node) if !node.labels.is_empty() => node.labels.join(", "),
+            _ => "None".to_owned(),
+        }
+    }
+}
+
+struct ProviderContextSelection<'a> {
+    nodes: &'a [GraphProviderContextNode],
+    selected_id: &'a str,
+}
+
+#[derive(Clone)]
+struct ProviderContextItem {
+    node: GraphProviderContextNode,
+    selected: bool,
+    point: Option<Point>,
 }
 
 fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> String {
@@ -124,6 +199,7 @@ fn render_content(snapshot: &GraphSnapshot) -> AnyView {
                 <div class="graph-surface" inner_html=graph_shell></div>
                 {time_scale}
             </div>
+            <ProviderContextPanel/>
             {side}
         </section>
     }
@@ -254,6 +330,15 @@ fn render_selection_style(_snapshot: &GraphSnapshot) -> String {
     String::new()
 }
 
+#[component]
+fn ProviderContextPanel() -> impl IntoView {
+    view! {
+        <section class="provider-context-panel">
+            <div class="provider-context-slot"><ProviderContextDefault/></div>
+        </section>
+    }
+}
+
 fn render_side(snapshot: &GraphSnapshot) -> AnyView {
     let default_details = render_default_node_details();
     let branches = render_branches(snapshot);
@@ -282,18 +367,46 @@ fn render_default_node_details() -> AnyView {
     .into_any()
 }
 
-fn render_node_details(node: &GraphNode) -> AnyView {
-    let labels = if node.labels.is_empty() {
-        "None".to_owned()
-    } else {
-        node.labels.join(", ")
-    };
-    let id = node.id.clone();
-    let kind = node.kind.clone();
-    let role = node.role.clone();
-    let created_at = node.created_at.clone();
-    let content = node.content.clone();
-    let target = node_target_id(&node.id);
+fn focused_node<'a>(snapshot: &'a GraphSnapshot, target: &str) -> Option<FocusedNode<'a>> {
+    snapshot
+        .nodes
+        .iter()
+        .find(|node| node_target_id(&node.id) == target)
+        .map(FocusedNode::Graph)
+        .or_else(|| {
+            snapshot
+                .nodes
+                .iter()
+                .flat_map(|node| node.provider_context_nodes.iter())
+                .find(|node| node_target_id(&node.id) == target)
+                .map(FocusedNode::ProviderContext)
+        })
+}
+
+fn provider_context_for_target<'a>(
+    snapshot: &'a GraphSnapshot,
+    target: &str,
+) -> Option<ProviderContextSelection<'a>> {
+    snapshot.nodes.iter().find_map(|node| {
+        let selected = node
+            .provider_context_nodes
+            .iter()
+            .find(|context_node| node_target_id(&context_node.id) == target)?;
+        Some(ProviderContextSelection {
+            nodes: &node.provider_context_nodes,
+            selected_id: &selected.id,
+        })
+    })
+}
+
+fn render_node_details(node: FocusedNode<'_>) -> AnyView {
+    let labels = node.labels();
+    let id = node.id().to_owned();
+    let kind = node.kind().to_owned();
+    let role = node.role().to_owned();
+    let created_at = node.created_at().to_owned();
+    let content = node.content().to_owned();
+    let target = node_target_id(node.id());
 
     view! {
         <section id=target class="node-details node-detail">
@@ -327,6 +440,125 @@ fn render_node_details(node: &GraphNode) -> AnyView {
         </section>
     }
     .into_any()
+}
+
+#[component]
+fn ProviderContextDefault() -> impl IntoView {
+    view! {
+        <section class="provider-context-section provider-context-default">
+            <h2>"Provider Context"</h2>
+            <p class="provider-context-empty">"Select a node to inspect its provider context."</p>
+        </section>
+    }
+}
+
+fn provider_context_items(
+    snapshot: &GraphSnapshot,
+    nodes: &[GraphProviderContextNode],
+    selected_id: &str,
+) -> Vec<ProviderContextItem> {
+    let graph_points = graph_points_by_node(snapshot);
+    nodes
+        .iter()
+        .map(|node| ProviderContextItem {
+            node: node.clone(),
+            selected: node.id == selected_id,
+            point: graph_points.get(&node.id).copied(),
+        })
+        .collect()
+}
+
+#[component]
+fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
+    if items.is_empty() {
+        view! {
+            <section class="provider-context-section">
+                <h2>"Provider Context"</h2>
+                <p class="provider-context-empty">"No provider context nodes."</p>
+            </section>
+        }
+        .into_any()
+    } else {
+        view! {
+            <section class="provider-context-section">
+                <h2>"Provider Context"</h2>
+                <ol class="provider-context-list">
+                    {items.into_iter().map(|item| view! { <ProviderContextRow item=item/> }).collect::<Vec<_>>()}
+                </ol>
+            </section>
+        }
+        .into_any()
+    }
+}
+
+fn graph_points_by_node(snapshot: &GraphSnapshot) -> std::collections::BTreeMap<String, Point> {
+    layout_graph(snapshot)
+        .occurrences
+        .into_iter()
+        .map(|occurrence| (occurrence.node_id, occurrence.point))
+        .collect()
+}
+
+#[component]
+fn ProviderContextRow(item: ProviderContextItem) -> impl IntoView {
+    let class = provider_context_node_class(item.node.visible, item.selected);
+    let kind = item.node.kind;
+    let role = item.node.role;
+    let created_at = item.node.created_at;
+    let summary = item.node.summary;
+    let id = item.node.short_id;
+    let node_target = node_target_id(&item.node.id);
+    let target = format!("#{node_target}");
+    let graph_point = item
+        .point
+        .map(|point| {
+            view! {
+                <span
+                    class="provider-context-node-graph-point"
+                    data-node-target=node_target.clone()
+                    data-node-x=point.x.to_string()
+                    data-node-y=point.y.to_string()
+                ></span>
+            }
+            .into_any()
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    view! {
+        <li class=class>
+            <a class="provider-context-node-link" href=target>
+                {graph_point}
+                <div class="provider-context-node-head">
+                    <span>{id}</span>
+                    <span>{kind}</span>
+                    <span>{role}</span>
+                </div>
+                <time>{created_at}</time>
+                <p>{summary}</p>
+            </a>
+        </li>
+    }
+}
+
+fn provider_context_node_class(visible: bool, selected: bool) -> &'static str {
+    match (visible, selected) {
+        (true, true) => "provider-context-node visible selected",
+        (true, false) => "provider-context-node visible",
+        (false, true) => "provider-context-node selected",
+        (false, false) => "provider-context-node",
+    }
+}
+
+#[component]
+fn ProviderContextMissing(target: String) -> impl IntoView {
+    view! {
+        <section class="provider-context-section provider-context-default">
+            <h2>"Provider Context"</h2>
+            <p class="provider-context-empty">"The selected node is no longer available."</p>
+            <p class="provider-context-target">{target}</p>
+        </section>
+    }
 }
 
 fn render_missing_node_details(target: &str) -> AnyView {

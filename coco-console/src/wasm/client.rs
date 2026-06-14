@@ -376,6 +376,7 @@ impl VirtualGraph {
             false,
         )?;
         self.sync_branch_visibility();
+        self.sync_selected_graph_node();
         self.hide_status();
         Ok(())
     }
@@ -394,6 +395,7 @@ impl VirtualGraph {
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
         self.sync_branch_visibility();
+        self.sync_selected_graph_node();
         self.hide_status();
         Ok(())
     }
@@ -466,6 +468,12 @@ impl VirtualGraph {
         )?;
         self.sync_branch_visibility();
         Ok(())
+    }
+
+    fn sync_selected_graph_node(&self) {
+        if let Err(error) = sync_selected_graph_node(&self.window, &self.document) {
+            web_sys::console::error_1(&error);
+        }
     }
 
     fn refresh_time_scale_elements(&mut self) -> Result<(), JsValue> {
@@ -2383,9 +2391,9 @@ fn node_link_from_event(event: &MouseEvent) -> Option<Element> {
 }
 
 fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
-    let (window, document) = {
+    let window = {
         let graph = graph.borrow();
-        (graph.window.clone(), graph.document.clone())
+        graph.window.clone()
     };
 
     if selected_node_target(&window).as_deref() != Some(target.as_str())
@@ -2396,7 +2404,7 @@ fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
     }
 
     spawn_local(async move {
-        if let Err(error) = refresh_selected_node_detail(&window, &document).await {
+        if let Err(error) = refresh_selected_node_detail_from_graph(graph).await {
             web_sys::console::error_1(&error);
         }
     });
@@ -2409,15 +2417,22 @@ async fn refresh_selected_node_detail_from_graph(
         let graph = graph.borrow();
         (graph.window.clone(), graph.document.clone())
     };
-    refresh_selected_node_detail(&window, &document).await
+    refresh_selected_node_detail(&window, &document).await?;
+    focus_selected_node_in_graph(graph);
+    Ok(())
 }
 
 async fn refresh_selected_node_detail(window: &Window, document: &Document) -> Result<(), JsValue> {
     let target = selected_node_target(window);
     render_loading_node_detail_if_current(window, document, target.as_deref())?;
-    let url = node_detail_url(target.as_deref(), &current_graph_mode(document));
-    let html = fetch_text(window, &url).await?;
-    render_node_detail_if_current(window, document, target, &html)
+    render_loading_provider_context_if_current(window, document, target.as_deref())?;
+    let graph_mode = current_graph_mode(document);
+    let detail_url = node_detail_url(target.as_deref(), &graph_mode);
+    let provider_context_fragment_url = provider_context_url(target.as_deref(), &graph_mode);
+    let detail_html = fetch_text(window, &detail_url).await?;
+    let provider_context_html = fetch_text(window, &provider_context_fragment_url).await?;
+    render_node_detail_if_current(window, document, target.clone(), &detail_html)?;
+    render_provider_context_if_current(window, document, target, &provider_context_html)
 }
 
 fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
@@ -2432,6 +2447,18 @@ fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
         .unwrap_or_else(|| format!("/api/node-detail?mode={graph_mode}"))
 }
 
+fn provider_context_url(target: Option<&str>, graph_mode: &str) -> String {
+    target
+        .map(|target| {
+            format!(
+                "/api/provider-context?target={}&mode={}",
+                percent_encode(target),
+                graph_mode
+            )
+        })
+        .unwrap_or_else(|| format!("/api/provider-context?mode={graph_mode}"))
+}
+
 fn render_node_detail_if_current(
     window: &Window,
     document: &Document,
@@ -2442,6 +2469,19 @@ fn render_node_detail_if_current(
         let slot = query_required(document, ".node-detail-slot")?;
         slot.set_inner_html(html);
         mark_selected_node_detail(&slot)?;
+    }
+    Ok(())
+}
+
+fn render_provider_context_if_current(
+    window: &Window,
+    document: &Document,
+    target: Option<String>,
+    html: &str,
+) -> Result<(), JsValue> {
+    if selected_node_target(window) == target {
+        let slot = query_required(document, ".provider-context-slot")?;
+        slot.set_inner_html(html);
     }
     Ok(())
 }
@@ -2461,10 +2501,32 @@ fn render_loading_node_detail_if_current(
     replace_node_detail_slot(document, &detail)
 }
 
+fn render_loading_provider_context_if_current(
+    window: &Window,
+    document: &Document,
+    target: Option<&str>,
+) -> Result<(), JsValue> {
+    if selected_node_target(window).as_deref() != target {
+        return Ok(());
+    }
+    let provider_context = loading_provider_context(document, target)?;
+    replace_provider_context_slot(document, &provider_context)
+}
+
 fn replace_node_detail_slot(document: &Document, detail: &Element) -> Result<(), JsValue> {
     let slot = query_required(document, ".node-detail-slot")?;
     slot.set_inner_html("");
     slot.append_child(detail)?;
+    Ok(())
+}
+
+fn replace_provider_context_slot(
+    document: &Document,
+    provider_context: &Element,
+) -> Result<(), JsValue> {
+    let slot = query_required(document, ".provider-context-slot")?;
+    slot.set_inner_html("");
+    slot.append_child(provider_context)?;
     Ok(())
 }
 
@@ -2480,6 +2542,20 @@ fn loading_node_detail(document: &Document, target: &str) -> Result<Element, JsV
     append_text_child(document, &section, "h2", "Node")?;
     let list = loading_detail_list(document)?;
     section.append_child(&list)?;
+    Ok(section)
+}
+
+fn loading_provider_context(document: &Document, target: Option<&str>) -> Result<Element, JsValue> {
+    let section = classed_element(document, "section", "provider-context-section")?;
+    append_text_child(document, &section, "h2", "Provider Context")?;
+    let message = if target.is_some() {
+        "Loading provider context..."
+    } else {
+        "Select a node to inspect its provider context."
+    };
+    let paragraph = classed_element(document, "p", "provider-context-empty")?;
+    paragraph.set_text_content(Some(message));
+    section.append_child(&paragraph)?;
     Ok(section)
 }
 
@@ -2549,6 +2625,99 @@ fn mark_selected_node_detail(slot: &Element) -> Result<(), JsValue> {
     Ok(())
 }
 
+fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
+    let point = {
+        let graph = graph.borrow();
+        graph.sync_selected_graph_node();
+        match selected_graph_focus_point(&graph.window, &graph.document) {
+            Ok(point) => point,
+            Err(error) => {
+                web_sys::console::error_1(&error);
+                None
+            }
+        }
+    };
+    if let Some(point) = point {
+        update_viewport(graph, |graph| {
+            if graph.auto_follow
+                && let Err(error) = graph.set_auto_follow(false)
+            {
+                web_sys::console::error_1(&error);
+            }
+            center_viewport_on_graph_point(graph, point);
+        });
+    }
+}
+
+fn sync_selected_graph_node(window: &Window, document: &Document) -> Result<(), JsValue> {
+    let selected = selected_node_target(window);
+    let nodes = document.query_selector_all(".node-link[data-node-target]")?;
+    for index in 0..nodes.length() {
+        let node = nodes
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let is_selected = node.get_attribute("data-node-target").as_deref() == selected.as_deref();
+        node.class_list()
+            .toggle_with_force("node-link-selected", is_selected)?;
+    }
+    Ok(())
+}
+
+fn selected_graph_focus_point(
+    window: &Window,
+    document: &Document,
+) -> Result<Option<Point>, JsValue> {
+    let Some(target) = selected_node_target(window) else {
+        return Ok(None);
+    };
+    if let Some(point) = graph_focus_point_from_provider_context(document, &target)? {
+        return Ok(Some(point));
+    }
+    graph_focus_point_from_rendered_node(document, &target)
+}
+
+fn graph_focus_point_from_provider_context(
+    document: &Document,
+    target: &str,
+) -> Result<Option<Point>, JsValue> {
+    let points = document.query_selector_all(
+        ".provider-context-node-graph-point[data-node-target][data-node-x][data-node-y]",
+    )?;
+    for index in 0..points.length() {
+        let point = points
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        if point.get_attribute("data-node-target").as_deref() == Some(target)
+            && let Some((x, y)) = graph_item_point(&point, "data-node-x", "data-node-y")
+        {
+            return Ok(Some(Point { x, y }));
+        }
+    }
+    Ok(None)
+}
+
+fn graph_focus_point_from_rendered_node(
+    document: &Document,
+    target: &str,
+) -> Result<Option<Point>, JsValue> {
+    let nodes =
+        document.query_selector_all(".node-link[data-node-target][data-node-x][data-node-y]")?;
+    for index in 0..nodes.length() {
+        let node = nodes
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        if node.get_attribute("data-node-target").as_deref() == Some(target)
+            && let Some((x, y)) = graph_item_point(&node, "data-node-x", "data-node-y")
+        {
+            return Ok(Some(Point { x, y }));
+        }
+    }
+    Ok(None)
+}
+
 fn selected_node_target(window: &Window) -> Option<String> {
     let hash = window.location().hash().ok()?;
     let target = hash.strip_prefix('#')?;
@@ -2612,6 +2781,12 @@ fn center_viewport_from_time_scale_key(graph: &mut VirtualGraph, direction: i32)
         return;
     };
     graph.viewport.x = tick.graph_x - graph.viewport.width / 2.0;
+    graph.clamp_viewport();
+}
+
+fn center_viewport_on_graph_point(graph: &mut VirtualGraph, point: Point) {
+    graph.viewport.x = f64::from(point.x) - graph.viewport.width / 2.0;
+    graph.viewport.y = f64::from(point.y) - graph.viewport.height / 2.0;
     graph.clamp_viewport();
 }
 

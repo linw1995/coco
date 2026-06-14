@@ -24,7 +24,10 @@ use crate::graph::{GraphMode, build_graph_snapshot_with_mode};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
-use crate::render::{render_fragment, render_index_page, render_node_detail_fragment};
+use crate::render::{
+    render_fragment, render_index_page, render_node_detail_fragment,
+    render_provider_context_fragment,
+};
 use crate::{Error, Result};
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -126,6 +129,7 @@ where
             get(graph_viewport_diff_get::<S>).post(graph_viewport_diff_post::<S>),
         )
         .route("/api/node-detail", get(node_detail::<S>))
+        .route("/api/provider-context", get(provider_context::<S>))
         .route("/fragment", get(fragment::<S>))
         .route("/events", get(event_stream::<S>))
         .route("/pkg/coco_console.js", get(client_js))
@@ -426,6 +430,28 @@ where
         graph_mode_from_query(&query),
     ) {
         Ok(snapshot) => html_response(render_node_detail_fragment(&snapshot, query.get("target"))),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn provider_context<S>(
+    State(state): State<AppState<S>>,
+    RawQuery(query): RawQuery,
+) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let query = parse_query(query.as_deref().unwrap_or_default());
+    wait_for_newer_version(&state.publisher, query.version()).await;
+    match build_graph_snapshot_with_mode(
+        &state.store,
+        state.publisher.current_version(),
+        graph_mode_from_query(&query),
+    ) {
+        Ok(snapshot) => html_response(render_provider_context_fragment(
+            &snapshot,
+            query.get("target"),
+        )),
         Err(error) => error_response(error),
     }
 }
@@ -1376,6 +1402,21 @@ mod tests {
         );
         assert!(
             response.contains("Select a node to inspect its content."),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_serves_provider_context_fragment() {
+        let response = response_from(get_request("/api/provider-context").as_bytes()).await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("content-type: text/html; charset=utf-8"),
+            "{response}"
+        );
+        assert!(
+            response.contains("Select a node to inspect its provider context."),
             "{response}"
         );
     }

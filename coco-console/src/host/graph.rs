@@ -56,6 +56,20 @@ pub struct GraphNode {
     pub content: String,
     pub summary: String,
     pub labels: Vec<String>,
+    pub provider_context_nodes: Vec<GraphProviderContextNode>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GraphProviderContextNode {
+    pub id: String,
+    pub short_id: String,
+    pub kind: String,
+    pub role: String,
+    pub created_at: String,
+    pub created_at_ns: i128,
+    pub content: String,
+    pub summary: String,
+    pub visible: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -93,6 +107,7 @@ struct GraphNodeEntry {
     primary_parent: Option<String>,
     merge_parents: Vec<MergeParent>,
     labels: Vec<GraphBranchLabel>,
+    provider_context_nodes: Vec<GraphProviderContextNode>,
 }
 
 struct GraphBuildState {
@@ -230,6 +245,7 @@ fn graph_node_from_entry(entry: GraphNodeEntry) -> GraphNode {
         content: render_node_content(&entry.node),
         summary: summarize_node(&entry.node),
         labels: render_graph_labels(&entry.labels),
+        provider_context_nodes: entry.provider_context_nodes,
     }
 }
 
@@ -318,13 +334,19 @@ impl GraphBuildState {
     }
 
     fn node_entries(&mut self, store: &impl NodeStore) -> Result<Vec<GraphNodeEntry>> {
+        let mut provider_context_nodes_by_node = self.provider_context_nodes_by_node(store)?;
         std::mem::take(&mut self.visible_nodes)
             .into_values()
-            .map(|node| self.node_entry(store, node))
+            .map(|node| self.node_entry(store, node, &mut provider_context_nodes_by_node))
             .collect()
     }
 
-    fn node_entry(&mut self, store: &impl NodeStore, node: Node) -> Result<GraphNodeEntry> {
+    fn node_entry(
+        &mut self,
+        store: &impl NodeStore,
+        node: Node,
+        provider_context_nodes_by_node: &mut HashMap<String, Vec<GraphProviderContextNode>>,
+    ) -> Result<GraphNodeEntry> {
         let scope_node_ids = self
             .visible_node_scopes
             .remove(&node.id)
@@ -333,12 +355,56 @@ impl GraphBuildState {
         let merge_parents =
             self.visible_merge_parents(store, &node, &scope_node_ids, &primary_parent)?;
         let labels = self.labels_by_node.remove(&node.id).unwrap_or_default();
+        let provider_context_nodes = provider_context_nodes_by_node
+            .remove(&node.id)
+            .unwrap_or_else(|| vec![graph_provider_context_node(&node, true)]);
         Ok(GraphNodeEntry {
             node,
             primary_parent,
             merge_parents,
             labels,
+            provider_context_nodes,
         })
+    }
+
+    fn provider_context_nodes_by_node(
+        &self,
+        store: &impl NodeStore,
+    ) -> Result<HashMap<String, Vec<GraphProviderContextNode>>> {
+        let mut contexts_by_node = HashMap::<String, Vec<GraphProviderContextNode>>::new();
+        for branch in &self.branches {
+            let ancestry = store.ancestry(&branch.head_id).context(StoreSnafu)?;
+            let context = provider_context_from_head(ancestry);
+            self.insert_provider_context(&mut contexts_by_node, context);
+        }
+
+        Ok(contexts_by_node)
+    }
+
+    fn insert_provider_context(
+        &self,
+        contexts_by_node: &mut HashMap<String, Vec<GraphProviderContextNode>>,
+        context: Vec<Node>,
+    ) {
+        if !context
+            .iter()
+            .any(|node| self.visible_node_ids.contains(&node.id))
+        {
+            return;
+        }
+
+        let context_nodes = context
+            .iter()
+            .map(|node| graph_provider_context_node(node, self.visible_node_ids.contains(&node.id)))
+            .collect::<Vec<_>>();
+        for node in context
+            .iter()
+            .filter(|node| self.visible_node_ids.contains(&node.id))
+        {
+            contexts_by_node
+                .entry(node.id.clone())
+                .or_insert_with(|| context_nodes.clone());
+        }
     }
 
     fn visible_merge_parents(
@@ -575,6 +641,36 @@ fn provider_context_node_id(done: &mut bool, node: Node) -> Option<String> {
     }
     *done = is_provider_context_start(&node);
     Some(node.id)
+}
+
+fn provider_context_from_head(ancestry: Vec<Node>) -> Vec<Node> {
+    ancestry
+        .into_iter()
+        .take_while(|node| !node.is_root())
+        .scan(false, provider_context_node)
+        .collect()
+}
+
+fn provider_context_node(done: &mut bool, node: Node) -> Option<Node> {
+    if *done {
+        return None;
+    }
+    *done = is_provider_context_start(&node);
+    Some(node)
+}
+
+fn graph_provider_context_node(node: &Node, visible: bool) -> GraphProviderContextNode {
+    GraphProviderContextNode {
+        id: node.id.clone(),
+        short_id: shorten_id(&node.id),
+        kind: graph_kind_name(node).to_owned(),
+        role: format!("{:?}", node.role),
+        created_at: node.created_at.to_string(),
+        created_at_ns: node.created_at.as_nanosecond(),
+        content: render_node_content(node),
+        summary: summarize_node(node),
+        visible,
+    }
 }
 
 fn is_provider_context_start(node: &Node) -> bool {
