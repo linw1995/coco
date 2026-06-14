@@ -661,9 +661,14 @@ fn provider_context_node_id(done: &mut bool, node: Node) -> Option<String> {
 fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
     let mut contexts = Vec::new();
     let mut current = Vec::new();
+    let mut previous_is_skill_invocation = false;
 
     for node in ancestry.into_iter().take_while(|node| !node.is_root()) {
+        if should_skip_skill_invocation_tool_use(&node, previous_is_skill_invocation) {
+            continue;
+        }
         let is_start = is_provider_context_start(&node);
+        previous_is_skill_invocation = is_skill_invocation_anchor(&node);
         current.push(node);
         if is_start {
             contexts.push(std::mem::take(&mut current));
@@ -674,6 +679,17 @@ fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
     }
 
     contexts
+}
+
+fn should_skip_skill_invocation_tool_use(node: &Node, previous_is_skill_invocation: bool) -> bool {
+    node.kind.as_tool_uses().is_some() && previous_is_skill_invocation
+}
+
+fn is_skill_invocation_anchor(node: &Node) -> bool {
+    matches!(
+        &node.kind,
+        Kind::Anchor(anchor) if anchor.as_skill_invocation().is_some()
+    )
 }
 
 fn provider_context_ids_by_node(

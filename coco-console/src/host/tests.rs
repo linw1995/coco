@@ -632,12 +632,12 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     assert!(node_ids.contains(&invocation_child.as_str()));
     assert!(!node_ids.contains(&ignored_child.as_str()));
     assert!(snapshot.edges.contains(&GraphEdge {
-        source: tool_use,
+        source: tool_use.clone(),
         target: invocation.clone(),
         kind: GraphEdgeKind::Primary,
     }));
     assert!(snapshot.edges.contains(&GraphEdge {
-        source: invocation,
+        source: invocation.clone(),
         target: invocation_child.clone(),
         kind: GraphEdgeKind::Primary,
     }));
@@ -648,6 +648,29 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     assert!(invocation_context.contains("Provider Context"));
     assert!(invocation_context.contains("No provider context nodes."));
     assert!(!invocation_context.contains("The selected node is no longer available."));
+
+    store.fork("skill", &invocation_child).unwrap();
+    let skill_snapshot = build_graph_snapshot(&store, 10).unwrap();
+    let skill_context = skill_snapshot
+        .provider_contexts
+        .iter()
+        .find(|context| context.id == provider_context_target(&session, "skill"))
+        .expect("skill provider context should exist");
+    let skill_context_ids = skill_context
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        skill_context_ids,
+        vec![
+            invocation_child.as_str(),
+            invocation.as_str(),
+            session.as_str()
+        ]
+    );
+    assert!(!skill_context.nodes.iter().any(|node| node.id == tool_use));
 }
 
 #[test]
