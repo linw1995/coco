@@ -3204,6 +3204,61 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_items_loading_provider_context_renders_selection_state() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+
+        let empty = loading_provider_context(&document, None)
+            .expect_throw("empty provider context loading state should render");
+        assert_eq!(
+            empty.text_content().as_deref(),
+            Some("Provider ContextSelect a node to inspect its provider context.")
+        );
+
+        let loading = loading_provider_context(&document, Some("detail-node"))
+            .expect_throw("selected provider context loading state should render");
+        assert_eq!(
+            loading.text_content().as_deref(),
+            Some("Provider ContextLoading provider context...")
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn graph_items_selected_node_detail_refresh_uses_context_hash() {
+        let fixture = GraphFixture::new();
+        let (window, document) = {
+            let graph = fixture.graph.borrow();
+            (graph.window.clone(), graph.document.clone())
+        };
+        let detail_slot = classed_element(&document, "div", "node-detail-slot")
+            .expect_throw("node detail slot should be created");
+        let provider_context_slot = classed_element(&document, "div", "provider-context-slot")
+            .expect_throw("provider context slot should be created");
+        fixture
+            .root
+            .append_child(&detail_slot)
+            .expect_throw("node detail slot should be mounted");
+        fixture
+            .root
+            .append_child(&provider_context_slot)
+            .expect_throw("provider context slot should be mounted");
+
+        window
+            .location()
+            .set_hash("detail-node?context=detail-head")
+            .expect_throw("hash should be set");
+
+        let result = refresh_selected_node_detail(&window, &document).await;
+        window
+            .location()
+            .set_hash("")
+            .expect_throw("hash should be cleared");
+
+        assert!(result.is_ok());
+        assert_eq!(selected_node_target(&window), None);
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_server_fragment_refreshes_time_scale_without_replacing_track() {
         let fixture = GraphFixture::new();
         let document = fixture.graph.borrow().document.clone();
