@@ -88,55 +88,27 @@ flow. Do not set `COCO_API_KEY` for `chatgpt`.
 `reasoning_level` accepts GPT reasoning levels such as `low`, `medium`, `high`,
 and `xhigh`. `service_tier = "fast"` requests the priority GPT tier.
 
-## Get ChatGPT OAuth Cache
+## Authorize ChatGPT OAuth
 
-Generate credentials in a throwaway Compose data directory, then copy only the
-OAuth cache into the persistent data directory. This keeps temporary auth
-sessions, prompt jobs, and workspace files out of the long-lived Compose
-environment.
+Leave `CHATGPT_ACCESS_TOKEN` and `CHATGPT_ACCOUNT_ID` empty in `.env` for the
+recommended OAuth cache flow. Static access-token secrets bypass the OAuth cache
+and cannot be refreshed automatically.
 
-Run the following commands in the same shell:
-
-```bash
-auth_data_dir="$(mktemp -d)"
-auth_workspace_dir="$(mktemp -d)"
-cp .coco-data/config.toml "${auth_data_dir}/config.toml"
-```
-
-Create the session anchor in the temporary data directory:
+Start the daemon:
 
 ```bash
-COCO_DATA_DIR="${auth_data_dir}" \
-COCO_WORKSPACE_DIR="${auth_workspace_dir}" \
-docker compose run --rm --no-deps \
-  -e COCO_START_CRON=0 \
-  coco \
-  coco session create \
-    --provider-profile gpt-subscription \
-    --system-prompt "You are a pragmatic coding assistant."
+docker compose up -d
 ```
 
-Then trigger the first provider request:
+Then watch the daemon logs for the ChatGPT device-code prompt:
 
 ```bash
-COCO_DATA_DIR="${auth_data_dir}" \
-COCO_WORKSPACE_DIR="${auth_workspace_dir}" \
-docker compose run --rm --no-deps \
-  -e COCO_START_CRON=0 \
-  coco \
-  coco job --branch main "Reply with OK after authentication succeeds."
+docker compose logs -f coco
 ```
 
-When the command prints the verification URL and device code, finish the login
-flow in the browser. Then install the OAuth cache into the persistent data
-directory and remove the temporary directories:
-
-```bash
-mkdir -p .coco-data/.config/chatgpt
-cp "${auth_data_dir}/.config/chatgpt/auth.json" \
-  .coco-data/.config/chatgpt/auth.json
-rm -rf "${auth_data_dir}" "${auth_workspace_dir}"
-```
+When the logs print the verification URL and device code, finish the login flow
+in the browser. Rig writes the OAuth cache directly into the persistent Compose
+data directory, so there is no separate copy step.
 
 The persistent OAuth cache is stored at:
 
@@ -144,15 +116,21 @@ The persistent OAuth cache is stored at:
 .coco-data/.config/chatgpt/auth.json
 ```
 
-If you prefer explicit environment secrets instead of OAuth cache lookup, read
-the values and write them into `.env`:
+When `coco daemon serve` is running, CoCo checks every configured `chatgpt`
+provider profile every 15 seconds by calling the ChatGPT OAuth authorization
+path. This keeps the OAuth cache active through Rig's token refresh logic
+without waiting for the next completion request. The check uses the same
+provider profile secrets and base URL settings as normal ChatGPT requests.
+
+For one-off debugging only, you can use explicit environment secrets instead of
+the OAuth cache. Read the values from the cache and write them into `.env`:
 
 ```bash
-jq -r '.access_token' .coco-data/.config/chatgpt/auth.json
-jq -r '.account_id // empty' .coco-data/.config/chatgpt/auth.json
+CHATGPT_ACCESS_TOKEN="$(jq -r '.access_token' .coco-data/.config/chatgpt/auth.json)"
+CHATGPT_ACCOUNT_ID="$(jq -r '.account_id // empty' .coco-data/.config/chatgpt/auth.json)"
 ```
 
-Then add secret references to `.coco-data/config.toml`:
+Then add the secret references to `.coco-data/config.toml`:
 
 ```toml
 [providers.gpt-subscription.secrets]
@@ -162,7 +140,9 @@ account_id = "${CHATGPT_ACCOUNT_ID}"
 
 When `.env` contains an empty token, CoCo can still fall back to device-code
 OAuth. If the config references an environment variable that is completely
-missing at runtime, CoCo treats that as a configuration error.
+missing at runtime, CoCo treats that as a configuration error. Explicit access
+token secrets are static credentials; they bypass the OAuth cache and are not
+refreshed by the 15-second ChatGPT auth check.
 
 ## Configure Telegram Channel
 

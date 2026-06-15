@@ -14,8 +14,8 @@ use coco_core::{
     ConversationEngine, CoreService, EngineError, FixedBranchResolver, SYSTEM_EVENT_QUEUE,
 };
 use coco_llm::{
-    CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService, Provider,
-    SessionConfig,
+    ChatGptAuthCheckConfig, CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend,
+    LlmService, Provider, SessionConfig,
 };
 use coco_mem::{
     Anchor, AnchorPayload, JobStatus, Kind, MessageQueueItem, SessionRole, Store, StoreError,
@@ -62,6 +62,7 @@ const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const TELEGRAM_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
 const ACTIVE_JOB_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+const CHATGPT_AUTH_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct CocoCliDaemonServerHandle<B, S> {
     socket_path: PathBuf,
@@ -69,6 +70,7 @@ pub struct CocoCliDaemonServerHandle<B, S> {
     socket_task: tokio::task::JoinHandle<()>,
     channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
     message_queue_task: tokio::task::JoinHandle<Result<()>>,
+    chatgpt_auth_check_task: Option<tokio::task::JoinHandle<()>>,
     console: Option<ConsoleServerHandle>,
 }
 
@@ -454,6 +456,11 @@ where
     }
     let channel_task = start_channel_task(options.channel_configs, &shared_store, &shared_engine)?;
     let message_queue_task = start_message_queue_task(&shared_store, &shared_engine);
+    let chatgpt_auth_check_task = if llm.enables_provider_auth_checks() {
+        start_chatgpt_auth_check_task(llm.chatgpt_auth_check_configs())
+    } else {
+        None
+    };
     let handle_llm = llm.clone();
 
     let socket_task = tokio::spawn(async move {
@@ -504,8 +511,41 @@ where
         socket_task,
         channel_task,
         message_queue_task,
+        chatgpt_auth_check_task,
         console,
     })
+}
+
+fn start_chatgpt_auth_check_task(
+    configs: Vec<ChatGptAuthCheckConfig>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if configs.is_empty() {
+        return None;
+    }
+
+    tracing::info!(
+        provider_profile_count = configs.len(),
+        interval_secs = CHATGPT_AUTH_CHECK_INTERVAL.as_secs(),
+        "starting chatgpt auth check task"
+    );
+    Some(tokio::spawn(async move {
+        loop {
+            for config in &configs {
+                match coco_llm::authorize_chatgpt_provider(config).await {
+                    Ok(()) => tracing::debug!(
+                        provider_profile = %config.profile,
+                        "chatgpt auth check succeeded"
+                    ),
+                    Err(error) => tracing::warn!(
+                        provider_profile = %config.profile,
+                        error = %error,
+                        "chatgpt auth check failed"
+                    ),
+                }
+            }
+            tokio::time::sleep(CHATGPT_AUTH_CHECK_INTERVAL).await;
+        }
+    }))
 }
 
 fn start_message_queue_task<B, S>(
@@ -1821,6 +1861,7 @@ impl<B, S> CocoCliDaemonServerHandle<B, S> {
             socket_task,
             channel_task,
             message_queue_task,
+            chatgpt_auth_check_task,
             console,
         } = self;
 
@@ -1831,6 +1872,7 @@ impl<B, S> CocoCliDaemonServerHandle<B, S> {
             console,
             channel_task,
             message_queue_task,
+            chatgpt_auth_check_task,
         )
         .await
     }
@@ -1842,6 +1884,7 @@ impl<B, S> CocoCliDaemonServerHandle<B, S> {
             channel_task.abort();
         }
         self.message_queue_task.abort();
+        abort_background_task(self.chatgpt_auth_check_task, "chatgpt auth check").await;
         let socket_result = self.socket_task.await;
         if let Some(channel_task) = self.channel_task {
             match channel_task.await {
@@ -1875,12 +1918,14 @@ async fn wait_daemon_tasks<B, S>(
     mut console: Option<ConsoleServerHandle>,
     mut channel_task: Option<tokio::task::JoinHandle<Result<()>>>,
     mut message_queue_task: tokio::task::JoinHandle<Result<()>>,
+    chatgpt_auth_check_task: Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     tokio::select! {
         socket_result = socket_task => {
             shutdown_console(console).await?;
             abort_channel_task(channel_task).await?;
             abort_message_queue_task(message_queue_task).await?;
+            abort_background_task(chatgpt_auth_check_task, "chatgpt auth check").await;
             llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             socket_result.context(JoinDaemonServerSnafu).map(|_| ())
@@ -1888,6 +1933,7 @@ async fn wait_daemon_tasks<B, S>(
         console_result = async { console.as_mut().expect("console task should exist").wait_mut().await }, if console.is_some() => {
             abort_channel_task(channel_task).await?;
             abort_message_queue_task(message_queue_task).await?;
+            abort_background_task(chatgpt_auth_check_task, "chatgpt auth check").await;
             llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             console_result.context(ConsoleSnafu)
@@ -1895,6 +1941,7 @@ async fn wait_daemon_tasks<B, S>(
         channel_result = async { channel_task.as_mut().expect("channel task should exist").await }, if channel_task.is_some() => {
             shutdown_console(console).await?;
             abort_message_queue_task(message_queue_task).await?;
+            abort_background_task(chatgpt_auth_check_task, "chatgpt auth check").await;
             llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             channel_result.context(JoinChannelTaskSnafu)??;
@@ -1903,6 +1950,7 @@ async fn wait_daemon_tasks<B, S>(
         message_queue_result = &mut message_queue_task => {
             shutdown_console(console).await?;
             abort_channel_task(channel_task).await?;
+            abort_background_task(chatgpt_auth_check_task, "chatgpt auth check").await;
             llm.cleanup_runtime_processes().await;
             cleanup_socket(&socket_path);
             message_queue_result.context(JoinMessageQueueTaskSnafu)??;
@@ -1940,6 +1988,23 @@ async fn abort_message_queue_task(
         Ok(result) => result,
         Err(source) if source.is_cancelled() => Ok(()),
         Err(source) => Err(source).context(JoinMessageQueueTaskSnafu),
+    }
+}
+
+async fn abort_background_task(task: Option<tokio::task::JoinHandle<()>>, task_name: &str) {
+    let Some(task) = task else {
+        return;
+    };
+
+    task.abort();
+    match task.await {
+        Ok(()) => {}
+        Err(source) if source.is_cancelled() => {}
+        Err(source) => tracing::warn!(
+            task = task_name,
+            error = %source,
+            "background task ended with join error"
+        ),
     }
 }
 
@@ -2075,7 +2140,7 @@ mod tests {
         TELEGRAM_INBOUND_QUEUE, TelegramMessageQueuePublisher, TelegramMessageQueueWorker,
         abort_channel_task, daemon_console_config, decode_telegram_message,
         encode_telegram_message, resolve_daemon_command_socket_path, resolve_daemon_socket_path,
-        run_daemon_command,
+        run_daemon_command, start_chatgpt_auth_check_task,
     };
 
     fn daemon_command<I, T>(args: I) -> DaemonCommand
@@ -2213,12 +2278,18 @@ mod tests {
             message_queue_task: tokio::spawn(async {
                 std::future::pending::<crate::Result<()>>().await
             }),
+            chatgpt_auth_check_task: None,
             console: None,
         };
 
         handle.wait().await.unwrap();
 
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn chatgpt_auth_check_task_skips_empty_config() {
+        assert!(start_chatgpt_auth_check_task(Vec::new()).is_none());
     }
 
     #[tokio::test]

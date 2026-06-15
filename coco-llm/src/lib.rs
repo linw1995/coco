@@ -343,6 +343,13 @@ pub struct ProviderRuntimeConfig {
     pub additional_params: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGptAuthCheckConfig {
+    pub profile: String,
+    pub secrets: BTreeMap<String, String>,
+    pub base_url: Option<String>,
+}
+
 pub fn provider_profile_additional_params(profile: &coco_mem::ProviderProfile) -> Option<Value> {
     let provider = Provider::parse(&profile.provider).ok()?;
     let spec = gpt_provider_spec(profile)?;
@@ -868,6 +875,10 @@ pub struct BackendFailureContext {
 
 #[async_trait]
 pub trait CompletionBackend: Send + Sync {
+    fn enables_provider_auth_checks(&self) -> bool {
+        false
+    }
+
     async fn step(&self, _ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
         Err(BackendError::failed("backend step is not implemented"))
     }
@@ -1096,6 +1107,21 @@ impl<B, S> LlmService<B, S> {
         self.runtime.store_path.as_deref()
     }
 
+    pub fn chatgpt_auth_check_configs(&self) -> Vec<ChatGptAuthCheckConfig> {
+        let mut configs = self
+            .provider_configs
+            .iter()
+            .filter(|(_, config)| config.provider == Provider::ChatGpt)
+            .map(|(profile, config)| ChatGptAuthCheckConfig {
+                profile: profile.clone(),
+                secrets: config.secrets.clone(),
+                base_url: config.base_url.clone(),
+            })
+            .collect::<Vec<_>>();
+        configs.sort_by(|left, right| left.profile.cmp(&right.profile));
+        configs
+    }
+
     pub async fn lock_branch_scope(&self, branch: &str) -> BranchLockGuard {
         let branch = branch.to_owned();
         let lock = {
@@ -1177,6 +1203,15 @@ impl<B, S> LlmService<B, S> {
         let cleaned_session_count = self.runtime.unified_exec_sessions.remove_all().await;
         tracing::info!(cleaned_session_count, "cleaned runtime processes");
         cleaned_session_count
+    }
+}
+
+impl<B, S> LlmService<B, S>
+where
+    B: CompletionBackend,
+{
+    pub fn enables_provider_auth_checks(&self) -> bool {
+        self.backend.enables_provider_auth_checks()
     }
 }
 
@@ -4031,8 +4066,30 @@ fn parse_env_placeholder(value: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+pub async fn authorize_chatgpt_provider(
+    config: &ChatGptAuthCheckConfig,
+) -> std::result::Result<(), BackendError> {
+    use rig::providers::chatgpt;
+
+    let mut builder = chatgpt::Client::builder().api_key(resolve_chatgpt_auth(&config.secrets)?);
+    if let Some(base_url) = resolve_base_url(config.base_url.as_deref())? {
+        builder = builder.base_url(base_url);
+    }
+    let client = builder
+        .build()
+        .map_err(|source| BackendError::failed(source.to_string()))?;
+    client
+        .authorize()
+        .await
+        .map_err(|source| BackendError::failed(source.to_string()))
+}
+
 #[async_trait]
 impl CompletionBackend for RigBackend {
+    fn enables_provider_auth_checks(&self) -> bool {
+        true
+    }
+
     async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
         match ctx.request.provider {
             Provider::OpenAi => send_openai_completion_turn(ctx).await,
@@ -5307,6 +5364,52 @@ mod tests {
     fn provider_parse_accepts_chatgpt() {
         assert_eq!(Provider::parse("chatgpt").unwrap(), Provider::ChatGpt);
         assert_eq!(Provider::ChatGpt.as_str(), "chatgpt");
+    }
+
+    #[test]
+    fn provider_auth_checks_are_enabled_only_for_rig_backend_by_default() {
+        let fake = LlmService::new(MemoryStore::new(), FakeBackend::with_responses(&[]));
+        let rig = LlmService::new(MemoryStore::new(), RigBackend);
+
+        assert!(!fake.enables_provider_auth_checks());
+        assert!(rig.enables_provider_auth_checks());
+    }
+
+    #[test]
+    fn chatgpt_auth_check_configs_include_only_chatgpt_profiles() {
+        let service = LlmService::builder(MemoryStore::new(), FakeBackend::with_responses(&[]))
+            .with_provider_configs(HashMap::from([
+                (
+                    "openai".to_owned(),
+                    ProviderRuntimeConfig {
+                        provider: Provider::OpenAi,
+                        secrets: BTreeMap::new(),
+                        base_url: None,
+                        default_model: None,
+                        additional_params: None,
+                    },
+                ),
+                (
+                    "gpt-subscription".to_owned(),
+                    ProviderRuntimeConfig {
+                        provider: Provider::ChatGpt,
+                        secrets: secrets(&[("access_token", "COCO_CHATGPT_ACCESS_TOKEN")]),
+                        base_url: Some("${COCO_CHATGPT_BASE_URL}".to_owned()),
+                        default_model: Some("gpt-5.4".to_owned()),
+                        additional_params: None,
+                    },
+                ),
+            ]))
+            .build();
+
+        assert_eq!(
+            service.chatgpt_auth_check_configs(),
+            vec![ChatGptAuthCheckConfig {
+                profile: "gpt-subscription".to_owned(),
+                secrets: secrets(&[("access_token", "COCO_CHATGPT_ACCESS_TOKEN")]),
+                base_url: Some("${COCO_CHATGPT_BASE_URL}".to_owned()),
+            }]
+        );
     }
 
     #[tokio::test]
