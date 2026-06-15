@@ -10,9 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-#[cfg(test)]
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
 use coco_mem::{
@@ -4078,6 +4076,18 @@ pub async fn authorize_chatgpt_provider(
     let client = builder
         .build()
         .map_err(|source| BackendError::failed(source.to_string()))?;
+    authorize_chatgpt_client(&client).await
+}
+
+async fn authorize_chatgpt_client(
+    client: &rig::providers::chatgpt::Client,
+) -> std::result::Result<(), BackendError> {
+    static CHATGPT_AUTH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    let _guard = CHATGPT_AUTH_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
     client
         .authorize()
         .await
@@ -4152,6 +4162,7 @@ async fn send_chatgpt_completion_turn(
     let client = builder
         .build()
         .map_err(|source| BackendError::failed(source.to_string()))?;
+    authorize_chatgpt_client(&client).await?;
     send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
 }
 
