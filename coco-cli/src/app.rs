@@ -39,7 +39,7 @@ pub async fn run<R>(cli: Cli, reader: &mut R) -> Result<Option<String>>
 where
     R: Read,
 {
-    run_with_backend(cli, reader, RigBackend).await
+    run_with_backend(cli, reader, RigBackend::default()).await
 }
 
 pub async fn run_with_backend<B, R>(cli: Cli, reader: &mut R, backend: B) -> Result<Option<String>>
