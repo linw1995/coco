@@ -13,7 +13,7 @@ use std::str::FromStr;
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use coco_mem::{
@@ -1041,7 +1041,8 @@ type ChatGptClient = rig::providers::chatgpt::Client;
 type ChatGptClientPool = Arc<StdMutex<HashMap<ChatGptClientKey, ChatGptClientEntry>>>;
 type ChatGptOAuthStateHandle = Arc<ChatGptOAuthState>;
 
-const CHATGPT_OAUTH_PREFLIGHT_TTL: Duration = Duration::from_secs(30);
+const CHATGPT_OAUTH_TOKEN_EXPIRY_SKEW_SECONDS: i64 = 60;
+const CHATGPT_OAUTH_REQUEST_PREFLIGHT_MARGIN_SECONDS: i64 = 15;
 
 #[derive(Clone, Default)]
 pub struct RigBackend {
@@ -1075,7 +1076,60 @@ enum ChatGptClientAuth {
 #[derive(Default)]
 struct ChatGptOAuthState {
     lock: Mutex<()>,
-    last_success: StdMutex<Option<Instant>>,
+}
+
+#[derive(Deserialize)]
+struct ChatGptOAuthCacheRecord {
+    expires_at: Option<i64>,
+}
+
+fn chatgpt_oauth_cache_valid_for_request() -> bool {
+    let Some(path) = default_chatgpt_oauth_cache_file() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_str::<ChatGptOAuthCacheRecord>(&contents) else {
+        return false;
+    };
+    let Some(expires_at) = record.expires_at else {
+        return false;
+    };
+    let Some(valid_until) = chatgpt_oauth_request_valid_until_unix_seconds() else {
+        return false;
+    };
+
+    expires_at > valid_until
+}
+
+fn chatgpt_oauth_request_valid_until_unix_seconds() -> Option<i64> {
+    chatgpt_oauth_now_unix_seconds()?.checked_add(
+        CHATGPT_OAUTH_TOKEN_EXPIRY_SKEW_SECONDS + CHATGPT_OAUTH_REQUEST_PREFLIGHT_MARGIN_SECONDS,
+    )
+}
+
+fn chatgpt_oauth_now_unix_seconds() -> Option<i64> {
+    let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(seconds).ok()
+}
+
+fn default_chatgpt_oauth_cache_file() -> Option<PathBuf> {
+    chatgpt_oauth_config_dir().map(|dir| dir.join("chatgpt").join("auth.json"))
+}
+
+fn chatgpt_oauth_config_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }
 }
 
 impl LlmService<RigBackend, MemoryStore> {
@@ -4197,25 +4251,11 @@ impl RigBackend {
         client
             .authorize()
             .await
-            .map_err(|source| BackendError::failed(source.to_string()))?;
-        *self
-            .chatgpt_oauth_state
-            .last_success
-            .lock()
-            .expect("chatgpt oauth state poisoned") = Some(Instant::now());
-        Ok(())
+            .map_err(|source| BackendError::failed(source.to_string()))
     }
 
     fn skip_chatgpt_oauth_preflight(&self, force: bool) -> bool {
-        !force && self.chatgpt_oauth_recently_authorized()
-    }
-
-    fn chatgpt_oauth_recently_authorized(&self) -> bool {
-        self.chatgpt_oauth_state
-            .last_success
-            .lock()
-            .expect("chatgpt oauth state poisoned")
-            .is_some_and(|last_success| last_success.elapsed() < CHATGPT_OAUTH_PREFLIGHT_TTL)
+        !force && chatgpt_oauth_cache_valid_for_request()
     }
 
     async fn send_chatgpt_completion_turn(
@@ -5618,11 +5658,6 @@ mod tests {
                 let second_client = backend
                     .chatgpt_client(&BTreeMap::new(), Some("https://chatgpt-two.example.test"))
                     .expect("second client should build");
-                *backend
-                    .chatgpt_oauth_state
-                    .last_success
-                    .lock()
-                    .expect("chatgpt oauth state should not be poisoned") = Some(Instant::now());
 
                 assert_eq!(first_client.auth, ChatGptClientAuth::OAuth);
                 assert_eq!(second_client.auth, ChatGptClientAuth::OAuth);
@@ -5634,10 +5669,66 @@ mod tests {
                         .len(),
                     2
                 );
-                assert!(backend.chatgpt_oauth_recently_authorized());
+                assert!(!backend.skip_chatgpt_oauth_preflight(false));
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn chatgpt_oauth_cache_valid_for_request_accepts_token_outside_skew() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join("xdg-config");
+        let expires_at = chatgpt_oauth_now_unix_seconds().unwrap()
+            + CHATGPT_OAUTH_TOKEN_EXPIRY_SKEW_SECONDS
+            + CHATGPT_OAUTH_REQUEST_PREFLIGHT_MARGIN_SECONDS
+            + 30;
+
+        with_process_env_async(
+            &[
+                ("XDG_CONFIG_HOME", Some(config_dir.as_os_str())),
+                ("HOME", None),
+            ],
+            || async {
+                write_chatgpt_oauth_cache(&config_dir, expires_at);
+
+                assert!(chatgpt_oauth_cache_valid_for_request());
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn chatgpt_oauth_cache_valid_for_request_rejects_token_inside_skew() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join("xdg-config");
+        let expires_at = chatgpt_oauth_now_unix_seconds().unwrap()
+            + CHATGPT_OAUTH_TOKEN_EXPIRY_SKEW_SECONDS
+            + CHATGPT_OAUTH_REQUEST_PREFLIGHT_MARGIN_SECONDS
+            - 1;
+
+        with_process_env_async(
+            &[
+                ("XDG_CONFIG_HOME", Some(config_dir.as_os_str())),
+                ("HOME", None),
+            ],
+            || async {
+                write_chatgpt_oauth_cache(&config_dir, expires_at);
+
+                assert!(!chatgpt_oauth_cache_valid_for_request());
+            },
+        )
+        .await;
+    }
+
+    fn write_chatgpt_oauth_cache(config_dir: &Path, expires_at: i64) {
+        let cache_dir = config_dir.join("chatgpt");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("auth.json"),
+            format!(r#"{{"expires_at":{expires_at}}}"#),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
