@@ -23,6 +23,7 @@ struct CacheSlot {
     snapshot: Option<Arc<GraphSnapshot>>,
     source_version: u64,
     building_source_version: Option<u64>,
+    failed_source_version: Option<u64>,
     requested: bool,
 }
 
@@ -61,14 +62,14 @@ where
         observed_version: u64,
     ) -> Arc<GraphSnapshot> {
         loop {
+            let mut rx = self.ready.subscribe();
+            let mut invalidations = self.invalidations.subscribe();
             self.ensure_rebuild(mode);
             if let Some(snapshot) = self.cached_snapshot(mode)
                 && snapshot.version > observed_version
             {
                 return snapshot;
             }
-            let mut rx = self.ready.subscribe();
-            let mut invalidations = self.invalidations.subscribe();
             tokio::select! {
                 changed = rx.changed() => {
                     if changed.is_err() {
@@ -87,6 +88,8 @@ where
     #[cfg(test)]
     pub async fn current_snapshot(&self, mode: GraphMode) -> Arc<GraphSnapshot> {
         loop {
+            let mut rx = self.ready.subscribe();
+            let mut invalidations = self.invalidations.subscribe();
             self.ensure_rebuild(mode);
             let source_version = self.invalidations.current_version();
             if let Some(snapshot) = self.cached_snapshot(mode)
@@ -94,8 +97,6 @@ where
             {
                 return snapshot;
             }
-            let mut rx = self.ready.subscribe();
-            let mut invalidations = self.invalidations.subscribe();
             tokio::select! {
                 changed = rx.changed() => {
                     if changed.is_err() {
@@ -181,7 +182,7 @@ where
                     error = %error,
                     "console graph rebuild failed"
                 );
-                self.clear_building(mode, source_version);
+                self.record_rebuild_failure(mode, source_version);
                 return;
             }
         };
@@ -200,6 +201,7 @@ where
             slot.snapshot = Some(Arc::new(snapshot));
             slot.source_version = source_version;
             slot.building_source_version = None;
+            slot.failed_source_version = None;
             let published_version = self.ready.mark_changed();
             debug_assert_eq!(published_version, graph_version);
             slot.requested && slot.needs_rebuild(self.invalidations.current_version())
@@ -210,7 +212,7 @@ where
         }
     }
 
-    fn clear_building(&self, mode: GraphMode, source_version: u64) {
+    fn record_rebuild_failure(&self, mode: GraphMode, source_version: u64) {
         let should_rebuild = {
             let mut state = self
                 .state
@@ -219,6 +221,7 @@ where
             let slot = state.slot_mut(mode);
             if slot.building_source_version == Some(source_version) {
                 slot.building_source_version = None;
+                slot.failed_source_version = Some(source_version);
             }
             slot.requested && slot.needs_rebuild(self.invalidations.current_version())
         };
@@ -262,6 +265,7 @@ impl CacheSlot {
         let snapshot_is_stale = self.source_version < source_version;
         (snapshot_is_missing || snapshot_is_stale)
             && self.building_source_version != Some(source_version)
+            && self.failed_source_version != Some(source_version)
     }
 }
 
@@ -372,5 +376,25 @@ mod tests {
             cache.cached_source_version(GraphMode::Anchors),
             current_source_version
         );
+    }
+
+    #[test]
+    fn failed_source_version_does_not_need_rebuild() {
+        let slot = CacheSlot {
+            failed_source_version: Some(7),
+            ..CacheSlot::default()
+        };
+
+        assert!(!slot.needs_rebuild(7));
+    }
+
+    #[test]
+    fn newer_source_version_needs_rebuild_after_failure() {
+        let slot = CacheSlot {
+            failed_source_version: Some(7),
+            ..CacheSlot::default()
+        };
+
+        assert!(slot.needs_rebuild(8));
     }
 }
