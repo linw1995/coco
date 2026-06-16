@@ -13,6 +13,7 @@ use std::str::FromStr;
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use coco_mem::{
@@ -879,6 +880,15 @@ pub trait CompletionBackend: Send + Sync {
         false
     }
 
+    async fn authorize_chatgpt_provider(
+        &self,
+        _config: &ChatGptAuthCheckConfig,
+    ) -> std::result::Result<(), BackendError> {
+        Err(BackendError::failed(
+            "chatgpt provider auth checks are not implemented",
+        ))
+    }
+
     async fn step(&self, _ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
         Err(BackendError::failed("backend step is not implemented"))
     }
@@ -1027,12 +1037,104 @@ struct ResolvedContext {
     nodes: Vec<coco_mem::Node>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct RigBackend;
+type ChatGptClient = rig::providers::chatgpt::Client;
+type ChatGptClientPool = Arc<StdMutex<HashMap<ChatGptClientKey, ChatGptClientEntry>>>;
+type ChatGptOAuthStateHandle = Arc<ChatGptOAuthState>;
+
+const CHATGPT_OAUTH_TOKEN_EXPIRY_SKEW_SECONDS: i64 = 60;
+const CHATGPT_OAUTH_REQUEST_PREFLIGHT_MARGIN_SECONDS: i64 = 15;
+
+#[derive(Clone, Default)]
+pub struct RigBackend {
+    chatgpt_clients: ChatGptClientPool,
+    chatgpt_oauth_state: ChatGptOAuthStateHandle,
+}
+
+impl std::fmt::Debug for RigBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RigBackend").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ChatGptClientKey {
+    base_url: Option<String>,
+}
+
+#[derive(Clone)]
+struct ChatGptClientEntry {
+    client: ChatGptClient,
+    auth: ChatGptClientAuth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatGptClientAuth {
+    AccessToken,
+    OAuth,
+}
+
+#[derive(Default)]
+struct ChatGptOAuthState {
+    lock: Mutex<()>,
+}
+
+#[derive(Deserialize)]
+struct ChatGptOAuthCacheRecord {
+    expires_at: Option<i64>,
+}
+
+fn chatgpt_oauth_cache_valid_for_request() -> bool {
+    let Some(path) = default_chatgpt_oauth_cache_file() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_str::<ChatGptOAuthCacheRecord>(&contents) else {
+        return false;
+    };
+    let Some(expires_at) = record.expires_at else {
+        return false;
+    };
+    let Some(valid_until) = chatgpt_oauth_request_valid_until_unix_seconds() else {
+        return false;
+    };
+
+    expires_at > valid_until
+}
+
+fn chatgpt_oauth_request_valid_until_unix_seconds() -> Option<i64> {
+    chatgpt_oauth_now_unix_seconds()?.checked_add(
+        CHATGPT_OAUTH_TOKEN_EXPIRY_SKEW_SECONDS + CHATGPT_OAUTH_REQUEST_PREFLIGHT_MARGIN_SECONDS,
+    )
+}
+
+fn chatgpt_oauth_now_unix_seconds() -> Option<i64> {
+    let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(seconds).ok()
+}
+
+fn default_chatgpt_oauth_cache_file() -> Option<PathBuf> {
+    chatgpt_oauth_config_dir().map(|dir| dir.join("chatgpt").join("auth.json"))
+}
+
+fn chatgpt_oauth_config_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }
+}
 
 impl LlmService<RigBackend, MemoryStore> {
     pub fn with_store(store: MemoryStore) -> Self {
-        Self::new(store, RigBackend)
+        Self::new(store, RigBackend::default())
     }
 }
 
@@ -1212,6 +1314,13 @@ where
 {
     pub fn enables_provider_auth_checks(&self) -> bool {
         self.backend.enables_provider_auth_checks()
+    }
+
+    pub async fn authorize_chatgpt_provider(
+        &self,
+        config: &ChatGptAuthCheckConfig,
+    ) -> std::result::Result<(), BackendError> {
+        self.backend.authorize_chatgpt_provider(config).await
     }
 }
 
@@ -4066,22 +4175,102 @@ fn parse_env_placeholder(value: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-pub async fn authorize_chatgpt_provider(
-    config: &ChatGptAuthCheckConfig,
-) -> std::result::Result<(), BackendError> {
+fn build_chatgpt_client(
+    auth: rig::providers::chatgpt::ChatGPTAuth,
+    base_url: Option<String>,
+) -> std::result::Result<ChatGptClient, BackendError> {
     use rig::providers::chatgpt;
 
-    let mut builder = chatgpt::Client::builder().api_key(resolve_chatgpt_auth(&config.secrets)?);
-    if let Some(base_url) = resolve_base_url(config.base_url.as_deref())? {
+    let mut builder = chatgpt::Client::builder().api_key(auth);
+    if let Some(base_url) = base_url {
         builder = builder.base_url(base_url);
     }
-    let client = builder
+    builder
         .build()
-        .map_err(|source| BackendError::failed(source.to_string()))?;
-    client
-        .authorize()
-        .await
         .map_err(|source| BackendError::failed(source.to_string()))
+}
+
+impl RigBackend {
+    fn chatgpt_client(
+        &self,
+        secrets: &BTreeMap<String, String>,
+        base_url: Option<&str>,
+    ) -> std::result::Result<ChatGptClientEntry, BackendError> {
+        let auth = resolve_chatgpt_auth(secrets)?;
+        let base_url = resolve_base_url(base_url)?;
+        match auth {
+            rig::providers::chatgpt::ChatGPTAuth::OAuth => {
+                let key = ChatGptClientKey {
+                    base_url: base_url.clone(),
+                };
+                let mut clients = self
+                    .chatgpt_clients
+                    .lock()
+                    .expect("chatgpt client pool poisoned");
+                if let Some(client) = clients.get(&key) {
+                    return Ok(client.clone());
+                }
+
+                let client =
+                    build_chatgpt_client(rig::providers::chatgpt::ChatGPTAuth::OAuth, base_url)?;
+                let entry = ChatGptClientEntry {
+                    client,
+                    auth: ChatGptClientAuth::OAuth,
+                };
+                clients.insert(key, entry.clone());
+                Ok(entry)
+            }
+            auth => Ok(ChatGptClientEntry {
+                client: build_chatgpt_client(auth, base_url)?,
+                auth: ChatGptClientAuth::AccessToken,
+            }),
+        }
+    }
+
+    async fn authorize_chatgpt_oauth_client(
+        &self,
+        client: &ChatGptClient,
+        force: bool,
+    ) -> std::result::Result<(), BackendError> {
+        if self.skip_chatgpt_oauth_preflight(force) {
+            return Ok(());
+        }
+
+        let _guard = self.chatgpt_oauth_state.lock.lock().await;
+        if self.skip_chatgpt_oauth_preflight(force) {
+            return Ok(());
+        }
+
+        self.run_chatgpt_oauth_authorize(client).await
+    }
+
+    async fn run_chatgpt_oauth_authorize(
+        &self,
+        client: &ChatGptClient,
+    ) -> std::result::Result<(), BackendError> {
+        client
+            .authorize()
+            .await
+            .map_err(|source| BackendError::failed(source.to_string()))
+    }
+
+    fn skip_chatgpt_oauth_preflight(&self, force: bool) -> bool {
+        !force && chatgpt_oauth_cache_valid_for_request()
+    }
+
+    async fn send_chatgpt_completion_turn(
+        &self,
+        ctx: StepContext<'_>,
+    ) -> std::result::Result<BackendTurn, BackendError> {
+        use rig::client::CompletionClient;
+
+        let entry = self.chatgpt_client(&ctx.request.secrets, ctx.request.base_url.as_deref())?;
+        if entry.auth == ChatGptClientAuth::OAuth {
+            self.authorize_chatgpt_oauth_client(&entry.client, false)
+                .await?;
+        }
+        send_completion_turn(entry.client.completion_model(&ctx.request.model), ctx).await
+    }
 }
 
 #[async_trait]
@@ -4090,11 +4279,28 @@ impl CompletionBackend for RigBackend {
         true
     }
 
+    async fn authorize_chatgpt_provider(
+        &self,
+        config: &ChatGptAuthCheckConfig,
+    ) -> std::result::Result<(), BackendError> {
+        let entry = self.chatgpt_client(&config.secrets, config.base_url.as_deref())?;
+        if entry.auth == ChatGptClientAuth::OAuth {
+            self.authorize_chatgpt_oauth_client(&entry.client, true)
+                .await
+        } else {
+            entry
+                .client
+                .authorize()
+                .await
+                .map_err(|source| BackendError::failed(source.to_string()))
+        }
+    }
+
     async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
         match ctx.request.provider {
             Provider::OpenAi => send_openai_completion_turn(ctx).await,
             Provider::Anthropic => send_anthropic_completion_turn(ctx).await,
-            Provider::ChatGpt => send_chatgpt_completion_turn(ctx).await,
+            Provider::ChatGpt => self.send_chatgpt_completion_turn(ctx).await,
         }
     }
 }
@@ -4131,23 +4337,6 @@ async fn send_anthropic_completion_turn(
     let mut builder = anthropic::Client::builder().api_key(api_key);
     if let Some(base_url) = resolve_base_url(ctx.request.base_url.as_deref())? {
         builder = builder.base_url(&base_url);
-    }
-    let client = builder
-        .build()
-        .map_err(|source| BackendError::failed(source.to_string()))?;
-    send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
-}
-
-async fn send_chatgpt_completion_turn(
-    ctx: StepContext<'_>,
-) -> std::result::Result<BackendTurn, BackendError> {
-    use rig::client::CompletionClient;
-    use rig::providers::chatgpt;
-
-    let mut builder =
-        chatgpt::Client::builder().api_key(resolve_chatgpt_auth(&ctx.request.secrets)?);
-    if let Some(base_url) = resolve_base_url(ctx.request.base_url.as_deref())? {
-        builder = builder.base_url(base_url);
     }
     let client = builder
         .build()
@@ -4754,7 +4943,7 @@ mod tests {
         request: &ResolvedCompletionRequest,
         env: &[(&str, Option<&OsStr>)],
     ) -> BackendError {
-        let backend = RigBackend;
+        let backend = RigBackend::default();
         let session = resolved_session_for_step();
         let prompt = CompletionMessage::user("Hello");
         with_process_env_async(env, || async {
@@ -5369,7 +5558,7 @@ mod tests {
     #[test]
     fn provider_auth_checks_are_enabled_only_for_rig_backend_by_default() {
         let fake = LlmService::new(MemoryStore::new(), FakeBackend::with_responses(&[]));
-        let rig = LlmService::new(MemoryStore::new(), RigBackend);
+        let rig = LlmService::new(MemoryStore::new(), RigBackend::default());
 
         assert!(!fake.enables_provider_auth_checks());
         assert!(rig.enables_provider_auth_checks());
@@ -5410,6 +5599,136 @@ mod tests {
                 base_url: Some("${COCO_CHATGPT_BASE_URL}".to_owned()),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn rig_backend_reuses_chatgpt_oauth_client_across_oauth_profiles() {
+        with_process_env_async(
+            &[
+                ("COCO_API_KEY", None),
+                ("CHATGPT_ACCESS_TOKEN", None),
+                (
+                    "COCO_CHATGPT_BASE_URL",
+                    Some(OsStr::new("https://chatgpt.example.test")),
+                ),
+            ],
+            || async {
+                let backend = RigBackend::default();
+                let first_config = ChatGptAuthCheckConfig {
+                    profile: "chatgpt-main".to_owned(),
+                    secrets: BTreeMap::new(),
+                    base_url: Some("${COCO_CHATGPT_BASE_URL}".to_owned()),
+                };
+                let second_config = ChatGptAuthCheckConfig {
+                    profile: "chatgpt-secondary".to_owned(),
+                    secrets: BTreeMap::new(),
+                    base_url: Some("${COCO_CHATGPT_BASE_URL}".to_owned()),
+                };
+
+                let _first_client = backend
+                    .chatgpt_client(&first_config.secrets, first_config.base_url.as_deref())
+                    .expect("auth check client should build");
+                let _second_client = backend
+                    .chatgpt_client(&second_config.secrets, second_config.base_url.as_deref())
+                    .expect("request client should build");
+
+                assert_eq!(
+                    backend
+                        .chatgpt_clients
+                        .lock()
+                        .expect("chatgpt client pool should not be poisoned")
+                        .len(),
+                    1
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rig_backend_shares_chatgpt_oauth_state_across_base_urls() {
+        with_process_env_async(
+            &[("COCO_API_KEY", None), ("CHATGPT_ACCESS_TOKEN", None)],
+            || async {
+                let backend = RigBackend::default();
+
+                let first_client = backend
+                    .chatgpt_client(&BTreeMap::new(), Some("https://chatgpt-one.example.test"))
+                    .expect("first client should build");
+                let second_client = backend
+                    .chatgpt_client(&BTreeMap::new(), Some("https://chatgpt-two.example.test"))
+                    .expect("second client should build");
+
+                assert_eq!(first_client.auth, ChatGptClientAuth::OAuth);
+                assert_eq!(second_client.auth, ChatGptClientAuth::OAuth);
+                assert_eq!(
+                    backend
+                        .chatgpt_clients
+                        .lock()
+                        .expect("chatgpt client pool should not be poisoned")
+                        .len(),
+                    2
+                );
+                assert!(!backend.skip_chatgpt_oauth_preflight(false));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn chatgpt_oauth_cache_valid_for_request_accepts_token_outside_skew() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join("xdg-config");
+        let expires_at = chatgpt_oauth_now_unix_seconds().unwrap()
+            + CHATGPT_OAUTH_TOKEN_EXPIRY_SKEW_SECONDS
+            + CHATGPT_OAUTH_REQUEST_PREFLIGHT_MARGIN_SECONDS
+            + 30;
+
+        with_process_env_async(
+            &[
+                ("XDG_CONFIG_HOME", Some(config_dir.as_os_str())),
+                ("HOME", None),
+            ],
+            || async {
+                write_chatgpt_oauth_cache(&config_dir, expires_at);
+
+                assert!(chatgpt_oauth_cache_valid_for_request());
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn chatgpt_oauth_cache_valid_for_request_rejects_token_inside_skew() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join("xdg-config");
+        let expires_at = chatgpt_oauth_now_unix_seconds().unwrap()
+            + CHATGPT_OAUTH_TOKEN_EXPIRY_SKEW_SECONDS
+            + CHATGPT_OAUTH_REQUEST_PREFLIGHT_MARGIN_SECONDS
+            - 1;
+
+        with_process_env_async(
+            &[
+                ("XDG_CONFIG_HOME", Some(config_dir.as_os_str())),
+                ("HOME", None),
+            ],
+            || async {
+                write_chatgpt_oauth_cache(&config_dir, expires_at);
+
+                assert!(!chatgpt_oauth_cache_valid_for_request());
+            },
+        )
+        .await;
+    }
+
+    fn write_chatgpt_oauth_cache(config_dir: &Path, expires_at: i64) {
+        let cache_dir = config_dir.join("chatgpt");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("auth.json"),
+            format!(r#"{{"expires_at":{expires_at}}}"#),
+        )
+        .unwrap();
     }
 
     #[tokio::test]

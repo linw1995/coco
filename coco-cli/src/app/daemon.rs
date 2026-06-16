@@ -14,8 +14,8 @@ use coco_core::{
     ConversationEngine, CoreService, EngineError, FixedBranchResolver, SYSTEM_EVENT_QUEUE,
 };
 use coco_llm::{
-    ChatGptAuthCheckConfig, CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend,
-    LlmService, Provider, SessionConfig,
+    CocoCliRuntimeRequest, CocoCliRuntimeResponse, CompletionBackend, LlmService, Provider,
+    SessionConfig,
 };
 use coco_mem::{
     Anchor, AnchorPayload, JobStatus, Kind, MessageQueueItem, SessionRole, Store, StoreError,
@@ -457,7 +457,7 @@ where
     let channel_task = start_channel_task(options.channel_configs, &shared_store, &shared_engine)?;
     let message_queue_task = start_message_queue_task(&shared_store, &shared_engine);
     let chatgpt_auth_check_task = if llm.enables_provider_auth_checks() {
-        start_chatgpt_auth_check_task(llm.chatgpt_auth_check_configs())
+        start_chatgpt_auth_check_task(llm.clone())
     } else {
         None
     };
@@ -516,9 +516,14 @@ where
     })
 }
 
-fn start_chatgpt_auth_check_task(
-    configs: Vec<ChatGptAuthCheckConfig>,
-) -> Option<tokio::task::JoinHandle<()>> {
+fn start_chatgpt_auth_check_task<B, S>(
+    llm: Arc<LlmService<B, S>>,
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    B: CompletionBackend + 'static,
+    S: Send + Sync + 'static,
+{
+    let configs = llm.chatgpt_auth_check_configs();
     if configs.is_empty() {
         return None;
     }
@@ -531,7 +536,7 @@ fn start_chatgpt_auth_check_task(
     Some(tokio::spawn(async move {
         loop {
             for config in &configs {
-                match coco_llm::authorize_chatgpt_provider(config).await {
+                match llm.authorize_chatgpt_provider(config).await {
                     Ok(()) => tracing::debug!(
                         provider_profile = %config.profile,
                         "chatgpt auth check succeeded"
@@ -2289,7 +2294,12 @@ mod tests {
 
     #[test]
     fn chatgpt_auth_check_task_skips_empty_config() {
-        assert!(start_chatgpt_auth_check_task(Vec::new()).is_none());
+        let llm = Arc::new(LlmService::new(
+            MemoryStore::new(),
+            BlockingOnceBackend::default(),
+        ));
+
+        assert!(start_chatgpt_auth_check_task(llm).is_none());
     }
 
     #[tokio::test]
