@@ -4178,15 +4178,22 @@ impl RigBackend {
         client: &ChatGptClient,
         force: bool,
     ) -> std::result::Result<(), BackendError> {
-        if !force && self.chatgpt_oauth_recently_authorized() {
+        if self.skip_chatgpt_oauth_preflight(force) {
             return Ok(());
         }
 
         let _guard = self.chatgpt_oauth_state.lock.lock().await;
-        if !force && self.chatgpt_oauth_recently_authorized() {
+        if self.skip_chatgpt_oauth_preflight(force) {
             return Ok(());
         }
 
+        self.run_chatgpt_oauth_authorize(client).await
+    }
+
+    async fn run_chatgpt_oauth_authorize(
+        &self,
+        client: &ChatGptClient,
+    ) -> std::result::Result<(), BackendError> {
         client
             .authorize()
             .await
@@ -4197,6 +4204,10 @@ impl RigBackend {
             .lock()
             .expect("chatgpt oauth state poisoned") = Some(Instant::now());
         Ok(())
+    }
+
+    fn skip_chatgpt_oauth_preflight(&self, force: bool) -> bool {
+        !force && self.chatgpt_oauth_recently_authorized()
     }
 
     fn chatgpt_oauth_recently_authorized(&self) -> bool {
