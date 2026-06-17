@@ -3,6 +3,7 @@ mod api;
 #[cfg(not(target_arch = "wasm32"))]
 mod host {
     pub mod api;
+    pub mod cache;
     pub mod config;
     pub mod error;
     pub mod graph;
@@ -12,6 +13,7 @@ mod host {
     pub mod server;
     pub mod store;
 
+    pub use cache::ConsoleGraphCache;
     pub use config::ConsoleConfig;
     pub use error::{Error, Result};
     pub use publisher::ConsolePublisher;
@@ -33,8 +35,8 @@ mod wasm {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use host::{
-    ConsoleConfig, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error, Result,
-    start_console_server,
+    ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error,
+    Result, start_console_server,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use host::{config, error, graph, layout, publisher, render};

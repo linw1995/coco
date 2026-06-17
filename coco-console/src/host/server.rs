@@ -13,22 +13,24 @@ use snafu::prelude::*;
 use std::convert::Infallible;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::Arc;
 use std::time::Instant;
 
+use crate::Result;
 use crate::api::GraphCanvas;
 use crate::config::ConsoleConfig;
 use crate::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
 };
-use crate::graph::{GraphMode, build_graph_snapshot_with_mode};
+use crate::graph::{GraphMode, GraphSnapshot};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
+use crate::host::cache::ConsoleGraphCache;
 use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
 use crate::render::{
     render_fragment, render_index_page, render_node_detail_fragment,
     render_provider_context_fragment,
 };
-use crate::{Error, Result};
 
 const STYLE_CSS: &str = include_str!("style.css");
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
@@ -37,8 +39,7 @@ const COCO_CONSOLE_WASM: &[u8] =
 
 #[derive(Clone)]
 struct AppState<S> {
-    store: S,
-    publisher: ConsolePublisher,
+    cache: ConsoleGraphCache<S>,
 }
 
 #[derive(Debug)]
@@ -89,7 +90,9 @@ where
     let addr = listener
         .local_addr()
         .context(ConfigureConsoleSocketSnafu { addr: config.addr })?;
-    let state = AppState { store, publisher };
+    let state = AppState {
+        cache: ConsoleGraphCache::new(store, publisher),
+    };
     let task = tokio::spawn(async move {
         serve_console(listener, state)
             .await
@@ -202,10 +205,8 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
-    match build_graph_snapshot_with_mode(&state.store, state.publisher.current_version(), mode) {
-        Ok(snapshot) => html_response(render_index_page(&snapshot)),
-        Err(error) => error_response(error),
-    }
+    let snapshot = state.cache.snapshot_or_placeholder(mode);
+    html_response(render_index_page(&snapshot))
 }
 
 async fn style_css() -> Response {
@@ -221,14 +222,10 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    match build_graph_snapshot_with_mode(
-        &state.store,
-        state.publisher.current_version(),
-        graph_mode_from_query(&query),
-    ) {
-        Ok(snapshot) => json_response(&snapshot, "graph"),
-        Err(error) => error_response(error),
-    }
+    let snapshot = state
+        .cache
+        .snapshot_or_placeholder(graph_mode_from_query(&query));
+    json_response(&snapshot, "graph")
 }
 
 async fn graph_viewport<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
@@ -236,15 +233,11 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    wait_for_newer_version(&state.publisher, query.version()).await;
-    let snapshot = match build_graph_snapshot_with_mode(
-        &state.store,
-        state.publisher.current_version(),
-        graph_mode_from_query(&query),
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return error_response(error),
-    };
+    let snapshot =
+        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return plain_error(error.to_string()),
+        };
     let response = layout_graph_viewport(&snapshot, viewport_request_from_query(&query));
     json_response(&response, "graph viewport")
 }
@@ -304,14 +297,9 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let request = viewport_diff_request_from_query(&query);
-    let snapshot = match build_graph_snapshot_with_mode(
-        &state.store,
-        state.publisher.current_version(),
-        graph_mode_from_query(&query),
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return error_response(error),
-    };
+    let snapshot = state
+        .cache
+        .snapshot_or_placeholder(graph_mode_from_query(&query));
     let response = layout_graph_viewport_diff(&snapshot, request);
     json_response(&response, "graph viewport diff")
 }
@@ -349,11 +337,9 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     loop {
-        wait_for_newer_version(&state.publisher, Some(observed_version)).await;
-        let current_version = state.publisher.current_version();
-        let snapshot = match build_graph_snapshot_with_mode(&state.store, current_version, mode) {
+        let snapshot = match state.cache.snapshot_after(mode, observed_version).await {
             Ok(snapshot) => snapshot,
-            Err(error) => return error_response(error),
+            Err(error) => return plain_error(error.to_string()),
         };
         let response = layout_graph_viewport_diff(&snapshot, request.clone());
         if viewport_diff_has_changes(&response, request.known.as_ref())
@@ -361,7 +347,7 @@ where
         {
             return json_response(&response, "graph viewport items diff");
         }
-        observed_version = current_version;
+        observed_version = snapshot.version;
     }
 }
 
@@ -407,15 +393,12 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    wait_for_newer_version(&state.publisher, query.version()).await;
-    match build_graph_snapshot_with_mode(
-        &state.store,
-        state.publisher.current_version(),
-        graph_mode_from_query(&query),
-    ) {
-        Ok(snapshot) => html_response(render_fragment(&snapshot)),
-        Err(error) => error_response(error),
-    }
+    let snapshot =
+        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return plain_error(error.to_string()),
+        };
+    html_response(render_fragment(&snapshot))
 }
 
 async fn node_detail<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
@@ -423,15 +406,12 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    wait_for_newer_version(&state.publisher, query.version()).await;
-    match build_graph_snapshot_with_mode(
-        &state.store,
-        state.publisher.current_version(),
-        graph_mode_from_query(&query),
-    ) {
-        Ok(snapshot) => html_response(render_node_detail_fragment(&snapshot, query.get("target"))),
-        Err(error) => error_response(error),
-    }
+    let snapshot =
+        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return plain_error(error.to_string()),
+        };
+    html_response(render_node_detail_fragment(&snapshot, query.get("target")))
 }
 
 async fn provider_context<S>(
@@ -442,27 +422,26 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    wait_for_newer_version(&state.publisher, query.version()).await;
-    match build_graph_snapshot_with_mode(
-        &state.store,
-        state.publisher.current_version(),
-        graph_mode_from_query(&query),
-    ) {
-        Ok(snapshot) => html_response(render_provider_context_fragment(
-            &snapshot,
-            query.get("target"),
-            query.get("context"),
-        )),
-        Err(error) => error_response(error),
-    }
+    let snapshot =
+        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return plain_error(error.to_string()),
+        };
+    html_response(render_provider_context_fragment(
+        &snapshot,
+        query.get("target"),
+        query.get("context"),
+    ))
 }
 
 async fn event_stream<S>(State(state): State<AppState<S>>) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let current_version = state.publisher.current_version();
-    let rx = state.publisher.subscribe();
+    let current_version = state.cache.current_version();
+    let rx = state.cache.subscribe();
+    let invalidations = state.cache.subscribe_invalidations();
+    let cache = state.cache.clone();
     let initial = stream::once(async move {
         Ok::<_, Infallible>(
             Event::default()
@@ -470,18 +449,49 @@ where
                 .data(current_version.to_string()),
         )
     });
-    let changes = stream::unfold(rx, |mut rx| async move {
-        if rx.changed().await.is_err() {
-            return None;
-        }
-        let version = *rx.borrow_and_update();
-        Some((
-            Ok::<_, Infallible>(Event::default().event("graph").data(version.to_string())),
-            rx,
-        ))
-    });
+    let changes = stream::unfold(
+        (rx, invalidations, cache),
+        |(mut rx, mut invalidations, cache)| async move {
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        let version = *rx.borrow_and_update();
+                        return Some((
+                            Ok::<_, Infallible>(
+                                Event::default().event("graph").data(version.to_string()),
+                            ),
+                            (rx, invalidations, cache),
+                        ));
+                    }
+                    changed = invalidations.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        cache.rebuild_requested_modes();
+                    }
+                }
+            }
+        },
+    );
 
     Sse::new(initial.chain(changes)).into_response()
+}
+
+async fn graph_snapshot_for_query<S>(
+    cache: &ConsoleGraphCache<S>,
+    mode: GraphMode,
+    query: &QueryParams,
+) -> Result<Arc<GraphSnapshot>>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    match query.version() {
+        Some(version) => cache.snapshot_after(mode, version).await,
+        None => Ok(cache.snapshot_or_placeholder(mode)),
+    }
 }
 
 async fn client_js() -> Response {
@@ -674,22 +684,6 @@ fn known_fingerprints_from_query(
         .collect()
 }
 
-async fn wait_for_newer_version(publisher: &ConsolePublisher, observed_version: Option<u64>) {
-    let Some(observed_version) = observed_version else {
-        return;
-    };
-    if publisher.current_version() > observed_version {
-        return;
-    }
-
-    let mut rx = publisher.subscribe();
-    while *rx.borrow_and_update() <= observed_version {
-        if rx.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
 fn json_response<T>(value: &T, name: &str) -> Response
 where
     T: Serialize,
@@ -706,10 +700,6 @@ where
 
 fn html_response(body: String) -> Response {
     response_with_body(StatusCode::OK, "text/html; charset=utf-8", Body::from(body))
-}
-
-fn error_response(error: Error) -> Response {
-    plain_error(error.to_string())
 }
 
 fn plain_error(message: impl Into<String>) -> Response {
@@ -740,11 +730,11 @@ mod tests {
         GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
         GraphViewportItems, GraphViewportRemovedItem, Point,
     };
-    use crate::graph::build_graph_snapshot;
+    use crate::graph::{GraphMode, build_graph_snapshot};
     use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
     use crate::layout::layout_graph_viewport;
-    use crate::{ConsoleConfig, ConsolePublisher, ConsoleStore};
-    use coco_mem::{BranchStore, Kind, MemoryStore, NewNode, NodeStore, Role};
+    use crate::{ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleStore};
+    use coco_mem::{BranchStore, Kind, MemoryStore, NewNode, NodeStore, Role, Store};
     use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
@@ -797,6 +787,15 @@ mod tests {
         query.push_str(key);
         query.push(':');
         query.push_str(fingerprint);
+    }
+
+    fn app_state<S>(store: S, publisher: ConsolePublisher) -> AppState<S>
+    where
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        AppState {
+            cache: ConsoleGraphCache::new(store, publisher),
+        }
     }
 
     async fn response_bytes_from(bytes: &[u8]) -> Vec<u8> {
@@ -862,8 +861,8 @@ mod tests {
     #[tokio::test]
     async fn write_event_stream_writes_initial_and_changed_events() {
         let publisher = ConsolePublisher::new();
-        let handle =
-            start_console_server(test_config(), MemoryStore::new(), publisher.clone()).unwrap();
+        let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+        let handle = start_console_server(test_config(), store.clone(), publisher.clone()).unwrap();
         let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         stream
             .write_all(b"GET /events HTTP/1.1\r\nhost: localhost\r\n\r\n")
@@ -881,12 +880,35 @@ mod tests {
         assert!(initial.starts_with("HTTP/1.1 200 OK"), "{initial}");
         assert!(initial.contains("content-type: text/event-stream"));
 
-        publisher.mark_changed();
+        let mut trigger = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        trigger
+            .write_all(get_request("/api/graph").as_bytes())
+            .await
+            .unwrap();
+        let mut trigger_response = Vec::new();
+        trigger.read_to_end(&mut trigger_response).await.unwrap();
+
         let mut changed = Vec::new();
         while !contains_bytes(&changed, b"event: graph\ndata: 1") {
             let read = stream.read(&mut response).await.unwrap();
             assert_ne!(read, 0);
             changed.extend_from_slice(&response[..read]);
+        }
+
+        store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("changed".to_owned()),
+            })
+            .unwrap();
+
+        let mut invalidated = Vec::new();
+        while !contains_bytes(&invalidated, b"event: graph\ndata: 2") {
+            let read = stream.read(&mut response).await.unwrap();
+            assert_ne!(read, 0);
+            invalidated.extend_from_slice(&response[..read]);
         }
 
         handle.shutdown().await.unwrap();
@@ -907,15 +929,12 @@ mod tests {
             })
             .unwrap();
         store.set_branch_head("main", &root, &first).unwrap();
-        let version = publisher.current_version();
         let viewport = GraphViewportRequest::default();
-        let snapshot = build_graph_snapshot(&store, version).unwrap();
+        let state = app_state(store.clone(), publisher.clone());
+        let snapshot = state.cache.current_snapshot(GraphMode::All).await;
+        let version = snapshot.version;
         let rendered = layout_graph_viewport(&snapshot, viewport);
         let query = known_viewport_query(version, viewport, &rendered);
-        let state = AppState {
-            store: store.clone(),
-            publisher: publisher.clone(),
-        };
         let mut task = tokio::spawn(graph_viewport_items_diff_response_from_query(
             state,
             parse_query(&query),
@@ -968,15 +987,12 @@ mod tests {
             .unwrap();
         store.fork("main", &first).unwrap();
         store.fork("draft", &second).unwrap();
-        let version = publisher.current_version();
         let viewport = GraphViewportRequest::default();
-        let snapshot = build_graph_snapshot(&store, version).unwrap();
+        let state = app_state(store.clone(), publisher.clone());
+        let snapshot = state.cache.current_snapshot(GraphMode::All).await;
+        let version = snapshot.version;
         let rendered = layout_graph_viewport(&snapshot, viewport);
         let query = known_viewport_query(version, viewport, &rendered);
-        let state = AppState {
-            store: store.clone(),
-            publisher: publisher.clone(),
-        };
         let task = tokio::spawn(graph_viewport_items_diff_response_from_query(
             state,
             parse_query(&query),
@@ -996,13 +1012,11 @@ mod tests {
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
         let viewport = GraphViewportRequest::default();
-        let state = AppState {
-            store,
-            publisher: publisher.clone(),
-        };
+        let state = app_state(store, publisher.clone());
+        let snapshot = state.cache.current_snapshot(GraphMode::All).await;
         let query = format!(
-            "version={}&x={}&y={}&width={}&height={}&overscan={}&known=1",
-            publisher.current_version(),
+            "version={}&mode=all&x={}&y={}&width={}&height={}&overscan={}&known=1",
+            snapshot.version,
             viewport.x,
             viewport.y,
             viewport.width,
@@ -1038,7 +1052,7 @@ mod tests {
         let snapshot = build_graph_snapshot(&store, version).unwrap();
         let rendered = layout_graph_viewport(&snapshot, viewport);
         let query = known_viewport_query(version, viewport, &rendered);
-        let state = AppState { store, publisher };
+        let state = app_state(store, publisher);
         let task = tokio::spawn(graph_viewport_diff_response(state, parse_query(&query)));
 
         let response = timeout(Duration::from_millis(50), task)
@@ -1130,9 +1144,30 @@ mod tests {
         let publisher = ConsolePublisher::new();
         let handle =
             start_console_server(test_config(), MemoryStore::new(), publisher.clone()).unwrap();
+        let mut initial = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        initial
+            .write_all(
+                b"GET /fragment?version=0 HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut initial_response = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            initial.read_to_end(&mut initial_response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let initial_response = String::from_utf8_lossy(&initial_response);
+        assert!(
+            initial_response.starts_with("HTTP/1.1 200 OK"),
+            "{initial_response}"
+        );
+
         let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         stream
-            .write_all(b"GET /fragment?version=0 HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .write_all(b"GET /fragment?version=1 HTTP/1.1\r\nhost: localhost\r\n\r\n")
             .await
             .unwrap();
         let mut response = vec![0; 256];
