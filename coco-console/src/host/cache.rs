@@ -116,6 +116,21 @@ where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        self.run_blocking_graph_compute_with(|| (), |_| compute())
+            .await
+    }
+
+    pub async fn run_blocking_graph_compute_with<T, I, P, F>(
+        &self,
+        prepare: P,
+        compute: F,
+    ) -> crate::Result<T>
+    where
+        T: Send + 'static,
+        I: Send + 'static,
+        P: FnOnce() -> I + Send,
+        F: FnOnce(I) -> T + Send + 'static,
+    {
         let Ok(_permit) = self.compute_permits.clone().acquire_owned().await else {
             return Err(crate::Error::ConsoleGraphRebuild {
                 mode: "any",
@@ -123,7 +138,8 @@ where
                 message: "graph compute limiter closed".to_owned(),
             });
         };
-        tokio::task::spawn_blocking(compute)
+        let input = prepare();
+        tokio::task::spawn_blocking(move || compute(input))
             .await
             .context(crate::error::JoinConsoleServerSnafu)
     }
@@ -775,6 +791,7 @@ mod tests {
         let cache = Arc::new(ConsoleGraphCache::new(store, publisher));
         let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
         let (release_first_tx, release_first_rx) = mpsc::channel();
+        let second_prepared = Arc::new(AtomicBool::new(false));
         let second_started = Arc::new(AtomicBool::new(false));
 
         let first = tokio::spawn({
@@ -793,18 +810,28 @@ mod tests {
 
         let second = tokio::spawn({
             let cache = cache.clone();
+            let second_prepared = second_prepared.clone();
             let second_started = second_started.clone();
             async move {
                 cache
-                    .run_blocking_graph_compute(move || {
-                        second_started.store(true, Ordering::SeqCst);
-                    })
+                    .run_blocking_graph_compute_with(
+                        move || {
+                            second_prepared.store(true, Ordering::SeqCst);
+                        },
+                        move |()| {
+                            second_started.store(true, Ordering::SeqCst);
+                        },
+                    )
                     .await
                     .unwrap();
             }
         });
 
         sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second_prepared.load(Ordering::SeqCst),
+            "second graph compute should prepare after the shared permit"
+        );
         assert!(
             !second_started.load(Ordering::SeqCst),
             "second graph compute should wait for the shared permit"
@@ -813,6 +840,7 @@ mod tests {
         release_first_tx.send(()).unwrap();
         first.await.unwrap();
         second.await.unwrap();
+        assert!(second_prepared.load(Ordering::SeqCst));
         assert!(second_started.load(Ordering::SeqCst));
     }
 
