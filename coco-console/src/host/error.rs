@@ -18,6 +18,15 @@ pub enum Error {
     #[snafu(display("Console server task failed: {source}"))]
     JoinConsoleServer { source: tokio::task::JoinError },
 
+    #[snafu(display(
+        "Console graph rebuild failed for {mode} at store version {source_version}: {message}"
+    ))]
+    ConsoleGraphRebuild {
+        mode: &'static str,
+        source_version: u64,
+        message: String,
+    },
+
     #[snafu(display("{source}"))]
     Store { source: coco_mem::StoreError },
 }

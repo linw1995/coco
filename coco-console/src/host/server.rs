@@ -234,7 +234,10 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let snapshot =
-        graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await;
+        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return plain_error(error.to_string()),
+        };
     let response = layout_graph_viewport(&snapshot, viewport_request_from_query(&query));
     json_response(&response, "graph viewport")
 }
@@ -334,7 +337,10 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     loop {
-        let snapshot = state.cache.snapshot_after(mode, observed_version).await;
+        let snapshot = match state.cache.snapshot_after(mode, observed_version).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return plain_error(error.to_string()),
+        };
         let response = layout_graph_viewport_diff(&snapshot, request.clone());
         if viewport_diff_has_changes(&response, request.known.as_ref())
             || known_canvas != Some(response.canvas)
@@ -388,7 +394,10 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let snapshot =
-        graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await;
+        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return plain_error(error.to_string()),
+        };
     html_response(render_fragment(&snapshot))
 }
 
@@ -398,7 +407,10 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let snapshot =
-        graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await;
+        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return plain_error(error.to_string()),
+        };
     html_response(render_node_detail_fragment(&snapshot, query.get("target")))
 }
 
@@ -411,7 +423,10 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let snapshot =
-        graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await;
+        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return plain_error(error.to_string()),
+        };
     html_response(render_provider_context_fragment(
         &snapshot,
         query.get("target"),
@@ -425,6 +440,8 @@ where
 {
     let current_version = state.cache.current_version();
     let rx = state.cache.subscribe();
+    let invalidations = state.cache.subscribe_invalidations();
+    let cache = state.cache.clone();
     let initial = stream::once(async move {
         Ok::<_, Infallible>(
             Event::default()
@@ -432,16 +449,33 @@ where
                 .data(current_version.to_string()),
         )
     });
-    let changes = stream::unfold(rx, |mut rx| async move {
-        if rx.changed().await.is_err() {
-            return None;
-        }
-        let version = *rx.borrow_and_update();
-        Some((
-            Ok::<_, Infallible>(Event::default().event("graph").data(version.to_string())),
-            rx,
-        ))
-    });
+    let changes = stream::unfold(
+        (rx, invalidations, cache),
+        |(mut rx, mut invalidations, cache)| async move {
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        let version = *rx.borrow_and_update();
+                        return Some((
+                            Ok::<_, Infallible>(
+                                Event::default().event("graph").data(version.to_string()),
+                            ),
+                            (rx, invalidations, cache),
+                        ));
+                    }
+                    changed = invalidations.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        cache.rebuild_requested_modes();
+                    }
+                }
+            }
+        },
+    );
 
     Sse::new(initial.chain(changes)).into_response()
 }
@@ -450,13 +484,13 @@ async fn graph_snapshot_for_query<S>(
     cache: &ConsoleGraphCache<S>,
     mode: GraphMode,
     query: &QueryParams,
-) -> Arc<GraphSnapshot>
+) -> Result<Arc<GraphSnapshot>>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
     match query.version() {
         Some(version) => cache.snapshot_after(mode, version).await,
-        None => cache.snapshot_or_placeholder(mode),
+        None => Ok(cache.snapshot_or_placeholder(mode)),
     }
 }
 
@@ -827,8 +861,8 @@ mod tests {
     #[tokio::test]
     async fn write_event_stream_writes_initial_and_changed_events() {
         let publisher = ConsolePublisher::new();
-        let handle =
-            start_console_server(test_config(), MemoryStore::new(), publisher.clone()).unwrap();
+        let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+        let handle = start_console_server(test_config(), store.clone(), publisher.clone()).unwrap();
         let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         stream
             .write_all(b"GET /events HTTP/1.1\r\nhost: localhost\r\n\r\n")
@@ -859,6 +893,22 @@ mod tests {
             let read = stream.read(&mut response).await.unwrap();
             assert_ne!(read, 0);
             changed.extend_from_slice(&response[..read]);
+        }
+
+        store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("changed".to_owned()),
+            })
+            .unwrap();
+
+        let mut invalidated = Vec::new();
+        while !contains_bytes(&invalidated, b"event: graph\ndata: 2") {
+            let read = stream.read(&mut response).await.unwrap();
+            assert_ne!(read, 0);
+            invalidated.extend_from_slice(&response[..read]);
         }
 
         handle.shutdown().await.unwrap();

@@ -23,8 +23,14 @@ struct CacheSlot {
     snapshot: Option<Arc<GraphSnapshot>>,
     source_version: u64,
     building_source_version: Option<u64>,
-    failed_source_version: Option<u64>,
+    failure: Option<CacheFailure>,
     requested: bool,
+}
+
+#[derive(Clone)]
+struct CacheFailure {
+    source_version: u64,
+    message: Arc<str>,
 }
 
 impl<S> ConsoleGraphCache<S>
@@ -48,6 +54,15 @@ where
         self.ready.subscribe()
     }
 
+    pub fn subscribe_invalidations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.invalidations.subscribe()
+    }
+
+    pub fn rebuild_requested_modes(&self) {
+        self.ensure_rebuild_if_requested(GraphMode::Anchors);
+        self.ensure_rebuild_if_requested(GraphMode::All);
+    }
+
     pub fn snapshot_or_placeholder(&self, mode: GraphMode) -> Arc<GraphSnapshot> {
         self.ensure_rebuild(mode);
         if let Some(snapshot) = self.cached_snapshot(mode) {
@@ -60,7 +75,7 @@ where
         &self,
         mode: GraphMode,
         observed_version: u64,
-    ) -> Arc<GraphSnapshot> {
+    ) -> crate::Result<Arc<GraphSnapshot>> {
         loop {
             let mut rx = self.ready.subscribe();
             let mut invalidations = self.invalidations.subscribe();
@@ -68,17 +83,25 @@ where
             if let Some(snapshot) = self.cached_snapshot(mode)
                 && snapshot.version > observed_version
             {
-                return snapshot;
+                return Ok(snapshot);
+            }
+            let source_version = self.invalidations.current_version();
+            if let Some(failure) = self.cached_failure(mode, source_version) {
+                return Err(crate::Error::ConsoleGraphRebuild {
+                    mode: mode.as_query_value(),
+                    source_version,
+                    message: failure.message.to_string(),
+                });
             }
             tokio::select! {
                 changed = rx.changed() => {
                     if changed.is_err() {
-                        return self.snapshot_or_placeholder(mode);
+                        return Ok(self.snapshot_or_placeholder(mode));
                     }
                 }
                 changed = invalidations.changed() => {
                     if changed.is_err() {
-                        return self.snapshot_or_placeholder(mode);
+                        return Ok(self.snapshot_or_placeholder(mode));
                     }
                 }
             }
@@ -120,6 +143,15 @@ where
         state.slot(mode).snapshot.clone()
     }
 
+    fn cached_failure(&self, mode: GraphMode, source_version: u64) -> Option<CacheFailure> {
+        let state = self
+            .state
+            .lock()
+            .expect("console graph cache lock poisoned");
+        let failure = state.slot(mode).failure.as_ref()?;
+        (failure.source_version == source_version).then(|| failure.clone())
+    }
+
     #[cfg(test)]
     fn cached_source_version(&self, mode: GraphMode) -> u64 {
         let state = self
@@ -130,6 +162,14 @@ where
     }
 
     fn ensure_rebuild(&self, mode: GraphMode) {
+        self.ensure_rebuild_with_request(mode, true);
+    }
+
+    fn ensure_rebuild_if_requested(&self, mode: GraphMode) {
+        self.ensure_rebuild_with_request(mode, false);
+    }
+
+    fn ensure_rebuild_with_request(&self, mode: GraphMode, mark_requested: bool) {
         let source_version = self.invalidations.current_version();
         let should_spawn = {
             let mut state = self
@@ -137,8 +177,10 @@ where
                 .lock()
                 .expect("console graph cache lock poisoned");
             let slot = state.slot_mut(mode);
-            slot.requested = true;
-            if !slot.needs_rebuild(source_version) {
+            if mark_requested {
+                slot.requested = true;
+            }
+            if !slot.requested || !slot.needs_rebuild(source_version) {
                 false
             } else {
                 slot.building_source_version = Some(source_version);
@@ -182,7 +224,7 @@ where
                     error = %error,
                     "console graph rebuild failed"
                 );
-                self.record_rebuild_failure(mode, source_version);
+                self.record_rebuild_failure(mode, source_version, error.to_string());
                 return;
             }
         };
@@ -201,7 +243,7 @@ where
             slot.snapshot = Some(Arc::new(snapshot));
             slot.source_version = source_version;
             slot.building_source_version = None;
-            slot.failed_source_version = None;
+            slot.failure = None;
             let published_version = self.ready.mark_changed();
             debug_assert_eq!(published_version, graph_version);
             slot.requested && slot.needs_rebuild(self.invalidations.current_version())
@@ -212,7 +254,7 @@ where
         }
     }
 
-    fn record_rebuild_failure(&self, mode: GraphMode, source_version: u64) {
+    fn record_rebuild_failure(&self, mode: GraphMode, source_version: u64, message: String) {
         let should_rebuild = {
             let mut state = self
                 .state
@@ -221,7 +263,11 @@ where
             let slot = state.slot_mut(mode);
             if slot.building_source_version == Some(source_version) {
                 slot.building_source_version = None;
-                slot.failed_source_version = Some(source_version);
+                slot.failure = Some(CacheFailure {
+                    source_version,
+                    message: Arc::from(message),
+                });
+                self.ready.mark_changed();
             }
             slot.requested && slot.needs_rebuild(self.invalidations.current_version())
         };
@@ -265,7 +311,10 @@ impl CacheSlot {
         let snapshot_is_stale = self.source_version < source_version;
         (snapshot_is_missing || snapshot_is_stale)
             && self.building_source_version != Some(source_version)
-            && self.failed_source_version != Some(source_version)
+            && self
+                .failure
+                .as_ref()
+                .is_none_or(|failure| failure.source_version != source_version)
     }
 }
 
@@ -381,7 +430,10 @@ mod tests {
     #[test]
     fn failed_source_version_does_not_need_rebuild() {
         let slot = CacheSlot {
-            failed_source_version: Some(7),
+            failure: Some(CacheFailure {
+                source_version: 7,
+                message: Arc::from("failed"),
+            }),
             ..CacheSlot::default()
         };
 
@@ -391,7 +443,10 @@ mod tests {
     #[test]
     fn newer_source_version_needs_rebuild_after_failure() {
         let slot = CacheSlot {
-            failed_source_version: Some(7),
+            failure: Some(CacheFailure {
+                source_version: 7,
+                message: Arc::from("failed"),
+            }),
             ..CacheSlot::default()
         };
 
