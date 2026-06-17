@@ -8,6 +8,7 @@ use crate::graph::{
 use crate::publisher::ConsolePublisher;
 use coco_mem::Store;
 use serde::Serialize;
+use snafu::prelude::*;
 use tokio::sync::Semaphore;
 
 const GRAPH_REBUILD_THROTTLE: Duration = Duration::from_millis(75);
@@ -40,7 +41,7 @@ pub struct ConsoleGraphCache<S> {
     invalidations: ConsolePublisher,
     ready: ConsolePublisher,
     progress: ConsolePublisher,
-    build_permits: Arc<Semaphore>,
+    compute_permits: Arc<Semaphore>,
     state: Arc<Mutex<CacheState>>,
 }
 
@@ -78,7 +79,7 @@ where
             invalidations,
             ready: ConsolePublisher::new(),
             progress: ConsolePublisher::new(),
-            build_permits: Arc::new(Semaphore::new(1)),
+            compute_permits: Arc::new(Semaphore::new(1)),
             state: Arc::new(Mutex::new(CacheState::default())),
         }
     }
@@ -108,6 +109,39 @@ where
 
     pub fn subscribe_invalidations(&self) -> tokio::sync::watch::Receiver<u64> {
         self.invalidations.subscribe()
+    }
+
+    pub async fn run_blocking_graph_compute<T, F>(&self, compute: F) -> crate::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.run_blocking_graph_compute_with(|| (), |_| compute())
+            .await
+    }
+
+    pub async fn run_blocking_graph_compute_with<T, I, P, F>(
+        &self,
+        prepare: P,
+        compute: F,
+    ) -> crate::Result<T>
+    where
+        T: Send + 'static,
+        I: Send + 'static,
+        P: FnOnce() -> I + Send,
+        F: FnOnce(I) -> T + Send + 'static,
+    {
+        let Ok(_permit) = self.compute_permits.clone().acquire_owned().await else {
+            return Err(crate::Error::ConsoleGraphRebuild {
+                mode: "any",
+                source_version: self.invalidations.current_version(),
+                message: "graph compute limiter closed".to_owned(),
+            });
+        };
+        let input = prepare();
+        tokio::task::spawn_blocking(move || compute(input))
+            .await
+            .context(crate::error::JoinConsoleServerSnafu)
     }
 
     pub fn rebuild_requested_modes(&self) {
@@ -312,7 +346,7 @@ where
     fn spawn_rebuild(&self, mode: GraphMode, source_version: u64) {
         let cache = self.clone();
         tokio::spawn(async move {
-            let Ok(permit) = cache.build_permits.clone().acquire_owned().await else {
+            let Ok(permit) = cache.compute_permits.clone().acquire_owned().await else {
                 return;
             };
             let Some(source_version) = cache.begin_rebuild_after_permit(mode, source_version)
@@ -610,6 +644,9 @@ mod tests {
         Anchor, BranchStore, Kind, MemoryStore, NewNode, NodeStore, Role, SessionAnchor,
         SessionRole, Tool,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use tokio::time::{Duration, sleep};
 
     fn session_anchor() -> SessionAnchor {
         SessionAnchor {
@@ -745,6 +782,66 @@ mod tests {
         assert!(cache.rebuild_statuses().iter().any(|status| {
             status.mode == GraphMode::All && status.state == ConsoleGraphRebuildState::Ready
         }));
+    }
+
+    #[tokio::test]
+    async fn graph_compute_permit_serializes_blocking_work() {
+        let publisher = ConsolePublisher::new();
+        let (store, _, _) = graph_store(publisher.clone());
+        let cache = Arc::new(ConsoleGraphCache::new(store, publisher));
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let second_prepared = Arc::new(AtomicBool::new(false));
+        let second_started = Arc::new(AtomicBool::new(false));
+
+        let first = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .run_blocking_graph_compute(move || {
+                        first_started_tx.send(()).unwrap();
+                        release_first_rx.recv().unwrap();
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        first_started_rx.await.unwrap();
+
+        let second = tokio::spawn({
+            let cache = cache.clone();
+            let second_prepared = second_prepared.clone();
+            let second_started = second_started.clone();
+            async move {
+                cache
+                    .run_blocking_graph_compute_with(
+                        move || {
+                            second_prepared.store(true, Ordering::SeqCst);
+                        },
+                        move |()| {
+                            second_started.store(true, Ordering::SeqCst);
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second_prepared.load(Ordering::SeqCst),
+            "second graph compute should prepare after the shared permit"
+        );
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "second graph compute should wait for the shared permit"
+        );
+
+        release_first_tx.send(()).unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
+        assert!(second_prepared.load(Ordering::SeqCst));
+        assert!(second_started.load(Ordering::SeqCst));
     }
 
     #[test]
