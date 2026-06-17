@@ -55,6 +55,14 @@ struct ConsoleGraphRebuildStatus {
     message: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum GraphProgressAction {
+    Active(String),
+    Failed(String),
+    Ready,
+    Ignore,
+}
+
 #[derive(Clone, Copy)]
 struct LaneDisplay {
     y: i32,
@@ -177,6 +185,25 @@ fn progress_status_message(status: &ConsoleGraphRebuildStatus) -> String {
         status.processed.min(status.total),
         status.total
     )
+}
+
+fn graph_progress_action(
+    mode: &str,
+    statuses: &[ConsoleGraphRebuildStatus],
+) -> GraphProgressAction {
+    statuses
+        .iter()
+        .find(|status| status.mode == mode)
+        .map_or(GraphProgressAction::Ignore, progress_status_action)
+}
+
+fn progress_status_action(status: &ConsoleGraphRebuildStatus) -> GraphProgressAction {
+    match status.state.as_str() {
+        "scheduled" | "building" => GraphProgressAction::Active(progress_status_message(status)),
+        "failed" => GraphProgressAction::Failed(status.message.clone()),
+        "ready" => GraphProgressAction::Ready,
+        _ => GraphProgressAction::Ignore,
+    }
 }
 
 impl From<GraphViewport> for ViewportState {
@@ -862,33 +889,42 @@ impl VirtualGraph {
     }
 
     fn apply_progress_statuses(&mut self, statuses: &[ConsoleGraphRebuildStatus]) -> bool {
-        let Some(status) = statuses
-            .iter()
-            .find(|status| status.mode == self.graph_mode)
-        else {
-            return false;
-        };
+        self.apply_progress_action(graph_progress_action(&self.graph_mode, statuses))
+    }
+
+    fn apply_progress_action(&mut self, action: GraphProgressAction) -> bool {
+        match action {
+            GraphProgressAction::Active(message) => self.apply_active_progress(&message),
+            GraphProgressAction::Failed(message) => self.apply_terminal_progress(Some(&message)),
+            GraphProgressAction::Ready => self.apply_terminal_progress(None),
+            GraphProgressAction::Ignore => false,
+        }
+    }
+
+    fn apply_active_progress(&mut self, message: &str) -> bool {
+        self.graph_rebuild_active = true;
+        self.abort_version_refresh();
+        self.show_status(message);
+        false
+    }
+
+    fn apply_terminal_progress(&mut self, message: Option<&str>) -> bool {
         let was_active = self.graph_rebuild_active;
-        match status.state.as_str() {
-            "scheduled" | "building" => {
-                self.graph_rebuild_active = true;
-                self.abort_version_refresh();
-                self.show_status(&progress_status_message(status));
-                false
-            }
-            "failed" => {
-                self.graph_rebuild_active = false;
-                self.show_status(&status.message);
-                was_active && self.deferred_viewport_update_needed()
-            }
-            "ready" => {
-                self.graph_rebuild_active = false;
-                if !self.viewport_update_active() {
-                    self.hide_status();
-                }
-                was_active && self.deferred_viewport_update_needed()
-            }
-            _ => false,
+        self.graph_rebuild_active = false;
+        self.apply_terminal_progress_status(message);
+        was_active && self.deferred_viewport_update_needed()
+    }
+
+    fn apply_terminal_progress_status(&self, message: Option<&str>) {
+        match message {
+            Some(message) => self.show_status(message),
+            None => self.hide_status_when_idle(),
+        }
+    }
+
+    fn hide_status_when_idle(&self) {
+        if !self.viewport_update_active() {
+            self.hide_status();
         }
     }
 
@@ -3324,6 +3360,80 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_progress_action_formats_active_status() {
+        let statuses = [progress_status(
+            "primary",
+            "building",
+            9,
+            12,
+            "Building graph entries",
+        )];
+
+        let action = graph_progress_action("primary", &statuses);
+
+        assert_eq!(
+            action,
+            GraphProgressAction::Active("Building graph entries (9/12)".to_owned())
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_progress_action_clamps_processed_count() {
+        let statuses = [progress_status(
+            "primary",
+            "scheduled",
+            15,
+            12,
+            "Queued graph build",
+        )];
+
+        let action = graph_progress_action("primary", &statuses);
+
+        assert_eq!(
+            action,
+            GraphProgressAction::Active("Queued graph build (12/12)".to_owned())
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_progress_action_maps_terminal_statuses() {
+        let failed = [progress_status(
+            "primary",
+            "failed",
+            0,
+            0,
+            "Graph build failed",
+        )];
+        let ready = [progress_status("primary", "ready", 0, 0, "Graph ready")];
+
+        assert_eq!(
+            graph_progress_action("primary", &failed),
+            GraphProgressAction::Failed("Graph build failed".to_owned())
+        );
+        assert_eq!(
+            graph_progress_action("primary", &ready),
+            GraphProgressAction::Ready
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_progress_action_ignores_unmatched_or_unknown_statuses() {
+        let statuses = [
+            progress_status("other", "building", 1, 4, "Building other graph"),
+            progress_status("primary", "mystery", 0, 0, "Unknown status"),
+        ];
+
+        assert_eq!(
+            graph_progress_action("primary", &statuses),
+            GraphProgressAction::Ignore
+        );
+        assert_eq!(
+            graph_progress_action("missing", &statuses),
+            GraphProgressAction::Ignore
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_abort_error_does_not_log_to_console() {
         let fixture = GraphFixture::new();
         let (console_error_calls, _guard) = install_console_error_counter();
@@ -3900,6 +4010,22 @@ mod tests {
         )
         .expect_throw("abort error name should be set");
         error.into()
+    }
+
+    fn progress_status(
+        mode: &str,
+        state: &str,
+        processed: usize,
+        total: usize,
+        message: &str,
+    ) -> ConsoleGraphRebuildStatus {
+        ConsoleGraphRebuildStatus {
+            mode: mode.to_owned(),
+            state: state.to_owned(),
+            processed,
+            total,
+            message: message.to_owned(),
+        }
     }
 
     fn install_console_error_counter() -> (Rc<Cell<u32>>, ConsoleErrorGuard) {
