@@ -354,7 +354,6 @@ where
             Ok(snapshot) => snapshot,
             Err(error) => return plain_error(error.to_string()),
         };
-        let snapshot_version = snapshot.version;
         let response = match layout_graph_viewport_diff_with_cache(
             &state.cache,
             mode,
@@ -371,7 +370,7 @@ where
         {
             return json_response(&response, "graph viewport items diff");
         }
-        observed_version = snapshot_version;
+        observed_version = response.version;
     }
 }
 
