@@ -8,8 +8,8 @@ use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    AbortController, AbortSignal, Document, Element, KeyboardEvent, MouseEvent, RequestInit,
-    Response, WheelEvent, Window,
+    AbortController, AbortSignal, Document, Element, EventSource, KeyboardEvent, MessageEvent,
+    MouseEvent, RequestInit, Response, WheelEvent, Window,
 };
 
 use super::refresh::{
@@ -44,6 +44,15 @@ struct GraphItemsRefreshInput {
     window: Window,
     viewport: ViewportState,
     query: String,
+}
+
+#[derive(Deserialize)]
+struct ConsoleGraphRebuildStatus {
+    mode: String,
+    state: String,
+    processed: usize,
+    total: usize,
+    message: String,
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +126,9 @@ fn setup_graph() -> Result<Rc<RefCell<VirtualGraph>>, JsValue> {
     let graph = Rc::new(RefCell::new(graph));
 
     install_graph_listeners(graph.clone())?;
+    if let Err(error) = install_graph_progress_events(graph.clone()) {
+        web_sys::console::error_1(&error);
+    }
 
     Ok(graph)
 }
@@ -125,6 +137,41 @@ fn browser_context() -> Result<(Window, Document), JsValue> {
     let window = browser_window()?;
     let document = browser_document(&window)?;
     Ok((window, document))
+}
+
+fn install_graph_progress_events(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let source = EventSource::new("/events")?;
+    let callback_graph = graph.clone();
+    let callback =
+        Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+            let Some(data) = event.data().as_string() else {
+                return;
+            };
+            handle_graph_progress_event(callback_graph.clone(), &data);
+        }));
+    source.add_event_listener_with_callback("graph-progress", callback.as_ref().unchecked_ref())?;
+    callback.forget();
+    graph.borrow_mut().progress_events = Some(source);
+    Ok(())
+}
+
+fn handle_graph_progress_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
+    match serde_json::from_str::<Vec<ConsoleGraphRebuildStatus>>(data) {
+        Ok(statuses) => graph.borrow().apply_progress_statuses(&statuses),
+        Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
+    }
+}
+
+fn progress_status_message(status: &ConsoleGraphRebuildStatus) -> String {
+    if status.total == 0 {
+        return status.message.clone();
+    }
+    format!(
+        "{} ({}/{})",
+        status.message,
+        status.processed.min(status.total),
+        status.total
+    )
 }
 
 impl From<GraphViewport> for ViewportState {
@@ -220,6 +267,7 @@ struct VirtualGraph {
     patch_in_flight: bool,
     pending_viewport_update: PendingViewportUpdate,
     version_refresh_abort: Option<AbortController>,
+    progress_events: Option<EventSource>,
 }
 
 impl VirtualGraph {
@@ -261,6 +309,7 @@ impl VirtualGraph {
             patch_in_flight: false,
             pending_viewport_update: PendingViewportUpdate::None,
             version_refresh_abort: None,
+            progress_events: None,
         };
         graph.apply_follow_toggle_state()?;
         Ok(graph)
@@ -795,9 +844,32 @@ impl VirtualGraph {
     }
 
     fn show_loading_status(&self) {
+        self.show_status("Loading graph...");
+    }
+
+    fn show_status(&self, message: &str) {
         if let Some(status) = &self.status {
-            status.set_text_content(Some("Loading graph..."));
+            status.set_text_content(Some(message));
             let _ = status.remove_attribute("hidden");
+        }
+    }
+
+    fn apply_progress_statuses(&self, statuses: &[ConsoleGraphRebuildStatus]) {
+        let Some(status) = statuses
+            .iter()
+            .find(|status| status.mode == self.graph_mode)
+        else {
+            return;
+        };
+        match status.state.as_str() {
+            "scheduled" | "building" => self.show_status(&progress_status_message(status)),
+            "failed" => self.show_status(&status.message),
+            "ready" => {
+                if !self.viewport_update_active() {
+                    self.hide_status();
+                }
+            }
+            _ => {}
         }
     }
 
