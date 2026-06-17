@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::Result;
-use crate::api::GraphCanvas;
+use crate::api::{GraphCanvas, GraphViewportDiffResponse, GraphViewportResponse};
 use crate::config::ConsoleConfig;
 use crate::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
@@ -238,7 +238,16 @@ where
             Ok(snapshot) => snapshot,
             Err(error) => return plain_error(error.to_string()),
         };
-    let response = layout_graph_viewport(&snapshot, viewport_request_from_query(&query));
+    let response = match layout_graph_viewport_with_cache(
+        &state.cache,
+        snapshot,
+        viewport_request_from_query(&query),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => return plain_error(error.to_string()),
+    };
     json_response(&response, "graph viewport")
 }
 
@@ -300,7 +309,11 @@ where
     let snapshot = state
         .cache
         .snapshot_or_placeholder(graph_mode_from_query(&query));
-    let response = layout_graph_viewport_diff(&snapshot, request);
+    let response =
+        match layout_graph_viewport_diff_with_cache(&state.cache, snapshot, request).await {
+            Ok(response) => response,
+            Err(error) => return plain_error(error.to_string()),
+        };
     json_response(&response, "graph viewport diff")
 }
 
@@ -341,13 +354,20 @@ where
             Ok(snapshot) => snapshot,
             Err(error) => return plain_error(error.to_string()),
         };
-        let response = layout_graph_viewport_diff(&snapshot, request.clone());
+        let snapshot_version = snapshot.version;
+        let response =
+            match layout_graph_viewport_diff_with_cache(&state.cache, snapshot, request.clone())
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => return plain_error(error.to_string()),
+            };
         if viewport_diff_has_changes(&response, request.known.as_ref())
             || known_canvas != Some(response.canvas)
         {
             return json_response(&response, "graph viewport items diff");
         }
-        observed_version = snapshot.version;
+        observed_version = snapshot_version;
     }
 }
 
@@ -386,6 +406,32 @@ fn viewport_diff_has_fingerprint_changes(
             .get(&edge.key)
             .is_none_or(|fingerprint| fingerprint != &edge.fingerprint())
     })
+}
+
+async fn layout_graph_viewport_with_cache<S>(
+    cache: &ConsoleGraphCache<S>,
+    snapshot: Arc<GraphSnapshot>,
+    request: GraphViewportRequest,
+) -> Result<GraphViewportResponse>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    cache
+        .run_blocking_graph_compute(move || layout_graph_viewport(&snapshot, request))
+        .await
+}
+
+async fn layout_graph_viewport_diff_with_cache<S>(
+    cache: &ConsoleGraphCache<S>,
+    snapshot: Arc<GraphSnapshot>,
+    request: GraphViewportDiffRequest,
+) -> Result<GraphViewportDiffResponse>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    cache
+        .run_blocking_graph_compute(move || layout_graph_viewport_diff(&snapshot, request))
+        .await
 }
 
 async fn fragment<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
