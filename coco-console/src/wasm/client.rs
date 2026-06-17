@@ -157,7 +157,12 @@ fn install_graph_progress_events(graph: Rc<RefCell<VirtualGraph>>) -> Result<(),
 
 fn handle_graph_progress_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
     match serde_json::from_str::<Vec<ConsoleGraphRebuildStatus>>(data) {
-        Ok(statuses) => graph.borrow().apply_progress_statuses(&statuses),
+        Ok(statuses) => {
+            let should_resume = graph.borrow_mut().apply_progress_statuses(&statuses);
+            if should_resume {
+                request_viewport_update(graph, PendingViewportUpdate::None);
+            }
+        }
         Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
     }
 }
@@ -266,6 +271,7 @@ struct VirtualGraph {
     rendered_viewport: ViewportState,
     patch_in_flight: bool,
     pending_viewport_update: PendingViewportUpdate,
+    graph_rebuild_active: bool,
     version_refresh_abort: Option<AbortController>,
     progress_events: Option<EventSource>,
 }
@@ -308,6 +314,7 @@ impl VirtualGraph {
             rendered_viewport: viewport,
             patch_in_flight: false,
             pending_viewport_update: PendingViewportUpdate::None,
+            graph_rebuild_active: false,
             version_refresh_abort: None,
             progress_events: None,
         };
@@ -854,22 +861,34 @@ impl VirtualGraph {
         }
     }
 
-    fn apply_progress_statuses(&self, statuses: &[ConsoleGraphRebuildStatus]) {
+    fn apply_progress_statuses(&mut self, statuses: &[ConsoleGraphRebuildStatus]) -> bool {
         let Some(status) = statuses
             .iter()
             .find(|status| status.mode == self.graph_mode)
         else {
-            return;
+            return false;
         };
+        let was_active = self.graph_rebuild_active;
         match status.state.as_str() {
-            "scheduled" | "building" => self.show_status(&progress_status_message(status)),
-            "failed" => self.show_status(&status.message),
+            "scheduled" | "building" => {
+                self.graph_rebuild_active = true;
+                self.abort_version_refresh();
+                self.show_status(&progress_status_message(status));
+                false
+            }
+            "failed" => {
+                self.graph_rebuild_active = false;
+                self.show_status(&status.message);
+                was_active && self.deferred_viewport_update_needed()
+            }
             "ready" => {
+                self.graph_rebuild_active = false;
                 if !self.viewport_update_active() {
                     self.hide_status();
                 }
+                was_active && self.deferred_viewport_update_needed()
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -887,6 +906,11 @@ impl VirtualGraph {
 
     fn viewport_update_active(&self) -> bool {
         viewport_update_active(self.patch_in_flight, self.pending_viewport_update)
+    }
+
+    fn deferred_viewport_update_needed(&self) -> bool {
+        self.pending_viewport_update.is_pending()
+            || !same_viewport(self.rendered_viewport, self.viewport)
     }
 
     fn abort_version_refresh(&mut self) {
@@ -1049,7 +1073,7 @@ fn request_viewport_update(graph: Rc<RefCell<VirtualGraph>>, update: PendingView
     let should_spawn = {
         let mut graph = graph.borrow_mut();
         graph.pending_viewport_update = graph.pending_viewport_update.merge(update);
-        if graph.patch_in_flight {
+        if graph.graph_rebuild_active || graph.patch_in_flight {
             false
         } else {
             graph.patch_in_flight = true;
@@ -1377,6 +1401,10 @@ async fn render_next_viewport_patch_or_stop(graph: Rc<RefCell<VirtualGraph>>) ->
 }
 
 async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
+    if graph.borrow().graph_rebuild_active {
+        graph.borrow_mut().patch_in_flight = false;
+        return Ok(false);
+    }
     let input = next_viewport_patch_input(graph.clone());
     match input.fetch {
         ViewportFetch::None => finish_idle_viewport_patch(graph),
@@ -1472,16 +1500,18 @@ async fn refresh_graph_items_once(graph: Rc<RefCell<VirtualGraph>>) {
 
 fn graph_items_refresh_input(graph: Rc<RefCell<VirtualGraph>>) -> Option<GraphItemsRefreshInput> {
     let graph = graph.borrow();
-    (!graph.viewport_update_active()).then(|| GraphItemsRefreshInput {
-        window: graph.window.clone(),
-        viewport: graph.viewport,
-        query: graph_items_refresh_query(
-            graph.version,
-            graph.viewport,
-            graph.canvas,
-            graph.rendered.known_query(),
-            &graph.graph_mode,
-        ),
+    (!graph.graph_rebuild_active && !graph.viewport_update_active()).then(|| {
+        GraphItemsRefreshInput {
+            window: graph.window.clone(),
+            viewport: graph.viewport,
+            query: graph_items_refresh_query(
+                graph.version,
+                graph.viewport,
+                graph.canvas,
+                graph.rendered.known_query(),
+                &graph.graph_mode,
+            ),
+        }
     })
 }
 
@@ -1610,7 +1640,7 @@ fn begin_version_refresh(
     graph: Rc<RefCell<VirtualGraph>>,
 ) -> Result<Option<AbortController>, JsValue> {
     let mut graph = graph.borrow_mut();
-    if graph.viewport_update_active() {
+    if graph.graph_rebuild_active || graph.viewport_update_active() {
         return Ok(None);
     }
     let controller = AbortController::new()?;
@@ -1652,6 +1682,10 @@ where
 }
 
 async fn refresh_server_rendered_sections_once(graph: Rc<RefCell<VirtualGraph>>) {
+    if graph.borrow().graph_rebuild_active {
+        delay_graph_items_retry(graph).await;
+        return;
+    }
     let (window, document, url) = server_rendered_sections_request(&graph);
     let response = refresh_server_rendered_sections_from_url(&window, &document, &url)
         .await
@@ -2486,10 +2520,19 @@ fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
 async fn refresh_selected_node_detail_from_graph(
     graph: Rc<RefCell<VirtualGraph>>,
 ) -> Result<(), JsValue> {
-    let (window, document) = {
+    let (window, document, graph_rebuild_active) = {
         let graph = graph.borrow();
-        (graph.window.clone(), graph.document.clone())
+        (
+            graph.window.clone(),
+            graph.document.clone(),
+            graph.graph_rebuild_active,
+        )
     };
+    if graph_rebuild_active {
+        let _ = selected_node_detail_request(&window, &document)?;
+        focus_selected_node_in_graph(graph);
+        return Ok(());
+    }
     refresh_selected_node_detail(&window, &document).await?;
     focus_selected_node_in_graph(graph);
     Ok(())
