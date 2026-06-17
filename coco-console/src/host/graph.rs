@@ -46,6 +46,33 @@ pub struct GraphSnapshot {
     pub provider_contexts: Vec<GraphProviderContext>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphBuildPhase {
+    Branches,
+    ProviderContexts,
+    Entries,
+    Snapshot,
+}
+
+impl GraphBuildPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Branches => "Collecting branches",
+            Self::ProviderContexts => "Collecting provider contexts",
+            Self::Entries => "Building graph entries",
+            Self::Snapshot => "Finalizing snapshot",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct GraphBuildProgress {
+    pub phase: GraphBuildPhase,
+    pub processed: usize,
+    pub total: usize,
+}
+
 #[derive(Debug, Serialize, PartialEq)]
 pub struct GraphNode {
     pub id: String,
@@ -149,15 +176,33 @@ pub fn build_graph_snapshot(
     build_graph_snapshot_with_mode(store, version, GraphMode::All)
 }
 
+#[cfg(test)]
 pub fn build_graph_snapshot_with_mode(
     store: &(impl BranchStore + NodeStore + SessionStore),
     version: u64,
     mode: GraphMode,
 ) -> Result<GraphSnapshot> {
-    let mut state = collect_graph_state(store, mode)?;
-    let contexts = state.provider_contexts(store)?;
-    let entries = sorted_graph_entries(&mut state, store, &contexts)?;
+    build_graph_snapshot_with_mode_and_progress(store, version, mode, |_| {})
+}
+
+pub fn build_graph_snapshot_with_mode_and_progress<F>(
+    store: &(impl BranchStore + NodeStore + SessionStore),
+    version: u64,
+    mode: GraphMode,
+    mut progress: F,
+) -> Result<GraphSnapshot>
+where
+    F: FnMut(GraphBuildProgress),
+{
+    let mut state = collect_graph_state(store, mode, &mut progress)?;
+    let contexts = state.provider_contexts(store, &mut progress)?;
+    let entries = sorted_graph_entries(&mut state, store, &contexts, &mut progress)?;
     let (nodes, edges) = graph_items_from_entries(entries);
+    progress(GraphBuildProgress {
+        phase: GraphBuildPhase::Snapshot,
+        processed: 1,
+        total: 1,
+    });
 
     Ok(GraphSnapshot {
         version,
@@ -170,23 +215,43 @@ pub fn build_graph_snapshot_with_mode(
     })
 }
 
-fn collect_graph_state(
+fn collect_graph_state<F>(
     store: &(impl BranchStore + NodeStore + SessionStore),
     mode: GraphMode,
-) -> Result<GraphBuildState> {
+    progress: &mut F,
+) -> Result<GraphBuildState>
+where
+    F: FnMut(GraphBuildProgress),
+{
     let mut state = GraphBuildState::new(mode);
-    for (branch, session_state) in sorted_session_states(store)? {
+    let session_states = sorted_session_states(store)?;
+    let total = session_states.len();
+    (*progress)(GraphBuildProgress {
+        phase: GraphBuildPhase::Branches,
+        processed: 0,
+        total,
+    });
+    for (index, (branch, session_state)) in session_states.into_iter().enumerate() {
         state.collect_branch(store, branch, session_state)?;
+        (*progress)(GraphBuildProgress {
+            phase: GraphBuildPhase::Branches,
+            processed: index + 1,
+            total,
+        });
     }
     Ok(state)
 }
 
-fn sorted_graph_entries(
+fn sorted_graph_entries<F>(
     state: &mut GraphBuildState,
     store: &impl NodeStore,
     contexts: &[GraphProviderContext],
-) -> Result<Vec<GraphNodeEntry>> {
-    let mut entries = state.node_entries(store, contexts)?;
+    progress: &mut F,
+) -> Result<Vec<GraphNodeEntry>>
+where
+    F: FnMut(GraphBuildProgress),
+{
+    let mut entries = state.node_entries(store, contexts, progress)?;
     entries.sort_by(graph_entry_order);
     Ok(entries)
 }
@@ -343,16 +408,33 @@ impl GraphBuildState {
             });
     }
 
-    fn node_entries(
+    fn node_entries<F>(
         &mut self,
         store: &impl NodeStore,
         contexts: &[GraphProviderContext],
-    ) -> Result<Vec<GraphNodeEntry>> {
+        progress: &mut F,
+    ) -> Result<Vec<GraphNodeEntry>>
+    where
+        F: FnMut(GraphBuildProgress),
+    {
         let context_ids_by_node = provider_context_ids_by_node(contexts, &self.visible_node_ids);
-        std::mem::take(&mut self.visible_nodes)
-            .into_values()
-            .map(|node| self.node_entry(store, node, &context_ids_by_node))
-            .collect()
+        let visible_nodes = std::mem::take(&mut self.visible_nodes);
+        let total = visible_nodes.len();
+        (*progress)(GraphBuildProgress {
+            phase: GraphBuildPhase::Entries,
+            processed: 0,
+            total,
+        });
+        let mut entries = Vec::with_capacity(total);
+        for (index, node) in visible_nodes.into_values().enumerate() {
+            entries.push(self.node_entry(store, node, &context_ids_by_node)?);
+            (*progress)(GraphBuildProgress {
+                phase: GraphBuildPhase::Entries,
+                processed: index + 1,
+                total,
+            });
+        }
+        Ok(entries)
     }
 
     fn node_entry(
@@ -382,13 +464,31 @@ impl GraphBuildState {
         })
     }
 
-    fn provider_contexts(&self, store: &impl NodeStore) -> Result<Vec<GraphProviderContext>> {
+    fn provider_contexts<F>(
+        &self,
+        store: &impl NodeStore,
+        progress: &mut F,
+    ) -> Result<Vec<GraphProviderContext>>
+    where
+        F: FnMut(GraphBuildProgress),
+    {
         let mut contexts = HashMap::<String, GraphProviderContext>::new();
-        for branch in &self.branches {
+        let total = self.branches.len();
+        progress(GraphBuildProgress {
+            phase: GraphBuildPhase::ProviderContexts,
+            processed: 0,
+            total,
+        });
+        for (index, branch) in self.branches.iter().enumerate() {
             let ancestry = store.ancestry(&branch.head_id).context(StoreSnafu)?;
             for context_nodes in provider_contexts_from_head(ancestry) {
                 self.insert_provider_context(&mut contexts, &branch.name, context_nodes);
             }
+            progress(GraphBuildProgress {
+                phase: GraphBuildPhase::ProviderContexts,
+                processed: index + 1,
+                total,
+            });
         }
 
         let mut contexts = contexts.into_values().collect::<Vec<_>>();

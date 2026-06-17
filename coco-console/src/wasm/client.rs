@@ -8,8 +8,8 @@ use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    AbortController, AbortSignal, Document, Element, KeyboardEvent, MouseEvent, RequestInit,
-    Response, WheelEvent, Window,
+    AbortController, AbortSignal, Document, Element, EventSource, KeyboardEvent, MessageEvent,
+    MouseEvent, RequestInit, Response, WheelEvent, Window,
 };
 
 use super::refresh::{
@@ -44,6 +44,23 @@ struct GraphItemsRefreshInput {
     window: Window,
     viewport: ViewportState,
     query: String,
+}
+
+#[derive(Deserialize)]
+struct ConsoleGraphRebuildStatus {
+    mode: String,
+    state: String,
+    processed: usize,
+    total: usize,
+    message: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GraphProgressAction {
+    Active(String),
+    Failed(String),
+    Ready,
+    Ignore,
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +134,9 @@ fn setup_graph() -> Result<Rc<RefCell<VirtualGraph>>, JsValue> {
     let graph = Rc::new(RefCell::new(graph));
 
     install_graph_listeners(graph.clone())?;
+    if let Err(error) = install_graph_progress_events(graph.clone()) {
+        web_sys::console::error_1(&error);
+    }
 
     Ok(graph)
 }
@@ -125,6 +145,65 @@ fn browser_context() -> Result<(Window, Document), JsValue> {
     let window = browser_window()?;
     let document = browser_document(&window)?;
     Ok((window, document))
+}
+
+fn install_graph_progress_events(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let source = EventSource::new("/events")?;
+    let callback_graph = graph.clone();
+    let callback =
+        Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+            let Some(data) = event.data().as_string() else {
+                return;
+            };
+            handle_graph_progress_event(callback_graph.clone(), &data);
+        }));
+    source.add_event_listener_with_callback("graph-progress", callback.as_ref().unchecked_ref())?;
+    callback.forget();
+    graph.borrow_mut().progress_events = Some(source);
+    Ok(())
+}
+
+fn handle_graph_progress_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
+    match serde_json::from_str::<Vec<ConsoleGraphRebuildStatus>>(data) {
+        Ok(statuses) => {
+            let should_resume = graph.borrow_mut().apply_progress_statuses(&statuses);
+            if should_resume {
+                request_viewport_update(graph, PendingViewportUpdate::None);
+            }
+        }
+        Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
+    }
+}
+
+fn progress_status_message(status: &ConsoleGraphRebuildStatus) -> String {
+    if status.total == 0 {
+        return status.message.clone();
+    }
+    format!(
+        "{} ({}/{})",
+        status.message,
+        status.processed.min(status.total),
+        status.total
+    )
+}
+
+fn graph_progress_action(
+    mode: &str,
+    statuses: &[ConsoleGraphRebuildStatus],
+) -> GraphProgressAction {
+    statuses
+        .iter()
+        .find(|status| status.mode == mode)
+        .map_or(GraphProgressAction::Ignore, progress_status_action)
+}
+
+fn progress_status_action(status: &ConsoleGraphRebuildStatus) -> GraphProgressAction {
+    match status.state.as_str() {
+        "scheduled" | "building" => GraphProgressAction::Active(progress_status_message(status)),
+        "failed" => GraphProgressAction::Failed(status.message.clone()),
+        "ready" => GraphProgressAction::Ready,
+        _ => GraphProgressAction::Ignore,
+    }
 }
 
 impl From<GraphViewport> for ViewportState {
@@ -219,7 +298,9 @@ struct VirtualGraph {
     rendered_viewport: ViewportState,
     patch_in_flight: bool,
     pending_viewport_update: PendingViewportUpdate,
+    graph_rebuild_active: bool,
     version_refresh_abort: Option<AbortController>,
+    progress_events: Option<EventSource>,
 }
 
 impl VirtualGraph {
@@ -260,7 +341,9 @@ impl VirtualGraph {
             rendered_viewport: viewport,
             patch_in_flight: false,
             pending_viewport_update: PendingViewportUpdate::None,
+            graph_rebuild_active: false,
             version_refresh_abort: None,
+            progress_events: None,
         };
         graph.apply_follow_toggle_state()?;
         Ok(graph)
@@ -795,9 +878,53 @@ impl VirtualGraph {
     }
 
     fn show_loading_status(&self) {
+        self.show_status("Loading graph...");
+    }
+
+    fn show_status(&self, message: &str) {
         if let Some(status) = &self.status {
-            status.set_text_content(Some("Loading graph..."));
+            status.set_text_content(Some(message));
             let _ = status.remove_attribute("hidden");
+        }
+    }
+
+    fn apply_progress_statuses(&mut self, statuses: &[ConsoleGraphRebuildStatus]) -> bool {
+        self.apply_progress_action(graph_progress_action(&self.graph_mode, statuses))
+    }
+
+    fn apply_progress_action(&mut self, action: GraphProgressAction) -> bool {
+        match action {
+            GraphProgressAction::Active(message) => self.apply_active_progress(&message),
+            GraphProgressAction::Failed(message) => self.apply_terminal_progress(Some(&message)),
+            GraphProgressAction::Ready => self.apply_terminal_progress(None),
+            GraphProgressAction::Ignore => false,
+        }
+    }
+
+    fn apply_active_progress(&mut self, message: &str) -> bool {
+        self.graph_rebuild_active = true;
+        self.abort_version_refresh();
+        self.show_status(message);
+        false
+    }
+
+    fn apply_terminal_progress(&mut self, message: Option<&str>) -> bool {
+        let was_active = self.graph_rebuild_active;
+        self.graph_rebuild_active = false;
+        self.apply_terminal_progress_status(message);
+        was_active && self.deferred_viewport_update_needed()
+    }
+
+    fn apply_terminal_progress_status(&self, message: Option<&str>) {
+        match message {
+            Some(message) => self.show_status(message),
+            None => self.hide_status_when_idle(),
+        }
+    }
+
+    fn hide_status_when_idle(&self) {
+        if !self.viewport_update_active() {
+            self.hide_status();
         }
     }
 
@@ -815,6 +942,11 @@ impl VirtualGraph {
 
     fn viewport_update_active(&self) -> bool {
         viewport_update_active(self.patch_in_flight, self.pending_viewport_update)
+    }
+
+    fn deferred_viewport_update_needed(&self) -> bool {
+        self.pending_viewport_update.is_pending()
+            || !same_viewport(self.rendered_viewport, self.viewport)
     }
 
     fn abort_version_refresh(&mut self) {
@@ -977,7 +1109,7 @@ fn request_viewport_update(graph: Rc<RefCell<VirtualGraph>>, update: PendingView
     let should_spawn = {
         let mut graph = graph.borrow_mut();
         graph.pending_viewport_update = graph.pending_viewport_update.merge(update);
-        if graph.patch_in_flight {
+        if graph.graph_rebuild_active || graph.patch_in_flight {
             false
         } else {
             graph.patch_in_flight = true;
@@ -1305,6 +1437,10 @@ async fn render_next_viewport_patch_or_stop(graph: Rc<RefCell<VirtualGraph>>) ->
 }
 
 async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
+    if graph.borrow().graph_rebuild_active {
+        graph.borrow_mut().patch_in_flight = false;
+        return Ok(false);
+    }
     let input = next_viewport_patch_input(graph.clone());
     match input.fetch {
         ViewportFetch::None => finish_idle_viewport_patch(graph),
@@ -1400,16 +1536,18 @@ async fn refresh_graph_items_once(graph: Rc<RefCell<VirtualGraph>>) {
 
 fn graph_items_refresh_input(graph: Rc<RefCell<VirtualGraph>>) -> Option<GraphItemsRefreshInput> {
     let graph = graph.borrow();
-    (!graph.viewport_update_active()).then(|| GraphItemsRefreshInput {
-        window: graph.window.clone(),
-        viewport: graph.viewport,
-        query: graph_items_refresh_query(
-            graph.version,
-            graph.viewport,
-            graph.canvas,
-            graph.rendered.known_query(),
-            &graph.graph_mode,
-        ),
+    (!graph.graph_rebuild_active && !graph.viewport_update_active()).then(|| {
+        GraphItemsRefreshInput {
+            window: graph.window.clone(),
+            viewport: graph.viewport,
+            query: graph_items_refresh_query(
+                graph.version,
+                graph.viewport,
+                graph.canvas,
+                graph.rendered.known_query(),
+                &graph.graph_mode,
+            ),
+        }
     })
 }
 
@@ -1538,7 +1676,7 @@ fn begin_version_refresh(
     graph: Rc<RefCell<VirtualGraph>>,
 ) -> Result<Option<AbortController>, JsValue> {
     let mut graph = graph.borrow_mut();
-    if graph.viewport_update_active() {
+    if graph.graph_rebuild_active || graph.viewport_update_active() {
         return Ok(None);
     }
     let controller = AbortController::new()?;
@@ -1580,6 +1718,10 @@ where
 }
 
 async fn refresh_server_rendered_sections_once(graph: Rc<RefCell<VirtualGraph>>) {
+    if graph.borrow().graph_rebuild_active {
+        delay_graph_items_retry(graph).await;
+        return;
+    }
     let (window, document, url) = server_rendered_sections_request(&graph);
     let response = refresh_server_rendered_sections_from_url(&window, &document, &url)
         .await
@@ -2414,10 +2556,19 @@ fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
 async fn refresh_selected_node_detail_from_graph(
     graph: Rc<RefCell<VirtualGraph>>,
 ) -> Result<(), JsValue> {
-    let (window, document) = {
+    let (window, document, graph_rebuild_active) = {
         let graph = graph.borrow();
-        (graph.window.clone(), graph.document.clone())
+        (
+            graph.window.clone(),
+            graph.document.clone(),
+            graph.graph_rebuild_active,
+        )
     };
+    if graph_rebuild_active {
+        let _ = selected_node_detail_request(&window, &document)?;
+        focus_selected_node_in_graph(graph);
+        return Ok(());
+    }
     refresh_selected_node_detail(&window, &document).await?;
     focus_selected_node_in_graph(graph);
     Ok(())
@@ -3209,6 +3360,80 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_progress_action_formats_active_status() {
+        let statuses = [progress_status(
+            "primary",
+            "building",
+            9,
+            12,
+            "Building graph entries",
+        )];
+
+        let action = graph_progress_action("primary", &statuses);
+
+        assert_eq!(
+            action,
+            GraphProgressAction::Active("Building graph entries (9/12)".to_owned())
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_progress_action_clamps_processed_count() {
+        let statuses = [progress_status(
+            "primary",
+            "scheduled",
+            15,
+            12,
+            "Queued graph build",
+        )];
+
+        let action = graph_progress_action("primary", &statuses);
+
+        assert_eq!(
+            action,
+            GraphProgressAction::Active("Queued graph build (12/12)".to_owned())
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_progress_action_maps_terminal_statuses() {
+        let failed = [progress_status(
+            "primary",
+            "failed",
+            0,
+            0,
+            "Graph build failed",
+        )];
+        let ready = [progress_status("primary", "ready", 0, 0, "Graph ready")];
+
+        assert_eq!(
+            graph_progress_action("primary", &failed),
+            GraphProgressAction::Failed("Graph build failed".to_owned())
+        );
+        assert_eq!(
+            graph_progress_action("primary", &ready),
+            GraphProgressAction::Ready
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_progress_action_ignores_unmatched_or_unknown_statuses() {
+        let statuses = [
+            progress_status("other", "building", 1, 4, "Building other graph"),
+            progress_status("primary", "mystery", 0, 0, "Unknown status"),
+        ];
+
+        assert_eq!(
+            graph_progress_action("primary", &statuses),
+            GraphProgressAction::Ignore
+        );
+        assert_eq!(
+            graph_progress_action("missing", &statuses),
+            GraphProgressAction::Ignore
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_abort_error_does_not_log_to_console() {
         let fixture = GraphFixture::new();
         let (console_error_calls, _guard) = install_console_error_counter();
@@ -3785,6 +4010,22 @@ mod tests {
         )
         .expect_throw("abort error name should be set");
         error.into()
+    }
+
+    fn progress_status(
+        mode: &str,
+        state: &str,
+        processed: usize,
+        total: usize,
+        message: &str,
+    ) -> ConsoleGraphRebuildStatus {
+        ConsoleGraphRebuildStatus {
+            mode: mode.to_owned(),
+            state: state.to_owned(),
+            processed,
+            total,
+            message: message.to_owned(),
+        }
     }
 
     fn install_console_error_counter() -> (Rc<Cell<u32>>, ConsoleErrorGuard) {

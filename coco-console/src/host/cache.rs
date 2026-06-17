@@ -1,14 +1,46 @@
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use crate::graph::{GraphMode, GraphSnapshot, build_graph_snapshot_with_mode};
+use crate::graph::{
+    GraphBuildPhase, GraphBuildProgress, GraphMode, GraphSnapshot,
+    build_graph_snapshot_with_mode_and_progress,
+};
 use crate::publisher::ConsolePublisher;
 use coco_mem::Store;
+use serde::Serialize;
+use tokio::sync::Semaphore;
+
+const GRAPH_REBUILD_THROTTLE: Duration = Duration::from_millis(75);
+const GRAPH_REBUILD_COOLDOWN: Duration = Duration::from_millis(150);
+const GRAPH_REBUILD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleGraphRebuildState {
+    Scheduled,
+    Building,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConsoleGraphRebuildStatus {
+    pub mode: GraphMode,
+    pub source_version: u64,
+    pub state: ConsoleGraphRebuildState,
+    pub phase: Option<GraphBuildPhase>,
+    pub processed: usize,
+    pub total: usize,
+    pub message: String,
+}
 
 #[derive(Clone)]
 pub struct ConsoleGraphCache<S> {
     store: S,
     invalidations: ConsolePublisher,
     ready: ConsolePublisher,
+    progress: ConsolePublisher,
+    build_permits: Arc<Semaphore>,
     state: Arc<Mutex<CacheState>>,
 }
 
@@ -22,9 +54,12 @@ struct CacheState {
 struct CacheSlot {
     snapshot: Option<Arc<GraphSnapshot>>,
     source_version: u64,
+    scheduled_source_version: Option<u64>,
     building_source_version: Option<u64>,
     failure: Option<CacheFailure>,
     requested: bool,
+    status: Option<ConsoleGraphRebuildStatus>,
+    last_status_published_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -42,6 +77,8 @@ where
             store,
             invalidations,
             ready: ConsolePublisher::new(),
+            progress: ConsolePublisher::new(),
+            build_permits: Arc::new(Semaphore::new(1)),
             state: Arc::new(Mutex::new(CacheState::default())),
         }
     }
@@ -52,6 +89,21 @@ where
 
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.ready.subscribe()
+    }
+
+    pub fn subscribe_progress(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.progress.subscribe()
+    }
+
+    pub fn rebuild_statuses(&self) -> Vec<ConsoleGraphRebuildStatus> {
+        let state = self
+            .state
+            .lock()
+            .expect("console graph cache lock poisoned");
+        [GraphMode::Anchors, GraphMode::All]
+            .into_iter()
+            .filter_map(|mode| state.slot(mode).status.clone())
+            .collect()
     }
 
     pub fn subscribe_invalidations(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -171,7 +223,7 @@ where
 
     fn ensure_rebuild_with_request(&self, mode: GraphMode, mark_requested: bool) {
         let source_version = self.invalidations.current_version();
-        let should_spawn = {
+        let action = {
             let mut state = self
                 .state
                 .lock()
@@ -180,15 +232,79 @@ where
             if mark_requested {
                 slot.requested = true;
             }
-            if !slot.requested || !slot.needs_rebuild(source_version) {
+            if !slot.requested
+                || !slot.needs_rebuild(source_version)
+                || slot.building_source_version.is_some()
+                || slot.scheduled_source_version.is_some()
+            {
+                RebuildAction::None
+            } else if slot.snapshot.is_some() {
+                slot.scheduled_source_version = Some(source_version);
+                slot.set_status(
+                    ConsoleGraphRebuildStatus::scheduled(mode, source_version),
+                    Instant::now(),
+                    true,
+                );
+                RebuildAction::Schedule
+            } else {
+                slot.building_source_version = Some(source_version);
+                slot.set_status(
+                    ConsoleGraphRebuildStatus::scheduled(mode, source_version),
+                    Instant::now(),
+                    true,
+                );
+                RebuildAction::Spawn(source_version)
+            }
+        };
+
+        match action {
+            RebuildAction::None => {}
+            RebuildAction::Schedule => {
+                self.progress.mark_changed();
+                self.spawn_scheduled_rebuild(mode);
+            }
+            RebuildAction::Spawn(source_version) => {
+                self.progress.mark_changed();
+                self.spawn_rebuild(mode, source_version);
+            }
+        }
+    }
+
+    fn spawn_scheduled_rebuild(&self, mode: GraphMode) {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(GRAPH_REBUILD_THROTTLE).await;
+            cache.start_scheduled_rebuild(mode);
+        });
+    }
+
+    fn start_scheduled_rebuild(&self, mode: GraphMode) {
+        let source_version = self.invalidations.current_version();
+        let should_spawn = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("console graph cache lock poisoned");
+            let slot = state.slot_mut(mode);
+            slot.scheduled_source_version = None;
+            if !slot.requested
+                || !slot.needs_rebuild(source_version)
+                || slot.building_source_version.is_some()
+            {
                 false
             } else {
                 slot.building_source_version = Some(source_version);
+                slot.set_status(
+                    ConsoleGraphRebuildStatus::scheduled(mode, source_version),
+                    Instant::now(),
+                    true,
+                );
                 true
             }
         };
 
         if should_spawn {
+            self.progress.mark_changed();
             self.spawn_rebuild(mode, source_version);
         }
     }
@@ -196,9 +312,19 @@ where
     fn spawn_rebuild(&self, mode: GraphMode, source_version: u64) {
         let cache = self.clone();
         tokio::spawn(async move {
+            let Ok(permit) = cache.build_permits.clone().acquire_owned().await else {
+                return;
+            };
+            let Some(source_version) = cache.begin_rebuild_after_permit(mode, source_version)
+            else {
+                return;
+            };
             let store = cache.store.clone();
+            let progress_cache = cache.clone();
             let result = match tokio::task::spawn_blocking(move || {
-                build_graph_snapshot_with_mode(&store, 0, mode)
+                build_graph_snapshot_with_mode_and_progress(&store, 0, mode, |progress| {
+                    progress_cache.record_rebuild_progress(mode, source_version, progress);
+                })
             })
             .await
             {
@@ -206,7 +332,71 @@ where
                 Err(source) => Err(crate::Error::JoinConsoleServer { source }),
             };
             cache.finish_rebuild(mode, source_version, result);
+            tokio::time::sleep(GRAPH_REBUILD_COOLDOWN).await;
+            drop(permit);
         });
+    }
+
+    fn begin_rebuild_after_permit(
+        &self,
+        mode: GraphMode,
+        queued_source_version: u64,
+    ) -> Option<u64> {
+        let source_version = self.invalidations.current_version();
+        let should_publish = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("console graph cache lock poisoned");
+            let slot = state.slot_mut(mode);
+            if slot.building_source_version != Some(queued_source_version) {
+                return None;
+            }
+            slot.building_source_version = Some(source_version);
+            slot.set_status(
+                ConsoleGraphRebuildStatus::building(
+                    mode,
+                    source_version,
+                    GraphBuildProgress {
+                        phase: GraphBuildPhase::Branches,
+                        processed: 0,
+                        total: 0,
+                    },
+                ),
+                Instant::now(),
+                true,
+            )
+        };
+        if should_publish {
+            self.progress.mark_changed();
+        }
+        Some(source_version)
+    }
+
+    fn record_rebuild_progress(
+        &self,
+        mode: GraphMode,
+        source_version: u64,
+        progress: GraphBuildProgress,
+    ) {
+        let should_publish = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("console graph cache lock poisoned");
+            let slot = state.slot_mut(mode);
+            if slot.building_source_version != Some(source_version) {
+                return;
+            }
+            slot.set_status(
+                ConsoleGraphRebuildStatus::building(mode, source_version, progress),
+                Instant::now(),
+                false,
+            )
+        };
+        if should_publish {
+            self.progress.mark_changed();
+        }
     }
 
     fn finish_rebuild(
@@ -244,11 +434,17 @@ where
             slot.source_version = source_version;
             slot.building_source_version = None;
             slot.failure = None;
+            slot.set_status(
+                ConsoleGraphRebuildStatus::ready(mode, source_version, graph_version),
+                Instant::now(),
+                true,
+            );
             let published_version = self.ready.mark_changed();
             debug_assert_eq!(published_version, graph_version);
             slot.requested && slot.needs_rebuild(self.invalidations.current_version())
         };
 
+        self.progress.mark_changed();
         if should_rebuild {
             self.ensure_rebuild(mode);
         }
@@ -267,7 +463,13 @@ where
                     source_version,
                     message: Arc::from(message),
                 });
+                slot.set_status(
+                    ConsoleGraphRebuildStatus::failed(mode, source_version),
+                    Instant::now(),
+                    true,
+                );
                 self.ready.mark_changed();
+                self.progress.mark_changed();
             }
             slot.requested && slot.needs_rebuild(self.invalidations.current_version())
         };
@@ -310,11 +512,92 @@ impl CacheSlot {
         let snapshot_is_missing = self.snapshot.is_none();
         let snapshot_is_stale = self.source_version < source_version;
         (snapshot_is_missing || snapshot_is_stale)
+            && self.scheduled_source_version != Some(source_version)
             && self.building_source_version != Some(source_version)
             && self
                 .failure
                 .as_ref()
                 .is_none_or(|failure| failure.source_version != source_version)
+    }
+
+    fn set_status(
+        &mut self,
+        status: ConsoleGraphRebuildStatus,
+        now: Instant,
+        force_publish: bool,
+    ) -> bool {
+        let phase_changed = self
+            .status
+            .as_ref()
+            .is_none_or(|current| current.state != status.state || current.phase != status.phase);
+        self.status = Some(status);
+        if force_publish
+            || phase_changed
+            || self
+                .last_status_published_at
+                .is_none_or(|last| now.duration_since(last) >= GRAPH_REBUILD_PROGRESS_INTERVAL)
+        {
+            self.last_status_published_at = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+enum RebuildAction {
+    None,
+    Schedule,
+    Spawn(u64),
+}
+
+impl ConsoleGraphRebuildStatus {
+    fn scheduled(mode: GraphMode, source_version: u64) -> Self {
+        Self {
+            mode,
+            source_version,
+            state: ConsoleGraphRebuildState::Scheduled,
+            phase: None,
+            processed: 0,
+            total: 0,
+            message: "Graph rebuild queued".to_owned(),
+        }
+    }
+
+    fn building(mode: GraphMode, source_version: u64, progress: GraphBuildProgress) -> Self {
+        Self {
+            mode,
+            source_version,
+            state: ConsoleGraphRebuildState::Building,
+            phase: Some(progress.phase),
+            processed: progress.processed,
+            total: progress.total,
+            message: progress.phase.label().to_owned(),
+        }
+    }
+
+    fn ready(mode: GraphMode, source_version: u64, graph_version: u64) -> Self {
+        Self {
+            mode,
+            source_version,
+            state: ConsoleGraphRebuildState::Ready,
+            phase: Some(GraphBuildPhase::Snapshot),
+            processed: 1,
+            total: 1,
+            message: format!("Graph version {graph_version} ready"),
+        }
+    }
+
+    fn failed(mode: GraphMode, source_version: u64) -> Self {
+        Self {
+            mode,
+            source_version,
+            state: ConsoleGraphRebuildState::Failed,
+            phase: None,
+            processed: 0,
+            total: 0,
+            message: "Graph rebuild failed".to_owned(),
+        }
     }
 }
 
@@ -425,6 +708,43 @@ mod tests {
             cache.cached_source_version(GraphMode::Anchors),
             current_source_version
         );
+    }
+
+    #[tokio::test]
+    async fn cache_queues_stale_rebuilds_before_refreshing_snapshot() {
+        let publisher = ConsolePublisher::new();
+        let (store, _, text) = graph_store(publisher.clone());
+        let cache = ConsoleGraphCache::new(store.clone(), publisher.clone());
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let next_text = store
+            .append(NewNode {
+                parent: text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("queued all-mode node".to_owned()),
+            })
+            .unwrap();
+        store.set_branch_head("main", &text, &next_text).unwrap();
+
+        let stale = cache.snapshot_or_placeholder(GraphMode::All);
+        let statuses = cache.rebuild_statuses();
+
+        assert_eq!(stale.version, initial.version);
+        assert!(
+            statuses.iter().any(|status| {
+                status.mode == GraphMode::All && status.state == ConsoleGraphRebuildState::Scheduled
+            }),
+            "stale requested mode should publish a queued rebuild status"
+        );
+
+        let refreshed = cache.current_snapshot(GraphMode::All).await;
+
+        assert!(refreshed.version > initial.version);
+        assert!(refreshed.nodes.iter().any(|node| node.id == next_text));
+        assert!(cache.rebuild_statuses().iter().any(|status| {
+            status.mode == GraphMode::All && status.state == ConsoleGraphRebuildState::Ready
+        }));
     }
 
     #[test]

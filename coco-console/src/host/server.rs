@@ -440,18 +440,21 @@ where
 {
     let current_version = state.cache.current_version();
     let rx = state.cache.subscribe();
+    let progress_rx = state.cache.subscribe_progress();
     let invalidations = state.cache.subscribe_invalidations();
     let cache = state.cache.clone();
-    let initial = stream::once(async move {
+    let initial_progress = graph_progress_event(&cache);
+    let initial = stream::iter([
         Ok::<_, Infallible>(
             Event::default()
                 .event("graph")
                 .data(current_version.to_string()),
-        )
-    });
+        ),
+        Ok::<_, Infallible>(initial_progress),
+    ]);
     let changes = stream::unfold(
-        (rx, invalidations, cache),
-        |(mut rx, mut invalidations, cache)| async move {
+        (rx, progress_rx, invalidations, cache),
+        |(mut rx, mut progress_rx, mut invalidations, cache)| async move {
             loop {
                 tokio::select! {
                     changed = rx.changed() => {
@@ -463,7 +466,19 @@ where
                             Ok::<_, Infallible>(
                                 Event::default().event("graph").data(version.to_string()),
                             ),
-                            (rx, invalidations, cache),
+                            (rx, progress_rx, invalidations, cache),
+                        ));
+                    }
+                    changed = progress_rx.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        progress_rx.borrow_and_update();
+                        return Some((
+                            Ok::<_, Infallible>(
+                                graph_progress_event(&cache),
+                            ),
+                            (rx, progress_rx, invalidations, cache),
                         ));
                     }
                     changed = invalidations.changed() => {
@@ -478,6 +493,15 @@ where
     );
 
     Sse::new(initial.chain(changes)).into_response()
+}
+
+fn graph_progress_event<S>(cache: &ConsoleGraphCache<S>) -> Event
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let data = serde_json::to_string(&cache.rebuild_statuses())
+        .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
+    Event::default().event("graph-progress").data(data)
 }
 
 async fn graph_snapshot_for_query<S>(
@@ -871,7 +895,9 @@ mod tests {
         let mut response = vec![0; 256];
 
         let mut initial = Vec::new();
-        while !contains_bytes(&initial, b"event: graph\ndata: 0") {
+        while !contains_bytes(&initial, b"event: graph\ndata: 0")
+            || !contains_bytes(&initial, b"event: graph-progress")
+        {
             let read = stream.read(&mut response).await.unwrap();
             assert_ne!(read, 0);
             initial.extend_from_slice(&response[..read]);
