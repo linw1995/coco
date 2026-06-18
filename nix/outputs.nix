@@ -55,10 +55,14 @@ in
       packages = rec {
         default = coco-cli;
         coco-cli = hostPackages.coco-cli;
+        coco-debug-cli = hostPackages.coco-debug-cli;
         coverage = coverageScript;
         coco-image = defaultDockerImagePackages.coco-image;
         coco-image-linux-amd64 = amd64LinuxPackages.coco-image;
         coco-image-linux-arm64 = arm64LinuxPackages.coco-image;
+        coco-debug-image = defaultDockerImagePackages.coco-debug-image;
+        coco-debug-image-linux-amd64 = amd64LinuxPackages.coco-debug-image;
+        coco-debug-image-linux-arm64 = arm64LinuxPackages.coco-debug-image;
       };
 
       apps = rec {

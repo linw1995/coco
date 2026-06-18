@@ -1,0 +1,24 @@
+name: "Debug CD"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GHCR tag for the debug image."
+        required: false
+        default: "debug"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-debug-image:
+    uses: ./.github/workflows/Publish-Image.yaml
+    with:
+      artifact-prefix: coco-debug
+      amd64-output: .#coco-debug-image-linux-amd64
+      arm64-output: .#coco-debug-image-linux-arm64
+      sha-tag-prefix: debug-sha
+      manual-tag: ${{ inputs.tag }}
+    secrets: inherit

@@ -236,6 +236,55 @@ Run manual image builds on Linux, or on a host whose Nix setup can build the
 selected Linux target. For example, a macOS host needs a Linux builder before it
 can build `.#coco-image-linux-arm64` locally.
 
+## Profiling Graph Builds
+
+For low-overhead timing against the deployed store, run the graph profile
+command as a one-shot Compose container:
+
+```bash
+docker compose run --rm \
+  -e COCO_START_CRON=0 \
+  coco \
+  coco daemon profile graph --all --json
+```
+
+For CPU sampling with symbols, use the manually triggered Debug CD workflow to
+publish a debug image. The debug image keeps release debuginfo, preserves frame
+pointers, disables stripping, and includes `perf` in the container. The default
+manual tag is:
+
+```text
+ghcr.io/linw1995/coco:debug
+```
+
+To profile without changing the long-lived deployment image, run a one-shot
+container with the debug image:
+
+```bash
+COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+docker compose run --rm \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -e COCO_START_CRON=0 \
+  coco \
+  perf record -F 99 -g -- coco daemon profile graph --all --json
+```
+
+Inspect the profile from inside a debug container that mounts the same data
+directory, or copy `perf.data` out and inspect it on a compatible Linux host:
+
+```bash
+COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+docker compose run --rm \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -e COCO_START_CRON=0 \
+  coco \
+  perf report
+```
+
 ## Cronjob Skill
 
 The entrypoint supervises one `supercronic -inotify` process per active
