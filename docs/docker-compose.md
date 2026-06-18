@@ -279,6 +279,8 @@ temporary container:
 
 ```bash
 COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+COCO_UID=0 \
+COCO_GID=0 \
 docker compose run --rm \
   --cap-add SYS_ADMIN \
   --cap-add SYS_PTRACE \
@@ -295,13 +297,17 @@ docker compose run --rm \
 
 If the host supports the narrower capability, `--cap-add PERFMON` can replace
 `--cap-add SYS_ADMIN`. Keep `SYS_PTRACE` and `seccomp=unconfined` when call
-stacks are incomplete.
+stacks are incomplete. Keep `COCO_UID=0` and `COCO_GID=0` for perf one-shot
+commands so the entrypoint does not drop the capabilities added by Compose
+before running `perf`.
 
 Inspect the profile from inside a debug container that mounts the same data
 directory:
 
 ```bash
 COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+COCO_UID=0 \
+COCO_GID=0 \
 docker compose run --rm \
   --cap-add SYS_ADMIN \
   --cap-add SYS_PTRACE \
@@ -316,6 +322,8 @@ use:
 
 ```bash
 COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+COCO_UID=0 \
+COCO_GID=0 \
 docker compose run --rm \
   --cap-add SYS_ADMIN \
   --cap-add SYS_PTRACE \
@@ -329,6 +337,8 @@ To export folded stack input for flamegraph tooling on the host:
 
 ```bash
 COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+COCO_UID=0 \
+COCO_GID=0 \
 docker compose run --rm \
   --cap-add SYS_ADMIN \
   --cap-add SYS_PTRACE \
