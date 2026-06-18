@@ -6337,7 +6337,9 @@ fn daemon_serve_enables_console_by_default() {
     let Command::Daemon(command) = cli.command else {
         panic!("expected daemon command");
     };
-    let DaemonSubcommand::Serve(command) = command.command;
+    let DaemonSubcommand::Serve(command) = command.command else {
+        panic!("expected daemon serve command");
+    };
 
     assert!(!command.no_console);
     assert_eq!(
@@ -6359,13 +6361,30 @@ fn daemon_serve_allows_disabling_console_and_overriding_addr() {
     let Command::Daemon(command) = cli.command else {
         panic!("expected daemon command");
     };
-    let DaemonSubcommand::Serve(command) = command.command;
+    let DaemonSubcommand::Serve(command) = command.command else {
+        panic!("expected daemon serve command");
+    };
 
     assert!(command.no_console);
     assert_eq!(
         command.console_addr,
         std::net::SocketAddr::from(([127, 0, 0, 1], 0))
     );
+}
+
+#[test]
+fn daemon_profile_graph_parses_all_and_json_flags() {
+    let cli = Cli::parse_from(["coco", "daemon", "profile", "graph", "--all", "--json"]);
+    let Command::Daemon(command) = cli.command else {
+        panic!("expected daemon command");
+    };
+    let DaemonSubcommand::Profile(command) = command.command else {
+        panic!("expected daemon profile command");
+    };
+    let crate::cli::DaemonProfileSubcommand::Graph(command) = command.command;
+
+    assert!(command.all);
+    assert!(command.json);
 }
 
 #[tokio::test]
