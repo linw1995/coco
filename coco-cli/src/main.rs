@@ -137,12 +137,12 @@ impl std::fmt::Display for ForwardSocketError {
 }
 
 fn resolve_forwarding_target(args: &[String]) -> Result<Option<ForwardingTarget>, String> {
-    if let Some(socket_path) = resolve_runtime_socket(args) {
-        return Ok(Some(ForwardingTarget::RuntimeSocket { socket_path }));
+    if is_local_daemon_command(args) {
+        return Ok(None);
     }
 
-    if is_daemon_serve_command(args) {
-        return Ok(None);
+    if let Some(socket_path) = resolve_runtime_socket(args) {
+        return Ok(Some(ForwardingTarget::RuntimeSocket { socket_path }));
     }
 
     // The daemon socket is OS-scoped rather than project-scoped, so client
@@ -213,7 +213,7 @@ fn resolve_forwarding_target(args: &[String]) -> Result<Option<ForwardingTarget>
     }))
 }
 
-fn is_daemon_serve_command(args: &[String]) -> bool {
+fn is_local_daemon_command(args: &[String]) -> bool {
     let mut command_tokens = Vec::with_capacity(2);
     let mut index = 0;
     while index < args.len() && command_tokens.len() < 2 {
@@ -234,7 +234,7 @@ fn is_daemon_serve_command(args: &[String]) -> bool {
         index += 1;
     }
 
-    matches!(command_tokens.as_slice(), ["daemon", "serve"])
+    matches!(command_tokens.as_slice(), ["daemon", "serve" | "profile"])
 }
 
 fn should_fallback_to_local(source: DaemonSocketSource, error: &ForwardSocketError) -> bool {
@@ -473,7 +473,7 @@ mod tests {
         DaemonSocketSource, ForwardSocketError, ForwardingTarget, build_forward_socket_request,
         collect_forward_socket_stdin, collect_forwarded_stdin, exchange_forward_socket_request,
         forward_cli_command, forward_daemon_socket, forward_runtime_socket,
-        is_daemon_serve_command, resolve_forwarding_target, should_fallback_to_local,
+        is_local_daemon_command, resolve_forwarding_target, should_fallback_to_local,
         should_forward_runtime_stdin,
     };
     use coco_cli::{COCO_DAEMON_SOCKET_ENV, resolve_default_daemon_socket_path};
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn daemon_serve_command_is_not_forwarded() {
-        assert!(is_daemon_serve_command(&[
+        assert!(is_local_daemon_command(&[
             "--daemon-socket".to_owned(),
             "/tmp/coco.sock".to_owned(),
             "daemon".to_owned(),
@@ -543,6 +543,28 @@ mod tests {
             "--socket".to_owned(),
             "/tmp/coco.sock".to_owned(),
         ]));
+    }
+
+    #[test]
+    fn daemon_profile_command_is_not_forwarded() {
+        let target = with_env_vars(
+            &[
+                (COCO_CLI_RUNTIME_SOCKET_ENV, Some("/tmp/runtime.sock")),
+                (COCO_DAEMON_SOCKET_ENV, Some("/tmp/daemon.sock")),
+            ],
+            || {
+                resolve_forwarding_target(&[
+                    "--daemon-socket".to_owned(),
+                    "/tmp/override.sock".to_owned(),
+                    "daemon".to_owned(),
+                    "profile".to_owned(),
+                    "graph".to_owned(),
+                ])
+            },
+        )
+        .unwrap();
+
+        assert_eq!(target, None);
     }
 
     #[test]
