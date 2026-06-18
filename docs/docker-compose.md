@@ -257,22 +257,25 @@ manual tag is:
 ghcr.io/linw1995/coco:debug
 ```
 
-To profile without changing the long-lived deployment image, run a one-shot
-container with the debug image:
+`perf` is Linux-only. On macOS or Windows Docker Desktop, collect the profile on
+a Linux host or remote Linux builder that runs the container. Host kernel policy
+can also block perf events. If recording fails with a permission error, check
+the host setting:
 
 ```bash
-COCO_IMAGE=ghcr.io/linw1995/coco:debug \
-docker compose run --rm \
-  --cap-add SYS_ADMIN \
-  --cap-add SYS_PTRACE \
-  --security-opt seccomp=unconfined \
-  -e COCO_START_CRON=0 \
-  coco \
-  perf record -F 99 -g -- coco daemon profile graph --all --json
+cat /proc/sys/kernel/perf_event_paranoid
 ```
 
-Inspect the profile from inside a debug container that mounts the same data
-directory, or copy `perf.data` out and inspect it on a compatible Linux host:
+For local debugging on a trusted host, lower it temporarily when needed:
+
+```bash
+sudo sysctl kernel.perf_event_paranoid=1
+```
+
+To profile without changing the long-lived deployment image, run a one-shot
+container with the debug image. The command writes `perf-graph.data` under
+`/data`, which is the `${COCO_DATA_DIR}` bind mount, so the profile survives the
+temporary container:
 
 ```bash
 COCO_IMAGE=ghcr.io/linw1995/coco:debug \
@@ -282,7 +285,57 @@ docker compose run --rm \
   --security-opt seccomp=unconfined \
   -e COCO_START_CRON=0 \
   coco \
-  perf report
+  perf record \
+    -o /data/perf-graph.data \
+    -F 99 \
+    --call-graph fp \
+    -- \
+    coco daemon profile graph --all --json
+```
+
+If the host supports the narrower capability, `--cap-add PERFMON` can replace
+`--cap-add SYS_ADMIN`. Keep `SYS_PTRACE` and `seccomp=unconfined` when call
+stacks are incomplete.
+
+Inspect the profile from inside a debug container that mounts the same data
+directory:
+
+```bash
+COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+docker compose run --rm \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -e COCO_START_CRON=0 \
+  coco \
+  perf report -i /data/perf-graph.data
+```
+
+For non-interactive output that can be saved in logs or attached to an issue,
+use:
+
+```bash
+COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+docker compose run --rm \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -e COCO_START_CRON=0 \
+  coco \
+  perf report --stdio -i /data/perf-graph.data
+```
+
+To export folded stack input for flamegraph tooling on the host:
+
+```bash
+COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+docker compose run --rm \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -e COCO_START_CRON=0 \
+  coco \
+  perf script -i /data/perf-graph.data > .coco-data/perf-graph.script
 ```
 
 ## Cronjob Skill
