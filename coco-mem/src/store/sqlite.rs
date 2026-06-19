@@ -314,10 +314,10 @@ impl SqliteStore {
 
     pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if sqlite_database_path(path).is_file() && fs_migration_complete_marker_exists(path)? {
-            return Self::open_read_only(path);
-        }
-        if sqlite_database_path(path).is_file() && !legacy_fs_store_exists(path) {
+        if sqlite_database_path(path).is_file() {
+            if Self::sqlite_schema_requires_migration(path)? {
+                drop(Self::open(path)?);
+            }
             return Self::open_read_only(path);
         }
         Self::open_read_only(path)
@@ -421,6 +421,32 @@ impl SqliteStore {
             );
             Ok(())
         })
+    }
+
+    fn sqlite_schema_requires_migration(path: &Path) -> Result<bool> {
+        ensure_existing_store_directory(path)?;
+        let store = Self::new(path, StoreAccess::ReadOnly)?;
+        ensure_existing_database_file(&store.database_path)?;
+        let version = store.block_on(async {
+            let mut connection = store.connect().await?;
+            ensure_migration_table_exists(&mut connection, &store.database_path).await?;
+            current_schema_version(&mut connection, &store.database_path)
+                .await?
+                .context(CorruptedStoreSnafu {
+                    path: store.database_path.clone(),
+                    message: "missing SQLite schema version".to_owned(),
+                })
+        })?;
+        ensure!(
+            version <= SQLITE_SCHEMA_VERSION,
+            CorruptedStoreSnafu {
+                path: store.database_path,
+                message: format!(
+                    "unsupported SQLite schema version {version}, expected at most {SQLITE_SCHEMA_VERSION}"
+                ),
+            }
+        );
+        Ok(version < SQLITE_SCHEMA_VERSION)
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -3024,6 +3050,44 @@ THIS IS NOT SQL;
                 0
             );
         });
+    }
+
+    #[test]
+    fn open_read_only_or_migrate_fs_upgrades_sqlite_schema() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
+        let state = super::StoreState::new();
+        let root = state.root_node().clone();
+        let root_id = root.id.clone();
+
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            super::configure_writable_connection(&mut connection, &store.database_path)
+                .await
+                .unwrap();
+            super::ensure_migration_table(&mut connection, &store.database_path)
+                .await
+                .unwrap();
+            super::apply_migration_if_needed(
+                &mut connection,
+                &store.database_path,
+                &super::SQLITE_MIGRATIONS[0],
+            )
+            .await
+            .unwrap();
+            persist_root_metadata(&mut connection, &store.database_path, &root_id)
+                .await
+                .unwrap();
+            insert_v1_node_row(&mut connection, &store.database_path, root).await;
+        });
+        drop(store);
+
+        let migrated = SqliteStore::open_read_only_or_migrate_fs(&path).unwrap();
+
+        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(migrated.root_id(), root_id);
     }
 
     #[test]
