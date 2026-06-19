@@ -12,15 +12,15 @@ use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 use snafu::prelude::*;
 use tokio::runtime::Runtime;
 
-use super::NodeStore;
 use super::state::StoreState;
+use super::{BranchStore, NodeStore};
 use crate::StoreResult as Result;
 use crate::error::{
     ConnectSqliteStoreSnafu, CorruptedStoreSnafu, ParseSqliteStoreValueSnafu,
     QuerySqliteStoreSnafu, StartSqliteRuntimeSnafu, StorePathIsNotDirectorySnafu,
     StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
-use crate::{Kind, MergeParent, NewNode, Node, NodeMetadata, Role};
+use crate::{Kind, MergeParent, NewNode, Node, NodeMetadata, Role, SessionState};
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const SQLITE_SCHEMA_VERSION: i32 = 1;
@@ -80,6 +80,22 @@ struct NodeRow {
     metadata_json: Option<String>,
     #[diesel(sql_type = Text)]
     kind_json: String,
+}
+
+#[derive(QueryableByName)]
+struct BranchRow {
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Text)]
+    head_id: String,
+}
+
+#[derive(QueryableByName)]
+struct SessionRow {
+    #[diesel(sql_type = Text)]
+    branch_name: String,
+    #[diesel(sql_type = Text)]
+    state_json: String,
 }
 
 const SQLITE_MIGRATIONS: &[SqliteMigration] = &[SqliteMigration {
@@ -585,6 +601,8 @@ async fn load_state(connection: &mut AsyncSqliteConnection, path: &Path) -> Resu
 
     let mut state = StoreState::from_root(root);
     insert_node_rows(&mut state, rows, path)?;
+    load_branches(connection, path, &mut state).await?;
+    load_sessions(connection, path, &mut state).await?;
     Ok(state)
 }
 
@@ -789,6 +807,124 @@ fn parse_role(role: &str, path: &Path) -> Result<Role> {
     }
 }
 
+async fn load_branches(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    state: &mut StoreState,
+) -> Result<()> {
+    let branches = sql_query("SELECT name, head_id FROM branches ORDER BY name")
+        .load::<BranchRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    for branch in branches {
+        state.apply_fork(branch.name, branch.head_id)?;
+    }
+    Ok(())
+}
+
+async fn load_sessions(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    state: &mut StoreState,
+) -> Result<()> {
+    let sessions = sql_query("SELECT branch_name, state_json FROM sessions ORDER BY branch_name")
+        .load::<SessionRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    state.sessions.clear();
+    for session in sessions {
+        let state_json = serde_json::from_str::<SessionState>(&session.state_json).context(
+            ParseSqliteStoreValueSnafu {
+                path: path.to_owned(),
+                column: "sessions.state_json".to_owned(),
+            },
+        )?;
+        state.sessions.insert(session.branch_name, state_json);
+    }
+    state.validate_session_records()
+}
+
+async fn persist_branch(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    head_id: &str,
+) -> Result<()> {
+    sql_query("INSERT INTO branches (name, head_id) VALUES (?, ?)")
+        .bind::<Text, _>(branch)
+        .bind::<Text, _>(head_id)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(())
+}
+
+async fn persist_session_state(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    state: &SessionState,
+) -> Result<()> {
+    let state_json = serde_json::to_string(state).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "sessions.state_json".to_owned(),
+    })?;
+    sql_query(
+        r#"
+INSERT INTO sessions (branch_name, state_json)
+VALUES (?, ?)
+ON CONFLICT(branch_name) DO UPDATE SET state_json = excluded.state_json
+"#,
+    )
+    .bind::<Text, _>(branch)
+    .bind::<Text, _>(state_json)
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    Ok(())
+}
+
+async fn update_branch_head(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    expected_old_head: &str,
+    new_head: &str,
+) -> Result<usize> {
+    sql_query("UPDATE branches SET head_id = ? WHERE name = ? AND head_id = ?")
+        .bind::<Text, _>(new_head)
+        .bind::<Text, _>(branch)
+        .bind::<Text, _>(expected_old_head)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn delete_branch_record(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+) -> Result<()> {
+    sql_query("DELETE FROM branches WHERE name = ?")
+        .bind::<Text, _>(branch)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(())
+}
+
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
         self.inner
@@ -836,10 +972,71 @@ impl NodeStore for SqliteStore {
     }
 }
 
+impl BranchStore for SqliteStore {
+    fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let plan = state.plan_fork(name, from_ref)?;
+        let mut temp = state.clone();
+        temp.apply_fork(name.to_owned(), plan.head_id.clone())?;
+        let session_state = temp.get_session_state(name)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_branch(&mut connection, &self.database_path, name, &plan.head_id).await?;
+            persist_session_state(&mut connection, &self.database_path, name, &session_state).await
+        })?;
+        state.apply_fork(name.to_owned(), plan.head_id.clone())?;
+        Ok(plan.head_id)
+    }
+
+    fn get_branch_head(&self, name: &str) -> Result<String> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_branch_head(name)
+            .map(str::to_owned)
+    }
+
+    fn delete_branch(&self, name: &str) -> Result<()> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        temp.delete_branch(name)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            delete_branch_record(&mut connection, &self.database_path, name).await
+        })?;
+        state.delete_branch(name)
+    }
+
+    fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        temp.apply_set_branch_head(name.to_owned(), expected_old_head, new_head.to_owned())?;
+        let updated = self.block_on(async {
+            let mut connection = self.connect().await?;
+            update_branch_head(
+                &mut connection,
+                &self.database_path,
+                name,
+                expected_old_head,
+                new_head,
+            )
+            .await
+        })?;
+        ensure!(
+            updated == 1,
+            CorruptedStoreSnafu {
+                path: self.database_path.clone(),
+                message: format!("SQLite branch {name:?} did not match expected head"),
+            }
+        );
+        state.apply_set_branch_head(name.to_owned(), expected_old_head, new_head.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SqliteStore;
-    use crate::{Kind, NewNode, NodeStore, Role};
+    use crate::{BranchStore, Kind, NewNode, NodeStore, Role};
 
     #[test]
     fn open_creates_sqlite_database_and_schema() {
@@ -940,5 +1137,40 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(log, vec![second.clone(), first, root_id]);
         assert_eq!(reopened.get_node(&second[..12]).unwrap().id, second);
+    }
+
+    #[test]
+    fn branch_operations_persist_across_reopen() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+        let first = store
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("first".to_owned()),
+            })
+            .unwrap();
+        let second = store
+            .append(NewNode {
+                parent: first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("second".to_owned()),
+            })
+            .unwrap();
+
+        assert_eq!(store.fork("main", &first).unwrap(), first);
+        store.set_branch_head("main", &first, &second).unwrap();
+        assert_eq!(store.get_branch_head("main").unwrap(), second);
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(reopened.get_branch_head("main").unwrap(), second);
+
+        reopened.delete_branch("main").unwrap();
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert!(reopened.get_branch_head("main").is_err());
     }
 }
