@@ -691,33 +691,41 @@ WHERE id = ?
         if let Some(head_id) = self.branch_head(reference)? {
             return self.get_node_by_exact_id(&head_id);
         }
-        if let Ok(node) = self.get_node_by_exact_id(reference) {
-            return Ok(node);
-        }
 
-        let matches = self.block_on(async {
+        match self.get_node_by_exact_id(reference) {
+            Ok(node) => Ok(node),
+            Err(crate::StoreError::NotFound { .. }) => self.get_node_by_prefix(reference),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn get_node_by_prefix(&self, prefix: &str) -> Result<Node> {
+        match self.node_ids_by_prefix(prefix)?.as_slice() {
+            [matched] => self.get_node_by_exact_id(matched),
+            [] => NotFoundSnafu {
+                id: prefix.to_owned(),
+            }
+            .fail(),
+            matches => AmbiguousNodePrefixSnafu {
+                prefix: prefix.to_owned(),
+                matches: matches.to_vec(),
+            }
+            .fail(),
+        }
+    }
+
+    fn node_ids_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        self.block_on(async {
             let mut connection = self.connect().await?;
             sql_query("SELECT id FROM nodes WHERE id LIKE ? ORDER BY id")
-                .bind::<Text, _>(format!("{reference}%"))
+                .bind::<Text, _>(format!("{prefix}%"))
                 .load::<NodeIdRow>(&mut connection)
                 .await
                 .context(QuerySqliteStoreSnafu {
                     path: self.database_path.clone(),
                 })
-        })?;
-
-        match matches.as_slice() {
-            [matched] => self.get_node_by_exact_id(&matched.id),
-            [] => NotFoundSnafu {
-                id: reference.to_owned(),
-            }
-            .fail(),
-            _ => AmbiguousNodePrefixSnafu {
-                prefix: reference.to_owned(),
-                matches: matches.into_iter().map(|row| row.id).collect::<Vec<_>>(),
-            }
-            .fail(),
-        }
+                .map(|rows| rows.into_iter().map(|row| row.id).collect())
+        })
     }
 }
 
@@ -2868,11 +2876,24 @@ THIS IS NOT SQL;
                 kind: Kind::Text("graph child".to_owned()),
             })
             .unwrap();
+        writer.fork("graph-child", &child_id).unwrap();
         drop(writer);
 
         let graph_store = SqliteGraphStore::open_read_only(&path).unwrap();
 
         assert_eq!(graph_store.root_id(), root_id);
+        assert_eq!(
+            graph_store.get_node(&child_id).unwrap().id,
+            child_id.clone()
+        );
+        assert_eq!(
+            graph_store.get_node(&child_id[..12]).unwrap().id,
+            child_id.clone()
+        );
+        assert_eq!(
+            graph_store.get_node("graph-child").unwrap().id,
+            child_id.clone()
+        );
         assert_eq!(graph_store.list_children(&root_id).unwrap()[0].id, child_id);
         assert_eq!(graph_store.ancestry(&child_id).unwrap().len(), 2);
         assert!(matches!(
