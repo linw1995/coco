@@ -13,14 +13,16 @@ use snafu::prelude::*;
 use tokio::runtime::Runtime;
 
 use super::state::StoreState;
-use super::{BranchStore, NodeStore};
+use super::{BranchStore, NodeStore, SessionStore};
 use crate::StoreResult as Result;
 use crate::error::{
     ConnectSqliteStoreSnafu, CorruptedStoreSnafu, ParseSqliteStoreValueSnafu,
     QuerySqliteStoreSnafu, StartSqliteRuntimeSnafu, StorePathIsNotDirectorySnafu,
     StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
-use crate::{Kind, MergeParent, NewNode, Node, NodeMetadata, Role, SessionState};
+use crate::{
+    Kind, MergeParent, NewNode, Node, NodeMetadata, Role, SessionAnchorPatch, SessionState,
+};
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const SQLITE_SCHEMA_VERSION: i32 = 1;
@@ -925,6 +927,28 @@ async fn delete_branch_record(
     Ok(())
 }
 
+async fn persist_session_nodes_and_branch_head(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    expected_old_head: &str,
+    new_head: &str,
+    nodes: &[Node],
+) -> Result<()> {
+    for node in nodes {
+        persist_node(connection, path, node).await?;
+    }
+    let updated = update_branch_head(connection, path, branch, expected_old_head, new_head).await?;
+    ensure!(
+        updated == 1,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("SQLite branch {branch:?} did not match expected head"),
+        }
+    );
+    Ok(())
+}
+
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
         self.inner
@@ -1033,10 +1057,118 @@ impl BranchStore for SqliteStore {
     }
 }
 
+impl SessionStore for SqliteStore {
+    fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_session_states())
+    }
+
+    fn get_session_state(&self, name: &str) -> Result<SessionState> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_session_state(name)
+    }
+
+    fn set_session_state(
+        &self,
+        name: &str,
+        expected: Option<&SessionState>,
+        next: SessionState,
+    ) -> Result<SessionState> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.set_session_state(name, expected, next)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_session_state(&mut connection, &self.database_path, name, &updated).await
+        })?;
+        state.set_session_state(name, expected, updated)
+    }
+
+    fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let plan = state.plan_rebase_session(name, patch)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_session_nodes_and_branch_head(
+                &mut connection,
+                &self.database_path,
+                &plan.branch,
+                &plan.expected_old_head,
+                &plan.new_head,
+                &plan.nodes,
+            )
+            .await
+        })?;
+        for node in plan.nodes {
+            state.insert_existing_node(node)?;
+        }
+        state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
+        Ok(plan.new_head)
+    }
+
+    fn handoff_session(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        prompt: &str,
+    ) -> Result<String> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let plan = state.plan_handoff_session(name, patch, prompt)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_session_nodes_and_branch_head(
+                &mut connection,
+                &self.database_path,
+                &plan.branch,
+                &plan.expected_old_head,
+                &plan.new_head,
+                std::slice::from_ref(&plan.node),
+            )
+            .await
+        })?;
+        state.insert_existing_node(plan.node)?;
+        state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
+        Ok(plan.new_head)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SqliteStore;
-    use crate::{BranchStore, Kind, NewNode, NodeStore, Role};
+    use crate::{
+        Anchor, BranchStore, Kind, NewNode, NodeStore, PauseReason, Role, SessionAnchor,
+        SessionAnchorPatch, SessionRole, SessionState, SessionStore,
+    };
+
+    fn session_anchor_node(parent: &str) -> NewNode {
+        NewNode {
+            parent: parent.to_owned(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(
+                vec![],
+                SessionAnchor {
+                    role: SessionRole::Orchestrator,
+                    provider_profile: None,
+                    provider: Some("openai".to_owned()),
+                    model: "gpt-5.4".to_owned(),
+                    tools: vec![],
+                    system_prompt: "system".to_owned(),
+                    prompt: "prompt".to_owned(),
+                    temperature: Some(0.1),
+                    max_tokens: Some(64),
+                    additional_params: None,
+                    enable_coco_shim: false,
+                    active_skill: None,
+                },
+            )),
+        }
+    }
 
     #[test]
     fn open_creates_sqlite_database_and_schema() {
@@ -1172,5 +1304,60 @@ mod tests {
         reopened.delete_branch("main").unwrap();
         let reopened = SqliteStore::open(&path).unwrap();
         assert!(reopened.get_branch_head("main").is_err());
+    }
+
+    #[test]
+    fn session_operations_persist_across_reopen() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+        let session = store.append(session_anchor_node(&root_id)).unwrap();
+        store.fork("main", &session).unwrap();
+        let text = store
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("text".to_owned()),
+            })
+            .unwrap();
+        store.set_branch_head("main", &session, &text).unwrap();
+        store
+            .set_session_state(
+                "main",
+                Some(&SessionState::Active),
+                SessionState::Paused {
+                    target_branch: String::new(),
+                    reason: PauseReason::Closed,
+                },
+            )
+            .unwrap();
+
+        let rebased = store
+            .rebase_session(
+                "main",
+                &SessionAnchorPatch {
+                    model: Some("gpt-5.5".to_owned()),
+                    ..SessionAnchorPatch::default()
+                },
+            )
+            .unwrap();
+        let handoff = store
+            .handoff_session("main", &SessionAnchorPatch::default(), "next prompt")
+            .unwrap();
+
+        let reopened = SqliteStore::open(&path).unwrap();
+
+        assert_eq!(reopened.get_branch_head("main").unwrap(), handoff);
+        assert_eq!(
+            reopened.get_session_state("main").unwrap(),
+            SessionState::Paused {
+                target_branch: String::new(),
+                reason: PauseReason::Closed,
+            }
+        );
+        assert!(reopened.get_node(&rebased).is_ok());
+        assert!(reopened.get_node(&handoff).is_ok());
     }
 }
