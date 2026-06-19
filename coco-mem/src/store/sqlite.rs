@@ -3053,7 +3053,7 @@ THIS IS NOT SQL;
     }
 
     #[test]
-    fn open_read_only_or_migrate_fs_upgrades_sqlite_schema() {
+    fn persistent_read_only_or_migrate_fs_upgrades_sqlite_schema() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
@@ -3084,7 +3084,11 @@ THIS IS NOT SQL;
         });
         drop(store);
 
-        let migrated = SqliteStore::open_read_only_or_migrate_fs(&path).unwrap();
+        let crate::store::PersistentStore::Sqlite(migrated) =
+            crate::store::PersistentStore::open_read_only_or_migrate_fs(&path).unwrap()
+        else {
+            panic!("expected SQLite store");
+        };
 
         assert_eq!(migrated.schema_version().unwrap(), 2);
         assert_eq!(migrated.root_id(), root_id);

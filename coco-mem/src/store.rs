@@ -234,15 +234,15 @@ impl PersistentStore {
         if sqlite::sqlite_database_path(path).is_file()
             && sqlite::fs_migration_complete_marker_exists(path)?
         {
-            return SqliteStore::open_read_only(path).map(Self::Sqlite);
+            return SqliteStore::open_read_only_or_migrate_fs(path).map(Self::Sqlite);
         }
         if sqlite::sqlite_database_path(path).is_file() && !sqlite::legacy_fs_store_exists(path) {
-            return SqliteStore::open_read_only(path).map(Self::Sqlite);
+            return SqliteStore::open_read_only_or_migrate_fs(path).map(Self::Sqlite);
         }
         if sqlite::legacy_fs_store_exists(path) {
             return FsStore::open_read_only(path).map(Self::Fs);
         }
-        SqliteStore::open_read_only(path).map(Self::Sqlite)
+        SqliteStore::open_read_only_or_migrate_fs(path).map(Self::Sqlite)
     }
 
     pub fn store_path(&self) -> &Path {
