@@ -20,8 +20,9 @@ use super::{
 };
 use crate::StoreResult as Result;
 use crate::error::{
-    ConnectSqliteStoreSnafu, CorruptedStoreSnafu, ParseSqliteStoreValueSnafu,
-    QuerySqliteStoreSnafu, StartSqliteRuntimeSnafu, StorePathIsNotDirectorySnafu,
+    AmbiguousNodePrefixSnafu, BranchNotFoundSnafu, ConnectSqliteStoreSnafu, CorruptedStoreSnafu,
+    NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu,
+    RefsNotConnectedSnafu, StartSqliteRuntimeSnafu, StorePathIsNotDirectorySnafu,
     StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::{
@@ -52,6 +53,14 @@ pub struct SqliteStore {
     _lock_file: Option<Arc<std::fs::File>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SqliteGraphStore {
+    dir: PathBuf,
+    database_path: PathBuf,
+    runtime: &'static Runtime,
+    root_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoreAccess {
     ReadWrite,
@@ -80,6 +89,12 @@ struct CurrentSchemaVersion {
 struct StoreMetaValue {
     #[diesel(sql_type = Text)]
     value_json: String,
+}
+
+#[derive(QueryableByName)]
+struct NodeIdRow {
+    #[diesel(sql_type = Text)]
+    id: String,
 }
 
 #[derive(QueryableByName)]
@@ -515,6 +530,190 @@ PRAGMA journal_mode = DELETE;
     #[cfg(test)]
     pub fn snapshot_state(&self) -> StoreState {
         self.inner.read().expect("store lock poisoned").clone()
+    }
+}
+
+impl SqliteGraphStore {
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        ensure_existing_store_directory(path)?;
+        let store = Self::new(path)?;
+        ensure_existing_database_file(&store.database_path)?;
+        store.ensure_current_schema()?;
+        let root_id = store.block_on(async {
+            let mut connection = store.connect().await?;
+            load_root_id(&mut connection, &store.database_path).await
+        })?;
+        Ok(Self { root_id, ..store })
+    }
+
+    pub fn store_path(&self) -> &Path {
+        &self.dir
+    }
+
+    fn new(path: &Path) -> Result<Self> {
+        Ok(Self {
+            dir: path.to_owned(),
+            database_path: sqlite_database_path(path),
+            runtime: sqlite_runtime()?,
+            root_id: String::new(),
+        })
+    }
+
+    fn ensure_current_schema(&self) -> Result<()> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            ensure_migration_table_exists(&mut connection, &self.database_path).await?;
+            let version = current_schema_version(&mut connection, &self.database_path)
+                .await?
+                .context(CorruptedStoreSnafu {
+                    path: self.database_path.clone(),
+                    message: "missing SQLite schema version".to_owned(),
+                })?;
+            ensure!(
+                version == SQLITE_SCHEMA_VERSION,
+                CorruptedStoreSnafu {
+                    path: self.database_path.clone(),
+                    message: format!(
+                        "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
+                    ),
+                }
+            );
+            Ok(())
+        })
+    }
+
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.runtime.block_on(future))
+                    .join()
+                    .expect("SQLite graph store worker thread should not panic")
+            });
+        }
+        self.runtime.block_on(future)
+    }
+
+    async fn connect(&self) -> Result<AsyncSqliteConnection> {
+        let database_url = self.database_path.to_string_lossy().into_owned();
+        let mut connection = AsyncSqliteConnection::establish(&database_url)
+            .await
+            .context(ConnectSqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?;
+        configure_connection(&mut connection, &self.database_path).await?;
+        Ok(connection)
+    }
+
+    fn ensure_read_only<T>(&self) -> Result<T> {
+        StoreReadOnlySnafu {
+            path: self.dir.clone(),
+        }
+        .fail()
+    }
+
+    fn get_node_by_exact_id(&self, id: &str) -> Result<Node> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let row = sql_query(
+                r#"
+SELECT id, parent_id, created_at, role, metadata_json, kind_json
+FROM nodes
+WHERE id = ?
+"#,
+            )
+            .bind::<Text, _>(id)
+            .get_result::<NodeRow>(&mut connection)
+            .await
+            .optional()
+            .context(QuerySqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?
+            .context(NotFoundSnafu { id: id.to_owned() })?;
+            row.into_node(&self.database_path)
+        })
+    }
+
+    fn resolve_ref_id(&self, reference: &str) -> Result<String> {
+        if self.node_exists(reference)? {
+            return Ok(reference.to_owned());
+        }
+        if let Some(head_id) = self.branch_head(reference)? {
+            self.get_node_by_exact_id(&head_id)?;
+            return Ok(head_id);
+        }
+        NotFoundSnafu {
+            id: reference.to_owned(),
+        }
+        .fail()
+    }
+
+    fn branch_head(&self, name: &str) -> Result<Option<String>> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            sql_query("SELECT head_id AS id FROM branches WHERE name = ?")
+                .bind::<Text, _>(name)
+                .get_result::<NodeIdRow>(&mut connection)
+                .await
+                .optional()
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })
+                .map(|row| row.map(|row| row.id))
+        })
+    }
+
+    fn node_exists(&self, id: &str) -> Result<bool> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let count = sql_query("SELECT COUNT(*) AS count FROM nodes WHERE id = ?")
+                .bind::<Text, _>(id)
+                .get_result::<TableCount>(&mut connection)
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })?
+                .count;
+            Ok(count > 0)
+        })
+    }
+
+    fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
+        if let Some(head_id) = self.branch_head(reference)? {
+            return self.get_node_by_exact_id(&head_id);
+        }
+        if let Ok(node) = self.get_node_by_exact_id(reference) {
+            return Ok(node);
+        }
+
+        let matches = self.block_on(async {
+            let mut connection = self.connect().await?;
+            sql_query("SELECT id FROM nodes WHERE id LIKE ? ORDER BY id")
+                .bind::<Text, _>(format!("{reference}%"))
+                .load::<NodeIdRow>(&mut connection)
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })
+        })?;
+
+        match matches.as_slice() {
+            [matched] => self.get_node_by_exact_id(&matched.id),
+            [] => NotFoundSnafu {
+                id: reference.to_owned(),
+            }
+            .fail(),
+            _ => AmbiguousNodePrefixSnafu {
+                prefix: reference.to_owned(),
+                matches: matches.into_iter().map(|row| row.id).collect::<Vec<_>>(),
+            }
+            .fail(),
+        }
     }
 }
 
@@ -1756,6 +1955,184 @@ fn parse_session_role(role: &str, path: &Path) -> Result<SessionRole> {
     }
 }
 
+impl NodeStore for SqliteGraphStore {
+    fn root_id(&self) -> String {
+        self.root_id.clone()
+    }
+
+    fn append(&self, _node: NewNode) -> Result<String> {
+        self.ensure_read_only()
+    }
+
+    fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
+        let head_id = self.resolve_ref_id(head_ref)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let rows = sql_query(
+                r#"
+WITH RECURSIVE ancestry(id, depth) AS (
+    SELECT ? AS id, 0 AS depth
+    UNION ALL
+    SELECT nodes.parent_id, ancestry.depth + 1
+    FROM nodes
+    JOIN ancestry ON nodes.id = ancestry.id
+    WHERE nodes.parent_id != ''
+)
+SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.metadata_json, nodes.kind_json
+FROM ancestry
+JOIN nodes ON nodes.id = ancestry.id
+ORDER BY ancestry.depth
+"#,
+            )
+            .bind::<Text, _>(&head_id)
+            .load::<NodeRow>(&mut connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?;
+
+            let nodes = rows
+                .into_iter()
+                .map(|row| row.into_node(&self.database_path))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(last) = nodes.last()
+                && !last.is_root()
+            {
+                return ParentNotFoundSnafu {
+                    id: last.parent.clone(),
+                }
+                .fail();
+            }
+            Ok(nodes)
+        })
+    }
+
+    fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
+        let base_id = self.resolve_ref_id(base_ref)?;
+        let mut nodes = self.ancestry(head_ref)?;
+        let Some(index) = nodes.iter().position(|node| node.id == base_id) else {
+            return RefsNotConnectedSnafu {
+                base_ref: base_ref.to_owned(),
+                head_ref: head_ref.to_owned(),
+            }
+            .fail();
+        };
+        nodes.truncate(index + 1);
+        Ok(nodes)
+    }
+
+    fn get_node(&self, id: &str) -> Result<Node> {
+        self.get_node_by_prefix_or_branch(id)
+    }
+
+    fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
+        self.get_node_by_exact_id(node_id)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let rows = sql_query(
+                r#"
+SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.metadata_json, nodes.kind_json
+FROM node_relations
+JOIN nodes ON nodes.id = node_relations.child_node_id
+WHERE node_relations.parent_node_id = ?
+ORDER BY nodes.created_at, nodes.id
+"#,
+            )
+            .bind::<Text, _>(node_id)
+            .load::<NodeRow>(&mut connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?;
+            rows.into_iter()
+                .map(|row| row.into_node(&self.database_path))
+                .collect()
+        })
+    }
+}
+
+impl BranchStore for SqliteGraphStore {
+    fn fork(&self, _name: &str, _from_ref: &str) -> Result<String> {
+        self.ensure_read_only()
+    }
+
+    fn get_branch_head(&self, name: &str) -> Result<String> {
+        self.branch_head(name)?.context(BranchNotFoundSnafu {
+            name: name.to_owned(),
+        })
+    }
+
+    fn delete_branch(&self, _name: &str) -> Result<()> {
+        self.ensure_read_only()
+    }
+
+    fn set_branch_head(
+        &self,
+        _name: &str,
+        _expected_old_head: &str,
+        _new_head: &str,
+    ) -> Result<()> {
+        self.ensure_read_only()
+    }
+}
+
+impl SessionStore for SqliteGraphStore {
+    fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let sessions =
+                sql_query("SELECT branch_name, state_json FROM sessions ORDER BY branch_name")
+                    .load::<SessionRow>(&mut connection)
+                    .await
+                    .context(QuerySqliteStoreSnafu {
+                        path: self.database_path.clone(),
+                    })?;
+            sessions
+                .into_iter()
+                .map(|session| {
+                    let state = serde_json::from_str::<SessionState>(&session.state_json).context(
+                        ParseSqliteStoreValueSnafu {
+                            path: self.database_path.clone(),
+                            column: "sessions.state_json".to_owned(),
+                        },
+                    )?;
+                    Ok((session.branch_name, state))
+                })
+                .collect()
+        })
+    }
+
+    fn get_session_state(&self, name: &str) -> Result<SessionState> {
+        self.list_session_states()?
+            .remove(name)
+            .context(BranchNotFoundSnafu {
+                name: name.to_owned(),
+            })
+    }
+
+    fn set_session_state(
+        &self,
+        _name: &str,
+        _expected: Option<&SessionState>,
+        _next: SessionState,
+    ) -> Result<SessionState> {
+        self.ensure_read_only()
+    }
+
+    fn rebase_session(&self, _name: &str, _patch: &SessionAnchorPatch) -> Result<String> {
+        self.ensure_read_only()
+    }
+
+    fn handoff_session(
+        &self,
+        _name: &str,
+        _patch: &SessionAnchorPatch,
+        _prompt: &str,
+    ) -> Result<String> {
+        self.ensure_read_only()
+    }
+}
+
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
         self.inner
@@ -2219,8 +2596,8 @@ impl ProcessShareableStore for SqliteStore {
 mod tests {
     use super::{
         AsyncSqliteConnection, FsStore, MessageQueueItem, NodeRow,
-        SQLITE_INCOMPLETE_DATABASE_FILE_NAME, SQLITE_MIGRATION_DATABASE_FILE_NAME, SqliteMigration,
-        SqliteStore, StoreAccess, persist_root_metadata,
+        SQLITE_INCOMPLETE_DATABASE_FILE_NAME, SQLITE_MIGRATION_DATABASE_FILE_NAME,
+        SqliteGraphStore, SqliteMigration, SqliteStore, StoreAccess, persist_root_metadata,
     };
     use crate::{
         Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, NewNode,
@@ -2471,6 +2848,40 @@ THIS IS NOT SQL;
             kind: "shadow".to_owned(),
             ordinal: 1,
         }));
+    }
+
+    #[test]
+    fn graph_store_reads_children_from_node_relations() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let writer = SqliteStore::open(&path).unwrap();
+        let root_id = writer.root_id();
+        let child_id = writer
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("graph child".to_owned()),
+            })
+            .unwrap();
+        drop(writer);
+
+        let graph_store = SqliteGraphStore::open_read_only(&path).unwrap();
+
+        assert_eq!(graph_store.root_id(), root_id);
+        assert_eq!(graph_store.list_children(&root_id).unwrap()[0].id, child_id);
+        assert_eq!(graph_store.ancestry(&child_id).unwrap().len(), 2);
+        assert!(matches!(
+            graph_store
+                .append(NewNode {
+                    parent: root_id,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("blocked".to_owned()),
+                })
+                .unwrap_err(),
+            crate::StoreError::StoreReadOnly { .. }
+        ));
     }
 
     #[test]

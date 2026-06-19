@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::graph::{GraphMode, GraphSnapshot, build_graph_snapshot_with_mode_and_progress};
 use crate::publisher::ConsolePublisher;
-use coco_mem::{PersistentStore, Store};
+use coco_mem::{SqliteGraphStore, Store};
 use serde::Serialize;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
@@ -200,8 +200,8 @@ where
                 build_graph_snapshot_with_mode_and_progress(&store, version, mode, |_| {})
             }
             Self::PersistentStorePath(path) => {
-                let store = PersistentStore::open_read_only_or_migrate_fs(&path)
-                    .context(crate::error::StoreSnafu)?;
+                let store =
+                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
                 build_graph_snapshot_with_mode_and_progress(&store, version, mode, |_| {})
             }
         }
