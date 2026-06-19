@@ -170,6 +170,13 @@ pub enum StoreError {
         source: diesel::result::Error,
     },
 
+    #[snafu(display("Failed to parse SQLite store value {column:?} in {path:?}: {source}"))]
+    ParseSqliteStoreValue {
+        path: PathBuf,
+        column: String,
+        source: serde_json::Error,
+    },
+
     #[snafu(display("Corrupted store at {path:?}: {message}"))]
     CorruptedStore { path: PathBuf, message: String },
 }
