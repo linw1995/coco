@@ -2363,7 +2363,7 @@ fn store_format_versions_match(
     }
 }
 
-fn open_store_lock(store_dir: &Path) -> Result<Arc<File>> {
+pub(super) fn open_store_lock(store_dir: &Path) -> Result<Arc<File>> {
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<File>>>> = OnceLock::new();
 
     let key = store_lock_key(store_dir);

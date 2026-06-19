@@ -46,6 +46,7 @@ pub struct SqliteStore {
     access: StoreAccess,
     runtime: &'static Runtime,
     inner: Arc<RwLock<StoreState>>,
+    _lock_file: Option<Arc<std::fs::File>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,12 +285,18 @@ impl SqliteStore {
     }
 
     fn new(path: &Path, access: StoreAccess) -> Result<Self> {
+        let lock_file = if access == StoreAccess::ReadWrite {
+            Some(super::fs::open_store_lock(path)?)
+        } else {
+            None
+        };
         Ok(Self {
             dir: path.to_owned(),
             database_path: path.join(SQLITE_DATABASE_FILE_NAME),
             access,
             runtime: sqlite_runtime()?,
             inner: Arc::new(RwLock::new(StoreState::new())),
+            _lock_file: lock_file,
         })
     }
 
@@ -1966,6 +1973,50 @@ mod tests {
         assert!(matches!(err, crate::StoreError::StoreReadOnly { .. }));
         let reopened = SqliteStore::open_read_only(&path).unwrap();
         assert!(reopened.list_children(&root_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_rejects_store_locked_by_another_owner() {
+        use std::os::fd::AsRawFd;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        let lock_path = path.join("store.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, 0);
+
+        let err = SqliteStore::open(&path).unwrap_err();
+
+        assert!(matches!(err, crate::StoreError::StoreLocked { path: locked } if locked == path));
+    }
+
+    #[test]
+    fn open_read_only_allows_store_locked_by_another_owner() {
+        use std::os::fd::AsRawFd;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        SqliteStore::open(&path).unwrap();
+        let lock_path = path.join("store.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, 0);
+
+        let store = SqliteStore::open_read_only(&path).unwrap();
+
+        assert_eq!(store.schema_version().unwrap(), 1);
     }
 
     #[test]
