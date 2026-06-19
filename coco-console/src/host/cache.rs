@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::graph::{GraphMode, GraphSnapshot, build_graph_snapshot_with_mode_and_progress};
 use crate::publisher::ConsolePublisher;
@@ -34,12 +34,24 @@ pub struct ConsoleGraphCache<S> {
     invalidations: ConsolePublisher,
     ready: ConsolePublisher,
     compute_permits: Arc<Semaphore>,
+    state: Arc<Mutex<CacheState>>,
 }
 
 #[derive(Clone)]
 enum ConsoleGraphSource<S> {
     Store(S),
     PersistentStorePath(PathBuf),
+}
+
+#[derive(Default)]
+struct CacheState {
+    anchors: Option<CachedGraphSnapshot>,
+    all: Option<CachedGraphSnapshot>,
+}
+
+struct CachedGraphSnapshot {
+    source_version: u64,
+    snapshot: Arc<GraphSnapshot>,
 }
 
 impl<S> ConsoleGraphCache<S>
@@ -52,6 +64,7 @@ where
             invalidations,
             ready: ConsolePublisher::new(),
             compute_permits: Arc::new(Semaphore::new(1)),
+            state: Arc::new(Mutex::new(CacheState::default())),
         }
     }
 
@@ -65,6 +78,7 @@ where
             invalidations,
             ready: ConsolePublisher::new(),
             compute_permits: Arc::new(Semaphore::new(1)),
+            state: Arc::new(Mutex::new(CacheState::default())),
         }
     }
 
@@ -127,12 +141,17 @@ where
 
     pub async fn snapshot_current(&self, mode: GraphMode) -> crate::Result<Arc<GraphSnapshot>> {
         let source_version = self.invalidations.current_version();
+        if let Some(snapshot) = self.cached_snapshot(mode, source_version) {
+            return Ok(snapshot);
+        }
         let graph_version = self.publish_source_version(source_version);
         let source = self.source.clone();
         let snapshot = self
             .run_blocking_graph_compute(move || source.build_snapshot(mode, graph_version))
             .await??;
-        Ok(Arc::new(snapshot))
+        let snapshot = Arc::new(snapshot);
+        self.store_cached_snapshot(mode, source_version, snapshot.clone());
+        Ok(snapshot)
     }
 
     pub async fn snapshot_after(
@@ -187,6 +206,50 @@ where
             self.ready.mark_changed();
         }
         self.ready.current_version()
+    }
+
+    fn cached_snapshot(&self, mode: GraphMode, source_version: u64) -> Option<Arc<GraphSnapshot>> {
+        let state = self
+            .state
+            .lock()
+            .expect("console graph cache lock poisoned");
+        state
+            .slot(mode)
+            .as_ref()
+            .filter(|cached| cached.source_version == source_version)
+            .map(|cached| cached.snapshot.clone())
+    }
+
+    fn store_cached_snapshot(
+        &self,
+        mode: GraphMode,
+        source_version: u64,
+        snapshot: Arc<GraphSnapshot>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("console graph cache lock poisoned");
+        *state.slot_mut(mode) = Some(CachedGraphSnapshot {
+            source_version,
+            snapshot,
+        });
+    }
+}
+
+impl CacheState {
+    fn slot(&self, mode: GraphMode) -> &Option<CachedGraphSnapshot> {
+        match mode {
+            GraphMode::Anchors => &self.anchors,
+            GraphMode::All => &self.all,
+        }
+    }
+
+    fn slot_mut(&mut self, mode: GraphMode) -> &mut Option<CachedGraphSnapshot> {
+        match mode {
+            GraphMode::Anchors => &mut self.anchors,
+            GraphMode::All => &mut self.all,
+        }
     }
 }
 
@@ -313,6 +376,32 @@ mod tests {
 
         assert!(refreshed.version > initial.version);
         assert!(refreshed.nodes.iter().any(|node| node.id == next_text));
+    }
+
+    #[tokio::test]
+    async fn cache_reuses_snapshot_for_same_source_version() {
+        let publisher = ConsolePublisher::new();
+        let (store, _, text) = graph_store(publisher.clone());
+        let cache = ConsoleGraphCache::new(store.clone(), publisher);
+
+        let first = cache.current_snapshot(GraphMode::All).await;
+        let second = cache.current_snapshot(GraphMode::All).await;
+
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let next_text = store
+            .append(NewNode {
+                parent: text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("new version".to_owned()),
+            })
+            .unwrap();
+        store.set_branch_head("main", &text, &next_text).unwrap();
+        let third = cache.current_snapshot(GraphMode::All).await;
+
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert!(third.nodes.iter().any(|node| node.id == next_text));
     }
 
     #[tokio::test]
