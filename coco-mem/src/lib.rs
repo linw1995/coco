@@ -7,6 +7,6 @@ mod types;
 pub use error::{StoreError, StoreResult};
 pub use store::{
     BranchStore, FsStore, JobStore, MemoryStore, MessageQueueStore, NodeStore, PresetStore,
-    ProcessShareableStore, SessionStore, SkillStore, Store,
+    ProcessShareableStore, SessionStore, SkillStore, SqliteStore, Store,
 };
 pub use types::*;
