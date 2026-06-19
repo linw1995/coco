@@ -1431,6 +1431,7 @@ impl NodeStore for SqliteStore {
     }
 
     fn append(&self, node: NewNode) -> Result<String> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let node = state.plan_append_node(node)?;
         self.block_on(async {
@@ -1470,6 +1471,7 @@ impl NodeStore for SqliteStore {
 
 impl BranchStore for SqliteStore {
     fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let plan = state.plan_fork(name, from_ref)?;
         let mut temp = state.clone();
@@ -1493,6 +1495,7 @@ impl BranchStore for SqliteStore {
     }
 
     fn delete_branch(&self, name: &str) -> Result<()> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         temp.delete_branch(name)?;
@@ -1504,6 +1507,7 @@ impl BranchStore for SqliteStore {
     }
 
     fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         temp.apply_set_branch_head(name.to_owned(), expected_old_head, new_head.to_owned())?;
@@ -1551,6 +1555,7 @@ impl SessionStore for SqliteStore {
         expected: Option<&SessionState>,
         next: SessionState,
     ) -> Result<SessionState> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let updated = temp.set_session_state(name, expected, next)?;
@@ -1562,6 +1567,7 @@ impl SessionStore for SqliteStore {
     }
 
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let plan = state.plan_rebase_session(name, patch)?;
         self.block_on(async {
@@ -1589,6 +1595,7 @@ impl SessionStore for SqliteStore {
         patch: &SessionAnchorPatch,
         prompt: &str,
     ) -> Result<String> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let plan = state.plan_handoff_session(name, patch, prompt)?;
         self.block_on(async {
@@ -1611,6 +1618,7 @@ impl SessionStore for SqliteStore {
 
 impl JobStore for SqliteStore {
     fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let created = temp.submit_job(branch, base)?;
@@ -1623,6 +1631,7 @@ impl JobStore for SqliteStore {
     }
 
     fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let created = temp.submit_job_with_id(job_id, branch, base)?;
@@ -1646,6 +1655,7 @@ impl JobStore for SqliteStore {
     }
 
     fn set_job_status(&self, job_id: &str, expected: JobStatus, next: JobStatus) -> Result<Job> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let updated = temp.set_job_status(job_id, expected, next)?;
@@ -1663,6 +1673,7 @@ impl JobStore for SqliteStore {
         expected_work_branch: &str,
         next_work_branch: &str,
     ) -> Result<Job> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let updated = temp.set_job_work_branch(job_id, expected_work_branch, next_work_branch)?;
@@ -1677,6 +1688,7 @@ impl JobStore for SqliteStore {
 
 impl MessageQueueStore for SqliteStore {
     fn enqueue_message(&self, queue: &str, payload: serde_json::Value) -> Result<MessageQueueItem> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let item = temp.enqueue_message(queue, payload);
@@ -1689,6 +1701,7 @@ impl MessageQueueStore for SqliteStore {
     }
 
     fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let item = temp.dequeue_message(queue);
@@ -1745,6 +1758,7 @@ impl PresetStore for SqliteStore {
     }
 
     fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let updated = temp.set_preset(name, config)?;
@@ -1757,6 +1771,7 @@ impl PresetStore for SqliteStore {
     }
 
     fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let updated = temp.rollback_preset(name, target_version)?;
@@ -1769,6 +1784,7 @@ impl PresetStore for SqliteStore {
     }
 
     fn delete_preset(&self, name: &str) -> Result<()> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         temp.delete_preset(name)?;
@@ -1803,6 +1819,7 @@ impl SkillStore for SqliteStore {
         name: &str,
         spec: SkillVersionSpec,
     ) -> Result<SkillRecord> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let created = temp.add_skill(role, name, spec)?;
@@ -1820,6 +1837,7 @@ impl SkillStore for SqliteStore {
         name: &str,
         patch: &SkillUpdatePatch,
     ) -> Result<SkillRecord> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let updated = temp.update_skill(role, name, patch)?;
@@ -1837,6 +1855,7 @@ impl SkillStore for SqliteStore {
         name: &str,
         target_version: u64,
     ) -> Result<SkillRecord> {
+        self.ensure_writable()?;
         let mut state = self.inner.write().expect("store lock poisoned");
         let mut temp = state.clone();
         let updated = temp.rollback_skill(role, name, target_version)?;
@@ -1924,6 +1943,29 @@ mod tests {
         let store = SqliteStore::open_read_only(&path).unwrap();
 
         assert_eq!(store.schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn open_read_only_rejects_writes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let writable = SqliteStore::open(&path).unwrap();
+        let root_id = writable.root_id();
+        drop(writable);
+
+        let store = SqliteStore::open_read_only(&path).unwrap();
+        let err = store
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("child".to_owned()),
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, crate::StoreError::StoreReadOnly { .. }));
+        let reopened = SqliteStore::open_read_only(&path).unwrap();
+        assert!(reopened.list_children(&root_id).unwrap().is_empty());
     }
 
     #[test]
