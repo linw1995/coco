@@ -12,6 +12,7 @@ use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 use snafu::prelude::*;
 use tokio::runtime::Runtime;
 
+use super::fs::FsStore;
 use super::state::StoreState;
 use super::{
     BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, ProcessShareableStore,
@@ -30,6 +31,7 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
+const LEGACY_FS_META_FILE_NAME: &str = "meta.json";
 const SQLITE_SCHEMA_VERSION: i32 = 1;
 
 type AsyncSqliteConnection = SyncConnectionWrapper<SqliteConnection>;
@@ -215,6 +217,30 @@ impl std::fmt::Debug for SqliteStore {
 }
 
 impl SqliteStore {
+    pub fn open_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if sqlite_database_path(path).is_file() || !legacy_fs_store_exists(path) {
+            return Self::open(path);
+        }
+
+        prepare_store_directory(path)?;
+        let legacy = FsStore::open(path)?;
+        let state = legacy.snapshot_state();
+        let store = Self::new(path, StoreAccess::ReadWrite)?;
+        store.run_migrations()?;
+        store.persist_state_snapshot(&state)?;
+        store.replace_state(state);
+        Ok(store)
+    }
+
+    pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if sqlite_database_path(path).is_file() {
+            return Self::open_read_only(path);
+        }
+        Self::open_or_migrate_fs(path)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         prepare_store_directory(path)?;
@@ -350,6 +376,14 @@ impl SqliteStore {
         *self.inner.write().expect("store lock poisoned") = state;
     }
 
+    fn persist_state_snapshot(&self, state: &StoreState) -> Result<()> {
+        self.ensure_writable()?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_state_snapshot(&mut connection, &self.database_path, state).await
+        })
+    }
+
     async fn connect(&self) -> Result<AsyncSqliteConnection> {
         let database_url = self.database_path.to_string_lossy().into_owned();
         let mut connection = AsyncSqliteConnection::establish(&database_url)
@@ -365,6 +399,14 @@ impl SqliteStore {
     pub fn snapshot_state(&self) -> StoreState {
         self.inner.read().expect("store lock poisoned").clone()
     }
+}
+
+fn sqlite_database_path(path: &Path) -> PathBuf {
+    path.join(SQLITE_DATABASE_FILE_NAME)
+}
+
+fn legacy_fs_store_exists(path: &Path) -> bool {
+    path.join(LEGACY_FS_META_FILE_NAME).is_file()
 }
 
 fn prepare_store_directory(path: &Path) -> Result<()> {
@@ -589,6 +631,64 @@ ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
     .context(QuerySqliteStoreSnafu {
         path: path.to_owned(),
     })?;
+    Ok(())
+}
+
+async fn persist_state_snapshot(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    state: &StoreState,
+) -> Result<()> {
+    persist_root_metadata(connection, path, state.root_id()).await?;
+
+    let mut nodes = state.nodes.values().collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    for node in nodes {
+        persist_node(connection, path, node).await?;
+    }
+
+    let mut branches = state.branches.iter().collect::<Vec<_>>();
+    branches.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (branch, head_id) in branches {
+        persist_branch(connection, path, branch, head_id).await?;
+    }
+
+    let mut sessions = state.sessions.iter().collect::<Vec<_>>();
+    sessions.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (branch, session_state) in sessions {
+        persist_session_state(connection, path, branch, session_state).await?;
+    }
+
+    let mut presets = state.presets.values().collect::<Vec<_>>();
+    presets.sort_by(|left, right| left.name.cmp(&right.name));
+    for preset in presets {
+        persist_preset(connection, path, preset).await?;
+    }
+
+    for role in [SessionRole::Orchestrator, SessionRole::Runner] {
+        for record in state.skill_groups.for_role(role).values() {
+            persist_skill(connection, path, role, record).await?;
+        }
+    }
+
+    let mut jobs = state.jobs.values().collect::<Vec<_>>();
+    jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+    for job in jobs {
+        persist_job(connection, path, job).await?;
+    }
+
+    let mut queues = state.message_queues.iter().collect::<Vec<_>>();
+    queues.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (_, items) in queues {
+        for item in items {
+            persist_message_queue_item(connection, path, item).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1674,7 +1774,7 @@ impl ProcessShareableStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use super::SqliteStore;
+    use super::{FsStore, SqliteStore};
     use crate::{
         Anchor, BranchStore, JobStatus, JobStore, Kind, MessageQueueStore, NewNode, NodeStore,
         PauseReason, Preset, PresetStore, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
@@ -2034,5 +2134,41 @@ mod tests {
 
         assert_eq!(record.current_version, 3);
         assert_eq!(record.current().unwrap().body, "run");
+    }
+
+    #[test]
+    fn open_or_migrate_fs_imports_legacy_store() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let legacy = FsStore::open(&path).unwrap();
+        let root_id = legacy.root_id();
+        let session = legacy.append(session_anchor_node(&root_id)).unwrap();
+        legacy.fork("main", &session).unwrap();
+        legacy.set_preset("default", preset("gpt-5.4")).unwrap();
+        let queued = legacy
+            .enqueue_message("runner", serde_json::json!({"source": "fs"}))
+            .unwrap();
+        drop(legacy);
+
+        let migrated = SqliteStore::open_or_migrate_fs(&path).unwrap();
+
+        assert!(migrated.database_path().is_file());
+        assert_eq!(migrated.get_branch_head("main").unwrap(), session);
+        assert_eq!(
+            migrated
+                .get_preset_record("default")
+                .unwrap()
+                .current_preset()
+                .unwrap()
+                .model,
+            "gpt-5.4"
+        );
+        assert_eq!(
+            migrated.peek_message("runner").unwrap().unwrap().message_id,
+            queued.message_id
+        );
+
+        let reopened = SqliteStore::open_read_only_or_migrate_fs(&path).unwrap();
+        assert_eq!(reopened.get_branch_head("main").unwrap(), session);
     }
 }

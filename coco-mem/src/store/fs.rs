@@ -2782,8 +2782,7 @@ impl FsStore {
         &self.persistence.dir
     }
 
-    #[cfg(test)]
-    pub fn snapshot_state(&self) -> StoreState {
+    pub(crate) fn snapshot_state(&self) -> StoreState {
         self.inner.read().expect("store lock poisoned").clone()
     }
 
