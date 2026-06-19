@@ -275,7 +275,7 @@ impl SqliteStore {
         if sqlite_database_path(path).is_file() && !legacy_fs_store_exists(path) {
             return Self::open_read_only(path);
         }
-        Self::open_or_migrate_fs(path)
+        Self::open_read_only(path)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -492,7 +492,7 @@ PRAGMA journal_mode = DELETE;
     }
 }
 
-fn sqlite_database_path(path: &Path) -> PathBuf {
+pub(super) fn sqlite_database_path(path: &Path) -> PathBuf {
     path.join(SQLITE_DATABASE_FILE_NAME)
 }
 
@@ -500,11 +500,11 @@ fn sqlite_migration_database_path(path: &Path) -> PathBuf {
     path.join(SQLITE_MIGRATION_DATABASE_FILE_NAME)
 }
 
-fn legacy_fs_store_exists(path: &Path) -> bool {
+pub(super) fn legacy_fs_store_exists(path: &Path) -> bool {
     path.join(LEGACY_FS_META_FILE_NAME).is_file()
 }
 
-fn fs_migration_complete_marker_exists(path: &Path) -> bool {
+pub(super) fn fs_migration_complete_marker_exists(path: &Path) -> bool {
     let Ok(store) = SqliteStore::new(path, StoreAccess::ReadOnly) else {
         return false;
     };

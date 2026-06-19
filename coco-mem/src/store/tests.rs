@@ -3,6 +3,7 @@ use std::fs;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
+use super::PersistentStore;
 use super::fs::FsStore;
 use super::memory::MemoryStore;
 use super::sqlite::SqliteStore;
@@ -2873,6 +2874,23 @@ fn open_read_only_allows_store_locked_by_another_owner() {
 
     let read_only = FsStore::open_read_only(&path).unwrap();
 
+    assert_eq!(read_only.get_branch_head("main").unwrap(), root_id);
+    let err = read_only
+        .append(make_text_node(&root_id, "read-only write"))
+        .unwrap_err();
+    assert!(matches!(err, Error::StoreReadOnly { path: locked } if locked == path));
+}
+
+#[test]
+fn persistent_read_only_open_preserves_locked_legacy_store() {
+    let (_tempdir, path) = temp_store_path();
+    let store = FsStore::open(&path).unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).unwrap();
+
+    let read_only = PersistentStore::open_read_only_or_migrate_fs(&path).unwrap();
+
+    assert!(matches!(read_only, PersistentStore::Fs(_)));
     assert_eq!(read_only.get_branch_head("main").unwrap(), root_id);
     let err = read_only
         .append(make_text_node(&root_id, "read-only write"))

@@ -217,3 +217,267 @@ impl<T> Store for T where
         + MessageQueueStore
 {
 }
+
+#[derive(Clone, Debug)]
+pub enum PersistentStore {
+    Fs(FsStore),
+    Sqlite(SqliteStore),
+}
+
+impl PersistentStore {
+    pub fn open_or_migrate_fs(path: impl AsRef<Path>) -> StoreResult<Self> {
+        SqliteStore::open_or_migrate_fs(path).map(Self::Sqlite)
+    }
+
+    pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path = path.as_ref();
+        if sqlite::sqlite_database_path(path).is_file()
+            && sqlite::fs_migration_complete_marker_exists(path)
+        {
+            return SqliteStore::open_read_only(path).map(Self::Sqlite);
+        }
+        if sqlite::sqlite_database_path(path).is_file() && !sqlite::legacy_fs_store_exists(path) {
+            return SqliteStore::open_read_only(path).map(Self::Sqlite);
+        }
+        if sqlite::legacy_fs_store_exists(path) {
+            return FsStore::open_read_only(path).map(Self::Fs);
+        }
+        SqliteStore::open_read_only(path).map(Self::Sqlite)
+    }
+
+    pub fn store_path(&self) -> &Path {
+        match self {
+            Self::Fs(store) => store.store_path(),
+            Self::Sqlite(store) => store.store_path(),
+        }
+    }
+}
+
+macro_rules! delegate_persistent_store {
+    ($self:expr, $store:ident, $body:expr) => {
+        match $self {
+            PersistentStore::Fs($store) => $body,
+            PersistentStore::Sqlite($store) => $body,
+        }
+    };
+}
+
+impl NodeStore for PersistentStore {
+    fn root_id(&self) -> String {
+        delegate_persistent_store!(self, store, store.root_id())
+    }
+
+    fn append(&self, node: NewNode) -> StoreResult<String> {
+        delegate_persistent_store!(self, store, store.append(node))
+    }
+
+    fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {
+        delegate_persistent_store!(self, store, store.ancestry(head_ref))
+    }
+
+    fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>> {
+        delegate_persistent_store!(self, store, store.log(base_ref, head_ref))
+    }
+
+    fn get_node(&self, id: &str) -> StoreResult<Node> {
+        delegate_persistent_store!(self, store, store.get_node(id))
+    }
+
+    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>> {
+        delegate_persistent_store!(self, store, store.list_children(node_id))
+    }
+}
+
+impl BranchStore for PersistentStore {
+    fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
+        delegate_persistent_store!(self, store, store.fork(name, from_ref))
+    }
+
+    fn get_branch_head(&self, name: &str) -> StoreResult<String> {
+        delegate_persistent_store!(self, store, store.get_branch_head(name))
+    }
+
+    fn delete_branch(&self, name: &str) -> StoreResult<()> {
+        delegate_persistent_store!(self, store, store.delete_branch(name))
+    }
+
+    fn set_branch_head(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        new_head: &str,
+    ) -> StoreResult<()> {
+        delegate_persistent_store!(
+            self,
+            store,
+            store.set_branch_head(name, expected_old_head, new_head)
+        )
+    }
+}
+
+impl SessionStore for PersistentStore {
+    fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>> {
+        delegate_persistent_store!(self, store, store.list_session_states())
+    }
+
+    fn get_session_state(&self, name: &str) -> StoreResult<SessionState> {
+        delegate_persistent_store!(self, store, store.get_session_state(name))
+    }
+
+    fn set_session_state(
+        &self,
+        name: &str,
+        expected: Option<&SessionState>,
+        next: SessionState,
+    ) -> StoreResult<SessionState> {
+        delegate_persistent_store!(self, store, store.set_session_state(name, expected, next))
+    }
+
+    fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
+        delegate_persistent_store!(self, store, store.rebase_session(name, patch))
+    }
+
+    fn handoff_session(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        prompt: &str,
+    ) -> StoreResult<String> {
+        delegate_persistent_store!(self, store, store.handoff_session(name, patch, prompt))
+    }
+}
+
+impl PresetStore for PersistentStore {
+    fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>> {
+        delegate_persistent_store!(self, store, store.list_preset_records())
+    }
+
+    fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord> {
+        delegate_persistent_store!(self, store, store.get_preset_record(name))
+    }
+
+    fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord> {
+        delegate_persistent_store!(self, store, store.set_preset(name, preset))
+    }
+
+    fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord> {
+        delegate_persistent_store!(self, store, store.rollback_preset(name, target_version))
+    }
+
+    fn delete_preset(&self, name: &str) -> StoreResult<()> {
+        delegate_persistent_store!(self, store, store.delete_preset(name))
+    }
+}
+
+impl SkillStore for PersistentStore {
+    fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>> {
+        delegate_persistent_store!(self, store, store.list_skills(role))
+    }
+
+    fn get_skill(&self, role: SessionRole, name: &str) -> StoreResult<SkillRecord> {
+        delegate_persistent_store!(self, store, store.get_skill(role, name))
+    }
+
+    fn add_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        spec: SkillVersionSpec,
+    ) -> StoreResult<SkillRecord> {
+        delegate_persistent_store!(self, store, store.add_skill(role, name, spec))
+    }
+
+    fn update_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        patch: &SkillUpdatePatch,
+    ) -> StoreResult<SkillRecord> {
+        delegate_persistent_store!(self, store, store.update_skill(role, name, patch))
+    }
+
+    fn rollback_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        target_version: u64,
+    ) -> StoreResult<SkillRecord> {
+        delegate_persistent_store!(
+            self,
+            store,
+            store.rollback_skill(role, name, target_version)
+        )
+    }
+}
+
+impl JobStore for PersistentStore {
+    fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job> {
+        delegate_persistent_store!(self, store, store.submit_job(branch, base))
+    }
+
+    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
+        delegate_persistent_store!(self, store, store.submit_job_with_id(job_id, branch, base))
+    }
+
+    fn get_job(&self, job_id: &str) -> StoreResult<Job> {
+        delegate_persistent_store!(self, store, store.get_job(job_id))
+    }
+
+    fn list_jobs(&self) -> StoreResult<HashMap<String, Job>> {
+        delegate_persistent_store!(self, store, store.list_jobs())
+    }
+
+    fn set_job_status(
+        &self,
+        job_id: &str,
+        expected: JobStatus,
+        next: JobStatus,
+    ) -> StoreResult<Job> {
+        delegate_persistent_store!(self, store, store.set_job_status(job_id, expected, next))
+    }
+
+    fn set_job_work_branch(
+        &self,
+        job_id: &str,
+        expected_work_branch: &str,
+        next_work_branch: &str,
+    ) -> StoreResult<Job> {
+        delegate_persistent_store!(
+            self,
+            store,
+            store.set_job_work_branch(job_id, expected_work_branch, next_work_branch)
+        )
+    }
+}
+
+impl MessageQueueStore for PersistentStore {
+    fn enqueue_message(
+        &self,
+        queue: &str,
+        payload: serde_json::Value,
+    ) -> StoreResult<MessageQueueItem> {
+        delegate_persistent_store!(self, store, store.enqueue_message(queue, payload))
+    }
+
+    fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
+        delegate_persistent_store!(self, store, store.dequeue_message(queue))
+    }
+
+    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
+        delegate_persistent_store!(self, store, store.peek_message(queue))
+    }
+
+    fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>> {
+        delegate_persistent_store!(self, store, store.list_queue_messages(queue))
+    }
+
+    fn list_message_queues(&self) -> StoreResult<Vec<String>> {
+        delegate_persistent_store!(self, store, store.list_message_queues())
+    }
+}
+
+impl ProcessShareableStore for PersistentStore {
+    fn store_path(&self) -> &Path {
+        delegate_persistent_store!(self, store, store.store_path())
+    }
+}
