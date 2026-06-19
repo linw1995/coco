@@ -231,14 +231,14 @@ impl SqliteStore {
         if !legacy_fs_store_exists(path) {
             return Self::open(path);
         }
-        if sqlite_database_path(path).is_file() && fs_migration_complete_marker_exists(path) {
+        if sqlite_database_path(path).is_file() && fs_migration_complete_marker_exists(path)? {
             return Self::open(path);
         }
 
         prepare_store_directory(path)?;
         let legacy = FsStore::open(path)?;
         if sqlite_database_path(path).is_file() {
-            if fs_migration_complete_marker_exists(path) {
+            if fs_migration_complete_marker_exists(path)? {
                 drop(legacy);
                 return Self::open(path);
             }
@@ -269,7 +269,7 @@ impl SqliteStore {
 
     pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if sqlite_database_path(path).is_file() && fs_migration_complete_marker_exists(path) {
+        if sqlite_database_path(path).is_file() && fs_migration_complete_marker_exists(path)? {
             return Self::open_read_only(path);
         }
         if sqlite_database_path(path).is_file() && !legacy_fs_store_exists(path) {
@@ -504,21 +504,17 @@ pub(super) fn legacy_fs_store_exists(path: &Path) -> bool {
     path.join(LEGACY_FS_META_FILE_NAME).is_file()
 }
 
-pub(super) fn fs_migration_complete_marker_exists(path: &Path) -> bool {
-    let Ok(store) = SqliteStore::new(path, StoreAccess::ReadOnly) else {
-        return false;
-    };
-    store
-        .block_on(async {
-            let mut connection = store.connect().await?;
-            load_store_meta_bool(
-                &mut connection,
-                &store.database_path,
-                FS_MIGRATION_COMPLETE_META_KEY,
-            )
-            .await
-        })
-        .unwrap_or(false)
+pub(super) fn fs_migration_complete_marker_exists(path: &Path) -> Result<bool> {
+    let store = SqliteStore::new(path, StoreAccess::ReadOnly)?;
+    store.block_on(async {
+        let mut connection = store.connect().await?;
+        load_store_meta_bool(
+            &mut connection,
+            &store.database_path,
+            FS_MIGRATION_COMPLETE_META_KEY,
+        )
+        .await
+    })
 }
 
 fn quarantine_incomplete_sqlite_database(path: &Path) -> Result<()> {
@@ -2967,6 +2963,24 @@ THIS IS NOT SQL;
 
         assert!(path.join(SQLITE_INCOMPLETE_DATABASE_FILE_NAME).is_file());
         assert_eq!(migrated.get_branch_head("main").unwrap(), session);
+    }
+
+    #[test]
+    fn open_or_migrate_fs_preserves_unreadable_completed_sqlite_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let legacy = FsStore::open(&path).unwrap();
+        let root_id = legacy.root_id();
+        legacy.fork("main", &root_id).unwrap();
+        drop(legacy);
+        SqliteStore::open_or_migrate_fs(&path).unwrap();
+        std::fs::write(super::sqlite_database_path(&path), "not sqlite").unwrap();
+
+        let err = SqliteStore::open_or_migrate_fs(&path).unwrap_err();
+
+        assert!(err.to_string().contains("SQLite"));
+        assert!(super::sqlite_database_path(&path).is_file());
+        assert!(!path.join(SQLITE_INCOMPLETE_DATABASE_FILE_NAME).exists());
     }
 
     #[test]

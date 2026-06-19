@@ -232,7 +232,7 @@ impl PersistentStore {
     pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
         if sqlite::sqlite_database_path(path).is_file()
-            && sqlite::fs_migration_complete_marker_exists(path)
+            && sqlite::fs_migration_complete_marker_exists(path)?
         {
             return SqliteStore::open_read_only(path).map(Self::Sqlite);
         }
