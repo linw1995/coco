@@ -1296,6 +1296,39 @@ async fn persist_branch(
     Ok(())
 }
 
+async fn persist_branch_and_session_state(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    head_id: &str,
+    session_state: &SessionState,
+) -> Result<()> {
+    connection
+        .batch_execute("BEGIN IMMEDIATE")
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    let result = async {
+        persist_branch(connection, path, branch, head_id).await?;
+        persist_session_state(connection, path, branch, session_state).await
+    }
+    .await;
+    match result {
+        Ok(()) => connection
+            .batch_execute("COMMIT")
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            }),
+        Err(error) => {
+            let _ = connection.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
 async fn persist_session_state(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -1690,8 +1723,14 @@ impl BranchStore for SqliteStore {
         let session_state = temp.get_session_state(name)?;
         self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_branch(&mut connection, &self.database_path, name, &plan.head_id).await?;
-            persist_session_state(&mut connection, &self.database_path, name, &session_state).await
+            persist_branch_and_session_state(
+                &mut connection,
+                &self.database_path,
+                name,
+                &plan.head_id,
+                &session_state,
+            )
+            .await
         })?;
         state.apply_fork(name.to_owned(), plan.head_id.clone())?;
         Ok(plan.head_id)
@@ -2384,6 +2423,45 @@ THIS IS NOT SQL;
         reopened.delete_branch("main").unwrap();
         let reopened = SqliteStore::open(&path).unwrap();
         assert!(reopened.get_branch_head("main").is_err());
+    }
+
+    #[test]
+    fn fork_persistence_rolls_back_branch_when_session_insert_fails() {
+        use diesel::sql_query;
+        use diesel::sql_types::Text;
+        use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            connection
+                .batch_execute("DROP TABLE sessions")
+                .await
+                .unwrap();
+
+            let err = super::persist_branch_and_session_state(
+                &mut connection,
+                &store.database_path,
+                "main",
+                &root_id,
+                &SessionState::Active,
+            )
+            .await
+            .unwrap_err();
+            let count = sql_query("SELECT COUNT(*) AS count FROM branches WHERE name = ?")
+                .bind::<Text, _>("main")
+                .get_result::<super::TableCount>(&mut connection)
+                .await
+                .unwrap()
+                .count;
+
+            assert!(err.to_string().contains("SQLite"));
+            assert_eq!(count, 0);
+        });
     }
 
     #[test]
