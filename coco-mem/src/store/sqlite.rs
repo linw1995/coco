@@ -13,7 +13,9 @@ use snafu::prelude::*;
 use tokio::runtime::Runtime;
 
 use super::state::StoreState;
-use super::{BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, SessionStore};
+use super::{
+    BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, SessionStore, SkillStore,
+};
 use crate::StoreResult as Result;
 use crate::error::{
     ConnectSqliteStoreSnafu, CorruptedStoreSnafu, ParseSqliteStoreValueSnafu,
@@ -22,7 +24,8 @@ use crate::error::{
 };
 use crate::{
     Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Preset,
-    PresetRecord, Role, SessionAnchorPatch, SessionState,
+    PresetRecord, Role, SessionAnchorPatch, SessionRole, SessionState, SkillRecord,
+    SkillUpdatePatch, SkillVersionSpec,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -115,6 +118,14 @@ struct MessageQueueItemRow {
 
 #[derive(QueryableByName)]
 struct PresetRow {
+    #[diesel(sql_type = Text)]
+    record_json: String,
+}
+
+#[derive(QueryableByName)]
+struct SkillRow {
+    #[diesel(sql_type = Text)]
+    role: String,
     #[diesel(sql_type = Text)]
     record_json: String,
 }
@@ -625,6 +636,7 @@ async fn load_state(connection: &mut AsyncSqliteConnection, path: &Path) -> Resu
     load_branches(connection, path, &mut state).await?;
     load_sessions(connection, path, &mut state).await?;
     load_presets(connection, path, &mut state).await?;
+    load_skills(connection, path, &mut state).await?;
     load_jobs(connection, path, &mut state).await?;
     load_message_queue_items(connection, path, &mut state).await?;
     Ok(state)
@@ -1158,6 +1170,73 @@ async fn delete_preset_record(
     Ok(())
 }
 
+async fn load_skills(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    state: &mut StoreState,
+) -> Result<()> {
+    let rows = sql_query("SELECT role, record_json FROM skills ORDER BY role, name")
+        .load::<SkillRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    for row in rows {
+        let role = parse_session_role(&row.role, path)?;
+        let record = serde_json::from_str::<SkillRecord>(&row.record_json).context(
+            ParseSqliteStoreValueSnafu {
+                path: path.to_owned(),
+                column: "skills.record_json".to_owned(),
+            },
+        )?;
+        state
+            .skill_groups
+            .for_role_mut(role)
+            .insert(record.name.clone(), record);
+    }
+    Ok(())
+}
+
+async fn persist_skill(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    role: SessionRole,
+    record: &SkillRecord,
+) -> Result<()> {
+    let record_json = serde_json::to_string(record).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "skills.record_json".to_owned(),
+    })?;
+    sql_query(
+        r#"
+INSERT INTO skills (role, name, record_json)
+VALUES (?, ?, ?)
+ON CONFLICT(role, name) DO UPDATE SET record_json = excluded.record_json
+"#,
+    )
+    .bind::<Text, _>(role.as_str())
+    .bind::<Text, _>(&record.name)
+    .bind::<Text, _>(record_json)
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    Ok(())
+}
+
+fn parse_session_role(role: &str, path: &Path) -> Result<SessionRole> {
+    match role {
+        "orchestrator" => Ok(SessionRole::Orchestrator),
+        "runner" => Ok(SessionRole::Runner),
+        _ => CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("invalid SQLite session role {role:?}"),
+        }
+        .fail(),
+    }
+}
+
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
         self.inner
@@ -1518,13 +1597,81 @@ impl PresetStore for SqliteStore {
     }
 }
 
+impl SkillStore for SqliteStore {
+    fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_skills(role))
+    }
+
+    fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_skill(role, name)
+    }
+
+    fn add_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        spec: SkillVersionSpec,
+    ) -> Result<SkillRecord> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let created = temp.add_skill(role, name, spec)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_skill(&mut connection, &self.database_path, role, &created).await
+        })?;
+        state.skill_groups = temp.skill_groups;
+        Ok(created)
+    }
+
+    fn update_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        patch: &SkillUpdatePatch,
+    ) -> Result<SkillRecord> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.update_skill(role, name, patch)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_skill(&mut connection, &self.database_path, role, &updated).await
+        })?;
+        state.skill_groups = temp.skill_groups;
+        Ok(updated)
+    }
+
+    fn rollback_skill(
+        &self,
+        role: SessionRole,
+        name: &str,
+        target_version: u64,
+    ) -> Result<SkillRecord> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.rollback_skill(role, name, target_version)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_skill(&mut connection, &self.database_path, role, &updated).await
+        })?;
+        state.skill_groups = temp.skill_groups;
+        Ok(updated)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SqliteStore;
     use crate::{
         Anchor, BranchStore, JobStatus, JobStore, Kind, MessageQueueStore, NewNode, NodeStore,
         PauseReason, Preset, PresetStore, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
-        SessionState, SessionStore,
+        SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
     };
 
     fn session_anchor_node(parent: &str) -> NewNode {
@@ -1831,5 +1978,54 @@ mod tests {
 
         assert_eq!(record.current_version, 3);
         assert_eq!(record.current_preset().unwrap().model, "gpt-5.4");
+    }
+
+    #[test]
+    fn skill_operations_persist_across_reopen() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(
+            store
+                .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+                .is_ok()
+        );
+
+        let created = store
+            .add_skill(
+                SessionRole::Runner,
+                "custom-runner",
+                SkillVersionSpec {
+                    description: "custom".to_owned(),
+                    body: "run".to_owned(),
+                    scripts: vec![],
+                    enable_coco_shim: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(created.current_version, 1);
+        let updated = store
+            .update_skill(
+                SessionRole::Runner,
+                "custom-runner",
+                &SkillUpdatePatch {
+                    body: Some("run updated".to_owned()),
+                    ..SkillUpdatePatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.current_version, 2);
+        let rolled_back = store
+            .rollback_skill(SessionRole::Runner, "custom-runner", 1)
+            .unwrap();
+        assert_eq!(rolled_back.current_version, 3);
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        let record = reopened
+            .get_skill(SessionRole::Runner, "custom-runner")
+            .unwrap();
+
+        assert_eq!(record.current_version, 3);
+        assert_eq!(record.current().unwrap().body, "run");
     }
 }
