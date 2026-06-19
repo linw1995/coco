@@ -4,7 +4,10 @@ use clap::{Parser, Subcommand};
 
 use crate::COCO_DAEMON_SOCKET_ENV;
 
-pub use daemon::{DaemonCommand, DaemonSubcommand};
+pub use daemon::{
+    DaemonCommand, DaemonProfileCommand, DaemonProfileGraphCommand, DaemonProfileSubcommand,
+    DaemonSubcommand,
+};
 pub use preset::{
     PresetCommand, PresetNameCommand, PresetRollbackCommand, PresetSetCommand, PresetSubcommand,
 };

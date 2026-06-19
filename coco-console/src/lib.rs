@@ -16,6 +16,7 @@ mod host {
     pub use cache::ConsoleGraphCache;
     pub use config::ConsoleConfig;
     pub use error::{Error, Result};
+    pub use graph::{GraphMode, GraphSnapshot};
     pub use publisher::ConsolePublisher;
     pub use server::{ConsoleServerHandle, start_console_server};
     pub use store::ConsoleStore;
@@ -36,7 +37,7 @@ mod wasm {
 #[cfg(not(target_arch = "wasm32"))]
 pub use host::{
     ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error,
-    Result, start_console_server,
+    GraphMode, GraphSnapshot, Result, start_console_server,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use host::{config, error, graph, layout, publisher, render};

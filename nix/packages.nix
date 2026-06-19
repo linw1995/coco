@@ -37,6 +37,15 @@
     ];
   };
   cargoArtifacts = craneLib.buildDepsOnly cargoArgs;
+  debugCargoArgs =
+    cargoArgs
+    // {
+      CARGO_PROFILE_RELEASE_DEBUG = "1";
+      CARGO_PROFILE_RELEASE_STRIP = "none";
+      RUSTFLAGS = "-C force-frame-pointers=yes";
+      dontStrip = true;
+    };
+  debugCargoArtifacts = craneLib.buildDepsOnly debugCargoArgs;
   cocoDockerEntrypoint = packagePkgs.writeShellApplication {
     name = "coco-docker-entrypoint";
     runtimeInputs = with packagePkgs; [
@@ -56,9 +65,23 @@
         mainProgram = "coco-cli";
       };
     });
+  coco-debug-cli = craneLib.buildPackage (debugCargoArgs
+    // {
+      cargoArtifacts = debugCargoArtifacts;
+
+      meta = {
+        inherit description;
+        mainProgram = "coco-cli";
+      };
+    });
   coco-image = import ./docker-image.nix {
     inherit packagePkgs lib targetSystem coco-cli cocoDockerEntrypoint;
   };
+  coco-debug-image = import ./docker-image.nix {
+    inherit packagePkgs lib targetSystem cocoDockerEntrypoint;
+    coco-cli = coco-debug-cli;
+    debugTools = true;
+  };
 in {
-  inherit coco-cli coco-image;
+  inherit coco-cli coco-debug-cli coco-image coco-debug-image;
 }

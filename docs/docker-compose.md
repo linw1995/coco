@@ -236,6 +236,118 @@ Run manual image builds on Linux, or on a host whose Nix setup can build the
 selected Linux target. For example, a macOS host needs a Linux builder before it
 can build `.#coco-image-linux-arm64` locally.
 
+## Profiling Graph Builds
+
+For low-overhead timing against the deployed store, run the graph profile
+command as a one-shot Compose container:
+
+```bash
+docker compose run --rm \
+  -e COCO_START_CRON=0 \
+  coco \
+  coco daemon profile graph --all --json
+```
+
+For CPU sampling with symbols, use the manually triggered Debug CD workflow to
+publish a debug image. The debug image keeps release debuginfo, preserves frame
+pointers, disables stripping, and includes `perf` in the container. The default
+manual tag is:
+
+```text
+ghcr.io/linw1995/coco:debug
+```
+
+`perf` is Linux-only. On macOS or Windows Docker Desktop, collect the profile on
+a Linux host or remote Linux builder that runs the container. Host kernel policy
+can also block perf events. If recording fails with a permission error, check
+the host setting:
+
+```bash
+cat /proc/sys/kernel/perf_event_paranoid
+```
+
+For local debugging on a trusted host, lower it temporarily when needed:
+
+```bash
+sudo sysctl kernel.perf_event_paranoid=1
+```
+
+To profile without changing the long-lived deployment image, run a one-shot
+container with the debug image. The command writes `perf-graph.data` under
+`/data`, which is the `${COCO_DATA_DIR}` bind mount, so the profile survives the
+temporary container:
+
+```bash
+COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+COCO_UID=0 \
+COCO_GID=0 \
+docker compose run --rm \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -e COCO_START_CRON=0 \
+  coco \
+  perf record \
+    -o /data/perf-graph.data \
+    -F 99 \
+    --call-graph fp \
+    -- \
+    coco daemon profile graph --all --json
+```
+
+If the host supports the narrower capability, `--cap-add PERFMON` can replace
+`--cap-add SYS_ADMIN`. Keep `SYS_PTRACE` and `seccomp=unconfined` when call
+stacks are incomplete. Keep `COCO_UID=0` and `COCO_GID=0` for perf one-shot
+commands so the entrypoint does not drop the capabilities added by Compose
+before running `perf`.
+
+Inspect the profile from inside a debug container that mounts the same data
+directory:
+
+```bash
+COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+COCO_UID=0 \
+COCO_GID=0 \
+docker compose run --rm \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -e COCO_START_CRON=0 \
+  coco \
+  perf report -i /data/perf-graph.data
+```
+
+For non-interactive output that can be saved in logs or attached to an issue,
+use:
+
+```bash
+COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+COCO_UID=0 \
+COCO_GID=0 \
+docker compose run --rm \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -e COCO_START_CRON=0 \
+  coco \
+  perf report --stdio -i /data/perf-graph.data
+```
+
+To export folded stack input for flamegraph tooling on the host:
+
+```bash
+COCO_IMAGE=ghcr.io/linw1995/coco:debug \
+COCO_UID=0 \
+COCO_GID=0 \
+docker compose run --rm \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -e COCO_START_CRON=0 \
+  coco \
+  perf script -i /data/perf-graph.data > .coco-data/perf-graph.script
+```
+
 ## Cronjob Skill
 
 The entrypoint supervises one `supercronic -inotify` process per active

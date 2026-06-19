@@ -4,6 +4,7 @@
   targetSystem,
   coco-cli,
   cocoDockerEntrypoint,
+  debugTools ? false,
 }: let
   fhsDynamicLinker = lib.attrByPath [targetSystem] null {
     x86_64-linux = "/lib64/ld-linux-x86-64.so.2";
@@ -47,6 +48,9 @@ in
         ++ [
           cacert
           tzdata
+        ]
+        ++ lib.optionals debugTools [
+          perf
         ]
         ++ lib.optionals (fhsDynamicLinker != null) [
           glibc

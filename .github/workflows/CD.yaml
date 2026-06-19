@@ -13,128 +13,13 @@ permissions:
   packages: write
 
 jobs:
-  publish-image-arch:
-    runs-on: ${{ matrix.runner }}
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-            nix-output: .#coco-image-linux-amd64
-            extra-platforms: x86_64-linux
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            nix-output: .#coco-image-linux-arm64
-            extra-platforms: aarch64-linux
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-nix
-
-      - name: Build Docker image
-        env:
-          NIX_CONFIG: |
-            extra-platforms = ${{ matrix.extra-platforms }}
-        run: nix build --out-link image "${{ matrix.nix-output }}" --print-build-logs
-
-      - name: Prepare Docker image artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p dist
-          cp --dereference image "dist/coco-${{ matrix.arch }}.tar.gz"
-
-      - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: "coco-image-${{ matrix.arch }}"
-          path: "dist/coco-${{ matrix.arch }}.tar.gz"
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-
   publish-image:
-    needs:
-      - publish-image-arch
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-nix
-
-      - name: Download Docker image artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-          pattern: "coco-image-*"
-          merge-multiple: true
-
-      - name: Login to GitHub Container Registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
-
-      - name: Publish Docker image
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          sha_tag="sha-${GITHUB_SHA::12}"
-          image_files=(artifacts/coco-*.tar.gz)
-
-          if ((${#image_files[@]} == 0)); then
-            echo "::error::No Docker image artifacts were built."
-            exit 1
-          fi
-
-          manifest_refs=()
-
-          for image_file in "${image_files[@]}"; do
-            case "$(basename "${image_file}")" in
-              coco-amd64.tar.gz)
-                arch="amd64"
-                ;;
-              coco-arm64.tar.gz)
-                arch="arm64"
-                ;;
-              *)
-                echo "::error::Unexpected Docker image artifact: ${image_file}"
-                exit 1
-                ;;
-            esac
-
-            docker_tar="${image_file%.gz}"
-            gzip -dc "${image_file}" > "${docker_tar}"
-
-            digest="$(nix run nixpkgs#crane -- digest --tarball "${docker_tar}")"
-            nix run nixpkgs#crane -- push "${docker_tar}" "${image}@${digest}"
-            manifest_refs+=("${image}@${digest}")
-          done
-
-          publish_image() {
-            local tag="$1"
-
-            if ((${#manifest_refs[@]} == 1)); then
-              nix run nixpkgs#crane -- copy "${manifest_refs[0]}" "${image}:${tag}"
-              return
-            fi
-
-            manifest_args=()
-            for manifest_ref in "${manifest_refs[@]}"; do
-              manifest_args+=("--manifest" "${manifest_ref}")
-            done
-
-            nix run nixpkgs#crane -- index append "${manifest_args[@]}" --tag "${image}:${tag}"
-          }
-
-          publish_image "${sha_tag}"
-
-          if [[ "${GITHUB_REF_TYPE}" == "branch" && "${GITHUB_REF_NAME}" == "main" ]]; then
-            publish_image "latest"
-          fi
-
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            publish_image "${GITHUB_REF_NAME}"
-          fi
+    uses: ./.github/workflows/Publish-Image.yaml
+    with:
+      artifact-prefix: coco
+      amd64-output: .#coco-image-linux-amd64
+      arm64-output: .#coco-image-linux-arm64
+      sha-tag-prefix: sha
+      publish-latest-on-main: true
+      publish-git-tag: true
+    secrets: inherit

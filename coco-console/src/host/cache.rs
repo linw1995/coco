@@ -194,8 +194,10 @@ where
         }
     }
 
-    #[cfg(test)]
-    pub async fn current_snapshot(&self, mode: GraphMode) -> Arc<GraphSnapshot> {
+    pub async fn snapshot_for_current_source(
+        &self,
+        mode: GraphMode,
+    ) -> crate::Result<Arc<GraphSnapshot>> {
         loop {
             let mut rx = self.ready.subscribe();
             let mut invalidations = self.invalidations.subscribe();
@@ -204,21 +206,35 @@ where
             if let Some(snapshot) = self.cached_snapshot(mode)
                 && self.cached_source_version(mode) >= source_version
             {
-                return snapshot;
+                return Ok(snapshot);
+            }
+            if let Some(failure) = self.cached_failure(mode, source_version) {
+                return Err(crate::Error::ConsoleGraphRebuild {
+                    mode: mode.as_query_value(),
+                    source_version,
+                    message: failure.message.to_string(),
+                });
             }
             tokio::select! {
                 changed = rx.changed() => {
                     if changed.is_err() {
-                        return self.snapshot_or_placeholder(mode);
+                        return Ok(self.snapshot_or_placeholder(mode));
                     }
                 }
                 changed = invalidations.changed() => {
                     if changed.is_err() {
-                        return self.snapshot_or_placeholder(mode);
+                        return Ok(self.snapshot_or_placeholder(mode));
                     }
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub async fn current_snapshot(&self, mode: GraphMode) -> Arc<GraphSnapshot> {
+        self.snapshot_for_current_source(mode)
+            .await
+            .expect("graph snapshot should build")
     }
 
     fn cached_snapshot(&self, mode: GraphMode) -> Option<Arc<GraphSnapshot>> {
@@ -238,7 +254,6 @@ where
         (failure.source_version == source_version).then(|| failure.clone())
     }
 
-    #[cfg(test)]
     fn cached_source_version(&self, mode: GraphMode) -> u64 {
         let state = self
             .state

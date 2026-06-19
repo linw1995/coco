@@ -1,0 +1,180 @@
+name: "Publish Image"
+
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        description: "Prefix for Docker image artifact files."
+        required: true
+        type: string
+      amd64-output:
+        description: "Nix flake output for the amd64 image."
+        required: true
+        type: string
+      arm64-output:
+        description: "Nix flake output for the arm64 image."
+        required: true
+        type: string
+      sha-tag-prefix:
+        description: "Prefix for the immutable commit SHA tag."
+        required: true
+        type: string
+      manual-tag:
+        description: "Optional extra tag to publish."
+        required: false
+        default: ""
+        type: string
+      publish-latest-on-main:
+        description: "Publish latest for main branch refs."
+        required: false
+        default: false
+        type: boolean
+      publish-git-tag:
+        description: "Publish the git tag name for tag refs."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-image-arch:
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            nix-output: ${{ inputs.amd64-output }}
+            extra-platforms: x86_64-linux
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            nix-output: ${{ inputs.arm64-output }}
+            extra-platforms: aarch64-linux
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+
+      - name: Build Docker image
+        env:
+          NIX_CONFIG: |
+            extra-platforms = ${{ matrix.extra-platforms }}
+        run: nix build --out-link image "${{ matrix.nix-output }}" --print-build-logs
+
+      - name: Prepare Docker image artifact
+        shell: bash
+        env:
+          ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          cp --dereference image "dist/${ARTIFACT_PREFIX}-${ARCH}.tar.gz"
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: "${{ inputs.artifact-prefix }}-image-${{ matrix.arch }}"
+          path: "dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}.tar.gz"
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-image:
+    needs:
+      - publish-image-arch
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+
+      - name: Download Docker image artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: "${{ inputs.artifact-prefix }}-image-*"
+          merge-multiple: true
+
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Publish Docker image
+        shell: bash
+        env:
+          ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
+          MANUAL_TAG: ${{ inputs.manual-tag }}
+          PUBLISH_LATEST_ON_MAIN: ${{ inputs.publish-latest-on-main }}
+          PUBLISH_GIT_TAG: ${{ inputs.publish-git-tag }}
+          SHA_TAG_PREFIX: ${{ inputs.sha-tag-prefix }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha_tag="${SHA_TAG_PREFIX}-${GITHUB_SHA::12}"
+          image_files=(artifacts/"${ARTIFACT_PREFIX}"-*.tar.gz)
+
+          if ((${#image_files[@]} == 0)); then
+            echo "::error::No Docker image artifacts were built."
+            exit 1
+          fi
+
+          manifest_refs=()
+
+          for image_file in "${image_files[@]}"; do
+            case "$(basename "${image_file}")" in
+              "${ARTIFACT_PREFIX}-amd64.tar.gz")
+                arch="amd64"
+                ;;
+              "${ARTIFACT_PREFIX}-arm64.tar.gz")
+                arch="arm64"
+                ;;
+              *)
+                echo "::error::Unexpected Docker image artifact: ${image_file}"
+                exit 1
+                ;;
+            esac
+
+            docker_tar="${image_file%.gz}"
+            gzip -dc "${image_file}" > "${docker_tar}"
+
+            digest="$(nix run nixpkgs#crane -- digest --tarball "${docker_tar}")"
+            nix run nixpkgs#crane -- push "${docker_tar}" "${image}@${digest}"
+            manifest_refs+=("${image}@${digest}")
+          done
+
+          publish_image() {
+            local tag="$1"
+
+            if ((${#manifest_refs[@]} == 1)); then
+              nix run nixpkgs#crane -- copy "${manifest_refs[0]}" "${image}:${tag}"
+              return
+            fi
+
+            manifest_args=()
+            for manifest_ref in "${manifest_refs[@]}"; do
+              manifest_args+=("--manifest" "${manifest_ref}")
+            done
+
+            nix run nixpkgs#crane -- index append "${manifest_args[@]}" --tag "${image}:${tag}"
+          }
+
+          publish_image "${sha_tag}"
+
+          if [[ "${PUBLISH_LATEST_ON_MAIN}" == "true" && "${GITHUB_REF_TYPE}" == "branch" && "${GITHUB_REF_NAME}" == "main" ]]; then
+            publish_image "latest"
+          fi
+
+          if [[ "${PUBLISH_GIT_TAG}" == "true" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            publish_image "${GITHUB_REF_NAME}"
+          fi
+
+          if [[ -n "${MANUAL_TAG}" ]]; then
+            publish_image "${MANUAL_TAG}"
+          fi
