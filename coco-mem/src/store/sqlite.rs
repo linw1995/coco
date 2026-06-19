@@ -868,6 +868,58 @@ VALUES (?, ?, ?, ?, ?, ?)
     Ok(())
 }
 
+async fn upsert_node(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    let row = NodeRow::from_node(node.clone(), path)?;
+    sql_query(
+        r#"
+INSERT INTO nodes (id, parent_id, created_at, role, metadata_json, kind_json)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    parent_id = excluded.parent_id,
+    created_at = excluded.created_at,
+    role = excluded.role,
+    metadata_json = excluded.metadata_json,
+    kind_json = excluded.kind_json
+"#,
+    )
+    .bind::<Text, _>(row.id)
+    .bind::<Text, _>(row.parent_id)
+    .bind::<Text, _>(row.created_at)
+    .bind::<Text, _>(row.role)
+    .bind::<Nullable<Text>, _>(row.metadata_json)
+    .bind::<Text, _>(row.kind_json)
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+
+    sql_query("DELETE FROM node_edges WHERE child_id = ?")
+        .bind::<Text, _>(&node.id)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    for edge in node_edges(node) {
+        sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
+            .bind::<Text, _>(edge.parent_id)
+            .bind::<Text, _>(edge.child_id)
+            .bind::<Text, _>(edge.kind)
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
+    }
+    Ok(())
+}
+
 struct NodeEdge {
     parent_id: String,
     child_id: String,
@@ -1102,7 +1154,7 @@ async fn persist_session_nodes_and_branch_head(
     nodes: &[Node],
 ) -> Result<()> {
     for node in nodes {
-        persist_node(connection, path, node).await?;
+        upsert_node(connection, path, node).await?;
     }
     let updated = update_branch_head(connection, path, branch, expected_old_head, new_head).await?;
     ensure!(
