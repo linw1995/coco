@@ -11,7 +11,7 @@ use coco_channel::{
 use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{
     ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleServerHandle, GraphMode,
-    GraphSnapshot, start_console_server,
+    GraphSnapshot, start_console_server_with_graph_store_path,
 };
 use coco_core::{
     ConversationEngine, CoreService, EngineError, FixedBranchResolver, SYSTEM_EVENT_QUEUE,
@@ -84,6 +84,7 @@ pub struct DaemonServerOptions<'a> {
     pub channel_configs: &'a ChannelConfigs,
     pub console_config: Option<ConsoleConfig>,
     pub console_publisher: Option<ConsolePublisher>,
+    pub console_graph_store_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +105,7 @@ pub async fn run_daemon_command<B, S>(
     provider_profiles: &ProviderProfiles,
     channel_configs: &ChannelConfigs,
     console_publisher: Option<ConsolePublisher>,
+    console_graph_store_path: Option<PathBuf>,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -130,6 +132,7 @@ where
             channel_configs,
             console_config,
             console_publisher,
+            console_graph_store_path,
         },
     )?;
     spawn_resume_incomplete_jobs(shared_engine);
@@ -542,12 +545,13 @@ where
     let shared_engine = shared_engine.clone();
     let console = match options.console_config {
         Some(config) => Some(
-            start_console_server(
+            start_console_server_with_graph_store_path(
                 config,
                 shared_store.clone(),
                 options
                     .console_publisher
                     .expect("console publisher should exist when console is enabled"),
+                options.console_graph_store_path.clone(),
             )
             .context(ConsoleSnafu)?,
         ),
@@ -2331,6 +2335,7 @@ mod tests {
             &provider_profiles(),
             &ChannelConfigs::default(),
             None,
+            None,
         )
         .await
         .unwrap()
@@ -2338,7 +2343,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(value["mode"], "all");
-        assert_eq!(value["version"], 1);
+        assert_eq!(value["version"], 0);
         assert_eq!(value["branches"], 1);
         assert_eq!(value["nodes"], 1);
     }
@@ -2397,6 +2402,7 @@ mod tests {
             &llm,
             &provider_profiles(),
             &ChannelConfigs::default(),
+            None,
             None,
         )
         .await

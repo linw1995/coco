@@ -13,6 +13,7 @@ use snafu::prelude::*;
 use std::convert::Infallible;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -80,6 +81,18 @@ pub fn start_console_server<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
+    start_console_server_with_graph_store_path(config, store, publisher, None)
+}
+
+pub fn start_console_server_with_graph_store_path<S>(
+    config: ConsoleConfig,
+    store: S,
+    publisher: ConsolePublisher,
+    graph_store_path: Option<PathBuf>,
+) -> Result<ConsoleServerHandle>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
     let listener =
         TcpListener::bind(config.addr).context(BindConsoleSnafu { addr: config.addr })?;
     listener
@@ -90,9 +103,11 @@ where
     let addr = listener
         .local_addr()
         .context(ConfigureConsoleSocketSnafu { addr: config.addr })?;
-    let state = AppState {
-        cache: ConsoleGraphCache::new(store, publisher),
+    let cache = match graph_store_path {
+        Some(path) => ConsoleGraphCache::new_with_persistent_store_path(store, publisher, path),
+        None => ConsoleGraphCache::new(store, publisher),
     };
+    let state = AppState { cache };
     let task = tokio::spawn(async move {
         serve_console(listener, state)
             .await
@@ -205,7 +220,10 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
-    let snapshot = state.cache.snapshot_or_placeholder(mode);
+    let snapshot = match state.cache.snapshot_current(mode).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return plain_error(error.to_string()),
+    };
     html_response(render_index_page(&snapshot))
 }
 
@@ -222,9 +240,14 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let snapshot = state
+    let snapshot = match state
         .cache
-        .snapshot_or_placeholder(graph_mode_from_query(&query));
+        .snapshot_current(graph_mode_from_query(&query))
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return plain_error(error.to_string()),
+    };
     json_response(&snapshot, "graph")
 }
 
@@ -308,7 +331,10 @@ where
 {
     let request = viewport_diff_request_from_query(&query);
     let mode = graph_mode_from_query(&query);
-    let snapshot = state.cache.snapshot_or_placeholder(mode);
+    let snapshot = match state.cache.snapshot_current(mode).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return plain_error(error.to_string()),
+    };
     let response =
         match layout_graph_viewport_diff_with_cache(&state.cache, mode, snapshot, request).await {
             Ok(response) => response,
@@ -413,7 +439,7 @@ fn viewport_diff_has_fingerprint_changes(
 
 async fn layout_graph_viewport_with_cache<S>(
     cache: &ConsoleGraphCache<S>,
-    mode: GraphMode,
+    _mode: GraphMode,
     snapshot: Arc<GraphSnapshot>,
     request: GraphViewportRequest,
 ) -> Result<GraphViewportResponse>
@@ -421,16 +447,13 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     cache
-        .run_blocking_graph_compute_with(
-            || newest_cached_snapshot(cache, mode, snapshot),
-            move |snapshot| layout_graph_viewport(&snapshot, request),
-        )
+        .run_blocking_graph_compute(move || layout_graph_viewport(&snapshot, request))
         .await
 }
 
 async fn layout_graph_viewport_diff_with_cache<S>(
     cache: &ConsoleGraphCache<S>,
-    mode: GraphMode,
+    _mode: GraphMode,
     snapshot: Arc<GraphSnapshot>,
     request: GraphViewportDiffRequest,
 ) -> Result<GraphViewportDiffResponse>
@@ -438,27 +461,8 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     cache
-        .run_blocking_graph_compute_with(
-            || newest_cached_snapshot(cache, mode, snapshot),
-            move |snapshot| layout_graph_viewport_diff(&snapshot, request),
-        )
+        .run_blocking_graph_compute(move || layout_graph_viewport_diff(&snapshot, request))
         .await
-}
-
-fn newest_cached_snapshot<S>(
-    cache: &ConsoleGraphCache<S>,
-    mode: GraphMode,
-    fallback: Arc<GraphSnapshot>,
-) -> Arc<GraphSnapshot>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    let current = cache.snapshot_or_placeholder(mode);
-    if current.version >= fallback.version {
-        current
-    } else {
-        fallback
-    }
 }
 
 async fn fragment<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
@@ -587,7 +591,7 @@ where
 {
     match query.version() {
         Some(version) => cache.snapshot_after(mode, version).await,
-        None => Ok(cache.snapshot_or_placeholder(mode)),
+        None => cache.snapshot_current(mode).await,
     }
 }
 
@@ -987,13 +991,6 @@ mod tests {
         let mut trigger_response = Vec::new();
         trigger.read_to_end(&mut trigger_response).await.unwrap();
 
-        let mut changed = Vec::new();
-        while !contains_bytes(&changed, b"event: graph\ndata: 1") {
-            let read = stream.read(&mut response).await.unwrap();
-            assert_ne!(read, 0);
-            changed.extend_from_slice(&response[..read]);
-        }
-
         store
             .append(NewNode {
                 parent: store.root_id(),
@@ -1004,7 +1001,7 @@ mod tests {
             .unwrap();
 
         let mut invalidated = Vec::new();
-        while !contains_bytes(&invalidated, b"event: graph\ndata: 2") {
+        while !contains_bytes(&invalidated, b"event: graph\ndata: 1") {
             let read = stream.read(&mut response).await.unwrap();
             assert_ne!(read, 0);
             invalidated.extend_from_slice(&response[..read]);
@@ -1245,9 +1242,7 @@ mod tests {
             start_console_server(test_config(), MemoryStore::new(), publisher.clone()).unwrap();
         let mut initial = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         initial
-            .write_all(
-                b"GET /fragment?version=0 HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
-            )
+            .write_all(b"GET /fragment HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
             .await
             .unwrap();
         let mut initial_response = Vec::new();
@@ -1266,7 +1261,7 @@ mod tests {
 
         let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         stream
-            .write_all(b"GET /fragment?version=1 HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .write_all(b"GET /fragment?version=0 HTTP/1.1\r\nhost: localhost\r\n\r\n")
             .await
             .unwrap();
         let mut response = vec![0; 256];
