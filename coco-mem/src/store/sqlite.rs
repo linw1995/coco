@@ -122,6 +122,8 @@ struct JobRow {
 
 #[derive(QueryableByName)]
 struct MessageQueueItemRow {
+    #[diesel(sql_type = BigInt)]
+    row_id: i64,
     #[diesel(sql_type = Text)]
     item_json: String,
 }
@@ -227,6 +229,9 @@ impl SqliteStore {
     pub fn open_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if !legacy_fs_store_exists(path) {
+            return Self::open(path);
+        }
+        if sqlite_database_path(path).is_file() && fs_migration_complete_marker_exists(path) {
             return Self::open(path);
         }
 
@@ -1463,9 +1468,9 @@ async fn load_message_queue_items(
 ) -> Result<()> {
     let rows = sql_query(
         r#"
-SELECT payload_json AS item_json
+SELECT rowid AS row_id, payload_json AS item_json
 FROM message_queue_items
-ORDER BY queue, created_at, rowid
+ORDER BY rowid
 "#,
     )
     .load::<MessageQueueItemRow>(connection)
@@ -1474,6 +1479,7 @@ ORDER BY queue, created_at, rowid
         path: path.to_owned(),
     })?;
     state.message_queues.clear();
+    let mut items = Vec::new();
     for row in rows {
         let item = serde_json::from_str::<MessageQueueItem>(&row.item_json).context(
             ParseSqliteStoreValueSnafu {
@@ -1481,6 +1487,15 @@ ORDER BY queue, created_at, rowid
                 column: "message_queue_items.payload_json".to_owned(),
             },
         )?;
+        items.push((row.row_id, item));
+    }
+    items.sort_by(|(left_row_id, left), (right_row_id, right)| {
+        left.queue
+            .cmp(&right.queue)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left_row_id.cmp(right_row_id))
+    });
+    for (_, item) in items {
         state
             .message_queues
             .entry(item.queue.clone())
@@ -2610,6 +2625,40 @@ THIS IS NOT SQL;
     }
 
     #[test]
+    fn message_queue_sorts_by_parsed_timestamp() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let first = MessageQueueItem {
+            message_id: "first".to_owned(),
+            queue: "runner".to_owned(),
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            payload: serde_json::json!({"index": 1}),
+        };
+        let second = MessageQueueItem {
+            message_id: "second".to_owned(),
+            queue: "runner".to_owned(),
+            created_at: "2026-01-01T00:00:00.001Z".parse().unwrap(),
+            payload: serde_json::json!({"index": 2}),
+        };
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            super::persist_message_queue_item(&mut connection, &store.database_path, &first)
+                .await
+                .unwrap();
+            super::persist_message_queue_item(&mut connection, &store.database_path, &second)
+                .await
+                .unwrap();
+        });
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        let messages = reopened.list_queue_messages("runner").unwrap();
+
+        assert_eq!(messages[0].message_id, first.message_id);
+        assert_eq!(messages[1].message_id, second.message_id);
+    }
+
+    #[test]
     fn preset_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -2729,6 +2778,25 @@ THIS IS NOT SQL;
         let read_only = SqliteStore::open_read_only_or_migrate_fs(&path).unwrap();
         assert_eq!(migrated.get_branch_head("main").unwrap(), session);
         assert_eq!(read_only.get_branch_head("main").unwrap(), session);
+    }
+
+    #[test]
+    fn migrated_writable_open_bypasses_legacy_replay() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let legacy = FsStore::open(&path).unwrap();
+        let root_id = legacy.root_id();
+        let session = legacy.append(session_anchor_node(&root_id)).unwrap();
+        legacy.fork("main", &session).unwrap();
+        drop(legacy);
+
+        let migrated = SqliteStore::open_or_migrate_fs(&path).unwrap();
+        drop(migrated);
+        std::fs::write(path.join("meta.json"), "{").unwrap();
+
+        let reopened = SqliteStore::open_or_migrate_fs(&path).unwrap();
+
+        assert_eq!(reopened.get_branch_head("main").unwrap(), session);
     }
 
     #[test]
