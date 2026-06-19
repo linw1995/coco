@@ -264,6 +264,9 @@ impl SqliteStore {
 
     pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        if sqlite_database_path(path).is_file() && fs_migration_complete_marker_exists(path) {
+            return Self::open_read_only(path);
+        }
         if sqlite_database_path(path).is_file() && !legacy_fs_store_exists(path) {
             return Self::open_read_only(path);
         }
@@ -727,6 +730,33 @@ async fn apply_migration_if_needed(
         return Ok(());
     }
 
+    connection
+        .batch_execute("BEGIN IMMEDIATE")
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    let result = apply_migration_in_transaction(connection, path, migration).await;
+    match result {
+        Ok(()) => connection
+            .batch_execute("COMMIT")
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            }),
+        Err(error) => {
+            let _ = connection.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
+async fn apply_migration_in_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    migration: &SqliteMigration,
+) -> Result<()> {
     connection
         .batch_execute(migration.sql)
         .await
@@ -1402,7 +1432,7 @@ async fn load_message_queue_items(
         r#"
 SELECT payload_json AS item_json
 FROM message_queue_items
-ORDER BY queue, created_at, message_id
+ORDER BY queue, created_at, rowid
 "#,
     )
     .load::<MessageQueueItemRow>(connection)
@@ -2058,8 +2088,8 @@ impl ProcessShareableStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        FsStore, SQLITE_INCOMPLETE_DATABASE_FILE_NAME, SQLITE_MIGRATION_DATABASE_FILE_NAME,
-        SqliteStore,
+        FsStore, MessageQueueItem, SQLITE_INCOMPLETE_DATABASE_FILE_NAME,
+        SQLITE_MIGRATION_DATABASE_FILE_NAME, SqliteMigration, SqliteStore, StoreAccess,
     };
     use crate::{
         Anchor, BranchStore, JobStatus, JobStore, Kind, MessageQueueStore, NewNode, NodeStore,
@@ -2116,6 +2146,52 @@ mod tests {
 
         assert!(store.database_path().is_file());
         assert_eq!(store.schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn failed_schema_migration_rolls_back_ddl() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
+        let migration = SqliteMigration {
+            version: 100,
+            name: "failing-test-migration",
+            sql: r#"
+CREATE TABLE rollback_probe (
+    id INTEGER PRIMARY KEY NOT NULL
+);
+THIS IS NOT SQL;
+"#,
+        };
+
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            super::configure_writable_connection(&mut connection, &store.database_path)
+                .await
+                .unwrap();
+            super::ensure_migration_table(&mut connection, &store.database_path)
+                .await
+                .unwrap();
+
+            let err =
+                super::apply_migration_if_needed(&mut connection, &store.database_path, &migration)
+                    .await
+                    .unwrap_err();
+
+            assert!(err.to_string().contains("SQLite"));
+            assert_eq!(
+                super::table_count(&mut connection, &store.database_path, "rollback_probe")
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(
+                !super::migration_applied(&mut connection, &store.database_path, migration.version)
+                    .await
+                    .unwrap()
+            );
+        });
     }
 
     #[test]
@@ -2421,6 +2497,41 @@ mod tests {
     }
 
     #[test]
+    fn message_queue_preserves_insert_order_for_equal_timestamps() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let created_at = "2026-01-01T00:00:00Z".parse().unwrap();
+        let first = MessageQueueItem {
+            message_id: "z-first".to_owned(),
+            queue: "runner".to_owned(),
+            created_at,
+            payload: serde_json::json!({"index": 1}),
+        };
+        let second = MessageQueueItem {
+            message_id: "a-second".to_owned(),
+            queue: "runner".to_owned(),
+            created_at,
+            payload: serde_json::json!({"index": 2}),
+        };
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            super::persist_message_queue_item(&mut connection, &store.database_path, &first)
+                .await
+                .unwrap();
+            super::persist_message_queue_item(&mut connection, &store.database_path, &second)
+                .await
+                .unwrap();
+        });
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        let messages = reopened.list_queue_messages("runner").unwrap();
+
+        assert_eq!(messages[0].message_id, first.message_id);
+        assert_eq!(messages[1].message_id, second.message_id);
+    }
+
+    #[test]
     fn preset_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -2523,6 +2634,23 @@ mod tests {
 
         let reopened = SqliteStore::open_read_only_or_migrate_fs(&path).unwrap();
         assert_eq!(reopened.get_branch_head("main").unwrap(), session);
+    }
+
+    #[test]
+    fn migrated_read_only_open_bypasses_legacy_lock() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let legacy = FsStore::open(&path).unwrap();
+        let root_id = legacy.root_id();
+        let session = legacy.append(session_anchor_node(&root_id)).unwrap();
+        legacy.fork("main", &session).unwrap();
+        drop(legacy);
+
+        let migrated = SqliteStore::open_or_migrate_fs(&path).unwrap();
+
+        let read_only = SqliteStore::open_read_only_or_migrate_fs(&path).unwrap();
+        assert_eq!(migrated.get_branch_head("main").unwrap(), session);
+        assert_eq!(read_only.get_branch_head("main").unwrap(), session);
     }
 
     #[test]
