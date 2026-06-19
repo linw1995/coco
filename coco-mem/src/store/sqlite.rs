@@ -13,7 +13,7 @@ use snafu::prelude::*;
 use tokio::runtime::Runtime;
 
 use super::state::StoreState;
-use super::{BranchStore, JobStore, MessageQueueStore, NodeStore, SessionStore};
+use super::{BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, SessionStore};
 use crate::StoreResult as Result;
 use crate::error::{
     ConnectSqliteStoreSnafu, CorruptedStoreSnafu, ParseSqliteStoreValueSnafu,
@@ -21,8 +21,8 @@ use crate::error::{
     StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::{
-    Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Role,
-    SessionAnchorPatch, SessionState,
+    Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Preset,
+    PresetRecord, Role, SessionAnchorPatch, SessionState,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -111,6 +111,12 @@ struct JobRow {
 struct MessageQueueItemRow {
     #[diesel(sql_type = Text)]
     item_json: String,
+}
+
+#[derive(QueryableByName)]
+struct PresetRow {
+    #[diesel(sql_type = Text)]
+    record_json: String,
 }
 
 const SQLITE_MIGRATIONS: &[SqliteMigration] = &[SqliteMigration {
@@ -618,6 +624,7 @@ async fn load_state(connection: &mut AsyncSqliteConnection, path: &Path) -> Resu
     insert_node_rows(&mut state, rows, path)?;
     load_branches(connection, path, &mut state).await?;
     load_sessions(connection, path, &mut state).await?;
+    load_presets(connection, path, &mut state).await?;
     load_jobs(connection, path, &mut state).await?;
     load_message_queue_items(connection, path, &mut state).await?;
     Ok(state)
@@ -1086,6 +1093,71 @@ async fn delete_message_queue_item(
     Ok(())
 }
 
+async fn load_presets(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    state: &mut StoreState,
+) -> Result<()> {
+    let rows = sql_query("SELECT record_json FROM presets ORDER BY name")
+        .load::<PresetRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    state.presets.clear();
+    for row in rows {
+        let record = serde_json::from_str::<PresetRecord>(&row.record_json).context(
+            ParseSqliteStoreValueSnafu {
+                path: path.to_owned(),
+                column: "presets.record_json".to_owned(),
+            },
+        )?;
+        state.presets.insert(record.name.clone(), record);
+    }
+    Ok(())
+}
+
+async fn persist_preset(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    record: &PresetRecord,
+) -> Result<()> {
+    let record_json = serde_json::to_string(record).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "presets.record_json".to_owned(),
+    })?;
+    sql_query(
+        r#"
+INSERT INTO presets (name, record_json)
+VALUES (?, ?)
+ON CONFLICT(name) DO UPDATE SET record_json = excluded.record_json
+"#,
+    )
+    .bind::<Text, _>(&record.name)
+    .bind::<Text, _>(record_json)
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    Ok(())
+}
+
+async fn delete_preset_record(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    name: &str,
+) -> Result<()> {
+    sql_query("DELETE FROM presets WHERE name = ?")
+        .bind::<Text, _>(name)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(())
+}
+
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
         self.inner
@@ -1393,13 +1465,66 @@ impl MessageQueueStore for SqliteStore {
     }
 }
 
+impl PresetStore for SqliteStore {
+    fn list_preset_records(&self) -> Result<std::collections::HashMap<String, PresetRecord>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_preset_records())
+    }
+
+    fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_preset_record(name)
+    }
+
+    fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.set_preset(name, config)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_preset(&mut connection, &self.database_path, &updated).await
+        })?;
+        state.presets = temp.presets;
+        Ok(updated)
+    }
+
+    fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.rollback_preset(name, target_version)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_preset(&mut connection, &self.database_path, &updated).await
+        })?;
+        state.presets = temp.presets;
+        Ok(updated)
+    }
+
+    fn delete_preset(&self, name: &str) -> Result<()> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        temp.delete_preset(name)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            delete_preset_record(&mut connection, &self.database_path, name).await
+        })?;
+        state.presets = temp.presets;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SqliteStore;
     use crate::{
         Anchor, BranchStore, JobStatus, JobStore, Kind, MessageQueueStore, NewNode, NodeStore,
-        PauseReason, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
-        SessionStore,
+        PauseReason, Preset, PresetStore, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
+        SessionState, SessionStore,
     };
 
     fn session_anchor_node(parent: &str) -> NewNode {
@@ -1424,6 +1549,21 @@ mod tests {
                     active_skill: None,
                 },
             )),
+        }
+    }
+
+    fn preset(model: &str) -> Preset {
+        Preset {
+            role: SessionRole::Orchestrator,
+            provider_profile: "openai".to_owned(),
+            model: model.to_owned(),
+            tools: vec![],
+            system_prompt: "system".to_owned(),
+            prompt: "prompt".to_owned(),
+            temperature: Some(0.1),
+            max_tokens: Some(64),
+            additional_params: None,
+            enable_coco_shim: false,
         }
     }
 
@@ -1671,5 +1811,25 @@ mod tests {
         let messages = reopened.list_queue_messages("runner").unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, second.message_id);
+    }
+
+    #[test]
+    fn preset_operations_persist_across_reopen() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+
+        let first = store.set_preset("default", preset("gpt-5.4")).unwrap();
+        assert_eq!(first.current_version, 1);
+        let second = store.set_preset("default", preset("gpt-5.5")).unwrap();
+        assert_eq!(second.current_version, 2);
+        let rolled_back = store.rollback_preset("default", 1).unwrap();
+        assert_eq!(rolled_back.current_version, 3);
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        let record = reopened.get_preset_record("default").unwrap();
+
+        assert_eq!(record.current_version, 3);
+        assert_eq!(record.current_preset().unwrap().model, "gpt-5.4");
     }
 }
