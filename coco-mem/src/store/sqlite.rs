@@ -13,7 +13,7 @@ use snafu::prelude::*;
 use tokio::runtime::Runtime;
 
 use super::state::StoreState;
-use super::{BranchStore, JobStore, NodeStore, SessionStore};
+use super::{BranchStore, JobStore, MessageQueueStore, NodeStore, SessionStore};
 use crate::StoreResult as Result;
 use crate::error::{
     ConnectSqliteStoreSnafu, CorruptedStoreSnafu, ParseSqliteStoreValueSnafu,
@@ -21,8 +21,8 @@ use crate::error::{
     StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::{
-    Job, JobStatus, Kind, MergeParent, NewNode, Node, NodeMetadata, Role, SessionAnchorPatch,
-    SessionState,
+    Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Role,
+    SessionAnchorPatch, SessionState,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -105,6 +105,12 @@ struct SessionRow {
 struct JobRow {
     #[diesel(sql_type = Text)]
     payload_json: String,
+}
+
+#[derive(QueryableByName)]
+struct MessageQueueItemRow {
+    #[diesel(sql_type = Text)]
+    item_json: String,
 }
 
 const SQLITE_MIGRATIONS: &[SqliteMigration] = &[SqliteMigration {
@@ -613,6 +619,7 @@ async fn load_state(connection: &mut AsyncSqliteConnection, path: &Path) -> Resu
     load_branches(connection, path, &mut state).await?;
     load_sessions(connection, path, &mut state).await?;
     load_jobs(connection, path, &mut state).await?;
+    load_message_queue_items(connection, path, &mut state).await?;
     Ok(state)
 }
 
@@ -1002,6 +1009,83 @@ ON CONFLICT(job_id) DO UPDATE SET payload_json = excluded.payload_json
     Ok(())
 }
 
+async fn load_message_queue_items(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    state: &mut StoreState,
+) -> Result<()> {
+    let rows = sql_query(
+        r#"
+SELECT payload_json AS item_json
+FROM message_queue_items
+ORDER BY queue, created_at, message_id
+"#,
+    )
+    .load::<MessageQueueItemRow>(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    state.message_queues.clear();
+    for row in rows {
+        let item = serde_json::from_str::<MessageQueueItem>(&row.item_json).context(
+            ParseSqliteStoreValueSnafu {
+                path: path.to_owned(),
+                column: "message_queue_items.payload_json".to_owned(),
+            },
+        )?;
+        state
+            .message_queues
+            .entry(item.queue.clone())
+            .or_default()
+            .push(item);
+    }
+    Ok(())
+}
+
+async fn persist_message_queue_item(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    item: &MessageQueueItem,
+) -> Result<()> {
+    let item_json = serde_json::to_string(item).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "message_queue_items.payload_json".to_owned(),
+    })?;
+    sql_query(
+        r#"
+INSERT INTO message_queue_items (queue, message_id, created_at, payload_json)
+VALUES (?, ?, ?, ?)
+"#,
+    )
+    .bind::<Text, _>(&item.queue)
+    .bind::<Text, _>(&item.message_id)
+    .bind::<Text, _>(item.created_at.to_string())
+    .bind::<Text, _>(item_json)
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    Ok(())
+}
+
+async fn delete_message_queue_item(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    item: &MessageQueueItem,
+) -> Result<()> {
+    sql_query("DELETE FROM message_queue_items WHERE queue = ? AND message_id = ?")
+        .bind::<Text, _>(&item.queue)
+        .bind::<Text, _>(&item.message_id)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(())
+}
+
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
         self.inner
@@ -1256,12 +1340,66 @@ impl JobStore for SqliteStore {
     }
 }
 
+impl MessageQueueStore for SqliteStore {
+    fn enqueue_message(&self, queue: &str, payload: serde_json::Value) -> Result<MessageQueueItem> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let item = temp.enqueue_message(queue, payload);
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_message_queue_item(&mut connection, &self.database_path, &item).await
+        })?;
+        state.message_queues = temp.message_queues;
+        Ok(item)
+    }
+
+    fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let item = temp.dequeue_message(queue);
+        let Some(item) = item else {
+            return Ok(None);
+        };
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            delete_message_queue_item(&mut connection, &self.database_path, &item).await
+        })?;
+        state.message_queues = temp.message_queues;
+        Ok(Some(item))
+    }
+
+    fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .peek_message(queue))
+    }
+
+    fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_queue_messages(queue))
+    }
+
+    fn list_message_queues(&self) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("store lock poisoned")
+            .list_message_queues())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SqliteStore;
     use crate::{
-        Anchor, BranchStore, JobStatus, JobStore, Kind, NewNode, NodeStore, PauseReason, Role,
-        SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore,
+        Anchor, BranchStore, JobStatus, JobStore, Kind, MessageQueueStore, NewNode, NodeStore,
+        PauseReason, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
+        SessionStore,
     };
 
     fn session_anchor_node(parent: &str) -> NewNode {
@@ -1504,5 +1642,34 @@ mod tests {
         assert_eq!(job.status, JobStatus::Running);
         assert_eq!(job.branch, "main");
         assert_eq!(job.base, session);
+    }
+
+    #[test]
+    fn message_queue_operations_persist_across_reopen() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let first = store
+            .enqueue_message("runner", serde_json::json!({"index": 1}))
+            .unwrap();
+        let second = store
+            .enqueue_message("runner", serde_json::json!({"index": 2}))
+            .unwrap();
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        let messages = reopened.list_queue_messages("runner").unwrap();
+        assert_eq!(messages[0].message_id, first.message_id);
+        assert_eq!(messages[1].message_id, second.message_id);
+        assert_eq!(
+            reopened.peek_message("runner").unwrap().unwrap().payload["index"],
+            1
+        );
+
+        let dequeued = reopened.dequeue_message("runner").unwrap().unwrap();
+        assert_eq!(dequeued.message_id, first.message_id);
+        let reopened = SqliteStore::open(&path).unwrap();
+        let messages = reopened.list_queue_messages("runner").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, second.message_id);
     }
 }
