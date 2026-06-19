@@ -284,7 +284,6 @@ COCO_GID=0 \
 docker compose run --rm \
   --cap-add SYS_ADMIN \
   --cap-add SYS_PTRACE \
-  --security-opt seccomp=unconfined \
   -e COCO_START_CRON=0 \
   coco \
   perf record \
@@ -296,10 +295,12 @@ docker compose run --rm \
 ```
 
 If the host supports the narrower capability, `--cap-add PERFMON` can replace
-`--cap-add SYS_ADMIN`. Keep `SYS_PTRACE` and `seccomp=unconfined` when call
-stacks are incomplete. Keep `COCO_UID=0` and `COCO_GID=0` for perf one-shot
-commands so the entrypoint does not drop the capabilities added by Compose
-before running `perf`.
+`--cap-add SYS_ADMIN`. Keep `SYS_PTRACE` when call stacks are incomplete. Keep
+`COCO_UID=0` and `COCO_GID=0` for perf one-shot commands so the entrypoint does
+not drop the capabilities added by Compose before running `perf`. `docker
+compose run` does not accept `--security-opt`; if the host seccomp profile still
+blocks stack collection, set `security_opt: ["seccomp=unconfined"]` in a
+temporary Compose override file for the profiling run.
 
 Inspect the profile from inside a debug container that mounts the same data
 directory:
@@ -311,7 +312,6 @@ COCO_GID=0 \
 docker compose run --rm \
   --cap-add SYS_ADMIN \
   --cap-add SYS_PTRACE \
-  --security-opt seccomp=unconfined \
   -e COCO_START_CRON=0 \
   coco \
   perf report -i /data/perf-graph.data
@@ -327,7 +327,6 @@ COCO_GID=0 \
 docker compose run --rm \
   --cap-add SYS_ADMIN \
   --cap-add SYS_PTRACE \
-  --security-opt seccomp=unconfined \
   -e COCO_START_CRON=0 \
   coco \
   perf report --stdio -i /data/perf-graph.data
@@ -342,7 +341,6 @@ COCO_GID=0 \
 docker compose run --rm \
   --cap-add SYS_ADMIN \
   --cap-add SYS_PTRACE \
-  --security-opt seccomp=unconfined \
   -e COCO_START_CRON=0 \
   coco \
   perf script -i /data/perf-graph.data > .coco-data/perf-graph.script
