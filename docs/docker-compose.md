@@ -3,7 +3,7 @@
 This guide describes the Docker Compose deployment path for CoCo. Compose runs
 the long-lived `coco daemon serve` process, `.env` stores host-specific
 deployment settings and optional secrets, and `./.coco-data` persists config,
-OAuth cache, memory store, skill data, cronjob state, and logs.
+OAuth cache, the SQLite memory store, skill data, cronjob state, and logs.
 
 ## Layout
 
@@ -67,6 +67,11 @@ The image uses these container paths:
 
 Compose reads `.env`, mounts `${COCO_DATA_DIR}` to `/data`, and mounts
 `${COCO_WORKSPACE_DIR}` to `/workspace`.
+
+`COCO_STORE_PATH` points at a store directory, not directly at the SQLite
+database file. The SQLite database is stored as `store.sqlite3` inside that
+directory. Existing JSON/JSONL file-system stores at the same path are migrated
+to SQLite automatically the first time CoCo opens the store.
 
 ## Configure ChatGPT Provider
 
