@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
@@ -34,6 +34,9 @@ const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const LEGACY_FS_META_FILE_NAME: &str = "meta.json";
 const SQLITE_SCHEMA_VERSION: i32 = 1;
 
+static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static SQLITE_RUNTIME_INIT: Mutex<()> = Mutex::new(());
+
 type AsyncSqliteConnection = SyncConnectionWrapper<SqliteConnection>;
 
 #[derive(Clone)]
@@ -41,7 +44,7 @@ pub struct SqliteStore {
     dir: PathBuf,
     database_path: PathBuf,
     access: StoreAccess,
-    runtime: Arc<Runtime>,
+    runtime: &'static Runtime,
     inner: Arc<RwLock<StoreState>>,
 }
 
@@ -281,15 +284,11 @@ impl SqliteStore {
     }
 
     fn new(path: &Path, access: StoreAccess) -> Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context(StartSqliteRuntimeSnafu)?;
         Ok(Self {
             dir: path.to_owned(),
             database_path: path.join(SQLITE_DATABASE_FILE_NAME),
             access,
-            runtime: Arc::new(runtime),
+            runtime: sqlite_runtime()?,
             inner: Arc::new(RwLock::new(StoreState::new())),
         })
     }
@@ -342,7 +341,19 @@ impl SqliteStore {
         .fail()
     }
 
-    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.runtime.block_on(future))
+                    .join()
+                    .expect("SQLite store worker thread should not panic")
+            });
+        }
         self.runtime.block_on(future)
     }
 
@@ -407,6 +418,26 @@ fn sqlite_database_path(path: &Path) -> PathBuf {
 
 fn legacy_fs_store_exists(path: &Path) -> bool {
     path.join(LEGACY_FS_META_FILE_NAME).is_file()
+}
+
+fn sqlite_runtime() -> Result<&'static Runtime> {
+    if let Some(runtime) = SQLITE_RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let _guard = SQLITE_RUNTIME_INIT
+        .lock()
+        .expect("SQLite runtime init lock poisoned");
+    if let Some(runtime) = SQLITE_RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context(StartSqliteRuntimeSnafu)?;
+    let _ = SQLITE_RUNTIME.set(runtime);
+    Ok(SQLITE_RUNTIME
+        .get()
+        .expect("SQLite runtime should be initialized"))
 }
 
 fn prepare_store_directory(path: &Path) -> Result<()> {

@@ -8,19 +8,19 @@ use crate::{
     cli::{Command, PresetSubcommand, PromptSubcommand, SessionSubcommand, SkillSubcommand},
     error::StoreSnafu,
 };
-use coco_mem::FsStore;
+use coco_mem::SqliteStore;
 
 #[cfg(test)]
-pub fn open_store(path: &Path) -> Result<FsStore> {
-    FsStore::open(path).context(StoreSnafu)
+pub fn open_store(path: &Path) -> Result<SqliteStore> {
+    SqliteStore::open_or_migrate_fs(path).context(StoreSnafu)
 }
 
-pub fn open_store_for_command(path: &Path, command: &Command) -> Result<FsStore> {
+pub fn open_store_for_command(path: &Path, command: &Command) -> Result<SqliteStore> {
     if command_is_read_only(command) && path.exists() {
-        return FsStore::open_read_only(path).context(StoreSnafu);
+        return SqliteStore::open_read_only_or_migrate_fs(path).context(StoreSnafu);
     }
 
-    FsStore::open(path).context(StoreSnafu)
+    SqliteStore::open_or_migrate_fs(path).context(StoreSnafu)
 }
 
 fn command_is_read_only(command: &Command) -> bool {
