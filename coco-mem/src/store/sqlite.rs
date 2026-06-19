@@ -14,7 +14,8 @@ use tokio::runtime::Runtime;
 
 use super::state::StoreState;
 use super::{
-    BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, SessionStore, SkillStore,
+    BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, ProcessShareableStore,
+    SessionStore, SkillStore,
 };
 use crate::StoreResult as Result;
 use crate::error::{
@@ -1662,6 +1663,12 @@ impl SkillStore for SqliteStore {
         })?;
         state.skill_groups = temp.skill_groups;
         Ok(updated)
+    }
+}
+
+impl ProcessShareableStore for SqliteStore {
+    fn store_path(&self) -> &Path {
+        &self.dir
     }
 }
 
