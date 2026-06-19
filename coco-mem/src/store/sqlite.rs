@@ -244,7 +244,11 @@ CREATE TABLE node_relations (
 );
 
 INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal)
-SELECT child_id, parent_id, kind, 0
+SELECT
+    child_id,
+    parent_id,
+    kind,
+    ROW_NUMBER() OVER (PARTITION BY child_id, kind ORDER BY rowid) - 1
 FROM node_edges;
 
 CREATE INDEX node_relations_child_kind_idx ON node_relations(child_node_id, kind);
@@ -2901,6 +2905,22 @@ THIS IS NOT SQL;
         );
         let child_id = child.id.clone();
         let root_id = root.id.clone();
+        let merge_parent_a = Node::new(
+            root_id.clone(),
+            Role::LLM,
+            None,
+            Kind::Text("legacy merge parent a".to_owned()),
+            "1970-01-01T00:00:02Z".parse().unwrap(),
+        );
+        let merge_parent_a_id = merge_parent_a.id.clone();
+        let merge_parent_b = Node::new(
+            root_id.clone(),
+            Role::LLM,
+            None,
+            Kind::Text("legacy merge parent b".to_owned()),
+            "1970-01-01T00:00:03Z".parse().unwrap(),
+        );
+        let merge_parent_b_id = merge_parent_b.id.clone();
 
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
@@ -2921,11 +2941,27 @@ THIS IS NOT SQL;
                 .await
                 .unwrap();
             insert_v1_node_row(&mut connection, &store.database_path, root).await;
+            insert_v1_node_row(&mut connection, &store.database_path, merge_parent_a).await;
+            insert_v1_node_row(&mut connection, &store.database_path, merge_parent_b).await;
             insert_v1_node_row(&mut connection, &store.database_path, child).await;
             sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
                 .bind::<Text, _>(&root_id)
                 .bind::<Text, _>(&child_id)
                 .bind::<Text, _>("primary")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
+                .bind::<Text, _>(&merge_parent_a_id)
+                .bind::<Text, _>(&child_id)
+                .bind::<Text, _>("merge")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
+                .bind::<Text, _>(&merge_parent_b_id)
+                .bind::<Text, _>(&child_id)
+                .bind::<Text, _>("merge")
                 .execute(&mut connection)
                 .await
                 .unwrap();
@@ -2937,12 +2973,26 @@ THIS IS NOT SQL;
         assert_eq!(migrated.schema_version().unwrap(), 2);
         assert_eq!(
             node_relation_rows(&migrated, &child_id),
-            vec![NodeRelationRow {
-                child_node_id: child_id,
-                parent_node_id: root_id,
-                kind: "primary".to_owned(),
-                ordinal: 0,
-            }]
+            vec![
+                NodeRelationRow {
+                    child_node_id: child_id.clone(),
+                    parent_node_id: merge_parent_a_id,
+                    kind: "merge".to_owned(),
+                    ordinal: 0,
+                },
+                NodeRelationRow {
+                    child_node_id: child_id.clone(),
+                    parent_node_id: merge_parent_b_id,
+                    kind: "merge".to_owned(),
+                    ordinal: 1,
+                },
+                NodeRelationRow {
+                    child_node_id: child_id,
+                    parent_node_id: root_id,
+                    kind: "primary".to_owned(),
+                    ordinal: 0,
+                },
+            ]
         );
         migrated.block_on(async {
             let mut connection = migrated.connect().await.unwrap();
