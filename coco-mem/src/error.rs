@@ -155,6 +155,28 @@ pub enum StoreError {
         source: serde_json::Error,
     },
 
+    #[snafu(display("Failed to start SQLite store runtime: {source}"))]
+    StartSqliteRuntime { source: std::io::Error },
+
+    #[snafu(display("Failed to connect to SQLite store {path:?}: {source}"))]
+    ConnectSqliteStore {
+        path: PathBuf,
+        source: diesel::ConnectionError,
+    },
+
+    #[snafu(display("Failed to query SQLite store {path:?}: {source}"))]
+    QuerySqliteStore {
+        path: PathBuf,
+        source: diesel::result::Error,
+    },
+
+    #[snafu(display("Failed to parse SQLite store value {column:?} in {path:?}: {source}"))]
+    ParseSqliteStoreValue {
+        path: PathBuf,
+        column: String,
+        source: serde_json::Error,
+    },
+
     #[snafu(display("Corrupted store at {path:?}: {message}"))]
     CorruptedStore { path: PathBuf, message: String },
 }

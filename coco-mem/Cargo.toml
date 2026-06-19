@@ -4,6 +4,12 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+# Storage.
+diesel.workspace = true
+diesel-async.workspace = true
+libsqlite3-sys.workspace = true
+tokio.workspace = true
+
 # Time and identifiers.
 jiff = { version = "0.2.28", features = ["serde"] }
 nanoid.workspace = true

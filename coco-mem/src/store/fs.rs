@@ -2363,7 +2363,7 @@ fn store_format_versions_match(
     }
 }
 
-fn open_store_lock(store_dir: &Path) -> Result<Arc<File>> {
+pub(super) fn open_store_lock(store_dir: &Path) -> Result<Arc<File>> {
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<File>>>> = OnceLock::new();
 
     let key = store_lock_key(store_dir);
@@ -2782,8 +2782,7 @@ impl FsStore {
         &self.persistence.dir
     }
 
-    #[cfg(test)]
-    pub fn snapshot_state(&self) -> StoreState {
+    pub(crate) fn snapshot_state(&self) -> StoreState {
         self.inner.read().expect("store lock poisoned").clone()
     }
 

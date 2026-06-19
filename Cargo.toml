@@ -34,6 +34,14 @@ toml = "1.1.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 
+# Storage.
+diesel = { version = "2.3.10", features = [
+  "sqlite",
+  "returning_clauses_for_sqlite_3_35",
+] }
+diesel-async = { version = "0.9.1", features = ["sqlite"] }
+libsqlite3-sys = { version = "0.37.0", features = ["bundled"] }
+
 # Error handling.
 snafu = "0.9.1"
 

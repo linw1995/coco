@@ -16,8 +16,8 @@ use coco_llm::{
     ProviderRuntimeConfig, StepContext,
 };
 use coco_mem::{
-    MessageQueueStore, PresetStore, ProcessShareableStore, ProviderProfile, SessionState,
-    SkillStore, SkillVersionSpec, Tool,
+    MessageQueueStore, PresetStore, ProviderProfile, SessionState, SkillStore, SkillVersionSpec,
+    Tool,
 };
 use indoc::formatdoc;
 use serde_json::{Value, json};
