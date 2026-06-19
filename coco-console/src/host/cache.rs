@@ -34,6 +34,7 @@ pub struct ConsoleGraphCache<S> {
     invalidations: ConsolePublisher,
     ready: ConsolePublisher,
     compute_permits: Arc<Semaphore>,
+    publish_lock: Arc<Mutex<()>>,
     state: Arc<Mutex<CacheState>>,
 }
 
@@ -64,6 +65,7 @@ where
             invalidations,
             ready: ConsolePublisher::new(),
             compute_permits: Arc::new(Semaphore::new(1)),
+            publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
         }
     }
@@ -78,6 +80,7 @@ where
             invalidations,
             ready: ConsolePublisher::new(),
             compute_permits: Arc::new(Semaphore::new(1)),
+            publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
         }
     }
@@ -201,6 +204,10 @@ where
     }
 
     fn publish_source_version(&self, source_version: u64) -> u64 {
+        let _guard = self
+            .publish_lock
+            .lock()
+            .expect("console graph publish lock poisoned");
         let target = source_version;
         while self.ready.current_version() < target {
             self.ready.mark_changed();
@@ -402,6 +409,22 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&first, &third));
         assert!(third.nodes.iter().any(|node| node.id == next_text));
+    }
+
+    #[test]
+    fn cache_publishes_source_version_once() {
+        let publisher = ConsolePublisher::new();
+        let (store, _, _) = graph_store(publisher.clone());
+        let cache = ConsoleGraphCache::new(store, publisher.clone());
+        publisher.mark_changed();
+        let source_version = publisher.current_version();
+
+        let first = cache.publish_source_version(source_version);
+        let second = cache.publish_source_version(source_version);
+
+        assert_eq!(first, source_version);
+        assert_eq!(second, source_version);
+        assert_eq!(cache.current_version(), source_version);
     }
 
     #[tokio::test]
