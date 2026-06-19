@@ -26,8 +26,8 @@ use crate::error::{
 };
 use crate::{
     Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Preset,
-    PresetRecord, Role, SessionAnchorPatch, SessionRole, SessionState, SkillRecord,
-    SkillUpdatePatch, SkillVersionSpec,
+    PresetRecord, Role, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillRecord,
+    SkillUpdatePatch, SkillVersionSpec, default_skill_groups,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -916,8 +916,12 @@ async fn persist_state_snapshot(
         persist_preset(connection, path, preset).await?;
     }
 
+    let default_skills = default_skill_groups();
     for role in [SessionRole::Orchestrator, SessionRole::Runner] {
         for record in state.skill_groups.for_role(role).values() {
+            if !should_persist_skill_record(&default_skills, role, record) {
+                continue;
+            }
             persist_skill(connection, path, role, record).await?;
         }
     }
@@ -937,6 +941,23 @@ async fn persist_state_snapshot(
     }
 
     Ok(())
+}
+
+fn should_persist_skill_record(
+    defaults: &SkillGroups,
+    role: SessionRole,
+    record: &SkillRecord,
+) -> bool {
+    let Some(default_record) = defaults.for_role(role).get(&record.name) else {
+        return true;
+    };
+    let Some(default_current) = default_record.current() else {
+        return true;
+    };
+    let Some(current) = record.current() else {
+        return true;
+    };
+    current.id != default_current.id
 }
 
 async fn load_root_id(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<String> {
@@ -2797,6 +2818,82 @@ THIS IS NOT SQL;
         let reopened = SqliteStore::open_or_migrate_fs(&path).unwrap();
 
         assert_eq!(reopened.get_branch_head("main").unwrap(), session);
+    }
+
+    #[test]
+    fn migrated_store_does_not_persist_unmodified_builtin_skills() {
+        use diesel::sql_query;
+        use diesel_async::RunQueryDsl;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let legacy = FsStore::open(&path).unwrap();
+        drop(legacy);
+
+        let migrated = SqliteStore::open_or_migrate_fs(&path).unwrap();
+        let default = crate::default_skill_groups()
+            .for_role(SessionRole::Orchestrator)
+            .get("coco-orchestrator")
+            .unwrap()
+            .current()
+            .unwrap()
+            .id
+            .clone();
+        let actual = migrated
+            .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+            .unwrap()
+            .current()
+            .unwrap()
+            .id
+            .clone();
+        let count = migrated.block_on(async {
+            let mut connection = migrated.connect().await.unwrap();
+            sql_query("SELECT COUNT(*) AS count FROM skills")
+                .get_result::<super::TableCount>(&mut connection)
+                .await
+                .unwrap()
+                .count
+        });
+
+        assert_eq!(actual, default);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn migrated_store_persists_modified_builtin_skills() {
+        use diesel::sql_query;
+        use diesel_async::RunQueryDsl;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let legacy = FsStore::open(&path).unwrap();
+        legacy
+            .update_skill(
+                SessionRole::Orchestrator,
+                "coco-orchestrator",
+                &SkillUpdatePatch {
+                    description: Some("custom builtin".to_owned()),
+                    ..SkillUpdatePatch::default()
+                },
+            )
+            .unwrap();
+        drop(legacy);
+
+        let migrated = SqliteStore::open_or_migrate_fs(&path).unwrap();
+        let record = migrated
+            .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+            .unwrap();
+        let count = migrated.block_on(async {
+            let mut connection = migrated.connect().await.unwrap();
+            sql_query("SELECT COUNT(*) AS count FROM skills")
+                .get_result::<super::TableCount>(&mut connection)
+                .await
+                .unwrap()
+                .count
+        });
+
+        assert_eq!(record.current().unwrap().description, "custom builtin");
+        assert_eq!(count, 1);
     }
 
     #[test]
