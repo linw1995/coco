@@ -31,7 +31,10 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
+const SQLITE_MIGRATION_DATABASE_FILE_NAME: &str = "store.sqlite3.migrating";
+const SQLITE_INCOMPLETE_DATABASE_FILE_NAME: &str = "store.sqlite3.incomplete";
 const LEGACY_FS_META_FILE_NAME: &str = "meta.json";
+const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
 const SQLITE_SCHEMA_VERSION: i32 = 1;
 
 static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -223,23 +226,45 @@ impl std::fmt::Debug for SqliteStore {
 impl SqliteStore {
     pub fn open_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if sqlite_database_path(path).is_file() || !legacy_fs_store_exists(path) {
+        if !legacy_fs_store_exists(path) {
             return Self::open(path);
         }
 
         prepare_store_directory(path)?;
         let legacy = FsStore::open(path)?;
+        if sqlite_database_path(path).is_file() {
+            if fs_migration_complete_marker_exists(path) {
+                drop(legacy);
+                return Self::open(path);
+            }
+            quarantine_incomplete_sqlite_database(path)?;
+        }
+        remove_sqlite_database_files(&sqlite_migration_database_path(path))?;
+
         let state = legacy.snapshot_state();
-        let store = Self::new(path, StoreAccess::ReadWrite)?;
+        let store = Self::new_with_database_path(
+            path,
+            sqlite_migration_database_path(path),
+            StoreAccess::ReadWrite,
+        )?;
         store.run_migrations()?;
         store.persist_state_snapshot(&state)?;
-        store.replace_state(state);
-        Ok(store)
+        store.persist_fs_migration_complete_marker()?;
+        store.prepare_database_for_atomic_rename()?;
+        fs::rename(&store.database_path, sqlite_database_path(path)).context(
+            WriteStoreDirectorySnafu {
+                path: store.database_path.clone(),
+            },
+        )?;
+
+        let migrated = Self::new(path, StoreAccess::ReadWrite)?;
+        migrated.load_state()?;
+        Ok(migrated)
     }
 
     pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if sqlite_database_path(path).is_file() {
+        if sqlite_database_path(path).is_file() && !legacy_fs_store_exists(path) {
             return Self::open_read_only(path);
         }
         Self::open_or_migrate_fs(path)
@@ -285,6 +310,14 @@ impl SqliteStore {
     }
 
     fn new(path: &Path, access: StoreAccess) -> Result<Self> {
+        Self::new_with_database_path(path, path.join(SQLITE_DATABASE_FILE_NAME), access)
+    }
+
+    fn new_with_database_path(
+        path: &Path,
+        database_path: PathBuf,
+        access: StoreAccess,
+    ) -> Result<Self> {
         let lock_file = if access == StoreAccess::ReadWrite {
             Some(super::fs::open_store_lock(path)?)
         } else {
@@ -292,7 +325,7 @@ impl SqliteStore {
         };
         Ok(Self {
             dir: path.to_owned(),
-            database_path: path.join(SQLITE_DATABASE_FILE_NAME),
+            database_path,
             access,
             runtime: sqlite_runtime()?,
             inner: Arc::new(RwLock::new(StoreState::new())),
@@ -402,6 +435,38 @@ impl SqliteStore {
         })
     }
 
+    fn persist_fs_migration_complete_marker(&self) -> Result<()> {
+        self.ensure_writable()?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_store_meta_bool(
+                &mut connection,
+                &self.database_path,
+                FS_MIGRATION_COMPLETE_META_KEY,
+                true,
+            )
+            .await
+        })
+    }
+
+    fn prepare_database_for_atomic_rename(&self) -> Result<()> {
+        self.ensure_writable()?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            connection
+                .batch_execute(
+                    r#"
+PRAGMA wal_checkpoint(TRUNCATE);
+PRAGMA journal_mode = DELETE;
+"#,
+                )
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })
+        })
+    }
+
     async fn connect(&self) -> Result<AsyncSqliteConnection> {
         let database_url = self.database_path.to_string_lossy().into_owned();
         let mut connection = AsyncSqliteConnection::establish(&database_url)
@@ -423,8 +488,65 @@ fn sqlite_database_path(path: &Path) -> PathBuf {
     path.join(SQLITE_DATABASE_FILE_NAME)
 }
 
+fn sqlite_migration_database_path(path: &Path) -> PathBuf {
+    path.join(SQLITE_MIGRATION_DATABASE_FILE_NAME)
+}
+
 fn legacy_fs_store_exists(path: &Path) -> bool {
     path.join(LEGACY_FS_META_FILE_NAME).is_file()
+}
+
+fn fs_migration_complete_marker_exists(path: &Path) -> bool {
+    let Ok(store) = SqliteStore::new(path, StoreAccess::ReadOnly) else {
+        return false;
+    };
+    store
+        .block_on(async {
+            let mut connection = store.connect().await?;
+            load_store_meta_bool(
+                &mut connection,
+                &store.database_path,
+                FS_MIGRATION_COMPLETE_META_KEY,
+            )
+            .await
+        })
+        .unwrap_or(false)
+}
+
+fn quarantine_incomplete_sqlite_database(path: &Path) -> Result<()> {
+    let database_path = sqlite_database_path(path);
+    let incomplete_path = path.join(SQLITE_INCOMPLETE_DATABASE_FILE_NAME);
+    remove_sqlite_database_files(&incomplete_path)?;
+    fs::rename(&database_path, &incomplete_path).context(WriteStoreDirectorySnafu {
+        path: database_path.clone(),
+    })?;
+    for suffix in ["-wal", "-shm"] {
+        let source = PathBuf::from(format!("{}{}", database_path.display(), suffix));
+        if source.exists() {
+            let target = PathBuf::from(format!("{}{}", incomplete_path.display(), suffix));
+            fs::rename(&source, &target).context(WriteStoreDirectorySnafu { path: source })?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_sqlite_database_files(path: &Path) -> Result<()> {
+    remove_file_if_exists(path)?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+        remove_file_if_exists(&sidecar)?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(source).context(WriteStoreDirectorySnafu {
+            path: path.to_owned(),
+        }),
+    }
 }
 
 fn sqlite_runtime() -> Result<&'static Runtime> {
@@ -670,6 +792,58 @@ ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
         path: path.to_owned(),
     })?;
     Ok(())
+}
+
+async fn persist_store_meta_bool(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    key: &str,
+    value: bool,
+) -> Result<()> {
+    let value_json = serde_json::to_string(&value).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: format!("store_meta.{key}"),
+    })?;
+    sql_query(
+        r#"
+INSERT INTO store_meta (key, value_json)
+VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+"#,
+    )
+    .bind::<Text, _>(key)
+    .bind::<Text, _>(value_json)
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    Ok(())
+}
+
+async fn load_store_meta_bool(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    key: &str,
+) -> Result<bool> {
+    if table_count(connection, path, "store_meta").await? == 0 {
+        return Ok(false);
+    }
+    let Some(value) = sql_query("SELECT value_json FROM store_meta WHERE key = ?")
+        .bind::<Text, _>(key)
+        .get_result::<StoreMetaValue>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+    else {
+        return Ok(false);
+    };
+    serde_json::from_str(&value.value_json).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: format!("store_meta.{key}"),
+    })
 }
 
 async fn persist_state_snapshot(
@@ -1883,7 +2057,10 @@ impl ProcessShareableStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{FsStore, SqliteStore};
+    use super::{
+        FsStore, SQLITE_INCOMPLETE_DATABASE_FILE_NAME, SQLITE_MIGRATION_DATABASE_FILE_NAME,
+        SqliteStore,
+    };
     use crate::{
         Anchor, BranchStore, JobStatus, JobStore, Kind, MessageQueueStore, NewNode, NodeStore,
         PauseReason, Preset, PresetStore, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
@@ -2346,5 +2523,42 @@ mod tests {
 
         let reopened = SqliteStore::open_read_only_or_migrate_fs(&path).unwrap();
         assert_eq!(reopened.get_branch_head("main").unwrap(), session);
+    }
+
+    #[test]
+    fn open_or_migrate_fs_retries_incomplete_sqlite_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let legacy = FsStore::open(&path).unwrap();
+        let root_id = legacy.root_id();
+        let session = legacy.append(session_anchor_node(&root_id)).unwrap();
+        legacy.fork("main", &session).unwrap();
+        drop(legacy);
+
+        let incomplete = SqliteStore::open(&path).unwrap();
+        assert!(incomplete.database_path().is_file());
+        drop(incomplete);
+
+        let migrated = SqliteStore::open_or_migrate_fs(&path).unwrap();
+
+        assert!(path.join(SQLITE_INCOMPLETE_DATABASE_FILE_NAME).is_file());
+        assert_eq!(migrated.get_branch_head("main").unwrap(), session);
+    }
+
+    #[test]
+    fn open_or_migrate_fs_removes_stale_temporary_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let legacy = FsStore::open(&path).unwrap();
+        let root_id = legacy.root_id();
+        let session = legacy.append(session_anchor_node(&root_id)).unwrap();
+        legacy.fork("main", &session).unwrap();
+        drop(legacy);
+        std::fs::write(path.join(SQLITE_MIGRATION_DATABASE_FILE_NAME), "stale").unwrap();
+
+        let migrated = SqliteStore::open_or_migrate_fs(&path).unwrap();
+
+        assert!(!path.join(SQLITE_MIGRATION_DATABASE_FILE_NAME).exists());
+        assert_eq!(migrated.get_branch_head("main").unwrap(), session);
     }
 }
