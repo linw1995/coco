@@ -13,7 +13,7 @@ use snafu::prelude::*;
 use tokio::runtime::Runtime;
 
 use super::state::StoreState;
-use super::{BranchStore, NodeStore, SessionStore};
+use super::{BranchStore, JobStore, NodeStore, SessionStore};
 use crate::StoreResult as Result;
 use crate::error::{
     ConnectSqliteStoreSnafu, CorruptedStoreSnafu, ParseSqliteStoreValueSnafu,
@@ -21,7 +21,8 @@ use crate::error::{
     StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::{
-    Kind, MergeParent, NewNode, Node, NodeMetadata, Role, SessionAnchorPatch, SessionState,
+    Job, JobStatus, Kind, MergeParent, NewNode, Node, NodeMetadata, Role, SessionAnchorPatch,
+    SessionState,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -98,6 +99,12 @@ struct SessionRow {
     branch_name: String,
     #[diesel(sql_type = Text)]
     state_json: String,
+}
+
+#[derive(QueryableByName)]
+struct JobRow {
+    #[diesel(sql_type = Text)]
+    payload_json: String,
 }
 
 const SQLITE_MIGRATIONS: &[SqliteMigration] = &[SqliteMigration {
@@ -605,6 +612,7 @@ async fn load_state(connection: &mut AsyncSqliteConnection, path: &Path) -> Resu
     insert_node_rows(&mut state, rows, path)?;
     load_branches(connection, path, &mut state).await?;
     load_sessions(connection, path, &mut state).await?;
+    load_jobs(connection, path, &mut state).await?;
     Ok(state)
 }
 
@@ -949,6 +957,51 @@ async fn persist_session_nodes_and_branch_head(
     Ok(())
 }
 
+async fn load_jobs(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    state: &mut StoreState,
+) -> Result<()> {
+    let jobs = sql_query("SELECT payload_json FROM jobs ORDER BY job_id")
+        .load::<JobRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    state.jobs.clear();
+    for row in jobs {
+        let job =
+            serde_json::from_str::<Job>(&row.payload_json).context(ParseSqliteStoreValueSnafu {
+                path: path.to_owned(),
+                column: "jobs.payload_json".to_owned(),
+            })?;
+        state.jobs.insert(job.job_id.clone(), job);
+    }
+    Ok(())
+}
+
+async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &Job) -> Result<()> {
+    let payload_json = serde_json::to_string(job).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "jobs.payload_json".to_owned(),
+    })?;
+    sql_query(
+        r#"
+INSERT INTO jobs (job_id, payload_json)
+VALUES (?, ?)
+ON CONFLICT(job_id) DO UPDATE SET payload_json = excluded.payload_json
+"#,
+    )
+    .bind::<Text, _>(&job.job_id)
+    .bind::<Text, _>(payload_json)
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    Ok(())
+}
+
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
         self.inner
@@ -1137,12 +1190,78 @@ impl SessionStore for SqliteStore {
     }
 }
 
+impl JobStore for SqliteStore {
+    fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let created = temp.submit_job(branch, base)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_job(&mut connection, &self.database_path, &created).await
+        })?;
+        state.jobs = temp.jobs;
+        Ok(created)
+    }
+
+    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let created = temp.submit_job_with_id(job_id, branch, base)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_job(&mut connection, &self.database_path, &created).await
+        })?;
+        state.jobs = temp.jobs;
+        Ok(created)
+    }
+
+    fn get_job(&self, job_id: &str) -> Result<Job> {
+        self.inner
+            .read()
+            .expect("store lock poisoned")
+            .get_job(job_id)
+    }
+
+    fn list_jobs(&self) -> Result<std::collections::HashMap<String, Job>> {
+        Ok(self.inner.read().expect("store lock poisoned").list_jobs())
+    }
+
+    fn set_job_status(&self, job_id: &str, expected: JobStatus, next: JobStatus) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.set_job_status(job_id, expected, next)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_job(&mut connection, &self.database_path, &updated).await
+        })?;
+        state.jobs = temp.jobs;
+        Ok(updated)
+    }
+
+    fn set_job_work_branch(
+        &self,
+        job_id: &str,
+        expected_work_branch: &str,
+        next_work_branch: &str,
+    ) -> Result<Job> {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        let mut temp = state.clone();
+        let updated = temp.set_job_work_branch(job_id, expected_work_branch, next_work_branch)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            persist_job(&mut connection, &self.database_path, &updated).await
+        })?;
+        state.jobs = temp.jobs;
+        Ok(updated)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SqliteStore;
     use crate::{
-        Anchor, BranchStore, Kind, NewNode, NodeStore, PauseReason, Role, SessionAnchor,
-        SessionAnchorPatch, SessionRole, SessionState, SessionStore,
+        Anchor, BranchStore, JobStatus, JobStore, Kind, NewNode, NodeStore, PauseReason, Role,
+        SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore,
     };
 
     fn session_anchor_node(parent: &str) -> NewNode {
@@ -1359,5 +1478,31 @@ mod tests {
         );
         assert!(reopened.get_node(&rebased).is_ok());
         assert!(reopened.get_node(&handoff).is_ok());
+    }
+
+    #[test]
+    fn job_operations_persist_across_reopen() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+        let session = store.append(session_anchor_node(&root_id)).unwrap();
+        store.fork("main", &session).unwrap();
+
+        let job = store
+            .submit_job_with_id("job-test", "main", &session)
+            .unwrap();
+        assert_eq!(job.status, JobStatus::Queued);
+        let job = store
+            .set_job_status("job-test", JobStatus::Queued, JobStatus::Running)
+            .unwrap();
+        assert_eq!(job.status, JobStatus::Running);
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        let job = reopened.get_job("job-test").unwrap();
+
+        assert_eq!(job.status, JobStatus::Running);
+        assert_eq!(job.branch, "main");
+        assert_eq!(job.base, session);
     }
 }
