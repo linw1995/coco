@@ -20,8 +20,9 @@ use super::{
 };
 use crate::StoreResult as Result;
 use crate::error::{
-    ConnectSqliteStoreSnafu, CorruptedStoreSnafu, ParseSqliteStoreValueSnafu,
-    QuerySqliteStoreSnafu, StartSqliteRuntimeSnafu, StorePathIsNotDirectorySnafu,
+    AmbiguousNodePrefixSnafu, BranchNotFoundSnafu, ConnectSqliteStoreSnafu, CorruptedStoreSnafu,
+    NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu,
+    RefsNotConnectedSnafu, StartSqliteRuntimeSnafu, StorePathIsNotDirectorySnafu,
     StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::{
@@ -35,7 +36,7 @@ const SQLITE_MIGRATION_DATABASE_FILE_NAME: &str = "store.sqlite3.migrating";
 const SQLITE_INCOMPLETE_DATABASE_FILE_NAME: &str = "store.sqlite3.incomplete";
 const LEGACY_FS_META_FILE_NAME: &str = "meta.json";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
-const SQLITE_SCHEMA_VERSION: i32 = 1;
+const SQLITE_SCHEMA_VERSION: i32 = 2;
 
 static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SQLITE_RUNTIME_INIT: Mutex<()> = Mutex::new(());
@@ -50,6 +51,14 @@ pub struct SqliteStore {
     runtime: &'static Runtime,
     inner: Arc<RwLock<StoreState>>,
     _lock_file: Option<Arc<std::fs::File>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteGraphStore {
+    dir: PathBuf,
+    database_path: PathBuf,
+    runtime: &'static Runtime,
+    root_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +89,12 @@ struct CurrentSchemaVersion {
 struct StoreMetaValue {
     #[diesel(sql_type = Text)]
     value_json: String,
+}
+
+#[derive(QueryableByName)]
+struct NodeIdRow {
+    #[diesel(sql_type = Text)]
+    id: String,
 }
 
 #[derive(QueryableByName)]
@@ -142,10 +157,11 @@ struct SkillRow {
     record_json: String,
 }
 
-const SQLITE_MIGRATIONS: &[SqliteMigration] = &[SqliteMigration {
-    version: 1,
-    name: "initial-store-schema",
-    sql: r#"
+const SQLITE_MIGRATIONS: &[SqliteMigration] = &[
+    SqliteMigration {
+        version: 1,
+        name: "initial-store-schema",
+        sql: r#"
 CREATE TABLE store_meta (
     key TEXT PRIMARY KEY NOT NULL,
     value_json TEXT NOT NULL
@@ -212,7 +228,36 @@ CREATE TABLE skills (
     PRIMARY KEY (role, name)
 );
 "#,
-}];
+    },
+    SqliteMigration {
+        version: 2,
+        name: "node-relations",
+        sql: r#"
+CREATE TABLE node_relations (
+    child_node_id TEXT NOT NULL,
+    parent_node_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (child_node_id, kind, ordinal),
+    FOREIGN KEY (child_node_id) REFERENCES nodes(id),
+    FOREIGN KEY (parent_node_id) REFERENCES nodes(id)
+);
+
+INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal)
+SELECT
+    child_id,
+    parent_id,
+    kind,
+    ROW_NUMBER() OVER (PARTITION BY child_id, kind ORDER BY rowid) - 1
+FROM node_edges;
+
+CREATE INDEX node_relations_child_kind_idx ON node_relations(child_node_id, kind);
+CREATE INDEX node_relations_parent_kind_idx ON node_relations(parent_node_id, kind);
+
+DROP TABLE node_edges;
+"#,
+    },
+];
 
 impl std::fmt::Debug for SqliteStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -269,10 +314,10 @@ impl SqliteStore {
 
     pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if sqlite_database_path(path).is_file() && fs_migration_complete_marker_exists(path)? {
-            return Self::open_read_only(path);
-        }
-        if sqlite_database_path(path).is_file() && !legacy_fs_store_exists(path) {
+        if sqlite_database_path(path).is_file() {
+            if Self::sqlite_schema_requires_migration(path)? {
+                drop(Self::open(path)?);
+            }
             return Self::open_read_only(path);
         }
         Self::open_read_only(path)
@@ -376,6 +421,32 @@ impl SqliteStore {
             );
             Ok(())
         })
+    }
+
+    fn sqlite_schema_requires_migration(path: &Path) -> Result<bool> {
+        ensure_existing_store_directory(path)?;
+        let store = Self::new(path, StoreAccess::ReadOnly)?;
+        ensure_existing_database_file(&store.database_path)?;
+        let version = store.block_on(async {
+            let mut connection = store.connect().await?;
+            ensure_migration_table_exists(&mut connection, &store.database_path).await?;
+            current_schema_version(&mut connection, &store.database_path)
+                .await?
+                .context(CorruptedStoreSnafu {
+                    path: store.database_path.clone(),
+                    message: "missing SQLite schema version".to_owned(),
+                })
+        })?;
+        ensure!(
+            version <= SQLITE_SCHEMA_VERSION,
+            CorruptedStoreSnafu {
+                path: store.database_path,
+                message: format!(
+                    "unsupported SQLite schema version {version}, expected at most {SQLITE_SCHEMA_VERSION}"
+                ),
+            }
+        );
+        Ok(version < SQLITE_SCHEMA_VERSION)
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -489,6 +560,198 @@ PRAGMA journal_mode = DELETE;
     #[cfg(test)]
     pub fn snapshot_state(&self) -> StoreState {
         self.inner.read().expect("store lock poisoned").clone()
+    }
+}
+
+impl SqliteGraphStore {
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        ensure_existing_store_directory(path)?;
+        let store = Self::new(path)?;
+        ensure_existing_database_file(&store.database_path)?;
+        store.ensure_current_schema()?;
+        let root_id = store.block_on(async {
+            let mut connection = store.connect().await?;
+            load_root_id(&mut connection, &store.database_path).await
+        })?;
+        Ok(Self { root_id, ..store })
+    }
+
+    pub fn store_path(&self) -> &Path {
+        &self.dir
+    }
+
+    fn new(path: &Path) -> Result<Self> {
+        Ok(Self {
+            dir: path.to_owned(),
+            database_path: sqlite_database_path(path),
+            runtime: sqlite_runtime()?,
+            root_id: String::new(),
+        })
+    }
+
+    fn ensure_current_schema(&self) -> Result<()> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            ensure_migration_table_exists(&mut connection, &self.database_path).await?;
+            let version = current_schema_version(&mut connection, &self.database_path)
+                .await?
+                .context(CorruptedStoreSnafu {
+                    path: self.database_path.clone(),
+                    message: "missing SQLite schema version".to_owned(),
+                })?;
+            ensure!(
+                version == SQLITE_SCHEMA_VERSION,
+                CorruptedStoreSnafu {
+                    path: self.database_path.clone(),
+                    message: format!(
+                        "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
+                    ),
+                }
+            );
+            Ok(())
+        })
+    }
+
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.runtime.block_on(future))
+                    .join()
+                    .expect("SQLite graph store worker thread should not panic")
+            });
+        }
+        self.runtime.block_on(future)
+    }
+
+    async fn connect(&self) -> Result<AsyncSqliteConnection> {
+        let database_url = self.database_path.to_string_lossy().into_owned();
+        let mut connection = AsyncSqliteConnection::establish(&database_url)
+            .await
+            .context(ConnectSqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?;
+        configure_connection(&mut connection, &self.database_path).await?;
+        Ok(connection)
+    }
+
+    fn ensure_read_only<T>(&self) -> Result<T> {
+        StoreReadOnlySnafu {
+            path: self.dir.clone(),
+        }
+        .fail()
+    }
+
+    fn get_node_by_exact_id(&self, id: &str) -> Result<Node> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let row = sql_query(
+                r#"
+SELECT id, parent_id, created_at, role, metadata_json, kind_json
+FROM nodes
+WHERE id = ?
+"#,
+            )
+            .bind::<Text, _>(id)
+            .get_result::<NodeRow>(&mut connection)
+            .await
+            .optional()
+            .context(QuerySqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?
+            .context(NotFoundSnafu { id: id.to_owned() })?;
+            row.into_node(&self.database_path)
+        })
+    }
+
+    fn resolve_ref_id(&self, reference: &str) -> Result<String> {
+        if self.node_exists(reference)? {
+            return Ok(reference.to_owned());
+        }
+        if let Some(head_id) = self.branch_head(reference)? {
+            self.get_node_by_exact_id(&head_id)?;
+            return Ok(head_id);
+        }
+        NotFoundSnafu {
+            id: reference.to_owned(),
+        }
+        .fail()
+    }
+
+    fn branch_head(&self, name: &str) -> Result<Option<String>> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            sql_query("SELECT head_id AS id FROM branches WHERE name = ?")
+                .bind::<Text, _>(name)
+                .get_result::<NodeIdRow>(&mut connection)
+                .await
+                .optional()
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })
+                .map(|row| row.map(|row| row.id))
+        })
+    }
+
+    fn node_exists(&self, id: &str) -> Result<bool> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let count = sql_query("SELECT COUNT(*) AS count FROM nodes WHERE id = ?")
+                .bind::<Text, _>(id)
+                .get_result::<TableCount>(&mut connection)
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })?
+                .count;
+            Ok(count > 0)
+        })
+    }
+
+    fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
+        if let Some(head_id) = self.branch_head(reference)? {
+            return self.get_node_by_exact_id(&head_id);
+        }
+
+        match self.get_node_by_exact_id(reference) {
+            Ok(node) => Ok(node),
+            Err(crate::StoreError::NotFound { .. }) => self.get_node_by_prefix(reference),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn get_node_by_prefix(&self, prefix: &str) -> Result<Node> {
+        match self.node_ids_by_prefix(prefix)?.as_slice() {
+            [matched] => self.get_node_by_exact_id(matched),
+            [] => NotFoundSnafu {
+                id: prefix.to_owned(),
+            }
+            .fail(),
+            matches => AmbiguousNodePrefixSnafu {
+                prefix: prefix.to_owned(),
+                matches: matches.to_vec(),
+            }
+            .fail(),
+        }
+    }
+
+    fn node_ids_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            sql_query("SELECT id FROM nodes WHERE id LIKE ? ORDER BY id")
+                .bind::<Text, _>(format!("{prefix}%"))
+                .load::<NodeIdRow>(&mut connection)
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })
+                .map(|rows| rows.into_iter().map(|row| row.id).collect())
+        })
     }
 }
 
@@ -1099,16 +1362,22 @@ VALUES (?, ?, ?, ?, ?, ?)
         path: path.to_owned(),
     })?;
 
-    for edge in node_edges(node) {
-        sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
-            .bind::<Text, _>(edge.parent_id)
-            .bind::<Text, _>(edge.child_id)
-            .bind::<Text, _>(edge.kind)
-            .execute(connection)
-            .await
-            .context(QuerySqliteStoreSnafu {
-                path: path.to_owned(),
-            })?;
+    for relation in node_relations(node) {
+        sql_query(
+            r#"
+INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal)
+VALUES (?, ?, ?, ?)
+"#,
+        )
+        .bind::<Text, _>(relation.child_node_id)
+        .bind::<Text, _>(relation.parent_node_id)
+        .bind::<Text, _>(relation.kind)
+        .bind::<Integer, _>(relation.ordinal)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
     }
     Ok(())
 }
@@ -1143,7 +1412,7 @@ ON CONFLICT(id) DO UPDATE SET
         path: path.to_owned(),
     })?;
 
-    sql_query("DELETE FROM node_edges WHERE child_id = ?")
+    sql_query("DELETE FROM node_relations WHERE child_node_id = ?")
         .bind::<Text, _>(&node.id)
         .execute(connection)
         .await
@@ -1151,46 +1420,61 @@ ON CONFLICT(id) DO UPDATE SET
             path: path.to_owned(),
         })?;
 
-    for edge in node_edges(node) {
-        sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
-            .bind::<Text, _>(edge.parent_id)
-            .bind::<Text, _>(edge.child_id)
-            .bind::<Text, _>(edge.kind)
-            .execute(connection)
-            .await
-            .context(QuerySqliteStoreSnafu {
-                path: path.to_owned(),
-            })?;
+    for relation in node_relations(node) {
+        sql_query(
+            r#"
+INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal)
+VALUES (?, ?, ?, ?)
+"#,
+        )
+        .bind::<Text, _>(relation.child_node_id)
+        .bind::<Text, _>(relation.parent_node_id)
+        .bind::<Text, _>(relation.kind)
+        .bind::<Integer, _>(relation.ordinal)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
     }
     Ok(())
 }
 
-struct NodeEdge {
-    parent_id: String,
-    child_id: String,
+struct NodeRelation {
+    child_node_id: String,
+    parent_node_id: String,
     kind: String,
+    ordinal: i32,
 }
 
-fn node_edges(node: &Node) -> Vec<NodeEdge> {
-    let mut edges = Vec::new();
+fn node_relations(node: &Node) -> Vec<NodeRelation> {
+    let mut relations = Vec::new();
     if !node.parent.is_empty() {
-        edges.push(NodeEdge {
-            parent_id: node.parent.clone(),
-            child_id: node.id.clone(),
+        relations.push(NodeRelation {
+            child_node_id: node.id.clone(),
+            parent_node_id: node.parent.clone(),
             kind: "primary".to_owned(),
+            ordinal: 0,
         });
     }
     if let Kind::Anchor(anchor) = &node.kind {
-        edges.extend(anchor.merge_parents().iter().map(|parent| NodeEdge {
-            parent_id: parent.node_id().to_owned(),
-            child_id: node.id.clone(),
-            kind: merge_parent_edge_kind(parent).to_owned(),
-        }));
+        relations.extend(
+            anchor
+                .merge_parents()
+                .iter()
+                .enumerate()
+                .map(|(ordinal, parent)| NodeRelation {
+                    child_node_id: node.id.clone(),
+                    parent_node_id: parent.node_id().to_owned(),
+                    kind: merge_parent_relation_kind(parent).to_owned(),
+                    ordinal: ordinal as i32,
+                }),
+        );
     }
-    edges
+    relations
 }
 
-fn merge_parent_edge_kind(parent: &MergeParent) -> &'static str {
+fn merge_parent_relation_kind(parent: &MergeParent) -> &'static str {
     if parent.is_shadow() {
         "shadow"
     } else {
@@ -1709,6 +1993,184 @@ fn parse_session_role(role: &str, path: &Path) -> Result<SessionRole> {
     }
 }
 
+impl NodeStore for SqliteGraphStore {
+    fn root_id(&self) -> String {
+        self.root_id.clone()
+    }
+
+    fn append(&self, _node: NewNode) -> Result<String> {
+        self.ensure_read_only()
+    }
+
+    fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
+        let head_id = self.resolve_ref_id(head_ref)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let rows = sql_query(
+                r#"
+WITH RECURSIVE ancestry(id, depth) AS (
+    SELECT ? AS id, 0 AS depth
+    UNION ALL
+    SELECT nodes.parent_id, ancestry.depth + 1
+    FROM nodes
+    JOIN ancestry ON nodes.id = ancestry.id
+    WHERE nodes.parent_id != ''
+)
+SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.metadata_json, nodes.kind_json
+FROM ancestry
+JOIN nodes ON nodes.id = ancestry.id
+ORDER BY ancestry.depth
+"#,
+            )
+            .bind::<Text, _>(&head_id)
+            .load::<NodeRow>(&mut connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?;
+
+            let nodes = rows
+                .into_iter()
+                .map(|row| row.into_node(&self.database_path))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(last) = nodes.last()
+                && !last.is_root()
+            {
+                return ParentNotFoundSnafu {
+                    id: last.parent.clone(),
+                }
+                .fail();
+            }
+            Ok(nodes)
+        })
+    }
+
+    fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
+        let base_id = self.resolve_ref_id(base_ref)?;
+        let mut nodes = self.ancestry(head_ref)?;
+        let Some(index) = nodes.iter().position(|node| node.id == base_id) else {
+            return RefsNotConnectedSnafu {
+                base_ref: base_ref.to_owned(),
+                head_ref: head_ref.to_owned(),
+            }
+            .fail();
+        };
+        nodes.truncate(index + 1);
+        Ok(nodes)
+    }
+
+    fn get_node(&self, id: &str) -> Result<Node> {
+        self.get_node_by_prefix_or_branch(id)
+    }
+
+    fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
+        self.get_node_by_exact_id(node_id)?;
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let rows = sql_query(
+                r#"
+SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.metadata_json, nodes.kind_json
+FROM node_relations
+JOIN nodes ON nodes.id = node_relations.child_node_id
+WHERE node_relations.parent_node_id = ?
+ORDER BY nodes.created_at, nodes.id
+"#,
+            )
+            .bind::<Text, _>(node_id)
+            .load::<NodeRow>(&mut connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?;
+            rows.into_iter()
+                .map(|row| row.into_node(&self.database_path))
+                .collect()
+        })
+    }
+}
+
+impl BranchStore for SqliteGraphStore {
+    fn fork(&self, _name: &str, _from_ref: &str) -> Result<String> {
+        self.ensure_read_only()
+    }
+
+    fn get_branch_head(&self, name: &str) -> Result<String> {
+        self.branch_head(name)?.context(BranchNotFoundSnafu {
+            name: name.to_owned(),
+        })
+    }
+
+    fn delete_branch(&self, _name: &str) -> Result<()> {
+        self.ensure_read_only()
+    }
+
+    fn set_branch_head(
+        &self,
+        _name: &str,
+        _expected_old_head: &str,
+        _new_head: &str,
+    ) -> Result<()> {
+        self.ensure_read_only()
+    }
+}
+
+impl SessionStore for SqliteGraphStore {
+    fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            let sessions =
+                sql_query("SELECT branch_name, state_json FROM sessions ORDER BY branch_name")
+                    .load::<SessionRow>(&mut connection)
+                    .await
+                    .context(QuerySqliteStoreSnafu {
+                        path: self.database_path.clone(),
+                    })?;
+            sessions
+                .into_iter()
+                .map(|session| {
+                    let state = serde_json::from_str::<SessionState>(&session.state_json).context(
+                        ParseSqliteStoreValueSnafu {
+                            path: self.database_path.clone(),
+                            column: "sessions.state_json".to_owned(),
+                        },
+                    )?;
+                    Ok((session.branch_name, state))
+                })
+                .collect()
+        })
+    }
+
+    fn get_session_state(&self, name: &str) -> Result<SessionState> {
+        self.list_session_states()?
+            .remove(name)
+            .context(BranchNotFoundSnafu {
+                name: name.to_owned(),
+            })
+    }
+
+    fn set_session_state(
+        &self,
+        _name: &str,
+        _expected: Option<&SessionState>,
+        _next: SessionState,
+    ) -> Result<SessionState> {
+        self.ensure_read_only()
+    }
+
+    fn rebase_session(&self, _name: &str, _patch: &SessionAnchorPatch) -> Result<String> {
+        self.ensure_read_only()
+    }
+
+    fn handoff_session(
+        &self,
+        _name: &str,
+        _patch: &SessionAnchorPatch,
+        _prompt: &str,
+    ) -> Result<String> {
+        self.ensure_read_only()
+    }
+}
+
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
         self.inner
@@ -2171,14 +2633,30 @@ impl ProcessShareableStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        FsStore, MessageQueueItem, SQLITE_INCOMPLETE_DATABASE_FILE_NAME,
-        SQLITE_MIGRATION_DATABASE_FILE_NAME, SqliteMigration, SqliteStore, StoreAccess,
+        AsyncSqliteConnection, FsStore, MessageQueueItem, NodeRow,
+        SQLITE_INCOMPLETE_DATABASE_FILE_NAME, SQLITE_MIGRATION_DATABASE_FILE_NAME,
+        SqliteGraphStore, SqliteMigration, SqliteStore, StoreAccess, persist_root_metadata,
     };
     use crate::{
-        Anchor, BranchStore, JobStatus, JobStore, Kind, MessageQueueStore, NewNode, NodeStore,
-        PauseReason, Preset, PresetStore, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
-        SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
+        Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, NewNode,
+        Node, NodeStore, PauseReason, Preset, PresetStore, Role, SessionAnchor, SessionAnchorPatch,
+        SessionRole, SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
     };
+    use diesel::sql_query;
+    use diesel::sql_types::{Integer, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
+    struct NodeRelationRow {
+        #[diesel(sql_type = Text)]
+        child_node_id: String,
+        #[diesel(sql_type = Text)]
+        parent_node_id: String,
+        #[diesel(sql_type = Text)]
+        kind: String,
+        #[diesel(sql_type = Integer)]
+        ordinal: i32,
+    }
 
     fn session_anchor_node(parent: &str) -> NewNode {
         NewNode {
@@ -2220,6 +2698,47 @@ mod tests {
         }
     }
 
+    fn node_relation_rows(store: &SqliteStore, child_node_id: &str) -> Vec<NodeRelationRow> {
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            sql_query(
+                r#"
+SELECT child_node_id, parent_node_id, kind, ordinal
+FROM node_relations
+WHERE child_node_id = ?
+ORDER BY kind, ordinal, parent_node_id
+"#,
+            )
+            .bind::<Text, _>(child_node_id)
+            .load::<NodeRelationRow>(&mut connection)
+            .await
+            .unwrap()
+        })
+    }
+
+    async fn insert_v1_node_row(
+        connection: &mut AsyncSqliteConnection,
+        store_path: &std::path::Path,
+        node: Node,
+    ) {
+        let row = NodeRow::from_node(node, store_path).unwrap();
+        sql_query(
+            r#"
+INSERT INTO nodes (id, parent_id, created_at, role, metadata_json, kind_json)
+VALUES (?, ?, ?, ?, ?, ?)
+"#,
+        )
+        .bind::<Text, _>(row.id)
+        .bind::<Text, _>(row.parent_id)
+        .bind::<Text, _>(row.created_at)
+        .bind::<Text, _>(row.role)
+        .bind::<Nullable<Text>, _>(row.metadata_json)
+        .bind::<Text, _>(row.kind_json)
+        .execute(connection)
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn open_creates_sqlite_database_and_schema() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -2228,7 +2747,7 @@ mod tests {
         let store = SqliteStore::open(&path).unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
     }
 
     #[test]
@@ -2285,7 +2804,294 @@ THIS IS NOT SQL;
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn append_persists_node_relations() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+        let primary_parent = store
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("primary parent".to_owned()),
+            })
+            .unwrap();
+        let merge_parent = store
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("merge parent".to_owned()),
+            })
+            .unwrap();
+        let shadow_parent = store
+            .append(NewNode {
+                parent: root_id,
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("shadow parent".to_owned()),
+            })
+            .unwrap();
+        let child = store
+            .append(NewNode {
+                parent: primary_parent.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(
+                    vec![
+                        MergeParent::merge(merge_parent.clone()),
+                        MergeParent::shadow(shadow_parent.clone()),
+                    ],
+                    SessionAnchor {
+                        role: SessionRole::Orchestrator,
+                        provider_profile: None,
+                        provider: Some("openai".to_owned()),
+                        model: "gpt-5.4".to_owned(),
+                        tools: vec![],
+                        system_prompt: "system".to_owned(),
+                        prompt: "prompt".to_owned(),
+                        temperature: Some(0.1),
+                        max_tokens: Some(64),
+                        additional_params: None,
+                        enable_coco_shim: false,
+                        active_skill: None,
+                    },
+                )),
+            })
+            .unwrap();
+
+        let relations = node_relation_rows(&store, &child);
+
+        assert_eq!(relations.len(), 3);
+        assert!(relations.contains(&NodeRelationRow {
+            child_node_id: child.clone(),
+            parent_node_id: primary_parent,
+            kind: "primary".to_owned(),
+            ordinal: 0,
+        }));
+        assert!(relations.contains(&NodeRelationRow {
+            child_node_id: child.clone(),
+            parent_node_id: merge_parent,
+            kind: "merge".to_owned(),
+            ordinal: 0,
+        }));
+        assert!(relations.contains(&NodeRelationRow {
+            child_node_id: child,
+            parent_node_id: shadow_parent,
+            kind: "shadow".to_owned(),
+            ordinal: 1,
+        }));
+    }
+
+    #[test]
+    fn graph_store_reads_children_from_node_relations() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let writer = SqliteStore::open(&path).unwrap();
+        let root_id = writer.root_id();
+        let child_id = writer
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("graph child".to_owned()),
+            })
+            .unwrap();
+        writer.fork("graph-child", &child_id).unwrap();
+        drop(writer);
+
+        let graph_store = SqliteGraphStore::open_read_only(&path).unwrap();
+
+        assert_eq!(graph_store.root_id(), root_id);
+        assert_eq!(
+            graph_store.get_node(&child_id).unwrap().id,
+            child_id.clone()
+        );
+        assert_eq!(
+            graph_store.get_node(&child_id[..12]).unwrap().id,
+            child_id.clone()
+        );
+        assert_eq!(
+            graph_store.get_node("graph-child").unwrap().id,
+            child_id.clone()
+        );
+        assert_eq!(graph_store.list_children(&root_id).unwrap()[0].id, child_id);
+        assert_eq!(graph_store.ancestry(&child_id).unwrap().len(), 2);
+        assert!(matches!(
+            graph_store
+                .append(NewNode {
+                    parent: root_id,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("blocked".to_owned()),
+                })
+                .unwrap_err(),
+            crate::StoreError::StoreReadOnly { .. }
+        ));
+    }
+
+    #[test]
+    fn schema_migration_backfills_node_relations_from_node_edges() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
+        let state = super::StoreState::new();
+        let root = state.root_node().clone();
+        let child = Node::new(
+            root.id.clone(),
+            Role::User,
+            None,
+            Kind::Text("legacy child".to_owned()),
+            "1970-01-01T00:00:01Z".parse().unwrap(),
+        );
+        let child_id = child.id.clone();
+        let root_id = root.id.clone();
+        let merge_parent_a = Node::new(
+            root_id.clone(),
+            Role::LLM,
+            None,
+            Kind::Text("legacy merge parent a".to_owned()),
+            "1970-01-01T00:00:02Z".parse().unwrap(),
+        );
+        let merge_parent_a_id = merge_parent_a.id.clone();
+        let merge_parent_b = Node::new(
+            root_id.clone(),
+            Role::LLM,
+            None,
+            Kind::Text("legacy merge parent b".to_owned()),
+            "1970-01-01T00:00:03Z".parse().unwrap(),
+        );
+        let merge_parent_b_id = merge_parent_b.id.clone();
+
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            super::configure_writable_connection(&mut connection, &store.database_path)
+                .await
+                .unwrap();
+            super::ensure_migration_table(&mut connection, &store.database_path)
+                .await
+                .unwrap();
+            super::apply_migration_if_needed(
+                &mut connection,
+                &store.database_path,
+                &super::SQLITE_MIGRATIONS[0],
+            )
+            .await
+            .unwrap();
+            persist_root_metadata(&mut connection, &store.database_path, &root_id)
+                .await
+                .unwrap();
+            insert_v1_node_row(&mut connection, &store.database_path, root).await;
+            insert_v1_node_row(&mut connection, &store.database_path, merge_parent_a).await;
+            insert_v1_node_row(&mut connection, &store.database_path, merge_parent_b).await;
+            insert_v1_node_row(&mut connection, &store.database_path, child).await;
+            sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
+                .bind::<Text, _>(&root_id)
+                .bind::<Text, _>(&child_id)
+                .bind::<Text, _>("primary")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
+                .bind::<Text, _>(&merge_parent_a_id)
+                .bind::<Text, _>(&child_id)
+                .bind::<Text, _>("merge")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
+                .bind::<Text, _>(&merge_parent_b_id)
+                .bind::<Text, _>(&child_id)
+                .bind::<Text, _>("merge")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        });
+        drop(store);
+
+        let migrated = SqliteStore::open(&path).unwrap();
+
+        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(
+            node_relation_rows(&migrated, &child_id),
+            vec![
+                NodeRelationRow {
+                    child_node_id: child_id.clone(),
+                    parent_node_id: merge_parent_a_id,
+                    kind: "merge".to_owned(),
+                    ordinal: 0,
+                },
+                NodeRelationRow {
+                    child_node_id: child_id.clone(),
+                    parent_node_id: merge_parent_b_id,
+                    kind: "merge".to_owned(),
+                    ordinal: 1,
+                },
+                NodeRelationRow {
+                    child_node_id: child_id,
+                    parent_node_id: root_id,
+                    kind: "primary".to_owned(),
+                    ordinal: 0,
+                },
+            ]
+        );
+        migrated.block_on(async {
+            let mut connection = migrated.connect().await.unwrap();
+            assert_eq!(
+                super::table_count(&mut connection, &migrated.database_path, "node_edges")
+                    .await
+                    .unwrap(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn persistent_read_only_or_migrate_fs_upgrades_sqlite_schema() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
+        let state = super::StoreState::new();
+        let root = state.root_node().clone();
+        let root_id = root.id.clone();
+
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            super::configure_writable_connection(&mut connection, &store.database_path)
+                .await
+                .unwrap();
+            super::ensure_migration_table(&mut connection, &store.database_path)
+                .await
+                .unwrap();
+            super::apply_migration_if_needed(
+                &mut connection,
+                &store.database_path,
+                &super::SQLITE_MIGRATIONS[0],
+            )
+            .await
+            .unwrap();
+            persist_root_metadata(&mut connection, &store.database_path, &root_id)
+                .await
+                .unwrap();
+            insert_v1_node_row(&mut connection, &store.database_path, root).await;
+        });
+        drop(store);
+
+        let crate::store::PersistentStore::Sqlite(migrated) =
+            crate::store::PersistentStore::open_read_only_or_migrate_fs(&path).unwrap()
+        else {
+            panic!("expected SQLite store");
+        };
+
+        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(migrated.root_id(), root_id);
     }
 
     #[test]
@@ -2352,7 +3158,7 @@ THIS IS NOT SQL;
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
     }
 
     #[test]
