@@ -161,7 +161,7 @@ where
 
     pub fn rebuild_requested_modes(&self) {
         for mode in [GraphMode::Anchors, GraphMode::All] {
-            self.ensure_snapshot_current(mode);
+            self.ensure_viewport_current(mode);
         }
     }
 
@@ -259,7 +259,7 @@ where
         request: GraphViewportRequest,
     ) -> Option<GraphViewportResponse> {
         if let Some(snapshots) = &self.snapshots {
-            self.ensure_snapshot_current(mode);
+            self.ensure_viewport_current(mode);
             return snapshots.latest_viewport(mode, request).ok().flatten();
         }
         self.snapshot_current_ready_or_schedule(mode)
@@ -306,7 +306,7 @@ where
         request: GraphViewportDiffRequest,
     ) -> Option<GraphViewportDiffResponse> {
         if let Some(snapshots) = &self.snapshots {
-            self.ensure_snapshot_current(mode);
+            self.ensure_viewport_current(mode);
             return snapshots.latest_viewport_diff(mode, request).ok().flatten();
         }
         self.snapshot_current_ready_or_schedule(mode)
@@ -441,6 +441,32 @@ where
         });
     }
 
+    fn ensure_viewport_current(&self, mode: GraphMode) {
+        let source_version = self.invalidations.current_version();
+        if self.cached_snapshot(mode, source_version).is_some()
+            || self.materialization_current(mode, source_version)
+        {
+            self.set_rebuild_status(rebuild_status(
+                mode,
+                source_version,
+                ConsoleGraphRebuildState::Ready,
+                None,
+                1,
+                1,
+                "Graph materialization ready",
+            ));
+            return;
+        }
+        if !self.mark_rebuild_scheduled(mode, source_version) {
+            return;
+        }
+
+        let cache = self.clone();
+        tokio::spawn(async move {
+            cache.rebuild_snapshot(mode, source_version).await;
+        });
+    }
+
     async fn rebuild_snapshot(&self, mode: GraphMode, source_version: u64) {
         self.set_rebuild_status(rebuild_status(
             mode,
@@ -451,6 +477,54 @@ where
             0,
             "Building graph snapshot",
         ));
+        if let Some(snapshots) = self.snapshots.clone() {
+            let source = self.source.clone();
+            let incremental_result = self
+                .run_blocking_graph_compute(move || {
+                    source.try_append_linear_materialization(snapshots, mode, source_version)
+                })
+                .await;
+            match incremental_result {
+                Ok(Ok(true)) => {
+                    self.publish_ready_version(source_version);
+                    self.set_rebuild_status(rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Ready,
+                        None,
+                        1,
+                        1,
+                        "Graph materialization updated",
+                    ));
+                    return;
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    self.set_rebuild_status(rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Failed,
+                        None,
+                        0,
+                        0,
+                        error.to_string(),
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    self.set_rebuild_status(rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Failed,
+                        None,
+                        0,
+                        0,
+                        error.to_string(),
+                    ));
+                    return;
+                }
+            }
+        }
         let source = self.source.clone();
         let progress_cache = self.clone();
         let result = self
@@ -513,6 +587,20 @@ where
                 error.to_string(),
             )),
         }
+    }
+
+    fn materialization_current(&self, mode: GraphMode, source_version: u64) -> bool {
+        if self.snapshots.is_none() {
+            return false;
+        }
+        let state = self
+            .state
+            .lock()
+            .expect("console graph cache lock poisoned");
+        state.rebuild_slot(mode).as_ref().is_some_and(|status| {
+            status.source_version == source_version
+                && status.state == ConsoleGraphRebuildState::Ready
+        })
     }
 
     fn mark_rebuild_scheduled(&self, mode: GraphMode, source_version: u64) -> bool {
@@ -633,6 +721,22 @@ where
                 let store =
                     SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
                 build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
+            }
+        }
+    }
+
+    fn try_append_linear_materialization(
+        self,
+        snapshots: ConsoleGraphSnapshotStore,
+        mode: GraphMode,
+        source_version: u64,
+    ) -> crate::Result<bool> {
+        match self {
+            Self::Store(store) => snapshots.try_append_linear_branch(source_version, mode, &store),
+            Self::PersistentStorePath(path) => {
+                let store =
+                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
+                snapshots.try_append_linear_branch(source_version, mode, &store)
             }
         }
     }
@@ -987,6 +1091,83 @@ mod tests {
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_appends_linear_graph_materialization_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let first = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("first child".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &first).unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let database_path = path.join("store.sqlite3");
+        create_graph_fact_audit_triggers(&database_path);
+        let second = writer
+            .append(NewNode {
+                parent: first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("second child".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &first, &second).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert!(viewport.nodes.iter().any(|node| node.id == second));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert!(cache.rebuild_statuses().iter().any(|status| {
+            status.mode == GraphMode::All
+                && status.source_version == target_version
+                && status.state == ConsoleGraphRebuildState::Ready
+        }));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

@@ -987,7 +987,7 @@ fn visible_merge_parent(parent: &MergeParent, node_id: String) -> MergeParent {
     }
 }
 
-fn graph_kind_name(node: &Node) -> &'static str {
+pub(crate) fn graph_kind_name(node: &Node) -> &'static str {
     match &node.kind {
         Kind::Anchor(anchor) => match &anchor.payload {
             AnchorPayload::Session(_) => "session",
@@ -1003,7 +1003,7 @@ fn graph_kind_name(node: &Node) -> &'static str {
     }
 }
 
-fn summarize_node(node: &Node) -> String {
+pub(crate) fn summarize_node(node: &Node) -> String {
     truncate_summary(&render_node_content(node))
 }
 
