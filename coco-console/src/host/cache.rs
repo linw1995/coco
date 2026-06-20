@@ -2520,24 +2520,38 @@ mod tests {
             .await
             .unwrap();
         let first_skill_lane = format!("skill {}", crate::graph::shorten_id(&first_result));
-        let second_skill_lane = format!("skill {}", crate::graph::shorten_id(&second_result));
+        let invocation_count = viewport
+            .nodes
+            .iter()
+            .filter(|node| node.id == invocation)
+            .count();
+        let skill_lane_count = viewport
+            .lanes
+            .iter()
+            .filter(|lane| lane.label.starts_with("skill "))
+            .count();
 
         assert_eq!(viewport.version, target_version);
-        assert!(viewport.nodes.iter().any(|node| node.id == invocation));
+        assert_eq!(invocation_count, 1);
         assert!(viewport.nodes.iter().any(|node| node.id == first_result));
         assert!(viewport.nodes.iter().any(|node| node.id == second_result));
+        assert_eq!(skill_lane_count, 1);
         assert!(
             viewport
                 .lanes
                 .iter()
                 .any(|lane| lane.label == first_skill_lane)
         );
-        assert!(
-            viewport
-                .lanes
-                .iter()
-                .any(|lane| lane.label == second_skill_lane)
-        );
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == invocation
+                && edge.target_id == first_result
+                && edge.kind == crate::api::GraphViewportEdgeKind::PrimaryParent
+        }));
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == invocation
+                && edge.target_id == second_result
+                && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+        }));
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
@@ -7258,6 +7272,98 @@ mod tests {
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_inserts_sorted_new_branch_from_earlier_lane_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("zeta", &session).unwrap();
+        let shared = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("shared".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("zeta", &session, &shared).unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        writer.fork("alpha", &shared).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let alpha_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "alpha")
+            .unwrap()
+            .y;
+        let zeta_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "zeta")
+            .unwrap()
+            .y;
+
+        assert_eq!(viewport.version, target_version);
+        assert!(alpha_y < zeta_y);
+        assert!(
+            viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == session && node.y == alpha_y)
+        );
+        assert!(
+            viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == shared && node.y == alpha_y)
+        );
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == session
+                && edge.target_id == shared
+                && edge.source.y == alpha_y
+                && edge.target.y == alpha_y
+                && edge.kind == crate::api::GraphViewportEdgeKind::PrimaryParent
+        }));
+        assert!(!viewport.edges.iter().any(|edge| {
+            edge.target_id == shared && edge.target.y == alpha_y && edge.source.y == zeta_y
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

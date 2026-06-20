@@ -207,6 +207,7 @@ struct OrphanMergeParentNodeEdgeInput<'a> {
     point: Point,
     previous: Option<&'a (String, Point)>,
     first_node: bool,
+    force_fork: bool,
 }
 
 enum SkillSubtreeAppend {
@@ -2006,6 +2007,7 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
                     point,
                     previous: previous.as_ref(),
                     first_node: index == 0,
+                    force_fork: false,
                 },
             )? {
                 return Ok(None);
@@ -2045,7 +2047,7 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
                 input.point,
             );
         };
-        let edge = if input.first_node && previous_point.y != input.point.y {
+        let edge = if input.force_fork || input.first_node && previous_point.y != input.point.y {
             routed_edge(
                 GraphViewportEdgeKind::Fork,
                 previous_id,
@@ -2245,40 +2247,42 @@ ORDER BY
         let ancestry = store
             .ancestry(input.head_id)
             .context(crate::error::StoreSnafu)?;
-        let (source, source_point, nodes): (Option<String>, Option<Point>, Vec<Node>) =
-            match self.first_materialized_ancestry_point(connection, input.mode, &ancestry)? {
-                Some((0, source_point)) => {
-                    return self.insert_branch_alias_lane(
-                        connection,
-                        input,
-                        lane_y,
-                        &ancestry[0],
-                        source_point,
-                    );
+        let (source, source_point, nodes): (Option<String>, Option<Point>, Vec<Node>) = match self
+            .first_materialized_ancestry_point(
+            connection, input.mode, &ancestry, lane_y,
+        )? {
+            Some((0, source_point)) => {
+                return self.insert_branch_alias_lane(
+                    connection,
+                    input,
+                    lane_y,
+                    &ancestry[0],
+                    source_point,
+                );
+            }
+            Some((source_index, source_point)) => {
+                let source = &ancestry[source_index];
+                let mut nodes = ancestry[..source_index].to_vec();
+                nodes.reverse();
+                if nodes.is_empty() || !is_linear_new_nodes(&source.id, &nodes) {
+                    return Ok(false);
                 }
-                Some((source_index, source_point)) => {
-                    let source = &ancestry[source_index];
-                    let mut nodes = ancestry[..source_index].to_vec();
-                    nodes.reverse();
-                    if nodes.is_empty() || !is_linear_new_nodes(&source.id, &nodes) {
-                        return Ok(false);
-                    }
-                    (Some(source.id.clone()), Some(source_point), nodes)
+                (Some(source.id.clone()), Some(source_point), nodes)
+            }
+            None => {
+                let mut nodes = ancestry
+                    .iter()
+                    .take_while(|node| !node.is_root())
+                    .filter(|node| is_visible_mode_node(input.mode, node))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                nodes.reverse();
+                if nodes.is_empty() || !initial_visible_lane_is_linear(input.mode, &nodes) {
+                    return Ok(false);
                 }
-                None => {
-                    let mut nodes = ancestry
-                        .iter()
-                        .take_while(|node| !node.is_root())
-                        .filter(|node| is_visible_mode_node(input.mode, node))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    nodes.reverse();
-                    if nodes.is_empty() || !initial_visible_lane_is_linear(input.mode, &nodes) {
-                        return Ok(false);
-                    }
-                    (None, None, nodes)
-                }
-            };
+                (None, None, nodes)
+            }
+        };
 
         let lane = GraphViewportLane {
             key: lane_key(input.branch),
@@ -2421,26 +2425,32 @@ ORDER BY
         }
 
         for nodes in subtrees {
-            let subtree_lane = match self
+            let (subtree_lane, fork_first_inserted) = match self
                 .materialized_skill_subtree_attach_row_in_connection(connection, mode, &nodes)?
             {
-                Some(row) => GraphViewportLane {
-                    key: row.lane_key,
-                    label: row.lane_label,
-                    y: row.lane_y,
-                },
+                Some((row, fork_first_inserted)) => (
+                    GraphViewportLane {
+                        key: row.lane_key,
+                        label: row.lane_label,
+                        y: row.lane_y,
+                    },
+                    fork_first_inserted,
+                ),
                 None => {
                     let subtree_source_id = nodes
                         .last()
                         .map(|node| node.id.as_str())
                         .unwrap_or(source_id);
-                    skill_invocation_subtree_lane(
-                        subtree_source_id,
-                        self.next_materialized_lane_y_after_reserved(
-                            connection,
-                            mode,
-                            Some(lane.y),
-                        )?,
+                    (
+                        skill_invocation_subtree_lane(
+                            subtree_source_id,
+                            self.next_materialized_lane_y_after_reserved(
+                                connection,
+                                mode,
+                                Some(lane.y),
+                            )?,
+                        ),
+                        false,
                     )
                 }
             };
@@ -2448,6 +2458,7 @@ ORDER BY
                 self.event_order_by_materialized_and_new_nodes(connection, store, mode, &nodes)?;
             let mut previous_id = source_id.to_owned();
             let mut previous_point = source_point;
+            let mut first_inserted_node = true;
             for node in nodes {
                 if let Some(row) = self.materialized_node_row_by_id_on_lane_in_connection(
                     connection,
@@ -2501,12 +2512,14 @@ ORDER BY
                         point,
                         previous: Some(&previous),
                         first_node: previous_id == source_id,
+                        force_fork: first_inserted_node && fork_first_inserted,
                     },
                 )? {
                     return Ok(SkillSubtreeAppend::Unsupported);
                 }
                 previous_id = node.id;
                 previous_point = point;
+                first_inserted_node = false;
             }
         }
         Ok(SkillSubtreeAppend::Applied)
@@ -3812,6 +3825,7 @@ ORDER BY lane_y, lane_key
         connection: &mut SqliteConnection,
         mode: GraphMode,
         ancestry: &[Node],
+        before_lane_y: i32,
     ) -> crate::Result<Option<(usize, Point)>> {
         for (index, node) in ancestry.iter().enumerate() {
             let Some(row) = self
@@ -3819,7 +3833,7 @@ ORDER BY lane_y, lane_key
             else {
                 continue;
             };
-            if is_orphan_lane_key(&row.lane_key) {
+            if row.y >= before_lane_y || is_orphan_lane_key(&row.lane_key) {
                 continue;
             }
             return Ok(Some((index, Point { x: row.x, y: row.y })));
@@ -3850,7 +3864,7 @@ ORDER BY lane_y, lane_key
         connection: &mut SqliteConnection,
         mode: GraphMode,
         nodes: &[Node],
-    ) -> crate::Result<Option<MaterializedTailNodeRow>> {
+    ) -> crate::Result<Option<(MaterializedTailNodeRow, bool)>> {
         for node in nodes.iter().rev() {
             let Some(row) = self.materialized_node_row_by_id_with_lane_prefix_in_connection(
                 connection,
@@ -3866,9 +3880,8 @@ ORDER BY lane_y, lane_key
             else {
                 continue;
             };
-            if tail.node_id == row.node_id {
-                return Ok(Some(row));
-            }
+            let fork_first_inserted = tail.node_key != row.node_key;
+            return Ok(Some((row, fork_first_inserted)));
         }
         Ok(None)
     }
