@@ -493,15 +493,24 @@ LIMIT 1
         session_states: &[(String, SessionState)],
     ) -> crate::Result<Option<usize>> {
         for (index, (branch, _)) in session_states.iter().enumerate() {
-            let head_id = store
-                .get_branch_head(branch)
-                .context(crate::error::StoreSnafu)?;
-            let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
-            if !initial_visible_graph_lane_nodes(store, mode, ancestry)?.is_empty() {
+            if self.branch_has_initial_visible_nodes(store, mode, branch)? {
                 return Ok(Some(index));
             }
         }
         Ok(None)
+    }
+
+    fn branch_has_initial_visible_nodes(
+        &self,
+        store: &(impl BranchStore + NodeStore),
+        mode: GraphMode,
+        branch: &str,
+    ) -> crate::Result<bool> {
+        let head_id = store
+            .get_branch_head(branch)
+            .context(crate::error::StoreSnafu)?;
+        let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+        Ok(!initial_visible_graph_lane_nodes(store, mode, ancestry)?.is_empty())
     }
 
     fn try_seed_first_branch_materialization_in_transaction(
@@ -1125,6 +1134,9 @@ LIMIT 1
     ) -> crate::Result<Option<Vec<MaterializedTailNodeRow>>> {
         let mut labels_by_node_id = BTreeMap::<String, Vec<String>>::new();
         for (branch, state) in session_states {
+            if !self.branch_has_initial_visible_nodes(store, mode, branch)? {
+                continue;
+            }
             let head_id = store
                 .get_branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
@@ -2336,6 +2348,9 @@ ORDER BY
                     },
                 )?
             } else {
+                if !self.branch_has_initial_visible_nodes(store, mode, branch)? {
+                    continue;
+                }
                 self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
                 let appended = self.try_append_new_branch_lane_in_transaction(
                     connection,
@@ -2356,7 +2371,9 @@ ORDER BY
             if !appended {
                 return Ok(false);
             }
-            next_lane_y += GRAPH_LANE_HEIGHT;
+            if materialized_lane_labels.contains(branch) {
+                next_lane_y += GRAPH_LANE_HEIGHT;
+            }
         }
         self.prune_removable_derived_lanes(connection, mode)?;
         self.rebalance_routed_edge_slots(connection, mode)?;

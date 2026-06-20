@@ -13,7 +13,7 @@ use crate::host::render::{
     MaterializedGraphShell, MaterializedGraphShellBranch, MaterializedGraphShellTick,
     ProviderContextItem,
 };
-use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
+use crate::layout::{lane_key, layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
 use coco_mem::{BranchStore, NodeStore, SessionState, SessionStore, SqliteGraphStore, Store};
 use serde::Serialize;
@@ -1070,9 +1070,9 @@ fn materialized_shell_branches(
     store: &(impl BranchStore + SessionStore),
     lanes: &[crate::api::GraphViewportLane],
 ) -> crate::Result<Vec<MaterializedGraphShellBranch>> {
-    let lane_by_label = lanes
+    let lane_by_key = lanes
         .iter()
-        .map(|lane| (lane.label.as_str(), lane))
+        .map(|lane| (lane.key.as_str(), lane))
         .collect::<BTreeMap<_, _>>();
     let mut states = store
         .list_session_states()
@@ -1080,12 +1080,14 @@ fn materialized_shell_branches(
         .into_iter()
         .collect::<Vec<(String, SessionState)>>();
     states.sort_by(|(left_branch, _), (right_branch, _)| {
-        let left_lane = lane_by_label
-            .get(left_branch.as_str())
+        let left_key = lane_key(left_branch);
+        let left_lane = lane_by_key
+            .get(left_key.as_str())
             .map(|lane| lane.y)
             .unwrap_or(i32::MAX);
-        let right_lane = lane_by_label
-            .get(right_branch.as_str())
+        let right_key = lane_key(right_branch);
+        let right_lane = lane_by_key
+            .get(right_key.as_str())
             .map(|lane| lane.y)
             .unwrap_or(i32::MAX);
         left_lane
@@ -1096,7 +1098,8 @@ fn materialized_shell_branches(
     states
         .into_iter()
         .filter_map(|(branch, state)| {
-            let lane = lane_by_label.get(branch.as_str())?;
+            let key = lane_key(&branch);
+            let lane = lane_by_key.get(key.as_str())?;
             Some((branch, state, *lane))
         })
         .map(|(branch, state, lane)| {
@@ -1185,6 +1188,40 @@ mod tests {
         let path = std::env::temp_dir().join(format!("coco-console-graph-{nanos}-{counter}"));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn materialized_shell_branches_use_branch_lane_keys() {
+        let store = MemoryStore::new();
+        let root = store.root_id();
+        let session = store
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        let branch = "orphan abc123";
+        store.fork(branch, &session).unwrap();
+        let branch_lane = crate::api::GraphViewportLane {
+            key: lane_key(branch),
+            label: branch.to_owned(),
+            y: 10,
+        };
+        let derived_lane = crate::api::GraphViewportLane {
+            key: "derived:orphan:abc123".to_owned(),
+            label: branch.to_owned(),
+            y: 20,
+        };
+
+        let branches =
+            materialized_shell_branches(&store, &[branch_lane.clone(), derived_lane]).unwrap();
+
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, branch);
+        assert_eq!(branches[0].key, branch_lane.key);
+        assert_eq!(branches[0].lane_y, branch_lane.y);
     }
 
     #[tokio::test]
@@ -3533,6 +3570,74 @@ mod tests {
         assert!(viewport.nodes.iter().any(|node| node.id == text));
         assert!(viewport.lanes.iter().any(|lane| lane.label == "draft"));
         assert!(!viewport.lanes.iter().any(|lane| lane.label == "main"));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+
+        drop(cache);
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_skips_root_only_new_branch_when_appending_materialization() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main history".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
+        publisher.mark_changed();
+        let initial = cache
+            .viewport_after(
+                GraphMode::All,
+                0,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        writer.fork("empty", &root).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert!(viewport.nodes.iter().any(|node| node.id == session));
+        assert!(viewport.nodes.iter().any(|node| node.id == text));
+        assert!(viewport.lanes.iter().any(|lane| lane.label == "main"));
+        assert!(!viewport.lanes.iter().any(|lane| lane.label == "empty"));
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
