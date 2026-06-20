@@ -421,7 +421,7 @@ LIMIT 1
             .context(crate::error::StoreSnafu)?;
         let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
         let nodes = initial_visible_lane_nodes(mode, ancestry);
-        if nodes.is_empty() || !initial_visible_lane_is_linear(&nodes) {
+        if nodes.is_empty() || !initial_visible_lane_is_linear(mode, &nodes) {
             return Ok(false);
         }
 
@@ -2740,8 +2740,8 @@ fn initial_visible_lane_nodes(mode: GraphMode, ancestry: Vec<Node>) -> Vec<Node>
         .collect()
 }
 
-fn initial_visible_lane_is_linear(nodes: &[Node]) -> bool {
-    nodes.windows(2).all(|nodes| nodes[1].parent == nodes[0].id)
+fn initial_visible_lane_is_linear(mode: GraphMode, nodes: &[Node]) -> bool {
+    mode == GraphMode::Anchors || nodes.windows(2).all(|nodes| nodes[1].parent == nodes[0].id)
 }
 
 fn is_linear_new_nodes(source_id: &str, nodes: &[Node]) -> bool {
