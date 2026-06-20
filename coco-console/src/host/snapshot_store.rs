@@ -3085,6 +3085,7 @@ LIMIT 1
         branch: &str,
         head_x: i32,
     ) -> crate::Result<bool> {
+        let branch_lane_key = lane_key(branch);
         let row = sql_query(
             r#"
 SELECT 1 AS value
@@ -3094,7 +3095,7 @@ WHERE edge.mode = ?
       SELECT 1
       FROM console_graph_node_locations AS suffix
       WHERE suffix.mode = edge.mode
-        AND suffix.lane_label = ?
+        AND suffix.lane_key = ?
         AND suffix.x > ?
         AND suffix.node_id = edge.source_id
         AND suffix.x = edge.source_x
@@ -3104,7 +3105,7 @@ WHERE edge.mode = ?
       SELECT 1
       FROM console_graph_node_locations AS suffix_target
       WHERE suffix_target.mode = edge.mode
-        AND suffix_target.lane_label = ?
+        AND suffix_target.lane_key = ?
         AND suffix_target.x > ?
         AND suffix_target.node_id = edge.target_id
         AND suffix_target.x = edge.target_x
@@ -3123,9 +3124,9 @@ LIMIT 1
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(branch)
+        .bind::<Text, _>(&branch_lane_key)
         .bind::<Integer, _>(head_x)
-        .bind::<Text, _>(branch)
+        .bind::<Text, _>(&branch_lane_key)
         .bind::<Integer, _>(head_x)
         .get_result::<SqliteInteger>(connection)
         .optional()
@@ -3182,11 +3183,11 @@ WHERE mode = ?
         sql_query(
             r#"
 DELETE FROM console_graph_node_locations
-WHERE mode = ? AND lane_label = ? AND x > ?
+WHERE mode = ? AND lane_key = ? AND x > ?
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(branch)
+        .bind::<Text, _>(lane_key(branch))
         .bind::<Integer, _>(head_x)
         .execute(connection)
         .context(QueryGraphSnapshotStoreSnafu {
@@ -3269,7 +3270,7 @@ SET node_key = 'node:' || node_id || ':' || x || ':' || (y - ?),
     y = y - ?,
     min_y = min_y - ?,
     max_y = max_y - ?
-WHERE mode = ? AND lane_label = ?
+WHERE mode = ? AND lane_key = ?
 "#,
         )
         .bind::<Integer, _>(delta)
@@ -3278,7 +3279,7 @@ WHERE mode = ? AND lane_label = ?
         .bind::<Integer, _>(delta)
         .bind::<Integer, _>(delta)
         .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(&lane.lane_label)
+        .bind::<Text, _>(&lane.lane_key)
         .execute(connection)
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
@@ -3393,13 +3394,13 @@ WHERE mode = ? AND coordinate_space = ?
             r#"
 SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
 FROM console_graph_node_locations
-WHERE mode = ? AND lane_label = ?
+WHERE mode = ? AND lane_key = ?
 ORDER BY x DESC, node_key DESC
 LIMIT 1
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(branch)
+        .bind::<Text, _>(lane_key(branch))
         .get_result::<MaterializedTailNodeRow>(connection)
         .optional()
         .context(QueryGraphSnapshotStoreSnafu {
@@ -3418,13 +3419,13 @@ LIMIT 1
             r#"
 SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
 FROM console_graph_node_locations
-WHERE mode = ? AND lane_label = ? AND node_id = ?
+WHERE mode = ? AND lane_key = ? AND node_id = ?
 ORDER BY x DESC, node_key DESC
 LIMIT 1
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(branch)
+        .bind::<Text, _>(lane_key(branch))
         .bind::<Text, _>(node_id)
         .get_result::<MaterializedTailNodeRow>(connection)
         .optional()
@@ -4233,7 +4234,10 @@ fn existing_branch_lanes_preserve_order(
         .collect::<Vec<_>>();
     let current_existing_lanes = materialized_lanes
         .iter()
-        .filter(|lane| materialized_lane_labels.contains(&lane.lane_label))
+        .filter(|lane| {
+            !is_derived_lane_key(&lane.lane_key)
+                && materialized_lane_labels.contains(&lane.lane_label)
+        })
         .map(|lane| lane.lane_label.as_str())
         .collect::<Vec<_>>();
     expected_existing_lanes == current_existing_lanes

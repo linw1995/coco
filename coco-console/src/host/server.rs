@@ -235,7 +235,7 @@ where
     let mode = graph_mode_from_query(&query);
     html_response(render_loading_index_page(
         mode,
-        state.cache.current_version(),
+        state.cache.current_viewport_version(mode),
     ))
 }
 
@@ -258,7 +258,7 @@ where
             .cache
             .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
         return json_response(
-            &loading_snapshot(mode, state.cache.current_version()),
+            &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
             "graph",
         );
     }
@@ -266,7 +266,7 @@ where
     match state.cache.snapshot_current_ready_or_schedule(mode) {
         Some(snapshot) => json_response(&snapshot, "graph"),
         None => json_response(
-            &loading_snapshot(mode, state.cache.current_version()),
+            &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
             "graph",
         ),
     }
@@ -499,7 +499,10 @@ where
             .materialized_fragment_current_ready_or_schedule(mode)
         {
             Ok(Some(shell)) => html_response(render_materialized_fragment(&shell)),
-            Ok(None) => html_response(render_loading_fragment(mode, state.cache.current_version())),
+            Ok(None) => html_response(render_loading_fragment(
+                mode,
+                state.cache.current_viewport_version(mode),
+            )),
             Err(error) => plain_error(error.to_string()),
         };
     }
@@ -532,7 +535,10 @@ where
             let _ = state
                 .cache
                 .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
-            html_response(render_loading_fragment(mode, state.cache.current_version()))
+            html_response(render_loading_fragment(
+                mode,
+                state.cache.current_viewport_version(mode),
+            ))
         }
     }
 }
@@ -546,7 +552,7 @@ where
     if state.cache.has_materialized_viewports() {
         let Some(target) = query.get("target") else {
             return html_response(render_node_detail_fragment(
-                &loading_snapshot(mode, state.cache.current_version()),
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
                 None,
             ));
         };
@@ -556,7 +562,7 @@ where
         {
             Ok(Some(node)) => html_response(render_graph_node_detail_fragment(&node)),
             Ok(None) => html_response(render_node_detail_fragment(
-                &loading_snapshot(mode, state.cache.current_version()),
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
                 Some(target),
             )),
             Err(error) => plain_error(error.to_string()),
@@ -566,7 +572,7 @@ where
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             return html_response(render_node_detail_fragment(
-                &loading_snapshot(mode, state.cache.current_version()),
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
                 query.get("target"),
             ));
         }
@@ -586,7 +592,7 @@ where
     let mode = graph_mode_from_query(&query);
     if query.get("target").is_none() {
         return html_response(render_provider_context_fragment(
-            &loading_snapshot(mode, state.cache.current_version()),
+            &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
             None,
             query.get("context"),
         ));
@@ -609,7 +615,7 @@ where
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             return html_response(render_provider_context_fragment(
-                &loading_snapshot(mode, state.cache.current_version()),
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
                 query.get("target"),
                 query.get("context"),
             ));
@@ -1005,8 +1011,9 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 mod tests {
     use super::{
         AppState, fragment, graph_json, graph_viewport_diff_response,
-        graph_viewport_items_diff_response_from_query, node_detail, parse_query, provider_context,
-        start_console_server, viewport_diff_has_changes, viewport_diff_request_from_query,
+        graph_viewport_items_diff_response_from_query, index_page, node_detail, parse_query,
+        provider_context, start_console_server, viewport_diff_has_changes,
+        viewport_diff_request_from_query,
     };
     use crate::api::{
         GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
@@ -1699,6 +1706,57 @@ mod tests {
         assert!(json.contains("\"nodes\":[]"), "{json}");
         assert!(!json.contains("cached full snapshot node"), "{json}");
 
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_page_uses_mode_specific_loading_version() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("all mode only".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &root, &text).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        let all = state
+            .cache
+            .viewport_after(GraphMode::All, 0, GraphViewportRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            state.cache.current_viewport_version(GraphMode::All),
+            all.version
+        );
+        assert_eq!(state.cache.current_viewport_version(GraphMode::Anchors), 0);
+
+        let response = index_page(
+            State(state.clone()),
+            RawQuery(Some("mode=anchors".to_owned())),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("data-version=\"0\""), "{html}");
+
+        drop(state);
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
