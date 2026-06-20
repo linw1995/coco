@@ -629,6 +629,7 @@ where
             "Building graph snapshot",
         ));
         if let Some(snapshots) = self.snapshots.clone() {
+            let has_materialization = snapshots.has_materialization(mode);
             let source = self.source.clone();
             let incremental_result = self
                 .run_blocking_graph_compute(move || {
@@ -649,7 +650,33 @@ where
                     ));
                     return;
                 }
-                Ok(Ok(false)) => {}
+                Ok(Ok(false)) => match has_materialization {
+                    Ok(true) => {
+                        self.set_rebuild_status(rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Failed,
+                            None,
+                            0,
+                            0,
+                            "Incremental graph materialization could not apply this store change",
+                        ));
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.set_rebuild_status(rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Failed,
+                            None,
+                            0,
+                            0,
+                            error.to_string(),
+                        ));
+                        return;
+                    }
+                },
                 Ok(Err(error)) => {
                     self.set_rebuild_status(rebuild_status(
                         mode,
@@ -1546,6 +1573,94 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_does_not_full_rebuild_when_incremental_materialization_cannot_apply() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let first = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("first materialized head".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &first).unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let sibling = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("sibling head cannot append incrementally".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &first, &sibling).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let stale = cache
+            .viewport_current_ready_or_schedule(
+                GraphMode::All,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .unwrap();
+        for _ in 0..50 {
+            if cache.rebuild_statuses().iter().any(|status| {
+                status.mode == GraphMode::All
+                    && status.source_version == target_version
+                    && status.state == ConsoleGraphRebuildState::Failed
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .latest_viewport(
+                GraphMode::All,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stale.version, initial.version);
+        assert_eq!(materialized.version, initial.version);
+        assert!(!materialized.nodes.iter().any(|node| node.id == sibling));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+        assert!(cache.rebuild_statuses().iter().any(|status| {
+            status.mode == GraphMode::All
+                && status.source_version == target_version
+                && status.state == ConsoleGraphRebuildState::Failed
+        }));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

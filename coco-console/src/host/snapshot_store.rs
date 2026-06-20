@@ -282,6 +282,10 @@ LIMIT 1
         Ok(points)
     }
 
+    pub(crate) fn has_materialization(&self, mode: GraphMode) -> crate::Result<bool> {
+        Ok(self.latest_materialization_row(mode)?.is_some())
+    }
+
     pub(crate) fn materialized_shell_facts(
         &self,
         mode: GraphMode,
