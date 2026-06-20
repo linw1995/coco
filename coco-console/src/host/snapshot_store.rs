@@ -21,7 +21,8 @@ use crate::graph::{
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
-    GRAPH_COLUMN_WIDTH, diff_graph_viewport_responses, lane_key, materialize_graph_viewport,
+    EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, diff_graph_viewport_responses, lane_key,
+    materialize_graph_viewport,
 };
 use coco_mem::{
     BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, SessionState, SessionStore,
@@ -328,7 +329,7 @@ impl ConsoleGraphSnapshotStore {
         if chain.first().is_none_or(|node| node.id != tail.node_id) {
             return Ok(false);
         }
-        if !is_linear_append_chain(&chain) {
+        if !is_linear_primary_chain(&chain) {
             return Ok(false);
         }
 
@@ -373,6 +374,16 @@ impl ConsoleGraphSnapshotStore {
                     bounds: edge_bounds(&edge),
                 },
             )?;
+            if !self.insert_node_merge_edges(
+                connection,
+                store,
+                input.mode,
+                &node,
+                &previous_id,
+                point,
+            )? {
+                return Ok(false);
+            }
             previous_id = node.id;
             previous_point = point;
         }
@@ -553,7 +564,7 @@ impl ConsoleGraphSnapshotStore {
                     bounds: edge_bounds(&edge),
                 },
             )?;
-            if !self.insert_anchor_merge_edges(
+            if !self.insert_node_merge_edges(
                 connection,
                 store,
                 input.mode,
@@ -569,7 +580,7 @@ impl ConsoleGraphSnapshotStore {
         Ok(true)
     }
 
-    fn insert_anchor_merge_edges(
+    fn insert_node_merge_edges(
         &self,
         connection: &mut SqliteConnection,
         store: &impl NodeStore,
@@ -588,7 +599,7 @@ impl ConsoleGraphSnapshotStore {
             if !parent_ids.insert(source_id.clone()) {
                 continue;
             }
-            let edge = routed_edge(
+            let mut edge = routed_edge(
                 GraphViewportEdgeKind::MergeParent,
                 &source_id,
                 source,
@@ -596,6 +607,8 @@ impl ConsoleGraphSnapshotStore {
                 target,
                 self.next_routed_edge_slot_in_connection(connection, mode, source, target)?,
             );
+            edge.target_port_offset =
+                self.next_secondary_target_port_offset(connection, mode, target)?;
             self.insert_edge_route(
                 connection,
                 EdgeRouteInsert {
@@ -626,6 +639,32 @@ impl ConsoleGraphSnapshotStore {
         Ok(ancestry
             .get(source_index)
             .map(|source| (source.id.clone(), source_point)))
+    }
+
+    fn next_secondary_target_port_offset(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        target: Point,
+    ) -> crate::Result<f64> {
+        let row = sql_query(
+            r#"
+SELECT COUNT(*) AS count
+FROM console_graph_edge_routes
+WHERE mode = ?
+  AND target_x = ?
+  AND target_y = ?
+  AND edge_kind != 'primary_parent'
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Integer, _>(target.x)
+        .bind::<Integer, _>(target.y)
+        .get_result::<SqliteCount>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(secondary_incoming_port_offset(row.count as usize))
     }
 
     fn try_append_new_branch_lane_in_transaction(
@@ -2128,14 +2167,6 @@ fn edge_key(
     )
 }
 
-fn is_linear_append_chain(chain: &[Node]) -> bool {
-    is_linear_primary_chain(chain)
-        && chain
-            .iter()
-            .skip(1)
-            .all(|node| node_anchor_merge_parent_count(node) == 0)
-}
-
 fn is_linear_primary_chain(chain: &[Node]) -> bool {
     chain.windows(2).all(|nodes| nodes[1].parent == nodes[0].id)
 }
@@ -2241,6 +2272,12 @@ fn route_slot_offset(route_slot: i32) -> i32 {
     let direction = if route_slot % 2 == 0 { 1 } else { -1 };
 
     magnitude.min(4) * EDGE_ROUTE_STEP * direction
+}
+
+fn secondary_incoming_port_offset(index: usize) -> f64 {
+    let distance = index / 2 + 1;
+    let direction = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
+    distance as f64 * EDGE_TARGET_PORT_STEP * direction
 }
 
 fn edge_kind_query_value(kind: GraphViewportEdgeKind) -> &'static str {
