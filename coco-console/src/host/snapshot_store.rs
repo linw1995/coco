@@ -672,79 +672,19 @@ LIMIT 1
             return Ok(false);
         };
         let branch_label = branch_label(input.branch, input.state);
-        if input.head_id == tail.node_id {
-            let lane = GraphViewportLane {
-                key: tail.lane_key,
-                label: tail.lane_label,
-                y: tail.lane_y,
-            };
-            return match self.try_append_skill_invocation_subtree_in_transaction(
-                connection,
-                store,
-                input.mode,
-                &tail.node_id,
-                Point {
-                    x: tail.x,
-                    y: tail.y,
-                },
-                &lane,
-            )? {
-                SkillSubtreeAppend::Unsupported => Ok(false),
-                SkillSubtreeAppend::Absent | SkillSubtreeAppend::Applied => Ok(true),
-            };
+        if let Some(appended) = self.try_append_unchanged_head_skill_subtree_in_transaction(
+            connection, store, &input, &tail,
+        )? {
+            return Ok(appended);
         }
-        if let Some(head) = self.materialized_lane_node_in_connection(
+        if let Some(appended) = self.try_refresh_materialized_branch_head_in_transaction(
             connection,
-            input.mode,
-            input.branch,
-            input.head_id,
-        )? && head.x < tail.x
-        {
-            let lane = GraphViewportLane {
-                key: head.lane_key.clone(),
-                label: head.lane_label.clone(),
-                y: head.lane_y,
-            };
-            match self.try_append_skill_invocation_subtree_in_transaction(
-                connection,
-                store,
-                input.mode,
-                input.head_id,
-                Point {
-                    x: head.x,
-                    y: head.y,
-                },
-                &lane,
-            )? {
-                SkillSubtreeAppend::Applied => {
-                    self.update_node_labels(
-                        connection,
-                        input.mode,
-                        &head.node_key,
-                        vec![branch_label],
-                    )?;
-                    return Ok(true);
-                }
-                SkillSubtreeAppend::Unsupported => return Ok(false),
-                SkillSubtreeAppend::Absent => {}
-            }
-            if self.lane_suffix_has_retained_downstream_edges(
-                connection,
-                input.mode,
-                input.branch,
-                head.x,
-            )? {
-                return Ok(false);
-            }
-            self.delete_materialized_lane_suffix(
-                connection,
-                input.mode,
-                input.branch,
-                head.x,
-                head.y,
-            )?;
-            self.update_node_labels(connection, input.mode, &head.node_key, vec![branch_label])?;
-            return Ok(true);
+            store,
+            &input,
+            &tail,
+            &branch_label,
+        )? {
+            return Ok(appended);
         }
         let Ok(mut chain) = store.log(&tail.node_id, input.head_id) else {
             return Ok(false);
@@ -844,6 +784,104 @@ LIMIT 1
             previous_point = point;
         }
         Ok(true)
+    }
+
+    fn try_append_unchanged_head_skill_subtree_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        input: &AppendLinearBranchInput<'_>,
+        tail: &MaterializedTailNodeRow,
+    ) -> crate::Result<Option<bool>> {
+        if input.head_id != tail.node_id {
+            return Ok(None);
+        }
+        let lane = GraphViewportLane {
+            key: tail.lane_key.clone(),
+            label: tail.lane_label.clone(),
+            y: tail.lane_y,
+        };
+        match self.try_append_skill_invocation_subtree_in_transaction(
+            connection,
+            store,
+            input.mode,
+            &tail.node_id,
+            Point {
+                x: tail.x,
+                y: tail.y,
+            },
+            &lane,
+        )? {
+            SkillSubtreeAppend::Unsupported => Ok(Some(false)),
+            SkillSubtreeAppend::Absent | SkillSubtreeAppend::Applied => Ok(Some(true)),
+        }
+    }
+
+    fn try_refresh_materialized_branch_head_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        input: &AppendLinearBranchInput<'_>,
+        tail: &MaterializedTailNodeRow,
+        branch_label: &str,
+    ) -> crate::Result<Option<bool>> {
+        let Some(head) = self.materialized_lane_node_in_connection(
+            connection,
+            input.mode,
+            input.branch,
+            input.head_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        if head.x >= tail.x {
+            return Ok(None);
+        }
+
+        let lane = GraphViewportLane {
+            key: head.lane_key.clone(),
+            label: head.lane_label.clone(),
+            y: head.lane_y,
+        };
+        match self.try_append_skill_invocation_subtree_in_transaction(
+            connection,
+            store,
+            input.mode,
+            input.head_id,
+            Point {
+                x: head.x,
+                y: head.y,
+            },
+            &lane,
+        )? {
+            SkillSubtreeAppend::Applied => {
+                self.update_node_labels(
+                    connection,
+                    input.mode,
+                    &head.node_key,
+                    vec![branch_label.to_owned()],
+                )?;
+                return Ok(Some(true));
+            }
+            SkillSubtreeAppend::Unsupported => return Ok(Some(false)),
+            SkillSubtreeAppend::Absent => {}
+        }
+        if self.lane_suffix_has_retained_downstream_edges(
+            connection,
+            input.mode,
+            input.branch,
+            head.x,
+        )? {
+            return Ok(Some(false));
+        }
+        self.delete_materialized_lane_suffix(connection, input.mode, input.branch, head.x, head.y)?;
+        self.update_node_labels(
+            connection,
+            input.mode,
+            &head.node_key,
+            vec![branch_label.to_owned()],
+        )?;
+        Ok(Some(true))
     }
 
     fn try_update_anchor_materialization_in_transaction(
