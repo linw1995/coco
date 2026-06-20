@@ -6441,7 +6441,7 @@ mod tests {
         let root = writer.root_id();
         let old_session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -6467,7 +6467,7 @@ mod tests {
             .unwrap();
         let current_session = writer
             .append(NewNode {
-                parent: old_prompt.clone(),
+                parent: root,
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -6995,6 +6995,121 @@ mod tests {
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 2);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 1);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_skips_anchor_merge_parent_outside_current_context_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let old_session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        let old_prompt = writer
+            .append(NewNode {
+                parent: old_session,
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "old prompt".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        let current_session = writer
+            .append(NewNode {
+                parent: old_prompt.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &current_session).unwrap();
+        let current_prompt = writer
+            .append(NewNode {
+                parent: current_session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "current prompt".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &current_session, &current_prompt)
+            .unwrap();
+        publisher.mark_changed();
+        let initial = cache.current_snapshot(GraphMode::Anchors).await;
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: current_prompt.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(old_prompt.clone())],
+                    PromptAnchor {
+                        prompt: "merge old prompt".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &current_prompt, &merge_anchor)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::Anchors,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(viewport.version, target_version);
+        assert!(viewport.nodes.iter().any(|node| node.id == merge_anchor));
+        assert!(!viewport.nodes.iter().any(|node| node.id == old_prompt));
+        assert!(
+            !viewport
+                .lanes
+                .iter()
+                .any(|lane| lane.label
+                    == format!("orphan {}", crate::graph::shorten_id(&old_prompt)))
+        );
+        assert!(!viewport.edges.iter().any(|edge| {
+            edge.source_id == old_prompt
+                && edge.target_id == merge_anchor
+                && edge.kind == crate::api::GraphViewportEdgeKind::MergeParent
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::Anchors, target_version)
+                .is_none()
+        );
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

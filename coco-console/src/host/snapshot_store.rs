@@ -187,6 +187,22 @@ struct MergeColumnConstraintInput<'a> {
     point: Point,
     event_order: &'a BTreeMap<String, usize>,
     reserved_lane_y: Option<i32>,
+    context_start_id: Option<&'a str>,
+}
+
+struct NodeMergeEdgesInput<'a> {
+    mode: GraphMode,
+    node: &'a Node,
+    primary_parent_id: &'a str,
+    target: Point,
+    context_start_id: Option<&'a str>,
+}
+
+struct AnchorBranchLaneInsert {
+    lane_y: i32,
+    nodes: Vec<Node>,
+    previous: Option<(String, Point)>,
+    context_start_id: Option<String>,
 }
 
 struct VisibleMergeParentPoint {
@@ -194,11 +210,18 @@ struct VisibleMergeParentPoint {
     point: Point,
 }
 
+enum MergeParentPoint {
+    Visible(VisibleMergeParentPoint),
+    Skipped,
+    Unsupported,
+}
+
 struct OrphanMergeParentLane {
     source_id: String,
     lane: GraphViewportLane,
     nodes: Vec<Node>,
     fork_source: Option<(String, Point)>,
+    context_start_id: Option<String>,
 }
 
 struct OrphanMergeParentNodeEdgeInput<'a> {
@@ -208,6 +231,15 @@ struct OrphanMergeParentNodeEdgeInput<'a> {
     previous: Option<&'a (String, Point)>,
     first_node: bool,
     force_fork: bool,
+    context_start_id: Option<&'a str>,
+}
+
+struct OrphanMergeParentLaneInput<'a> {
+    mode: GraphMode,
+    ancestry: &'a [Node],
+    source_index: usize,
+    reserved_lane_y: Option<i32>,
+    context_start_id: Option<&'a str>,
 }
 
 enum SkillSubtreeAppend {
@@ -534,6 +566,7 @@ LIMIT 1
             .get_branch_head(first_branch)
             .context(crate::error::StoreSnafu)?;
         let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+        let context_start_id = merge_parent_context_start_id(mode, &ancestry);
         let nodes = initial_visible_graph_lane_nodes(store, mode, ancestry)?;
         if nodes.is_empty() || !initial_visible_lane_is_linear(mode, &nodes) {
             return Ok(false);
@@ -576,6 +609,7 @@ LIMIT 1
                     point: candidate,
                     event_order: &event_order,
                     reserved_lane_y: Some(lane.y),
+                    context_start_id: context_start_id.as_deref(),
                 },
             )?
             else {
@@ -609,14 +643,27 @@ LIMIT 1
                 if !self.insert_node_merge_edges(
                     connection,
                     store,
-                    mode,
-                    &node,
-                    previous_id,
-                    point,
+                    NodeMergeEdgesInput {
+                        mode,
+                        node: &node,
+                        primary_parent_id: previous_id,
+                        target: point,
+                        context_start_id: context_start_id.as_deref(),
+                    },
                 )? {
                     return Ok(false);
                 }
-            } else if !self.insert_node_merge_edges(connection, store, mode, &node, "", point)? {
+            } else if !self.insert_node_merge_edges(
+                connection,
+                store,
+                NodeMergeEdgesInput {
+                    mode,
+                    node: &node,
+                    primary_parent_id: "",
+                    target: point,
+                    context_start_id: context_start_id.as_deref(),
+                },
+            )? {
                 return Ok(false);
             }
             if matches!(
@@ -810,6 +857,7 @@ LIMIT 1
                     point,
                     event_order: &event_order,
                     reserved_lane_y: None,
+                    context_start_id: None,
                 },
             )?
             else {
@@ -842,10 +890,13 @@ LIMIT 1
             if !self.insert_node_merge_edges(
                 connection,
                 store,
-                input.mode,
-                &node,
-                &previous_id,
-                point,
+                NodeMergeEdgesInput {
+                    mode: input.mode,
+                    node: &node,
+                    primary_parent_id: &previous_id,
+                    target: point,
+                    context_start_id: None,
+                },
             )? {
                 return Ok(false);
             }
@@ -1198,10 +1249,12 @@ LIMIT 1
         )? {
             return Ok(false);
         }
+        let context_start_id = context_start_id_from_scoped_ancestry(&scoped_ancestry);
         let visible_chain = scoped_ancestry
-            .into_iter()
+            .iter()
             .rev()
-            .filter(is_anchor_node)
+            .filter(|node| is_anchor_node(node))
+            .cloned()
             .collect::<Vec<_>>();
         if visible_chain.is_empty() {
             return Ok(false);
@@ -1217,7 +1270,17 @@ LIMIT 1
                 lane_y,
             }],
         )?;
-        self.insert_anchor_branch_lane_nodes(connection, store, &input, lane_y, visible_chain, None)
+        self.insert_anchor_branch_lane_nodes(
+            connection,
+            store,
+            &input,
+            AnchorBranchLaneInsert {
+                lane_y,
+                nodes: visible_chain,
+                previous: None,
+                context_start_id,
+            },
+        )
     }
 
     fn refresh_materialized_node_labels(
@@ -1270,7 +1333,9 @@ LIMIT 1
         let ancestry = store
             .ancestry(input.head_id)
             .context(crate::error::StoreSnafu)?;
-        let visible_chain = provider_context_ancestry_nodes(ancestry)
+        let scoped_ancestry = provider_context_ancestry_nodes(ancestry);
+        let context_start_id = context_start_id_from_scoped_ancestry(&scoped_ancestry);
+        let visible_chain = scoped_ancestry
             .iter()
             .rev()
             .filter(|node| is_anchor_node(node))
@@ -1315,9 +1380,12 @@ LIMIT 1
             connection,
             store,
             &input,
-            lane_y,
-            nodes,
-            previous.take(),
+            AnchorBranchLaneInsert {
+                lane_y,
+                nodes,
+                previous: previous.take(),
+                context_start_id,
+            },
         )?;
         if let Some(row) =
             self.latest_lane_tail_in_connection(connection, input.mode, input.branch)?
@@ -1332,10 +1400,15 @@ LIMIT 1
         connection: &mut SqliteConnection,
         store: &impl NodeStore,
         input: &AppendLinearBranchInput<'_>,
-        lane_y: i32,
-        nodes: Vec<Node>,
-        mut previous: Option<(String, Point)>,
+        lane_insert: AnchorBranchLaneInsert,
     ) -> crate::Result<bool> {
+        let AnchorBranchLaneInsert {
+            lane_y,
+            nodes,
+            mut previous,
+            context_start_id,
+        } = lane_insert;
+        let context_start_id = context_start_id.as_deref();
         let lane = GraphViewportLane {
             key: lane_key(input.branch),
             label: input.branch.to_owned(),
@@ -1373,6 +1446,7 @@ LIMIT 1
                     point: candidate,
                     event_order: &event_order,
                     reserved_lane_y: Some(lane.y),
+                    context_start_id,
                 },
             )?
             else {
@@ -1422,16 +1496,27 @@ LIMIT 1
                 if !self.insert_node_merge_edges(
                     connection,
                     store,
-                    input.mode,
-                    &node,
-                    previous_id,
-                    point,
+                    NodeMergeEdgesInput {
+                        mode: input.mode,
+                        node: &node,
+                        primary_parent_id: previous_id,
+                        target: point,
+                        context_start_id,
+                    },
                 )? {
                     return Ok(false);
                 }
-            } else if !self
-                .insert_node_merge_edges(connection, store, input.mode, &node, "", point)?
-            {
+            } else if !self.insert_node_merge_edges(
+                connection,
+                store,
+                NodeMergeEdgesInput {
+                    mode: input.mode,
+                    node: &node,
+                    primary_parent_id: "",
+                    target: point,
+                    context_start_id,
+                },
+            )? {
                 return Ok(false);
             }
             previous = Some((node.id, point));
@@ -1449,6 +1534,10 @@ LIMIT 1
         if input.head_id == tail.node_id {
             return Ok(true);
         }
+        let ancestry = store
+            .ancestry(input.head_id)
+            .context(crate::error::StoreSnafu)?;
+        let context_start_id = merge_parent_context_start_id(input.mode, &ancestry);
         let Ok(mut chain) = store.log(&tail.node_id, input.head_id) else {
             return Ok(false);
         };
@@ -1498,6 +1587,7 @@ LIMIT 1
                     point,
                     event_order: &event_order,
                     reserved_lane_y: None,
+                    context_start_id: context_start_id.as_deref(),
                 },
             )?
             else {
@@ -1525,10 +1615,13 @@ LIMIT 1
             if !self.insert_node_merge_edges(
                 connection,
                 store,
-                input.mode,
-                &node,
-                &previous_id,
-                point,
+                NodeMergeEdgesInput {
+                    mode: input.mode,
+                    node: &node,
+                    primary_parent_id: &previous_id,
+                    target: point,
+                    context_start_id: context_start_id.as_deref(),
+                },
             )? {
                 return Ok(false);
             }
@@ -1743,15 +1836,17 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
         let mut refreshed_event_order = None;
         let mut x = input.point.x;
         for merge_parent in node_anchor_merge_parents(input.node) {
-            let Some(source) = self.ensure_visible_merge_parent_point(
+            let source = match self.ensure_visible_merge_parent_point(
                 connection,
                 store,
                 input.mode,
                 merge_parent,
                 input.reserved_lane_y,
-            )?
-            else {
-                return Ok(None);
+                input.context_start_id,
+            )? {
+                MergeParentPoint::Visible(source) => source,
+                MergeParentPoint::Skipped => continue,
+                MergeParentPoint::Unsupported => return Ok(None),
             };
             if parent_ids.insert(source.node_id.clone()) {
                 let event_order = if input.event_order.contains_key(&source.node_id) {
@@ -1797,22 +1892,21 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
         &self,
         connection: &mut SqliteConnection,
         store: &impl NodeStore,
-        mode: GraphMode,
-        node: &Node,
-        primary_parent_id: &str,
-        target: Point,
+        input: NodeMergeEdgesInput<'_>,
     ) -> crate::Result<bool> {
-        let mut parent_ids = BTreeSet::from([primary_parent_id.to_owned()]);
-        for merge_parent in node_anchor_merge_parents(node) {
-            let Some(source) = self.ensure_visible_merge_parent_point(
+        let mut parent_ids = BTreeSet::from([input.primary_parent_id.to_owned()]);
+        for merge_parent in node_anchor_merge_parents(input.node) {
+            let source = match self.ensure_visible_merge_parent_point(
                 connection,
                 store,
-                mode,
+                input.mode,
                 merge_parent,
                 None,
-            )?
-            else {
-                return Ok(false);
+                input.context_start_id,
+            )? {
+                MergeParentPoint::Visible(source) => source,
+                MergeParentPoint::Skipped => continue,
+                MergeParentPoint::Unsupported => return Ok(false),
             };
             if !parent_ids.insert(source.node_id.clone()) {
                 continue;
@@ -1821,19 +1915,24 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
                 GraphViewportEdgeKind::MergeParent,
                 &source.node_id,
                 source.point,
-                &node.id,
-                target,
-                self.next_routed_edge_slot_in_connection(connection, mode, source.point, target)?,
+                &input.node.id,
+                input.target,
+                self.next_routed_edge_slot_in_connection(
+                    connection,
+                    input.mode,
+                    source.point,
+                    input.target,
+                )?,
             );
             self.insert_edge_route(
                 connection,
                 EdgeRouteInsert {
-                    mode,
+                    mode: input.mode,
                     edge: &edge,
                     bounds: edge_bounds(&edge),
                 },
             )?;
-            self.rebalance_target_port_offsets(connection, mode, target)?;
+            self.rebalance_target_port_offsets(connection, input.mode, input.target)?;
         }
         Ok(true)
     }
@@ -1845,56 +1944,60 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
         mode: GraphMode,
         merge_parent: &MergeParent,
         reserved_lane_y: Option<i32>,
-    ) -> crate::Result<Option<VisibleMergeParentPoint>> {
+        context_start_id: Option<&str>,
+    ) -> crate::Result<MergeParentPoint> {
         let ancestry = store
             .ancestry(merge_parent.node_id())
             .context(crate::error::StoreSnafu)?;
-        let Some(source_index) = ancestry
-            .iter()
-            .position(|node| is_visible_mode_node(mode, node))
+        let Some(source_index) =
+            visible_scoped_merge_parent_source_index(mode, &ancestry, context_start_id)
         else {
-            return Ok(None);
+            return Ok(MergeParentPoint::Skipped);
         };
         let source = &ancestry[source_index];
         if let Some(point) =
             self.materialized_node_point_in_connection(connection, mode, &source.id)?
         {
-            return Ok(Some(VisibleMergeParentPoint {
+            return Ok(MergeParentPoint::Visible(VisibleMergeParentPoint {
                 node_id: source.id.clone(),
                 point,
             }));
         }
-        self.insert_orphan_merge_parent_lane(
+        match self.insert_orphan_merge_parent_lane(
             connection,
             store,
-            mode,
-            &ancestry,
-            source_index,
-            reserved_lane_y,
-        )
+            OrphanMergeParentLaneInput {
+                mode,
+                ancestry: &ancestry,
+                source_index,
+                reserved_lane_y,
+                context_start_id,
+            },
+        )? {
+            Some(point) => Ok(MergeParentPoint::Visible(point)),
+            None => Ok(MergeParentPoint::Unsupported),
+        }
     }
 
     fn insert_orphan_merge_parent_lane(
         &self,
         connection: &mut SqliteConnection,
         store: &impl NodeStore,
-        mode: GraphMode,
-        ancestry: &[Node],
-        source_index: usize,
-        reserved_lane_y: Option<i32>,
+        input: OrphanMergeParentLaneInput<'_>,
     ) -> crate::Result<Option<VisibleMergeParentPoint>> {
         let Some(orphan) = self.orphan_merge_parent_lane(
             connection,
-            mode,
-            ancestry,
-            source_index,
-            reserved_lane_y,
+            input.mode,
+            input.ancestry,
+            input.source_index,
+            input.reserved_lane_y,
+            input.context_start_id,
         )?
         else {
             return Ok(None);
         };
         let Some(point) =
-            self.insert_orphan_merge_parent_nodes(connection, store, mode, &orphan)?
+            self.insert_orphan_merge_parent_nodes(connection, store, input.mode, &orphan)?
         else {
             return Ok(None);
         };
@@ -1911,9 +2014,15 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
         ancestry: &[Node],
         source_index: usize,
         reserved_lane_y: Option<i32>,
+        context_start_id: Option<&str>,
     ) -> crate::Result<Option<OrphanMergeParentLane>> {
-        let (fork_source, end_index) =
-            self.orphan_merge_parent_fork_source(connection, mode, ancestry, source_index)?;
+        let (fork_source, end_index) = self.orphan_merge_parent_fork_source(
+            connection,
+            mode,
+            ancestry,
+            source_index,
+            context_start_id,
+        )?;
         let nodes = visible_orphan_merge_parent_nodes(mode, ancestry, end_index);
         let Some(source_id) = nodes.last().map(|source| source.id.clone()) else {
             return Ok(None);
@@ -1927,6 +2036,7 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
             lane,
             nodes,
             fork_source,
+            context_start_id: context_start_id.map(str::to_owned),
         }))
     }
 
@@ -1936,12 +2046,14 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
         mode: GraphMode,
         ancestry: &[Node],
         source_index: usize,
+        context_start_id: Option<&str>,
     ) -> crate::Result<(Option<(String, Point)>, usize)> {
-        let end_index = ancestry
-            .iter()
-            .position(|node| node.is_root())
-            .unwrap_or(ancestry.len());
+        let end_index =
+            scoped_merge_parent_end_index(ancestry, context_start_id).unwrap_or(ancestry.len());
         for (index, node) in ancestry.iter().enumerate().skip(source_index + 1) {
+            if index >= end_index {
+                break;
+            }
             if let Some(point) =
                 self.materialized_node_point_in_connection(connection, mode, &node.id)?
             {
@@ -1989,6 +2101,7 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
                     point,
                     event_order: &event_order,
                     reserved_lane_y: Some(orphan.lane.y),
+                    context_start_id: orphan.context_start_id.as_deref(),
                 },
             )?
             else {
@@ -2014,6 +2127,7 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
                     previous: previous.as_ref(),
                     first_node: index == 0,
                     force_fork: false,
+                    context_start_id: orphan.context_start_id.as_deref(),
                 },
             )? {
                 return Ok(None);
@@ -2047,10 +2161,13 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
             return self.insert_node_merge_edges(
                 connection,
                 store,
-                input.mode,
-                input.node,
-                "",
-                input.point,
+                NodeMergeEdgesInput {
+                    mode: input.mode,
+                    node: input.node,
+                    primary_parent_id: "",
+                    target: input.point,
+                    context_start_id: input.context_start_id,
+                },
             );
         };
         let edge = if input.force_fork || input.first_node && previous_point.y != input.point.y {
@@ -2081,10 +2198,13 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
         self.insert_node_merge_edges(
             connection,
             store,
-            input.mode,
-            input.node,
-            previous_id,
-            input.point,
+            NodeMergeEdgesInput {
+                mode: input.mode,
+                node: input.node,
+                primary_parent_id: previous_id,
+                target: input.point,
+                context_start_id: input.context_start_id,
+            },
         )
     }
 
@@ -2327,6 +2447,7 @@ ORDER BY
                     point,
                     event_order: &event_order,
                     reserved_lane_y: Some(lane_y),
+                    context_start_id: None,
                 },
             )?
             else {
@@ -2376,16 +2497,27 @@ ORDER BY
                 if !self.insert_node_merge_edges(
                     connection,
                     store,
-                    input.mode,
-                    &node,
-                    previous_id,
-                    point,
+                    NodeMergeEdgesInput {
+                        mode: input.mode,
+                        node: &node,
+                        primary_parent_id: previous_id,
+                        target: point,
+                        context_start_id: None,
+                    },
                 )? {
                     return Ok(false);
                 }
-            } else if !self
-                .insert_node_merge_edges(connection, store, input.mode, &node, "", point)?
-            {
+            } else if !self.insert_node_merge_edges(
+                connection,
+                store,
+                NodeMergeEdgesInput {
+                    mode: input.mode,
+                    node: &node,
+                    primary_parent_id: "",
+                    target: point,
+                    context_start_id: None,
+                },
+            )? {
                 return Ok(false);
             }
             if matches!(
@@ -2493,6 +2625,7 @@ ORDER BY
                         point: candidate,
                         event_order: &event_order,
                         reserved_lane_y: Some(subtree_lane.y),
+                        context_start_id: None,
                     },
                 )?
                 else {
@@ -2519,6 +2652,7 @@ ORDER BY
                         previous: Some(&previous),
                         first_node: previous_id == source_id,
                         force_fork: first_inserted_node && fork_first_inserted,
+                        context_start_id: None,
                     },
                 )? {
                     return Ok(SkillSubtreeAppend::Unsupported);
@@ -4664,6 +4798,43 @@ fn is_anchor_node(node: &Node) -> bool {
 
 fn is_visible_mode_node(mode: GraphMode, node: &Node) -> bool {
     !node.is_root() && (mode == GraphMode::All || is_anchor_node(node))
+}
+
+fn merge_parent_context_start_id(mode: GraphMode, ancestry: &[Node]) -> Option<String> {
+    (mode == GraphMode::Anchors)
+        .then(|| {
+            context_start_id_from_scoped_ancestry(&provider_context_ancestry_nodes(
+                ancestry.to_vec(),
+            ))
+        })
+        .flatten()
+}
+
+fn context_start_id_from_scoped_ancestry(scoped_ancestry: &[Node]) -> Option<String> {
+    scoped_ancestry.last().map(|node| node.id.clone())
+}
+
+fn visible_scoped_merge_parent_source_index(
+    mode: GraphMode,
+    ancestry: &[Node],
+    context_start_id: Option<&str>,
+) -> Option<usize> {
+    let end_index = scoped_merge_parent_end_index(ancestry, context_start_id)?;
+    ancestry[..=end_index]
+        .iter()
+        .position(|node| is_visible_mode_node(mode, node))
+}
+
+fn scoped_merge_parent_end_index(
+    ancestry: &[Node],
+    context_start_id: Option<&str>,
+) -> Option<usize> {
+    match context_start_id {
+        Some(context_start_id) => ancestry
+            .iter()
+            .position(|node| !node.is_root() && node.id == context_start_id),
+        None => ancestry.iter().position(|node| node.is_root()),
+    }
 }
 
 fn is_orphan_lane_key(key: &str) -> bool {
