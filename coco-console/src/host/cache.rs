@@ -1111,9 +1111,11 @@ mod tests {
     use crate::host::snapshot_store::ConsoleGraphSnapshotStore;
     use coco_mem::{
         Anchor, BranchStore, Kind, MemoryStore, MergeParent, NewNode, NodeStore, PersistentStore,
-        PromptAnchor, Role, SessionAnchor, SessionRole, Tool,
+        PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor, SkillInvocationMode,
+        SkillResultAnchor, Tool, ToolUse,
     };
     use diesel::QueryableByName;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -1439,6 +1441,110 @@ mod tests {
                 .iter()
                 .any(|node| node.id == session)
         );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_seeds_initial_materialization_with_skill_invocation_subtree() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let tool_use = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "tool-1".to_owned(),
+                    name: "skill".to_owned(),
+                    input: json!({}),
+                }),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        let invocation = writer
+            .append(NewNode {
+                parent: tool_use.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    Vec::new(),
+                    SkillInvocationAnchor {
+                        skill_name: "fast-rust".to_owned(),
+                        mode: SkillInvocationMode::InheritContext,
+                    },
+                )),
+            })
+            .unwrap();
+        let result = writer
+            .append(NewNode {
+                parent: invocation.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_result(
+                    Vec::new(),
+                    SkillResultAnchor {
+                        skill_name: "fast-rust".to_owned(),
+                        output: "done".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        assert!(
+            cache
+                .viewport_current_ready_or_schedule(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .is_none()
+        );
+        let mut materialized = None;
+        for _ in 0..50 {
+            materialized = ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .latest_viewport(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .unwrap();
+            if materialized
+                .as_ref()
+                .is_some_and(|viewport| viewport.version == target_version)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let materialized = materialized.expect("materialized viewport should be stored");
+        let node_ids = materialized
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(node_ids.contains(invocation.as_str()));
+        assert!(node_ids.contains(result.as_str()));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

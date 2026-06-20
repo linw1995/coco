@@ -948,6 +948,61 @@ fn is_visible_graph_node(node: &Node, mode: GraphMode) -> bool {
     }
 }
 
+pub(crate) fn initial_visible_graph_lane_nodes(
+    store: &impl NodeStore,
+    mode: GraphMode,
+    ancestry: Vec<Node>,
+) -> Result<Vec<Node>> {
+    let mut nodes = Vec::new();
+    let mut seen = BTreeSet::new();
+    for node in ancestry.into_iter().rev() {
+        push_initial_lane_node(mode, node.clone(), &mut seen, &mut nodes);
+        if mode == GraphMode::All && node.kind.as_tool_uses().is_some() {
+            push_initial_skill_invocation_subtrees(store, mode, &node.id, &mut seen, &mut nodes)?;
+        }
+    }
+    Ok(nodes)
+}
+
+fn push_initial_skill_invocation_subtrees(
+    store: &impl NodeStore,
+    mode: GraphMode,
+    parent_id: &str,
+    seen: &mut BTreeSet<String>,
+    nodes: &mut Vec<Node>,
+) -> Result<()> {
+    for node_id in skill_invocation_children(store, parent_id)? {
+        push_initial_subtree_node(store, mode, &node_id, seen, nodes)?;
+    }
+    Ok(())
+}
+
+fn push_initial_subtree_node(
+    store: &impl NodeStore,
+    mode: GraphMode,
+    node_id: &str,
+    seen: &mut BTreeSet<String>,
+    nodes: &mut Vec<Node>,
+) -> Result<()> {
+    let node = store.get_node(node_id).context(StoreSnafu)?;
+    push_initial_lane_node(mode, node.clone(), seen, nodes);
+    for child_id in child_ids(store, &node.id)? {
+        push_initial_subtree_node(store, mode, &child_id, seen, nodes)?;
+    }
+    Ok(())
+}
+
+fn push_initial_lane_node(
+    mode: GraphMode,
+    node: Node,
+    seen: &mut BTreeSet<String>,
+    nodes: &mut Vec<Node>,
+) {
+    if !node.is_root() && is_visible_graph_node(&node, mode) && seen.insert(node.id.clone()) {
+        nodes.push(node);
+    }
+}
+
 fn collect_visible_skill_invocation_subtrees(
     store: &impl NodeStore,
     parent_id: &str,

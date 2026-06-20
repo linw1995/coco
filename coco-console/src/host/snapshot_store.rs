@@ -16,7 +16,10 @@ use crate::api::{
 use crate::error::{
     ConnectGraphSnapshotStoreSnafu, ParseGraphSnapshotStoreValueSnafu, QueryGraphSnapshotStoreSnafu,
 };
-use crate::graph::{GraphMode, graph_kind_name, node_target_id, shorten_id, summarize_node};
+use crate::graph::{
+    GraphMode, graph_kind_name, initial_visible_graph_lane_nodes, node_target_id, shorten_id,
+    summarize_node,
+};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LEFT_X, diff_graph_viewport_responses,
@@ -455,7 +458,7 @@ LIMIT 1
             .get_branch_head(first_branch)
             .context(crate::error::StoreSnafu)?;
         let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
-        let nodes = initial_visible_lane_nodes(mode, ancestry);
+        let nodes = initial_visible_graph_lane_nodes(store, mode, ancestry)?;
         if nodes.is_empty() || !initial_visible_lane_is_linear(mode, &nodes) {
             return Ok(false);
         }
@@ -3457,14 +3460,6 @@ fn visible_orphan_merge_parent_nodes(
         .filter(|node| is_visible_mode_node(mode, node))
         .cloned()
         .rev()
-        .collect()
-}
-
-fn initial_visible_lane_nodes(mode: GraphMode, ancestry: Vec<Node>) -> Vec<Node> {
-    ancestry
-        .into_iter()
-        .rev()
-        .filter(|node| is_visible_mode_node(mode, node))
         .collect()
 }
 
