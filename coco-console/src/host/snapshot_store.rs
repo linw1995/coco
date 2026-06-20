@@ -187,6 +187,21 @@ struct VisibleMergeParentPoint {
     point: Point,
 }
 
+struct OrphanMergeParentLane {
+    source_id: String,
+    lane: GraphViewportLane,
+    nodes: Vec<Node>,
+    fork_source: Option<(String, Point)>,
+}
+
+struct OrphanMergeParentNodeEdgeInput<'a> {
+    mode: GraphMode,
+    node: &'a Node,
+    point: Point,
+    previous: Option<&'a (String, Point)>,
+    first_node: bool,
+}
+
 struct MaterializationMetaInput {
     source_version: u64,
     mode: GraphMode,
@@ -1286,8 +1301,55 @@ LIMIT 1
         ancestry: &[Node],
         source_index: usize,
     ) -> crate::Result<Option<VisibleMergeParentPoint>> {
-        let mut fork_source = None::<(String, Point)>;
-        let mut end_index = ancestry
+        let Some(orphan) =
+            self.orphan_merge_parent_lane(connection, mode, ancestry, source_index)?
+        else {
+            return Ok(None);
+        };
+        let Some(point) =
+            self.insert_orphan_merge_parent_nodes(connection, store, mode, &orphan)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(VisibleMergeParentPoint {
+            node_id: orphan.source_id,
+            point,
+        }))
+    }
+
+    fn orphan_merge_parent_lane(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        ancestry: &[Node],
+        source_index: usize,
+    ) -> crate::Result<Option<OrphanMergeParentLane>> {
+        let (fork_source, end_index) =
+            self.orphan_merge_parent_fork_source(connection, mode, ancestry, source_index)?;
+        let nodes = visible_orphan_merge_parent_nodes(mode, ancestry, end_index);
+        let Some(source_id) = nodes.last().map(|source| source.id.clone()) else {
+            return Ok(None);
+        };
+        let lane = orphan_merge_parent_lane(
+            source_id.as_str(),
+            self.next_materialized_lane_y(connection, mode)?,
+        );
+        Ok(Some(OrphanMergeParentLane {
+            source_id,
+            lane,
+            nodes,
+            fork_source,
+        }))
+    }
+
+    fn orphan_merge_parent_fork_source(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        ancestry: &[Node],
+        source_index: usize,
+    ) -> crate::Result<(Option<(String, Point)>, usize)> {
+        let end_index = ancestry
             .iter()
             .position(|node| node.is_root())
             .unwrap_or(ancestry.len());
@@ -1295,102 +1357,114 @@ LIMIT 1
             if let Some(point) =
                 self.materialized_node_point_in_connection(connection, mode, &node.id)?
             {
-                fork_source = Some((node.id.clone(), point));
-                end_index = index;
-                break;
+                return Ok((Some((node.id.clone(), point)), index));
             }
         }
+        Ok((None, end_index))
+    }
 
-        let nodes = ancestry[..end_index]
-            .iter()
-            .filter(|node| is_visible_mode_node(mode, node))
-            .cloned()
-            .rev()
-            .collect::<Vec<_>>();
-        let Some(source) = nodes.last() else {
-            return Ok(None);
-        };
-        let source_id = source.id.clone();
-        let lane_y = self.next_materialized_lane_y(connection, mode)?;
-        let lane_label = format!("orphan {}", shorten_id(&source_id));
-        let lane = GraphViewportLane {
-            key: lane_key(&lane_label),
-            label: lane_label,
-            y: lane_y,
-        };
+    fn insert_orphan_merge_parent_nodes(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        mode: GraphMode,
+        orphan: &OrphanMergeParentLane,
+    ) -> crate::Result<Option<Point>> {
         let event_order =
-            self.event_order_by_materialized_and_new_nodes(connection, store, mode, &nodes)?;
-        let mut previous = fork_source;
+            self.event_order_by_materialized_and_new_nodes(connection, store, mode, &orphan.nodes)?;
+        let mut previous = orphan.fork_source.clone();
         let mut source_point = None;
-        for (index, node) in nodes.into_iter().enumerate() {
+        for (index, node) in orphan.nodes.iter().enumerate() {
             let point = match previous.as_ref() {
                 Some((previous_id, previous_point)) => Point {
                     x: previous_point.x
                         + required_column_gap(previous_id, &node.id, &event_order)
                             * GRAPH_COLUMN_WIDTH,
-                    y: lane_y,
+                    y: orphan.lane.y,
                 },
                 None => Point {
                     x: GRAPH_LEFT_X,
-                    y: lane_y,
+                    y: orphan.lane.y,
                 },
             };
-            let viewport_node = graph_viewport_node_from_node(&node, point, Vec::new());
+            let viewport_node = graph_viewport_node_from_node(node, point, Vec::new());
             self.insert_node_location(
                 connection,
                 NodeLocationInsert {
                     mode,
                     node: &viewport_node,
-                    lane: &lane,
+                    lane: &orphan.lane,
                     bounds: node_bounds(&viewport_node),
                 },
             )?;
-            if let Some((previous_id, previous_point)) = previous.as_ref() {
-                let edge = if index == 0 && previous_point.y != lane_y {
-                    routed_edge(
-                        GraphViewportEdgeKind::Fork,
-                        previous_id,
-                        *previous_point,
-                        &node.id,
-                        point,
-                        self.next_routed_edge_slot_in_connection(
-                            connection,
-                            mode,
-                            *previous_point,
-                            point,
-                        )?,
-                    )
-                } else {
-                    primary_parent_edge(previous_id, *previous_point, &node.id, point)
-                };
-                self.insert_edge_route(
-                    connection,
-                    EdgeRouteInsert {
-                        mode,
-                        edge: &edge,
-                        bounds: edge_bounds(&edge),
-                    },
-                )?;
-                if !self.insert_node_merge_edges(
-                    connection,
-                    store,
+            if !self.insert_orphan_merge_parent_node_edges(
+                connection,
+                store,
+                OrphanMergeParentNodeEdgeInput {
                     mode,
-                    &node,
-                    previous_id,
+                    node,
                     point,
-                )? {
-                    return Ok(None);
-                }
-            } else if !self.insert_node_merge_edges(connection, store, mode, &node, "", point)? {
+                    previous: previous.as_ref(),
+                    first_node: index == 0,
+                },
+            )? {
                 return Ok(None);
             }
             source_point = Some(point);
-            previous = Some((node.id, point));
+            previous = Some((node.id.clone(), point));
         }
-        Ok(source_point.map(|point| VisibleMergeParentPoint {
-            node_id: source_id,
-            point,
-        }))
+        Ok(source_point)
+    }
+
+    fn insert_orphan_merge_parent_node_edges(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        input: OrphanMergeParentNodeEdgeInput<'_>,
+    ) -> crate::Result<bool> {
+        let Some((previous_id, previous_point)) = input.previous else {
+            return self.insert_node_merge_edges(
+                connection,
+                store,
+                input.mode,
+                input.node,
+                "",
+                input.point,
+            );
+        };
+        let edge = if input.first_node && previous_point.y != input.point.y {
+            routed_edge(
+                GraphViewportEdgeKind::Fork,
+                previous_id,
+                *previous_point,
+                &input.node.id,
+                input.point,
+                self.next_routed_edge_slot_in_connection(
+                    connection,
+                    input.mode,
+                    *previous_point,
+                    input.point,
+                )?,
+            )
+        } else {
+            primary_parent_edge(previous_id, *previous_point, &input.node.id, input.point)
+        };
+        self.insert_edge_route(
+            connection,
+            EdgeRouteInsert {
+                mode: input.mode,
+                edge: &edge,
+                bounds: edge_bounds(&edge),
+            },
+        )?;
+        self.insert_node_merge_edges(
+            connection,
+            store,
+            input.mode,
+            input.node,
+            previous_id,
+            input.point,
+        )
     }
 
     fn rebalance_target_port_offsets(
@@ -3106,6 +3180,28 @@ fn is_visible_mode_node(mode: GraphMode, node: &Node) -> bool {
 
 fn is_orphan_lane_label(label: &str) -> bool {
     label.starts_with("orphan ")
+}
+
+fn orphan_merge_parent_lane(source_id: &str, y: i32) -> GraphViewportLane {
+    let label = format!("orphan {}", shorten_id(source_id));
+    GraphViewportLane {
+        key: lane_key(&label),
+        label,
+        y,
+    }
+}
+
+fn visible_orphan_merge_parent_nodes(
+    mode: GraphMode,
+    ancestry: &[Node],
+    end_index: usize,
+) -> Vec<Node> {
+    ancestry[..end_index]
+        .iter()
+        .filter(|node| is_visible_mode_node(mode, node))
+        .cloned()
+        .rev()
+        .collect()
 }
 
 fn initial_visible_lane_nodes(mode: GraphMode, ancestry: Vec<Node>) -> Vec<Node> {
