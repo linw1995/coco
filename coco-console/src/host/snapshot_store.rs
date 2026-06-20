@@ -633,6 +633,9 @@ LIMIT 1
     ) -> crate::Result<bool> {
         let mut next_lane_y = crate::layout::GRAPH_TOP_Y + GRAPH_LANE_HEIGHT;
         for (branch, state) in session_states.iter().skip(1) {
+            if !self.branch_has_initial_visible_nodes(store, mode, branch)? {
+                continue;
+            }
             self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
             let head_id = store
                 .get_branch_head(branch)
