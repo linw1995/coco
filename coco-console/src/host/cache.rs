@@ -839,7 +839,7 @@ where
         };
         if let Some(status) = status
             && status.state == ConsoleGraphRebuildState::Failed
-            && status.source_version > observed_version
+            && status.source_version >= observed_version
         {
             crate::error::ConsoleGraphRebuildSnafu {
                 mode: mode.as_query_value(),
@@ -2234,6 +2234,29 @@ mod tests {
                 ..
             } if source_version == target_version && message.contains("could not apply")
         ));
+        let equal_observed_diff_error = tokio::time::timeout(
+            Duration::from_millis(200),
+            cache.viewport_diff_after(
+                GraphMode::All,
+                target_version,
+                crate::host::api::GraphViewportDiffRequest {
+                    previous: crate::host::api::GraphViewportRequest::default(),
+                    current: crate::host::api::GraphViewportRequest::default(),
+                    known: None,
+                },
+            ),
+        )
+        .await
+        .expect("failed materialization viewport diff at observed version should not hang")
+        .unwrap_err();
+        assert!(matches!(
+            equal_observed_diff_error,
+            crate::error::Error::ConsoleGraphRebuild {
+                source_version,
+                message,
+                ..
+            } if source_version == target_version && message.contains("could not apply")
+        ));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -2579,6 +2602,141 @@ mod tests {
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 1);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_seeds_initial_merge_after_orphan_parent_column_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let main_first = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main first".to_owned()),
+            })
+            .unwrap();
+        let orphan_first = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan first".to_owned()),
+            })
+            .unwrap();
+        let orphan_second = writer
+            .append(NewNode {
+                parent: orphan_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan second".to_owned()),
+            })
+            .unwrap();
+        let orphan_third = writer
+            .append(NewNode {
+                parent: orphan_second.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan third".to_owned()),
+            })
+            .unwrap();
+        let orphan_parent = writer
+            .append(NewNode {
+                parent: orphan_third.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan parent".to_owned()),
+            })
+            .unwrap();
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: main_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan_parent.clone())],
+                    PromptAnchor {
+                        prompt: "seed merge orphan".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &merge_anchor)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                0,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let full_snapshot =
+            crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .unwrap();
+        let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
+        let incremental_merge = viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == merge_anchor)
+            .unwrap();
+        let full_merge = full_viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == merge_anchor)
+            .unwrap();
+        let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan_parent));
+        let main_lane_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "main")
+            .unwrap()
+            .y;
+        let orphan_lane_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == orphan_lane)
+            .unwrap()
+            .y;
+
+        assert_eq!(viewport.version, target_version);
+        assert_eq!(incremental_merge.x, full_merge.x);
+        assert_ne!(main_lane_y, orphan_lane_y);
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == orphan_parent
+                && edge.target_id == merge_anchor
+                && edge.kind == crate::api::GraphViewportEdgeKind::MergeParent
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -3883,6 +4041,28 @@ mod tests {
         assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
 
+        publisher.mark_changed();
+        let refresh_version = publisher.current_version();
+        let refreshed = cache
+            .viewport_after(
+                GraphMode::All,
+                target_version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let refreshed_alias_nodes = refreshed
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.id == main_first && node.labels == vec!["draft".to_owned(), "main".to_owned()]
+            })
+            .count();
+
+        assert_eq!(refreshed.version, refresh_version);
+        assert_eq!(refreshed_alias_nodes, 2);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
+
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
@@ -4014,11 +4194,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let draft_tail = viewport
+        let draft_tail_count = viewport
             .nodes
             .iter()
-            .find(|node| node.id == shared && node.labels == vec!["draft".to_owned()])
-            .unwrap();
+            .filter(|node| node.id == shared && node.labels == vec!["draft".to_owned()])
+            .count();
         let main_next_node = viewport
             .nodes
             .iter()
@@ -4027,7 +4207,7 @@ mod tests {
 
         assert_eq!(viewport.version, target_version);
         assert_eq!(main_next_node.labels, vec!["main".to_owned()]);
-        assert_eq!(draft_tail.labels, vec!["draft".to_owned()]);
+        assert_eq!(draft_tail_count, 2);
         assert!(viewport.edges.iter().any(|edge| {
             edge.source_id == shared
                 && edge.target_id == main_next
@@ -4040,7 +4220,7 @@ mod tests {
         );
         assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 2);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 3);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
 
         drop(writer);

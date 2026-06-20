@@ -180,6 +180,7 @@ struct MergeColumnConstraintInput<'a> {
     primary_parent_id: &'a str,
     point: Point,
     event_order: &'a BTreeMap<String, usize>,
+    reserved_lane_y: Option<i32>,
 }
 
 struct VisibleMergeParentPoint {
@@ -482,6 +483,25 @@ LIMIT 1
                     y: lane.y,
                 },
             };
+            let primary_parent_id = previous
+                .as_ref()
+                .map(|(previous_id, _)| previous_id.as_str())
+                .unwrap_or("");
+            let Some(point) = self.point_with_merge_parent_column_constraints(
+                connection,
+                store,
+                MergeColumnConstraintInput {
+                    mode,
+                    node: &node,
+                    primary_parent_id,
+                    point,
+                    event_order: &event_order,
+                    reserved_lane_y: Some(lane.y),
+                },
+            )?
+            else {
+                return Ok(false);
+            };
             let labels = if index + 1 == appended_len {
                 vec![branch_label.clone()]
             } else {
@@ -596,7 +616,6 @@ LIMIT 1
         };
         let branch_label = branch_label(input.branch, input.state);
         if input.head_id == tail.node_id {
-            self.update_node_labels(connection, input.mode, &tail.node_key, vec![branch_label])?;
             return Ok(true);
         }
         if let Some(head) = self.materialized_lane_node_in_connection(
@@ -670,6 +689,7 @@ LIMIT 1
                     primary_parent_id: &previous_id,
                     point,
                     event_order: &event_order,
+                    reserved_lane_y: None,
                 },
             )?
             else {
@@ -742,8 +762,12 @@ LIMIT 1
         )? {
             return Ok(false);
         }
-        let Some(materialized_nodes) =
-            self.refresh_anchor_node_labels(connection, store, session_states)?
+        let Some(materialized_nodes) = self.refresh_materialized_node_labels(
+            connection,
+            store,
+            GraphMode::Anchors,
+            session_states,
+        )?
         else {
             return Ok(false);
         };
@@ -902,13 +926,13 @@ LIMIT 1
         self.try_append_anchor_branch_after_row(connection, store, input, visible_head)
     }
 
-    fn refresh_anchor_node_labels(
+    fn refresh_materialized_node_labels(
         &self,
         connection: &mut SqliteConnection,
         store: &(impl BranchStore + NodeStore),
+        mode: GraphMode,
         session_states: &[(String, SessionState)],
     ) -> crate::Result<Option<Vec<MaterializedTailNodeRow>>> {
-        let mode = GraphMode::Anchors;
         let mut labels_by_node_id = BTreeMap::<String, Vec<String>>::new();
         for (branch, state) in session_states {
             let head_id = store
@@ -1200,6 +1224,7 @@ LIMIT 1
         input: MergeColumnConstraintInput<'_>,
     ) -> crate::Result<Option<Point>> {
         let mut parent_ids = BTreeSet::from([input.primary_parent_id.to_owned()]);
+        let mut refreshed_event_order = None;
         let mut x = input.point.x;
         for merge_parent in node_anchor_merge_parents(input.node) {
             let Some(source) = self.ensure_visible_merge_parent_point(
@@ -1207,17 +1232,44 @@ LIMIT 1
                 store,
                 input.mode,
                 merge_parent,
+                input.reserved_lane_y,
             )?
             else {
                 return Ok(None);
             };
             if parent_ids.insert(source.node_id.clone()) {
+                let event_order = if input.event_order.contains_key(&source.node_id) {
+                    input.event_order
+                } else {
+                    refreshed_event_order.get_or_insert(
+                        self.event_order_by_materialized_and_new_nodes(
+                            connection,
+                            store,
+                            input.mode,
+                            std::slice::from_ref(input.node),
+                        )?,
+                    )
+                };
                 x = x.max(
                     source.point.x
-                        + required_column_gap(&source.node_id, &input.node.id, input.event_order)
+                        + required_column_gap(&source.node_id, &input.node.id, event_order)
                             * GRAPH_COLUMN_WIDTH,
                 );
             }
+        }
+        if let Some(event_order) = refreshed_event_order.as_ref()
+            && !input.primary_parent_id.is_empty()
+            && let Some(primary_point) = self.materialized_node_point_in_connection(
+                connection,
+                input.mode,
+                input.primary_parent_id,
+            )?
+        {
+            x = x.max(
+                primary_point.x
+                    + required_column_gap(input.primary_parent_id, &input.node.id, event_order)
+                        * GRAPH_COLUMN_WIDTH,
+            );
         }
         Ok(Some(Point {
             x,
@@ -1236,8 +1288,13 @@ LIMIT 1
     ) -> crate::Result<bool> {
         let mut parent_ids = BTreeSet::from([primary_parent_id.to_owned()]);
         for merge_parent in node_anchor_merge_parents(node) {
-            let Some(source) =
-                self.ensure_visible_merge_parent_point(connection, store, mode, merge_parent)?
+            let Some(source) = self.ensure_visible_merge_parent_point(
+                connection,
+                store,
+                mode,
+                merge_parent,
+                None,
+            )?
             else {
                 return Ok(false);
             };
@@ -1271,6 +1328,7 @@ LIMIT 1
         store: &impl NodeStore,
         mode: GraphMode,
         merge_parent: &MergeParent,
+        reserved_lane_y: Option<i32>,
     ) -> crate::Result<Option<VisibleMergeParentPoint>> {
         let ancestry = store
             .ancestry(merge_parent.node_id())
@@ -1290,7 +1348,14 @@ LIMIT 1
                 point,
             }));
         }
-        self.insert_orphan_merge_parent_lane(connection, store, mode, &ancestry, source_index)
+        self.insert_orphan_merge_parent_lane(
+            connection,
+            store,
+            mode,
+            &ancestry,
+            source_index,
+            reserved_lane_y,
+        )
     }
 
     fn insert_orphan_merge_parent_lane(
@@ -1300,9 +1365,15 @@ LIMIT 1
         mode: GraphMode,
         ancestry: &[Node],
         source_index: usize,
+        reserved_lane_y: Option<i32>,
     ) -> crate::Result<Option<VisibleMergeParentPoint>> {
-        let Some(orphan) =
-            self.orphan_merge_parent_lane(connection, mode, ancestry, source_index)?
+        let Some(orphan) = self.orphan_merge_parent_lane(
+            connection,
+            mode,
+            ancestry,
+            source_index,
+            reserved_lane_y,
+        )?
         else {
             return Ok(None);
         };
@@ -1323,6 +1394,7 @@ LIMIT 1
         mode: GraphMode,
         ancestry: &[Node],
         source_index: usize,
+        reserved_lane_y: Option<i32>,
     ) -> crate::Result<Option<OrphanMergeParentLane>> {
         let (fork_source, end_index) =
             self.orphan_merge_parent_fork_source(connection, mode, ancestry, source_index)?;
@@ -1332,7 +1404,7 @@ LIMIT 1
         };
         let lane = orphan_merge_parent_lane(
             source_id.as_str(),
-            self.next_materialized_lane_y(connection, mode)?,
+            self.next_materialized_lane_y_after_reserved(connection, mode, reserved_lane_y)?,
         );
         Ok(Some(OrphanMergeParentLane {
             source_id,
@@ -1611,6 +1683,7 @@ ORDER BY
                     primary_parent_id: &previous_id,
                     point,
                     event_order: &event_order,
+                    reserved_lane_y: None,
                 },
             )?
             else {
@@ -1714,7 +1787,6 @@ ORDER BY
             return Ok(false);
         }
 
-        let mut world_max_x = meta.world_max_x;
         let mut materialized_lane_labels = materialized_lane_labels;
         let mut next_lane_y = crate::layout::GRAPH_TOP_Y;
         for (branch, state) in session_states {
@@ -1753,12 +1825,19 @@ ORDER BY
             if !appended {
                 return Ok(false);
             }
-            let Some(tail) = self.latest_lane_tail_in_connection(connection, mode, branch)? else {
-                return Ok(false);
-            };
-            world_max_x = world_max_x.max(tail.x + 120);
             next_lane_y += GRAPH_LANE_HEIGHT;
         }
+        let Some(materialized_nodes) =
+            self.refresh_materialized_node_labels(connection, store, mode, session_states)?
+        else {
+            return Ok(false);
+        };
+        let world_max_x = materialized_nodes
+            .iter()
+            .map(|row| row.x)
+            .max()
+            .unwrap_or(meta.world_max_x - 120)
+            + 120;
         let world_max_y = self
             .materialized_lanes_in_connection(connection, mode)?
             .iter()
@@ -2625,6 +2704,18 @@ ORDER BY lane_y, lane_key
             .max()
             .unwrap_or(crate::layout::GRAPH_TOP_Y - GRAPH_LANE_HEIGHT)
             + GRAPH_LANE_HEIGHT)
+    }
+
+    fn next_materialized_lane_y_after_reserved(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        reserved_lane_y: Option<i32>,
+    ) -> crate::Result<i32> {
+        let next_y = self.next_materialized_lane_y(connection, mode)?;
+        Ok(reserved_lane_y
+            .map(|lane_y| next_y.max(lane_y + GRAPH_LANE_HEIGHT))
+            .unwrap_or(next_y))
     }
 
     fn first_materialized_ancestry_point(
