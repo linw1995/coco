@@ -77,7 +77,8 @@ impl ConsoleServerHandle {
     }
 }
 
-pub fn start_console_server<S>(
+#[cfg(test)]
+fn start_console_server<S>(
     config: ConsoleConfig,
     store: S,
     publisher: ConsolePublisher,
