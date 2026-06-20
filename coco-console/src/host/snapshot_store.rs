@@ -762,6 +762,7 @@ LIMIT 1
         )? {
             return Ok(false);
         }
+        self.rebalance_routed_edge_slots(connection, mode)?;
         let Some(materialized_nodes) = self.refresh_materialized_node_labels(
             connection,
             store,
@@ -1035,6 +1036,25 @@ LIMIT 1
                     y: lane_y,
                 },
             };
+            let primary_parent_id = previous
+                .as_ref()
+                .map(|(previous_id, _)| previous_id.as_str())
+                .unwrap_or("");
+            let Some(point) = self.point_with_merge_parent_column_constraints(
+                connection,
+                store,
+                MergeColumnConstraintInput {
+                    mode: input.mode,
+                    node: &node,
+                    primary_parent_id,
+                    point,
+                    event_order: &event_order,
+                    reserved_lane_y: Some(lane.y),
+                },
+            )?
+            else {
+                return Ok(false);
+            };
             let labels = if index + 1 == appended_len {
                 vec![branch_label.clone()]
             } else {
@@ -1144,6 +1164,21 @@ LIMIT 1
                     + required_column_gap(&previous_id, &node.id, &event_order)
                         * GRAPH_COLUMN_WIDTH,
                 y: previous_point.y,
+            };
+            let Some(point) = self.point_with_merge_parent_column_constraints(
+                connection,
+                store,
+                MergeColumnConstraintInput {
+                    mode: input.mode,
+                    node: &node,
+                    primary_parent_id: &previous_id,
+                    point,
+                    event_order: &event_order,
+                    reserved_lane_y: None,
+                },
+            )?
+            else {
+                return Ok(false);
             };
             let viewport_node = graph_viewport_node_from_node(&node, point, Vec::new());
             self.insert_node_location(
@@ -1625,6 +1660,75 @@ ORDER BY
         Ok(())
     }
 
+    fn rebalance_routed_edge_slots(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<()> {
+        let rows = sql_query(
+            r#"
+SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
+FROM console_graph_edge_routes
+WHERE mode = ? AND edge_kind != 'primary_parent'
+ORDER BY
+  source_y,
+  CASE
+    WHEN target_y > source_y THEN 1
+    WHEN target_y < source_y THEN -1
+    ELSE 0
+  END,
+  CASE edge_kind
+    WHEN 'fork' THEN 0
+    ELSE 1
+  END,
+  target_y,
+  target_x,
+  edge_key
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .load::<EdgeRouteRow>(&mut *connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        let mut next_slot_by_corridor = BTreeMap::<(i32, i32), i32>::new();
+        for row in rows {
+            let kind = parse_edge_kind(&row.edge_kind)?;
+            let source = Point {
+                x: row.source_x,
+                y: row.source_y,
+            };
+            let target = Point {
+                x: row.target_x,
+                y: row.target_y,
+            };
+            let direction = (target.y - source.y).signum();
+            let next_slot = next_slot_by_corridor
+                .entry((source.y, direction))
+                .or_default();
+            let edge = GraphViewportEdge {
+                key: row.edge_key,
+                kind,
+                source_id: row.source_id,
+                target_id: row.target_id,
+                source,
+                target,
+                route_slot: *next_slot,
+                target_port_offset: row.target_port_offset,
+            };
+            *next_slot += 1;
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge: &edge,
+                    bounds: edge_bounds(&edge),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn try_append_new_branch_lane_in_transaction(
         &self,
         connection: &mut SqliteConnection,
@@ -1828,6 +1932,7 @@ ORDER BY
             next_lane_y += GRAPH_LANE_HEIGHT;
         }
         self.prune_orphan_lanes_without_external_edges(connection, mode)?;
+        self.rebalance_routed_edge_slots(connection, mode)?;
         let Some(materialized_nodes) =
             self.refresh_materialized_node_labels(connection, store, mode, session_states)?
         else {

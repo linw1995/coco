@@ -2353,7 +2353,6 @@ mod tests {
             )
             .await
             .unwrap();
-
         assert_eq!(viewport.version, target_version);
         assert!(
             viewport
@@ -3498,6 +3497,23 @@ mod tests {
         writer
             .set_branch_head("draft", &session, &draft_hidden)
             .unwrap();
+        let draft_second = writer
+            .append(NewNode {
+                parent: draft_hidden.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "draft second".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("draft", &draft_hidden, &draft_second)
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
@@ -3509,7 +3525,7 @@ mod tests {
                 role: Role::User,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::prompt(
-                    vec![MergeParent::merge(draft_hidden.clone())],
+                    vec![MergeParent::merge(draft_second.clone())],
                     PromptAnchor {
                         prompt: "merge anchor".to_owned(),
                         attachments: Vec::new(),
@@ -3531,8 +3547,26 @@ mod tests {
             )
             .await
             .unwrap();
+        let full_snapshot = crate::graph::build_graph_snapshot_with_mode(
+            &writer,
+            target_version,
+            GraphMode::Anchors,
+        )
+        .unwrap();
+        let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
+        let incremental_merge = viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == merge_anchor)
+            .unwrap();
+        let full_merge = full_viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == merge_anchor)
+            .unwrap();
 
         assert_eq!(viewport.version, target_version);
+        assert_eq!(incremental_merge.x, full_merge.x);
         assert!(
             viewport
                 .nodes
@@ -3545,7 +3579,7 @@ mod tests {
                 && edge.kind == crate::api::GraphViewportEdgeKind::PrimaryParent
         }));
         assert!(viewport.edges.iter().any(|edge| {
-            edge.source_id == draft_anchor
+            edge.source_id == draft_second
                 && edge.target_id == merge_anchor
                 && edge.kind == crate::api::GraphViewportEdgeKind::MergeParent
                 && edge.target_port_offset == crate::layout::EDGE_TARGET_PORT_STEP
@@ -4419,8 +4453,28 @@ mod tests {
             .iter()
             .find(|node| node.id == zeta_first)
             .unwrap();
+        let beta_edge = viewport
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.source_id == main_first
+                    && edge.target_id == beta_first
+                    && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+            })
+            .unwrap();
+        let zeta_edge = viewport
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.source_id == main_first
+                    && edge.target_id == zeta_first
+                    && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+            })
+            .unwrap();
 
         assert_eq!(viewport.version, target_version);
+        assert_eq!(beta_edge.route_slot, 0);
+        assert_eq!(zeta_edge.route_slot, 1);
         assert_eq!(
             beta.y,
             crate::layout::GRAPH_TOP_Y + crate::layout::GRAPH_LANE_HEIGHT
@@ -4437,7 +4491,7 @@ mod tests {
         assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 1);
         assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 2);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -4726,9 +4780,19 @@ mod tests {
             .iter()
             .find(|node| node.id == zeta_first)
             .unwrap();
+        let zeta_edge = viewport
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.source_id == main_first
+                    && edge.target_id == zeta_first
+                    && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+            })
+            .unwrap();
 
         assert_eq!(viewport.version, target_version);
         assert!(!viewport.nodes.iter().any(|node| node.id == beta_first));
+        assert_eq!(zeta_edge.route_slot, 0);
         assert_eq!(
             zeta.y,
             crate::layout::GRAPH_TOP_Y + crate::layout::GRAPH_LANE_HEIGHT
@@ -4741,7 +4805,7 @@ mod tests {
         assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 1);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 2);
         assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 1);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
