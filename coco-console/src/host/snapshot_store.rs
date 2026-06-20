@@ -174,6 +174,14 @@ struct AppendLinearBranchInput<'a> {
     head_id: &'a str,
 }
 
+struct MergeColumnConstraintInput<'a> {
+    mode: GraphMode,
+    node: &'a Node,
+    primary_parent_id: &'a str,
+    point: Point,
+    event_order: &'a BTreeMap<String, usize>,
+}
+
 struct MaterializationMetaInput {
     source_version: u64,
     mode: GraphMode,
@@ -633,6 +641,20 @@ LIMIT 1
                         * GRAPH_COLUMN_WIDTH,
                 y: previous_point.y,
             };
+            let Some(point) = self.point_with_merge_parent_column_constraints(
+                connection,
+                store,
+                MergeColumnConstraintInput {
+                    mode: input.mode,
+                    node: &node,
+                    primary_parent_id: &previous_id,
+                    point,
+                    event_order: &event_order,
+                },
+            )?
+            else {
+                return Ok(false);
+            };
             let labels = if index + 1 == appended_len {
                 vec![branch_label.clone()]
             } else {
@@ -744,6 +766,9 @@ LIMIT 1
             .collect::<BTreeSet<_>>();
         let removed_lanes = removed_lanes_in_order(&materialized_lanes, &branch_names);
         if !removed_lanes.is_empty() {
+            if self.lanes_have_retained_downstream_edges(connection, mode, &removed_lanes)? {
+                return Ok(None);
+            }
             self.delete_materialized_lanes(connection, mode, &removed_lanes)?;
             self.shift_lanes_after_deletion(connection, mode, &removed_lanes)?;
             materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
@@ -1110,6 +1135,67 @@ LIMIT 1
         Ok(true)
     }
 
+    fn insert_branch_alias_lane(
+        &self,
+        connection: &mut SqliteConnection,
+        input: AppendLinearBranchInput<'_>,
+        lane_y: i32,
+        node: &Node,
+        source_point: Point,
+    ) -> crate::Result<bool> {
+        let lane = GraphViewportLane {
+            key: lane_key(input.branch),
+            label: input.branch.to_owned(),
+            y: lane_y,
+        };
+        let viewport_node = graph_viewport_node_from_node(
+            node,
+            Point {
+                x: source_point.x,
+                y: lane_y,
+            },
+            vec![branch_label(input.branch, input.state)],
+        );
+        self.insert_node_location(
+            connection,
+            NodeLocationInsert {
+                mode: input.mode,
+                node: &viewport_node,
+                lane: &lane,
+                bounds: node_bounds(&viewport_node),
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn point_with_merge_parent_column_constraints(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        input: MergeColumnConstraintInput<'_>,
+    ) -> crate::Result<Option<Point>> {
+        let mut parent_ids = BTreeSet::from([input.primary_parent_id.to_owned()]);
+        let mut x = input.point.x;
+        for merge_parent in node_anchor_merge_parents(input.node) {
+            let Some((source_id, source)) =
+                self.visible_merge_parent_point(connection, store, input.mode, merge_parent)?
+            else {
+                return Ok(None);
+            };
+            if parent_ids.insert(source_id.clone()) {
+                x = x.max(
+                    source.x
+                        + required_column_gap(&source_id, &input.node.id, input.event_order)
+                            * GRAPH_COLUMN_WIDTH,
+                );
+            }
+        }
+        Ok(Some(Point {
+            x,
+            y: input.point.y,
+        }))
+    }
+
     fn insert_node_merge_edges(
         &self,
         connection: &mut SqliteConnection,
@@ -1271,22 +1357,18 @@ ORDER BY
         else {
             return Ok(false);
         };
-        let (source, nodes, source_point) = if source_index == 0 {
-            let Some(source) = ancestry.get(1) else {
-                return Ok(false);
-            };
-            let Some(source_point) =
-                self.materialized_node_point_in_connection(connection, input.mode, &source.id)?
-            else {
-                return Ok(false);
-            };
-            (source, vec![ancestry[0].clone()], source_point)
-        } else {
-            let source = &ancestry[source_index];
-            let mut nodes = ancestry[..source_index].to_vec();
-            nodes.reverse();
-            (source, nodes, source_point)
-        };
+        if source_index == 0 {
+            return self.insert_branch_alias_lane(
+                connection,
+                input,
+                lane_y,
+                &ancestry[0],
+                source_point,
+            );
+        }
+        let source = &ancestry[source_index];
+        let mut nodes = ancestry[..source_index].to_vec();
+        nodes.reverse();
         if nodes.is_empty() || !is_linear_new_nodes(&source.id, &nodes) {
             return Ok(false);
         }
@@ -1308,6 +1390,20 @@ ORDER BY
                     + required_column_gap(&previous_id, &node.id, &event_order)
                         * GRAPH_COLUMN_WIDTH,
                 y: lane_y,
+            };
+            let Some(point) = self.point_with_merge_parent_column_constraints(
+                connection,
+                store,
+                MergeColumnConstraintInput {
+                    mode: input.mode,
+                    node: &node,
+                    primary_parent_id: &previous_id,
+                    point,
+                    event_order: &event_order,
+                },
+            )?
+            else {
+                return Ok(false);
             };
             let labels = if index + 1 == appended_len {
                 vec![branch_label.clone()]
@@ -1387,6 +1483,9 @@ ORDER BY
             .collect::<BTreeSet<_>>();
         let removed_lanes = removed_lanes_in_order(&materialized_lanes, &branch_names);
         if !removed_lanes.is_empty() {
+            if self.lanes_have_retained_downstream_edges(connection, mode, &removed_lanes)? {
+                return Ok(false);
+            }
             self.delete_materialized_lanes(connection, mode, &removed_lanes)?;
             self.shift_lanes_after_deletion(connection, mode, &removed_lanes)?;
             materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
@@ -1916,6 +2015,25 @@ LIMIT 1
             path: self.path.as_ref().clone(),
         })?;
         Ok(row.is_some())
+    }
+
+    fn lanes_have_retained_downstream_edges(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        lanes: &[LaneRow],
+    ) -> crate::Result<bool> {
+        for lane in lanes {
+            if self.lane_suffix_has_retained_downstream_edges(
+                connection,
+                mode,
+                &lane.lane_label,
+                i32::MIN,
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn delete_materialized_lane_suffix(
