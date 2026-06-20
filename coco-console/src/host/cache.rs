@@ -206,7 +206,7 @@ where
             })
             .await??;
         let snapshot = Arc::new(snapshot);
-        self.store_cached_snapshot(mode, source_version, snapshot.clone())?;
+        self.store_cached_snapshot(mode, source_version, snapshot.clone());
         self.publish_ready_version(source_version);
         self.set_rebuild_status(rebuild_status(
             mode,
@@ -508,9 +508,13 @@ where
 
     #[cfg(test)]
     pub async fn current_snapshot(&self, mode: GraphMode) -> Arc<GraphSnapshot> {
-        self.snapshot_for_current_source(mode)
+        let snapshot = self
+            .snapshot_for_current_source(mode)
             .await
-            .expect("graph snapshot should build")
+            .expect("graph snapshot should build");
+        self.store_snapshot_materialization(snapshot.version, &snapshot)
+            .expect("test snapshot materialization should store");
+        snapshot
     }
 
     fn publish_ready_version(&self, source_version: u64) -> u64 {
@@ -553,10 +557,7 @@ where
         mode: GraphMode,
         source_version: u64,
         snapshot: Arc<GraphSnapshot>,
-    ) -> crate::Result<()> {
-        if let Some(snapshots) = &self.snapshots {
-            snapshots.put(source_version, &snapshot)?;
-        }
+    ) {
         let mut state = self
             .state
             .lock()
@@ -565,6 +566,16 @@ where
             source_version,
             snapshot,
         });
+    }
+
+    fn store_snapshot_materialization(
+        &self,
+        source_version: u64,
+        snapshot: &GraphSnapshot,
+    ) -> crate::Result<()> {
+        if let Some(snapshots) = &self.snapshots {
+            snapshots.put(source_version, snapshot)?;
+        }
         Ok(())
     }
 
@@ -722,8 +733,9 @@ where
             .await;
         match result {
             Ok(Ok(snapshot)) => {
-                match self.store_cached_snapshot(mode, source_version, Arc::new(snapshot)) {
+                match self.store_snapshot_materialization(source_version, &snapshot) {
                     Ok(()) => {
+                        self.store_cached_snapshot(mode, source_version, Arc::new(snapshot));
                         self.publish_ready_version(source_version);
                         self.set_rebuild_status(rebuild_status(
                             mode,
@@ -1260,16 +1272,34 @@ mod tests {
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
+        let target_version = publisher.current_version();
 
-        let snapshot = cache.current_snapshot(GraphMode::All).await;
-        let materialized = ConsoleGraphSnapshotStore::open(&path)
-            .unwrap()
-            .latest_viewport(
-                GraphMode::All,
-                crate::host::api::GraphViewportRequest::default(),
-            )
-            .unwrap()
-            .unwrap();
+        assert!(
+            cache
+                .viewport_current_ready_or_schedule(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .is_none()
+        );
+        let mut materialized = None;
+        for _ in 0..50 {
+            materialized = ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .latest_viewport(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .unwrap();
+            if materialized
+                .as_ref()
+                .is_some_and(|viewport| viewport.version == target_version)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let materialized = materialized.expect("materialized viewport should be stored");
         let database_path = path.join("store.sqlite3");
         assert_eq!(
             sqlite_table_row_count(&database_path, "console_graph_materializations"),
@@ -1297,7 +1327,7 @@ mod tests {
             path.clone(),
         )
         .unwrap();
-        let reopened = reopened_cache.snapshot_current_ready_or_schedule(GraphMode::All);
+        let reopened = reopened_cache.snapshot_current_ready(GraphMode::All);
         let reopened_materialized = reopened_cache
             .viewport_current_ready_or_schedule(
                 GraphMode::All,
@@ -1305,8 +1335,13 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(materialized.version, snapshot.version);
+        assert_eq!(materialized.version, target_version);
         assert!(materialized.nodes.iter().any(|node| node.id == session));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
         assert!(reopened.is_none());
         assert!(!path.join("console-graph-snapshots.sqlite3").exists());
         assert!(
@@ -3661,7 +3696,7 @@ END;
     }
 
     #[tokio::test]
-    async fn cache_rolls_back_snapshot_store_refresh_when_materialization_fails() {
+    async fn cache_current_snapshot_does_not_rewrite_materialized_facts() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
         let publisher = ConsolePublisher::new();
@@ -3682,8 +3717,34 @@ END;
             .unwrap();
         writer.fork("main", &session).unwrap();
         publisher.mark_changed();
-        let first = cache.current_snapshot(GraphMode::All).await;
-        drop_materialized_nodes_table(&path);
+        let first_version = publisher.current_version();
+        assert!(
+            cache
+                .viewport_current_ready_or_schedule(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .is_none()
+        );
+        let mut first_materialized = None;
+        for _ in 0..50 {
+            first_materialized = ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .latest_viewport(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .unwrap();
+            if first_materialized
+                .as_ref()
+                .is_some_and(|viewport| viewport.version == first_version)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let first_materialized =
+            first_materialized.expect("initial materialization should be seeded");
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3694,8 +3755,9 @@ END;
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
+        let target_version = publisher.current_version();
 
-        let result = cache.snapshot_current(GraphMode::All).await;
+        let snapshot = cache.snapshot_current(GraphMode::All).await.unwrap();
         let materialized = ConsoleGraphSnapshotStore::open(&path)
             .unwrap()
             .latest_viewport(
@@ -3705,24 +3767,13 @@ END;
             .unwrap()
             .unwrap();
 
-        assert!(result.is_err());
-        assert_eq!(materialized.version, first.version);
+        assert_eq!(first_materialized.version, first_version);
+        assert_eq!(snapshot.version, target_version);
+        assert_eq!(materialized.version, first_version);
         assert!(!materialized.nodes.iter().any(|node| node.id == text));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
-    }
-
-    fn drop_materialized_nodes_table(path: &std::path::Path) {
-        use diesel::prelude::*;
-        use diesel::sql_query;
-
-        let database_path = path.join("store.sqlite3");
-        let database_url = database_path.to_string_lossy().into_owned();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
-        sql_query("DROP TABLE console_graph_node_locations")
-            .execute(&mut connection)
-            .unwrap();
     }
 
     #[tokio::test]
