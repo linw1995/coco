@@ -51,7 +51,7 @@ struct MaterializationRow {
     world_max_y: i32,
 }
 
-#[derive(QueryableByName)]
+#[derive(Clone, QueryableByName)]
 struct LaneRow {
     #[diesel(sql_type = Text)]
     lane_key: String,
@@ -465,23 +465,37 @@ impl ConsoleGraphSnapshotStore {
             return Ok(true);
         }
 
-        let materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
-        let materialized_lane_labels = materialized_lanes
-            .iter()
-            .map(|lane| lane.lane_label.clone())
-            .collect::<BTreeSet<_>>();
+        let mut materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
         let branch_names = session_states
             .iter()
             .map(|(branch, _)| branch.clone())
             .collect::<BTreeSet<_>>();
-        if !materialized_lane_labels.is_subset(&branch_names) {
+        let Some(removed_lanes) = trailing_removed_lanes(&materialized_lanes, &branch_names) else {
             return Ok(false);
+        };
+        if !removed_lanes.is_empty() {
+            self.delete_materialized_lanes(connection, mode, &removed_lanes)?;
+            let removed_labels = removed_lanes
+                .iter()
+                .map(|lane| lane.lane_label.as_str())
+                .collect::<HashSet<_>>();
+            materialized_lanes.retain(|lane| !removed_labels.contains(lane.lane_label.as_str()));
         }
+        let materialized_lane_labels = materialized_lanes
+            .iter()
+            .map(|lane| lane.lane_label.clone())
+            .collect::<BTreeSet<_>>();
         if !new_branch_lanes_append_after_existing(session_states, &materialized_lane_labels) {
             return Ok(false);
         }
 
         let mut world_max_x = meta.world_max_x;
+        let mut world_max_y = materialized_lanes
+            .iter()
+            .map(|lane| lane.lane_y)
+            .max()
+            .unwrap_or(crate::layout::GRAPH_TOP_Y - GRAPH_LANE_HEIGHT)
+            + 120;
         let mut next_lane_y = materialized_lanes
             .iter()
             .map(|lane| lane.lane_y)
@@ -517,6 +531,7 @@ impl ConsoleGraphSnapshotStore {
                 )?;
                 if appended {
                     next_lane_y += GRAPH_LANE_HEIGHT;
+                    world_max_y = world_max_y.max(next_lane_y - GRAPH_LANE_HEIGHT + 120);
                 }
                 appended
             };
@@ -537,7 +552,7 @@ impl ConsoleGraphSnapshotStore {
                 world_min_x: meta.world_min_x,
                 world_min_y: meta.world_min_y,
                 world_max_x,
-                world_max_y: meta.world_max_y,
+                world_max_y,
             },
         )?;
         Ok(true)
@@ -1012,6 +1027,42 @@ WHERE mode = ? AND node_key = ? AND labels_json IS NOT ?
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })?;
+        Ok(())
+    }
+
+    fn delete_materialized_lanes(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        lanes: &[LaneRow],
+    ) -> crate::Result<()> {
+        for lane in lanes {
+            sql_query(
+                r#"
+DELETE FROM console_graph_edge_routes
+WHERE mode = ? AND (source_y = ? OR target_y = ?)
+"#,
+            )
+            .bind::<Text, _>(mode.as_query_value())
+            .bind::<Integer, _>(lane.lane_y)
+            .bind::<Integer, _>(lane.lane_y)
+            .execute(&mut *connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+            sql_query(
+                r#"
+DELETE FROM console_graph_node_locations
+WHERE mode = ? AND lane_label = ?
+"#,
+            )
+            .bind::<Text, _>(mode.as_query_value())
+            .bind::<Text, _>(&lane.lane_label)
+            .execute(&mut *connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+        }
         Ok(())
     }
 
@@ -1610,6 +1661,25 @@ fn new_branch_lanes_append_after_existing(
         || session_states
             .iter()
             .all(|(branch, _)| materialized_lane_labels.contains(branch))
+}
+
+fn trailing_removed_lanes(
+    materialized_lanes: &[LaneRow],
+    branch_names: &BTreeSet<String>,
+) -> Option<Vec<LaneRow>> {
+    let mut removed = Vec::new();
+    let mut seen_removed = false;
+    for lane in materialized_lanes {
+        if branch_names.contains(&lane.lane_label) {
+            if seen_removed {
+                return None;
+            }
+            continue;
+        }
+        seen_removed = true;
+        removed.push(lane.clone());
+    }
+    Some(removed)
 }
 
 fn edge_corridor_y(source_y: i32, target_y: i32, route_slot: i32) -> i32 {
