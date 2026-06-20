@@ -5198,6 +5198,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_trims_orphan_prefix_when_branch_adopts_chain_middle() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let main_first = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main first".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &main_first)
+            .unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let orphan_first = writer
+            .append(NewNode {
+                parent: main_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan first".to_owned()),
+            })
+            .unwrap();
+        let orphan_middle = writer
+            .append(NewNode {
+                parent: orphan_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan middle".to_owned()),
+            })
+            .unwrap();
+        let orphan_tail = writer
+            .append(NewNode {
+                parent: orphan_middle.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan tail".to_owned()),
+            })
+            .unwrap();
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: main_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan_tail.clone())],
+                    PromptAnchor {
+                        prompt: "merge orphan tail".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &main_first, &merge_anchor)
+            .unwrap();
+        publisher.mark_changed();
+        let merge_version = publisher.current_version();
+
+        let merged = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan_tail));
+        assert_eq!(merged.version, merge_version);
+        assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
+
+        writer.fork("draft", &orphan_middle).unwrap();
+        publisher.mark_changed();
+        let adopt_version = publisher.current_version();
+        let adopted = cache
+            .viewport_after(
+                GraphMode::All,
+                merge_version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let draft_y = adopted
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "draft")
+            .unwrap()
+            .y;
+        let orphan_y = adopted
+            .lanes
+            .iter()
+            .find(|lane| lane.label == orphan_lane)
+            .unwrap()
+            .y;
+
+        assert_eq!(adopted.version, adopt_version);
+        assert!(
+            adopted
+                .nodes
+                .iter()
+                .any(|node| node.id == orphan_first && node.y == draft_y)
+        );
+        assert!(
+            adopted
+                .nodes
+                .iter()
+                .any(|node| node.id == orphan_middle && node.y == draft_y)
+        );
+        assert!(
+            adopted
+                .nodes
+                .iter()
+                .any(|node| node.id == orphan_tail && node.y == orphan_y)
+        );
+        assert!(
+            !adopted
+                .nodes
+                .iter()
+                .any(|node| node.id == orphan_first && node.y == orphan_y)
+        );
+        assert!(
+            !adopted
+                .nodes
+                .iter()
+                .any(|node| node.id == orphan_middle && node.y == orphan_y)
+        );
+        assert!(adopted.edges.iter().any(|edge| {
+            edge.source_id == orphan_middle
+                && edge.source.y == draft_y
+                && edge.target_id == orphan_tail
+                && edge.target.y == orphan_y
+                && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+        }));
+        assert!(adopted.edges.iter().any(|edge| {
+            edge.source_id == orphan_tail
+                && edge.source.y == orphan_y
+                && edge.target_id == merge_anchor
+                && edge.kind == crate::api::GraphViewportEdgeKind::MergeParent
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, adopt_version)
+                .is_none()
+        );
+
+        drop(cache);
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_adopts_root_started_orphan_chain_tail_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
