@@ -394,7 +394,17 @@ impl ConsoleGraphSnapshotStore {
         if meta.source_version >= 0 && source_version <= meta.source_version as u64 {
             return Ok(true);
         }
-        let materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
+        let mut materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
+        let branch_names = session_states
+            .iter()
+            .map(|(branch, _)| branch.clone())
+            .collect::<BTreeSet<_>>();
+        let removed_lanes = removed_lanes_in_order(&materialized_lanes, &branch_names);
+        if !removed_lanes.is_empty() {
+            self.delete_materialized_lanes(connection, mode, &removed_lanes)?;
+            self.shift_lanes_after_deletion(connection, mode, &removed_lanes)?;
+            materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
+        }
         let materialized_lane_labels = materialized_lanes
             .iter()
             .map(|lane| lane.lane_label.clone())
