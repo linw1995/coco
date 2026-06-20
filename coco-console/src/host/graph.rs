@@ -182,7 +182,6 @@ pub fn build_graph_snapshot(
     build_graph_snapshot_with_mode(store, version, GraphMode::All)
 }
 
-#[cfg(test)]
 pub fn build_graph_snapshot_with_mode(
     store: &(impl BranchStore + NodeStore + SessionStore),
     version: u64,

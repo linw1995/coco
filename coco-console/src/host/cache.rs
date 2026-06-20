@@ -75,7 +75,7 @@ impl<S> ConsoleGraphCache<S>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    pub fn new(store: S, invalidations: ConsolePublisher) -> Self {
+    pub(crate) fn new(store: S, invalidations: ConsolePublisher) -> Self {
         Self {
             source: ConsoleGraphSource::Store(store),
             invalidations,
@@ -173,6 +173,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn snapshot_current(
         &self,
         mode: GraphMode,
@@ -502,17 +503,10 @@ where
         }
     }
 
-    pub async fn snapshot_for_current_source(
-        &self,
-        mode: GraphMode,
-    ) -> crate::Result<Arc<GraphSnapshot>> {
-        self.snapshot_current(mode).await
-    }
-
     #[cfg(test)]
     pub async fn current_snapshot(&self, mode: GraphMode) -> Arc<GraphSnapshot> {
         let snapshot = self
-            .snapshot_for_current_source(mode)
+            .snapshot_current(mode)
             .await
             .expect("graph snapshot should build");
         self.wait_for_materialization_current(mode, snapshot.version)

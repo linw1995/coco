@@ -10,8 +10,8 @@ use coco_channel::{
 };
 use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{
-    ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleServerHandle, GraphMode,
-    GraphSnapshot, start_console_server_with_graph_store_path,
+    ConsoleConfig, ConsolePublisher, ConsoleServerHandle, GraphMode, GraphSnapshot,
+    build_graph_snapshot_with_mode, start_console_server_with_graph_store_path,
 };
 use coco_core::{
     ConversationEngine, CoreService, EngineError, FixedBranchResolver, SYSTEM_EVENT_QUEUE,
@@ -181,12 +181,8 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let mode = daemon_profile_graph_mode(command);
-    let cache = ConsoleGraphCache::new(shared_store.clone(), ConsolePublisher::new());
     let started_at = Instant::now();
-    let snapshot = cache
-        .snapshot_for_current_source(mode)
-        .await
-        .context(ConsoleSnafu)?;
+    let snapshot = build_graph_snapshot_with_mode(shared_store, 0, mode).context(ConsoleSnafu)?;
     let result = daemon_graph_profile_result(mode, &snapshot, started_at.elapsed());
 
     if command.json {

@@ -1003,8 +1003,9 @@ mod tests {
     };
     use crate::graph::{GraphMode, build_graph_snapshot, node_target_id};
     use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
+    use crate::host::cache::ConsoleGraphCache;
     use crate::layout::layout_graph_viewport;
-    use crate::{ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleStore};
+    use crate::{ConsoleConfig, ConsolePublisher, ConsoleStore};
     use axum::body::to_bytes;
     use axum::extract::{RawQuery, State};
     use coco_mem::{
