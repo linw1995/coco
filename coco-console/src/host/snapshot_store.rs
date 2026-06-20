@@ -497,23 +497,17 @@ impl ConsoleGraphSnapshotStore {
             .iter()
             .map(|lane| lane.lane_label.clone())
             .collect::<BTreeSet<_>>();
-        if !new_branch_lanes_append_after_existing(session_states, &materialized_lane_labels) {
+        if !existing_branch_lanes_preserve_order(
+            session_states,
+            &materialized_lanes,
+            &materialized_lane_labels,
+        ) {
             return Ok(false);
         }
 
         let mut world_max_x = meta.world_max_x;
-        let mut world_max_y = materialized_lanes
-            .iter()
-            .map(|lane| lane.lane_y)
-            .max()
-            .unwrap_or(crate::layout::GRAPH_TOP_Y - GRAPH_LANE_HEIGHT)
-            + 120;
-        let mut next_lane_y = materialized_lanes
-            .iter()
-            .map(|lane| lane.lane_y)
-            .max()
-            .unwrap_or(crate::layout::GRAPH_TOP_Y - GRAPH_LANE_HEIGHT)
-            + GRAPH_LANE_HEIGHT;
+        let mut materialized_lane_labels = materialized_lane_labels;
+        let mut next_lane_y = crate::layout::GRAPH_TOP_Y;
         for (branch, state) in session_states {
             let head_id = store
                 .get_branch_head(branch)
@@ -530,6 +524,7 @@ impl ConsoleGraphSnapshotStore {
                     },
                 )?
             } else {
+                self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
                 let appended = self.try_append_new_branch_lane_in_transaction(
                     connection,
                     store,
@@ -542,8 +537,7 @@ impl ConsoleGraphSnapshotStore {
                     next_lane_y,
                 )?;
                 if appended {
-                    next_lane_y += GRAPH_LANE_HEIGHT;
-                    world_max_y = world_max_y.max(next_lane_y - GRAPH_LANE_HEIGHT + 120);
+                    materialized_lane_labels.insert(branch.clone());
                 }
                 appended
             };
@@ -554,7 +548,15 @@ impl ConsoleGraphSnapshotStore {
                 return Ok(false);
             };
             world_max_x = world_max_x.max(tail.x + 120);
+            next_lane_y += GRAPH_LANE_HEIGHT;
         }
+        let world_max_y = self
+            .materialized_lanes_in_connection(connection, mode)?
+            .iter()
+            .map(|lane| lane.lane_y)
+            .max()
+            .unwrap_or(crate::layout::GRAPH_TOP_Y - GRAPH_LANE_HEIGHT)
+            + 120;
 
         self.put_materialization_meta(
             connection,
@@ -1116,6 +1118,30 @@ WHERE mode = ? AND lane_label = ? AND x > ?
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })?;
+        Ok(())
+    }
+
+    fn shift_lanes_for_insertion(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        insert_y: i32,
+    ) -> crate::Result<()> {
+        let mut lanes = self
+            .materialized_lanes_in_connection(connection, mode)?
+            .into_iter()
+            .filter(|lane| lane.lane_y >= insert_y)
+            .collect::<Vec<_>>();
+        lanes.sort_by(|left, right| {
+            right
+                .lane_y
+                .cmp(&left.lane_y)
+                .then_with(|| right.lane_key.cmp(&left.lane_key))
+        });
+        for lane in lanes {
+            self.shift_lane_nodes(connection, mode, &lane, -GRAPH_LANE_HEIGHT)?;
+            self.shift_lane_edges(connection, mode, lane.lane_y, -GRAPH_LANE_HEIGHT)?;
+        }
         Ok(())
     }
 
@@ -1857,24 +1883,21 @@ fn branch_lane_priority(branch: &str) -> (u8, &str) {
     }
 }
 
-fn new_branch_lanes_append_after_existing(
+fn existing_branch_lanes_preserve_order(
     session_states: &[(String, SessionState)],
+    materialized_lanes: &[LaneRow],
     materialized_lane_labels: &BTreeSet<String>,
 ) -> bool {
-    let mut seen_missing = false;
-    for (branch, _) in session_states {
-        if materialized_lane_labels.contains(branch) {
-            if seen_missing {
-                return false;
-            }
-        } else {
-            seen_missing = true;
-        }
-    }
-    seen_missing
-        || session_states
-            .iter()
-            .all(|(branch, _)| materialized_lane_labels.contains(branch))
+    let expected_existing_lanes = session_states
+        .iter()
+        .filter(|(branch, _)| materialized_lane_labels.contains(branch))
+        .map(|(branch, _)| branch.as_str())
+        .collect::<Vec<_>>();
+    let current_existing_lanes = materialized_lanes
+        .iter()
+        .map(|lane| lane.lane_label.as_str())
+        .collect::<Vec<_>>();
+    expected_existing_lanes == current_existing_lanes
 }
 
 fn removed_lanes_in_order(
