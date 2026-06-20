@@ -3895,13 +3895,24 @@ mod tests {
         count: i64,
     }
 
+    fn sqlite_test_connection(database_path: &std::path::Path) -> diesel::sqlite::SqliteConnection {
+        use diesel::connection::SimpleConnection;
+        use diesel::prelude::*;
+
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        connection
+            .batch_execute("PRAGMA busy_timeout = 5000;")
+            .unwrap();
+        connection
+    }
+
     fn sqlite_table_exists(database_path: &std::path::Path, table: &str) -> bool {
         use diesel::prelude::*;
         use diesel::sql_query;
         use diesel::sql_types::Text;
 
-        let database_url = database_path.to_string_lossy().into_owned();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        let mut connection = sqlite_test_connection(database_path);
         let row = sql_query(
             "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?",
         )
@@ -3915,8 +3926,7 @@ mod tests {
         use diesel::prelude::*;
         use diesel::sql_query;
 
-        let database_url = database_path.to_string_lossy().into_owned();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        let mut connection = sqlite_test_connection(database_path);
         sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
             .get_result::<SqliteCount>(&mut connection)
             .unwrap()
@@ -3928,8 +3938,7 @@ mod tests {
         use diesel::sql_query;
         use diesel::sql_types::Text;
 
-        let database_url = database_path.to_string_lossy().into_owned();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        let mut connection = sqlite_test_connection(database_path);
         sql_query("SELECT COUNT(*) AS count FROM console_graph_fact_audit WHERE kind = ?")
             .bind::<Text, _>(kind)
             .get_result::<SqliteCount>(&mut connection)
@@ -3942,8 +3951,7 @@ mod tests {
         use diesel::sql_query;
         use diesel::sql_types::Text;
 
-        let database_url = database_path.to_string_lossy().into_owned();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        let mut connection = sqlite_test_connection(database_path);
         let row = sql_query(format!(
             "SELECT COUNT(*) AS count FROM pragma_table_info('{table}') WHERE name = ?"
         ))
@@ -3955,10 +3963,8 @@ mod tests {
 
     fn create_legacy_snapshot_materialization_tables(database_path: &std::path::Path) {
         use diesel::connection::SimpleConnection;
-        use diesel::prelude::*;
 
-        let database_url = database_path.to_string_lossy().into_owned();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        let mut connection = sqlite_test_connection(database_path);
         connection
             .batch_execute(
                 r#"
@@ -3974,10 +3980,8 @@ CREATE TABLE console_graph_viewport_edges (mode TEXT NOT NULL);
 
     fn create_graph_fact_audit_triggers(database_path: &std::path::Path) {
         use diesel::connection::SimpleConnection;
-        use diesel::prelude::*;
 
-        let database_url = database_path.to_string_lossy().into_owned();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        let mut connection = sqlite_test_connection(database_path);
         connection
             .batch_execute(
                 r#"
