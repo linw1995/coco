@@ -3797,6 +3797,7 @@ mod tests {
                 .is_none()
         );
 
+        drop(cache);
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
@@ -3907,6 +3908,7 @@ mod tests {
                 .is_none()
         );
 
+        drop(cache);
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
