@@ -406,13 +406,51 @@ impl ConsoleGraphSnapshotStore {
             return Ok(false);
         }
 
+        for (branch, state) in session_states {
+            let head_id = store
+                .get_branch_head(branch)
+                .context(crate::error::StoreSnafu)?;
+            let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+            let Some(visible_head) =
+                self.first_materialized_lane_ancestry_node(connection, mode, branch, &ancestry)?
+            else {
+                return Ok(false);
+            };
+            let Some(tail) = self.latest_lane_tail_in_connection(connection, mode, branch)? else {
+                return Ok(false);
+            };
+            if visible_head.x < tail.x {
+                self.delete_materialized_lane_suffix(
+                    connection,
+                    mode,
+                    branch,
+                    visible_head.x,
+                    visible_head.y,
+                )?;
+            }
+            if !self.try_append_anchor_branch_after_row(
+                connection,
+                store,
+                AppendLinearBranchInput {
+                    mode,
+                    branch,
+                    state,
+                    head_id: &head_id,
+                },
+                visible_head,
+            )? {
+                return Ok(false);
+            }
+        }
+
         let mut labels_by_node_id = BTreeMap::<String, Vec<String>>::new();
         for (branch, state) in session_states {
             let head_id = store
                 .get_branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
             let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
-            let Some(row) = self.first_materialized_ancestry_node(connection, mode, &ancestry)?
+            let Some(row) =
+                self.first_materialized_lane_ancestry_node(connection, mode, branch, &ancestry)?
             else {
                 return Ok(false);
             };
@@ -424,13 +462,26 @@ impl ConsoleGraphSnapshotStore {
         for labels in labels_by_node_id.values_mut() {
             labels.sort();
         }
-        for row in self.materialized_node_rows_in_connection(connection, mode)? {
+        let materialized_nodes = self.materialized_node_rows_in_connection(connection, mode)?;
+        for row in &materialized_nodes {
             let labels = labels_by_node_id
                 .get(&row.node_id)
                 .cloned()
                 .unwrap_or_default();
             self.update_node_labels(connection, mode, &row.node_key, labels)?;
         }
+        let world_max_x = materialized_nodes
+            .iter()
+            .map(|row| row.x)
+            .max()
+            .unwrap_or(meta.world_max_x - 120)
+            + 120;
+        let world_max_y = materialized_nodes
+            .iter()
+            .map(|row| row.y)
+            .max()
+            .unwrap_or(meta.world_max_y - 120)
+            + 120;
         self.put_materialization_meta(
             connection,
             MaterializationMetaInput {
@@ -438,10 +489,71 @@ impl ConsoleGraphSnapshotStore {
                 mode,
                 world_min_x: meta.world_min_x,
                 world_min_y: meta.world_min_y,
-                world_max_x: meta.world_max_x,
-                world_max_y: meta.world_max_y,
+                world_max_x,
+                world_max_y,
             },
         )?;
+        Ok(true)
+    }
+
+    fn try_append_anchor_branch_after_row(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        input: AppendLinearBranchInput<'_>,
+        tail: MaterializedTailNodeRow,
+    ) -> crate::Result<bool> {
+        if input.head_id == tail.node_id {
+            return Ok(true);
+        }
+        let Ok(mut chain) = store.log(&tail.node_id, input.head_id) else {
+            return Ok(false);
+        };
+        chain.reverse();
+        if chain.first().is_none_or(|node| node.id != tail.node_id) {
+            return Ok(false);
+        }
+        if !is_linear_append_chain(&chain) {
+            return Ok(false);
+        }
+
+        let lane = GraphViewportLane {
+            key: tail.lane_key,
+            label: tail.lane_label,
+            y: tail.lane_y,
+        };
+        let mut previous_id = tail.node_id;
+        let mut previous_point = Point {
+            x: tail.x,
+            y: tail.y,
+        };
+        for node in chain.into_iter().skip(1).filter(is_anchor_node) {
+            let point = Point {
+                x: previous_point.x + GRAPH_COLUMN_WIDTH,
+                y: previous_point.y,
+            };
+            let viewport_node = graph_viewport_node_from_node(&node, point, Vec::new());
+            self.insert_node_location(
+                connection,
+                NodeLocationInsert {
+                    mode: input.mode,
+                    node: &viewport_node,
+                    lane: &lane,
+                    bounds: node_bounds(&viewport_node),
+                },
+            )?;
+            let edge = primary_parent_edge(&previous_id, previous_point, &node.id, point);
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode: input.mode,
+                    edge: &edge,
+                    bounds: edge_bounds(&edge),
+                },
+            )?;
+            previous_id = node.id;
+            previous_point = point;
+        }
         Ok(true)
     }
 
@@ -1469,14 +1581,16 @@ ORDER BY lane_y, lane_key
         Ok(None)
     }
 
-    fn first_materialized_ancestry_node(
+    fn first_materialized_lane_ancestry_node(
         &self,
         connection: &mut SqliteConnection,
         mode: GraphMode,
+        branch: &str,
         ancestry: &[Node],
     ) -> crate::Result<Option<MaterializedTailNodeRow>> {
         for node in ancestry {
-            let Some(row) = self.materialized_node_row_in_connection(connection, mode, &node.id)?
+            let Some(row) =
+                self.materialized_lane_node_in_connection(connection, mode, branch, &node.id)?
             else {
                 continue;
             };
@@ -1500,30 +1614,6 @@ ORDER BY y, x, node_key
         )
         .bind::<Text, _>(mode.as_query_value())
         .load::<MaterializedTailNodeRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
-    }
-
-    fn materialized_node_row_in_connection(
-        &self,
-        connection: &mut SqliteConnection,
-        mode: GraphMode,
-        node_id: &str,
-    ) -> crate::Result<Option<MaterializedTailNodeRow>> {
-        sql_query(
-            r#"
-SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ?
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .get_result::<MaterializedTailNodeRow>(connection)
-        .optional()
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })
@@ -1980,6 +2070,10 @@ fn node_anchor_merge_parent_count(node: &Node) -> usize {
         Kind::Anchor(anchor) => anchor.merge_parents().len(),
         _ => 0,
     }
+}
+
+fn is_anchor_node(node: &Node) -> bool {
+    matches!(&node.kind, Kind::Anchor(_))
 }
 
 fn is_linear_new_nodes(source_id: &str, nodes: &[Node]) -> bool {
