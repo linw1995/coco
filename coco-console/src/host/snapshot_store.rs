@@ -454,6 +454,35 @@ LIMIT 1
         let Some((first_branch, first_state)) = session_states.first() else {
             return Ok(false);
         };
+        if !self.try_seed_first_branch_materialization_in_transaction(
+            connection,
+            store,
+            mode,
+            first_branch,
+            first_state,
+        )? {
+            return Ok(false);
+        }
+        if !self.try_seed_remaining_branch_materializations_in_transaction(
+            connection,
+            store,
+            mode,
+            session_states,
+        )? {
+            return Ok(false);
+        }
+        self.put_materialization_meta_from_materialized_rows(connection, source_version, mode)?;
+        Ok(true)
+    }
+
+    fn try_seed_first_branch_materialization_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &(impl BranchStore + NodeStore),
+        mode: GraphMode,
+        first_branch: &str,
+        first_state: &SessionState,
+    ) -> crate::Result<bool> {
         let head_id = store
             .get_branch_head(first_branch)
             .context(crate::error::StoreSnafu)?;
@@ -465,7 +494,7 @@ LIMIT 1
 
         let lane = GraphViewportLane {
             key: lane_key(first_branch),
-            label: first_branch.clone(),
+            label: first_branch.to_owned(),
             y: crate::layout::GRAPH_TOP_Y,
         };
         let branch_label = branch_label(first_branch, first_state);
@@ -546,6 +575,16 @@ LIMIT 1
             previous = Some((node.id, point));
         }
 
+        Ok(true)
+    }
+
+    fn try_seed_remaining_branch_materializations_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &(impl BranchStore + NodeStore),
+        mode: GraphMode,
+        session_states: &[(String, SessionState)],
+    ) -> crate::Result<bool> {
         let mut next_lane_y = crate::layout::GRAPH_TOP_Y + GRAPH_LANE_HEIGHT;
         for (branch, state) in session_states.iter().skip(1) {
             self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
@@ -578,6 +617,15 @@ LIMIT 1
             next_lane_y += GRAPH_LANE_HEIGHT;
         }
 
+        Ok(true)
+    }
+
+    fn put_materialization_meta_from_materialized_rows(
+        &self,
+        connection: &mut SqliteConnection,
+        source_version: u64,
+        mode: GraphMode,
+    ) -> crate::Result<()> {
         let materialized_nodes = self.materialized_node_rows_in_connection(connection, mode)?;
         let world_max_x = materialized_nodes
             .iter()
@@ -603,7 +651,7 @@ LIMIT 1
                 world_max_y,
             },
         )?;
-        Ok(true)
+        Ok(())
     }
 
     fn try_append_linear_branch_in_transaction(
