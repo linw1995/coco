@@ -1610,43 +1610,10 @@ LIMIT 1
             return Ok(());
         }
 
-        let mut outgoing_edges = Vec::new();
-        for lane in &lanes {
-            outgoing_edges.extend(self.outgoing_edge_routes_from_lane_node(
-                connection,
-                mode,
-                node_id,
-                lane.lane_y,
-            )?);
-        }
+        let outgoing_edges =
+            self.outgoing_edge_routes_from_lanes(connection, mode, node_id, &lanes)?;
         self.delete_materialized_lanes(connection, mode, &lanes)?;
-        for row in outgoing_edges {
-            let kind = parse_edge_kind(&row.edge_kind)?;
-            let target = Point {
-                x: row.target_x,
-                y: row.target_y,
-            };
-            let edge = GraphViewportEdge {
-                key: edge_key(kind, &row.source_id, point, &row.target_id, target),
-                kind,
-                source_id: row.source_id,
-                target_id: row.target_id,
-                source: point,
-                target,
-                route_slot: row.route_slot,
-                target_port_offset: row.target_port_offset,
-            };
-            self.insert_edge_route(
-                connection,
-                EdgeRouteInsert {
-                    mode,
-                    edge: &edge,
-                    bounds: edge_bounds(&edge),
-                },
-            )?;
-            self.rebalance_target_port_offsets(connection, mode, target)?;
-        }
-        Ok(())
+        self.insert_migrated_outgoing_edge_routes(connection, mode, point, outgoing_edges)
     }
 
     fn orphan_lanes_for_node_in_connection(
@@ -1671,6 +1638,25 @@ ORDER BY lane_y
         })
     }
 
+    fn outgoing_edge_routes_from_lanes(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+        lanes: &[LaneRow],
+    ) -> crate::Result<Vec<EdgeRouteRow>> {
+        let mut outgoing_edges = Vec::new();
+        for lane in lanes {
+            outgoing_edges.extend(self.outgoing_edge_routes_from_lane_node(
+                connection,
+                mode,
+                node_id,
+                lane.lane_y,
+            )?);
+        }
+        Ok(outgoing_edges)
+    }
+
     fn outgoing_edge_routes_from_lane_node(
         &self,
         connection: &mut SqliteConnection,
@@ -1692,6 +1678,52 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })
+    }
+
+    fn insert_migrated_outgoing_edge_routes(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        point: Point,
+        rows: Vec<EdgeRouteRow>,
+    ) -> crate::Result<()> {
+        for row in rows {
+            self.insert_migrated_outgoing_edge_route(connection, mode, point, row)?;
+        }
+        Ok(())
+    }
+
+    fn insert_migrated_outgoing_edge_route(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        point: Point,
+        row: EdgeRouteRow,
+    ) -> crate::Result<()> {
+        let kind = parse_edge_kind(&row.edge_kind)?;
+        let target = Point {
+            x: row.target_x,
+            y: row.target_y,
+        };
+        let edge = GraphViewportEdge {
+            key: edge_key(kind, &row.source_id, point, &row.target_id, target),
+            kind,
+            source_id: row.source_id,
+            target_id: row.target_id,
+            source: point,
+            target,
+            route_slot: row.route_slot,
+            target_port_offset: row.target_port_offset,
+        };
+        self.insert_edge_route(
+            connection,
+            EdgeRouteInsert {
+                mode,
+                edge: &edge,
+                bounds: edge_bounds(&edge),
+            },
+        )?;
+        self.rebalance_target_port_offsets(connection, mode, target)
     }
 
     fn point_with_merge_parent_column_constraints(
