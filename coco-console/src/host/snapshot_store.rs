@@ -578,6 +578,14 @@ LIMIT 1
             input.head_id,
         )? && head.x < tail.x
         {
+            if self.lane_suffix_has_retained_downstream_edges(
+                connection,
+                input.mode,
+                input.branch,
+                head.x,
+            )? {
+                return Ok(false);
+            }
             self.delete_materialized_lane_suffix(
                 connection,
                 input.mode,
@@ -829,6 +837,14 @@ LIMIT 1
             return Ok(false);
         };
         if visible_head.x < tail.x {
+            if self.lane_suffix_has_retained_downstream_edges(
+                connection,
+                input.mode,
+                input.branch,
+                visible_head.x,
+            )? {
+                return Ok(false);
+            }
             self.delete_materialized_lane_suffix(
                 connection,
                 input.mode,
@@ -1852,6 +1868,54 @@ WHERE mode = ? AND lane_label = ?
                 })?;
         }
         Ok(())
+    }
+
+    fn lane_suffix_has_retained_downstream_edges(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        branch: &str,
+        head_x: i32,
+    ) -> crate::Result<bool> {
+        let row = sql_query(
+            r#"
+SELECT 1 AS value
+FROM console_graph_edge_routes AS edge
+WHERE edge.mode = ?
+  AND EXISTS (
+      SELECT 1
+      FROM console_graph_node_locations AS suffix
+      WHERE suffix.mode = edge.mode
+        AND suffix.lane_label = ?
+        AND suffix.x > ?
+        AND suffix.node_id = edge.source_id
+        AND suffix.x = edge.source_x
+        AND suffix.y = edge.source_y
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM console_graph_node_locations AS suffix_target
+      WHERE suffix_target.mode = edge.mode
+        AND suffix_target.lane_label = ?
+        AND suffix_target.x > ?
+        AND suffix_target.node_id = edge.target_id
+        AND suffix_target.x = edge.target_x
+        AND suffix_target.y = edge.target_y
+  )
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(branch)
+        .bind::<Integer, _>(head_x)
+        .bind::<Text, _>(branch)
+        .bind::<Integer, _>(head_x)
+        .get_result::<SqliteInteger>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(row.is_some())
     }
 
     fn delete_materialized_lane_suffix(

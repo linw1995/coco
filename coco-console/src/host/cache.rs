@@ -1972,6 +1972,7 @@ mod tests {
         assert!(empty_again.edges.is_empty());
         assert!(empty_again.lanes.is_empty());
 
+        drop(cache);
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
@@ -3145,6 +3146,135 @@ mod tests {
         assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
 
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_rejects_branch_rewind_that_orphans_dependent_lane() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let main_first = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main first".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &main_first)
+            .unwrap();
+        let main_second = writer
+            .append(NewNode {
+                parent: main_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main second".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &main_first, &main_second)
+            .unwrap();
+        writer.fork("draft", &main_second).unwrap();
+        let draft_first = writer
+            .append(NewNode {
+                parent: main_second.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("draft first".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("draft", &main_second, &draft_first)
+            .unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let database_path = path.join("store.sqlite3");
+        create_graph_fact_audit_triggers(&database_path);
+        writer
+            .set_branch_head("main", &main_second, &main_first)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let stale = cache
+            .viewport_current_ready_or_schedule(
+                GraphMode::All,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .unwrap();
+        for _ in 0..50 {
+            if cache.rebuild_statuses().iter().any(|status| {
+                status.mode == GraphMode::All
+                    && status.source_version == target_version
+                    && status.state == ConsoleGraphRebuildState::Failed
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .latest_viewport(
+                GraphMode::All,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stale.version, initial.version);
+        assert_eq!(materialized.version, initial.version);
+        assert!(materialized.nodes.iter().any(|node| node.id == main_second));
+        assert!(materialized.nodes.iter().any(|node| node.id == draft_first));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        let viewport_error = tokio::time::timeout(
+            Duration::from_millis(200),
+            cache.viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            ),
+        )
+        .await
+        .expect("failed dependent rewind should not hang")
+        .unwrap_err();
+        assert!(matches!(
+            viewport_error,
+            crate::error::Error::ConsoleGraphRebuild {
+                source_version,
+                message,
+                ..
+            } if source_version == target_version && message.contains("could not apply")
+        ));
+
+        drop(cache);
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
