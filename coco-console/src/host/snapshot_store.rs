@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -237,9 +237,6 @@ impl ConsoleGraphSnapshotStore {
         mode: GraphMode,
         store: &(impl BranchStore + NodeStore + SessionStore),
     ) -> crate::Result<bool> {
-        if mode != GraphMode::All {
-            return Ok(false);
-        }
         let mut session_states = store
             .list_session_states()
             .context(crate::error::StoreSnafu)?
@@ -254,13 +251,21 @@ impl ConsoleGraphSnapshotStore {
 
         let mut connection = self.connect()?;
         self.begin_write_transaction(&mut connection)?;
-        let result = self.try_append_linear_branches_in_transaction(
-            &mut connection,
-            store,
-            source_version,
-            mode,
-            &session_states,
-        );
+        let result = match mode {
+            GraphMode::Anchors => self.try_update_anchor_materialization_in_transaction(
+                &mut connection,
+                store,
+                source_version,
+                &session_states,
+            ),
+            GraphMode::All => self.try_append_linear_branches_in_transaction(
+                &mut connection,
+                store,
+                source_version,
+                mode,
+                &session_states,
+            ),
+        };
         match result {
             Ok(true) => {
                 self.commit_transaction(&mut connection)?;
@@ -369,6 +374,74 @@ impl ConsoleGraphSnapshotStore {
             previous_id = node.id;
             previous_point = point;
         }
+        Ok(true)
+    }
+
+    fn try_update_anchor_materialization_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &(impl BranchStore + NodeStore),
+        source_version: u64,
+        session_states: &[(String, SessionState)],
+    ) -> crate::Result<bool> {
+        let mode = GraphMode::Anchors;
+        let Some(meta) = self.latest_materialization_row_in_connection(connection, mode)? else {
+            return Ok(false);
+        };
+        if meta.source_version >= 0 && source_version <= meta.source_version as u64 {
+            return Ok(true);
+        }
+        let materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
+        let materialized_lane_labels = materialized_lanes
+            .iter()
+            .map(|lane| lane.lane_label.clone())
+            .collect::<BTreeSet<_>>();
+        if materialized_lanes.len() != session_states.len()
+            || !existing_branch_lanes_preserve_order(
+                session_states,
+                &materialized_lanes,
+                &materialized_lane_labels,
+            )
+        {
+            return Ok(false);
+        }
+
+        let mut labels_by_node_id = BTreeMap::<String, Vec<String>>::new();
+        for (branch, state) in session_states {
+            let head_id = store
+                .get_branch_head(branch)
+                .context(crate::error::StoreSnafu)?;
+            let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+            let Some(row) = self.first_materialized_ancestry_node(connection, mode, &ancestry)?
+            else {
+                return Ok(false);
+            };
+            labels_by_node_id
+                .entry(row.node_id)
+                .or_default()
+                .push(branch_label(branch, state));
+        }
+        for labels in labels_by_node_id.values_mut() {
+            labels.sort();
+        }
+        for row in self.materialized_node_rows_in_connection(connection, mode)? {
+            let labels = labels_by_node_id
+                .get(&row.node_id)
+                .cloned()
+                .unwrap_or_default();
+            self.update_node_labels(connection, mode, &row.node_key, labels)?;
+        }
+        self.put_materialization_meta(
+            connection,
+            MaterializationMetaInput {
+                source_version,
+                mode,
+                world_min_x: meta.world_min_x,
+                world_min_y: meta.world_min_y,
+                world_max_x: meta.world_max_x,
+                world_max_y: meta.world_max_y,
+            },
+        )?;
         Ok(true)
     }
 
@@ -1394,6 +1467,66 @@ ORDER BY lane_y, lane_key
             return Ok(Some((index, point)));
         }
         Ok(None)
+    }
+
+    fn first_materialized_ancestry_node(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        ancestry: &[Node],
+    ) -> crate::Result<Option<MaterializedTailNodeRow>> {
+        for node in ancestry {
+            let Some(row) = self.materialized_node_row_in_connection(connection, mode, &node.id)?
+            else {
+                continue;
+            };
+            return Ok(Some(row));
+        }
+        Ok(None)
+    }
+
+    fn materialized_node_rows_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<Vec<MaterializedTailNodeRow>> {
+        sql_query(
+            r#"
+SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
+FROM console_graph_node_locations
+WHERE mode = ?
+ORDER BY y, x, node_key
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .load::<MaterializedTailNodeRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
+    fn materialized_node_row_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+    ) -> crate::Result<Option<MaterializedTailNodeRow>> {
+        sql_query(
+            r#"
+SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
+FROM console_graph_node_locations
+WHERE mode = ? AND node_id = ?
+ORDER BY y, x, node_key
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .get_result::<MaterializedTailNodeRow>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
     }
 
     fn materialized_node_point_in_connection(
