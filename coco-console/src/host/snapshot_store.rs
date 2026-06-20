@@ -1872,6 +1872,19 @@ WHERE mode = ? AND source_id = ? AND source_y = ?
             )? {
                 return Ok(None);
             }
+            if matches!(
+                self.try_append_skill_invocation_subtree_in_transaction(
+                    connection,
+                    store,
+                    mode,
+                    &node.id,
+                    point,
+                    &orphan.lane,
+                )?,
+                SkillSubtreeAppend::Unsupported
+            ) {
+                return Ok(None);
+            }
             source_point = Some(point);
             previous = Some((node.id.clone(), point));
         }
@@ -2242,36 +2255,40 @@ ORDER BY
         }
 
         for nodes in subtrees {
-            let subtree_lane =
-                match self.first_materialized_node_row_in_connection(connection, mode, &nodes)? {
-                    Some(row) => GraphViewportLane {
-                        key: row.lane_key,
-                        label: row.lane_label,
-                        y: row.lane_y,
-                    },
-                    None => {
-                        let subtree_source_id = nodes
-                            .last()
-                            .map(|node| node.id.as_str())
-                            .unwrap_or(source_id);
-                        skill_invocation_subtree_lane(
-                            subtree_source_id,
-                            self.next_materialized_lane_y_after_reserved(
-                                connection,
-                                mode,
-                                Some(lane.y),
-                            )?,
-                        )
-                    }
-                };
+            let subtree_lane = match self
+                .first_materialized_skill_node_row_in_connection(connection, mode, &nodes)?
+            {
+                Some(row) => GraphViewportLane {
+                    key: row.lane_key,
+                    label: row.lane_label,
+                    y: row.lane_y,
+                },
+                None => {
+                    let subtree_source_id = nodes
+                        .last()
+                        .map(|node| node.id.as_str())
+                        .unwrap_or(source_id);
+                    skill_invocation_subtree_lane(
+                        subtree_source_id,
+                        self.next_materialized_lane_y_after_reserved(
+                            connection,
+                            mode,
+                            Some(lane.y),
+                        )?,
+                    )
+                }
+            };
             let event_order =
                 self.event_order_by_materialized_and_new_nodes(connection, store, mode, &nodes)?;
             let mut previous_id = source_id.to_owned();
             let mut previous_point = source_point;
             for node in nodes {
-                if let Some(row) =
-                    self.materialized_node_row_by_id_in_connection(connection, mode, &node.id)?
-                {
+                if let Some(row) = self.materialized_node_row_by_id_on_lane_in_connection(
+                    connection,
+                    mode,
+                    &node.id,
+                    &subtree_lane.key,
+                )? {
                     let point = Point { x: row.x, y: row.y };
                     previous_id = node.id;
                     previous_point = point;
@@ -3669,15 +3686,19 @@ ORDER BY lane_y, lane_key
         Ok(None)
     }
 
-    fn first_materialized_node_row_in_connection(
+    fn first_materialized_skill_node_row_in_connection(
         &self,
         connection: &mut SqliteConnection,
         mode: GraphMode,
         nodes: &[Node],
     ) -> crate::Result<Option<MaterializedTailNodeRow>> {
         for node in nodes {
-            let Some(row) =
-                self.materialized_node_row_by_id_in_connection(connection, mode, &node.id)?
+            let Some(row) = self.materialized_node_row_by_id_with_lane_prefix_in_connection(
+                connection,
+                mode,
+                &node.id,
+                DERIVED_SKILL_LANE_KEY_PREFIX,
+            )?
             else {
                 continue;
             };
@@ -3686,23 +3707,51 @@ ORDER BY lane_y, lane_key
         Ok(None)
     }
 
-    fn materialized_node_row_by_id_in_connection(
+    fn materialized_node_row_by_id_on_lane_in_connection(
         &self,
         connection: &mut SqliteConnection,
         mode: GraphMode,
         node_id: &str,
+        lane_key: &str,
     ) -> crate::Result<Option<MaterializedTailNodeRow>> {
         sql_query(
             r#"
 SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
 FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ?
+WHERE mode = ? AND node_id = ? AND lane_key = ?
 ORDER BY y, x, node_key
 LIMIT 1
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
         .bind::<Text, _>(node_id)
+        .bind::<Text, _>(lane_key)
+        .get_result::<MaterializedTailNodeRow>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
+    fn materialized_node_row_by_id_with_lane_prefix_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+        lane_key_prefix: &str,
+    ) -> crate::Result<Option<MaterializedTailNodeRow>> {
+        sql_query(
+            r#"
+SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
+FROM console_graph_node_locations
+WHERE mode = ? AND node_id = ? AND lane_key LIKE ?
+ORDER BY y, x, node_key
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .bind::<Text, _>(format!("{lane_key_prefix}%"))
         .get_result::<MaterializedTailNodeRow>(connection)
         .optional()
         .context(QueryGraphSnapshotStoreSnafu {
