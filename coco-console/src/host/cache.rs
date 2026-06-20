@@ -630,6 +630,7 @@ where
     }
 
     async fn rebuild_snapshot(&self, mode: GraphMode, source_version: u64) {
+        let uses_materialized_store = self.snapshots.is_some();
         self.set_rebuild_status(rebuild_status(
             mode,
             source_version,
@@ -637,7 +638,11 @@ where
             None,
             0,
             0,
-            "Building graph snapshot",
+            if uses_materialized_store {
+                "Building graph materialization"
+            } else {
+                "Building graph snapshot"
+            },
         ));
         if let Some(snapshots) = self.snapshots.clone() {
             let has_materialization = snapshots.has_materialization(mode);
@@ -674,7 +679,18 @@ where
                         ));
                         return;
                     }
-                    Ok(false) => {}
+                    Ok(false) => {
+                        self.set_rebuild_status(rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Failed,
+                            None,
+                            0,
+                            0,
+                            "Incremental graph materialization could not seed this store state",
+                        ));
+                        return;
+                    }
                     Err(error) => {
                         self.set_rebuild_status(rebuild_status(
                             mode,
@@ -1743,6 +1759,65 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_does_not_full_rebuild_when_initial_seed_cannot_apply() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        assert!(
+            cache
+                .viewport_current_ready_or_schedule(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .is_none()
+        );
+        for _ in 0..50 {
+            if cache.rebuild_statuses().iter().any(|status| {
+                status.mode == GraphMode::All
+                    && status.source_version == target_version
+                    && status.state == ConsoleGraphRebuildState::Failed
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .latest_viewport(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+        assert!(cache.rebuild_statuses().iter().any(|status| {
+            status.mode == GraphMode::All
+                && status.source_version == target_version
+                && status.state == ConsoleGraphRebuildState::Failed
+                && status.message.contains("could not seed this store state")
+        }));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
