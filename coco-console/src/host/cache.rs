@@ -2131,6 +2131,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_appends_from_duplicated_branch_tail_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let shared = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("shared tail".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &shared).unwrap();
+        writer.fork("draft", &shared).unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let database_path = path.join("store.sqlite3");
+        create_graph_fact_audit_triggers(&database_path);
+        let main_next = writer
+            .append(NewNode {
+                parent: shared.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main next".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &shared, &main_next).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let draft_tail = viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == shared && node.labels == vec!["draft".to_owned()])
+            .unwrap();
+        let main_next_node = viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == main_next)
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert_eq!(main_next_node.labels, vec!["main".to_owned()]);
+        assert_eq!(draft_tail.labels, vec!["draft".to_owned()]);
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == shared
+                && edge.target_id == main_next
+                && edge.kind == crate::api::GraphViewportEdgeKind::PrimaryParent
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 2);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_inserts_middle_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();

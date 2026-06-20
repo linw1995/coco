@@ -172,12 +172,6 @@ struct MaterializationMetaInput {
 }
 
 #[derive(QueryableByName)]
-struct SqliteCount {
-    #[diesel(sql_type = BigInt)]
-    count: i64,
-}
-
-#[derive(QueryableByName)]
 struct SqliteInteger {
     #[diesel(sql_type = Integer)]
     value: i32,
@@ -318,10 +312,6 @@ impl ConsoleGraphSnapshotStore {
             self.update_node_labels(connection, input.mode, &head.node_key, vec![branch_label])?;
             return Ok(true);
         }
-        if self.node_occurrence_count_in_connection(connection, input.mode, &tail.node_id)? > 1 {
-            return Ok(false);
-        }
-
         let Ok(mut chain) = store.log(&tail.node_id, input.head_id) else {
             return Ok(false);
         };
@@ -1850,28 +1840,6 @@ WHERE mode = ?
         .bind::<Integer, _>(direction)
         .get_result::<SqliteInteger>(connection)
         .map(|row| row.value)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
-    }
-
-    fn node_occurrence_count_in_connection(
-        &self,
-        connection: &mut SqliteConnection,
-        mode: GraphMode,
-        node_id: &str,
-    ) -> crate::Result<i64> {
-        sql_query(
-            r#"
-SELECT COUNT(*) AS count
-FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ?
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .get_result::<SqliteCount>(connection)
-        .map(|row| row.count)
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })
