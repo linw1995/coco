@@ -23,7 +23,9 @@ use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
     GRAPH_COLUMN_WIDTH, diff_graph_viewport_responses, lane_key, materialize_graph_viewport,
 };
-use coco_mem::{BranchStore, Kind, Node, NodeStore, PauseReason, SessionState, SessionStore};
+use coco_mem::{
+    BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, SessionState, SessionStore,
+};
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const COORDINATE_SPACE: &str = "graph_layout_v1";
@@ -513,7 +515,7 @@ impl ConsoleGraphSnapshotStore {
         if chain.first().is_none_or(|node| node.id != tail.node_id) {
             return Ok(false);
         }
-        if !is_linear_append_chain(&chain) {
+        if !is_linear_primary_chain(&chain) {
             return Ok(false);
         }
 
@@ -551,10 +553,79 @@ impl ConsoleGraphSnapshotStore {
                     bounds: edge_bounds(&edge),
                 },
             )?;
+            if !self.insert_anchor_merge_edges(
+                connection,
+                store,
+                input.mode,
+                &node,
+                &previous_id,
+                point,
+            )? {
+                return Ok(false);
+            }
             previous_id = node.id;
             previous_point = point;
         }
         Ok(true)
+    }
+
+    fn insert_anchor_merge_edges(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        mode: GraphMode,
+        node: &Node,
+        primary_parent_id: &str,
+        target: Point,
+    ) -> crate::Result<bool> {
+        let mut parent_ids = BTreeSet::from([primary_parent_id.to_owned()]);
+        for merge_parent in node_anchor_merge_parents(node) {
+            let Some((source_id, source)) =
+                self.visible_merge_parent_point(connection, store, mode, merge_parent)?
+            else {
+                return Ok(false);
+            };
+            if !parent_ids.insert(source_id.clone()) {
+                continue;
+            }
+            let edge = routed_edge(
+                GraphViewportEdgeKind::MergeParent,
+                &source_id,
+                source,
+                &node.id,
+                target,
+                self.next_routed_edge_slot_in_connection(connection, mode, source, target)?,
+            );
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge: &edge,
+                    bounds: edge_bounds(&edge),
+                },
+            )?;
+        }
+        Ok(true)
+    }
+
+    fn visible_merge_parent_point(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        mode: GraphMode,
+        merge_parent: &MergeParent,
+    ) -> crate::Result<Option<(String, Point)>> {
+        let ancestry = store
+            .ancestry(merge_parent.node_id())
+            .context(crate::error::StoreSnafu)?;
+        let Some((source_index, source_point)) =
+            self.first_materialized_ancestry_point(connection, mode, &ancestry)?
+        else {
+            return Ok(None);
+        };
+        Ok(ancestry
+            .get(source_index)
+            .map(|source| (source.id.clone(), source_point)))
     }
 
     fn try_append_new_branch_lane_in_transaction(
@@ -2058,17 +2129,28 @@ fn edge_key(
 }
 
 fn is_linear_append_chain(chain: &[Node]) -> bool {
-    chain.windows(2).all(|nodes| nodes[1].parent == nodes[0].id)
+    is_linear_primary_chain(chain)
         && chain
             .iter()
             .skip(1)
             .all(|node| node_anchor_merge_parent_count(node) == 0)
 }
 
+fn is_linear_primary_chain(chain: &[Node]) -> bool {
+    chain.windows(2).all(|nodes| nodes[1].parent == nodes[0].id)
+}
+
 fn node_anchor_merge_parent_count(node: &Node) -> usize {
     match &node.kind {
         Kind::Anchor(anchor) => anchor.merge_parents().len(),
         _ => 0,
+    }
+}
+
+fn node_anchor_merge_parents(node: &Node) -> &[MergeParent] {
+    match &node.kind {
+        Kind::Anchor(anchor) => anchor.merge_parents(),
+        _ => &[],
     }
 }
 
