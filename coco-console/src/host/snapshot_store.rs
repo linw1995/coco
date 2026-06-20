@@ -1827,6 +1827,7 @@ ORDER BY
             }
             next_lane_y += GRAPH_LANE_HEIGHT;
         }
+        self.prune_orphan_lanes_without_external_edges(connection, mode)?;
         let Some(materialized_nodes) =
             self.refresh_materialized_node_labels(connection, store, mode, session_states)?
         else {
@@ -2308,6 +2309,65 @@ WHERE mode = ? AND lane_label = ?
             })?;
         }
         Ok(())
+    }
+
+    fn prune_orphan_lanes_without_external_edges(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<()> {
+        let mut lanes = Vec::new();
+        for lane in self.materialized_lanes_in_connection(connection, mode)? {
+            if is_orphan_lane_label(&lane.lane_label)
+                && !self.lane_has_external_outgoing_edge(connection, mode, &lane.lane_label)?
+            {
+                lanes.push(lane);
+            }
+        }
+        self.delete_materialized_lanes(connection, mode, &lanes)
+    }
+
+    fn lane_has_external_outgoing_edge(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        lane_label: &str,
+    ) -> crate::Result<bool> {
+        let row = sql_query(
+            r#"
+SELECT 1 AS value
+FROM console_graph_edge_routes AS edge
+WHERE edge.mode = ?
+  AND EXISTS (
+      SELECT 1
+      FROM console_graph_node_locations AS source
+      WHERE source.mode = edge.mode
+        AND source.lane_label = ?
+        AND source.node_id = edge.source_id
+        AND source.x = edge.source_x
+        AND source.y = edge.source_y
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM console_graph_node_locations AS target
+      WHERE target.mode = edge.mode
+        AND target.lane_label = ?
+        AND target.node_id = edge.target_id
+        AND target.x = edge.target_x
+        AND target.y = edge.target_y
+  )
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(lane_label)
+        .bind::<Text, _>(lane_label)
+        .get_result::<SqliteInteger>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(row.is_some())
     }
 
     fn clear_materialized_mode_facts(
