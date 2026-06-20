@@ -84,7 +84,7 @@ pub struct DaemonServerOptions<'a> {
     pub channel_configs: &'a ChannelConfigs,
     pub console_config: Option<ConsoleConfig>,
     pub console_publisher: Option<ConsolePublisher>,
-    pub console_graph_store_path: Option<PathBuf>,
+    pub console_graph_store_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,7 +105,7 @@ pub async fn run_daemon_command<B, S>(
     provider_profiles: &ProviderProfiles,
     channel_configs: &ChannelConfigs,
     console_publisher: Option<ConsolePublisher>,
-    console_graph_store_path: Option<PathBuf>,
+    console_graph_store_path: PathBuf,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -547,7 +547,7 @@ where
                 options
                     .console_publisher
                     .expect("console publisher should exist when console is enabled"),
-                options.console_graph_store_path.clone(),
+                options.console_graph_store_path,
             )
             .context(ConsoleSnafu)?,
         ),
@@ -2331,7 +2331,7 @@ mod tests {
             &provider_profiles(),
             &ChannelConfigs::default(),
             None,
-            None,
+            PathBuf::from(".coco-store"),
         )
         .await
         .unwrap()
@@ -2399,7 +2399,7 @@ mod tests {
             &provider_profiles(),
             &ChannelConfigs::default(),
             None,
-            None,
+            PathBuf::from(".coco-store"),
         )
         .await
         .unwrap_err();

@@ -54,6 +54,7 @@ pub struct ConsoleGraphCache<S> {
 
 #[derive(Clone)]
 enum ConsoleGraphSource<S> {
+    #[allow(dead_code)]
     Store(S),
     PersistentStorePath(PathBuf),
 }
@@ -75,6 +76,7 @@ impl<S> ConsoleGraphCache<S>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
+    #[allow(dead_code)]
     pub(crate) fn new(store: S, invalidations: ConsolePublisher) -> Self {
         Self {
             source: ConsoleGraphSource::Store(store),

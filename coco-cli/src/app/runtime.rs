@@ -210,7 +210,7 @@ where
                 services.provider_profiles,
                 &Default::default(),
                 None,
-                None,
+                default_forwarded_store_path(),
             )
             .await
         }

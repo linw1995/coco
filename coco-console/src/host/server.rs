@@ -86,14 +86,26 @@ fn start_console_server<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    start_console_server_with_graph_store_path(config, store, publisher, None)
+    start_console_server_with_cache(config, ConsoleGraphCache::new(store, publisher))
 }
 
 pub fn start_console_server_with_graph_store_path<S>(
     config: ConsoleConfig,
     store: S,
     publisher: ConsolePublisher,
-    graph_store_path: Option<PathBuf>,
+    graph_store_path: PathBuf,
+) -> Result<ConsoleServerHandle>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let cache =
+        ConsoleGraphCache::new_with_persistent_store_path(store, publisher, graph_store_path)?;
+    start_console_server_with_cache(config, cache)
+}
+
+fn start_console_server_with_cache<S>(
+    config: ConsoleConfig,
+    cache: ConsoleGraphCache<S>,
 ) -> Result<ConsoleServerHandle>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -108,10 +120,6 @@ where
     let addr = listener
         .local_addr()
         .context(ConfigureConsoleSocketSnafu { addr: config.addr })?;
-    let cache = match graph_store_path {
-        Some(path) => ConsoleGraphCache::new_with_persistent_store_path(store, publisher, path)?,
-        None => ConsoleGraphCache::new(store, publisher),
-    };
     let state = AppState { cache };
     let task = tokio::spawn(async move {
         serve_console(listener, state)
