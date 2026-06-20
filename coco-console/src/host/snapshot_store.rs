@@ -679,117 +679,24 @@ LIMIT 1
         if meta.source_version >= 0 && source_version <= meta.source_version as u64 {
             return Ok(true);
         }
-        let mut materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
-        let branch_names = session_states
-            .iter()
-            .map(|(branch, _)| branch.clone())
-            .collect::<BTreeSet<_>>();
-        let removed_lanes = removed_lanes_in_order(&materialized_lanes, &branch_names);
-        if !removed_lanes.is_empty() {
-            self.delete_materialized_lanes(connection, mode, &removed_lanes)?;
-            self.shift_lanes_after_deletion(connection, mode, &removed_lanes)?;
-            materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
-        }
-        let materialized_lane_labels = materialized_lanes
-            .iter()
-            .map(|lane| lane.lane_label.clone())
-            .collect::<BTreeSet<_>>();
-        if !existing_branch_lanes_preserve_order(
+        let Some(materialized_lane_labels) =
+            self.prune_anchor_materialized_lanes(connection, session_states)?
+        else {
+            return Ok(false);
+        };
+        if !self.try_update_anchor_branch_lanes(
+            connection,
+            store,
             session_states,
-            &materialized_lanes,
-            &materialized_lane_labels,
-        ) {
+            materialized_lane_labels,
+        )? {
             return Ok(false);
         }
-
-        let mut materialized_lane_labels = materialized_lane_labels;
-        let mut next_lane_y = crate::layout::GRAPH_TOP_Y;
-        for (branch, state) in session_states {
-            let head_id = store
-                .get_branch_head(branch)
-                .context(crate::error::StoreSnafu)?;
-            let appended = if materialized_lane_labels.contains(branch) {
-                let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
-                let Some(visible_head) = self
-                    .first_materialized_lane_ancestry_node(connection, mode, branch, &ancestry)?
-                else {
-                    return Ok(false);
-                };
-                let Some(tail) = self.latest_lane_tail_in_connection(connection, mode, branch)?
-                else {
-                    return Ok(false);
-                };
-                if visible_head.x < tail.x {
-                    self.delete_materialized_lane_suffix(
-                        connection,
-                        mode,
-                        branch,
-                        visible_head.x,
-                        visible_head.y,
-                    )?;
-                }
-                self.try_append_anchor_branch_after_row(
-                    connection,
-                    store,
-                    AppendLinearBranchInput {
-                        mode,
-                        branch,
-                        state,
-                        head_id: &head_id,
-                    },
-                    visible_head,
-                )?
-            } else {
-                self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
-                let appended = self.try_append_new_anchor_branch_lane_in_transaction(
-                    connection,
-                    store,
-                    AppendLinearBranchInput {
-                        mode,
-                        branch,
-                        state,
-                        head_id: &head_id,
-                    },
-                    next_lane_y,
-                )?;
-                if appended {
-                    materialized_lane_labels.insert(branch.clone());
-                }
-                appended
-            };
-            if !appended {
-                return Ok(false);
-            }
-            next_lane_y += GRAPH_LANE_HEIGHT;
-        }
-
-        let mut labels_by_node_id = BTreeMap::<String, Vec<String>>::new();
-        for (branch, state) in session_states {
-            let head_id = store
-                .get_branch_head(branch)
-                .context(crate::error::StoreSnafu)?;
-            let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
-            let Some(row) =
-                self.first_materialized_lane_ancestry_node(connection, mode, branch, &ancestry)?
-            else {
-                return Ok(false);
-            };
-            labels_by_node_id
-                .entry(row.node_id)
-                .or_default()
-                .push(branch_label(branch, state));
-        }
-        for labels in labels_by_node_id.values_mut() {
-            labels.sort();
-        }
-        let materialized_nodes = self.materialized_node_rows_in_connection(connection, mode)?;
-        for row in &materialized_nodes {
-            let labels = labels_by_node_id
-                .get(&row.node_id)
-                .cloned()
-                .unwrap_or_default();
-            self.update_node_labels(connection, mode, &row.node_key, labels)?;
-        }
+        let Some(materialized_nodes) =
+            self.refresh_anchor_node_labels(connection, store, session_states)?
+        else {
+            return Ok(false);
+        };
         let world_max_x = materialized_nodes
             .iter()
             .map(|row| row.x)
@@ -814,6 +721,160 @@ LIMIT 1
             },
         )?;
         Ok(true)
+    }
+
+    fn prune_anchor_materialized_lanes(
+        &self,
+        connection: &mut SqliteConnection,
+        session_states: &[(String, SessionState)],
+    ) -> crate::Result<Option<BTreeSet<String>>> {
+        let mode = GraphMode::Anchors;
+        let mut materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
+        let branch_names = session_states
+            .iter()
+            .map(|(branch, _)| branch.clone())
+            .collect::<BTreeSet<_>>();
+        let removed_lanes = removed_lanes_in_order(&materialized_lanes, &branch_names);
+        if !removed_lanes.is_empty() {
+            self.delete_materialized_lanes(connection, mode, &removed_lanes)?;
+            self.shift_lanes_after_deletion(connection, mode, &removed_lanes)?;
+            materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
+        }
+        let materialized_lane_labels = materialized_lanes
+            .iter()
+            .map(|lane| lane.lane_label.clone())
+            .collect::<BTreeSet<_>>();
+        if !existing_branch_lanes_preserve_order(
+            session_states,
+            &materialized_lanes,
+            &materialized_lane_labels,
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(materialized_lane_labels))
+    }
+
+    fn try_update_anchor_branch_lanes(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &(impl BranchStore + NodeStore),
+        session_states: &[(String, SessionState)],
+        materialized_lane_labels: BTreeSet<String>,
+    ) -> crate::Result<bool> {
+        let mode = GraphMode::Anchors;
+        let mut materialized_lane_labels = materialized_lane_labels;
+        let mut next_lane_y = crate::layout::GRAPH_TOP_Y;
+        for (branch, state) in session_states {
+            let head_id = store
+                .get_branch_head(branch)
+                .context(crate::error::StoreSnafu)?;
+            let appended = if materialized_lane_labels.contains(branch) {
+                self.try_update_existing_anchor_branch_lane(
+                    connection,
+                    store,
+                    AppendLinearBranchInput {
+                        mode,
+                        branch,
+                        state,
+                        head_id: &head_id,
+                    },
+                )?
+            } else {
+                self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
+                let appended = self.try_append_new_anchor_branch_lane_in_transaction(
+                    connection,
+                    store,
+                    AppendLinearBranchInput {
+                        mode,
+                        branch,
+                        state,
+                        head_id: &head_id,
+                    },
+                    next_lane_y,
+                )?;
+                if appended {
+                    materialized_lane_labels.insert(branch.clone());
+                }
+                appended
+            };
+            if !appended {
+                return Ok(false);
+            }
+            next_lane_y += GRAPH_LANE_HEIGHT;
+        }
+        Ok(true)
+    }
+
+    fn try_update_existing_anchor_branch_lane(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        input: AppendLinearBranchInput<'_>,
+    ) -> crate::Result<bool> {
+        let ancestry = store
+            .ancestry(input.head_id)
+            .context(crate::error::StoreSnafu)?;
+        let Some(visible_head) = self.first_materialized_lane_ancestry_node(
+            connection,
+            input.mode,
+            input.branch,
+            &ancestry,
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(tail) =
+            self.latest_lane_tail_in_connection(connection, input.mode, input.branch)?
+        else {
+            return Ok(false);
+        };
+        if visible_head.x < tail.x {
+            self.delete_materialized_lane_suffix(
+                connection,
+                input.mode,
+                input.branch,
+                visible_head.x,
+                visible_head.y,
+            )?;
+        }
+        self.try_append_anchor_branch_after_row(connection, store, input, visible_head)
+    }
+
+    fn refresh_anchor_node_labels(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &(impl BranchStore + NodeStore),
+        session_states: &[(String, SessionState)],
+    ) -> crate::Result<Option<Vec<MaterializedTailNodeRow>>> {
+        let mode = GraphMode::Anchors;
+        let mut labels_by_node_id = BTreeMap::<String, Vec<String>>::new();
+        for (branch, state) in session_states {
+            let head_id = store
+                .get_branch_head(branch)
+                .context(crate::error::StoreSnafu)?;
+            let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+            let Some(row) =
+                self.first_materialized_lane_ancestry_node(connection, mode, branch, &ancestry)?
+            else {
+                return Ok(None);
+            };
+            labels_by_node_id
+                .entry(row.node_id)
+                .or_default()
+                .push(branch_label(branch, state));
+        }
+        for labels in labels_by_node_id.values_mut() {
+            labels.sort();
+        }
+        let materialized_nodes = self.materialized_node_rows_in_connection(connection, mode)?;
+        for row in &materialized_nodes {
+            let labels = labels_by_node_id
+                .get(&row.node_id)
+                .cloned()
+                .unwrap_or_default();
+            self.update_node_labels(connection, mode, &row.node_key, labels)?;
+        }
+        Ok(Some(materialized_nodes))
     }
 
     fn try_append_new_anchor_branch_lane_in_transaction(
