@@ -550,6 +550,13 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
+    if query.get("target").is_none() {
+        return html_response(render_provider_context_fragment(
+            &loading_snapshot(mode, state.cache.current_version()),
+            None,
+            query.get("context"),
+        ));
+    }
     let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
@@ -950,7 +957,7 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 mod tests {
     use super::{
         AppState, fragment, graph_json, graph_viewport_diff_response,
-        graph_viewport_items_diff_response_from_query, node_detail, parse_query,
+        graph_viewport_items_diff_response_from_query, node_detail, parse_query, provider_context,
         start_console_server, viewport_diff_has_changes, viewport_diff_request_from_query,
     };
     use crate::api::{
@@ -1804,6 +1811,45 @@ mod tests {
             response.contains("Select a node to inspect its provider context."),
             "{response}"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_context_default_avoids_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        writer.fork("main", &writer.root_id()).unwrap();
+        publisher.mark_changed();
+        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        seed_cache.current_snapshot(GraphMode::All).await;
+        drop(seed_cache);
+
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+
+        let response = provider_context(State(state.clone()), RawQuery(None)).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            html.contains("Select a node to inspect its provider context."),
+            "{html}"
+        );
+        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]
