@@ -2371,6 +2371,57 @@ ORDER BY
             return Ok(false);
         }
 
+        if !self.try_update_all_branch_lanes(
+            connection,
+            store,
+            session_states,
+            materialized_lane_labels,
+        )? {
+            return Ok(false);
+        }
+        self.prune_removable_derived_lanes(connection, mode)?;
+        self.rebalance_routed_edge_slots(connection, mode)?;
+        let Some(materialized_nodes) =
+            self.refresh_materialized_node_labels(connection, store, mode, session_states)?
+        else {
+            return Ok(false);
+        };
+        let world_max_x = materialized_nodes
+            .iter()
+            .map(|row| row.x)
+            .max()
+            .unwrap_or(meta.world_max_x - 120)
+            + 120;
+        let world_max_y = self
+            .materialized_lanes_in_connection(connection, mode)?
+            .iter()
+            .map(|lane| lane.lane_y)
+            .max()
+            .unwrap_or(crate::layout::GRAPH_TOP_Y - GRAPH_LANE_HEIGHT)
+            + 120;
+
+        self.put_materialization_meta(
+            connection,
+            MaterializationMetaInput {
+                source_version,
+                mode,
+                world_min_x: meta.world_min_x,
+                world_min_y: meta.world_min_y,
+                world_max_x,
+                world_max_y,
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn try_update_all_branch_lanes(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &(impl BranchStore + NodeStore),
+        session_states: &[(String, SessionState)],
+        materialized_lane_labels: BTreeSet<String>,
+    ) -> crate::Result<bool> {
+        let mode = GraphMode::All;
         let mut materialized_lane_labels = materialized_lane_labels;
         let mut next_lane_y = crate::layout::GRAPH_TOP_Y;
         for (branch, state) in session_states {
@@ -2426,38 +2477,6 @@ ORDER BY
                 next_lane_y += GRAPH_LANE_HEIGHT;
             }
         }
-        self.prune_removable_derived_lanes(connection, mode)?;
-        self.rebalance_routed_edge_slots(connection, mode)?;
-        let Some(materialized_nodes) =
-            self.refresh_materialized_node_labels(connection, store, mode, session_states)?
-        else {
-            return Ok(false);
-        };
-        let world_max_x = materialized_nodes
-            .iter()
-            .map(|row| row.x)
-            .max()
-            .unwrap_or(meta.world_max_x - 120)
-            + 120;
-        let world_max_y = self
-            .materialized_lanes_in_connection(connection, mode)?
-            .iter()
-            .map(|lane| lane.lane_y)
-            .max()
-            .unwrap_or(crate::layout::GRAPH_TOP_Y - GRAPH_LANE_HEIGHT)
-            + 120;
-
-        self.put_materialization_meta(
-            connection,
-            MaterializationMetaInput {
-                source_version,
-                mode,
-                world_min_x: meta.world_min_x,
-                world_min_y: meta.world_min_y,
-                world_max_x,
-                world_max_y,
-            },
-        )?;
         Ok(true)
     }
 
