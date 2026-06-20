@@ -3351,7 +3351,7 @@ WHERE mode = ? AND node_key = ?
         mode: GraphMode,
         lane_key: &str,
     ) -> crate::Result<()> {
-        if !is_orphan_lane_key(lane_key) {
+        if !is_derived_lane_key(lane_key) {
             return Ok(());
         }
         let nodes =
@@ -3366,6 +3366,9 @@ WHERE mode = ? AND node_key = ?
             covered_prefix.push((node.clone(), cover));
         }
         if covered_prefix.is_empty() || covered_prefix.len() == nodes.len() {
+            return Ok(());
+        }
+        if is_skill_invocation_lane_key(lane_key) && covered_prefix.len() < 2 {
             return Ok(());
         }
 

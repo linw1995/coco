@@ -303,6 +303,11 @@ where
                 let Some(node_id) = node_id_from_graph_target(target) else {
                     return Ok(None);
                 };
+                if snapshots.has_materialization(mode)?
+                    && !self.node_is_in_materialized_provider_context(snapshots, mode, &node_id)?
+                {
+                    return Ok(None);
+                }
                 (node_id, Vec::new())
             }
         };
@@ -310,6 +315,30 @@ where
             Ok(node) => Ok(Some(graph_node_from_node(node, labels, Vec::new()))),
             Err(_) => Ok(None),
         }
+    }
+
+    fn node_is_in_materialized_provider_context(
+        &self,
+        snapshots: &ConsoleGraphSnapshotStore,
+        mode: GraphMode,
+        node_id: &str,
+    ) -> crate::Result<bool> {
+        let Some(selection) = self
+            .source
+            .clone()
+            .provider_context_for_node(node_id, None)?
+        else {
+            return Ok(false);
+        };
+        let node_ids = selection
+            .context
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        Ok(!snapshots
+            .materialized_node_points(mode, &node_ids)?
+            .is_empty())
     }
 
     pub(crate) fn provider_context_current_ready_or_schedule(
@@ -2853,6 +2882,167 @@ mod tests {
                 .any(|lane| lane.label == main_skill_lane)
         );
         assert_eq!(compacted_draft_skill_y, main_skill_y);
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_trims_skill_prefix_when_branch_adopts_result_middle() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let tool_use = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "tool-1".to_owned(),
+                    name: "skill".to_owned(),
+                    input: json!({}),
+                }),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        let invocation = writer
+            .append(NewNode {
+                parent: tool_use.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    Vec::new(),
+                    SkillInvocationAnchor {
+                        skill_name: "fast-rust".to_owned(),
+                        mode: SkillInvocationMode::InheritContext,
+                    },
+                )),
+            })
+            .unwrap();
+        let result_first = writer
+            .append(NewNode {
+                parent: invocation.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_result(
+                    Vec::new(),
+                    SkillResultAnchor {
+                        skill_name: "fast-rust".to_owned(),
+                        output: "first".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        let result_second = writer
+            .append(NewNode {
+                parent: result_first.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_result(
+                    Vec::new(),
+                    SkillResultAnchor {
+                        skill_name: "fast-rust".to_owned(),
+                        output: "second".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        publisher.mark_changed();
+        let initial = cache
+            .viewport_after(
+                GraphMode::All,
+                0,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let skill_lane = format!("skill {}", crate::graph::shorten_id(&result_second));
+        assert!(initial.lanes.iter().any(|lane| lane.label == skill_lane));
+
+        writer.fork("draft", &result_first).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let draft_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "draft")
+            .unwrap()
+            .y;
+        let skill_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == skill_lane)
+            .unwrap()
+            .y;
+
+        assert_eq!(viewport.version, target_version);
+        assert!(
+            viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == invocation && node.y == draft_y)
+        );
+        assert!(
+            viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == result_first && node.y == draft_y)
+        );
+        assert!(
+            viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == result_second && node.y == skill_y)
+        );
+        assert!(
+            !viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == invocation && node.y == skill_y)
+        );
+        assert!(
+            !viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == result_first && node.y == skill_y)
+        );
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == result_first
+                && edge.source.y == draft_y
+                && edge.target_id == result_second
+                && edge.target.y == skill_y
+                && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+        }));
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)

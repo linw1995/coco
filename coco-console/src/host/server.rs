@@ -2090,6 +2090,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_detail_ignores_hidden_node_outside_current_materialized_context() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let hidden_text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("stale hidden materialized detail".to_owned()),
+            })
+            .unwrap();
+        let prompt = writer
+            .append(NewNode {
+                parent: hidden_text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "visible prompt before rewind".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &prompt).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher.clone(),
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        let initial = state.cache.current_snapshot(GraphMode::Anchors).await;
+        writer.set_branch_head("main", &prompt, &session).unwrap();
+        publisher.mark_changed();
+        state
+            .cache
+            .viewport_after(
+                GraphMode::Anchors,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        let detail = state
+            .cache
+            .node_detail_current_ready_or_schedule(
+                GraphMode::Anchors,
+                &node_target_id(&hidden_text),
+            )
+            .unwrap();
+
+        assert!(detail.is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn handle_connection_serves_provider_context_fragment() {
         let response = response_from(get_request("/api/provider-context").as_bytes()).await;
 
