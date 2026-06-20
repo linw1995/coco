@@ -436,13 +436,20 @@ where
         loop {
             let mut rx = self.ready.subscribe();
             let mut invalidations = self.invalidations.subscribe();
+            let mut progress = self.progress.subscribe();
             if let Some(response) = self.viewport_current_ready_or_schedule(mode, request)
                 && response.version > observed_version
             {
                 return Ok(response);
             }
+            self.fail_if_materialization_failed(mode, observed_version)?;
             tokio::select! {
                 changed = rx.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                }
+                changed = progress.changed() => {
                     if changed.is_err() {
                         continue;
                     }
@@ -483,14 +490,21 @@ where
         loop {
             let mut rx = self.ready.subscribe();
             let mut invalidations = self.invalidations.subscribe();
+            let mut progress = self.progress.subscribe();
             if let Some(response) =
                 self.viewport_diff_current_ready_or_schedule(mode, request.clone())
                 && response.version > observed_version
             {
                 return Ok(response);
             }
+            self.fail_if_materialization_failed(mode, observed_version)?;
             tokio::select! {
                 changed = rx.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                }
+                changed = progress.changed() => {
                     if changed.is_err() {
                         continue;
                     }
@@ -801,6 +815,32 @@ where
         }) == Some(source_version)
     }
 
+    fn fail_if_materialization_failed(
+        &self,
+        mode: GraphMode,
+        observed_version: u64,
+    ) -> crate::Result<()> {
+        let status = {
+            let state = self
+                .state
+                .lock()
+                .expect("console graph cache lock poisoned");
+            state.rebuild_slot(mode).as_ref().cloned()
+        };
+        if let Some(status) = status
+            && status.state == ConsoleGraphRebuildState::Failed
+            && status.source_version > observed_version
+        {
+            crate::error::ConsoleGraphRebuildSnafu {
+                mode: mode.as_query_value(),
+                source_version: status.source_version,
+                message: status.message,
+            }
+            .fail()?;
+        }
+        Ok(())
+    }
+
     fn mark_rebuild_scheduled(&self, mode: GraphMode, source_version: u64) -> bool {
         let mut state = self
             .state
@@ -818,7 +858,9 @@ where
             status.source_version == source_version
                 && matches!(
                     status.state,
-                    ConsoleGraphRebuildState::Scheduled | ConsoleGraphRebuildState::Building
+                    ConsoleGraphRebuildState::Scheduled
+                        | ConsoleGraphRebuildState::Building
+                        | ConsoleGraphRebuildState::Failed
                 )
         }) {
             return false;
@@ -2064,6 +2106,48 @@ mod tests {
                 && status.source_version == target_version
                 && status.state == ConsoleGraphRebuildState::Failed
         }));
+        let viewport_error = tokio::time::timeout(
+            Duration::from_millis(200),
+            cache.viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            ),
+        )
+        .await
+        .expect("failed materialization viewport wait should not hang")
+        .unwrap_err();
+        assert!(matches!(
+            viewport_error,
+            crate::error::Error::ConsoleGraphRebuild {
+                source_version,
+                message,
+                ..
+            } if source_version == target_version && message.contains("could not apply")
+        ));
+        let diff_error = tokio::time::timeout(
+            Duration::from_millis(200),
+            cache.viewport_diff_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportDiffRequest {
+                    previous: crate::host::api::GraphViewportRequest::default(),
+                    current: crate::host::api::GraphViewportRequest::default(),
+                    known: None,
+                },
+            ),
+        )
+        .await
+        .expect("failed materialization viewport diff wait should not hang")
+        .unwrap_err();
+        assert!(matches!(
+            diff_error,
+            crate::error::Error::ConsoleGraphRebuild {
+                source_version,
+                message,
+                ..
+            } if source_version == target_version && message.contains("could not apply")
+        ));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
