@@ -224,6 +224,11 @@ where
         self.latest_cached_snapshot(mode)
     }
 
+    pub fn snapshot_current_ready(&self, mode: GraphMode) -> Option<Arc<GraphSnapshot>> {
+        let source_version = self.invalidations.current_version();
+        self.cached_snapshot(mode, source_version)
+    }
+
     pub async fn snapshot_after(
         &self,
         mode: GraphMode,

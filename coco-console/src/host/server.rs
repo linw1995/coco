@@ -456,14 +456,38 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
-    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => {
-            return html_response(render_loading_fragment(mode, state.cache.current_version()));
+    match query.version() {
+        Some(version) => {
+            if let Some(snapshot) = state.cache.snapshot_current_ready(mode)
+                && snapshot.version > version
+            {
+                return html_response(render_fragment(&snapshot));
+            }
+            let materialized = match state
+                .cache
+                .viewport_after(mode, version, GraphViewportRequest::default())
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => return plain_error(error.to_string()),
+            };
+            if let Some(snapshot) = state.cache.snapshot_current_ready(mode)
+                && snapshot.version >= materialized.version
+            {
+                return html_response(render_fragment(&snapshot));
+            }
+            html_response(render_loading_fragment(mode, materialized.version))
         }
-        Err(error) => return plain_error(error.to_string()),
-    };
-    html_response(render_fragment(&snapshot))
+        None => {
+            if let Some(snapshot) = state.cache.snapshot_current_ready(mode) {
+                return html_response(render_fragment(&snapshot));
+            }
+            let _ = state
+                .cache
+                .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
+            html_response(render_loading_fragment(mode, state.cache.current_version()))
+        }
+    }
 }
 
 async fn node_detail<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
@@ -893,9 +917,9 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, graph_viewport_diff_response, graph_viewport_items_diff_response_from_query,
-        parse_query, start_console_server, viewport_diff_has_changes,
-        viewport_diff_request_from_query,
+        AppState, fragment, graph_viewport_diff_response,
+        graph_viewport_items_diff_response_from_query, parse_query, start_console_server,
+        viewport_diff_has_changes, viewport_diff_request_from_query,
     };
     use crate::api::{
         GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
@@ -905,8 +929,14 @@ mod tests {
     use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
     use crate::layout::layout_graph_viewport;
     use crate::{ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleStore};
-    use coco_mem::{BranchStore, Kind, MemoryStore, NewNode, NodeStore, Role, Store};
+    use axum::body::to_bytes;
+    use axum::extract::{RawQuery, State};
+    use coco_mem::{
+        BranchStore, Kind, MemoryStore, NewNode, NodeStore, PersistentStore, Role, Store,
+    };
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
 
@@ -967,6 +997,17 @@ mod tests {
         AppState {
             cache: ConsoleGraphCache::new(store, publisher),
         }
+    }
+
+    fn temp_store_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "coco-console-server-test-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     async fn response_bytes_from(bytes: &[u8]) -> Vec<u8> {
@@ -1599,6 +1640,33 @@ mod tests {
             "{response}"
         );
         assert!(response.contains("data-version=\"0\""), "{response}");
+    }
+
+    #[tokio::test]
+    async fn fragment_schedules_materialization_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        writer.fork("main", &writer.root_id()).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+
+        let response = fragment(State(state.clone()), RawQuery(None)).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("Loading graph"));
+        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]
