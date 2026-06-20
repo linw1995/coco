@@ -269,13 +269,20 @@ where
                 }));
         };
         self.ensure_viewport_current(mode);
-        let Some(reference) = snapshots.materialized_node_reference(mode, target)? else {
-            return Ok(None);
+        let reference = snapshots.materialized_node_reference(mode, target)?;
+        let (node_id, labels) = match reference {
+            Some(reference) => (reference.node_id, reference.labels),
+            None => {
+                let Some(node_id) = node_id_from_graph_target(target) else {
+                    return Ok(None);
+                };
+                (node_id, Vec::new())
+            }
         };
-        self.source
-            .clone()
-            .get_node(&reference.node_id)
-            .map(|node| Some(graph_node_from_node(node, reference.labels, Vec::new())))
+        match self.source.clone().get_node(&node_id) {
+            Ok(node) => Ok(Some(graph_node_from_node(node, labels, Vec::new()))),
+            Err(_) => Ok(None),
+        }
     }
 
     pub(crate) fn provider_context_current_ready_or_schedule(

@@ -245,9 +245,6 @@ where
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
     if state.cache.has_materialized_viewports() {
-        if let Some(snapshot) = state.cache.snapshot_current_ready(mode) {
-            return json_response(&snapshot, "graph");
-        }
         let _ = state
             .cache
             .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
@@ -535,9 +532,6 @@ where
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
     if state.cache.has_materialized_viewports() {
-        if let Some(snapshot) = state.cache.snapshot_current_ready(mode) {
-            return html_response(render_node_detail_fragment(&snapshot, query.get("target")));
-        }
         let Some(target) = query.get("target") else {
             return html_response(render_node_detail_fragment(
                 &loading_snapshot(mode, state.cache.current_version()),
@@ -1658,6 +1652,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_json_ignores_cached_full_snapshot_in_materialized_mode() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("cached full snapshot node".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &root, &text).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        state.cache.current_snapshot(GraphMode::All).await;
+
+        let response =
+            graph_json(State(state.clone()), RawQuery(Some("mode=all".to_owned()))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(json.contains("\"nodes\":[]"), "{json}");
+        assert!(!json.contains("cached full snapshot node"), "{json}");
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn handle_connection_serves_graph_viewport_json() {
         let response = response_from(
             get_request("/api/graph/viewport?x=10&y=20&width=640&height=360&overscan=40")
@@ -1925,6 +1958,70 @@ mod tests {
 
         assert!(html.contains("single node detail"), "{html}");
         assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_detail_reads_hidden_context_node_incrementally() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let hidden_text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("hidden targeted materialized detail".to_owned()),
+            })
+            .unwrap();
+        let prompt = writer
+            .append(NewNode {
+                parent: hidden_text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "visible prompt after hidden detail".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &prompt).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        state.cache.current_snapshot(GraphMode::Anchors).await;
+        let query = format!("mode=anchors&target={}", node_target_id(&hidden_text));
+
+        let response = node_detail(State(state.clone()), RawQuery(Some(query))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            html.contains("hidden targeted materialized detail"),
+            "{html}"
+        );
+        assert!(html.contains("<dd>None</dd>"), "{html}");
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
