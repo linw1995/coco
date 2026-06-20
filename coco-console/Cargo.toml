@@ -25,6 +25,7 @@ futures-util = "0.3.32"
 leptos.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+diesel.workspace = true
 
 # Error handling.
 snafu.workspace = true

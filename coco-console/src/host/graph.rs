@@ -4,7 +4,7 @@ use coco_mem::{
     Anchor, AnchorPayload, BranchStore, Kind, ManyOrOne, MergeParent, Node, NodeStore, PauseReason,
     SessionAnchor, SessionState, SessionStore, ToolResult, ToolUse,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
 use crate::Result;
@@ -12,7 +12,7 @@ use crate::error::StoreSnafu;
 
 const SUMMARY_LIMIT: usize = 140;
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphMode {
     Anchors,
@@ -35,7 +35,7 @@ impl GraphMode {
     }
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct GraphSnapshot {
     pub version: u64,
     pub mode: GraphMode,
@@ -46,7 +46,7 @@ pub struct GraphSnapshot {
     pub provider_contexts: Vec<GraphProviderContext>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphBuildPhase {
     Branches,
@@ -66,14 +66,14 @@ impl GraphBuildPhase {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphBuildProgress {
     pub phase: GraphBuildPhase,
     pub processed: usize,
     pub total: usize,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct GraphNode {
     pub id: String,
     pub short_id: String,
@@ -87,13 +87,13 @@ pub struct GraphNode {
     pub provider_context_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphProviderContext {
     pub id: String,
     pub nodes: Vec<GraphProviderContextNode>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphProviderContextNode {
     pub id: String,
     pub short_id: String,
@@ -106,14 +106,14 @@ pub struct GraphProviderContextNode {
     pub visible: bool,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphEdge {
     pub source: String,
     pub target: String,
     pub kind: GraphEdgeKind,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphEdgeKind {
     Primary,
@@ -121,7 +121,7 @@ pub enum GraphEdgeKind {
     Shadow,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct GraphBranch {
     pub name: String,
     pub head_id: String,

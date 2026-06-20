@@ -18,7 +18,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::Result;
-use crate::api::{GraphCanvas, GraphViewportDiffResponse, GraphViewportResponse};
+use crate::api::{
+    GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportItems,
+    GraphViewportResponse,
+};
 use crate::config::ConsoleConfig;
 use crate::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
@@ -26,11 +29,10 @@ use crate::error::{
 use crate::graph::{GraphMode, GraphSnapshot};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::cache::ConsoleGraphCache;
-use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
 use crate::render::{
-    render_fragment, render_index_page, render_node_detail_fragment,
-    render_provider_context_fragment,
+    render_fragment, render_loading_fragment, render_loading_index_page,
+    render_node_detail_fragment, render_provider_context_fragment,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -104,7 +106,7 @@ where
         .local_addr()
         .context(ConfigureConsoleSocketSnafu { addr: config.addr })?;
     let cache = match graph_store_path {
-        Some(path) => ConsoleGraphCache::new_with_persistent_store_path(store, publisher, path),
+        Some(path) => ConsoleGraphCache::new_with_persistent_store_path(store, publisher, path)?,
         None => ConsoleGraphCache::new(store, publisher),
     };
     let state = AppState { cache };
@@ -220,11 +222,10 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
-    let snapshot = match state.cache.snapshot_current(mode).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return plain_error(error.to_string()),
-    };
-    html_response(render_index_page(&snapshot))
+    html_response(render_loading_index_page(
+        mode,
+        state.cache.current_version(),
+    ))
 }
 
 async fn style_css() -> Response {
@@ -240,13 +241,15 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let snapshot = match state
-        .cache
-        .snapshot_current(graph_mode_from_query(&query))
-        .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => return plain_error(error.to_string()),
+    let mode = graph_mode_from_query(&query);
+    let snapshot = match state.cache.snapshot_current_ready_or_schedule(mode) {
+        Some(snapshot) => snapshot,
+        None => {
+            return json_response(
+                &loading_snapshot(mode, state.cache.current_version()),
+                "graph",
+            );
+        }
     };
     json_response(&snapshot, "graph")
 }
@@ -257,22 +260,36 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
-    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return plain_error(error.to_string()),
-    };
-    let response = match layout_graph_viewport_with_cache(
-        &state.cache,
-        mode,
-        snapshot,
-        viewport_request_from_query(&query),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => return plain_error(error.to_string()),
+    let request = viewport_request_from_query(&query);
+    let response = match query.version() {
+        Some(version) => match state.cache.viewport_after(mode, version, request).await {
+            Ok(response) => response,
+            Err(error) => return plain_error(error.to_string()),
+        },
+        None => match state
+            .cache
+            .viewport_current_ready_or_schedule(mode, request)
+        {
+            Some(response) => response,
+            None => {
+                return json_response(
+                    &empty_graph_viewport_response(state.cache.current_version(), request),
+                    "graph viewport",
+                );
+            }
+        },
     };
     json_response(&response, "graph viewport")
+}
+
+fn empty_graph_viewport_diff_pending_response(
+    version: u64,
+    request: GraphViewportDiffRequest,
+) -> Response {
+    json_response(
+        &empty_graph_viewport_diff_response(version, request),
+        "graph viewport diff",
+    )
 }
 
 async fn graph_viewport_diff_get<S>(
@@ -331,15 +348,18 @@ where
 {
     let request = viewport_diff_request_from_query(&query);
     let mode = graph_mode_from_query(&query);
-    let snapshot = match state.cache.snapshot_current(mode).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return plain_error(error.to_string()),
+    let response = match state
+        .cache
+        .viewport_diff_current_ready_or_schedule(mode, request.clone())
+    {
+        Some(response) => response,
+        None => {
+            return empty_graph_viewport_diff_pending_response(
+                state.cache.current_version(),
+                request,
+            );
+        }
     };
-    let response =
-        match layout_graph_viewport_diff_with_cache(&state.cache, mode, snapshot, request).await {
-            Ok(response) => response,
-            Err(error) => return plain_error(error.to_string()),
-        };
     json_response(&response, "graph viewport diff")
 }
 
@@ -376,17 +396,10 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     loop {
-        let snapshot = match state.cache.snapshot_after(mode, observed_version).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return plain_error(error.to_string()),
-        };
-        let response = match layout_graph_viewport_diff_with_cache(
-            &state.cache,
-            mode,
-            snapshot,
-            request.clone(),
-        )
-        .await
+        let response = match state
+            .cache
+            .viewport_diff_after(mode, observed_version, request.clone())
+            .await
         {
             Ok(response) => response,
             Err(error) => return plain_error(error.to_string()),
@@ -437,44 +450,19 @@ fn viewport_diff_has_fingerprint_changes(
     })
 }
 
-async fn layout_graph_viewport_with_cache<S>(
-    cache: &ConsoleGraphCache<S>,
-    _mode: GraphMode,
-    snapshot: Arc<GraphSnapshot>,
-    request: GraphViewportRequest,
-) -> Result<GraphViewportResponse>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    cache
-        .run_blocking_graph_compute(move || layout_graph_viewport(&snapshot, request))
-        .await
-}
-
-async fn layout_graph_viewport_diff_with_cache<S>(
-    cache: &ConsoleGraphCache<S>,
-    _mode: GraphMode,
-    snapshot: Arc<GraphSnapshot>,
-    request: GraphViewportDiffRequest,
-) -> Result<GraphViewportDiffResponse>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    cache
-        .run_blocking_graph_compute(move || layout_graph_viewport_diff(&snapshot, request))
-        .await
-}
-
 async fn fragment<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let snapshot =
-        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return plain_error(error.to_string()),
-        };
+    let mode = graph_mode_from_query(&query);
+    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return html_response(render_loading_fragment(mode, state.cache.current_version()));
+        }
+        Err(error) => return plain_error(error.to_string()),
+    };
     html_response(render_fragment(&snapshot))
 }
 
@@ -483,11 +471,17 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let snapshot =
-        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return plain_error(error.to_string()),
-        };
+    let mode = graph_mode_from_query(&query);
+    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return html_response(render_node_detail_fragment(
+                &loading_snapshot(mode, state.cache.current_version()),
+                query.get("target"),
+            ));
+        }
+        Err(error) => return plain_error(error.to_string()),
+    };
     html_response(render_node_detail_fragment(&snapshot, query.get("target")))
 }
 
@@ -499,11 +493,18 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let snapshot =
-        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return plain_error(error.to_string()),
-        };
+    let mode = graph_mode_from_query(&query);
+    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return html_response(render_provider_context_fragment(
+                &loading_snapshot(mode, state.cache.current_version()),
+                query.get("target"),
+                query.get("context"),
+            ));
+        }
+        Err(error) => return plain_error(error.to_string()),
+    };
     html_response(render_provider_context_fragment(
         &snapshot,
         query.get("target"),
@@ -581,17 +582,86 @@ where
     Event::default().event("graph-progress").data(data)
 }
 
+fn loading_snapshot(mode: GraphMode, version: u64) -> GraphSnapshot {
+    GraphSnapshot {
+        version,
+        mode,
+        root_id: String::new(),
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        branches: Vec::new(),
+        provider_contexts: Vec::new(),
+    }
+}
+
+fn empty_graph_viewport_response(
+    version: u64,
+    request: GraphViewportRequest,
+) -> GraphViewportResponse {
+    let request = request.normalized();
+    GraphViewportResponse {
+        version,
+        canvas: empty_graph_canvas(request),
+        viewport: GraphViewport {
+            x: request.x,
+            y: request.y,
+            width: request.width,
+            height: request.height,
+            overscan: request.overscan,
+        },
+        lanes: Vec::new(),
+        nodes: Vec::new(),
+        edges: Vec::new(),
+    }
+}
+
+fn empty_graph_viewport_diff_response(
+    version: u64,
+    request: GraphViewportDiffRequest,
+) -> GraphViewportDiffResponse {
+    let previous = request.previous.normalized();
+    let current = request.current.normalized();
+    GraphViewportDiffResponse {
+        version,
+        canvas: empty_graph_canvas(current),
+        previous_viewport: GraphViewport {
+            x: previous.x,
+            y: previous.y,
+            width: previous.width,
+            height: previous.height,
+            overscan: previous.overscan,
+        },
+        viewport: GraphViewport {
+            x: current.x,
+            y: current.y,
+            width: current.width,
+            height: current.height,
+            overscan: current.overscan,
+        },
+        added: GraphViewportItems::default(),
+        updated: GraphViewportItems::default(),
+        removed: Vec::new(),
+    }
+}
+
+fn empty_graph_canvas(request: GraphViewportRequest) -> GraphCanvas {
+    GraphCanvas {
+        width: request.width.max(1),
+        height: request.height.max(1),
+    }
+}
+
 async fn graph_snapshot_for_query<S>(
     cache: &ConsoleGraphCache<S>,
     mode: GraphMode,
     query: &QueryParams,
-) -> Result<Arc<GraphSnapshot>>
+) -> Result<Option<Arc<GraphSnapshot>>>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
     match query.version() {
-        Some(version) => cache.snapshot_after(mode, version).await,
-        None => cache.snapshot_current(mode).await,
+        Some(version) => cache.snapshot_after(mode, version).await.map(Some),
+        None => Ok(cache.snapshot_current_ready_or_schedule(mode)),
     }
 }
 
@@ -1166,8 +1236,11 @@ mod tests {
         .await;
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"kind\":\"node\""), "{response}");
-        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(response.contains("\"removed\":[]"), "{response}");
+        assert!(
+            !response.contains("\"key\":\"node:stale\""),
+            "pending snapshots must not remove previously rendered items: {response}"
+        );
     }
 
     #[tokio::test]
@@ -1181,8 +1254,11 @@ mod tests {
         let response = response_from(request.as_bytes()).await;
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"kind\":\"node\""), "{response}");
-        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(response.contains("\"removed\":[]"), "{response}");
+        assert!(
+            !response.contains("\"key\":\"node:stale\""),
+            "pending snapshots must not remove previously rendered items: {response}"
+        );
     }
 
     #[test]
@@ -1344,11 +1420,13 @@ mod tests {
         let response = response_from(request.as_bytes()).await;
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"kind\":\"node\""), "{response}");
-        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
-        assert!(response.contains("\"kind\":\"edge\""), "{response}");
         assert!(
-            response.contains("\"key\":\"edge:primary_parent:base:stale\""),
+            response.contains("\"removed\":[]"),
+            "pending snapshots must not remove previously rendered items: {response}"
+        );
+        assert!(!response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(
+            !response.contains("\"key\":\"edge:primary_parent:base:stale\""),
             "{response}"
         );
     }
@@ -1462,11 +1540,13 @@ mod tests {
         .await;
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"kind\":\"node\""), "{response}");
-        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
-        assert!(response.contains("\"kind\":\"edge\""), "{response}");
         assert!(
-            response.contains("\"key\":\"edge:primary_parent:base:stale\""),
+            response.contains("\"removed\":[]"),
+            "pending snapshots must not remove previously rendered items: {response}"
+        );
+        assert!(!response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(
+            !response.contains("\"key\":\"edge:primary_parent:base:stale\""),
             "{response}"
         );
     }

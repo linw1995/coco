@@ -19,7 +19,7 @@ use crate::layout::{
     routed_elbow_points,
 };
 use crate::render::{
-    render_fragment, render_index_page, render_node_detail_fragment,
+    render_fragment, render_index_page, render_loading_index_page, render_node_detail_fragment,
     render_provider_context_fragment, render_snapshot_page,
 };
 use crate::{ConsolePublisher, ConsoleStore};
@@ -2380,6 +2380,19 @@ fn index_page_loads_wasm_client_without_document_refresh() {
     assert!(!html.contains("/live"));
     assert!(!html.contains("javascript"));
     assert!(!html.contains("http-equiv=\"refresh\""));
+}
+
+#[test]
+fn loading_index_page_renders_bootstrap_shell_without_snapshot() {
+    let html = render_loading_index_page(GraphMode::Anchors, 42);
+
+    assert!(html.contains("src=\"/pkg/coco_console.js\""));
+    assert!(html.contains("id=\"console-root\""));
+    assert!(html.contains("data-version=\"42\""));
+    assert!(html.contains("data-graph-mode=\"anchors\""));
+    assert!(html.contains("Loading graph"));
+    assert!(html.contains("class=\"graph-status\""));
+    assert!(html.contains("class=\"branch-section\""));
 }
 
 #[test]

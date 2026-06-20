@@ -11,6 +11,7 @@ mod host {
     pub mod publisher;
     pub mod render;
     pub mod server;
+    pub mod snapshot_store;
     pub mod store;
 
     pub use cache::ConsoleGraphCache;
