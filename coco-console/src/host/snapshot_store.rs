@@ -483,6 +483,7 @@ LIMIT 1
         )? {
             return Ok(false);
         }
+        self.rebalance_routed_edge_slots(connection, mode)?;
         self.put_materialization_meta_from_materialized_rows(connection, source_version, mode)?;
         Ok(true)
     }
@@ -1134,19 +1135,26 @@ LIMIT 1
         let ancestry = store
             .ancestry(input.head_id)
             .context(crate::error::StoreSnafu)?;
-        let Some(visible_head) = self.first_materialized_lane_ancestry_node(
-            connection,
-            input.mode,
-            input.branch,
-            &ancestry,
-        )?
-        else {
-            return Ok(false);
-        };
+        let scoped_ancestry = provider_context_ancestry_nodes(ancestry);
         let Some(tail) =
             self.latest_lane_tail_in_connection(connection, input.mode, input.branch)?
         else {
             return Ok(false);
+        };
+        let Some(visible_head) = self.first_materialized_lane_ancestry_node(
+            connection,
+            input.mode,
+            input.branch,
+            &scoped_ancestry,
+        )?
+        else {
+            return self.replace_anchor_branch_lane_for_context_shift(
+                connection,
+                store,
+                input,
+                tail,
+                scoped_ancestry,
+            );
         };
         if visible_head.x < tail.x {
             if self.lane_suffix_has_retained_downstream_edges(
@@ -1165,6 +1173,44 @@ LIMIT 1
             )?;
         }
         self.try_append_anchor_branch_after_row(connection, store, input, visible_head)
+    }
+
+    fn replace_anchor_branch_lane_for_context_shift(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        input: AppendLinearBranchInput<'_>,
+        tail: MaterializedTailNodeRow,
+        scoped_ancestry: Vec<Node>,
+    ) -> crate::Result<bool> {
+        if self.lane_suffix_has_retained_downstream_edges(
+            connection,
+            input.mode,
+            input.branch,
+            i32::MIN,
+        )? {
+            return Ok(false);
+        }
+        let visible_chain = scoped_ancestry
+            .into_iter()
+            .rev()
+            .filter(is_anchor_node)
+            .collect::<Vec<_>>();
+        if visible_chain.is_empty() {
+            return Ok(false);
+        }
+
+        let lane_y = tail.lane_y;
+        self.delete_materialized_lanes(
+            connection,
+            input.mode,
+            &[LaneRow {
+                lane_key: tail.lane_key,
+                lane_label: tail.lane_label,
+                lane_y,
+            }],
+        )?;
+        self.insert_anchor_branch_lane_nodes(connection, store, &input, lane_y, visible_chain, None)
     }
 
     fn refresh_materialized_node_labels(
@@ -1257,6 +1303,32 @@ LIMIT 1
             None => None,
         };
 
+        let branch_label = branch_label(input.branch, input.state);
+        self.insert_anchor_branch_lane_nodes(
+            connection,
+            store,
+            &input,
+            lane_y,
+            nodes,
+            previous.take(),
+        )?;
+        if let Some(row) =
+            self.latest_lane_tail_in_connection(connection, input.mode, input.branch)?
+        {
+            self.update_node_labels(connection, input.mode, &row.node_key, vec![branch_label])?;
+        }
+        Ok(true)
+    }
+
+    fn insert_anchor_branch_lane_nodes(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        input: &AppendLinearBranchInput<'_>,
+        lane_y: i32,
+        nodes: Vec<Node>,
+        mut previous: Option<(String, Point)>,
+    ) -> crate::Result<bool> {
         let lane = GraphViewportLane {
             key: lane_key(input.branch),
             label: input.branch.to_owned(),
@@ -1264,6 +1336,7 @@ LIMIT 1
         };
         let branch_label = branch_label(input.branch, input.state);
         let appended_len = nodes.len();
+        let starts_from_fork = previous.is_some();
         let event_order =
             self.event_order_by_materialized_and_new_nodes(connection, store, input.mode, &nodes)?;
         for (index, node) in nodes.into_iter().enumerate() {
@@ -1314,7 +1387,7 @@ LIMIT 1
                 },
             )?;
             if let Some((previous_id, previous_point)) = previous.as_ref() {
-                let edge = if index == 0 && fork_source.is_some() {
+                let edge = if index == 0 && starts_from_fork {
                     routed_edge(
                         GraphViewportEdgeKind::Fork,
                         previous_id,
