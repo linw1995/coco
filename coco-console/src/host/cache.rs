@@ -1545,6 +1545,30 @@ mod tests {
 
         assert!(node_ids.contains(invocation.as_str()));
         assert!(node_ids.contains(result.as_str()));
+        let main_y = materialized
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "main")
+            .unwrap()
+            .y;
+        assert_eq!(
+            materialized
+                .nodes
+                .iter()
+                .find(|node| node.id == tool_use)
+                .unwrap()
+                .y,
+            main_y
+        );
+        assert_ne!(
+            materialized
+                .nodes
+                .iter()
+                .find(|node| node.id == invocation)
+                .unwrap()
+                .y,
+            main_y
+        );
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -1644,6 +1668,30 @@ mod tests {
         assert_eq!(viewport.version, target_version);
         assert!(node_ids.contains(invocation.as_str()));
         assert!(node_ids.contains(result.as_str()));
+        let main_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "main")
+            .unwrap()
+            .y;
+        assert_eq!(
+            viewport
+                .nodes
+                .iter()
+                .find(|node| node.id == tool_use)
+                .unwrap()
+                .y,
+            main_y
+        );
+        assert_ne!(
+            viewport
+                .nodes
+                .iter()
+                .find(|node| node.id == result)
+                .unwrap()
+                .y,
+            main_y
+        );
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
@@ -1745,6 +1793,30 @@ mod tests {
         assert_eq!(viewport.version, target_version);
         assert!(node_ids.contains(invocation.as_str()));
         assert!(node_ids.contains(result.as_str()));
+        let main_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "main")
+            .unwrap()
+            .y;
+        assert_eq!(
+            viewport
+                .nodes
+                .iter()
+                .find(|node| node.id == tool_use)
+                .unwrap()
+                .y,
+            main_y
+        );
+        assert_ne!(
+            viewport
+                .nodes
+                .iter()
+                .find(|node| node.id == invocation)
+                .unwrap()
+                .y,
+            main_y
+        );
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
@@ -3103,6 +3175,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_drops_orphan_lane_when_branch_adopts_merge_parent() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let main_first = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main first".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &main_first)
+            .unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let orphan_parent = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan feedback".to_owned()),
+            })
+            .unwrap();
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: main_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan_parent.clone())],
+                    PromptAnchor {
+                        prompt: "merge orphan".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &main_first, &merge_anchor)
+            .unwrap();
+        publisher.mark_changed();
+        let merge_version = publisher.current_version();
+
+        let merged = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan_parent));
+        assert_eq!(merged.version, merge_version);
+        assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
+
+        writer.fork("draft", &orphan_parent).unwrap();
+        publisher.mark_changed();
+        let adopt_version = publisher.current_version();
+        let adopted = cache
+            .viewport_after(
+                GraphMode::All,
+                merge_version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let draft_y = adopted
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "draft")
+            .unwrap()
+            .y;
+        let adopted_node = adopted
+            .nodes
+            .iter()
+            .find(|node| node.id == orphan_parent)
+            .unwrap();
+
+        assert_eq!(adopted.version, adopt_version);
+        assert!(!adopted.lanes.iter().any(|lane| lane.label == orphan_lane));
+        assert_eq!(adopted_node.y, draft_y);
+        assert!(adopted.edges.iter().any(|edge| {
+            edge.source_id == orphan_parent
+                && edge.source.y == draft_y
+                && edge.target_id == merge_anchor
+                && edge.kind == crate::api::GraphViewportEdgeKind::MergeParent
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, adopt_version)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_prunes_orphan_merge_parent_after_rewind_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
@@ -3335,6 +3524,131 @@ mod tests {
         assert!(viewport.edges.iter().any(|edge| {
             edge.source_id == orphan_parent
                 && edge.target_id == merge_anchor
+                && edge.kind == crate::api::GraphViewportEdgeKind::MergeParent
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_applies_merge_constraints_to_orphan_lane_nodes() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let main_first = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main first".to_owned()),
+            })
+            .unwrap();
+        let main_second = writer
+            .append(NewNode {
+                parent: main_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main second".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &main_second)
+            .unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let orphan_base = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan base".to_owned()),
+            })
+            .unwrap();
+        let orphan_parent = writer
+            .append(NewNode {
+                parent: orphan_base,
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(main_second.clone())],
+                    PromptAnchor {
+                        prompt: "orphan constrained".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: main_second.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan_parent.clone())],
+                    PromptAnchor {
+                        prompt: "merge constrained orphan".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &main_second, &merge_anchor)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let full_snapshot =
+            crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .unwrap();
+        let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
+        let incremental_orphan = viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == orphan_parent)
+            .unwrap();
+        let full_orphan = full_viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == orphan_parent)
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert_eq!(incremental_orphan.x, full_orphan.x);
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == main_second
+                && edge.target_id == orphan_parent
                 && edge.kind == crate::api::GraphViewportEdgeKind::MergeParent
         }));
         assert!(

@@ -18,7 +18,7 @@ use crate::error::{
 };
 use crate::graph::{
     GraphMode, graph_kind_name, initial_visible_graph_lane_nodes, node_target_id, shorten_id,
-    summarize_node,
+    summarize_node, visible_skill_invocation_subtree_nodes,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
@@ -509,7 +509,7 @@ LIMIT 1
         let mut previous = None::<(String, Point)>;
         let appended_len = nodes.len();
         for (index, node) in nodes.into_iter().enumerate() {
-            let point = match previous.as_ref() {
+            let candidate = match previous.as_ref() {
                 Some((previous_id, previous_point)) => Point {
                     x: previous_point.x
                         + required_column_gap(previous_id, &node.id, &event_order)
@@ -532,7 +532,7 @@ LIMIT 1
                     mode,
                     node: &node,
                     primary_parent_id,
-                    point,
+                    point: candidate,
                     event_order: &event_order,
                     reserved_lane_y: Some(lane.y),
                 },
@@ -576,6 +576,14 @@ LIMIT 1
                     return Ok(false);
                 }
             } else if !self.insert_node_merge_edges(connection, store, mode, &node, "", point)? {
+                return Ok(false);
+            }
+            if matches!(
+                self.try_append_skill_invocation_subtree_in_transaction(
+                    connection, store, mode, &node.id, point, &lane,
+                )?,
+                SkillSubtreeAppend::Unsupported
+            ) {
                 return Ok(false);
             }
             previous = Some((node.id, point));
@@ -970,7 +978,7 @@ LIMIT 1
         }
         let materialized_lane_labels = materialized_lanes
             .iter()
-            .filter(|lane| !is_orphan_lane_label(&lane.lane_label))
+            .filter(|lane| !is_derived_lane_label(&lane.lane_label))
             .map(|lane| lane.lane_label.clone())
             .collect::<BTreeSet<_>>();
         if !existing_branch_lanes_preserve_order(
@@ -1174,7 +1182,7 @@ LIMIT 1
         let event_order =
             self.event_order_by_materialized_and_new_nodes(connection, store, input.mode, &nodes)?;
         for (index, node) in nodes.into_iter().enumerate() {
-            let point = match previous.as_ref() {
+            let candidate = match previous.as_ref() {
                 Some((previous_id, previous_point)) => Point {
                     x: previous_point.x
                         + required_column_gap(previous_id, &node.id, &event_order)
@@ -1197,7 +1205,7 @@ LIMIT 1
                     mode: input.mode,
                     node: &node,
                     primary_parent_id,
-                    point,
+                    point: candidate,
                     event_order: &event_order,
                     reserved_lane_y: Some(lane.y),
                 },
@@ -1381,14 +1389,11 @@ LIMIT 1
             label: input.branch.to_owned(),
             y: lane_y,
         };
-        let viewport_node = graph_viewport_node_from_node(
-            node,
-            Point {
-                x: source_point.x,
-                y: lane_y,
-            },
-            labels.clone(),
-        );
+        let point = Point {
+            x: source_point.x,
+            y: lane_y,
+        };
+        let viewport_node = graph_viewport_node_from_node(node, point, labels.clone());
         self.insert_node_location(
             connection,
             NodeLocationInsert {
@@ -1398,8 +1403,105 @@ LIMIT 1
                 bounds: node_bounds(&viewport_node),
             },
         )?;
+        self.migrate_orphan_occurrences_to_point(connection, input.mode, &node.id, point)?;
         self.update_node_id_labels(connection, input.mode, &node.id, labels)?;
         Ok(true)
+    }
+
+    fn migrate_orphan_occurrences_to_point(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+        point: Point,
+    ) -> crate::Result<()> {
+        let lanes = self.orphan_lanes_for_node_in_connection(connection, mode, node_id)?;
+        if lanes.is_empty() {
+            return Ok(());
+        }
+
+        let mut outgoing_edges = Vec::new();
+        for lane in &lanes {
+            outgoing_edges.extend(self.outgoing_edge_routes_from_lane_node(
+                connection,
+                mode,
+                node_id,
+                lane.lane_y,
+            )?);
+        }
+        self.delete_materialized_lanes(connection, mode, &lanes)?;
+        for row in outgoing_edges {
+            let kind = parse_edge_kind(&row.edge_kind)?;
+            let target = Point {
+                x: row.target_x,
+                y: row.target_y,
+            };
+            let edge = GraphViewportEdge {
+                key: edge_key(kind, &row.source_id, point, &row.target_id, target),
+                kind,
+                source_id: row.source_id,
+                target_id: row.target_id,
+                source: point,
+                target,
+                route_slot: row.route_slot,
+                target_port_offset: row.target_port_offset,
+            };
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge: &edge,
+                    bounds: edge_bounds(&edge),
+                },
+            )?;
+            self.rebalance_target_port_offsets(connection, mode, target)?;
+        }
+        Ok(())
+    }
+
+    fn orphan_lanes_for_node_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+    ) -> crate::Result<Vec<LaneRow>> {
+        sql_query(
+            r#"
+SELECT DISTINCT lane_key, lane_label, lane_y
+FROM console_graph_node_locations
+WHERE mode = ? AND node_id = ? AND lane_label LIKE 'orphan %'
+ORDER BY lane_y
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .load::<LaneRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
+    fn outgoing_edge_routes_from_lane_node(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+        lane_y: i32,
+    ) -> crate::Result<Vec<EdgeRouteRow>> {
+        sql_query(
+            r#"
+SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
+FROM console_graph_edge_routes
+WHERE mode = ? AND source_id = ? AND source_y = ?
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .bind::<Integer, _>(lane_y)
+        .load::<EdgeRouteRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
     }
 
     fn point_with_merge_parent_column_constraints(
@@ -1643,6 +1745,25 @@ LIMIT 1
                     x: GRAPH_LEFT_X,
                     y: orphan.lane.y,
                 },
+            };
+            let primary_parent_id = previous
+                .as_ref()
+                .map(|(previous_id, _)| previous_id.as_str())
+                .unwrap_or("");
+            let Some(point) = self.point_with_merge_parent_column_constraints(
+                connection,
+                store,
+                MergeColumnConstraintInput {
+                    mode,
+                    node,
+                    primary_parent_id,
+                    point,
+                    event_order: &event_order,
+                    reserved_lane_y: Some(orphan.lane.y),
+                },
+            )?
+            else {
+                return Ok(None);
             };
             let viewport_node = graph_viewport_node_from_node(node, point, Vec::new());
             self.insert_node_location(
@@ -2025,10 +2146,7 @@ ORDER BY
         if source.kind.as_tool_uses().is_none() {
             return Ok(SkillSubtreeAppend::Absent);
         }
-        let nodes = initial_visible_graph_lane_nodes(store, mode, vec![source])?
-            .into_iter()
-            .skip(1)
-            .collect::<Vec<_>>();
+        let nodes = visible_skill_invocation_subtree_nodes(store, mode, source_id)?;
         if nodes.is_empty() {
             return Ok(SkillSubtreeAppend::Absent);
         }
@@ -2036,23 +2154,58 @@ ORDER BY
             return Ok(SkillSubtreeAppend::Unsupported);
         }
 
+        let subtree_lane = match self
+            .first_materialized_node_row_in_connection(connection, mode, &nodes)?
+        {
+            Some(row) => GraphViewportLane {
+                key: row.lane_key,
+                label: row.lane_label,
+                y: row.lane_y,
+            },
+            None => {
+                let source_id = nodes
+                    .last()
+                    .map(|node| node.id.as_str())
+                    .unwrap_or(source_id);
+                skill_invocation_subtree_lane(
+                    source_id,
+                    self.next_materialized_lane_y_after_reserved(connection, mode, Some(lane.y))?,
+                )
+            }
+        };
         let event_order =
             self.event_order_by_materialized_and_new_nodes(connection, store, mode, &nodes)?;
         let mut previous_id = source_id.to_owned();
         let mut previous_point = source_point;
         for node in nodes {
-            if let Some(point) =
-                self.materialized_node_point_in_connection(connection, mode, &node.id)?
+            if let Some(row) =
+                self.materialized_node_row_by_id_in_connection(connection, mode, &node.id)?
             {
+                let point = Point { x: row.x, y: row.y };
                 previous_id = node.id;
                 previous_point = point;
                 continue;
             }
-            let point = Point {
+            let candidate = Point {
                 x: previous_point.x
                     + required_column_gap(&previous_id, &node.id, &event_order)
                         * GRAPH_COLUMN_WIDTH,
-                y: lane.y,
+                y: subtree_lane.y,
+            };
+            let Some(point) = self.point_with_merge_parent_column_constraints(
+                connection,
+                store,
+                MergeColumnConstraintInput {
+                    mode,
+                    node: &node,
+                    primary_parent_id: &previous_id,
+                    point: candidate,
+                    event_order: &event_order,
+                    reserved_lane_y: Some(subtree_lane.y),
+                },
+            )?
+            else {
+                return Ok(SkillSubtreeAppend::Unsupported);
             };
             let viewport_node = graph_viewport_node_from_node(&node, point, Vec::new());
             self.insert_node_location(
@@ -2060,20 +2213,22 @@ ORDER BY
                 NodeLocationInsert {
                     mode,
                     node: &viewport_node,
-                    lane,
+                    lane: &subtree_lane,
                     bounds: node_bounds(&viewport_node),
                 },
             )?;
-            let edge = primary_parent_edge(&previous_id, previous_point, &node.id, point);
-            self.insert_edge_route(
+            let previous = (previous_id.clone(), previous_point);
+            if !self.insert_orphan_merge_parent_node_edges(
                 connection,
-                EdgeRouteInsert {
+                store,
+                OrphanMergeParentNodeEdgeInput {
                     mode,
-                    edge: &edge,
-                    bounds: edge_bounds(&edge),
+                    node: &node,
+                    point,
+                    previous: Some(&previous),
+                    first_node: previous_id == source_id,
                 },
-            )?;
-            if !self.insert_node_merge_edges(connection, store, mode, &node, &previous_id, point)? {
+            )? {
                 return Ok(SkillSubtreeAppend::Unsupported);
             }
             previous_id = node.id;
@@ -2113,7 +2268,7 @@ ORDER BY
         }
         let materialized_lane_labels = materialized_lanes
             .iter()
-            .filter(|lane| !is_orphan_lane_label(&lane.lane_label))
+            .filter(|lane| !is_derived_lane_label(&lane.lane_label))
             .map(|lane| lane.lane_label.clone())
             .collect::<BTreeSet<_>>();
         if !existing_branch_lanes_preserve_order(
@@ -3151,6 +3306,47 @@ ORDER BY lane_y, lane_key
         Ok(None)
     }
 
+    fn first_materialized_node_row_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        nodes: &[Node],
+    ) -> crate::Result<Option<MaterializedTailNodeRow>> {
+        for node in nodes {
+            let Some(row) =
+                self.materialized_node_row_by_id_in_connection(connection, mode, &node.id)?
+            else {
+                continue;
+            };
+            return Ok(Some(row));
+        }
+        Ok(None)
+    }
+
+    fn materialized_node_row_by_id_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+    ) -> crate::Result<Option<MaterializedTailNodeRow>> {
+        sql_query(
+            r#"
+SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
+FROM console_graph_node_locations
+WHERE mode = ? AND node_id = ?
+ORDER BY y, x, node_key
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .get_result::<MaterializedTailNodeRow>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
     fn materialized_node_rows_in_connection(
         &self,
         connection: &mut SqliteConnection,
@@ -3671,8 +3867,25 @@ fn is_orphan_lane_label(label: &str) -> bool {
     label.starts_with("orphan ")
 }
 
+fn is_skill_invocation_lane_label(label: &str) -> bool {
+    label.starts_with("skill ")
+}
+
+fn is_derived_lane_label(label: &str) -> bool {
+    is_orphan_lane_label(label) || is_skill_invocation_lane_label(label)
+}
+
 fn orphan_merge_parent_lane(source_id: &str, y: i32) -> GraphViewportLane {
     let label = format!("orphan {}", shorten_id(source_id));
+    GraphViewportLane {
+        key: lane_key(&label),
+        label,
+        y,
+    }
+}
+
+fn skill_invocation_subtree_lane(source_id: &str, y: i32) -> GraphViewportLane {
+    let label = format!("skill {}", shorten_id(source_id));
     GraphViewportLane {
         key: lane_key(&label),
         label,
@@ -3766,7 +3979,7 @@ fn removed_lanes_in_order(
     materialized_lanes
         .iter()
         .filter(|lane| {
-            !is_orphan_lane_label(&lane.lane_label) && !branch_names.contains(&lane.lane_label)
+            !is_derived_lane_label(&lane.lane_label) && !branch_names.contains(&lane.lane_label)
         })
         .cloned()
         .collect()

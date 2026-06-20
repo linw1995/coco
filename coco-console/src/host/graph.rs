@@ -949,7 +949,7 @@ fn is_visible_graph_node(node: &Node, mode: GraphMode) -> bool {
 }
 
 pub(crate) fn initial_visible_graph_lane_nodes(
-    store: &impl NodeStore,
+    _store: &impl NodeStore,
     mode: GraphMode,
     ancestry: Vec<Node>,
 ) -> Result<Vec<Node>> {
@@ -957,10 +957,18 @@ pub(crate) fn initial_visible_graph_lane_nodes(
     let mut seen = BTreeSet::new();
     for node in ancestry.into_iter().rev() {
         push_initial_lane_node(mode, node.clone(), &mut seen, &mut nodes);
-        if mode == GraphMode::All && node.kind.as_tool_uses().is_some() {
-            push_initial_skill_invocation_subtrees(store, mode, &node.id, &mut seen, &mut nodes)?;
-        }
     }
+    Ok(nodes)
+}
+
+pub(crate) fn visible_skill_invocation_subtree_nodes(
+    store: &impl NodeStore,
+    mode: GraphMode,
+    parent_id: &str,
+) -> Result<Vec<Node>> {
+    let mut nodes = Vec::new();
+    let mut seen = BTreeSet::new();
+    push_initial_skill_invocation_subtrees(store, mode, parent_id, &mut seen, &mut nodes)?;
     Ok(nodes)
 }
 
