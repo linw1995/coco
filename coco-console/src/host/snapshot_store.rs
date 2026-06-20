@@ -365,7 +365,7 @@ LIMIT 1
             .latest_materialization_row_in_connection(&mut connection, mode)?
             .is_none()
         {
-            self.try_seed_initial_single_branch_materialization_in_transaction(
+            self.try_seed_initial_branch_materialization_in_transaction(
                 &mut connection,
                 store,
                 source_version,
@@ -405,7 +405,7 @@ LIMIT 1
         }
     }
 
-    fn try_seed_initial_single_branch_materialization_in_transaction(
+    fn try_seed_initial_branch_materialization_in_transaction(
         &self,
         connection: &mut SqliteConnection,
         store: &(impl BranchStore + NodeStore),
@@ -413,11 +413,11 @@ LIMIT 1
         mode: GraphMode,
         session_states: &[(String, SessionState)],
     ) -> crate::Result<bool> {
-        let [(branch, state)] = session_states else {
+        let Some((first_branch, first_state)) = session_states.first() else {
             return Ok(false);
         };
         let head_id = store
-            .get_branch_head(branch)
+            .get_branch_head(first_branch)
             .context(crate::error::StoreSnafu)?;
         let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
         let nodes = initial_visible_lane_nodes(mode, ancestry);
@@ -426,11 +426,11 @@ LIMIT 1
         }
 
         let lane = GraphViewportLane {
-            key: lane_key(branch),
-            label: branch.clone(),
+            key: lane_key(first_branch),
+            label: first_branch.clone(),
             y: crate::layout::GRAPH_TOP_Y,
         };
-        let branch_label = branch_label(branch, state);
+        let branch_label = branch_label(first_branch, first_state);
         let event_order =
             self.event_order_by_materialized_and_new_nodes(connection, store, mode, &nodes)?;
         let mut previous = None::<(String, Point)>;
@@ -489,12 +489,41 @@ LIMIT 1
             previous = Some((node.id, point));
         }
 
+        let mut next_lane_y = crate::layout::GRAPH_TOP_Y + GRAPH_LANE_HEIGHT;
+        for (branch, state) in session_states.iter().skip(1) {
+            self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
+            let head_id = store
+                .get_branch_head(branch)
+                .context(crate::error::StoreSnafu)?;
+            if !self.try_append_new_branch_lane_in_transaction(
+                connection,
+                store,
+                AppendLinearBranchInput {
+                    mode,
+                    branch,
+                    state,
+                    head_id: &head_id,
+                },
+                next_lane_y,
+            )? {
+                return Ok(false);
+            }
+            next_lane_y += GRAPH_LANE_HEIGHT;
+        }
+
         let materialized_nodes = self.materialized_node_rows_in_connection(connection, mode)?;
         let world_max_x = materialized_nodes
             .iter()
             .map(|row| row.x)
             .max()
             .unwrap_or(GRAPH_LEFT_X)
+            + 120;
+        let world_max_y = self
+            .materialized_lanes_in_connection(connection, mode)?
+            .iter()
+            .map(|lane| lane.lane_y)
+            .max()
+            .unwrap_or(crate::layout::GRAPH_TOP_Y)
             + 120;
         self.put_materialization_meta(
             connection,
@@ -504,7 +533,7 @@ LIMIT 1
                 world_min_x: 0,
                 world_min_y: 0,
                 world_max_x,
-                world_max_y: lane.y + 120,
+                world_max_y,
             },
         )?;
         Ok(true)
