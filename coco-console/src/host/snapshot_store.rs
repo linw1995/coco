@@ -827,6 +827,22 @@ LIMIT 1
             label: tail.lane_label,
             y: tail.lane_y,
         };
+        if matches!(
+            self.try_append_skill_invocation_subtree_in_transaction(
+                connection,
+                store,
+                input.mode,
+                &tail.node_id,
+                Point {
+                    x: tail.x,
+                    y: tail.y,
+                },
+                &lane,
+            )?,
+            SkillSubtreeAppend::Unsupported
+        ) {
+            return Ok(false);
+        }
         let appended_nodes = chain.into_iter().skip(1).collect::<Vec<_>>();
         let event_order = self.event_order_by_materialized_and_new_nodes(
             connection,
