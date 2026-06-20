@@ -599,7 +599,7 @@ impl ConsoleGraphSnapshotStore {
             if !parent_ids.insert(source_id.clone()) {
                 continue;
             }
-            let mut edge = routed_edge(
+            let edge = routed_edge(
                 GraphViewportEdgeKind::MergeParent,
                 &source_id,
                 source,
@@ -607,8 +607,6 @@ impl ConsoleGraphSnapshotStore {
                 target,
                 self.next_routed_edge_slot_in_connection(connection, mode, source, target)?,
             );
-            edge.target_port_offset =
-                self.next_secondary_target_port_offset(connection, mode, target)?;
             self.insert_edge_route(
                 connection,
                 EdgeRouteInsert {
@@ -617,6 +615,7 @@ impl ConsoleGraphSnapshotStore {
                     bounds: edge_bounds(&edge),
                 },
             )?;
+            self.rebalance_target_port_offsets(connection, mode, target)?;
         }
         Ok(true)
     }
@@ -641,30 +640,90 @@ impl ConsoleGraphSnapshotStore {
             .map(|source| (source.id.clone(), source_point)))
     }
 
-    fn next_secondary_target_port_offset(
+    fn rebalance_target_port_offsets(
         &self,
         connection: &mut SqliteConnection,
         mode: GraphMode,
         target: Point,
-    ) -> crate::Result<f64> {
-        let row = sql_query(
+    ) -> crate::Result<()> {
+        let rows = sql_query(
             r#"
-SELECT COUNT(*) AS count
+SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
 FROM console_graph_edge_routes
 WHERE mode = ?
   AND target_x = ?
   AND target_y = ?
-  AND edge_kind != 'primary_parent'
+ORDER BY
+  CASE edge_kind
+    WHEN 'primary_parent' THEN 0
+    WHEN 'fork' THEN 1
+    ELSE 2
+  END,
+  edge_key
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
         .bind::<Integer, _>(target.x)
         .bind::<Integer, _>(target.y)
-        .get_result::<SqliteCount>(connection)
+        .load::<EdgeRouteRow>(&mut *connection)
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })?;
-        Ok(secondary_incoming_port_offset(row.count as usize))
+        let mut primary_edges = Vec::new();
+        let mut secondary_edges = Vec::new();
+        for row in rows {
+            let kind = parse_edge_kind(&row.edge_kind)?;
+            let edge = GraphViewportEdge {
+                key: row.edge_key,
+                kind,
+                source_id: row.source_id,
+                target_id: row.target_id,
+                source: Point {
+                    x: row.source_x,
+                    y: row.source_y,
+                },
+                target: Point {
+                    x: row.target_x,
+                    y: row.target_y,
+                },
+                route_slot: row.route_slot,
+                target_port_offset: row.target_port_offset,
+            };
+            if kind == GraphViewportEdgeKind::PrimaryParent {
+                primary_edges.push(edge);
+            } else {
+                secondary_edges.push(edge);
+            }
+        }
+        let primary_count = primary_edges.len();
+        for (index, edge) in primary_edges.iter_mut().enumerate() {
+            edge.target_port_offset = primary_incoming_port_offset(primary_count, index);
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge,
+                    bounds: edge_bounds(edge),
+                },
+            )?;
+        }
+        let secondary_count = secondary_edges.len();
+        for (index, edge) in secondary_edges.iter_mut().enumerate() {
+            edge.target_port_offset = if primary_count > 0 {
+                secondary_incoming_port_offset(index)
+            } else {
+                primary_incoming_port_offset(secondary_count, index)
+            };
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge,
+                    bounds: edge_bounds(edge),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn try_append_new_branch_lane_in_transaction(
@@ -756,6 +815,16 @@ WHERE mode = ?
                     bounds: edge_bounds(&edge),
                 },
             )?;
+            if !self.insert_node_merge_edges(
+                connection,
+                store,
+                input.mode,
+                &node,
+                &previous_id,
+                point,
+            )? {
+                return Ok(false);
+            }
             previous_id = node.id;
             previous_point = point;
         }
@@ -2171,13 +2240,6 @@ fn is_linear_primary_chain(chain: &[Node]) -> bool {
     chain.windows(2).all(|nodes| nodes[1].parent == nodes[0].id)
 }
 
-fn node_anchor_merge_parent_count(node: &Node) -> usize {
-    match &node.kind {
-        Kind::Anchor(anchor) => anchor.merge_parents().len(),
-        _ => 0,
-    }
-}
-
 fn node_anchor_merge_parents(node: &Node) -> &[MergeParent] {
     match &node.kind {
         Kind::Anchor(anchor) => anchor.merge_parents(),
@@ -2192,9 +2254,6 @@ fn is_anchor_node(node: &Node) -> bool {
 fn is_linear_new_nodes(source_id: &str, nodes: &[Node]) -> bool {
     nodes.first().is_some_and(|node| node.parent == source_id)
         && nodes.windows(2).all(|nodes| nodes[1].parent == nodes[0].id)
-        && nodes
-            .iter()
-            .all(|node| node_anchor_merge_parent_count(node) == 0)
 }
 
 fn branch_label(branch: &str, state: &SessionState) -> String {
@@ -2272,6 +2331,10 @@ fn route_slot_offset(route_slot: i32) -> i32 {
     let direction = if route_slot % 2 == 0 { 1 } else { -1 };
 
     magnitude.min(4) * EDGE_ROUTE_STEP * direction
+}
+
+fn primary_incoming_port_offset(count: usize, index: usize) -> f64 {
+    (index as f64 - (count as f64 - 1.0) / 2.0) * EDGE_TARGET_PORT_STEP
 }
 
 fn secondary_incoming_port_offset(index: usize) -> f64 {
