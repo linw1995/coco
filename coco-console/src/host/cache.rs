@@ -123,6 +123,17 @@ where
         self.ready.current_version()
     }
 
+    pub fn current_viewport_version(&self, mode: GraphMode) -> u64 {
+        match self.snapshots.as_ref() {
+            Some(snapshots) => snapshots
+                .latest_materialization_version(mode)
+                .ok()
+                .flatten()
+                .unwrap_or(0),
+            None => self.current_version(),
+        }
+    }
+
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.ready.subscribe()
     }
@@ -1256,6 +1267,50 @@ mod tests {
         assert_eq!(first.version, ready_version);
         assert_eq!(second.version, ready_version);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn cache_reports_viewport_version_per_materialized_mode() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                0,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert_eq!(
+            cache.current_viewport_version(GraphMode::All),
+            target_version
+        );
+        assert_eq!(cache.current_viewport_version(GraphMode::Anchors), 0);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]
@@ -2659,6 +2714,91 @@ mod tests {
         assert!(
             cache
                 .cached_snapshot(GraphMode::Anchors, target_version)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_preserves_branches_named_like_derived_lanes() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("skill research", &session).unwrap();
+        writer.fork("orphan fix", &session).unwrap();
+        publisher.mark_changed();
+
+        let initial = cache
+            .viewport_after(
+                GraphMode::All,
+                0,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            initial
+                .lanes
+                .iter()
+                .any(|lane| lane.label == "skill research")
+        );
+        assert!(initial.lanes.iter().any(|lane| lane.label == "orphan fix"));
+
+        let next = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("next".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("skill research", &session, &next)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+        let refreshed = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed.version, target_version);
+        assert!(
+            refreshed
+                .lanes
+                .iter()
+                .any(|lane| lane.label == "skill research")
+        );
+        assert!(
+            refreshed
+                .lanes
+                .iter()
+                .any(|lane| lane.label == "orphan fix")
+        );
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
 

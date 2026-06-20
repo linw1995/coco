@@ -36,6 +36,8 @@ const EDGE_TARGET_APPROACH: i32 = 48;
 const GRAPH_LANE_HEIGHT: i32 = 140;
 const EDGE_ROUTE_STEP: i32 = 12;
 const MAX_EDGE_COLUMN_GAP: usize = 5;
+const DERIVED_ORPHAN_LANE_KEY_PREFIX: &str = "derived:orphan:";
+const DERIVED_SKILL_LANE_KEY_PREFIX: &str = "derived:skill:";
 
 #[derive(Clone, Debug)]
 pub struct ConsoleGraphSnapshotStore {
@@ -978,7 +980,7 @@ LIMIT 1
         }
         let materialized_lane_labels = materialized_lanes
             .iter()
-            .filter(|lane| !is_derived_lane_label(&lane.lane_label))
+            .filter(|lane| !is_derived_lane_key(&lane.lane_key))
             .map(|lane| lane.lane_label.clone())
             .collect::<BTreeSet<_>>();
         if !existing_branch_lanes_preserve_order(
@@ -1469,7 +1471,7 @@ LIMIT 1
             r#"
 SELECT DISTINCT lane_key, lane_label, lane_y
 FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ? AND lane_label LIKE 'orphan %'
+WHERE mode = ? AND node_id = ? AND lane_key LIKE 'derived:orphan:%'
 ORDER BY lane_y
 "#,
         )
@@ -2268,7 +2270,7 @@ ORDER BY
         }
         let materialized_lane_labels = materialized_lanes
             .iter()
-            .filter(|lane| !is_derived_lane_label(&lane.lane_label))
+            .filter(|lane| !is_derived_lane_key(&lane.lane_key))
             .map(|lane| lane.lane_label.clone())
             .collect::<BTreeSet<_>>();
         if !existing_branch_lanes_preserve_order(
@@ -2791,11 +2793,11 @@ WHERE mode = ? AND (source_y = ? OR target_y = ?)
             sql_query(
                 r#"
 DELETE FROM console_graph_node_locations
-WHERE mode = ? AND lane_label = ?
+WHERE mode = ? AND lane_key = ?
 "#,
             )
             .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(&lane.lane_label)
+            .bind::<Text, _>(&lane.lane_key)
             .execute(&mut *connection)
             .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
@@ -2811,15 +2813,15 @@ WHERE mode = ? AND lane_label = ?
     ) -> crate::Result<()> {
         let mut lanes = Vec::new();
         for lane in self.materialized_lanes_in_connection(connection, mode)? {
-            let should_prune = is_orphan_lane_label(&lane.lane_label)
-                && !self.lane_has_external_outgoing_edge(connection, mode, &lane.lane_label)?;
+            let should_prune = is_orphan_lane_key(&lane.lane_key)
+                && !self.lane_has_external_outgoing_edge(connection, mode, &lane.lane_key)?;
             let should_prune = should_prune
-                || is_skill_invocation_lane_label(&lane.lane_label)
-                    && (!self.lane_has_external_edge(connection, mode, &lane.lane_label)?
+                || is_skill_invocation_lane_key(&lane.lane_key)
+                    && (!self.lane_has_external_edge(connection, mode, &lane.lane_key)?
                         || self.derived_lane_nodes_are_covered_by_branch_lanes(
                             connection,
                             mode,
-                            &lane.lane_label,
+                            &lane.lane_key,
                         )?);
             if should_prune {
                 lanes.push(lane);
@@ -2832,7 +2834,7 @@ WHERE mode = ? AND lane_label = ?
         &self,
         connection: &mut SqliteConnection,
         mode: GraphMode,
-        lane_label: &str,
+        lane_key: &str,
     ) -> crate::Result<bool> {
         let row = sql_query(
             r#"
@@ -2843,7 +2845,7 @@ WHERE edge.mode = ?
       SELECT 1
       FROM console_graph_node_locations AS source
       WHERE source.mode = edge.mode
-        AND source.lane_label = ?
+        AND source.lane_key = ?
         AND source.node_id = edge.source_id
         AND source.x = edge.source_x
         AND source.y = edge.source_y
@@ -2852,7 +2854,7 @@ WHERE edge.mode = ?
       SELECT 1
       FROM console_graph_node_locations AS target
       WHERE target.mode = edge.mode
-        AND target.lane_label = ?
+        AND target.lane_key = ?
         AND target.node_id = edge.target_id
         AND target.x = edge.target_x
         AND target.y = edge.target_y
@@ -2861,8 +2863,8 @@ LIMIT 1
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(lane_label)
-        .bind::<Text, _>(lane_label)
+        .bind::<Text, _>(lane_key)
+        .bind::<Text, _>(lane_key)
         .get_result::<SqliteInteger>(connection)
         .optional()
         .context(QueryGraphSnapshotStoreSnafu {
@@ -2875,7 +2877,7 @@ LIMIT 1
         &self,
         connection: &mut SqliteConnection,
         mode: GraphMode,
-        lane_label: &str,
+        lane_key: &str,
     ) -> crate::Result<bool> {
         let row = sql_query(
             r#"
@@ -2888,7 +2890,7 @@ WHERE edge.mode = ?
           SELECT 1
           FROM console_graph_node_locations AS source
           WHERE source.mode = edge.mode
-            AND source.lane_label = ?
+            AND source.lane_key = ?
             AND source.node_id = edge.source_id
             AND source.x = edge.source_x
             AND source.y = edge.source_y
@@ -2897,7 +2899,7 @@ WHERE edge.mode = ?
           SELECT 1
           FROM console_graph_node_locations AS target
           WHERE target.mode = edge.mode
-            AND target.lane_label = ?
+            AND target.lane_key = ?
             AND target.node_id = edge.target_id
             AND target.x = edge.target_x
             AND target.y = edge.target_y
@@ -2908,7 +2910,7 @@ WHERE edge.mode = ?
           SELECT 1
           FROM console_graph_node_locations AS target
           WHERE target.mode = edge.mode
-            AND target.lane_label = ?
+            AND target.lane_key = ?
             AND target.node_id = edge.target_id
             AND target.x = edge.target_x
             AND target.y = edge.target_y
@@ -2917,7 +2919,7 @@ WHERE edge.mode = ?
           SELECT 1
           FROM console_graph_node_locations AS source
           WHERE source.mode = edge.mode
-            AND source.lane_label = ?
+            AND source.lane_key = ?
             AND source.node_id = edge.source_id
             AND source.x = edge.source_x
             AND source.y = edge.source_y
@@ -2928,10 +2930,10 @@ LIMIT 1
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(lane_label)
-        .bind::<Text, _>(lane_label)
-        .bind::<Text, _>(lane_label)
-        .bind::<Text, _>(lane_label)
+        .bind::<Text, _>(lane_key)
+        .bind::<Text, _>(lane_key)
+        .bind::<Text, _>(lane_key)
+        .bind::<Text, _>(lane_key)
         .get_result::<SqliteInteger>(connection)
         .optional()
         .context(QueryGraphSnapshotStoreSnafu {
@@ -2944,28 +2946,28 @@ LIMIT 1
         &self,
         connection: &mut SqliteConnection,
         mode: GraphMode,
-        lane_label: &str,
+        lane_key: &str,
     ) -> crate::Result<bool> {
         let row = sql_query(
             r#"
 SELECT 1 AS value
 FROM console_graph_node_locations AS node
 WHERE node.mode = ?
-  AND node.lane_label = ?
+  AND node.lane_key = ?
   AND NOT EXISTS (
       SELECT 1
       FROM console_graph_node_locations AS cover
       WHERE cover.mode = node.mode
         AND cover.node_id = node.node_id
-        AND cover.lane_label != node.lane_label
-        AND cover.lane_label NOT LIKE 'orphan %'
-        AND cover.lane_label NOT LIKE 'skill %'
+        AND cover.lane_key != node.lane_key
+        AND cover.lane_key NOT LIKE 'derived:orphan:%'
+        AND cover.lane_key NOT LIKE 'derived:skill:%'
   )
 LIMIT 1
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(lane_label)
+        .bind::<Text, _>(lane_key)
         .get_result::<SqliteInteger>(connection)
         .optional()
         .context(QueryGraphSnapshotStoreSnafu {
@@ -3026,7 +3028,7 @@ WHERE edge.mode = ?
       SELECT 1
       FROM console_graph_node_locations AS derived_target
       WHERE derived_target.mode = edge.mode
-        AND derived_target.lane_label LIKE 'skill %'
+        AND derived_target.lane_key LIKE 'derived:skill:%'
         AND derived_target.node_id = edge.target_id
         AND derived_target.x = edge.target_x
         AND derived_target.y = edge.target_y
@@ -3477,7 +3479,7 @@ LIMIT 1
             r#"
 SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
 FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ? AND lane_label NOT LIKE 'skill %'
+WHERE mode = ? AND node_id = ? AND lane_key NOT LIKE 'derived:skill:%'
 ORDER BY y, x, node_key
 LIMIT 1
 "#,
@@ -4007,22 +4009,22 @@ fn is_visible_mode_node(mode: GraphMode, node: &Node) -> bool {
     !node.is_root() && (mode == GraphMode::All || is_anchor_node(node))
 }
 
-fn is_orphan_lane_label(label: &str) -> bool {
-    label.starts_with("orphan ")
+fn is_orphan_lane_key(key: &str) -> bool {
+    key.starts_with(DERIVED_ORPHAN_LANE_KEY_PREFIX)
 }
 
-fn is_skill_invocation_lane_label(label: &str) -> bool {
-    label.starts_with("skill ")
+fn is_skill_invocation_lane_key(key: &str) -> bool {
+    key.starts_with(DERIVED_SKILL_LANE_KEY_PREFIX)
 }
 
-fn is_derived_lane_label(label: &str) -> bool {
-    is_orphan_lane_label(label) || is_skill_invocation_lane_label(label)
+fn is_derived_lane_key(key: &str) -> bool {
+    is_orphan_lane_key(key) || is_skill_invocation_lane_key(key)
 }
 
 fn orphan_merge_parent_lane(source_id: &str, y: i32) -> GraphViewportLane {
     let label = format!("orphan {}", shorten_id(source_id));
     GraphViewportLane {
-        key: lane_key(&label),
+        key: format!("{DERIVED_ORPHAN_LANE_KEY_PREFIX}{source_id}"),
         label,
         y,
     }
@@ -4031,7 +4033,7 @@ fn orphan_merge_parent_lane(source_id: &str, y: i32) -> GraphViewportLane {
 fn skill_invocation_subtree_lane(source_id: &str, y: i32) -> GraphViewportLane {
     let label = format!("skill {}", shorten_id(source_id));
     GraphViewportLane {
-        key: lane_key(&label),
+        key: format!("{DERIVED_SKILL_LANE_KEY_PREFIX}{source_id}"),
         label,
         y,
     }
@@ -4123,7 +4125,7 @@ fn removed_lanes_in_order(
     materialized_lanes
         .iter()
         .filter(|lane| {
-            !is_derived_lane_label(&lane.lane_label) && !branch_names.contains(&lane.lane_label)
+            !is_derived_lane_key(&lane.lane_key) && !branch_names.contains(&lane.lane_label)
         })
         .cloned()
         .collect()

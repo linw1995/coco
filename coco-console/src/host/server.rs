@@ -291,7 +291,10 @@ where
             Some(response) => response,
             None => {
                 return json_response(
-                    &empty_graph_viewport_response(state.cache.current_version(), request),
+                    &empty_graph_viewport_response(
+                        state.cache.current_viewport_version(mode),
+                        request,
+                    ),
                     "graph viewport",
                 );
             }
@@ -373,7 +376,7 @@ where
         Some(response) => response,
         None => {
             return empty_graph_viewport_diff_pending_response(
-                state.cache.current_version(),
+                state.cache.current_viewport_version(mode),
                 request,
             );
         }
