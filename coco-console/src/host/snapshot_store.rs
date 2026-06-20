@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,13 +16,11 @@ use crate::api::{
 use crate::error::{
     ConnectGraphSnapshotStoreSnafu, ParseGraphSnapshotStoreValueSnafu, QueryGraphSnapshotStoreSnafu,
 };
-use crate::graph::{
-    GraphMode, GraphSnapshot, graph_kind_name, node_target_id, shorten_id, summarize_node,
-};
+use crate::graph::{GraphMode, graph_kind_name, node_target_id, shorten_id, summarize_node};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LEFT_X, diff_graph_viewport_responses,
-    lane_key, materialize_graph_viewport,
+    lane_key,
 };
 use coco_mem::{
     BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, SessionState, SessionStore,
@@ -109,12 +107,6 @@ struct EdgeRouteRow {
     route_slot: i32,
     #[diesel(sql_type = Double)]
     target_port_offset: f64,
-}
-
-#[derive(QueryableByName)]
-struct MaterializedKeyRow {
-    #[diesel(sql_type = Text)]
-    item_key: String,
 }
 
 #[derive(QueryableByName)]
@@ -286,6 +278,15 @@ LIMIT 1
         Ok(self.latest_materialization_row(mode)?.is_some())
     }
 
+    pub(crate) fn latest_materialization_version(
+        &self,
+        mode: GraphMode,
+    ) -> crate::Result<Option<u64>> {
+        Ok(self
+            .latest_materialization_row(mode)?
+            .map(|meta| meta.source_version.max(0) as u64))
+    }
+
     pub(crate) fn materialized_shell_facts(
         &self,
         mode: GraphMode,
@@ -320,25 +321,6 @@ LIMIT 1
             nodes,
             edge_count: self.materialized_edge_count_in_connection(&mut connection, mode)?,
         }))
-    }
-
-    pub fn put(&self, source_version: u64, snapshot: &GraphSnapshot) -> crate::Result<()> {
-        let materialized = materialize_graph_viewport(snapshot);
-        let mut connection = self.connect()?;
-        self.begin_write_transaction(&mut connection)?;
-        let result = self.put_materialized_graph(
-            &mut connection,
-            source_version,
-            snapshot.mode,
-            &materialized,
-        );
-        match result {
-            Ok(()) => self.commit_transaction(&mut connection),
-            Err(error) => {
-                let _ = self.rollback_transaction(&mut connection);
-                Err(error)
-            }
-        }
     }
 
     pub fn try_append_linear_branch(
@@ -495,17 +477,27 @@ LIMIT 1
             let head_id = store
                 .get_branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
-            if !self.try_append_new_branch_lane_in_transaction(
-                connection,
-                store,
-                AppendLinearBranchInput {
-                    mode,
-                    branch,
-                    state,
-                    head_id: &head_id,
-                },
-                next_lane_y,
-            )? {
+            let input = AppendLinearBranchInput {
+                mode,
+                branch,
+                state,
+                head_id: &head_id,
+            };
+            let appended = match mode {
+                GraphMode::Anchors => self.try_append_new_anchor_branch_lane_in_transaction(
+                    connection,
+                    store,
+                    input,
+                    next_lane_y,
+                )?,
+                GraphMode::All => self.try_append_new_branch_lane_in_transaction(
+                    connection,
+                    store,
+                    input,
+                    next_lane_y,
+                )?,
+            };
+            if !appended {
                 return Ok(false);
             }
             next_lane_y += GRAPH_LANE_HEIGHT;
@@ -1377,16 +1369,6 @@ ORDER BY
         Ok(true)
     }
 
-    fn put_materialized_graph(
-        &self,
-        connection: &mut SqliteConnection,
-        source_version: u64,
-        mode: GraphMode,
-        materialized: &GraphViewportResponse,
-    ) -> crate::Result<()> {
-        self.put_materialized_viewport(connection, source_version, mode, materialized)
-    }
-
     fn begin_write_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
         sql_query("BEGIN IMMEDIATE TRANSACTION")
             .execute(connection)
@@ -1533,27 +1515,6 @@ CREATE TABLE IF NOT EXISTS console_graph_edge_routes (
         Ok(())
     }
 
-    fn put_materialized_viewport(
-        &self,
-        connection: &mut SqliteConnection,
-        source_version: u64,
-        mode: GraphMode,
-        materialized: &GraphViewportResponse,
-    ) -> crate::Result<()> {
-        self.put_materialization_meta(
-            connection,
-            MaterializationMetaInput {
-                source_version,
-                mode,
-                world_min_x: 0,
-                world_min_y: 0,
-                world_max_x: materialized.canvas.width,
-                world_max_y: materialized.canvas.height,
-            },
-        )?;
-        self.replace_materialized_facts(connection, mode, materialized)
-    }
-
     fn put_materialization_meta(
         &self,
         connection: &mut SqliteConnection,
@@ -1586,99 +1547,6 @@ ON CONFLICT(mode) DO UPDATE SET
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })?;
-        Ok(())
-    }
-
-    fn replace_materialized_facts(
-        &self,
-        connection: &mut SqliteConnection,
-        mode: GraphMode,
-        materialized: &GraphViewportResponse,
-    ) -> crate::Result<()> {
-        self.delete_stale_materialized_keys(
-            connection,
-            "console_graph_node_locations",
-            "node_key",
-            mode,
-            materialized
-                .nodes
-                .iter()
-                .map(|node| node.key.as_str())
-                .collect(),
-        )?;
-        self.delete_stale_materialized_keys(
-            connection,
-            "console_graph_edge_routes",
-            "edge_key",
-            mode,
-            materialized
-                .edges
-                .iter()
-                .map(|edge| edge.key.as_str())
-                .collect(),
-        )?;
-        let lane_by_y = materialized
-            .lanes
-            .iter()
-            .map(|lane| (lane.y, lane))
-            .collect::<std::collections::HashMap<_, _>>();
-        for node in &materialized.nodes {
-            let lane = lane_by_y
-                .get(&node.y)
-                .expect("materialized node should reference a lane y");
-            self.insert_node_location(
-                connection,
-                NodeLocationInsert {
-                    mode,
-                    node,
-                    lane,
-                    bounds: node_bounds(node),
-                },
-            )?;
-        }
-        for edge in &materialized.edges {
-            self.insert_edge_route(
-                connection,
-                EdgeRouteInsert {
-                    mode,
-                    edge,
-                    bounds: edge_bounds(edge),
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    fn delete_stale_materialized_keys(
-        &self,
-        connection: &mut SqliteConnection,
-        table: &'static str,
-        key_column: &'static str,
-        mode: GraphMode,
-        current_keys: HashSet<&str>,
-    ) -> crate::Result<()> {
-        let existing_keys = sql_query(format!(
-            "SELECT {key_column} AS item_key FROM {table} WHERE mode = ?"
-        ))
-        .bind::<Text, _>(mode.as_query_value())
-        .load::<MaterializedKeyRow>(&mut *connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
-        for row in existing_keys {
-            if current_keys.contains(row.item_key.as_str()) {
-                continue;
-            }
-            sql_query(format!(
-                "DELETE FROM {table} WHERE mode = ? AND {key_column} = ?"
-            ))
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(row.item_key)
-            .execute(&mut *connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
-        }
         Ok(())
     }
 

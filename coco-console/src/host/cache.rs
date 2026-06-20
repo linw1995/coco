@@ -512,9 +512,31 @@ where
             .snapshot_for_current_source(mode)
             .await
             .expect("graph snapshot should build");
-        self.store_snapshot_materialization(snapshot.version, &snapshot)
-            .expect("test snapshot materialization should store");
+        self.wait_for_materialization_current(mode, snapshot.version)
+            .await;
         snapshot
+    }
+
+    #[cfg(test)]
+    async fn wait_for_materialization_current(&self, mode: GraphMode, source_version: u64) {
+        if self.snapshots.is_none() {
+            return;
+        }
+        self.ensure_viewport_current(mode);
+        for _ in 0..50 {
+            if self.materialization_current(mode, source_version) {
+                return;
+            }
+            if self.rebuild_statuses().iter().any(|status| {
+                status.mode == mode
+                    && status.source_version == source_version
+                    && status.state == ConsoleGraphRebuildState::Failed
+            }) {
+                panic!("graph materialization should not fail");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("graph materialization should become current");
     }
 
     fn publish_ready_version(&self, source_version: u64) -> u64 {
@@ -568,17 +590,6 @@ where
         });
     }
 
-    fn store_snapshot_materialization(
-        &self,
-        source_version: u64,
-        snapshot: &GraphSnapshot,
-    ) -> crate::Result<()> {
-        if let Some(snapshots) = &self.snapshots {
-            snapshots.put(source_version, snapshot)?;
-        }
-        Ok(())
-    }
-
     fn ensure_snapshot_current(&self, mode: GraphMode) {
         let source_version = self.invalidations.current_version();
         if self.cached_snapshot(mode, source_version).is_some() {
@@ -605,7 +616,7 @@ where
 
     fn ensure_viewport_current(&self, mode: GraphMode) {
         let source_version = self.invalidations.current_version();
-        if self.cached_snapshot(mode, source_version).is_some()
+        if (self.snapshots.is_none() && self.cached_snapshot(mode, source_version).is_some())
             || self.materialization_current(mode, source_version)
         {
             self.set_rebuild_status(rebuild_status(
@@ -749,30 +760,17 @@ where
             .await;
         match result {
             Ok(Ok(snapshot)) => {
-                match self.store_snapshot_materialization(source_version, &snapshot) {
-                    Ok(()) => {
-                        self.store_cached_snapshot(mode, source_version, Arc::new(snapshot));
-                        self.publish_ready_version(source_version);
-                        self.set_rebuild_status(rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Ready,
-                            None,
-                            1,
-                            1,
-                            "Graph snapshot ready",
-                        ));
-                    }
-                    Err(error) => self.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Failed,
-                        None,
-                        0,
-                        0,
-                        error.to_string(),
-                    )),
-                }
+                self.store_cached_snapshot(mode, source_version, Arc::new(snapshot));
+                self.publish_ready_version(source_version);
+                self.set_rebuild_status(rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Ready,
+                    None,
+                    1,
+                    1,
+                    "Graph snapshot ready",
+                ));
             }
             Ok(Err(error)) => self.set_rebuild_status(rebuild_status(
                 mode,
@@ -796,17 +794,12 @@ where
     }
 
     fn materialization_current(&self, mode: GraphMode, source_version: u64) -> bool {
-        if self.snapshots.is_none() {
-            return false;
-        }
-        let state = self
-            .state
-            .lock()
-            .expect("console graph cache lock poisoned");
-        state.rebuild_slot(mode).as_ref().is_some_and(|status| {
-            status.source_version == source_version
-                && status.state == ConsoleGraphRebuildState::Ready
-        })
+        self.snapshots.as_ref().and_then(|snapshots| {
+            snapshots
+                .latest_materialization_version(mode)
+                .ok()
+                .flatten()
+        }) == Some(source_version)
     }
 
     fn mark_rebuild_scheduled(&self, mode: GraphMode, source_version: u64) -> bool {
@@ -814,10 +807,11 @@ where
             .state
             .lock()
             .expect("console graph cache lock poisoned");
-        if state
-            .slot(mode)
-            .as_ref()
-            .is_some_and(|cached| cached.source_version == source_version)
+        if self.snapshots.is_none()
+            && state
+                .slot(mode)
+                .as_ref()
+                .is_some_and(|cached| cached.source_version == source_version)
         {
             return false;
         }
@@ -1403,17 +1397,50 @@ mod tests {
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
 
-        let snapshot = cache.current_snapshot(GraphMode::All).await;
+        cache.current_snapshot(GraphMode::All).await;
         let database_path = path.join("store.sqlite3");
         create_graph_fact_audit_triggers(&database_path);
-        ConsoleGraphSnapshotStore::open(&path)
-            .unwrap()
-            .put(snapshot.version + 1, &snapshot)
+        let next = writer
+            .append(NewNode {
+                parent: text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("next visible child".to_owned()),
+            })
             .unwrap();
+        writer.set_branch_head("main", &text, &next).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let mut materialized = None;
+        for _ in 0..50 {
+            materialized = ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .latest_viewport(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .unwrap();
+            if materialized
+                .as_ref()
+                .is_some_and(|viewport| viewport.version == target_version)
+            {
+                break;
+            }
+            let _ = cache.viewport_current_ready_or_schedule(
+                GraphMode::All,
+                crate::host::api::GraphViewportRequest::default(),
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        let materialized = materialized.expect("materialization should append incrementally");
+
+        assert_eq!(materialized.version, target_version);
+        assert!(materialized.nodes.iter().any(|node| node.id == next));
 
         assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
@@ -3421,7 +3448,7 @@ mod tests {
         );
         assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 2);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
 
         drop(writer);

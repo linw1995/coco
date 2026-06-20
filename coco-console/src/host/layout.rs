@@ -487,6 +487,7 @@ pub fn layout_graph_viewport(
     }
 }
 
+#[cfg(test)]
 pub fn materialize_graph_viewport(snapshot: &GraphSnapshot) -> GraphViewportResponse {
     let layout = layout_graph(snapshot);
     let nodes_by_id = snapshot

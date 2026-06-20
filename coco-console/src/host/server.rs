@@ -1933,15 +1933,6 @@ mod tests {
             .unwrap();
         writer.set_branch_head("main", &root, &text).unwrap();
         publisher.mark_changed();
-        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
-            publisher.clone(),
-            path.clone(),
-        )
-        .unwrap();
-        seed_cache.current_snapshot(GraphMode::All).await;
-        drop(seed_cache);
-
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
                 MemoryStore::new(),
@@ -2049,15 +2040,6 @@ mod tests {
         let publisher = ConsolePublisher::new();
         writer.fork("main", &writer.root_id()).unwrap();
         publisher.mark_changed();
-        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
-            publisher.clone(),
-            path.clone(),
-        )
-        .unwrap();
-        seed_cache.current_snapshot(GraphMode::All).await;
-        drop(seed_cache);
-
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
                 MemoryStore::new(),
