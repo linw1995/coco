@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -99,6 +100,12 @@ struct EdgeRouteRow {
     route_slot: i32,
     #[diesel(sql_type = Double)]
     target_port_offset: f64,
+}
+
+#[derive(QueryableByName)]
+struct MaterializedKeyRow {
+    #[diesel(sql_type = Text)]
+    item_key: String,
 }
 
 struct NodeLocationInsert<'a> {
@@ -364,14 +371,28 @@ ON CONFLICT(mode) DO UPDATE SET
         mode: GraphMode,
         materialized: &GraphViewportResponse,
     ) -> crate::Result<()> {
-        for table in ["console_graph_node_locations", "console_graph_edge_routes"] {
-            sql_query(format!("DELETE FROM {table} WHERE mode = ?"))
-                .bind::<Text, _>(mode.as_query_value())
-                .execute(&mut *connection)
-                .context(QueryGraphSnapshotStoreSnafu {
-                    path: self.path.as_ref().clone(),
-                })?;
-        }
+        self.delete_stale_materialized_keys(
+            connection,
+            "console_graph_node_locations",
+            "node_key",
+            mode,
+            materialized
+                .nodes
+                .iter()
+                .map(|node| node.key.as_str())
+                .collect(),
+        )?;
+        self.delete_stale_materialized_keys(
+            connection,
+            "console_graph_edge_routes",
+            "edge_key",
+            mode,
+            materialized
+                .edges
+                .iter()
+                .map(|edge| edge.key.as_str())
+                .collect(),
+        )?;
         let lane_by_y = materialized
             .lanes
             .iter()
@@ -404,6 +425,39 @@ ON CONFLICT(mode) DO UPDATE SET
         Ok(())
     }
 
+    fn delete_stale_materialized_keys(
+        &self,
+        connection: &mut SqliteConnection,
+        table: &'static str,
+        key_column: &'static str,
+        mode: GraphMode,
+        current_keys: HashSet<&str>,
+    ) -> crate::Result<()> {
+        let existing_keys = sql_query(format!(
+            "SELECT {key_column} AS item_key FROM {table} WHERE mode = ?"
+        ))
+        .bind::<Text, _>(mode.as_query_value())
+        .load::<MaterializedKeyRow>(&mut *connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        for row in existing_keys {
+            if current_keys.contains(row.item_key.as_str()) {
+                continue;
+            }
+            sql_query(format!(
+                "DELETE FROM {table} WHERE mode = ? AND {key_column} = ?"
+            ))
+            .bind::<Text, _>(mode.as_query_value())
+            .bind::<Text, _>(row.item_key)
+            .execute(&mut *connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+        }
+        Ok(())
+    }
+
     fn insert_node_location(
         &self,
         connection: &mut SqliteConnection,
@@ -421,6 +475,37 @@ INSERT INTO console_graph_node_locations (
     labels_json, lane_key, lane_label, lane_y, x, y, min_x, min_y, max_x, max_y
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(mode, node_key) DO UPDATE SET
+    node_id = excluded.node_id,
+    node_target = excluded.node_target,
+    short_id = excluded.short_id,
+    node_kind = excluded.node_kind,
+    summary = excluded.summary,
+    labels_json = excluded.labels_json,
+    lane_key = excluded.lane_key,
+    lane_label = excluded.lane_label,
+    lane_y = excluded.lane_y,
+    x = excluded.x,
+    y = excluded.y,
+    min_x = excluded.min_x,
+    min_y = excluded.min_y,
+    max_x = excluded.max_x,
+    max_y = excluded.max_y
+WHERE console_graph_node_locations.node_id IS NOT excluded.node_id
+   OR console_graph_node_locations.node_target IS NOT excluded.node_target
+   OR console_graph_node_locations.short_id IS NOT excluded.short_id
+   OR console_graph_node_locations.node_kind IS NOT excluded.node_kind
+   OR console_graph_node_locations.summary IS NOT excluded.summary
+   OR console_graph_node_locations.labels_json IS NOT excluded.labels_json
+   OR console_graph_node_locations.lane_key IS NOT excluded.lane_key
+   OR console_graph_node_locations.lane_label IS NOT excluded.lane_label
+   OR console_graph_node_locations.lane_y IS NOT excluded.lane_y
+   OR console_graph_node_locations.x IS NOT excluded.x
+   OR console_graph_node_locations.y IS NOT excluded.y
+   OR console_graph_node_locations.min_x IS NOT excluded.min_x
+   OR console_graph_node_locations.min_y IS NOT excluded.min_y
+   OR console_graph_node_locations.max_x IS NOT excluded.max_x
+   OR console_graph_node_locations.max_y IS NOT excluded.max_y
 "#,
         )
         .bind::<Text, _>(insert.mode.as_query_value())
@@ -460,6 +545,33 @@ INSERT INTO console_graph_edge_routes (
     min_x, min_y, max_x, max_y
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(mode, edge_key) DO UPDATE SET
+    edge_kind = excluded.edge_kind,
+    source_id = excluded.source_id,
+    target_id = excluded.target_id,
+    source_x = excluded.source_x,
+    source_y = excluded.source_y,
+    target_x = excluded.target_x,
+    target_y = excluded.target_y,
+    route_slot = excluded.route_slot,
+    target_port_offset = excluded.target_port_offset,
+    min_x = excluded.min_x,
+    min_y = excluded.min_y,
+    max_x = excluded.max_x,
+    max_y = excluded.max_y
+WHERE console_graph_edge_routes.edge_kind IS NOT excluded.edge_kind
+   OR console_graph_edge_routes.source_id IS NOT excluded.source_id
+   OR console_graph_edge_routes.target_id IS NOT excluded.target_id
+   OR console_graph_edge_routes.source_x IS NOT excluded.source_x
+   OR console_graph_edge_routes.source_y IS NOT excluded.source_y
+   OR console_graph_edge_routes.target_x IS NOT excluded.target_x
+   OR console_graph_edge_routes.target_y IS NOT excluded.target_y
+   OR console_graph_edge_routes.route_slot IS NOT excluded.route_slot
+   OR console_graph_edge_routes.target_port_offset IS NOT excluded.target_port_offset
+   OR console_graph_edge_routes.min_x IS NOT excluded.min_x
+   OR console_graph_edge_routes.min_y IS NOT excluded.min_y
+   OR console_graph_edge_routes.max_x IS NOT excluded.max_x
+   OR console_graph_edge_routes.max_y IS NOT excluded.max_y
 "#,
         )
         .bind::<Text, _>(insert.mode.as_query_value())

@@ -944,6 +944,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_refreshes_graph_locations_incrementally() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("visible child".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
+        publisher.mark_changed();
+
+        let snapshot = cache.current_snapshot(GraphMode::All).await;
+        let database_path = path.join("store.sqlite3");
+        create_graph_fact_audit_triggers(&database_path);
+        ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .put(snapshot.version + 1, &snapshot)
+            .unwrap();
+
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_drops_legacy_snapshot_materialization_tables() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
@@ -1006,6 +1055,20 @@ mod tests {
             .count
     }
 
+    fn sqlite_audit_row_count(database_path: &std::path::Path, kind: &str) -> i64 {
+        use diesel::prelude::*;
+        use diesel::sql_query;
+        use diesel::sql_types::Text;
+
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        sql_query("SELECT COUNT(*) AS count FROM console_graph_fact_audit WHERE kind = ?")
+            .bind::<Text, _>(kind)
+            .get_result::<SqliteCount>(&mut connection)
+            .unwrap()
+            .count
+    }
+
     fn sqlite_table_has_column(database_path: &std::path::Path, table: &str, column: &str) -> bool {
         use diesel::prelude::*;
         use diesel::sql_query;
@@ -1036,6 +1099,41 @@ CREATE TABLE console_graph_viewports (mode TEXT PRIMARY KEY NOT NULL);
 CREATE TABLE console_graph_viewport_lanes (mode TEXT NOT NULL);
 CREATE TABLE console_graph_viewport_nodes (mode TEXT NOT NULL);
 CREATE TABLE console_graph_viewport_edges (mode TEXT NOT NULL);
+"#,
+            )
+            .unwrap();
+    }
+
+    fn create_graph_fact_audit_triggers(database_path: &std::path::Path) {
+        use diesel::connection::SimpleConnection;
+        use diesel::prelude::*;
+
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        connection
+            .batch_execute(
+                r#"
+CREATE TABLE console_graph_fact_audit (kind TEXT NOT NULL);
+CREATE TRIGGER console_graph_node_delete_audit
+AFTER DELETE ON console_graph_node_locations
+BEGIN
+    INSERT INTO console_graph_fact_audit (kind) VALUES ('node_delete');
+END;
+CREATE TRIGGER console_graph_edge_delete_audit
+AFTER DELETE ON console_graph_edge_routes
+BEGIN
+    INSERT INTO console_graph_fact_audit (kind) VALUES ('edge_delete');
+END;
+CREATE TRIGGER console_graph_node_update_audit
+AFTER UPDATE ON console_graph_node_locations
+BEGIN
+    INSERT INTO console_graph_fact_audit (kind) VALUES ('node_update');
+END;
+CREATE TRIGGER console_graph_edge_update_audit
+AFTER UPDATE ON console_graph_edge_routes
+BEGIN
+    INSERT INTO console_graph_fact_audit (kind) VALUES ('edge_update');
+END;
 "#,
             )
             .unwrap();
