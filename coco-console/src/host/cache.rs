@@ -2488,6 +2488,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_seeds_orphan_merge_parent_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let main_first = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main first".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &main_first)
+            .unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let database_path = path.join("store.sqlite3");
+        create_graph_fact_audit_triggers(&database_path);
+        let orphan_parent = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan feedback".to_owned()),
+            })
+            .unwrap();
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: main_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan_parent.clone())],
+                    PromptAnchor {
+                        prompt: "merge orphan".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &main_first, &merge_anchor)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan_parent));
+
+        assert_eq!(viewport.version, target_version);
+        assert!(viewport.lanes.iter().any(|lane| lane.label == orphan_lane));
+        assert!(viewport.nodes.iter().any(|node| node.id == orphan_parent));
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == orphan_parent
+                && edge.target_id == merge_anchor
+                && edge.kind == crate::api::GraphViewportEdgeKind::MergeParent
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 1);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_updates_anchor_materialization_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
@@ -3769,11 +3866,13 @@ mod tests {
         let draft_nodes = viewport
             .nodes
             .iter()
-            .filter(|node| node.id == main_first && node.labels == vec!["draft".to_owned()])
+            .filter(|node| {
+                node.id == main_first && node.labels == vec!["draft".to_owned(), "main".to_owned()]
+            })
             .count();
 
         assert_eq!(viewport.version, target_version);
-        assert_eq!(draft_nodes, 1);
+        assert_eq!(draft_nodes, 2);
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
@@ -3781,7 +3880,7 @@ mod tests {
         );
         assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
@@ -3829,11 +3928,22 @@ mod tests {
         let draft_nodes = viewport
             .nodes
             .iter()
-            .filter(|node| node.id == session && node.labels == vec!["draft".to_owned()])
+            .filter(|node| {
+                node.id == session && node.labels == vec!["draft".to_owned(), "main".to_owned()]
+            })
             .count();
+        let reference = ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .materialized_node_reference(GraphMode::All, &crate::graph::node_target_id(&session))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(viewport.version, target_version);
-        assert_eq!(draft_nodes, 1);
+        assert_eq!(draft_nodes, 2);
+        assert_eq!(
+            reference.labels,
+            vec!["draft".to_owned(), "main".to_owned()]
+        );
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
@@ -3841,7 +3951,7 @@ mod tests {
         );
         assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
@@ -3930,7 +4040,7 @@ mod tests {
         );
         assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 2);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
 
         drop(writer);

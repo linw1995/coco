@@ -182,6 +182,11 @@ struct MergeColumnConstraintInput<'a> {
     event_order: &'a BTreeMap<String, usize>,
 }
 
+struct VisibleMergeParentPoint {
+    node_id: String,
+    point: Point,
+}
+
 struct MaterializationMetaInput {
     source_version: u64,
     mode: GraphMode,
@@ -775,6 +780,7 @@ LIMIT 1
         }
         let materialized_lane_labels = materialized_lanes
             .iter()
+            .filter(|lane| !is_orphan_lane_label(&lane.lane_label))
             .map(|lane| lane.lane_label.clone())
             .collect::<BTreeSet<_>>();
         if !existing_branch_lanes_preserve_order(
@@ -1143,6 +1149,9 @@ LIMIT 1
         node: &Node,
         source_point: Point,
     ) -> crate::Result<bool> {
+        let mut labels = self.materialized_node_label_set(connection, input.mode, &node.id)?;
+        labels.insert(branch_label(input.branch, input.state));
+        let labels = labels.into_iter().collect::<Vec<_>>();
         let lane = GraphViewportLane {
             key: lane_key(input.branch),
             label: input.branch.to_owned(),
@@ -1154,7 +1163,7 @@ LIMIT 1
                 x: source_point.x,
                 y: lane_y,
             },
-            vec![branch_label(input.branch, input.state)],
+            labels.clone(),
         );
         self.insert_node_location(
             connection,
@@ -1165,6 +1174,7 @@ LIMIT 1
                 bounds: node_bounds(&viewport_node),
             },
         )?;
+        self.update_node_id_labels(connection, input.mode, &node.id, labels)?;
         Ok(true)
     }
 
@@ -1177,15 +1187,19 @@ LIMIT 1
         let mut parent_ids = BTreeSet::from([input.primary_parent_id.to_owned()]);
         let mut x = input.point.x;
         for merge_parent in node_anchor_merge_parents(input.node) {
-            let Some((source_id, source)) =
-                self.visible_merge_parent_point(connection, store, input.mode, merge_parent)?
+            let Some(source) = self.ensure_visible_merge_parent_point(
+                connection,
+                store,
+                input.mode,
+                merge_parent,
+            )?
             else {
                 return Ok(None);
             };
-            if parent_ids.insert(source_id.clone()) {
+            if parent_ids.insert(source.node_id.clone()) {
                 x = x.max(
-                    source.x
-                        + required_column_gap(&source_id, &input.node.id, input.event_order)
+                    source.point.x
+                        + required_column_gap(&source.node_id, &input.node.id, input.event_order)
                             * GRAPH_COLUMN_WIDTH,
                 );
             }
@@ -1207,21 +1221,21 @@ LIMIT 1
     ) -> crate::Result<bool> {
         let mut parent_ids = BTreeSet::from([primary_parent_id.to_owned()]);
         for merge_parent in node_anchor_merge_parents(node) {
-            let Some((source_id, source)) =
-                self.visible_merge_parent_point(connection, store, mode, merge_parent)?
+            let Some(source) =
+                self.ensure_visible_merge_parent_point(connection, store, mode, merge_parent)?
             else {
                 return Ok(false);
             };
-            if !parent_ids.insert(source_id.clone()) {
+            if !parent_ids.insert(source.node_id.clone()) {
                 continue;
             }
             let edge = routed_edge(
                 GraphViewportEdgeKind::MergeParent,
-                &source_id,
-                source,
+                &source.node_id,
+                source.point,
                 &node.id,
                 target,
-                self.next_routed_edge_slot_in_connection(connection, mode, source, target)?,
+                self.next_routed_edge_slot_in_connection(connection, mode, source.point, target)?,
             );
             self.insert_edge_route(
                 connection,
@@ -1236,24 +1250,147 @@ LIMIT 1
         Ok(true)
     }
 
-    fn visible_merge_parent_point(
+    fn ensure_visible_merge_parent_point(
         &self,
         connection: &mut SqliteConnection,
         store: &impl NodeStore,
         mode: GraphMode,
         merge_parent: &MergeParent,
-    ) -> crate::Result<Option<(String, Point)>> {
+    ) -> crate::Result<Option<VisibleMergeParentPoint>> {
         let ancestry = store
             .ancestry(merge_parent.node_id())
             .context(crate::error::StoreSnafu)?;
-        let Some((source_index, source_point)) =
-            self.first_materialized_ancestry_point(connection, mode, &ancestry)?
+        let Some(source_index) = ancestry
+            .iter()
+            .position(|node| is_visible_mode_node(mode, node))
         else {
             return Ok(None);
         };
-        Ok(ancestry
-            .get(source_index)
-            .map(|source| (source.id.clone(), source_point)))
+        let source = &ancestry[source_index];
+        if let Some(point) =
+            self.materialized_node_point_in_connection(connection, mode, &source.id)?
+        {
+            return Ok(Some(VisibleMergeParentPoint {
+                node_id: source.id.clone(),
+                point,
+            }));
+        }
+        self.insert_orphan_merge_parent_lane(connection, store, mode, &ancestry, source_index)
+    }
+
+    fn insert_orphan_merge_parent_lane(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        mode: GraphMode,
+        ancestry: &[Node],
+        source_index: usize,
+    ) -> crate::Result<Option<VisibleMergeParentPoint>> {
+        let mut fork_source = None::<(String, Point)>;
+        let mut end_index = ancestry
+            .iter()
+            .position(|node| node.is_root())
+            .unwrap_or(ancestry.len());
+        for (index, node) in ancestry.iter().enumerate().skip(source_index + 1) {
+            if let Some(point) =
+                self.materialized_node_point_in_connection(connection, mode, &node.id)?
+            {
+                fork_source = Some((node.id.clone(), point));
+                end_index = index;
+                break;
+            }
+        }
+
+        let nodes = ancestry[..end_index]
+            .iter()
+            .filter(|node| is_visible_mode_node(mode, node))
+            .cloned()
+            .rev()
+            .collect::<Vec<_>>();
+        let Some(source) = nodes.last() else {
+            return Ok(None);
+        };
+        let source_id = source.id.clone();
+        let lane_y = self.next_materialized_lane_y(connection, mode)?;
+        let lane_label = format!("orphan {}", shorten_id(&source_id));
+        let lane = GraphViewportLane {
+            key: lane_key(&lane_label),
+            label: lane_label,
+            y: lane_y,
+        };
+        let event_order =
+            self.event_order_by_materialized_and_new_nodes(connection, store, mode, &nodes)?;
+        let mut previous = fork_source;
+        let mut source_point = None;
+        for (index, node) in nodes.into_iter().enumerate() {
+            let point = match previous.as_ref() {
+                Some((previous_id, previous_point)) => Point {
+                    x: previous_point.x
+                        + required_column_gap(previous_id, &node.id, &event_order)
+                            * GRAPH_COLUMN_WIDTH,
+                    y: lane_y,
+                },
+                None => Point {
+                    x: GRAPH_LEFT_X,
+                    y: lane_y,
+                },
+            };
+            let viewport_node = graph_viewport_node_from_node(&node, point, Vec::new());
+            self.insert_node_location(
+                connection,
+                NodeLocationInsert {
+                    mode,
+                    node: &viewport_node,
+                    lane: &lane,
+                    bounds: node_bounds(&viewport_node),
+                },
+            )?;
+            if let Some((previous_id, previous_point)) = previous.as_ref() {
+                let edge = if index == 0 && previous_point.y != lane_y {
+                    routed_edge(
+                        GraphViewportEdgeKind::Fork,
+                        previous_id,
+                        *previous_point,
+                        &node.id,
+                        point,
+                        self.next_routed_edge_slot_in_connection(
+                            connection,
+                            mode,
+                            *previous_point,
+                            point,
+                        )?,
+                    )
+                } else {
+                    primary_parent_edge(previous_id, *previous_point, &node.id, point)
+                };
+                self.insert_edge_route(
+                    connection,
+                    EdgeRouteInsert {
+                        mode,
+                        edge: &edge,
+                        bounds: edge_bounds(&edge),
+                    },
+                )?;
+                if !self.insert_node_merge_edges(
+                    connection,
+                    store,
+                    mode,
+                    &node,
+                    previous_id,
+                    point,
+                )? {
+                    return Ok(None);
+                }
+            } else if !self.insert_node_merge_edges(connection, store, mode, &node, "", point)? {
+                return Ok(None);
+            }
+            source_point = Some(point);
+            previous = Some((node.id, point));
+        }
+        Ok(source_point.map(|point| VisibleMergeParentPoint {
+            node_id: source_id,
+            point,
+        }))
     }
 
     fn rebalance_target_port_offsets(
@@ -1492,6 +1629,7 @@ ORDER BY
         }
         let materialized_lane_labels = materialized_lanes
             .iter()
+            .filter(|lane| !is_orphan_lane_label(&lane.lane_label))
             .map(|lane| lane.lane_label.clone())
             .collect::<BTreeSet<_>>();
         if !existing_branch_lanes_preserve_order(
@@ -1917,6 +2055,72 @@ WHERE mode = ? AND node_key = ? AND labels_json IS NOT ?
         Ok(())
     }
 
+    fn update_node_id_labels(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+        labels: Vec<String>,
+    ) -> crate::Result<()> {
+        let labels_json =
+            serde_json::to_string(&labels).context(ParseGraphSnapshotStoreValueSnafu {
+                column: "console_graph_node_locations.labels_json",
+            })?;
+        sql_query(
+            r#"
+UPDATE console_graph_node_locations
+SET labels_json = ?
+WHERE mode = ? AND node_id = ? AND labels_json IS NOT ?
+"#,
+        )
+        .bind::<Text, _>(&labels_json)
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .bind::<Text, _>(&labels_json)
+        .execute(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(())
+    }
+
+    fn materialized_node_label_set(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+    ) -> crate::Result<BTreeSet<String>> {
+        #[derive(QueryableByName)]
+        struct LabelsRow {
+            #[diesel(sql_type = Text)]
+            labels_json: String,
+        }
+
+        let rows = sql_query(
+            r#"
+SELECT labels_json
+FROM console_graph_node_locations
+WHERE mode = ? AND node_id = ?
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .load::<LabelsRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        let mut labels = BTreeSet::new();
+        for row in rows {
+            let row_labels = serde_json::from_str::<Vec<String>>(&row.labels_json).context(
+                ParseGraphSnapshotStoreValueSnafu {
+                    column: "console_graph_node_locations.labels_json",
+                },
+            )?;
+            labels.extend(row_labels);
+        }
+        Ok(labels)
+    }
+
     fn delete_materialized_lanes(
         &self,
         connection: &mut SqliteConnection,
@@ -2333,6 +2537,20 @@ ORDER BY lane_y, lane_key
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })
+    }
+
+    fn next_materialized_lane_y(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<i32> {
+        Ok(self
+            .materialized_lanes_in_connection(connection, mode)?
+            .iter()
+            .map(|lane| lane.lane_y)
+            .max()
+            .unwrap_or(crate::layout::GRAPH_TOP_Y - GRAPH_LANE_HEIGHT)
+            + GRAPH_LANE_HEIGHT)
     }
 
     fn first_materialized_ancestry_point(
@@ -2882,12 +3100,19 @@ fn is_anchor_node(node: &Node) -> bool {
     matches!(&node.kind, Kind::Anchor(_))
 }
 
+fn is_visible_mode_node(mode: GraphMode, node: &Node) -> bool {
+    !node.is_root() && (mode == GraphMode::All || is_anchor_node(node))
+}
+
+fn is_orphan_lane_label(label: &str) -> bool {
+    label.starts_with("orphan ")
+}
+
 fn initial_visible_lane_nodes(mode: GraphMode, ancestry: Vec<Node>) -> Vec<Node> {
     ancestry
         .into_iter()
         .rev()
-        .filter(|node| !node.is_root())
-        .filter(|node| mode == GraphMode::All || is_anchor_node(node))
+        .filter(|node| is_visible_mode_node(mode, node))
         .collect()
 }
 
@@ -2951,6 +3176,7 @@ fn existing_branch_lanes_preserve_order(
         .collect::<Vec<_>>();
     let current_existing_lanes = materialized_lanes
         .iter()
+        .filter(|lane| materialized_lane_labels.contains(&lane.lane_label))
         .map(|lane| lane.lane_label.as_str())
         .collect::<Vec<_>>();
     expected_existing_lanes == current_existing_lanes
@@ -2962,7 +3188,9 @@ fn removed_lanes_in_order(
 ) -> Vec<LaneRow> {
     materialized_lanes
         .iter()
-        .filter(|lane| !branch_names.contains(&lane.lane_label))
+        .filter(|lane| {
+            !is_orphan_lane_label(&lane.lane_label) && !branch_names.contains(&lane.lane_label)
+        })
         .cloned()
         .collect()
 }
