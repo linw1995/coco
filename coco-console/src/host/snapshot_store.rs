@@ -34,6 +34,7 @@ const NODE_RADIUS: i32 = 26;
 const EDGE_TARGET_APPROACH: i32 = 48;
 const GRAPH_LANE_HEIGHT: i32 = 140;
 const EDGE_ROUTE_STEP: i32 = 12;
+const MAX_EDGE_COLUMN_GAP: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct ConsoleGraphSnapshotStore {
@@ -329,15 +330,24 @@ impl ConsoleGraphSnapshotStore {
             label: tail.lane_label,
             y: tail.lane_y,
         };
+        let appended_nodes = chain.into_iter().skip(1).collect::<Vec<_>>();
+        let event_order = self.event_order_by_materialized_and_new_nodes(
+            connection,
+            store,
+            input.mode,
+            &appended_nodes,
+        )?;
         let mut previous_id = tail.node_id;
         let mut previous_point = Point {
             x: tail.x,
             y: tail.y,
         };
-        let appended_len = chain.len().saturating_sub(1);
-        for (index, node) in chain.into_iter().skip(1).enumerate() {
+        let appended_len = appended_nodes.len();
+        for (index, node) in appended_nodes.into_iter().enumerate() {
             let point = Point {
-                x: previous_point.x + GRAPH_COLUMN_WIDTH,
+                x: previous_point.x
+                    + required_column_gap(&previous_id, &node.id, &event_order)
+                        * GRAPH_COLUMN_WIDTH,
                 y: previous_point.y,
             };
             let labels = if index + 1 == appended_len {
@@ -588,10 +598,14 @@ impl ConsoleGraphSnapshotStore {
         };
         let branch_label = branch_label(input.branch, input.state);
         let appended_len = nodes.len();
+        let event_order =
+            self.event_order_by_materialized_and_new_nodes(connection, store, input.mode, &nodes)?;
         for (index, node) in nodes.into_iter().enumerate() {
             let point = match previous.as_ref() {
-                Some((_, previous_point)) => Point {
-                    x: previous_point.x + GRAPH_COLUMN_WIDTH,
+                Some((previous_id, previous_point)) => Point {
+                    x: previous_point.x
+                        + required_column_gap(previous_id, &node.id, &event_order)
+                            * GRAPH_COLUMN_WIDTH,
                     y: lane_y,
                 },
                 None => Point {
@@ -686,14 +700,27 @@ impl ConsoleGraphSnapshotStore {
             label: tail.lane_label,
             y: tail.lane_y,
         };
+        let appended_nodes = chain
+            .into_iter()
+            .skip(1)
+            .filter(is_anchor_node)
+            .collect::<Vec<_>>();
+        let event_order = self.event_order_by_materialized_and_new_nodes(
+            connection,
+            store,
+            input.mode,
+            &appended_nodes,
+        )?;
         let mut previous_id = tail.node_id;
         let mut previous_point = Point {
             x: tail.x,
             y: tail.y,
         };
-        for node in chain.into_iter().skip(1).filter(is_anchor_node) {
+        for node in appended_nodes {
             let point = Point {
-                x: previous_point.x + GRAPH_COLUMN_WIDTH,
+                x: previous_point.x
+                    + required_column_gap(&previous_id, &node.id, &event_order)
+                        * GRAPH_COLUMN_WIDTH,
                 y: previous_point.y,
             };
             let viewport_node = graph_viewport_node_from_node(&node, point, Vec::new());
@@ -921,9 +948,13 @@ ORDER BY
         let mut previous_id = source.id.clone();
         let mut previous_point = source_point;
         let appended_len = nodes.len();
+        let event_order =
+            self.event_order_by_materialized_and_new_nodes(connection, store, input.mode, &nodes)?;
         for (index, node) in nodes.into_iter().enumerate() {
             let point = Point {
-                x: previous_point.x + GRAPH_COLUMN_WIDTH,
+                x: previous_point.x
+                    + required_column_gap(&previous_id, &node.id, &event_order)
+                        * GRAPH_COLUMN_WIDTH,
                 y: lane_y,
             };
             let labels = if index + 1 == appended_len {
@@ -1974,6 +2005,41 @@ LIMIT 1
         })
     }
 
+    fn event_order_by_materialized_and_new_nodes(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        mode: GraphMode,
+        new_nodes: &[Node],
+    ) -> crate::Result<BTreeMap<String, usize>> {
+        let mut nodes_by_id = new_nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for row in self.materialized_node_rows_in_connection(connection, mode)? {
+            if nodes_by_id.contains_key(&row.node_id) {
+                continue;
+            }
+            let node = store
+                .get_node(&row.node_id)
+                .context(crate::error::StoreSnafu)?;
+            nodes_by_id.insert(row.node_id, node);
+        }
+
+        let mut nodes = nodes_by_id.into_values().collect::<Vec<_>>();
+        nodes.sort_by(|left, right| {
+            left.created_at
+                .as_nanosecond()
+                .cmp(&right.created_at.as_nanosecond())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, node)| (node.id, index))
+            .collect())
+    }
+
     fn next_routed_edge_slot_in_connection(
         &self,
         connection: &mut SqliteConnection,
@@ -2383,6 +2449,19 @@ fn is_anchor_node(node: &Node) -> bool {
 fn is_linear_new_nodes(source_id: &str, nodes: &[Node]) -> bool {
     nodes.first().is_some_and(|node| node.parent == source_id)
         && nodes.windows(2).all(|nodes| nodes[1].parent == nodes[0].id)
+}
+
+fn required_column_gap(
+    source_id: &str,
+    target_id: &str,
+    event_order_by_node: &BTreeMap<String, usize>,
+) -> i32 {
+    event_order_by_node
+        .get(target_id)
+        .zip(event_order_by_node.get(source_id))
+        .and_then(|(target_order, source_order)| target_order.checked_sub(*source_order))
+        .map(|gap| gap.clamp(1, MAX_EDGE_COLUMN_GAP) as i32)
+        .unwrap_or(1)
 }
 
 fn branch_label(branch: &str, state: &SessionState) -> String {

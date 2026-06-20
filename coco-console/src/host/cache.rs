@@ -1692,6 +1692,23 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_anchor)
             .unwrap();
+        let main_followup = writer
+            .append(NewNode {
+                parent: main_anchor.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "main followup".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &main_anchor, &main_followup)
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
@@ -1726,8 +1743,26 @@ mod tests {
             )
             .await
             .unwrap();
+        let full_snapshot = crate::graph::build_graph_snapshot_with_mode(
+            &writer,
+            target_version,
+            GraphMode::Anchors,
+        )
+        .unwrap();
+        let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
+        let incremental_draft = viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == draft_anchor)
+            .unwrap();
+        let full_draft = full_viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == draft_anchor)
+            .unwrap();
 
         assert_eq!(viewport.version, target_version);
+        assert_eq!(incremental_draft.x, full_draft.x);
         assert!(
             viewport
                 .nodes
@@ -2181,6 +2216,17 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_first)
             .unwrap();
+        let main_second = writer
+            .append(NewNode {
+                parent: main_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main second".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &main_first, &main_second)
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -2209,8 +2255,23 @@ mod tests {
             )
             .await
             .unwrap();
+        let full_snapshot =
+            crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .unwrap();
+        let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
+        let incremental_draft = viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == draft_first)
+            .unwrap();
+        let full_draft = full_viewport
+            .nodes
+            .iter()
+            .find(|node| node.id == draft_first)
+            .unwrap();
 
         assert_eq!(viewport.version, target_version);
+        assert_eq!(incremental_draft.x, full_draft.x);
         assert!(viewport.nodes.iter().any(|node| node.id == draft_first));
         assert!(
             cache
