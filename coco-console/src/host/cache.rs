@@ -229,6 +229,10 @@ where
         self.cached_snapshot(mode, source_version)
     }
 
+    pub fn has_materialized_viewports(&self) -> bool {
+        self.snapshots.is_some()
+    }
+
     pub async fn snapshot_after(
         &self,
         mode: GraphMode,
