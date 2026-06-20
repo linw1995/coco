@@ -703,6 +703,31 @@ LIMIT 1
         Ok(())
     }
 
+    fn delete_materialized_branch_lane_if_isolated(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        branch: &str,
+    ) -> crate::Result<bool> {
+        let Some(lane) = self
+            .materialized_lanes_in_connection(connection, mode)?
+            .into_iter()
+            .find(|lane| lane.lane_key == lane_key(branch))
+        else {
+            return Ok(true);
+        };
+        if self.lanes_have_retained_downstream_edges(
+            connection,
+            mode,
+            std::slice::from_ref(&lane),
+        )? {
+            return Ok(false);
+        }
+        self.delete_materialized_lanes(connection, mode, std::slice::from_ref(&lane))?;
+        self.shift_lanes_after_deletion(connection, mode, std::slice::from_ref(&lane))?;
+        Ok(true)
+    }
+
     fn try_append_linear_branch_in_transaction(
         &self,
         connection: &mut SqliteConnection,
@@ -1049,7 +1074,17 @@ LIMIT 1
             let head_id = store
                 .get_branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
+            let has_visible_nodes = self.branch_has_initial_visible_nodes(store, mode, branch)?;
             let appended = if materialized_lane_labels.contains(branch) {
+                if !has_visible_nodes {
+                    if !self
+                        .delete_materialized_branch_lane_if_isolated(connection, mode, branch)?
+                    {
+                        return Ok(false);
+                    }
+                    materialized_lane_labels.remove(branch);
+                    continue;
+                }
                 self.try_update_existing_anchor_branch_lane(
                     connection,
                     store,
@@ -1061,6 +1096,9 @@ LIMIT 1
                     },
                 )?
             } else {
+                if !has_visible_nodes {
+                    continue;
+                }
                 self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
                 let appended = self.try_append_new_anchor_branch_lane_in_transaction(
                     connection,
@@ -2339,7 +2377,17 @@ ORDER BY
             let head_id = store
                 .get_branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
+            let has_visible_nodes = self.branch_has_initial_visible_nodes(store, mode, branch)?;
             let appended = if materialized_lane_labels.contains(branch) {
+                if !has_visible_nodes {
+                    if !self
+                        .delete_materialized_branch_lane_if_isolated(connection, mode, branch)?
+                    {
+                        return Ok(false);
+                    }
+                    materialized_lane_labels.remove(branch);
+                    continue;
+                }
                 self.try_append_linear_branch_in_transaction(
                     connection,
                     store,
@@ -2351,7 +2399,7 @@ ORDER BY
                     },
                 )?
             } else {
-                if !self.branch_has_initial_visible_nodes(store, mode, branch)? {
+                if !has_visible_nodes {
                     continue;
                 }
                 self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;

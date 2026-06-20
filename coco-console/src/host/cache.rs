@@ -3709,6 +3709,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_deletes_branch_lane_rewound_to_root_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main history".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
+        publisher.mark_changed();
+        let initial = cache
+            .viewport_after(
+                GraphMode::All,
+                0,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        writer.set_branch_head("main", &text, &root).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert!(viewport.nodes.is_empty());
+        assert!(viewport.edges.is_empty());
+        assert!(viewport.lanes.is_empty());
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+
+        drop(cache);
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn pending_viewport_after_refreshes_materialization_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
@@ -5455,6 +5522,93 @@ mod tests {
         assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
         assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
 
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_skips_hidden_new_anchor_branch_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let main_anchor = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "main anchor".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &main_anchor)
+            .unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::Anchors).await;
+        writer.fork("hidden", &root).unwrap();
+        let hidden_text = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("hidden branch text".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("hidden", &root, &hidden_text)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::Anchors,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let main_lane = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "main")
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert_eq!(main_lane.y, crate::layout::GRAPH_TOP_Y);
+        assert!(viewport.lanes.iter().any(|lane| lane.label == "main"));
+        assert!(!viewport.lanes.iter().any(|lane| lane.label == "hidden"));
+        assert!(viewport.nodes.iter().any(|node| node.id == main_anchor));
+        assert!(!viewport.nodes.iter().any(|node| node.id == hidden_text));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::Anchors, target_version)
+                .is_none()
+        );
+
+        drop(cache);
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
