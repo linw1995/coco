@@ -375,13 +375,6 @@ where
     }
 
     fn cached_snapshot(&self, mode: GraphMode, source_version: u64) -> Option<Arc<GraphSnapshot>> {
-        if let Some(snapshots) = &self.snapshots {
-            return snapshots
-                .get(mode, source_version)
-                .ok()
-                .flatten()
-                .map(Arc::new);
-        }
         let state = self
             .state
             .lock()
@@ -394,9 +387,6 @@ where
     }
 
     fn latest_cached_snapshot(&self, mode: GraphMode) -> Option<Arc<GraphSnapshot>> {
-        if let Some(snapshots) = &self.snapshots {
-            return snapshots.latest(mode).ok().flatten().map(Arc::new);
-        }
         let state = self
             .state
             .lock()
@@ -415,7 +405,6 @@ where
     ) -> crate::Result<()> {
         if let Some(snapshots) = &self.snapshots {
             snapshots.put(source_version, &snapshot)?;
-            return Ok(());
         }
         let mut state = self
             .state
@@ -659,8 +648,9 @@ mod tests {
         Anchor, BranchStore, Kind, MemoryStore, NewNode, NodeStore, PersistentStore, Role,
         SessionAnchor, SessionRole, Tool,
     };
+    use diesel::QueryableByName;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{Duration, sleep};
@@ -708,11 +698,13 @@ mod tests {
     }
 
     fn temp_store_path() -> PathBuf {
+        static TEMP_STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("coco-console-graph-{nanos}"));
+        let counter = TEMP_STORE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("coco-console-graph-{nanos}-{counter}"));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
@@ -842,6 +834,15 @@ mod tests {
             })
             .unwrap();
         writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("visible child".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
 
         let snapshot = cache.current_snapshot(GraphMode::All).await;
@@ -852,7 +853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_persists_snapshots_to_sqlite_store_database() {
+    async fn cache_persists_graph_locations_to_sqlite_store_database() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
         let publisher = ConsolePublisher::new();
@@ -872,14 +873,18 @@ mod tests {
             })
             .unwrap();
         writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("visible child".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
 
         let snapshot = cache.current_snapshot(GraphMode::All).await;
-        let stored = ConsoleGraphSnapshotStore::open(&path)
-            .unwrap()
-            .latest(GraphMode::All)
-            .unwrap()
-            .unwrap();
         let materialized = ConsoleGraphSnapshotStore::open(&path)
             .unwrap()
             .latest_viewport(
@@ -888,31 +893,47 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        let database_path = path.join("store.sqlite3");
+        assert_eq!(
+            sqlite_table_row_count(&database_path, "console_graph_materializations"),
+            1
+        );
+        assert!(sqlite_table_row_count(&database_path, "console_graph_node_locations") > 0);
+        assert!(sqlite_table_row_count(&database_path, "console_graph_edge_routes") > 0);
+        assert!(!sqlite_table_has_column(
+            &database_path,
+            "console_graph_node_locations",
+            "source_version",
+        ));
+        assert!(!sqlite_table_has_column(
+            &database_path,
+            "console_graph_edge_routes",
+            "source_version",
+        ));
+        assert!(!sqlite_table_exists(
+            &database_path,
+            "console_graph_snapshots"
+        ));
         let reopened_cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
             ConsolePublisher::new(),
             path.clone(),
         )
         .unwrap();
-        let reopened = reopened_cache
-            .snapshot_current_ready_or_schedule(GraphMode::All)
-            .unwrap();
-        corrupt_persisted_snapshot_json(&path);
-        let materialized_after_corruption = reopened_cache
+        let reopened = reopened_cache.snapshot_current_ready_or_schedule(GraphMode::All);
+        let reopened_materialized = reopened_cache
             .viewport_current_ready_or_schedule(
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
             .unwrap();
 
-        assert_eq!(stored.version, snapshot.version);
-        assert!(stored.nodes.iter().any(|node| node.id == session));
+        assert_eq!(materialized.version, snapshot.version);
         assert!(materialized.nodes.iter().any(|node| node.id == session));
-        assert_eq!(reopened.version, snapshot.version);
-        assert!(reopened.nodes.iter().any(|node| node.id == session));
+        assert!(reopened.is_none());
         assert!(!path.join("console-graph-snapshots.sqlite3").exists());
         assert!(
-            materialized_after_corruption
+            reopened_materialized
                 .nodes
                 .iter()
                 .any(|node| node.id == session)
@@ -920,6 +941,104 @@ mod tests {
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_drops_legacy_snapshot_materialization_tables() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let database_path = path.join("store.sqlite3");
+        create_legacy_snapshot_materialization_tables(&database_path);
+
+        let publisher = ConsolePublisher::new();
+        let _cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher,
+            path.clone(),
+        )
+        .unwrap();
+
+        for table in [
+            "console_graph_snapshots",
+            "console_graph_viewports",
+            "console_graph_viewport_lanes",
+            "console_graph_viewport_nodes",
+            "console_graph_viewport_edges",
+        ] {
+            assert!(!sqlite_table_exists(&database_path, table));
+        }
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[derive(QueryableByName)]
+    struct SqliteCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    fn sqlite_table_exists(database_path: &std::path::Path, table: &str) -> bool {
+        use diesel::prelude::*;
+        use diesel::sql_query;
+        use diesel::sql_types::Text;
+
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        let row = sql_query(
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind::<Text, _>(table)
+        .get_result::<SqliteCount>(&mut connection)
+        .unwrap();
+        row.count > 0
+    }
+
+    fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
+        use diesel::prelude::*;
+        use diesel::sql_query;
+
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
+            .get_result::<SqliteCount>(&mut connection)
+            .unwrap()
+            .count
+    }
+
+    fn sqlite_table_has_column(database_path: &std::path::Path, table: &str, column: &str) -> bool {
+        use diesel::prelude::*;
+        use diesel::sql_query;
+        use diesel::sql_types::Text;
+
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        let row = sql_query(format!(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('{table}') WHERE name = ?"
+        ))
+        .bind::<Text, _>(column)
+        .get_result::<SqliteCount>(&mut connection)
+        .unwrap();
+        row.count > 0
+    }
+
+    fn create_legacy_snapshot_materialization_tables(database_path: &std::path::Path) {
+        use diesel::connection::SimpleConnection;
+        use diesel::prelude::*;
+
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        connection
+            .batch_execute(
+                r#"
+CREATE TABLE console_graph_snapshots (mode TEXT PRIMARY KEY NOT NULL);
+CREATE TABLE console_graph_viewports (mode TEXT PRIMARY KEY NOT NULL);
+CREATE TABLE console_graph_viewport_lanes (mode TEXT NOT NULL);
+CREATE TABLE console_graph_viewport_nodes (mode TEXT NOT NULL);
+CREATE TABLE console_graph_viewport_edges (mode TEXT NOT NULL);
+"#,
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -958,32 +1077,21 @@ mod tests {
         publisher.mark_changed();
 
         let result = cache.snapshot_current(GraphMode::All).await;
-        let stored = ConsoleGraphSnapshotStore::open(&path)
+        let materialized = ConsoleGraphSnapshotStore::open(&path)
             .unwrap()
-            .latest(GraphMode::All)
+            .latest_viewport(
+                GraphMode::All,
+                crate::host::api::GraphViewportRequest::default(),
+            )
             .unwrap()
             .unwrap();
 
         assert!(result.is_err());
-        assert_eq!(stored.version, first.version);
-        assert!(!stored.nodes.iter().any(|node| node.id == text));
+        assert_eq!(materialized.version, first.version);
+        assert!(!materialized.nodes.iter().any(|node| node.id == text));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
-    }
-
-    fn corrupt_persisted_snapshot_json(path: &std::path::Path) {
-        use diesel::prelude::*;
-        use diesel::sql_query;
-        use diesel::sql_types::Text;
-
-        let database_path = path.join("store.sqlite3");
-        let database_url = database_path.to_string_lossy().into_owned();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
-        sql_query("UPDATE console_graph_snapshots SET snapshot_json = ?")
-            .bind::<Text, _>("{not-json")
-            .execute(&mut connection)
-            .unwrap();
     }
 
     fn drop_materialized_nodes_table(path: &std::path::Path) {
@@ -993,7 +1101,7 @@ mod tests {
         let database_path = path.join("store.sqlite3");
         let database_url = database_path.to_string_lossy().into_owned();
         let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
-        sql_query("DROP TABLE console_graph_viewport_nodes")
+        sql_query("DROP TABLE console_graph_node_locations")
             .execute(&mut connection)
             .unwrap();
     }
