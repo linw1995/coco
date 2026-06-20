@@ -1920,11 +1920,57 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert!(cache.rebuild_statuses().iter().any(|status| {
-            status.mode == GraphMode::All
-                && status.source_version == target_version
-                && status.state == ConsoleGraphRebuildState::Ready
-        }));
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("first non-empty node".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
+        publisher.mark_changed();
+        let non_empty_version = publisher.current_version();
+        let non_empty = cache
+            .viewport_after(
+                GraphMode::All,
+                target_version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(non_empty.version, non_empty_version);
+        assert!(non_empty.nodes.iter().any(|node| node.id == session));
+        assert!(non_empty.nodes.iter().any(|node| node.id == text));
+        assert!(non_empty.lanes.iter().any(|lane| lane.label == "main"));
+
+        writer.delete_branch("main").unwrap();
+        publisher.mark_changed();
+        let empty_again_version = publisher.current_version();
+        let empty_again = cache
+            .viewport_after(
+                GraphMode::All,
+                non_empty_version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(empty_again.version, empty_again_version);
+        assert!(empty_again.nodes.is_empty());
+        assert!(empty_again.edges.is_empty());
+        assert!(empty_again.lanes.is_empty());
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

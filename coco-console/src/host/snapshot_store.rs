@@ -345,7 +345,11 @@ LIMIT 1
             .is_some();
         let result = if session_states.is_empty() {
             self.put_empty_materialization_in_transaction(&mut connection, source_version, mode)
-        } else if !has_materialization {
+        } else if !has_materialization
+            || self
+                .materialized_node_rows_in_connection(&mut connection, mode)?
+                .is_empty()
+        {
             self.try_seed_initial_branch_materialization_in_transaction(
                 &mut connection,
                 store,
@@ -392,6 +396,7 @@ LIMIT 1
         source_version: u64,
         mode: GraphMode,
     ) -> crate::Result<bool> {
+        self.clear_materialized_mode_facts(connection, mode)?;
         self.put_materialization_meta(
             connection,
             MaterializationMetaInput {
@@ -1768,6 +1773,22 @@ WHERE mode = ? AND lane_label = ?
             .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
             })?;
+        }
+        Ok(())
+    }
+
+    fn clear_materialized_mode_facts(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<()> {
+        for table in ["console_graph_edge_routes", "console_graph_node_locations"] {
+            sql_query(format!("DELETE FROM {table} WHERE mode = ?"))
+                .bind::<Text, _>(mode.as_query_value())
+                .execute(&mut *connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: self.path.as_ref().clone(),
+                })?;
         }
         Ok(())
     }
