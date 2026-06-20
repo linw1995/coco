@@ -173,7 +173,10 @@ where
         }
     }
 
-    pub async fn snapshot_current(&self, mode: GraphMode) -> crate::Result<Arc<GraphSnapshot>> {
+    pub(crate) async fn snapshot_current(
+        &self,
+        mode: GraphMode,
+    ) -> crate::Result<Arc<GraphSnapshot>> {
         let source_version = self.invalidations.current_version();
         if let Some(snapshot) = self.cached_snapshot(mode, source_version) {
             return Ok(snapshot);
@@ -220,7 +223,7 @@ where
         Ok(snapshot)
     }
 
-    pub fn snapshot_current_ready_or_schedule(
+    pub(crate) fn snapshot_current_ready_or_schedule(
         &self,
         mode: GraphMode,
     ) -> Option<Arc<GraphSnapshot>> {
@@ -232,7 +235,7 @@ where
         self.latest_cached_snapshot(mode)
     }
 
-    pub fn snapshot_current_ready(&self, mode: GraphMode) -> Option<Arc<GraphSnapshot>> {
+    pub(crate) fn snapshot_current_ready(&self, mode: GraphMode) -> Option<Arc<GraphSnapshot>> {
         let source_version = self.invalidations.current_version();
         self.cached_snapshot(mode, source_version)
     }
@@ -375,7 +378,7 @@ where
         }))
     }
 
-    pub async fn snapshot_after(
+    pub(crate) async fn snapshot_after(
         &self,
         mode: GraphMode,
         observed_version: u64,
