@@ -97,10 +97,20 @@ where
     ) -> crate::Result<Self> {
         SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
         let snapshots = ConsoleGraphSnapshotStore::open(&path)?;
+        let persisted_version = latest_persistent_materialization_version(&snapshots)?;
+        let ready = ConsolePublisher::new();
+        if let Some(version) = persisted_version {
+            ready.advance_to(version);
+        }
+        invalidations.advance_to(
+            persisted_version
+                .map(|version| version.saturating_add(1))
+                .unwrap_or(1),
+        );
         Ok(Self {
             source: ConsoleGraphSource::PersistentStorePath(path),
             invalidations,
-            ready: ConsolePublisher::new(),
+            ready,
             progress: ConsolePublisher::new(),
             snapshots: Some(snapshots),
             compute_permits: Arc::new(Semaphore::new(1)),
@@ -941,6 +951,21 @@ fn rebuild_status(
     }
 }
 
+fn latest_persistent_materialization_version(
+    snapshots: &ConsoleGraphSnapshotStore,
+) -> crate::Result<Option<u64>> {
+    [GraphMode::Anchors, GraphMode::All]
+        .into_iter()
+        .map(|mode| snapshots.latest_materialization_version(mode))
+        .try_fold(None, |latest: Option<u64>, version| {
+            version.map(|version| match (latest, version) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(left), None) => Some(left),
+                (None, right) => right,
+            })
+        })
+}
+
 fn node_id_from_graph_target(target: &str) -> Option<String> {
     target
         .strip_prefix("detail-")
@@ -1372,21 +1397,34 @@ mod tests {
             &database_path,
             "console_graph_snapshots"
         ));
+        let reopened_publisher = ConsolePublisher::new();
         let reopened_cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
-            ConsolePublisher::new(),
+            reopened_publisher.clone(),
             path.clone(),
         )
         .unwrap();
         let reopened = reopened_cache.snapshot_current_ready(GraphMode::All);
-        let reopened_materialized = reopened_cache
+        assert_eq!(reopened_cache.current_version(), target_version);
+        assert_eq!(reopened_publisher.current_version(), target_version + 1);
+        let stale_reopened_materialized = reopened_cache
             .viewport_current_ready_or_schedule(
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
             .unwrap();
+        let reopened_materialized = reopened_cache
+            .viewport_after(
+                GraphMode::All,
+                target_version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(materialized.version, target_version);
+        assert_eq!(stale_reopened_materialized.version, target_version);
+        assert_eq!(reopened_materialized.version, target_version + 1);
         assert!(materialized.nodes.iter().any(|node| node.id == session));
         assert!(
             cache

@@ -34,6 +34,15 @@ impl ConsolePublisher {
         version
     }
 
+    pub fn advance_to(&self, target: u64) -> u64 {
+        let previous = self.version.fetch_max(target, Ordering::SeqCst);
+        let version = previous.max(target);
+        if previous < target {
+            self.tx.send_replace(target);
+        }
+        version
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.tx.subscribe()
     }
