@@ -1489,7 +1489,39 @@ LIMIT 1
         )?;
         self.migrate_orphan_occurrences_to_point(connection, input.mode, &node.id, point)?;
         self.update_node_id_labels(connection, input.mode, &node.id, labels)?;
+        self.insert_branch_alias_fork_edge(connection, input.mode, node, point)?;
         Ok(true)
+    }
+
+    fn insert_branch_alias_fork_edge(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node: &Node,
+        point: Point,
+    ) -> crate::Result<()> {
+        let Some(parent_point) =
+            self.materialized_node_point_in_connection(connection, mode, &node.parent)?
+        else {
+            return Ok(());
+        };
+        let edge = routed_edge(
+            GraphViewportEdgeKind::Fork,
+            &node.parent,
+            parent_point,
+            &node.id,
+            point,
+            self.next_routed_edge_slot_in_connection(connection, mode, parent_point, point)?,
+        );
+        self.insert_edge_route(
+            connection,
+            EdgeRouteInsert {
+                mode,
+                edge: &edge,
+                bounds: edge_bounds(&edge),
+            },
+        )?;
+        self.rebalance_target_port_offsets(connection, mode, point)
     }
 
     fn migrate_orphan_occurrences_to_point(

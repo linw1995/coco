@@ -6721,6 +6721,18 @@ mod tests {
 
         assert_eq!(viewport.version, target_version);
         assert_eq!(draft_nodes, 2);
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == session
+                && edge.target_id == main_first
+                && edge.target.y
+                    == viewport
+                        .lanes
+                        .iter()
+                        .find(|lane| lane.label == "draft")
+                        .unwrap()
+                        .y
+                && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+        }));
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
