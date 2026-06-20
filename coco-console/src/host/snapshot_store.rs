@@ -143,6 +143,20 @@ struct MaterializedNodePointRow {
     y: i32,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializedGraphShellFacts {
+    pub version: u64,
+    pub lanes: Vec<GraphViewportLane>,
+    pub nodes: Vec<MaterializedGraphShellNode>,
+    pub edge_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializedGraphShellNode {
+    pub node_id: String,
+    pub point: Point,
+}
+
 struct NodeLocationInsert<'a> {
     mode: GraphMode,
     node: &'a GraphViewportNode,
@@ -266,6 +280,42 @@ LIMIT 1
             }
         }
         Ok(points)
+    }
+
+    pub(crate) fn materialized_shell_facts(
+        &self,
+        mode: GraphMode,
+    ) -> crate::Result<Option<MaterializedGraphShellFacts>> {
+        let mut connection = self.connect()?;
+        let Some(meta) = self.latest_materialization_row_in_connection(&mut connection, mode)?
+        else {
+            return Ok(None);
+        };
+        let lanes = self
+            .materialized_lanes_in_connection(&mut connection, mode)?
+            .into_iter()
+            .map(|row| GraphViewportLane {
+                key: row.lane_key,
+                label: row.lane_label,
+                y: row.lane_y,
+            })
+            .collect();
+        let mut nodes_by_id = BTreeMap::new();
+        for row in self.materialized_node_rows_in_connection(&mut connection, mode)? {
+            nodes_by_id
+                .entry(row.node_id)
+                .or_insert(Point { x: row.x, y: row.y });
+        }
+        let nodes = nodes_by_id
+            .into_iter()
+            .map(|(node_id, point)| MaterializedGraphShellNode { node_id, point })
+            .collect();
+        Ok(Some(MaterializedGraphShellFacts {
+            version: meta.source_version.max(0) as u64,
+            lanes,
+            nodes,
+            edge_count: self.materialized_edge_count_in_connection(&mut connection, mode)?,
+        }))
     }
 
     pub fn put(&self, source_version: u64, snapshot: &GraphSnapshot) -> crate::Result<()> {
@@ -2058,6 +2108,32 @@ LIMIT 1
         .get_result::<MaterializedNodePointRow>(connection)
         .optional()
         .map(|row| row.map(|row| Point { x: row.x, y: row.y }))
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
+    fn materialized_edge_count_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<usize> {
+        #[derive(QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = BigInt)]
+            value: i64,
+        }
+
+        sql_query(
+            r#"
+SELECT COUNT(DISTINCT edge_key) AS value
+FROM console_graph_edge_routes
+WHERE mode = ?
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .get_result::<CountRow>(connection)
+        .map(|row| row.value.max(0) as usize)
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })

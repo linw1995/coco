@@ -32,8 +32,9 @@ use crate::host::cache::ConsoleGraphCache;
 use crate::publisher::ConsolePublisher;
 use crate::render::{
     render_fragment, render_graph_node_detail_fragment, render_loading_fragment,
-    render_loading_index_page, render_node_detail_fragment, render_provider_context_fragment,
-    render_provider_context_items_fragment, render_provider_context_missing_fragment,
+    render_loading_index_page, render_materialized_fragment, render_node_detail_fragment,
+    render_provider_context_fragment, render_provider_context_items_fragment,
+    render_provider_context_missing_fragment,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -467,6 +468,32 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
+    if state.cache.has_materialized_viewports() {
+        match query.version() {
+            Some(version) => {
+                if let Err(error) = state
+                    .cache
+                    .viewport_after(mode, version, GraphViewportRequest::default())
+                    .await
+                {
+                    return plain_error(error.to_string());
+                }
+            }
+            None => {
+                let _ = state
+                    .cache
+                    .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
+            }
+        }
+        return match state
+            .cache
+            .materialized_fragment_current_ready_or_schedule(mode)
+        {
+            Ok(Some(shell)) => html_response(render_materialized_fragment(&shell)),
+            Ok(None) => html_response(render_loading_fragment(mode, state.cache.current_version())),
+            Err(error) => plain_error(error.to_string()),
+        };
+    }
     match query.version() {
         Some(version) => {
             if let Some(snapshot) = state.cache.snapshot_current_ready(mode)
@@ -1764,6 +1791,78 @@ mod tests {
 
         assert!(html.contains("Loading graph"));
         assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fragment_uses_materialized_shell_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let prompt = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "visible shell prompt".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &prompt).unwrap();
+        publisher.mark_changed();
+        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        seed_cache.current_snapshot(GraphMode::Anchors).await;
+        drop(seed_cache);
+
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+
+        let response = fragment(
+            State(state.clone()),
+            RawQuery(Some("mode=anchors".to_owned())),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("2 nodes / 1 edges / Anchors"), "{html}");
+        assert!(html.contains("<strong>main</strong>"), "{html}");
+        assert!(html.contains("time-scale-tick"), "{html}");
+        assert!(!html.contains("Loading graph / Anchors"), "{html}");
+        assert!(
+            state
+                .cache
+                .snapshot_current_ready(GraphMode::Anchors)
+                .is_none()
+        );
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

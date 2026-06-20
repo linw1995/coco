@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -9,10 +9,13 @@ use crate::graph::{
     graph_node_from_node, provider_context_for_node,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
-use crate::host::render::ProviderContextItem;
+use crate::host::render::{
+    MaterializedGraphShell, MaterializedGraphShellBranch, MaterializedGraphShellTick,
+    ProviderContextItem,
+};
 use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
-use coco_mem::{NodeStore, SqliteGraphStore, Store};
+use coco_mem::{BranchStore, NodeStore, SessionState, SessionStore, SqliteGraphStore, Store};
 use serde::Serialize;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
@@ -329,6 +332,40 @@ where
             })
             .collect();
         Ok(Some(items))
+    }
+
+    pub(crate) fn materialized_fragment_current_ready_or_schedule(
+        &self,
+        mode: GraphMode,
+    ) -> crate::Result<Option<MaterializedGraphShell>> {
+        let Some(snapshots) = &self.snapshots else {
+            return Ok(None);
+        };
+        self.ensure_viewport_current(mode);
+        let Some(facts) = snapshots.materialized_shell_facts(mode)? else {
+            return Ok(None);
+        };
+        let branches = self
+            .source
+            .clone()
+            .materialized_shell_branches(&facts.lanes)?;
+        let mut time_ticks = Vec::with_capacity(facts.nodes.len());
+        for node in &facts.nodes {
+            let store_node = self.source.clone().get_node(&node.node_id)?;
+            time_ticks.push(MaterializedGraphShellTick {
+                time_ns: store_node.created_at.as_nanosecond(),
+                label: store_node.created_at.to_string(),
+                graph_x: f64::from(node.point.x),
+            });
+        }
+        Ok(Some(MaterializedGraphShell {
+            version: facts.version,
+            mode,
+            node_count: facts.nodes.len(),
+            edge_count: facts.edge_count,
+            branches,
+            time_ticks,
+        }))
     }
 
     pub async fn snapshot_after(
@@ -880,6 +917,68 @@ where
             }
         }
     }
+
+    fn materialized_shell_branches(
+        self,
+        lanes: &[crate::api::GraphViewportLane],
+    ) -> crate::Result<Vec<MaterializedGraphShellBranch>> {
+        match self {
+            Self::Store(store) => materialized_shell_branches(&store, lanes),
+            Self::PersistentStorePath(path) => {
+                let store =
+                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
+                materialized_shell_branches(&store, lanes)
+            }
+        }
+    }
+}
+
+fn materialized_shell_branches(
+    store: &(impl BranchStore + SessionStore),
+    lanes: &[crate::api::GraphViewportLane],
+) -> crate::Result<Vec<MaterializedGraphShellBranch>> {
+    let lane_by_label = lanes
+        .iter()
+        .map(|lane| (lane.label.as_str(), lane))
+        .collect::<BTreeMap<_, _>>();
+    let mut states = store
+        .list_session_states()
+        .context(crate::error::StoreSnafu)?
+        .into_iter()
+        .collect::<Vec<(String, SessionState)>>();
+    states.sort_by(|(left_branch, _), (right_branch, _)| {
+        let left_lane = lane_by_label
+            .get(left_branch.as_str())
+            .map(|lane| lane.y)
+            .unwrap_or(i32::MAX);
+        let right_lane = lane_by_label
+            .get(right_branch.as_str())
+            .map(|lane| lane.y)
+            .unwrap_or(i32::MAX);
+        left_lane
+            .cmp(&right_lane)
+            .then_with(|| left_branch.cmp(right_branch))
+    });
+
+    states
+        .into_iter()
+        .filter_map(|(branch, state)| {
+            let lane = lane_by_label.get(branch.as_str())?;
+            Some((branch, state, *lane))
+        })
+        .map(|(branch, state, lane)| {
+            let head_id = store
+                .get_branch_head(&branch)
+                .context(crate::error::StoreSnafu)?;
+            Ok(MaterializedGraphShellBranch {
+                name: branch,
+                key: lane.key.clone(),
+                lane_y: lane.y,
+                head_short_id: crate::graph::shorten_id(&head_id),
+                state,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
