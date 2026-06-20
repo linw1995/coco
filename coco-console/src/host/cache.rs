@@ -1097,19 +1097,18 @@ fn materialized_shell_branches(
 
     states
         .into_iter()
-        .filter_map(|(branch, state)| {
-            let key = lane_key(&branch);
-            let lane = lane_by_key.get(key.as_str())?;
-            Some((branch, state, *lane))
-        })
-        .map(|(branch, state, lane)| {
+        .map(|(branch, state)| {
+            let branch_key = lane_key(&branch);
+            let lane = lane_by_key.get(branch_key.as_str());
             let head_id = store
                 .get_branch_head(&branch)
                 .context(crate::error::StoreSnafu)?;
             Ok(MaterializedGraphShellBranch {
                 name: branch,
-                key: lane.key.clone(),
-                lane_y: lane.y,
+                key: lane
+                    .map(|lane| lane.key.clone())
+                    .unwrap_or_else(|| branch_key.clone()),
+                lane_y: lane.map(|lane| lane.y),
                 head_short_id: crate::graph::shorten_id(&head_id),
                 state,
             })
@@ -1221,7 +1220,21 @@ mod tests {
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].name, branch);
         assert_eq!(branches[0].key, branch_lane.key);
-        assert_eq!(branches[0].lane_y, branch_lane.y);
+        assert_eq!(branches[0].lane_y, Some(branch_lane.y));
+    }
+
+    #[test]
+    fn materialized_shell_branches_preserve_hidden_branches() {
+        let store = MemoryStore::new();
+        let root = store.root_id();
+        store.fork("hidden", &root).unwrap();
+
+        let branches = materialized_shell_branches(&store, &[]).unwrap();
+
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "hidden");
+        assert_eq!(branches[0].key, lane_key("hidden"));
+        assert_eq!(branches[0].lane_y, None);
     }
 
     #[tokio::test]

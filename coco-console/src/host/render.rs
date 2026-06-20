@@ -157,7 +157,7 @@ pub(crate) struct MaterializedGraphShell {
 pub(crate) struct MaterializedGraphShellBranch {
     pub name: String,
     pub key: String,
-    pub lane_y: i32,
+    pub lane_y: Option<i32>,
     pub head_short_id: String,
     pub state: SessionState,
 }
@@ -850,7 +850,7 @@ fn render_materialized_branches(shell: &MaterializedGraphShell) -> AnyView {
         .map(|branch| {
             let name = branch.name.clone();
             let key = branch.key.clone();
-            let lane_y = branch.lane_y.to_string();
+            let lane_y = branch.lane_y.map(|y| y.to_string()).unwrap_or_default();
             let head = format!("head {}", branch.head_short_id);
             let state = format_session_state(&branch.state);
             view! {
