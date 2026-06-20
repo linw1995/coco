@@ -921,7 +921,7 @@ LIMIT 1
         )? {
             return Ok(false);
         }
-        self.prune_orphan_lanes_without_external_edges(connection, mode)?;
+        self.prune_removable_derived_lanes(connection, mode)?;
         self.rebalance_routed_edge_slots(connection, mode)?;
         let Some(materialized_nodes) = self.refresh_materialized_node_labels(
             connection,
@@ -2321,7 +2321,7 @@ ORDER BY
             }
             next_lane_y += GRAPH_LANE_HEIGHT;
         }
-        self.prune_orphan_lanes_without_external_edges(connection, mode)?;
+        self.prune_removable_derived_lanes(connection, mode)?;
         self.rebalance_routed_edge_slots(connection, mode)?;
         let Some(materialized_nodes) =
             self.refresh_materialized_node_labels(connection, store, mode, session_states)?
@@ -2806,28 +2806,114 @@ WHERE mode = ? AND lane_key = ?
         Ok(())
     }
 
-    fn prune_orphan_lanes_without_external_edges(
+    fn prune_removable_derived_lanes(
         &self,
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<()> {
         let mut lanes = Vec::new();
         for lane in self.materialized_lanes_in_connection(connection, mode)? {
+            let covered = is_derived_lane_key(&lane.lane_key)
+                && self.derived_lane_nodes_are_covered_by_branch_lanes(
+                    connection,
+                    mode,
+                    &lane.lane_key,
+                )?;
             let should_prune = is_orphan_lane_key(&lane.lane_key)
-                && !self.lane_has_external_outgoing_edge(connection, mode, &lane.lane_key)?;
+                && (!self.lane_has_external_outgoing_edge(connection, mode, &lane.lane_key)?
+                    || covered);
             let should_prune = should_prune
                 || is_skill_invocation_lane_key(&lane.lane_key)
-                    && (!self.lane_has_external_edge(connection, mode, &lane.lane_key)?
-                        || self.derived_lane_nodes_are_covered_by_branch_lanes(
-                            connection,
-                            mode,
-                            &lane.lane_key,
-                        )?);
+                    && (!self.lane_has_external_edge(connection, mode, &lane.lane_key)? || covered);
             if should_prune {
+                if covered {
+                    self.migrate_covered_derived_lane_outgoing_edges(
+                        connection,
+                        mode,
+                        &lane.lane_key,
+                    )?;
+                }
                 lanes.push(lane);
             }
         }
         self.delete_materialized_lanes(connection, mode, &lanes)
+    }
+
+    fn migrate_covered_derived_lane_outgoing_edges(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        lane_key: &str,
+    ) -> crate::Result<()> {
+        let rows = sql_query(
+            r#"
+SELECT edge.edge_key, edge.edge_kind, edge.source_id, edge.target_id,
+       cover.x AS source_x, cover.y AS source_y,
+       edge.target_x, edge.target_y, edge.route_slot, edge.target_port_offset
+FROM console_graph_edge_routes AS edge
+JOIN console_graph_node_locations AS source
+  ON source.mode = edge.mode
+ AND source.lane_key = ?
+ AND source.node_id = edge.source_id
+ AND source.x = edge.source_x
+ AND source.y = edge.source_y
+JOIN console_graph_node_locations AS cover
+  ON cover.mode = edge.mode
+ AND cover.node_id = edge.source_id
+ AND cover.lane_key != source.lane_key
+ AND cover.lane_key NOT LIKE 'derived:orphan:%'
+ AND cover.lane_key NOT LIKE 'derived:skill:%'
+WHERE edge.mode = ?
+  AND NOT EXISTS (
+      SELECT 1
+      FROM console_graph_node_locations AS target
+      WHERE target.mode = edge.mode
+        AND target.lane_key = ?
+        AND target.node_id = edge.target_id
+        AND target.x = edge.target_x
+        AND target.y = edge.target_y
+  )
+ORDER BY edge.edge_key, cover.y, cover.x
+"#,
+        )
+        .bind::<Text, _>(lane_key)
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(lane_key)
+        .load::<EdgeRouteRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        for row in rows {
+            let kind = parse_edge_kind(&row.edge_kind)?;
+            let source = Point {
+                x: row.source_x,
+                y: row.source_y,
+            };
+            let target = Point {
+                x: row.target_x,
+                y: row.target_y,
+            };
+            let edge = GraphViewportEdge {
+                key: edge_key(kind, &row.source_id, source, &row.target_id, target),
+                kind,
+                source_id: row.source_id,
+                target_id: row.target_id,
+                source,
+                target,
+                route_slot: row.route_slot,
+                target_port_offset: row.target_port_offset,
+            };
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge: &edge,
+                    bounds: edge_bounds(&edge),
+                },
+            )?;
+            self.rebalance_target_port_offsets(connection, mode, target)?;
+        }
+        Ok(())
     }
 
     fn lane_has_external_outgoing_edge(
@@ -3405,6 +3491,16 @@ ORDER BY lane_y, lane_key
             else {
                 continue;
             };
+            if is_orphan_lane_key(&row.lane_key)
+                && self.materialized_lane_node_has_incoming_edge(
+                    connection,
+                    mode,
+                    &row.node_id,
+                    row.lane_y,
+                )?
+            {
+                continue;
+            }
             return Ok(Some((index, Point { x: row.x, y: row.y })));
         }
         Ok(None)
@@ -3467,6 +3563,31 @@ LIMIT 1
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })
+    }
+
+    fn materialized_lane_node_has_incoming_edge(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+        lane_y: i32,
+    ) -> crate::Result<bool> {
+        let count = sql_query(
+            r#"
+SELECT COUNT(*) AS value
+FROM console_graph_edge_routes
+WHERE mode = ? AND target_id = ? AND target_y = ?
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .bind::<Integer, _>(lane_y)
+        .get_result::<SqliteInteger>(connection)
+        .map(|row| row.value)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(count > 0)
     }
 
     fn materialized_non_skill_node_row_by_id_in_connection(

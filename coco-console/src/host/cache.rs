@@ -3660,6 +3660,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_preserves_orphan_ancestry_when_branch_adopts_chain_tail() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let shared = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("shared".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &shared).unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let orphan_first = writer
+            .append(NewNode {
+                parent: shared.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan first".to_owned()),
+            })
+            .unwrap();
+        let orphan_tail = writer
+            .append(NewNode {
+                parent: orphan_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan tail".to_owned()),
+            })
+            .unwrap();
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: shared.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan_tail.clone())],
+                    PromptAnchor {
+                        prompt: "merge orphan tail".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &shared, &merge_anchor)
+            .unwrap();
+        publisher.mark_changed();
+        let merge_version = publisher.current_version();
+
+        let merged = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan_tail));
+        assert_eq!(merged.version, merge_version);
+        assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
+
+        writer.fork("draft", &orphan_tail).unwrap();
+        publisher.mark_changed();
+        let adopt_version = publisher.current_version();
+        let adopted = cache
+            .viewport_after(
+                GraphMode::All,
+                merge_version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let draft_y = adopted
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "draft")
+            .unwrap()
+            .y;
+
+        assert_eq!(adopted.version, adopt_version);
+        assert!(!adopted.lanes.iter().any(|lane| lane.label == orphan_lane));
+        assert!(
+            adopted
+                .nodes
+                .iter()
+                .any(|node| node.id == orphan_first && node.y == draft_y)
+        );
+        assert!(
+            adopted
+                .nodes
+                .iter()
+                .any(|node| node.id == orphan_tail && node.y == draft_y)
+        );
+        assert!(adopted.edges.iter().any(|edge| {
+            edge.source_id == shared
+                && edge.target_id == orphan_first
+                && edge.target.y == draft_y
+                && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+        }));
+        assert!(adopted.edges.iter().any(|edge| {
+            edge.source_id == orphan_first
+                && edge.target_id == orphan_tail
+                && edge.source.y == draft_y
+                && edge.target.y == draft_y
+                && edge.kind == crate::api::GraphViewportEdgeKind::PrimaryParent
+        }));
+        assert!(adopted.edges.iter().any(|edge| {
+            edge.source_id == orphan_tail
+                && edge.source.y == draft_y
+                && edge.target_id == merge_anchor
+                && edge.kind == crate::api::GraphViewportEdgeKind::MergeParent
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, adopt_version)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_prunes_orphan_merge_parent_after_rewind_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
