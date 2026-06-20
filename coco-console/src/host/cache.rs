@@ -1155,7 +1155,7 @@ mod tests {
         let root = store.root_id();
         let session = store
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -1283,7 +1283,7 @@ mod tests {
         let root = writer.root_id();
         let session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -2391,6 +2391,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_compacts_lanes_after_pruning_derived_skill_lane() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let main_tool_use = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "tool-1".to_owned(),
+                    name: "skill".to_owned(),
+                    input: json!({}),
+                }),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &main_tool_use)
+            .unwrap();
+        let main_invocation = writer
+            .append(NewNode {
+                parent: main_tool_use.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    Vec::new(),
+                    SkillInvocationAnchor {
+                        skill_name: "fast-rust".to_owned(),
+                        mode: SkillInvocationMode::InheritContext,
+                    },
+                )),
+            })
+            .unwrap();
+        let main_result = writer
+            .append(NewNode {
+                parent: main_invocation.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_result(
+                    Vec::new(),
+                    SkillResultAnchor {
+                        skill_name: "fast-rust".to_owned(),
+                        output: "done".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        let draft_tool_use = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "tool-2".to_owned(),
+                    name: "skill".to_owned(),
+                    input: json!({}),
+                }),
+            })
+            .unwrap();
+        writer.fork("draft", &draft_tool_use).unwrap();
+        let draft_invocation = writer
+            .append(NewNode {
+                parent: draft_tool_use.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    Vec::new(),
+                    SkillInvocationAnchor {
+                        skill_name: "careful-rust".to_owned(),
+                        mode: SkillInvocationMode::InheritContext,
+                    },
+                )),
+            })
+            .unwrap();
+        let draft_result = writer
+            .append(NewNode {
+                parent: draft_invocation.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_result(
+                    Vec::new(),
+                    SkillResultAnchor {
+                        skill_name: "careful-rust".to_owned(),
+                        output: "done".to_owned(),
+                    },
+                )),
+            })
+            .unwrap();
+        publisher.mark_changed();
+        let initial = cache
+            .viewport_after(
+                GraphMode::All,
+                0,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let main_skill_lane = format!("skill {}", crate::graph::shorten_id(&main_result));
+        let draft_skill_lane = format!("skill {}", crate::graph::shorten_id(&draft_result));
+        let main_skill_y = initial
+            .lanes
+            .iter()
+            .find(|lane| lane.label == main_skill_lane)
+            .unwrap()
+            .y;
+        let draft_skill_y = initial
+            .lanes
+            .iter()
+            .find(|lane| lane.label == draft_skill_lane)
+            .unwrap()
+            .y;
+        assert!(main_skill_y < draft_skill_y);
+
+        writer
+            .set_branch_head("main", &main_tool_use, &session)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let compacted_draft_skill_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == draft_skill_lane)
+            .unwrap()
+            .y;
+
+        assert_eq!(viewport.version, target_version);
+        assert!(
+            !viewport
+                .lanes
+                .iter()
+                .any(|lane| lane.label == main_skill_lane)
+        );
+        assert_eq!(compacted_draft_skill_y, main_skill_y);
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_reserves_new_branch_lane_when_seeding_merge_orphan() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
@@ -3222,6 +3390,8 @@ mod tests {
             path.clone(),
         )
         .unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -3261,16 +3431,14 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        let root = writer.root_id();
         let session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
             .unwrap();
-        writer.fork("main", &session).unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3279,7 +3447,7 @@ mod tests {
                 kind: Kind::Text("first non-empty node".to_owned()),
             })
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer.set_branch_head("main", &root, &text).unwrap();
         publisher.mark_changed();
         let non_empty_version = publisher.current_version();
         let non_empty = cache
@@ -3312,6 +3480,64 @@ mod tests {
         assert!(empty_again.nodes.is_empty());
         assert!(empty_again.edges.is_empty());
         assert!(empty_again.lanes.is_empty());
+
+        drop(cache);
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_skips_root_only_leading_branch_when_seeding_materialization() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("draft history".to_owned()),
+            })
+            .unwrap();
+        writer.fork("draft", &text).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                0,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert!(viewport.nodes.iter().any(|node| node.id == session));
+        assert!(viewport.nodes.iter().any(|node| node.id == text));
+        assert!(viewport.lanes.iter().any(|lane| lane.label == "draft"));
+        assert!(!viewport.lanes.iter().any(|lane| lane.label == "main"));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
 
         drop(cache);
         drop(writer);

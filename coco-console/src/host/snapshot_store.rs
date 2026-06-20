@@ -459,9 +459,12 @@ LIMIT 1
         mode: GraphMode,
         session_states: &[(String, SessionState)],
     ) -> crate::Result<bool> {
-        let Some((first_branch, first_state)) = session_states.first() else {
-            return Ok(false);
+        let Some(first_index) =
+            self.first_visible_initial_branch_index(store, mode, session_states)?
+        else {
+            return self.put_empty_materialization_in_transaction(connection, source_version, mode);
         };
+        let (first_branch, first_state) = &session_states[first_index];
         if !self.try_seed_first_branch_materialization_in_transaction(
             connection,
             store,
@@ -475,12 +478,30 @@ LIMIT 1
             connection,
             store,
             mode,
-            session_states,
+            &session_states[first_index..],
         )? {
             return Ok(false);
         }
         self.put_materialization_meta_from_materialized_rows(connection, source_version, mode)?;
         Ok(true)
+    }
+
+    fn first_visible_initial_branch_index(
+        &self,
+        store: &(impl BranchStore + NodeStore),
+        mode: GraphMode,
+        session_states: &[(String, SessionState)],
+    ) -> crate::Result<Option<usize>> {
+        for (index, (branch, _)) in session_states.iter().enumerate() {
+            let head_id = store
+                .get_branch_head(branch)
+                .context(crate::error::StoreSnafu)?;
+            let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+            if !initial_visible_graph_lane_nodes(store, mode, ancestry)?.is_empty() {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
     }
 
     fn try_seed_first_branch_materialization_in_transaction(
@@ -2852,7 +2873,8 @@ WHERE mode = ? AND lane_key = ?
                 lanes.push(lane);
             }
         }
-        self.delete_materialized_lanes(connection, mode, &lanes)
+        self.delete_materialized_lanes(connection, mode, &lanes)?;
+        self.shift_lanes_after_deletion(connection, mode, &lanes)
     }
 
     fn migrate_covered_derived_lane_outgoing_edges(
