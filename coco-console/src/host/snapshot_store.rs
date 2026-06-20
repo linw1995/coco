@@ -334,19 +334,18 @@ LIMIT 1
             .context(crate::error::StoreSnafu)?
             .into_iter()
             .collect::<Vec<_>>();
-        if session_states.is_empty() {
-            return Ok(false);
-        }
         session_states.sort_by(|(left, _), (right, _)| {
             branch_lane_priority(left).cmp(&branch_lane_priority(right))
         });
 
         let mut connection = self.connect()?;
         self.begin_write_transaction(&mut connection)?;
-        let result = if self
+        let has_materialization = self
             .latest_materialization_row_in_connection(&mut connection, mode)?
-            .is_none()
-        {
+            .is_some();
+        let result = if session_states.is_empty() {
+            self.put_empty_materialization_in_transaction(&mut connection, source_version, mode)
+        } else if !has_materialization {
             self.try_seed_initial_branch_materialization_in_transaction(
                 &mut connection,
                 store,
@@ -385,6 +384,26 @@ LIMIT 1
                 Err(error)
             }
         }
+    }
+
+    fn put_empty_materialization_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        source_version: u64,
+        mode: GraphMode,
+    ) -> crate::Result<bool> {
+        self.put_materialization_meta(
+            connection,
+            MaterializationMetaInput {
+                source_version,
+                mode,
+                world_min_x: 0,
+                world_min_y: 0,
+                world_max_x: GRAPH_LEFT_X + 120,
+                world_max_y: crate::layout::GRAPH_TOP_Y + 120,
+            },
+        )?;
+        Ok(true)
     }
 
     fn try_seed_initial_branch_materialization_in_transaction(

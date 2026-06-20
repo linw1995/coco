@@ -1833,7 +1833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_does_not_full_rebuild_when_initial_seed_cannot_apply() {
+    async fn cache_seeds_empty_materialization_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
         let publisher = ConsolePublisher::new();
@@ -1854,27 +1854,29 @@ mod tests {
                 )
                 .is_none()
         );
+        let mut materialized = None;
         for _ in 0..50 {
-            if cache.rebuild_statuses().iter().any(|status| {
-                status.mode == GraphMode::All
-                    && status.source_version == target_version
-                    && status.state == ConsoleGraphRebuildState::Failed
-            }) {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-
-        assert!(
-            ConsoleGraphSnapshotStore::open(&path)
+            materialized = ConsoleGraphSnapshotStore::open(&path)
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
-                .unwrap()
-                .is_none()
-        );
+                .unwrap();
+            if materialized
+                .as_ref()
+                .is_some_and(|viewport| viewport.version == target_version)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let materialized = materialized.expect("empty materialization should be seeded");
+
+        assert_eq!(materialized.version, target_version);
+        assert!(materialized.nodes.is_empty());
+        assert!(materialized.edges.is_empty());
+        assert!(materialized.lanes.is_empty());
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
@@ -1883,8 +1885,7 @@ mod tests {
         assert!(cache.rebuild_statuses().iter().any(|status| {
             status.mode == GraphMode::All
                 && status.source_version == target_version
-                && status.state == ConsoleGraphRebuildState::Failed
-                && status.message.contains("could not seed this store state")
+                && status.state == ConsoleGraphRebuildState::Ready
         }));
 
         drop(writer);
