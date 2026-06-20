@@ -361,20 +361,33 @@ LIMIT 1
 
         let mut connection = self.connect()?;
         self.begin_write_transaction(&mut connection)?;
-        let result = match mode {
-            GraphMode::Anchors => self.try_update_anchor_materialization_in_transaction(
-                &mut connection,
-                store,
-                source_version,
-                &session_states,
-            ),
-            GraphMode::All => self.try_append_linear_branches_in_transaction(
+        let result = if self
+            .latest_materialization_row_in_connection(&mut connection, mode)?
+            .is_none()
+        {
+            self.try_seed_initial_single_branch_materialization_in_transaction(
                 &mut connection,
                 store,
                 source_version,
                 mode,
                 &session_states,
-            ),
+            )
+        } else {
+            match mode {
+                GraphMode::Anchors => self.try_update_anchor_materialization_in_transaction(
+                    &mut connection,
+                    store,
+                    source_version,
+                    &session_states,
+                ),
+                GraphMode::All => self.try_append_linear_branches_in_transaction(
+                    &mut connection,
+                    store,
+                    source_version,
+                    mode,
+                    &session_states,
+                ),
+            }
         };
         match result {
             Ok(true) => {
@@ -390,6 +403,111 @@ LIMIT 1
                 Err(error)
             }
         }
+    }
+
+    fn try_seed_initial_single_branch_materialization_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &(impl BranchStore + NodeStore),
+        source_version: u64,
+        mode: GraphMode,
+        session_states: &[(String, SessionState)],
+    ) -> crate::Result<bool> {
+        let [(branch, state)] = session_states else {
+            return Ok(false);
+        };
+        let head_id = store
+            .get_branch_head(branch)
+            .context(crate::error::StoreSnafu)?;
+        let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+        let nodes = initial_visible_lane_nodes(mode, ancestry);
+        if nodes.is_empty() || !initial_visible_lane_is_linear(&nodes) {
+            return Ok(false);
+        }
+
+        let lane = GraphViewportLane {
+            key: lane_key(branch),
+            label: branch.clone(),
+            y: crate::layout::GRAPH_TOP_Y,
+        };
+        let branch_label = branch_label(branch, state);
+        let event_order =
+            self.event_order_by_materialized_and_new_nodes(connection, store, mode, &nodes)?;
+        let mut previous = None::<(String, Point)>;
+        let appended_len = nodes.len();
+        for (index, node) in nodes.into_iter().enumerate() {
+            let point = match previous.as_ref() {
+                Some((previous_id, previous_point)) => Point {
+                    x: previous_point.x
+                        + required_column_gap(previous_id, &node.id, &event_order)
+                            * GRAPH_COLUMN_WIDTH,
+                    y: lane.y,
+                },
+                None => Point {
+                    x: GRAPH_LEFT_X,
+                    y: lane.y,
+                },
+            };
+            let labels = if index + 1 == appended_len {
+                vec![branch_label.clone()]
+            } else {
+                Vec::new()
+            };
+            let viewport_node = graph_viewport_node_from_node(&node, point, labels);
+            self.insert_node_location(
+                connection,
+                NodeLocationInsert {
+                    mode,
+                    node: &viewport_node,
+                    lane: &lane,
+                    bounds: node_bounds(&viewport_node),
+                },
+            )?;
+            if let Some((previous_id, previous_point)) = previous.as_ref() {
+                let edge = primary_parent_edge(previous_id, *previous_point, &node.id, point);
+                self.insert_edge_route(
+                    connection,
+                    EdgeRouteInsert {
+                        mode,
+                        edge: &edge,
+                        bounds: edge_bounds(&edge),
+                    },
+                )?;
+                if !self.insert_node_merge_edges(
+                    connection,
+                    store,
+                    mode,
+                    &node,
+                    previous_id,
+                    point,
+                )? {
+                    return Ok(false);
+                }
+            } else if !self.insert_node_merge_edges(connection, store, mode, &node, "", point)? {
+                return Ok(false);
+            }
+            previous = Some((node.id, point));
+        }
+
+        let materialized_nodes = self.materialized_node_rows_in_connection(connection, mode)?;
+        let world_max_x = materialized_nodes
+            .iter()
+            .map(|row| row.x)
+            .max()
+            .unwrap_or(GRAPH_LEFT_X)
+            + 120;
+        self.put_materialization_meta(
+            connection,
+            MaterializationMetaInput {
+                source_version,
+                mode,
+                world_min_x: 0,
+                world_min_y: 0,
+                world_max_x,
+                world_max_y: lane.y + 120,
+            },
+        )?;
+        Ok(true)
     }
 
     fn try_append_linear_branch_in_transaction(
@@ -2582,6 +2700,19 @@ fn node_anchor_merge_parents(node: &Node) -> &[MergeParent] {
 
 fn is_anchor_node(node: &Node) -> bool {
     matches!(&node.kind, Kind::Anchor(_))
+}
+
+fn initial_visible_lane_nodes(mode: GraphMode, ancestry: Vec<Node>) -> Vec<Node> {
+    ancestry
+        .into_iter()
+        .rev()
+        .filter(|node| !node.is_root())
+        .filter(|node| mode == GraphMode::All || is_anchor_node(node))
+        .collect()
+}
+
+fn initial_visible_lane_is_linear(nodes: &[Node]) -> bool {
+    nodes.windows(2).all(|nodes| nodes[1].parent == nodes[0].id)
 }
 
 fn is_linear_new_nodes(source_id: &str, nodes: &[Node]) -> bool {

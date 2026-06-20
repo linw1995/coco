@@ -1447,6 +1447,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_seeds_single_branch_materialization_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("initial materialized seed".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        assert!(
+            cache
+                .viewport_current_ready_or_schedule(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .is_none()
+        );
+        let mut materialized = None;
+        for _ in 0..50 {
+            materialized = ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .latest_viewport(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .unwrap();
+            if materialized
+                .as_ref()
+                .is_some_and(|viewport| viewport.version == target_version)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let materialized = materialized.expect("initial materialization should be seeded");
+
+        assert_eq!(materialized.version, target_version);
+        assert!(materialized.nodes.iter().any(|node| node.id == session));
+        assert!(materialized.nodes.iter().any(|node| node.id == text));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn pending_viewport_after_refreshes_materialization_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
