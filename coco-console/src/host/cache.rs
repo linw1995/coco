@@ -922,6 +922,56 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    #[tokio::test]
+    async fn cache_rolls_back_snapshot_store_refresh_when_materialization_fails() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        publisher.mark_changed();
+        let first = cache.current_snapshot(GraphMode::All).await;
+        drop_materialized_nodes_table(&path);
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("new node should roll back".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
+        publisher.mark_changed();
+
+        let result = cache.snapshot_current(GraphMode::All).await;
+        let stored = ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .latest(GraphMode::All)
+            .unwrap()
+            .unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(stored.version, first.version);
+        assert!(!stored.nodes.iter().any(|node| node.id == text));
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     fn corrupt_persisted_snapshot_json(path: &std::path::Path) {
         use diesel::prelude::*;
         use diesel::sql_query;
@@ -932,6 +982,18 @@ mod tests {
         let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
         sql_query("UPDATE console_graph_snapshots SET snapshot_json = ?")
             .bind::<Text, _>("{not-json")
+            .execute(&mut connection)
+            .unwrap();
+    }
+
+    fn drop_materialized_nodes_table(path: &std::path::Path) {
+        use diesel::prelude::*;
+        use diesel::sql_query;
+
+        let database_path = path.join("store.sqlite3");
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
+        sql_query("DROP TABLE console_graph_viewport_nodes")
             .execute(&mut connection)
             .unwrap();
     }

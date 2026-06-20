@@ -120,6 +120,31 @@ impl ConsoleGraphSnapshotStore {
             })?;
         let materialized = materialize_graph_viewport(snapshot);
         let mut connection = self.connect()?;
+        self.begin_write_transaction(&mut connection)?;
+        let result = self.put_snapshot_and_materialized_viewport(
+            &mut connection,
+            source_version,
+            snapshot.mode,
+            snapshot_json,
+            &materialized,
+        );
+        match result {
+            Ok(()) => self.commit_transaction(&mut connection),
+            Err(error) => {
+                let _ = self.rollback_transaction(&mut connection);
+                Err(error)
+            }
+        }
+    }
+
+    fn put_snapshot_and_materialized_viewport(
+        &self,
+        connection: &mut SqliteConnection,
+        source_version: u64,
+        mode: GraphMode,
+        snapshot_json: String,
+        materialized: &GraphViewportResponse,
+    ) -> crate::Result<()> {
         sql_query(
             r#"
 INSERT INTO console_graph_snapshots (mode, source_version, snapshot_json)
@@ -130,19 +155,40 @@ ON CONFLICT(mode) DO UPDATE SET
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 "#,
         )
-        .bind::<Text, _>(snapshot.mode.as_query_value())
+        .bind::<Text, _>(mode.as_query_value())
         .bind::<BigInt, _>(source_version as i64)
         .bind::<Text, _>(snapshot_json)
-        .execute(&mut connection)
+        .execute(connection)
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })?;
-        self.put_materialized_viewport(
-            &mut connection,
-            source_version,
-            snapshot.mode,
-            &materialized,
-        )?;
+        self.put_materialized_viewport(connection, source_version, mode, materialized)
+    }
+
+    fn begin_write_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
+        sql_query("BEGIN IMMEDIATE TRANSACTION")
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+        Ok(())
+    }
+
+    fn commit_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
+        sql_query("COMMIT")
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+        Ok(())
+    }
+
+    fn rollback_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
+        sql_query("ROLLBACK")
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         Ok(())
     }
 
