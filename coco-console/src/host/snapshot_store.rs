@@ -206,6 +206,12 @@ struct OrphanMergeParentNodeEdgeInput<'a> {
     first_node: bool,
 }
 
+enum SkillSubtreeAppend {
+    Absent,
+    Applied,
+    Unsupported,
+}
+
 struct MaterializationMetaInput {
     source_version: u64,
     mode: GraphMode,
@@ -667,7 +673,25 @@ LIMIT 1
         };
         let branch_label = branch_label(input.branch, input.state);
         if input.head_id == tail.node_id {
-            return Ok(true);
+            let lane = GraphViewportLane {
+                key: tail.lane_key,
+                label: tail.lane_label,
+                y: tail.lane_y,
+            };
+            return match self.try_append_skill_invocation_subtree_in_transaction(
+                connection,
+                store,
+                input.mode,
+                &tail.node_id,
+                Point {
+                    x: tail.x,
+                    y: tail.y,
+                },
+                &lane,
+            )? {
+                SkillSubtreeAppend::Unsupported => Ok(false),
+                SkillSubtreeAppend::Absent | SkillSubtreeAppend::Applied => Ok(true),
+            };
         }
         if let Some(head) = self.materialized_lane_node_in_connection(
             connection,
@@ -676,6 +700,34 @@ LIMIT 1
             input.head_id,
         )? && head.x < tail.x
         {
+            let lane = GraphViewportLane {
+                key: head.lane_key.clone(),
+                label: head.lane_label.clone(),
+                y: head.lane_y,
+            };
+            match self.try_append_skill_invocation_subtree_in_transaction(
+                connection,
+                store,
+                input.mode,
+                input.head_id,
+                Point {
+                    x: head.x,
+                    y: head.y,
+                },
+                &lane,
+            )? {
+                SkillSubtreeAppend::Applied => {
+                    self.update_node_labels(
+                        connection,
+                        input.mode,
+                        &head.node_key,
+                        vec![branch_label],
+                    )?;
+                    return Ok(true);
+                }
+                SkillSubtreeAppend::Unsupported => return Ok(false),
+                SkillSubtreeAppend::Absent => {}
+            }
             if self.lane_suffix_has_retained_downstream_edges(
                 connection,
                 input.mode,
@@ -780,6 +832,14 @@ LIMIT 1
             )? {
                 return Ok(false);
             }
+            if matches!(
+                self.try_append_skill_invocation_subtree_in_transaction(
+                    connection, store, input.mode, &node.id, point, &lane,
+                )?,
+                SkillSubtreeAppend::Unsupported
+            ) {
+                return Ok(false);
+            }
             previous_id = node.id;
             previous_point = point;
         }
@@ -813,6 +873,7 @@ LIMIT 1
         )? {
             return Ok(false);
         }
+        self.prune_orphan_lanes_without_external_edges(connection, mode)?;
         self.rebalance_routed_edge_slots(connection, mode)?;
         let Some(materialized_nodes) = self.refresh_materialized_node_labels(
             connection,
@@ -1838,7 +1899,7 @@ ORDER BY
                     primary_parent_id: &previous_id,
                     point,
                     event_order: &event_order,
-                    reserved_lane_y: None,
+                    reserved_lane_y: Some(lane_y),
                 },
             )?
             else {
@@ -1894,10 +1955,93 @@ ORDER BY
             )? {
                 return Ok(false);
             }
+            if matches!(
+                self.try_append_skill_invocation_subtree_in_transaction(
+                    connection, store, input.mode, &node.id, point, &lane,
+                )?,
+                SkillSubtreeAppend::Unsupported
+            ) {
+                return Ok(false);
+            }
             previous_id = node.id;
             previous_point = point;
         }
         Ok(true)
+    }
+
+    fn try_append_skill_invocation_subtree_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        mode: GraphMode,
+        source_id: &str,
+        source_point: Point,
+        lane: &GraphViewportLane,
+    ) -> crate::Result<SkillSubtreeAppend> {
+        if mode != GraphMode::All {
+            return Ok(SkillSubtreeAppend::Absent);
+        }
+        let source = store
+            .get_node(source_id)
+            .context(crate::error::StoreSnafu)?;
+        if source.kind.as_tool_uses().is_none() {
+            return Ok(SkillSubtreeAppend::Absent);
+        }
+        let nodes = initial_visible_graph_lane_nodes(store, mode, vec![source])?
+            .into_iter()
+            .skip(1)
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            return Ok(SkillSubtreeAppend::Absent);
+        }
+        if !is_linear_new_nodes(source_id, &nodes) {
+            return Ok(SkillSubtreeAppend::Unsupported);
+        }
+
+        let event_order =
+            self.event_order_by_materialized_and_new_nodes(connection, store, mode, &nodes)?;
+        let mut previous_id = source_id.to_owned();
+        let mut previous_point = source_point;
+        for node in nodes {
+            if let Some(point) =
+                self.materialized_node_point_in_connection(connection, mode, &node.id)?
+            {
+                previous_id = node.id;
+                previous_point = point;
+                continue;
+            }
+            let point = Point {
+                x: previous_point.x
+                    + required_column_gap(&previous_id, &node.id, &event_order)
+                        * GRAPH_COLUMN_WIDTH,
+                y: lane.y,
+            };
+            let viewport_node = graph_viewport_node_from_node(&node, point, Vec::new());
+            self.insert_node_location(
+                connection,
+                NodeLocationInsert {
+                    mode,
+                    node: &viewport_node,
+                    lane,
+                    bounds: node_bounds(&viewport_node),
+                },
+            )?;
+            let edge = primary_parent_edge(&previous_id, previous_point, &node.id, point);
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge: &edge,
+                    bounds: edge_bounds(&edge),
+                },
+            )?;
+            if !self.insert_node_merge_edges(connection, store, mode, &node, &previous_id, point)? {
+                return Ok(SkillSubtreeAppend::Unsupported);
+            }
+            previous_id = node.id;
+            previous_point = point;
+        }
+        Ok(SkillSubtreeAppend::Applied)
     }
 
     fn try_append_linear_branches_in_transaction(
