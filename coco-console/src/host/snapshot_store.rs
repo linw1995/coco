@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -114,6 +114,12 @@ struct MaterializedKeyRow {
 }
 
 #[derive(QueryableByName)]
+struct MaterializedLaneLabelRow {
+    #[diesel(sql_type = Text)]
+    lane_label: String,
+}
+
+#[derive(QueryableByName)]
 struct MaterializedTailNodeRow {
     #[diesel(sql_type = Text)]
     node_key: String,
@@ -145,7 +151,6 @@ struct EdgeRouteInsert<'a> {
 }
 
 struct AppendLinearBranchInput<'a> {
-    source_version: u64,
     mode: GraphMode,
     branch: &'a str,
     state: &'a SessionState,
@@ -159,6 +164,12 @@ struct MaterializationMetaInput {
     world_min_y: i32,
     world_max_x: i32,
     world_max_y: i32,
+}
+
+#[derive(QueryableByName)]
+struct SqliteCount {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
 }
 
 impl ConsoleGraphSnapshotStore {
@@ -221,37 +232,35 @@ impl ConsoleGraphSnapshotStore {
         if mode != GraphMode::All {
             return Ok(false);
         }
-        let session_states = store
+        let mut session_states = store
             .list_session_states()
-            .context(crate::error::StoreSnafu)?;
-        let mut session_states = session_states.into_iter();
-        let Some((branch, state)) = session_states.next() else {
-            return Ok(false);
-        };
-        if session_states.next().is_some() {
+            .context(crate::error::StoreSnafu)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        if session_states.is_empty() {
             return Ok(false);
         }
-        let head_id = store
-            .get_branch_head(&branch)
-            .context(crate::error::StoreSnafu)?;
+        session_states.sort_by(|(left, _), (right, _)| {
+            branch_lane_priority(left).cmp(&branch_lane_priority(right))
+        });
 
         let mut connection = self.connect()?;
         self.begin_write_transaction(&mut connection)?;
-        let result = self.try_append_linear_branch_in_transaction(
+        let result = self.try_append_linear_branches_in_transaction(
             &mut connection,
             store,
-            AppendLinearBranchInput {
-                source_version,
-                mode,
-                branch: &branch,
-                state: &state,
-                head_id: &head_id,
-            },
+            source_version,
+            mode,
+            &session_states,
         );
         match result {
-            Ok(appended) => {
+            Ok(true) => {
                 self.commit_transaction(&mut connection)?;
-                Ok(appended)
+                Ok(true)
+            }
+            Ok(false) => {
+                let _ = self.rollback_transaction(&mut connection);
+                Ok(false)
             }
             Err(error) => {
                 let _ = self.rollback_transaction(&mut connection);
@@ -266,13 +275,6 @@ impl ConsoleGraphSnapshotStore {
         store: &impl NodeStore,
         input: AppendLinearBranchInput<'_>,
     ) -> crate::Result<bool> {
-        let Some(meta) = self.latest_materialization_row_in_connection(connection, input.mode)?
-        else {
-            return Ok(false);
-        };
-        if meta.source_version >= 0 && input.source_version <= meta.source_version as u64 {
-            return Ok(true);
-        }
         let Some(tail) =
             self.latest_lane_tail_in_connection(connection, input.mode, input.branch)?
         else {
@@ -281,18 +283,10 @@ impl ConsoleGraphSnapshotStore {
         let branch_label = branch_label(input.branch, input.state);
         if input.head_id == tail.node_id {
             self.update_node_labels(connection, input.mode, &tail.node_key, vec![branch_label])?;
-            self.put_materialization_meta(
-                connection,
-                MaterializationMetaInput {
-                    source_version: input.source_version,
-                    mode: input.mode,
-                    world_min_x: meta.world_min_x,
-                    world_min_y: meta.world_min_y,
-                    world_max_x: meta.world_max_x,
-                    world_max_y: meta.world_max_y,
-                },
-            )?;
             return Ok(true);
+        }
+        if self.node_occurrence_count_in_connection(connection, input.mode, &tail.node_id)? > 1 {
+            return Ok(false);
         }
 
         let Ok(mut chain) = store.log(&tail.node_id, input.head_id) else {
@@ -350,14 +344,64 @@ impl ConsoleGraphSnapshotStore {
             previous_id = node.id;
             previous_point = point;
         }
+        Ok(true)
+    }
+
+    fn try_append_linear_branches_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &(impl BranchStore + NodeStore),
+        source_version: u64,
+        mode: GraphMode,
+        session_states: &[(String, SessionState)],
+    ) -> crate::Result<bool> {
+        let Some(meta) = self.latest_materialization_row_in_connection(connection, mode)? else {
+            return Ok(false);
+        };
+        if meta.source_version >= 0 && source_version <= meta.source_version as u64 {
+            return Ok(true);
+        }
+
+        let branch_names = session_states
+            .iter()
+            .map(|(branch, _)| branch.clone())
+            .collect::<BTreeSet<_>>();
+        if self.materialized_lane_labels_in_connection(connection, mode)? != branch_names {
+            return Ok(false);
+        }
+
+        let mut world_max_x = meta.world_max_x;
+        for (branch, state) in session_states {
+            let head_id = store
+                .get_branch_head(branch)
+                .context(crate::error::StoreSnafu)?;
+            let appended = self.try_append_linear_branch_in_transaction(
+                connection,
+                store,
+                AppendLinearBranchInput {
+                    mode,
+                    branch,
+                    state,
+                    head_id: &head_id,
+                },
+            )?;
+            if !appended {
+                return Ok(false);
+            }
+            let Some(tail) = self.latest_lane_tail_in_connection(connection, mode, branch)? else {
+                return Ok(false);
+            };
+            world_max_x = world_max_x.max(tail.x + 120);
+        }
+
         self.put_materialization_meta(
             connection,
             MaterializationMetaInput {
-                source_version: input.source_version,
-                mode: input.mode,
+                source_version,
+                mode,
                 world_min_x: meta.world_min_x,
                 world_min_y: meta.world_min_y,
-                world_max_x: meta.world_max_x.max(previous_point.x + 120),
+                world_max_x,
                 world_max_y: meta.world_max_y,
             },
         )?;
@@ -889,6 +933,48 @@ LIMIT 1
         })
     }
 
+    fn materialized_lane_labels_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<BTreeSet<String>> {
+        let rows = sql_query(
+            r#"
+SELECT DISTINCT lane_label
+FROM console_graph_node_locations
+WHERE mode = ?
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .load::<MaterializedLaneLabelRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(rows.into_iter().map(|row| row.lane_label).collect())
+    }
+
+    fn node_occurrence_count_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+    ) -> crate::Result<i64> {
+        sql_query(
+            r#"
+SELECT COUNT(*) AS count
+FROM console_graph_node_locations
+WHERE mode = ? AND node_id = ?
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .get_result::<SqliteCount>(connection)
+        .map(|row| row.count)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
     fn viewport_from_row(
         &self,
         mode: GraphMode,
@@ -1238,6 +1324,14 @@ fn session_state_suffix(state: &SessionState) -> String {
             PauseReason::Merged { .. } => format!("@Paused({target_branch},merged)"),
             PauseReason::Closed => format!("@Paused({target_branch},closed)"),
         },
+    }
+}
+
+fn branch_lane_priority(branch: &str) -> (u8, &str) {
+    if branch == "main" {
+        (0, branch)
+    } else {
+        (1, branch)
     }
 }
 
