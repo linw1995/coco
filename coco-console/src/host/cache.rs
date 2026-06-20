@@ -247,7 +247,7 @@ where
                     if changed.is_err() {
                         continue;
                     }
-                    self.ensure_snapshot_current(mode);
+                    self.ensure_viewport_current(mode);
                 }
             }
         }
@@ -294,7 +294,7 @@ where
                     if changed.is_err() {
                         continue;
                     }
-                    self.ensure_snapshot_current(mode);
+                    self.ensure_viewport_current(mode);
                 }
             }
         }
@@ -1168,6 +1168,70 @@ mod tests {
                 && status.source_version == target_version
                 && status.state == ConsoleGraphRebuildState::Ready
         }));
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_viewport_after_refreshes_materialization_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let cache_for_wait = cache.clone();
+        let waiter = tokio::spawn(async move {
+            cache_for_wait
+                .viewport_after(
+                    GraphMode::All,
+                    initial.version,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .await
+                .unwrap()
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("pending viewport update".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = waiter.await.unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert!(viewport.nodes.iter().any(|node| node.id == text));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
