@@ -2811,9 +2811,17 @@ WHERE mode = ? AND lane_label = ?
     ) -> crate::Result<()> {
         let mut lanes = Vec::new();
         for lane in self.materialized_lanes_in_connection(connection, mode)? {
-            if is_orphan_lane_label(&lane.lane_label)
-                && !self.lane_has_external_outgoing_edge(connection, mode, &lane.lane_label)?
-            {
+            let should_prune = is_orphan_lane_label(&lane.lane_label)
+                && !self.lane_has_external_outgoing_edge(connection, mode, &lane.lane_label)?;
+            let should_prune = should_prune
+                || is_skill_invocation_lane_label(&lane.lane_label)
+                    && (!self.lane_has_external_edge(connection, mode, &lane.lane_label)?
+                        || self.derived_lane_nodes_are_covered_by_branch_lanes(
+                            connection,
+                            mode,
+                            &lane.lane_label,
+                        )?);
+            if should_prune {
                 lanes.push(lane);
             }
         }
@@ -2863,6 +2871,109 @@ LIMIT 1
         Ok(row.is_some())
     }
 
+    fn lane_has_external_edge(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        lane_label: &str,
+    ) -> crate::Result<bool> {
+        let row = sql_query(
+            r#"
+SELECT 1 AS value
+FROM console_graph_edge_routes AS edge
+WHERE edge.mode = ?
+  AND (
+    (
+      EXISTS (
+          SELECT 1
+          FROM console_graph_node_locations AS source
+          WHERE source.mode = edge.mode
+            AND source.lane_label = ?
+            AND source.node_id = edge.source_id
+            AND source.x = edge.source_x
+            AND source.y = edge.source_y
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM console_graph_node_locations AS target
+          WHERE target.mode = edge.mode
+            AND target.lane_label = ?
+            AND target.node_id = edge.target_id
+            AND target.x = edge.target_x
+            AND target.y = edge.target_y
+      )
+    )
+    OR (
+      EXISTS (
+          SELECT 1
+          FROM console_graph_node_locations AS target
+          WHERE target.mode = edge.mode
+            AND target.lane_label = ?
+            AND target.node_id = edge.target_id
+            AND target.x = edge.target_x
+            AND target.y = edge.target_y
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM console_graph_node_locations AS source
+          WHERE source.mode = edge.mode
+            AND source.lane_label = ?
+            AND source.node_id = edge.source_id
+            AND source.x = edge.source_x
+            AND source.y = edge.source_y
+      )
+    )
+  )
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(lane_label)
+        .bind::<Text, _>(lane_label)
+        .bind::<Text, _>(lane_label)
+        .bind::<Text, _>(lane_label)
+        .get_result::<SqliteInteger>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(row.is_some())
+    }
+
+    fn derived_lane_nodes_are_covered_by_branch_lanes(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        lane_label: &str,
+    ) -> crate::Result<bool> {
+        let row = sql_query(
+            r#"
+SELECT 1 AS value
+FROM console_graph_node_locations AS node
+WHERE node.mode = ?
+  AND node.lane_label = ?
+  AND NOT EXISTS (
+      SELECT 1
+      FROM console_graph_node_locations AS cover
+      WHERE cover.mode = node.mode
+        AND cover.node_id = node.node_id
+        AND cover.lane_label != node.lane_label
+        AND cover.lane_label NOT LIKE 'orphan %'
+        AND cover.lane_label NOT LIKE 'skill %'
+  )
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(lane_label)
+        .get_result::<SqliteInteger>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(row.is_none())
+    }
+
     fn clear_materialized_mode_facts(
         &self,
         connection: &mut SqliteConnection,
@@ -2910,6 +3021,15 @@ WHERE edge.mode = ?
         AND suffix_target.node_id = edge.target_id
         AND suffix_target.x = edge.target_x
         AND suffix_target.y = edge.target_y
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM console_graph_node_locations AS derived_target
+      WHERE derived_target.mode = edge.mode
+        AND derived_target.lane_label LIKE 'skill %'
+        AND derived_target.node_id = edge.target_id
+        AND derived_target.x = edge.target_x
+        AND derived_target.y = edge.target_y
   )
 LIMIT 1
 "#,
@@ -3278,12 +3398,12 @@ ORDER BY lane_y, lane_key
         ancestry: &[Node],
     ) -> crate::Result<Option<(usize, Point)>> {
         for (index, node) in ancestry.iter().enumerate() {
-            let Some(point) =
-                self.materialized_node_point_in_connection(connection, mode, &node.id)?
+            let Some(row) = self
+                .materialized_non_skill_node_row_by_id_in_connection(connection, mode, &node.id)?
             else {
                 continue;
             };
-            return Ok(Some((index, point)));
+            return Ok(Some((index, Point { x: row.x, y: row.y })));
         }
         Ok(None)
     }
@@ -3334,6 +3454,30 @@ ORDER BY lane_y, lane_key
 SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
 FROM console_graph_node_locations
 WHERE mode = ? AND node_id = ?
+ORDER BY y, x, node_key
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .get_result::<MaterializedTailNodeRow>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
+    fn materialized_non_skill_node_row_by_id_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+    ) -> crate::Result<Option<MaterializedTailNodeRow>> {
+        sql_query(
+            r#"
+SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
+FROM console_graph_node_locations
+WHERE mode = ? AND node_id = ? AND lane_label NOT LIKE 'skill %'
 ORDER BY y, x, node_key
 LIMIT 1
 "#,
