@@ -485,6 +485,12 @@ LIMIT 1
             return Ok(false);
         }
         self.rebalance_routed_edge_slots(connection, mode)?;
+        if self
+            .refresh_materialized_node_labels(connection, store, mode, session_states)?
+            .is_none()
+        {
+            return Ok(false);
+        }
         self.put_materialization_meta_from_materialized_rows(connection, source_version, mode)?;
         Ok(true)
     }
