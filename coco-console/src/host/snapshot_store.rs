@@ -17,8 +17,9 @@ use crate::error::{
     ConnectGraphSnapshotStoreSnafu, ParseGraphSnapshotStoreValueSnafu, QueryGraphSnapshotStoreSnafu,
 };
 use crate::graph::{
-    GraphMode, graph_kind_name, initial_visible_graph_lane_nodes, node_target_id, shorten_id,
-    summarize_node, visible_skill_invocation_subtree_nodes,
+    GraphMode, graph_kind_name, initial_visible_graph_lane_nodes, node_target_id,
+    provider_context_ancestry_nodes, shorten_id, summarize_node,
+    visible_skill_invocation_subtree_nodes,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
@@ -1216,7 +1217,7 @@ LIMIT 1
         let ancestry = store
             .ancestry(input.head_id)
             .context(crate::error::StoreSnafu)?;
-        let visible_chain = ancestry
+        let visible_chain = provider_context_ancestry_nodes(ancestry)
             .iter()
             .rev()
             .filter(|node| is_anchor_node(node))
@@ -3289,7 +3290,7 @@ WHERE edge.mode = ?
       SELECT 1
       FROM console_graph_node_locations AS derived_target
       WHERE derived_target.mode = edge.mode
-        AND derived_target.lane_key LIKE 'derived:skill:%'
+        AND derived_target.lane_key LIKE 'derived:%'
         AND derived_target.node_id = edge.target_id
         AND derived_target.x = edge.target_x
         AND derived_target.y = edge.target_y

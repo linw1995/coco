@@ -5802,6 +5802,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_scopes_new_anchor_branch_lane_to_current_context_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let old_session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &old_session).unwrap();
+        let old_prompt = writer
+            .append(NewNode {
+                parent: old_session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "old prompt".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &old_session, &old_prompt)
+            .unwrap();
+        let current_session = writer
+            .append(NewNode {
+                parent: old_prompt.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &old_prompt, &current_session)
+            .unwrap();
+        let main_anchor = writer
+            .append(NewNode {
+                parent: current_session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "main anchor".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &current_session, &main_anchor)
+            .unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::Anchors).await;
+        let database_path = path.join("store.sqlite3");
+        create_graph_fact_audit_triggers(&database_path);
+        writer.fork("draft", &current_session).unwrap();
+        let draft_anchor = writer
+            .append(NewNode {
+                parent: current_session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "draft anchor".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("draft", &current_session, &draft_anchor)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::Anchors,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert!(viewport.nodes.iter().any(|node| node.id == current_session));
+        assert!(viewport.nodes.iter().any(|node| node.id == draft_anchor));
+        assert!(!viewport.nodes.iter().any(|node| node.id == old_session));
+        assert!(!viewport.nodes.iter().any(|node| node.id == old_prompt));
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == current_session
+                && edge.target_id == draft_anchor
+                && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::Anchors, target_version)
+                .is_none()
+        );
+        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
+        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
+
+        drop(cache);
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_skips_hidden_new_anchor_branch_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
@@ -6342,6 +6466,112 @@ mod tests {
                 ..
             } if source_version == target_version && message.contains("could not apply")
         ));
+
+        drop(cache);
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_deletes_branch_with_orphan_lane_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let main_first = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("main first".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &main_first)
+            .unwrap();
+        writer.fork("draft", &main_first).unwrap();
+        let draft_first = writer
+            .append(NewNode {
+                parent: main_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("draft first".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("draft", &main_first, &draft_first)
+            .unwrap();
+        let orphan_parent = writer
+            .append(NewNode {
+                parent: draft_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("orphan parent".to_owned()),
+            })
+            .unwrap();
+        let draft_merge = writer
+            .append(NewNode {
+                parent: draft_first.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan_parent.clone())],
+                    PromptAnchor {
+                        prompt: "draft merge".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("draft", &draft_first, &draft_merge)
+            .unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::All).await;
+        let database_path = path.join("store.sqlite3");
+        create_graph_fact_audit_triggers(&database_path);
+        writer.delete_branch("draft").unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::All,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(viewport.version, target_version);
+        assert!(!viewport.lanes.iter().any(|lane| lane.label == "draft"));
+        assert!(!viewport.nodes.iter().any(|node| node.id == draft_first));
+        assert!(!viewport.nodes.iter().any(|node| node.id == orphan_parent));
+        assert!(!viewport.nodes.iter().any(|node| node.id == draft_merge));
+        assert!(viewport.nodes.iter().any(|node| node.id == main_first));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+        assert!(sqlite_audit_row_count(&database_path, "node_delete") >= 3);
+        assert!(sqlite_audit_row_count(&database_path, "edge_delete") >= 3);
 
         drop(cache);
         drop(writer);

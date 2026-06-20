@@ -804,19 +804,26 @@ fn collect_provider_context_node_ids(
 }
 
 fn provider_context_node_ids(ancestry: Vec<Node>) -> BTreeSet<String> {
-    ancestry
+    provider_context_ancestry_nodes(ancestry)
         .into_iter()
-        .take_while(|node| !node.is_root())
-        .scan(false, provider_context_node_id)
+        .map(|node| node.id)
         .collect()
 }
 
-fn provider_context_node_id(done: &mut bool, node: Node) -> Option<String> {
+pub(crate) fn provider_context_ancestry_nodes(ancestry: Vec<Node>) -> Vec<Node> {
+    ancestry
+        .into_iter()
+        .take_while(|node| !node.is_root())
+        .scan(false, provider_context_node)
+        .collect()
+}
+
+fn provider_context_node(done: &mut bool, node: Node) -> Option<Node> {
     if *done {
         return None;
     }
     *done = is_provider_context_start(&node);
-    Some(node.id)
+    Some(node)
 }
 
 fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
@@ -955,6 +962,10 @@ pub(crate) fn initial_visible_graph_lane_nodes(
 ) -> Result<Vec<Node>> {
     let mut nodes = Vec::new();
     let mut seen = BTreeSet::new();
+    let ancestry = match mode {
+        GraphMode::Anchors => provider_context_ancestry_nodes(ancestry),
+        GraphMode::All => ancestry,
+    };
     for node in ancestry.into_iter().rev() {
         push_initial_lane_node(mode, node.clone(), &mut seen, &mut nodes);
     }
