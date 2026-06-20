@@ -470,16 +470,11 @@ impl ConsoleGraphSnapshotStore {
             .iter()
             .map(|(branch, _)| branch.clone())
             .collect::<BTreeSet<_>>();
-        let Some(removed_lanes) = trailing_removed_lanes(&materialized_lanes, &branch_names) else {
-            return Ok(false);
-        };
+        let removed_lanes = removed_lanes_in_order(&materialized_lanes, &branch_names);
         if !removed_lanes.is_empty() {
             self.delete_materialized_lanes(connection, mode, &removed_lanes)?;
-            let removed_labels = removed_lanes
-                .iter()
-                .map(|lane| lane.lane_label.as_str())
-                .collect::<HashSet<_>>();
-            materialized_lanes.retain(|lane| !removed_labels.contains(lane.lane_label.as_str()));
+            self.shift_lanes_after_deletion(connection, mode, &removed_lanes)?;
+            materialized_lanes = self.materialized_lanes_in_connection(connection, mode)?;
         }
         let materialized_lane_labels = materialized_lanes
             .iter()
@@ -1062,6 +1057,141 @@ WHERE mode = ? AND lane_label = ?
             .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
             })?;
+        }
+        Ok(())
+    }
+
+    fn shift_lanes_after_deletion(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        removed_lanes: &[LaneRow],
+    ) -> crate::Result<()> {
+        for lane in self.lane_shifts_after_deletion(connection, mode, removed_lanes)? {
+            let delta = GRAPH_LANE_HEIGHT * removed_lane_count_before(removed_lanes, lane.lane_y);
+            if delta == 0 {
+                continue;
+            }
+            self.shift_lane_nodes(connection, mode, &lane, delta)?;
+            self.shift_lane_edges(connection, mode, lane.lane_y, delta)?;
+        }
+        Ok(())
+    }
+
+    fn lane_shifts_after_deletion(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        removed_lanes: &[LaneRow],
+    ) -> crate::Result<Vec<LaneRow>> {
+        let first_removed_y = removed_lanes
+            .iter()
+            .map(|lane| lane.lane_y)
+            .min()
+            .unwrap_or(i32::MAX);
+        Ok(self
+            .materialized_lanes_in_connection(connection, mode)?
+            .into_iter()
+            .filter(|lane| lane.lane_y > first_removed_y)
+            .collect())
+    }
+
+    fn shift_lane_nodes(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        lane: &LaneRow,
+        delta: i32,
+    ) -> crate::Result<()> {
+        sql_query(
+            r#"
+UPDATE console_graph_node_locations
+SET node_key = 'node:' || node_id || ':' || x || ':' || (y - ?),
+    lane_y = lane_y - ?,
+    y = y - ?,
+    min_y = min_y - ?,
+    max_y = max_y - ?
+WHERE mode = ? AND lane_label = ?
+"#,
+        )
+        .bind::<Integer, _>(delta)
+        .bind::<Integer, _>(delta)
+        .bind::<Integer, _>(delta)
+        .bind::<Integer, _>(delta)
+        .bind::<Integer, _>(delta)
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(&lane.lane_label)
+        .execute(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(())
+    }
+
+    fn shift_lane_edges(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        lane_y: i32,
+        delta: i32,
+    ) -> crate::Result<()> {
+        let rows = sql_query(
+            r#"
+SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
+FROM console_graph_edge_routes
+WHERE mode = ? AND (source_y = ? OR target_y = ?)
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Integer, _>(lane_y)
+        .bind::<Integer, _>(lane_y)
+        .load::<EdgeRouteRow>(&mut *connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        for row in rows {
+            sql_query("DELETE FROM console_graph_edge_routes WHERE mode = ? AND edge_key = ?")
+                .bind::<Text, _>(mode.as_query_value())
+                .bind::<Text, _>(&row.edge_key)
+                .execute(&mut *connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: self.path.as_ref().clone(),
+                })?;
+            let kind = parse_edge_kind(&row.edge_kind)?;
+            let source = Point {
+                x: row.source_x,
+                y: if row.source_y == lane_y {
+                    row.source_y - delta
+                } else {
+                    row.source_y
+                },
+            };
+            let target = Point {
+                x: row.target_x,
+                y: if row.target_y == lane_y {
+                    row.target_y - delta
+                } else {
+                    row.target_y
+                },
+            };
+            let edge = GraphViewportEdge {
+                key: edge_key(kind, &row.source_id, source, &row.target_id, target),
+                kind,
+                source_id: row.source_id,
+                target_id: row.target_id,
+                source,
+                target,
+                route_slot: row.route_slot,
+                target_port_offset: row.target_port_offset,
+            };
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge: &edge,
+                    bounds: edge_bounds(&edge),
+                },
+            )?;
         }
         Ok(())
     }
@@ -1663,23 +1793,22 @@ fn new_branch_lanes_append_after_existing(
             .all(|(branch, _)| materialized_lane_labels.contains(branch))
 }
 
-fn trailing_removed_lanes(
+fn removed_lanes_in_order(
     materialized_lanes: &[LaneRow],
     branch_names: &BTreeSet<String>,
-) -> Option<Vec<LaneRow>> {
-    let mut removed = Vec::new();
-    let mut seen_removed = false;
-    for lane in materialized_lanes {
-        if branch_names.contains(&lane.lane_label) {
-            if seen_removed {
-                return None;
-            }
-            continue;
-        }
-        seen_removed = true;
-        removed.push(lane.clone());
-    }
-    Some(removed)
+) -> Vec<LaneRow> {
+    materialized_lanes
+        .iter()
+        .filter(|lane| !branch_names.contains(&lane.lane_label))
+        .cloned()
+        .collect()
+}
+
+fn removed_lane_count_before(removed_lanes: &[LaneRow], lane_y: i32) -> i32 {
+    removed_lanes
+        .iter()
+        .filter(|removed| removed.lane_y < lane_y)
+        .count() as i32
 }
 
 fn edge_corridor_y(source_y: i32, target_y: i32, route_slot: i32) -> i32 {
