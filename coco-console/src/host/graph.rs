@@ -310,17 +310,29 @@ fn graph_merge_edge_kind(parent: &MergeParent) -> GraphEdgeKind {
 }
 
 fn graph_node_from_entry(entry: GraphNodeEntry) -> GraphNode {
+    graph_node_from_node(
+        entry.node,
+        render_graph_labels(&entry.labels),
+        entry.provider_context_ids,
+    )
+}
+
+pub(crate) fn graph_node_from_node(
+    node: Node,
+    labels: Vec<String>,
+    provider_context_ids: Vec<String>,
+) -> GraphNode {
     GraphNode {
-        id: entry.node.id.clone(),
-        short_id: shorten_id(&entry.node.id),
-        kind: graph_kind_name(&entry.node).to_owned(),
-        role: format!("{:?}", entry.node.role),
-        created_at: entry.node.created_at.to_string(),
-        created_at_ns: entry.node.created_at.as_nanosecond(),
-        content: render_node_content(&entry.node),
-        summary: summarize_node(&entry.node),
-        labels: render_graph_labels(&entry.labels),
-        provider_context_ids: entry.provider_context_ids,
+        id: node.id.clone(),
+        short_id: shorten_id(&node.id),
+        kind: graph_kind_name(&node).to_owned(),
+        role: format!("{:?}", node.role),
+        created_at: node.created_at.to_string(),
+        created_at_ns: node.created_at.as_nanosecond(),
+        content: render_node_content(&node),
+        summary: summarize_node(&node),
+        labels,
+        provider_context_ids,
     }
 }
 

@@ -150,6 +150,11 @@ struct NodeLocationInsert<'a> {
     bounds: ItemBounds,
 }
 
+pub(crate) struct MaterializedNodeReference {
+    pub node_id: String,
+    pub labels: Vec<String>,
+}
+
 struct EdgeRouteInsert<'a> {
     mode: GraphMode,
     edge: &'a GraphViewportEdge,
@@ -208,6 +213,42 @@ impl ConsoleGraphSnapshotStore {
             return Ok(None);
         };
         self.viewport_diff_from_row(mode, meta, request)
+    }
+
+    pub(crate) fn materialized_node_reference(
+        &self,
+        mode: GraphMode,
+        target: &str,
+    ) -> crate::Result<Option<MaterializedNodeReference>> {
+        let mut connection = self.connect()?;
+        let row = sql_query(
+            r#"
+SELECT node_key, node_id, node_target, short_id, node_kind, summary, labels_json, x, y
+FROM console_graph_node_locations
+WHERE mode = ? AND node_target = ?
+ORDER BY y, x, node_key
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(target)
+        .get_result::<NodeLocationRow>(&mut connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        row.map(|row| {
+            let labels = serde_json::from_str::<Vec<String>>(&row.labels_json).context(
+                ParseGraphSnapshotStoreValueSnafu {
+                    column: "console_graph_node_locations.labels_json",
+                },
+            )?;
+            Ok(MaterializedNodeReference {
+                node_id: row.node_id,
+                labels,
+            })
+        })
+        .transpose()
     }
 
     pub fn put(&self, source_version: u64, snapshot: &GraphSnapshot) -> crate::Result<()> {

@@ -31,8 +31,8 @@ use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphV
 use crate::host::cache::ConsoleGraphCache;
 use crate::publisher::ConsolePublisher;
 use crate::render::{
-    render_fragment, render_loading_fragment, render_loading_index_page,
-    render_node_detail_fragment, render_provider_context_fragment,
+    render_fragment, render_graph_node_detail_fragment, render_loading_fragment,
+    render_loading_index_page, render_node_detail_fragment, render_provider_context_fragment,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -506,6 +506,28 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
+    if state.cache.has_materialized_viewports() {
+        if let Some(snapshot) = state.cache.snapshot_current_ready(mode) {
+            return html_response(render_node_detail_fragment(&snapshot, query.get("target")));
+        }
+        let Some(target) = query.get("target") else {
+            return html_response(render_node_detail_fragment(
+                &loading_snapshot(mode, state.cache.current_version()),
+                None,
+            ));
+        };
+        return match state
+            .cache
+            .node_detail_current_ready_or_schedule(mode, target)
+        {
+            Ok(Some(node)) => html_response(render_graph_node_detail_fragment(&node)),
+            Ok(None) => html_response(render_node_detail_fragment(
+                &loading_snapshot(mode, state.cache.current_version()),
+                Some(target),
+            )),
+            Err(error) => plain_error(error.to_string()),
+        };
+    }
     let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
@@ -928,14 +950,14 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 mod tests {
     use super::{
         AppState, fragment, graph_json, graph_viewport_diff_response,
-        graph_viewport_items_diff_response_from_query, parse_query, start_console_server,
-        viewport_diff_has_changes, viewport_diff_request_from_query,
+        graph_viewport_items_diff_response_from_query, node_detail, parse_query,
+        start_console_server, viewport_diff_has_changes, viewport_diff_request_from_query,
     };
     use crate::api::{
         GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
         GraphViewportItems, GraphViewportRemovedItem, Point,
     };
-    use crate::graph::{GraphMode, build_graph_snapshot};
+    use crate::graph::{GraphMode, build_graph_snapshot, node_target_id};
     use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
     use crate::layout::layout_graph_viewport;
     use crate::{ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleStore};
@@ -1720,6 +1742,53 @@ mod tests {
             response.contains("Select a node to inspect its content."),
             "{response}"
         );
+    }
+
+    #[tokio::test]
+    async fn node_detail_uses_materialized_facts_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("single node detail".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &root, &text).unwrap();
+        publisher.mark_changed();
+        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        seed_cache.current_snapshot(GraphMode::All).await;
+        drop(seed_cache);
+
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        let query = format!("target={}&mode=all", node_target_id(&text));
+
+        let response = node_detail(State(state.clone()), RawQuery(Some(query))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("single node detail"), "{html}");
+        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]

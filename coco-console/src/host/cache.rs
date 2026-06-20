@@ -3,11 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use super::snapshot_store::ConsoleGraphSnapshotStore;
 use crate::api::{GraphViewportDiffResponse, GraphViewportResponse};
-use crate::graph::{GraphMode, GraphSnapshot, build_graph_snapshot_with_mode_and_progress};
+use crate::graph::{
+    GraphMode, GraphNode, GraphSnapshot, build_graph_snapshot_with_mode_and_progress,
+    graph_node_from_node,
+};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
-use coco_mem::{SqliteGraphStore, Store};
+use coco_mem::{NodeStore, SqliteGraphStore, Store};
 use serde::Serialize;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
@@ -231,6 +234,43 @@ where
 
     pub fn has_materialized_viewports(&self) -> bool {
         self.snapshots.is_some()
+    }
+
+    pub fn node_detail_current_ready_or_schedule(
+        &self,
+        mode: GraphMode,
+        target: &str,
+    ) -> crate::Result<Option<GraphNode>> {
+        let Some(snapshots) = &self.snapshots else {
+            return Ok(self
+                .snapshot_current_ready_or_schedule(mode)
+                .and_then(|snapshot| {
+                    snapshot
+                        .nodes
+                        .iter()
+                        .find(|node| crate::graph::node_target_id(&node.id) == target)
+                        .map(|node| GraphNode {
+                            id: node.id.clone(),
+                            short_id: node.short_id.clone(),
+                            kind: node.kind.clone(),
+                            role: node.role.clone(),
+                            created_at: node.created_at.clone(),
+                            created_at_ns: node.created_at_ns,
+                            content: node.content.clone(),
+                            summary: node.summary.clone(),
+                            labels: node.labels.clone(),
+                            provider_context_ids: node.provider_context_ids.clone(),
+                        })
+                }));
+        };
+        self.ensure_viewport_current(mode);
+        let Some(reference) = snapshots.materialized_node_reference(mode, target)? else {
+            return Ok(None);
+        };
+        self.source
+            .clone()
+            .get_node(&reference.node_id)
+            .map(|node| Some(graph_node_from_node(node, reference.labels, Vec::new())))
     }
 
     pub async fn snapshot_after(
@@ -746,6 +786,17 @@ where
                 let store =
                     SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
                 snapshots.try_append_linear_branch(source_version, mode, &store)
+            }
+        }
+    }
+
+    fn get_node(self, node_id: &str) -> crate::Result<coco_mem::Node> {
+        match self {
+            Self::Store(store) => store.get_node(node_id).context(crate::error::StoreSnafu),
+            Self::PersistentStorePath(path) => {
+                let store =
+                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
+                store.get_node(node_id).context(crate::error::StoreSnafu)
             }
         }
     }

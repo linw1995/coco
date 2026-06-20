@@ -45,6 +45,10 @@ pub fn render_node_detail_fragment(snapshot: &GraphSnapshot, target: Option<&str
     }
 }
 
+pub fn render_graph_node_detail_fragment(node: &GraphNode) -> String {
+    render_node_details(FocusedNode::Graph(node)).to_html()
+}
+
 pub fn render_provider_context_fragment(
     snapshot: &GraphSnapshot,
     target: Option<&str>,
