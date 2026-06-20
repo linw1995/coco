@@ -21,8 +21,8 @@ use crate::graph::{
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
-    EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, diff_graph_viewport_responses, lane_key,
-    materialize_graph_viewport,
+    EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LEFT_X, diff_graph_viewport_responses,
+    lane_key, materialize_graph_viewport,
 };
 use coco_mem::{
     BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, SessionState, SessionStore,
@@ -409,51 +409,73 @@ impl ConsoleGraphSnapshotStore {
             .iter()
             .map(|lane| lane.lane_label.clone())
             .collect::<BTreeSet<_>>();
-        if materialized_lanes.len() != session_states.len()
-            || !existing_branch_lanes_preserve_order(
-                session_states,
-                &materialized_lanes,
-                &materialized_lane_labels,
-            )
-        {
+        if !existing_branch_lanes_preserve_order(
+            session_states,
+            &materialized_lanes,
+            &materialized_lane_labels,
+        ) {
             return Ok(false);
         }
 
+        let mut materialized_lane_labels = materialized_lane_labels;
+        let mut next_lane_y = crate::layout::GRAPH_TOP_Y;
         for (branch, state) in session_states {
             let head_id = store
                 .get_branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
-            let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
-            let Some(visible_head) =
-                self.first_materialized_lane_ancestry_node(connection, mode, branch, &ancestry)?
-            else {
-                return Ok(false);
-            };
-            let Some(tail) = self.latest_lane_tail_in_connection(connection, mode, branch)? else {
-                return Ok(false);
-            };
-            if visible_head.x < tail.x {
-                self.delete_materialized_lane_suffix(
+            let appended = if materialized_lane_labels.contains(branch) {
+                let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+                let Some(visible_head) = self
+                    .first_materialized_lane_ancestry_node(connection, mode, branch, &ancestry)?
+                else {
+                    return Ok(false);
+                };
+                let Some(tail) = self.latest_lane_tail_in_connection(connection, mode, branch)?
+                else {
+                    return Ok(false);
+                };
+                if visible_head.x < tail.x {
+                    self.delete_materialized_lane_suffix(
+                        connection,
+                        mode,
+                        branch,
+                        visible_head.x,
+                        visible_head.y,
+                    )?;
+                }
+                self.try_append_anchor_branch_after_row(
                     connection,
-                    mode,
-                    branch,
-                    visible_head.x,
-                    visible_head.y,
+                    store,
+                    AppendLinearBranchInput {
+                        mode,
+                        branch,
+                        state,
+                        head_id: &head_id,
+                    },
+                    visible_head,
+                )?
+            } else {
+                self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
+                let appended = self.try_append_new_anchor_branch_lane_in_transaction(
+                    connection,
+                    store,
+                    AppendLinearBranchInput {
+                        mode,
+                        branch,
+                        state,
+                        head_id: &head_id,
+                    },
+                    next_lane_y,
                 )?;
-            }
-            if !self.try_append_anchor_branch_after_row(
-                connection,
-                store,
-                AppendLinearBranchInput {
-                    mode,
-                    branch,
-                    state,
-                    head_id: &head_id,
-                },
-                visible_head,
-            )? {
+                if appended {
+                    materialized_lane_labels.insert(branch.clone());
+                }
+                appended
+            };
+            if !appended {
                 return Ok(false);
             }
+            next_lane_y += GRAPH_LANE_HEIGHT;
         }
 
         let mut labels_by_node_id = BTreeMap::<String, Vec<String>>::new();
@@ -506,6 +528,135 @@ impl ConsoleGraphSnapshotStore {
                 world_max_y,
             },
         )?;
+        Ok(true)
+    }
+
+    fn try_append_new_anchor_branch_lane_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        store: &impl NodeStore,
+        input: AppendLinearBranchInput<'_>,
+        lane_y: i32,
+    ) -> crate::Result<bool> {
+        let ancestry = store
+            .ancestry(input.head_id)
+            .context(crate::error::StoreSnafu)?;
+        let visible_chain = ancestry
+            .iter()
+            .rev()
+            .filter(|node| is_anchor_node(node))
+            .cloned()
+            .collect::<Vec<_>>();
+        if visible_chain.is_empty() {
+            return Ok(false);
+        }
+
+        let covered_before_lane = self
+            .materialized_node_rows_in_connection(connection, input.mode)?
+            .into_iter()
+            .filter(|row| row.y < lane_y)
+            .map(|row| row.node_id)
+            .collect::<BTreeSet<_>>();
+        let first_new = visible_chain
+            .iter()
+            .position(|node| !covered_before_lane.contains(&node.id))
+            .unwrap_or_else(|| visible_chain.len().saturating_sub(1));
+        let nodes = visible_chain[first_new..].to_vec();
+        if nodes.is_empty() {
+            return Ok(false);
+        }
+
+        let fork_source = first_new
+            .checked_sub(1)
+            .and_then(|index| visible_chain.get(index));
+        let mut previous = match fork_source {
+            Some(source) => {
+                let Some(source_point) =
+                    self.materialized_node_point_in_connection(connection, input.mode, &source.id)?
+                else {
+                    return Ok(false);
+                };
+                Some((source.id.clone(), source_point))
+            }
+            None => None,
+        };
+
+        let lane = GraphViewportLane {
+            key: lane_key(input.branch),
+            label: input.branch.to_owned(),
+            y: lane_y,
+        };
+        let branch_label = branch_label(input.branch, input.state);
+        let appended_len = nodes.len();
+        for (index, node) in nodes.into_iter().enumerate() {
+            let point = match previous.as_ref() {
+                Some((_, previous_point)) => Point {
+                    x: previous_point.x + GRAPH_COLUMN_WIDTH,
+                    y: lane_y,
+                },
+                None => Point {
+                    x: GRAPH_LEFT_X,
+                    y: lane_y,
+                },
+            };
+            let labels = if index + 1 == appended_len {
+                vec![branch_label.clone()]
+            } else {
+                Vec::new()
+            };
+            let viewport_node = graph_viewport_node_from_node(&node, point, labels);
+            self.insert_node_location(
+                connection,
+                NodeLocationInsert {
+                    mode: input.mode,
+                    node: &viewport_node,
+                    lane: &lane,
+                    bounds: node_bounds(&viewport_node),
+                },
+            )?;
+            if let Some((previous_id, previous_point)) = previous.as_ref() {
+                let edge = if index == 0 && fork_source.is_some() {
+                    routed_edge(
+                        GraphViewportEdgeKind::Fork,
+                        previous_id,
+                        *previous_point,
+                        &node.id,
+                        point,
+                        self.next_routed_edge_slot_in_connection(
+                            connection,
+                            input.mode,
+                            *previous_point,
+                            point,
+                        )?,
+                    )
+                } else {
+                    primary_parent_edge(previous_id, *previous_point, &node.id, point)
+                };
+                self.insert_edge_route(
+                    connection,
+                    EdgeRouteInsert {
+                        mode: input.mode,
+                        edge: &edge,
+                        bounds: edge_bounds(&edge),
+                    },
+                )?;
+                if !self.insert_node_merge_edges(
+                    connection,
+                    store,
+                    input.mode,
+                    &node,
+                    previous_id,
+                    point,
+                )? {
+                    return Ok(false);
+                }
+            } else if !self
+                .insert_node_merge_edges(connection, store, input.mode, &node, "", point)?
+            {
+                return Ok(false);
+            }
+            previous = Some((node.id, point));
+        }
         Ok(true)
     }
 
