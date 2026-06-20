@@ -293,6 +293,23 @@ impl ConsoleGraphSnapshotStore {
             self.update_node_labels(connection, input.mode, &tail.node_key, vec![branch_label])?;
             return Ok(true);
         }
+        if let Some(head) = self.materialized_lane_node_in_connection(
+            connection,
+            input.mode,
+            input.branch,
+            input.head_id,
+        )? && head.x < tail.x
+        {
+            self.delete_materialized_lane_suffix(
+                connection,
+                input.mode,
+                input.branch,
+                head.x,
+                head.y,
+            )?;
+            self.update_node_labels(connection, input.mode, &head.node_key, vec![branch_label])?;
+            return Ok(true);
+        }
         if self.node_occurrence_count_in_connection(connection, input.mode, &tail.node_id)? > 1 {
             return Ok(false);
         }
@@ -1061,6 +1078,47 @@ WHERE mode = ? AND lane_label = ?
         Ok(())
     }
 
+    fn delete_materialized_lane_suffix(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        branch: &str,
+        head_x: i32,
+        lane_y: i32,
+    ) -> crate::Result<()> {
+        sql_query(
+            r#"
+DELETE FROM console_graph_edge_routes
+WHERE mode = ?
+  AND (source_y = ? OR target_y = ?)
+  AND (source_x > ? OR target_x > ?)
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Integer, _>(lane_y)
+        .bind::<Integer, _>(lane_y)
+        .bind::<Integer, _>(head_x)
+        .bind::<Integer, _>(head_x)
+        .execute(&mut *connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        sql_query(
+            r#"
+DELETE FROM console_graph_node_locations
+WHERE mode = ? AND lane_label = ? AND x > ?
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(branch)
+        .bind::<Integer, _>(head_x)
+        .execute(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(())
+    }
+
     fn shift_lanes_after_deletion(
         &self,
         connection: &mut SqliteConnection,
@@ -1242,6 +1300,32 @@ LIMIT 1
         )
         .bind::<Text, _>(mode.as_query_value())
         .bind::<Text, _>(branch)
+        .get_result::<MaterializedTailNodeRow>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
+    fn materialized_lane_node_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        branch: &str,
+        node_id: &str,
+    ) -> crate::Result<Option<MaterializedTailNodeRow>> {
+        sql_query(
+            r#"
+SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
+FROM console_graph_node_locations
+WHERE mode = ? AND lane_label = ? AND node_id = ?
+ORDER BY x DESC, node_key DESC
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(branch)
+        .bind::<Text, _>(node_id)
         .get_result::<MaterializedTailNodeRow>(connection)
         .optional()
         .context(QueryGraphSnapshotStoreSnafu {
