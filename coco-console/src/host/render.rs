@@ -69,6 +69,14 @@ pub fn render_provider_context_fragment(
     }
 }
 
+pub(crate) fn render_provider_context_items_fragment(items: Vec<ProviderContextItem>) -> String {
+    view! { <ProviderContextList items=items/> }.to_html()
+}
+
+pub(crate) fn render_provider_context_missing_fragment(target: &str) -> String {
+    view! { <ProviderContextMissing target=target.to_owned()/> }.to_html()
+}
+
 enum FocusedNode<'a> {
     Graph(&'a GraphNode),
     ProviderContext(&'a GraphProviderContextNode),
@@ -124,11 +132,11 @@ struct ProviderContextSelection<'a> {
 }
 
 #[derive(Clone)]
-struct ProviderContextItem {
-    context_target: String,
-    node: GraphProviderContextNode,
-    selected: bool,
-    point: Option<Point>,
+pub(crate) struct ProviderContextItem {
+    pub context_target: String,
+    pub node: GraphProviderContextNode,
+    pub selected: bool,
+    pub point: Option<Point>,
 }
 
 #[cfg(test)]

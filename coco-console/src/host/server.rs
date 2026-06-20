@@ -33,6 +33,7 @@ use crate::publisher::ConsolePublisher;
 use crate::render::{
     render_fragment, render_graph_node_detail_fragment, render_loading_fragment,
     render_loading_index_page, render_node_detail_fragment, render_provider_context_fragment,
+    render_provider_context_items_fragment, render_provider_context_missing_fragment,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -557,6 +558,20 @@ where
             query.get("context"),
         ));
     }
+    if state.cache.has_materialized_viewports() {
+        let target = query
+            .get("target")
+            .expect("target was checked before materialized provider context lookup");
+        return match state.cache.provider_context_current_ready_or_schedule(
+            mode,
+            target,
+            query.get("context"),
+        ) {
+            Ok(Some(items)) => html_response(render_provider_context_items_fragment(items)),
+            Ok(None) => html_response(render_provider_context_missing_fragment(target)),
+            Err(error) => plain_error(error.to_string()),
+        };
+    }
     let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
@@ -971,7 +986,8 @@ mod tests {
     use axum::body::to_bytes;
     use axum::extract::{RawQuery, State};
     use coco_mem::{
-        BranchStore, Kind, MemoryStore, NewNode, NodeStore, PersistentStore, Role, Store,
+        Anchor, BranchStore, Kind, MemoryStore, NewNode, NodeStore, PersistentStore, PromptAnchor,
+        Role, SessionAnchor, SessionRole, Store,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -1047,6 +1063,23 @@ mod tests {
             "coco-console-server-test-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn test_session_anchor() -> SessionAnchor {
+        SessionAnchor {
+            role: SessionRole::Orchestrator,
+            provider_profile: None,
+            provider: Some("openai".to_owned()),
+            model: "gpt-4.1-mini".to_owned(),
+            tools: Vec::new(),
+            system_prompt: "You are helpful.".to_owned(),
+            prompt: "Start".to_owned(),
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+            enable_coco_shim: false,
+            active_skill: None,
+        }
     }
 
     async fn response_bytes_from(bytes: &[u8]) -> Vec<u8> {
@@ -1847,6 +1880,105 @@ mod tests {
             "{html}"
         );
         assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_context_uses_materialized_facts_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let hidden_text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("hidden context item".to_owned()),
+            })
+            .unwrap();
+        let prompt = writer
+            .append(NewNode {
+                parent: hidden_text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "visible context prompt".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &prompt).unwrap();
+        publisher.mark_changed();
+        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        seed_cache.current_snapshot(GraphMode::Anchors).await;
+        drop(seed_cache);
+
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        let visible_query = format!("mode=anchors&target={}", node_target_id(&prompt));
+
+        let response = provider_context(State(state.clone()), RawQuery(Some(visible_query))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let visible_html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            visible_html.contains("visible context prompt"),
+            "{visible_html}"
+        );
+        assert!(
+            visible_html.contains("hidden context item"),
+            "{visible_html}"
+        );
+        assert!(visible_html.contains("data-node-x="), "{visible_html}");
+        assert!(
+            state
+                .cache
+                .snapshot_current_ready(GraphMode::Anchors)
+                .is_none()
+        );
+
+        let hidden_query = format!("mode=anchors&target={}", node_target_id(&hidden_text));
+        let response = provider_context(State(state.clone()), RawQuery(Some(hidden_query))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let hidden_html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(hidden_html.contains("hidden context item"), "{hidden_html}");
+        assert!(
+            hidden_html.contains("class=\"provider-context-node selected\""),
+            "{hidden_html}"
+        );
+        assert!(
+            state
+                .cache
+                .snapshot_current_ready(GraphMode::Anchors)
+                .is_none()
+        );
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

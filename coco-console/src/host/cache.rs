@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -5,9 +6,10 @@ use super::snapshot_store::ConsoleGraphSnapshotStore;
 use crate::api::{GraphViewportDiffResponse, GraphViewportResponse};
 use crate::graph::{
     GraphMode, GraphNode, GraphSnapshot, build_graph_snapshot_with_mode_and_progress,
-    graph_node_from_node,
+    graph_node_from_node, provider_context_for_node,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
+use crate::host::render::ProviderContextItem;
 use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
 use coco_mem::{NodeStore, SqliteGraphStore, Store};
@@ -271,6 +273,62 @@ where
             .clone()
             .get_node(&reference.node_id)
             .map(|node| Some(graph_node_from_node(node, reference.labels, Vec::new())))
+    }
+
+    pub(crate) fn provider_context_current_ready_or_schedule(
+        &self,
+        mode: GraphMode,
+        target: &str,
+        context: Option<&str>,
+    ) -> crate::Result<Option<Vec<ProviderContextItem>>> {
+        let Some(snapshots) = &self.snapshots else {
+            return Ok(None);
+        };
+        self.ensure_viewport_current(mode);
+        let materialized_reference = snapshots.materialized_node_reference(mode, target)?;
+        let target_was_materialized = materialized_reference.is_some();
+        let Some(target_node_id) = materialized_reference
+            .map(|reference| reference.node_id)
+            .or_else(|| node_id_from_graph_target(target))
+        else {
+            return Ok(None);
+        };
+        let Some(selection) = self
+            .source
+            .clone()
+            .provider_context_for_node(&target_node_id, context)?
+        else {
+            return Ok(target_was_materialized.then(Vec::new));
+        };
+
+        let node_ids = selection
+            .context
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        let points = snapshots.materialized_node_points(mode, &node_ids)?;
+        if points.is_empty() {
+            return Ok(None);
+        }
+
+        let context_target = selection.context.id;
+        let items = selection
+            .context
+            .nodes
+            .into_iter()
+            .map(|mut node| {
+                let point = points.get(&node.id).copied();
+                node.visible = point.is_some();
+                ProviderContextItem {
+                    context_target: context_target.clone(),
+                    selected: node.id == selection.selected_id,
+                    node,
+                    point,
+                }
+            })
+            .collect();
+        Ok(Some(items))
     }
 
     pub async fn snapshot_after(
@@ -749,6 +807,13 @@ fn rebuild_status(
     }
 }
 
+fn node_id_from_graph_target(target: &str) -> Option<String> {
+    target
+        .strip_prefix("detail-")
+        .filter(|node_id| !node_id.is_empty())
+        .map(str::to_owned)
+}
+
 impl<S> ConsoleGraphSource<S>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -797,6 +862,21 @@ where
                 let store =
                     SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
                 store.get_node(node_id).context(crate::error::StoreSnafu)
+            }
+        }
+    }
+
+    fn provider_context_for_node(
+        self,
+        target_node_id: &str,
+        context: Option<&str>,
+    ) -> crate::Result<Option<crate::graph::GraphProviderContextSelection>> {
+        match self {
+            Self::Store(store) => provider_context_for_node(&store, target_node_id, context),
+            Self::PersistentStorePath(path) => {
+                let store =
+                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
+                provider_context_for_node(&store, target_node_id, context)
             }
         }
     }

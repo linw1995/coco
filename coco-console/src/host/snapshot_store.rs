@@ -251,6 +251,23 @@ LIMIT 1
         .transpose()
     }
 
+    pub(crate) fn materialized_node_points(
+        &self,
+        mode: GraphMode,
+        node_ids: &BTreeSet<String>,
+    ) -> crate::Result<BTreeMap<String, Point>> {
+        let mut connection = self.connect()?;
+        let mut points = BTreeMap::new();
+        for node_id in node_ids {
+            if let Some(point) =
+                self.materialized_node_point_in_connection(&mut connection, mode, node_id)?
+            {
+                points.insert(node_id.clone(), point);
+            }
+        }
+        Ok(points)
+    }
+
     pub fn put(&self, source_version: u64, snapshot: &GraphSnapshot) -> crate::Result<()> {
         let materialized = materialize_graph_viewport(snapshot);
         let mut connection = self.connect()?;

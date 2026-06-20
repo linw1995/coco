@@ -106,6 +106,12 @@ pub struct GraphProviderContextNode {
     pub visible: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphProviderContextSelection {
+    pub context: GraphProviderContext,
+    pub selected_id: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphEdge {
     pub source: String,
@@ -676,6 +682,50 @@ fn sorted_session_states(store: &impl SessionStore) -> Result<Vec<(String, Sessi
         .collect::<Vec<_>>();
     branches.sort_by(|(left, _), (right, _)| left.cmp(right));
     Ok(branches)
+}
+
+pub(crate) fn provider_context_for_node(
+    store: &(impl BranchStore + NodeStore + SessionStore),
+    target_node_id: &str,
+    context_id: Option<&str>,
+) -> Result<Option<GraphProviderContextSelection>> {
+    let mut contexts = HashMap::<String, GraphProviderContext>::new();
+    for (branch_name, _) in sorted_session_states(store)? {
+        let head_id = store.get_branch_head(&branch_name).context(StoreSnafu)?;
+        let ancestry = store.ancestry(&head_id).context(StoreSnafu)?;
+        for context_nodes in provider_contexts_from_head(ancestry) {
+            let Some(id) = provider_context_id(&branch_name, &context_nodes) else {
+                continue;
+            };
+            if context_id.is_some_and(|selected| selected != id) {
+                continue;
+            }
+            if !context_nodes.iter().any(|node| node.id == target_node_id) {
+                continue;
+            }
+            let nodes = context_nodes
+                .iter()
+                .map(|node| graph_provider_context_node(node, false))
+                .collect();
+            contexts
+                .entry(id.clone())
+                .or_insert(GraphProviderContext { id, nodes });
+        }
+    }
+
+    let mut contexts = contexts.into_values().collect::<Vec<_>>();
+    contexts.sort_by(provider_context_order);
+    Ok(contexts.into_iter().find_map(|context| {
+        let selected_id = context
+            .nodes
+            .iter()
+            .find(|node| node.id == target_node_id)
+            .map(|node| node.id.clone())?;
+        Some(GraphProviderContextSelection {
+            selected_id,
+            context,
+        })
+    }))
 }
 
 fn node_anchor(node: &Node) -> Option<&Anchor> {
