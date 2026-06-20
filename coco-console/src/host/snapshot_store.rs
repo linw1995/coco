@@ -941,7 +941,10 @@ LIMIT 1
             &lane,
         )? {
             SkillSubtreeAppend::Unsupported => Ok(Some(false)),
-            SkillSubtreeAppend::Absent | SkillSubtreeAppend::Applied => Ok(Some(true)),
+            SkillSubtreeAppend::Absent | SkillSubtreeAppend::Applied => {
+                self.trim_branch_lane_covered_prefix(connection, input.mode, input.branch)?;
+                Ok(Some(true))
+            }
         }
     }
 
@@ -1532,6 +1535,7 @@ LIMIT 1
         tail: MaterializedTailNodeRow,
     ) -> crate::Result<bool> {
         if input.head_id == tail.node_id {
+            self.trim_branch_lane_covered_prefix(connection, input.mode, input.branch)?;
             return Ok(true);
         }
         let ancestry = store
@@ -3411,6 +3415,155 @@ WHERE mode = ? AND node_key = ?
         self.rebalance_target_port_offsets(connection, mode, target_point)
     }
 
+    fn trim_branch_lane_covered_prefix(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        branch: &str,
+    ) -> crate::Result<()> {
+        let lane_key = lane_key(branch);
+        let nodes =
+            self.materialized_node_rows_by_lane_key_in_connection(connection, mode, &lane_key)?;
+        if nodes.len() < 2 {
+            return Ok(());
+        }
+        let lane_y = nodes[0].y;
+        let mut covered_prefix = Vec::new();
+        for node in &nodes {
+            let Some(cover) = self.materialized_branch_node_point_before_lane_in_connection(
+                connection,
+                mode,
+                &node.node_id,
+                lane_y,
+            )?
+            else {
+                break;
+            };
+            covered_prefix.push((node.clone(), cover));
+        }
+        if covered_prefix.is_empty() {
+            return Ok(());
+        }
+
+        if covered_prefix.len() == nodes.len() {
+            self.trim_fully_covered_branch_lane(connection, mode, &nodes, &covered_prefix)
+        } else {
+            self.trim_partially_covered_branch_lane_prefix(
+                connection,
+                mode,
+                &nodes,
+                &covered_prefix,
+            )
+        }
+    }
+
+    fn trim_fully_covered_branch_lane(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        nodes: &[MaterializedTailNodeRow],
+        covered_prefix: &[(MaterializedTailNodeRow, Point)],
+    ) -> crate::Result<()> {
+        let Some((alias, _)) = covered_prefix.last() else {
+            return Ok(());
+        };
+        let incoming = self.primary_incoming_edge_to_node_occurrence(
+            connection,
+            mode,
+            &alias.node_id,
+            alias.x,
+            alias.y,
+        )?;
+        self.delete_materialized_node_occurrences(
+            connection,
+            mode,
+            &nodes[..nodes.len().saturating_sub(1)],
+        )?;
+        let Some(incoming) = incoming else {
+            return Ok(());
+        };
+        let Some(source) = self.materialized_branch_node_point_before_lane_in_connection(
+            connection,
+            mode,
+            &incoming.source_id,
+            alias.y,
+        )?
+        else {
+            return Ok(());
+        };
+        let target = Point {
+            x: alias.x,
+            y: alias.y,
+        };
+        self.insert_trimmed_branch_fork_edge(
+            connection,
+            mode,
+            &incoming.source_id,
+            source,
+            alias,
+            target,
+        )
+    }
+
+    fn trim_partially_covered_branch_lane_prefix(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        nodes: &[MaterializedTailNodeRow],
+        covered_prefix: &[(MaterializedTailNodeRow, Point)],
+    ) -> crate::Result<()> {
+        self.delete_materialized_node_occurrences(
+            connection,
+            mode,
+            &covered_prefix
+                .iter()
+                .map(|(node, _)| node.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let (source, source_point) = covered_prefix.last().expect("prefix is not empty");
+        let target = &nodes[covered_prefix.len()];
+        let target_point = Point {
+            x: target.x,
+            y: target.y,
+        };
+        self.insert_trimmed_branch_fork_edge(
+            connection,
+            mode,
+            &source.node_id,
+            *source_point,
+            target,
+            target_point,
+        )
+    }
+
+    fn insert_trimmed_branch_fork_edge(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        source_id: &str,
+        source: Point,
+        target: &MaterializedTailNodeRow,
+        target_point: Point,
+    ) -> crate::Result<()> {
+        let edge = routed_edge(
+            GraphViewportEdgeKind::Fork,
+            source_id,
+            source,
+            &target.node_id,
+            target_point,
+            self.next_routed_edge_slot_in_connection(connection, mode, source, target_point)?,
+        );
+        self.insert_edge_route(
+            connection,
+            EdgeRouteInsert {
+                mode,
+                edge: &edge,
+                bounds: edge_bounds(&edge),
+            },
+        )?;
+        self.rebalance_target_port_offsets(connection, mode, target_point)
+    }
+
     fn migrate_covered_derived_lane_outgoing_edges(
         &self,
         connection: &mut SqliteConnection,
@@ -4305,6 +4458,68 @@ LIMIT 1
             path: self.path.as_ref().clone(),
         })?;
         Ok(row.map(|row| Point { x: row.x, y: row.y }))
+    }
+
+    fn materialized_branch_node_point_before_lane_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+        before_lane_y: i32,
+    ) -> crate::Result<Option<Point>> {
+        let row = sql_query(
+            r#"
+SELECT x, y
+FROM console_graph_node_locations
+WHERE mode = ?
+  AND node_id = ?
+  AND y < ?
+  AND lane_key NOT LIKE 'derived:orphan:%'
+  AND lane_key NOT LIKE 'derived:skill:%'
+ORDER BY y, x, node_key
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .bind::<Integer, _>(before_lane_y)
+        .get_result::<MaterializedNodePointRow>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(row.map(|row| Point { x: row.x, y: row.y }))
+    }
+
+    fn primary_incoming_edge_to_node_occurrence(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_id: &str,
+        x: i32,
+        y: i32,
+    ) -> crate::Result<Option<EdgeRouteRow>> {
+        sql_query(
+            r#"
+SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
+FROM console_graph_edge_routes
+WHERE mode = ?
+  AND edge_kind = 'primary_parent'
+  AND target_id = ?
+  AND target_x = ?
+  AND target_y = ?
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(node_id)
+        .bind::<Integer, _>(x)
+        .bind::<Integer, _>(y)
+        .get_result::<EdgeRouteRow>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
     }
 
     fn materialized_node_point_in_connection(

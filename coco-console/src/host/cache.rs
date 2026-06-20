@@ -7897,12 +7897,126 @@ mod tests {
                 && edge.target.y == alpha_y
                 && edge.kind == crate::api::GraphViewportEdgeKind::PrimaryParent
         }));
+        assert!(
+            !viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == session && node.y == zeta_y)
+        );
+        assert!(
+            viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == shared && node.y == zeta_y)
+        );
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == session
+                && edge.source.y == alpha_y
+                && edge.target_id == shared
+                && edge.target.y == zeta_y
+                && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+        }));
         assert!(!viewport.edges.iter().any(|edge| {
             edge.target_id == shared && edge.target.y == alpha_y && edge.source.y == zeta_y
         }));
         assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_trims_lower_anchor_lane_after_earlier_branch_insert() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("zeta", &session).unwrap();
+        let prompt = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "shared anchor node".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer.set_branch_head("zeta", &session, &prompt).unwrap();
+        publisher.mark_changed();
+
+        let initial = cache.current_snapshot(GraphMode::Anchors).await;
+        writer.fork("alpha", &prompt).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let viewport = cache
+            .viewport_after(
+                GraphMode::Anchors,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+        let alpha_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "alpha")
+            .unwrap()
+            .y;
+        let zeta_y = viewport
+            .lanes
+            .iter()
+            .find(|lane| lane.label == "zeta")
+            .unwrap()
+            .y;
+
+        assert_eq!(viewport.version, target_version);
+        assert!(alpha_y < zeta_y);
+        assert!(
+            !viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == session && node.y == zeta_y)
+        );
+        assert!(
+            viewport
+                .nodes
+                .iter()
+                .any(|node| node.id == prompt && node.y == zeta_y)
+        );
+        assert!(viewport.edges.iter().any(|edge| {
+            edge.source_id == session
+                && edge.source.y == alpha_y
+                && edge.target_id == prompt
+                && edge.target.y == zeta_y
+                && edge.kind == crate::api::GraphViewportEdgeKind::Fork
+        }));
+        assert!(
+            cache
+                .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
 
