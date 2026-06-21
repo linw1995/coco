@@ -5643,8 +5643,10 @@ mod tests {
     use super::*;
 
     use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use coco_mem::{MemoryStore, NewNode, NodeStore, Role};
+    use coco_mem::{MemoryStore, NewNode, NodeStore, PersistentStore, Role};
 
     struct BranchAdvanceDuringWalkStore {
         root: Node,
@@ -5810,6 +5812,21 @@ mod tests {
         }
     }
 
+    fn temp_store_path() -> PathBuf {
+        static TEMP_STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let process_id = std::process::id();
+        let counter = TEMP_STORE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "coco-console-snapshot-{process_id}-{nanos}-{counter}"
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     #[test]
     fn materialization_source_snapshot_captures_branch_heads_before_node_walk() {
         let store = BranchAdvanceDuringWalkStore::new();
@@ -5823,6 +5840,44 @@ mod tests {
         assert_eq!(store.get_branch_head("main").unwrap(), store.new_head_id);
         assert_eq!(snapshot.get_branch_head("main").unwrap(), store.old_head.id);
         assert_eq!(snapshot.ancestry("main").unwrap()[0].id, store.old_head.id);
+    }
+
+    #[test]
+    fn boolean_write_transaction_rolls_back_false_result() {
+        let path = temp_store_path();
+        let _writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let writer = snapshots.clone();
+        let applied = snapshots
+            .with_connection_for_tests(move |connection| {
+                writer.run_bool_write_transaction(connection, |this, connection| {
+                    this.put_materialization_meta(
+                        connection,
+                        MaterializationMetaInput {
+                            source_version: 42,
+                            mode: GraphMode::All,
+                            world_min_x: 0,
+                            world_min_y: 0,
+                            world_max_x: 1,
+                            world_max_y: 1,
+                        },
+                    )?;
+                    Ok(false)
+                })
+            })
+            .unwrap();
+        assert!(!applied);
+
+        let reader = snapshots.clone();
+        let row = snapshots
+            .with_connection_for_tests(move |connection| {
+                reader.latest_materialization_row_in_connection(connection, GraphMode::All)
+            })
+            .unwrap();
+        assert!(row.is_none());
+
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
