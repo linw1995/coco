@@ -637,7 +637,7 @@ LIMIT 1
         if session_states.is_empty() {
             let this = self.clone();
             return self.with_connection(move |connection| {
-                this.run_write_transaction(connection, |this, connection| {
+                this.run_bool_write_transaction(connection, |this, connection| {
                     this.put_empty_materialization_in_transaction(connection, source_version, mode)
                 })
             });
@@ -665,7 +665,7 @@ LIMIT 1
 
         let this = self.clone();
         self.with_connection(move |connection| {
-            this.run_write_transaction(connection, |this, connection| match mode {
+            this.run_bool_write_transaction(connection, |this, connection| match mode {
                 GraphMode::Anchors => this.try_update_anchor_materialization_in_transaction(
                     connection,
                     &source,
@@ -695,7 +695,7 @@ LIMIT 1
             let Some(first_index) =
                 this.first_visible_initial_branch_index(&source, mode, &session_states)?
             else {
-                return this.run_write_transaction(connection, |this, connection| {
+                return this.run_bool_write_transaction(connection, |this, connection| {
                     this.delete_materialization_meta(connection, mode)?;
                     this.put_empty_materialization_in_transaction(connection, source_version, mode)
                 });
@@ -707,7 +707,7 @@ LIMIT 1
             })?;
 
             let (first_branch, first_state) = &session_states[first_index];
-            if !this.run_write_transaction(connection, |this, connection| {
+            if !this.run_bool_write_transaction(connection, |this, connection| {
                 this.try_seed_first_branch_materialization_in_transaction(
                     connection,
                     &source,
@@ -727,37 +727,38 @@ LIMIT 1
                 let head_id = source
                     .get_branch_head(branch)
                     .context(crate::error::StoreSnafu)?;
-                let appended = this.run_write_transaction(connection, |this, connection| {
-                    this.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
-                    let input = AppendLinearBranchInput {
-                        mode,
-                        branch,
-                        state,
-                        head_id: &head_id,
-                    };
-                    match mode {
-                        GraphMode::Anchors => this
-                            .try_append_new_anchor_branch_lane_in_transaction(
+                let appended =
+                    this.run_bool_write_transaction(connection, |this, connection| {
+                        this.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
+                        let input = AppendLinearBranchInput {
+                            mode,
+                            branch,
+                            state,
+                            head_id: &head_id,
+                        };
+                        match mode {
+                            GraphMode::Anchors => this
+                                .try_append_new_anchor_branch_lane_in_transaction(
+                                    connection,
+                                    &source,
+                                    input,
+                                    next_lane_y,
+                                ),
+                            GraphMode::All => this.try_append_new_branch_lane_in_transaction(
                                 connection,
                                 &source,
                                 input,
                                 next_lane_y,
                             ),
-                        GraphMode::All => this.try_append_new_branch_lane_in_transaction(
-                            connection,
-                            &source,
-                            input,
-                            next_lane_y,
-                        ),
-                    }
-                })?;
+                        }
+                    })?;
                 if !appended {
                     return Ok(false);
                 }
                 next_lane_y += GRAPH_LANE_HEIGHT;
             }
 
-            this.run_write_transaction(connection, |this, connection| {
+            this.run_bool_write_transaction(connection, |this, connection| {
                 this.rebalance_routed_edge_slots(connection, mode)?;
                 if this
                     .refresh_materialized_node_labels(connection, &source, mode, &session_states)?
@@ -788,6 +789,31 @@ LIMIT 1
             Ok(value) => {
                 self.commit_transaction(connection)?;
                 Ok(value)
+            }
+            Err(error) => {
+                let _ = self.rollback_transaction(connection);
+                Err(error)
+            }
+        }
+    }
+
+    fn run_bool_write_transaction<F>(
+        &self,
+        connection: &mut SqliteConnection,
+        operation: F,
+    ) -> crate::Result<bool>
+    where
+        F: FnOnce(&Self, &mut SqliteConnection) -> crate::Result<bool>,
+    {
+        self.begin_write_transaction(connection)?;
+        match operation(self, connection) {
+            Ok(true) => {
+                self.commit_transaction(connection)?;
+                Ok(true)
+            }
+            Ok(false) => {
+                let _ = self.rollback_transaction(connection);
+                Ok(false)
             }
             Err(error) => {
                 let _ = self.rollback_transaction(connection);
