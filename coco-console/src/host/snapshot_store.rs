@@ -3061,11 +3061,11 @@ ORDER BY
     }
 
     fn begin_write_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
-        sql_query("BEGIN TRANSACTION").execute(connection).context(
-            QueryGraphSnapshotStoreSnafu {
+        sql_query("BEGIN IMMEDIATE TRANSACTION")
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
-            },
-        )?;
+            })?;
         Ok(())
     }
 

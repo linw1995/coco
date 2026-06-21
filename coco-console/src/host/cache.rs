@@ -1738,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_materialization_read_transaction_does_not_block_store_writes() {
+    fn graph_materialization_preflight_read_does_not_block_store_writes() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
         ConsoleGraphSnapshotStore::open(&path).unwrap();
@@ -1767,7 +1767,7 @@ mod tests {
         });
         transaction_started_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("graph materialization read transaction should start");
+            .expect("graph materialization preflight read should start");
 
         let writer_for_thread = writer.clone();
         let root = writer.root_id();
