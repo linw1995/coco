@@ -347,6 +347,7 @@ impl SqliteDatabase {
                     path: database_path.clone(),
                 })?;
             configure_connection(&mut connection, &database_path).await?;
+            ensure_wal_journal_mode(&mut connection, &database_path).await?;
             Ok(connection)
         })?;
         Ok(Self {
@@ -1030,6 +1031,13 @@ PRAGMA busy_timeout = 5000;
 }
 
 async fn configure_writable_connection(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<()> {
+    ensure_wal_journal_mode(connection, path).await
+}
+
+async fn ensure_wal_journal_mode(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<()> {
@@ -2770,7 +2778,7 @@ impl ProcessShareableStore for SqliteStore {
 mod tests {
     use super::{
         AsyncSqliteConnection, FsStore, MessageQueueItem, NodeRow,
-        SQLITE_INCOMPLETE_DATABASE_FILE_NAME, SQLITE_MIGRATION_DATABASE_FILE_NAME,
+        SQLITE_INCOMPLETE_DATABASE_FILE_NAME, SQLITE_MIGRATION_DATABASE_FILE_NAME, SqliteDatabase,
         SqliteGraphStore, SqliteMigration, SqliteStore, StoreAccess, persist_root_metadata,
     };
     use crate::{
@@ -2793,6 +2801,12 @@ mod tests {
         kind: String,
         #[diesel(sql_type = Integer)]
         ordinal: i32,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct JournalModeRow {
+        #[diesel(sql_type = Text)]
+        journal_mode: String,
     }
 
     fn session_anchor_node(parent: &str) -> NewNode {
@@ -3830,6 +3844,48 @@ THIS IS NOT SQL;
 
         let reopened = SqliteStore::open_read_only_or_migrate_fs(&path).unwrap();
         assert_eq!(reopened.get_branch_head("main").unwrap(), session);
+    }
+
+    #[test]
+    fn unshared_open_enables_wal_after_fs_migration() {
+        use diesel::sql_query;
+        use diesel_async::RunQueryDsl;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let legacy = FsStore::open(&path).unwrap();
+        let root_id = legacy.root_id();
+        let session = legacy.append(session_anchor_node(&root_id)).unwrap();
+        legacy.fork("main", &session).unwrap();
+        drop(legacy);
+
+        let migrated = SqliteStore::open_or_migrate_fs(&path).unwrap();
+        let journal_mode = migrated.block_on(async {
+            let mut connection = migrated.connect().await.unwrap();
+            sql_query("PRAGMA journal_mode")
+                .get_result::<JournalModeRow>(&mut connection)
+                .await
+                .unwrap()
+                .journal_mode
+        });
+        assert_eq!(journal_mode, "delete");
+
+        let database = SqliteDatabase::open_unshared_file_path(migrated.database_path()).unwrap();
+        let journal_mode = database
+            .with_sync_connection(
+                |connection| {
+                    Ok(diesel::RunQueryDsl::get_result::<JournalModeRow>(
+                        sql_query("PRAGMA journal_mode"),
+                        connection,
+                    )
+                    .unwrap()
+                    .journal_mode)
+                },
+                std::convert::identity,
+            )
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
     }
 
     #[test]
