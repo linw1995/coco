@@ -990,23 +990,19 @@ fn push_initial_skill_invocation_subtrees(
     seen: &mut BTreeSet<String>,
     nodes: &mut Vec<Node>,
 ) -> Result<()> {
-    for node_id in skill_invocation_children(store, parent_id)? {
-        push_initial_subtree_node(store, mode, &node_id, seen, nodes)?;
-    }
-    Ok(())
-}
+    let mut pending = skill_invocation_children(store, parent_id)?;
+    pending.reverse();
+    let mut visited = BTreeSet::new();
 
-fn push_initial_subtree_node(
-    store: &impl NodeStore,
-    mode: GraphMode,
-    node_id: &str,
-    seen: &mut BTreeSet<String>,
-    nodes: &mut Vec<Node>,
-) -> Result<()> {
-    let node = store.get_node(node_id).context(StoreSnafu)?;
-    push_initial_lane_node(mode, node.clone(), seen, nodes);
-    for child_id in child_ids(store, &node.id)? {
-        push_initial_subtree_node(store, mode, &child_id, seen, nodes)?;
+    while let Some(node_id) = pending.pop() {
+        if node_id.is_empty() || !visited.insert(node_id.clone()) {
+            continue;
+        }
+        let node = store.get_node(&node_id).context(StoreSnafu)?;
+        let mut children = child_ids(store, &node.id)?;
+        children.reverse();
+        pending.extend(children);
+        push_initial_lane_node(mode, node, seen, nodes);
     }
     Ok(())
 }
