@@ -667,9 +667,19 @@ impl SqliteStore {
             if node_count(&mut connection, &self.database_path).await? == 0 {
                 self.ensure_writable()?;
                 let state = StoreState::new();
-                persist_root_metadata(&mut connection, &self.database_path, state.root_id())
-                    .await?;
-                persist_node(&mut connection, &self.database_path, state.root_node()).await?;
+                begin_immediate_transaction(&mut connection, &self.database_path).await?;
+                let result = async {
+                    persist_root_metadata(&mut connection, &self.database_path, state.root_id())
+                        .await?;
+                    persist_node_without_transaction(
+                        &mut connection,
+                        &self.database_path,
+                        state.root_node(),
+                    )
+                    .await
+                }
+                .await;
+                finish_transaction(&mut connection, &self.database_path, result).await?;
                 return Ok(state);
             }
             load_state(&mut connection, &self.database_path).await
@@ -1398,61 +1408,66 @@ async fn persist_state_snapshot(
     path: &Path,
     state: &StoreState,
 ) -> Result<()> {
-    persist_root_metadata(connection, path, state.root_id()).await?;
+    begin_immediate_transaction(connection, path).await?;
+    let result = async {
+        persist_root_metadata(connection, path, state.root_id()).await?;
 
-    let mut nodes = state.nodes.values().collect::<Vec<_>>();
-    nodes.sort_by(|left, right| {
-        left.created_at
-            .cmp(&right.created_at)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    for node in nodes {
-        persist_node(connection, path, node).await?;
-    }
+        let mut nodes = state.nodes.values().collect::<Vec<_>>();
+        nodes.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for node in nodes {
+            persist_node_without_transaction(connection, path, node).await?;
+        }
 
-    let mut branches = state.branches.iter().collect::<Vec<_>>();
-    branches.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (branch, head_id) in branches {
-        persist_branch(connection, path, branch, head_id).await?;
-    }
+        let mut branches = state.branches.iter().collect::<Vec<_>>();
+        branches.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (branch, head_id) in branches {
+            persist_branch(connection, path, branch, head_id).await?;
+        }
 
-    let mut sessions = state.sessions.iter().collect::<Vec<_>>();
-    sessions.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (branch, session_state) in sessions {
-        persist_session_state(connection, path, branch, session_state).await?;
-    }
+        let mut sessions = state.sessions.iter().collect::<Vec<_>>();
+        sessions.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (branch, session_state) in sessions {
+            persist_session_state(connection, path, branch, session_state).await?;
+        }
 
-    let mut presets = state.presets.values().collect::<Vec<_>>();
-    presets.sort_by(|left, right| left.name.cmp(&right.name));
-    for preset in presets {
-        persist_preset(connection, path, preset).await?;
-    }
+        let mut presets = state.presets.values().collect::<Vec<_>>();
+        presets.sort_by(|left, right| left.name.cmp(&right.name));
+        for preset in presets {
+            persist_preset(connection, path, preset).await?;
+        }
 
-    let default_skills = default_skill_groups();
-    for role in [SessionRole::Orchestrator, SessionRole::Runner] {
-        for record in state.skill_groups.for_role(role).values() {
-            if !should_persist_skill_record(&default_skills, role, record) {
-                continue;
+        let default_skills = default_skill_groups();
+        for role in [SessionRole::Orchestrator, SessionRole::Runner] {
+            for record in state.skill_groups.for_role(role).values() {
+                if !should_persist_skill_record(&default_skills, role, record) {
+                    continue;
+                }
+                persist_skill(connection, path, role, record).await?;
             }
-            persist_skill(connection, path, role, record).await?;
         }
-    }
 
-    let mut jobs = state.jobs.values().collect::<Vec<_>>();
-    jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
-    for job in jobs {
-        persist_job(connection, path, job).await?;
-    }
-
-    let mut queues = state.message_queues.iter().collect::<Vec<_>>();
-    queues.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (_, items) in queues {
-        for item in items {
-            persist_message_queue_item(connection, path, item).await?;
+        let mut jobs = state.jobs.values().collect::<Vec<_>>();
+        jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        for job in jobs {
+            persist_job(connection, path, job).await?;
         }
-    }
 
-    Ok(())
+        let mut queues = state.message_queues.iter().collect::<Vec<_>>();
+        queues.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (_, items) in queues {
+            for item in items {
+                persist_message_queue_item(connection, path, item).await?;
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+    finish_transaction(connection, path, result).await
 }
 
 fn should_persist_skill_record(
@@ -1591,7 +1606,55 @@ fn node_references_known_parents(state: &StoreState, node: &Node) -> bool {
         .all(|parent| state.nodes.contains_key(parent.node_id()))
 }
 
+async fn begin_immediate_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<()> {
+    connection
+        .batch_execute("BEGIN IMMEDIATE")
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn commit_transaction(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
+    connection
+        .batch_execute("COMMIT")
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn finish_transaction<T>(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => {
+            commit_transaction(connection, path).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = connection.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
 async fn persist_node(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    begin_immediate_transaction(connection, path).await?;
+    let result = persist_node_without_transaction(connection, path, node).await;
+    finish_transaction(connection, path, result).await
+}
+
+async fn persist_node_without_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     node: &Node,
@@ -1635,7 +1698,7 @@ VALUES (?, ?, ?, ?)
     Ok(())
 }
 
-async fn upsert_node(
+async fn upsert_node_without_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     node: &Node,
@@ -1874,30 +1937,14 @@ async fn persist_branch_and_session_state(
     head_id: &str,
     session_state: &SessionState,
 ) -> Result<()> {
-    connection
-        .batch_execute("BEGIN IMMEDIATE")
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
+    begin_immediate_transaction(connection, path).await?;
 
     let result = async {
         persist_branch(connection, path, branch, head_id).await?;
         persist_session_state(connection, path, branch, session_state).await
     }
     .await;
-    match result {
-        Ok(()) => connection
-            .batch_execute("COMMIT")
-            .await
-            .context(QuerySqliteStoreSnafu {
-                path: path.to_owned(),
-            }),
-        Err(error) => {
-            let _ = connection.batch_execute("ROLLBACK").await;
-            Err(error)
-        }
-    }
+    finish_transaction(connection, path, result).await
 }
 
 async fn persist_session_state(
@@ -1968,18 +2015,24 @@ async fn persist_session_nodes_and_branch_head(
     new_head: &str,
     nodes: &[Node],
 ) -> Result<()> {
-    for node in nodes {
-        upsert_node(connection, path, node).await?;
-    }
-    let updated = update_branch_head(connection, path, branch, expected_old_head, new_head).await?;
-    ensure!(
-        updated == 1,
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!("SQLite branch {branch:?} did not match expected head"),
+    begin_immediate_transaction(connection, path).await?;
+    let result = async {
+        for node in nodes {
+            upsert_node_without_transaction(connection, path, node).await?;
         }
-    );
-    Ok(())
+        let updated =
+            update_branch_head(connection, path, branch, expected_old_head, new_head).await?;
+        ensure!(
+            updated == 1,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("SQLite branch {branch:?} did not match expected head"),
+            }
+        );
+        Ok(())
+    }
+    .await;
+    finish_transaction(connection, path, result).await
 }
 
 async fn load_jobs(
@@ -3703,6 +3756,57 @@ THIS IS NOT SQL;
             assert!(err.to_string().contains("SQLite"));
             assert_eq!(count, 0);
         });
+    }
+
+    #[test]
+    fn session_node_persistence_rolls_back_nodes_when_branch_head_update_fails() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+        let session = store.append(session_anchor_node(&root_id)).unwrap();
+        store.fork("main", &session).unwrap();
+        let replacement = Node::new(
+            root_id,
+            Role::System,
+            None,
+            Kind::Text("replacement".to_owned()),
+            "1970-01-01T00:00:01Z".parse().unwrap(),
+        );
+        let replacement_id = replacement.id.clone();
+
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            let err = super::persist_session_nodes_and_branch_head(
+                &mut connection,
+                &store.database_path,
+                "main",
+                "stale-head",
+                &replacement_id,
+                std::slice::from_ref(&replacement),
+            )
+            .await
+            .unwrap_err();
+            let node_count = sql_query("SELECT COUNT(*) AS count FROM nodes WHERE id = ?")
+                .bind::<Text, _>(&replacement_id)
+                .get_result::<super::TableCount>(&mut connection)
+                .await
+                .unwrap()
+                .count;
+            let relation_count =
+                sql_query("SELECT COUNT(*) AS count FROM node_relations WHERE child_node_id = ?")
+                    .bind::<Text, _>(&replacement_id)
+                    .get_result::<super::TableCount>(&mut connection)
+                    .await
+                    .unwrap()
+                    .count;
+
+            assert!(err.to_string().contains("expected head"));
+            assert_eq!(node_count, 0);
+            assert_eq!(relation_count, 0);
+        });
+        assert!(store.get_node(&replacement_id).is_err());
+        assert_eq!(store.get_branch_head("main").unwrap(), session);
     }
 
     #[test]
