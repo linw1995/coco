@@ -72,6 +72,53 @@ struct CachedGraphSnapshot {
     snapshot: Arc<GraphSnapshot>,
 }
 
+macro_rules! log_rebuild_status {
+    ($status:expr) => {{
+        let status = &$status;
+        if status.state == ConsoleGraphRebuildState::Failed {
+            tracing::warn!(
+                mode = ?status.mode,
+                source_version = status.source_version,
+                phase = ?status.phase,
+                processed = status.processed,
+                total = status.total,
+                message = %status.message,
+                "console graph rebuild failed",
+            );
+        } else if should_log_rebuild_status_at_info(status) {
+            tracing::info!(
+                mode = ?status.mode,
+                source_version = status.source_version,
+                state = ?status.state,
+                phase = ?status.phase,
+                processed = status.processed,
+                total = status.total,
+                message = %status.message,
+                "console graph rebuild status",
+            );
+        } else {
+            tracing::debug!(
+                mode = ?status.mode,
+                source_version = status.source_version,
+                state = ?status.state,
+                phase = ?status.phase,
+                processed = status.processed,
+                total = status.total,
+                message = %status.message,
+                "console graph rebuild progress",
+            );
+        }
+    }};
+}
+
+macro_rules! set_rebuild_status {
+    ($cache:expr, $status:expr) => {{
+        let status = $status;
+        log_rebuild_status!(status);
+        $cache.set_rebuild_status(status);
+    }};
+}
+
 impl<S> ConsoleGraphCache<S>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -207,43 +254,52 @@ where
         }
         let graph_version = source_version;
         let source = self.source.clone();
-        self.set_rebuild_status(rebuild_status(
-            mode,
-            source_version,
-            ConsoleGraphRebuildState::Building,
-            None,
-            0,
-            0,
-            "Building graph snapshot",
-        ));
+        set_rebuild_status!(
+            self,
+            rebuild_status(
+                mode,
+                source_version,
+                ConsoleGraphRebuildState::Building,
+                None,
+                0,
+                0,
+                "Building graph snapshot",
+            )
+        );
         let progress_cache = self.clone();
         let snapshot = self
             .run_blocking_graph_compute(move || {
                 source.build_snapshot_with_progress(mode, graph_version, |progress| {
-                    progress_cache.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Building,
-                        Some(progress.phase),
-                        progress.processed,
-                        progress.total,
-                        progress.phase.label(),
-                    ));
+                    set_rebuild_status!(
+                        progress_cache,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Building,
+                            Some(progress.phase),
+                            progress.processed,
+                            progress.total,
+                            progress.phase.label(),
+                        )
+                    );
                 })
             })
             .await??;
         let snapshot = Arc::new(snapshot);
         self.store_cached_snapshot(mode, source_version, snapshot.clone());
         self.publish_ready_version(source_version);
-        self.set_rebuild_status(rebuild_status(
-            mode,
-            source_version,
-            ConsoleGraphRebuildState::Ready,
-            None,
-            1,
-            1,
-            "Graph snapshot ready",
-        ));
+        set_rebuild_status!(
+            self,
+            rebuild_status(
+                mode,
+                source_version,
+                ConsoleGraphRebuildState::Ready,
+                None,
+                1,
+                1,
+                "Graph snapshot ready",
+            )
+        );
         Ok(snapshot)
     }
 
@@ -656,15 +712,18 @@ where
     fn ensure_snapshot_current(&self, mode: GraphMode) {
         let source_version = self.invalidations.current_version();
         if self.cached_snapshot(mode, source_version).is_some() {
-            self.set_rebuild_status(rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Ready,
-                None,
-                1,
-                1,
-                "Graph snapshot ready",
-            ));
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Ready,
+                    None,
+                    1,
+                    1,
+                    "Graph snapshot ready",
+                )
+            );
             return;
         }
         if !self.mark_rebuild_scheduled(mode, source_version) {
@@ -682,15 +741,18 @@ where
         if (self.snapshots.is_none() && self.cached_snapshot(mode, source_version).is_some())
             || self.materialization_current(mode, source_version)
         {
-            self.set_rebuild_status(rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Ready,
-                None,
-                1,
-                1,
-                "Graph materialization ready",
-            ));
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Ready,
+                    None,
+                    1,
+                    1,
+                    "Graph materialization ready",
+                )
+            );
             return;
         }
         if !self.mark_rebuild_scheduled(mode, source_version) {
@@ -705,19 +767,22 @@ where
 
     async fn rebuild_snapshot(&self, mode: GraphMode, source_version: u64) {
         let uses_materialized_store = self.snapshots.is_some();
-        self.set_rebuild_status(rebuild_status(
-            mode,
-            source_version,
-            ConsoleGraphRebuildState::Building,
-            None,
-            0,
-            0,
-            if uses_materialized_store {
-                "Building graph materialization"
-            } else {
-                "Building graph snapshot"
-            },
-        ));
+        set_rebuild_status!(
+            self,
+            rebuild_status(
+                mode,
+                source_version,
+                ConsoleGraphRebuildState::Building,
+                None,
+                0,
+                0,
+                if uses_materialized_store {
+                    "Building graph materialization"
+                } else {
+                    "Building graph snapshot"
+                },
+            )
+        );
         if let Some(snapshots) = self.snapshots.clone() {
             let has_materialization = snapshots.has_materialization(mode);
             let source = self.source.clone();
@@ -729,44 +794,71 @@ where
             match incremental_result {
                 Ok(Ok(true)) => {
                     self.publish_ready_version(source_version);
-                    self.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Ready,
-                        None,
-                        1,
-                        1,
-                        "Graph materialization updated",
-                    ));
+                    set_rebuild_status!(
+                        self,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Ready,
+                            None,
+                            1,
+                            1,
+                            "Graph materialization updated",
+                        )
+                    );
                     return;
                 }
                 Ok(Ok(false)) => match has_materialization {
                     Ok(true) => {
-                        self.set_rebuild_status(rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Failed,
-                            None,
-                            0,
-                            0,
-                            "Incremental graph materialization could not apply this store change",
-                        ));
+                        set_rebuild_status!(
+                            self,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Failed,
+                                None,
+                                0,
+                                0,
+                                "Incremental graph materialization could not apply this store change",
+                            )
+                        );
                         return;
                     }
                     Ok(false) => {
-                        self.set_rebuild_status(rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Failed,
-                            None,
-                            0,
-                            0,
-                            "Incremental graph materialization could not seed this store state",
-                        ));
+                        set_rebuild_status!(
+                            self,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Failed,
+                                None,
+                                0,
+                                0,
+                                "Incremental graph materialization could not seed this store state",
+                            )
+                        );
                         return;
                     }
                     Err(error) => {
-                        self.set_rebuild_status(rebuild_status(
+                        set_rebuild_status!(
+                            self,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Failed,
+                                None,
+                                0,
+                                0,
+                                error.to_string(),
+                            )
+                        );
+                        return;
+                    }
+                },
+                Ok(Err(error)) => {
+                    set_rebuild_status!(
+                        self,
+                        rebuild_status(
                             mode,
                             source_version,
                             ConsoleGraphRebuildState::Failed,
@@ -774,32 +866,23 @@ where
                             0,
                             0,
                             error.to_string(),
-                        ));
-                        return;
-                    }
-                },
-                Ok(Err(error)) => {
-                    self.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Failed,
-                        None,
-                        0,
-                        0,
-                        error.to_string(),
-                    ));
+                        )
+                    );
                     return;
                 }
                 Err(error) => {
-                    self.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Failed,
-                        None,
-                        0,
-                        0,
-                        error.to_string(),
-                    ));
+                    set_rebuild_status!(
+                        self,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Failed,
+                            None,
+                            0,
+                            0,
+                            error.to_string(),
+                        )
+                    );
                     return;
                 }
             }
@@ -809,15 +892,18 @@ where
         let result = self
             .run_blocking_graph_compute(move || {
                 source.build_snapshot_with_progress(mode, source_version, |progress| {
-                    progress_cache.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Building,
-                        Some(progress.phase),
-                        progress.processed,
-                        progress.total,
-                        progress.phase.label(),
-                    ));
+                    set_rebuild_status!(
+                        progress_cache,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Building,
+                            Some(progress.phase),
+                            progress.processed,
+                            progress.total,
+                            progress.phase.label(),
+                        )
+                    );
                 })
             })
             .await;
@@ -825,34 +911,47 @@ where
             Ok(Ok(snapshot)) => {
                 self.store_cached_snapshot(mode, source_version, Arc::new(snapshot));
                 self.publish_ready_version(source_version);
-                self.set_rebuild_status(rebuild_status(
-                    mode,
-                    source_version,
-                    ConsoleGraphRebuildState::Ready,
-                    None,
-                    1,
-                    1,
-                    "Graph snapshot ready",
-                ));
+                set_rebuild_status!(
+                    self,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Ready,
+                        None,
+                        1,
+                        1,
+                        "Graph snapshot ready",
+                    )
+                );
             }
-            Ok(Err(error)) => self.set_rebuild_status(rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Failed,
-                None,
-                0,
-                0,
-                error.to_string(),
-            )),
-            Err(error) => self.set_rebuild_status(rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Failed,
-                None,
-                0,
-                0,
-                error.to_string(),
-            )),
+            Ok(Err(error)) => {
+                set_rebuild_status!(
+                    self,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Failed,
+                        None,
+                        0,
+                        0,
+                        error.to_string(),
+                    )
+                );
+            }
+            Err(error) => {
+                set_rebuild_status!(
+                    self,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Failed,
+                        None,
+                        0,
+                        0,
+                        error.to_string(),
+                    )
+                );
+            }
         }
     }
 
@@ -915,7 +1014,7 @@ where
         }) {
             return false;
         }
-        *state.rebuild_slot_mut(mode) = Some(rebuild_status(
+        let status = rebuild_status(
             mode,
             source_version,
             ConsoleGraphRebuildState::Scheduled,
@@ -923,7 +1022,9 @@ where
             0,
             0,
             "Graph snapshot scheduled",
-        ));
+        );
+        log_rebuild_status!(status);
+        *state.rebuild_slot_mut(mode) = Some(status);
         drop(state);
         self.progress.mark_changed();
         true
@@ -939,6 +1040,16 @@ where
         drop(state);
         self.progress.mark_changed();
     }
+}
+
+fn should_log_rebuild_status_at_info(status: &ConsoleGraphRebuildStatus) -> bool {
+    if status.state != ConsoleGraphRebuildState::Building {
+        return true;
+    }
+
+    status
+        .phase
+        .is_some_and(|_| status.processed == 0 || status.processed == status.total)
 }
 
 impl CacheState {
@@ -1266,6 +1377,51 @@ mod tests {
         assert_eq!(branches[0].name, "hidden");
         assert_eq!(branches[0].key, lane_key("hidden"));
         assert_eq!(branches[0].lane_y, None);
+    }
+
+    #[test]
+    fn graph_rebuild_status_logs_phase_boundaries_at_info() {
+        let phase_start = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Building,
+            Some(crate::graph::GraphBuildPhase::Entries),
+            0,
+            10,
+            "Building graph entries",
+        );
+        let phase_progress = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Building,
+            Some(crate::graph::GraphBuildPhase::Entries),
+            5,
+            10,
+            "Building graph entries",
+        );
+        let phase_complete = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Building,
+            Some(crate::graph::GraphBuildPhase::Entries),
+            10,
+            10,
+            "Building graph entries",
+        );
+        let ready = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Ready,
+            None,
+            1,
+            1,
+            "Graph snapshot ready",
+        );
+
+        assert!(should_log_rebuild_status_at_info(&phase_start));
+        assert!(!should_log_rebuild_status_at_info(&phase_progress));
+        assert!(should_log_rebuild_status_at_info(&phase_complete));
+        assert!(should_log_rebuild_status_at_info(&ready));
     }
 
     #[tokio::test]
