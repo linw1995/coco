@@ -57,6 +57,16 @@ impl MaterializationSourceSnapshot {
         store: &(impl BranchStore + NodeStore + SessionStore),
         session_states: &[(String, SessionState)],
     ) -> crate::Result<Self> {
+        let mut branches = BTreeMap::new();
+        for (branch, _) in session_states {
+            branches.insert(
+                branch.clone(),
+                store
+                    .get_branch_head(branch)
+                    .context(crate::error::StoreSnafu)?,
+            );
+        }
+
         let root_id = store.root_id();
         let mut nodes = BTreeMap::new();
         let mut children = BTreeMap::new();
@@ -74,15 +84,6 @@ impl MaterializationSourceSnapshot {
             nodes.insert(node.id.clone(), node);
         }
 
-        let mut branches = BTreeMap::new();
-        for (branch, _) in session_states {
-            branches.insert(
-                branch.clone(),
-                store
-                    .get_branch_head(branch)
-                    .context(crate::error::StoreSnafu)?,
-            );
-        }
         Ok(Self {
             root_id,
             nodes,
@@ -5565,7 +5566,188 @@ fn parse_edge_kind(value: &str) -> crate::Result<GraphViewportEdgeKind> {
 mod tests {
     use super::*;
 
+    use std::cell::{Cell, RefCell};
+
     use coco_mem::{MemoryStore, NewNode, NodeStore, Role};
+
+    struct BranchAdvanceDuringWalkStore {
+        root: Node,
+        old_head: Node,
+        new_head_id: String,
+        branch_head: RefCell<String>,
+        advanced: Cell<bool>,
+    }
+
+    impl BranchAdvanceDuringWalkStore {
+        fn new() -> Self {
+            let memory = MemoryStore::new();
+            let root = memory.get_node(&memory.root_id()).unwrap();
+            let old_head = Node::new(
+                root.id.clone(),
+                Role::User,
+                None,
+                Kind::Text("old head".to_owned()),
+                "1970-01-01T00:00:01Z".parse().unwrap(),
+            );
+            let new_head = Node::new(
+                old_head.id.clone(),
+                Role::User,
+                None,
+                Kind::Text("new head".to_owned()),
+                "1970-01-01T00:00:02Z".parse().unwrap(),
+            );
+            Self {
+                root,
+                branch_head: RefCell::new(old_head.id.clone()),
+                old_head,
+                new_head_id: new_head.id,
+                advanced: Cell::new(false),
+            }
+        }
+    }
+
+    impl NodeStore for BranchAdvanceDuringWalkStore {
+        fn root_id(&self) -> String {
+            self.root.id.clone()
+        }
+
+        fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
+            })
+        }
+
+        fn ancestry(&self, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+            match head_ref {
+                id if id == self.old_head.id => Ok(vec![self.old_head.clone(), self.root.clone()]),
+                id if id == self.root.id => Ok(vec![self.root.clone()]),
+                id => Err(coco_mem::StoreError::NotFound { id: id.to_owned() }),
+            }
+        }
+
+        fn log(&self, _base_ref: &str, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+            self.ancestry(head_ref)
+        }
+
+        fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
+            match id {
+                id if id == self.root.id => Ok(self.root.clone()),
+                id if id == self.old_head.id => Ok(self.old_head.clone()),
+                id => Err(coco_mem::StoreError::NotFound { id: id.to_owned() }),
+            }
+        }
+
+        fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
+            if node_id == self.root.id {
+                if !self.advanced.replace(true) {
+                    *self.branch_head.borrow_mut() = self.new_head_id.clone();
+                }
+                return Ok(vec![self.old_head.clone()]);
+            }
+            if node_id == self.old_head.id {
+                return Ok(Vec::new());
+            }
+            Err(coco_mem::StoreError::NotFound {
+                id: node_id.to_owned(),
+            })
+        }
+    }
+
+    impl BranchStore for BranchAdvanceDuringWalkStore {
+        fn fork(&self, _name: &str, _from_ref: &str) -> coco_mem::StoreResult<String> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
+            })
+        }
+
+        fn get_branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {
+            if name == "main" {
+                return Ok(self.branch_head.borrow().clone());
+            }
+            Err(coco_mem::StoreError::BranchNotFound {
+                name: name.to_owned(),
+            })
+        }
+
+        fn delete_branch(&self, _name: &str) -> coco_mem::StoreResult<()> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
+            })
+        }
+
+        fn set_branch_head(
+            &self,
+            _name: &str,
+            _expected_old_head: &str,
+            _new_head: &str,
+        ) -> coco_mem::StoreResult<()> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
+            })
+        }
+    }
+
+    impl SessionStore for BranchAdvanceDuringWalkStore {
+        fn list_session_states(&self) -> coco_mem::StoreResult<HashMap<String, SessionState>> {
+            Ok(HashMap::from([("main".to_owned(), SessionState::Active)]))
+        }
+
+        fn get_session_state(&self, name: &str) -> coco_mem::StoreResult<SessionState> {
+            if name == "main" {
+                return Ok(SessionState::Active);
+            }
+            Err(coco_mem::StoreError::BranchNotFound {
+                name: name.to_owned(),
+            })
+        }
+
+        fn set_session_state(
+            &self,
+            _name: &str,
+            _expected: Option<&SessionState>,
+            _next: SessionState,
+        ) -> coco_mem::StoreResult<SessionState> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
+            })
+        }
+
+        fn rebase_session(
+            &self,
+            _name: &str,
+            _patch: &SessionAnchorPatch,
+        ) -> coco_mem::StoreResult<String> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
+            })
+        }
+
+        fn handoff_session(
+            &self,
+            _name: &str,
+            _patch: &SessionAnchorPatch,
+            _prompt: &str,
+        ) -> coco_mem::StoreResult<String> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
+            })
+        }
+    }
+
+    #[test]
+    fn materialization_source_snapshot_captures_branch_heads_before_node_walk() {
+        let store = BranchAdvanceDuringWalkStore::new();
+
+        let snapshot = MaterializationSourceSnapshot::from_store(
+            &store,
+            &[("main".to_owned(), SessionState::Active)],
+        )
+        .unwrap();
+
+        assert_eq!(store.get_branch_head("main").unwrap(), store.new_head_id);
+        assert_eq!(snapshot.get_branch_head("main").unwrap(), store.old_head.id);
+        assert_eq!(snapshot.ancestry("main").unwrap()[0].id, store.old_head.id);
+    }
 
     #[test]
     fn visible_skill_invocation_linear_subtrees_handles_deep_chain() {
