@@ -1670,7 +1670,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         let materialized = materialized.expect("materialized viewport should be stored");
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         assert_eq!(
             sqlite_table_row_count(&database_path, "console_graph_materializations"),
             1
@@ -1726,13 +1726,70 @@ mod tests {
                 .is_none()
         );
         assert!(reopened.is_none());
-        assert!(!path.join("console-graph-snapshots.sqlite3").exists());
         assert!(
             reopened_materialized
                 .nodes
                 .iter()
                 .any(|node| node.id == session)
         );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn graph_materialization_read_transaction_does_not_block_store_writes() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
+        let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
+        let transaction = std::thread::spawn(move || {
+            use diesel::connection::SimpleConnection;
+            use diesel::prelude::*;
+            use diesel::sql_query;
+
+            with_sqlite_test_connection(&graph_database_path, move |connection| {
+                connection.batch_execute("BEGIN TRANSACTION").unwrap();
+                assert_eq!(
+                    sql_query("SELECT COUNT(*) AS count FROM console_graph_materializations")
+                        .get_result::<SqliteCount>(connection)
+                        .unwrap()
+                        .count,
+                    0,
+                );
+                transaction_started_tx.send(()).unwrap();
+                release_transaction_rx.recv().unwrap();
+                connection.batch_execute("ROLLBACK").unwrap();
+            });
+        });
+        transaction_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("graph materialization read transaction should start");
+
+        let writer_for_thread = writer.clone();
+        let root = writer.root_id();
+        let (write_tx, write_rx) = mpsc::channel();
+        let write = std::thread::spawn(move || {
+            let node = writer_for_thread
+                .append(NewNode {
+                    parent: root,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("store write while graph db is locked".to_owned()),
+                })
+                .unwrap();
+            write_tx.send(node).unwrap();
+        });
+
+        let written = write_rx.recv_timeout(Duration::from_secs(1));
+        release_transaction_tx.send(()).unwrap();
+        transaction.join().unwrap();
+        write.join().unwrap();
+        let written = written.expect("store write should not wait for graph transaction release");
+        assert_eq!(writer.get_node(&written).unwrap().id, written);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -3537,7 +3594,7 @@ mod tests {
         publisher.mark_changed();
 
         cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let next = writer
             .append(NewNode {
@@ -3619,7 +3676,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let second = writer
             .append(NewNode {
@@ -5026,7 +5083,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let merge_anchor = writer
             .append(NewNode {
@@ -5146,7 +5203,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let merge_anchor = writer
             .append(NewNode {
@@ -5247,7 +5304,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let orphan_parent = writer
             .append(NewNode {
@@ -6425,7 +6482,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let second = writer
             .append(NewNode {
@@ -6495,7 +6552,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let prompt = writer
             .append(NewNode {
@@ -6614,7 +6671,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer
             .set_branch_head("main", &second_prompt, &first_prompt)
@@ -6712,7 +6769,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("draft").unwrap();
         publisher.mark_changed();
@@ -6807,7 +6864,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &session).unwrap();
         let draft_anchor = writer
@@ -6952,7 +7009,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &current_session).unwrap();
         let draft_anchor = writer
@@ -7048,7 +7105,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let current_session = writer
             .append(NewNode {
@@ -7241,7 +7298,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &main_anchor).unwrap();
         publisher.mark_changed();
@@ -7375,7 +7432,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let merge_anchor = writer
             .append(NewNode {
@@ -7613,7 +7670,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.set_branch_head("main", &second, &first).unwrap();
         publisher.mark_changed();
@@ -7704,7 +7761,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer
             .set_branch_head("main", &main_second, &main_first)
@@ -7847,7 +7904,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("draft").unwrap();
         publisher.mark_changed();
@@ -7928,7 +7985,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let main_second = writer
             .append(NewNode {
@@ -8027,7 +8084,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &main_first).unwrap();
         let draft_first = writer
@@ -8336,7 +8393,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &main_first).unwrap();
         let draft_merge = writer
@@ -8436,7 +8493,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &main_first).unwrap();
         publisher.mark_changed();
@@ -8532,7 +8589,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &session).unwrap();
         publisher.mark_changed();
@@ -8613,7 +8670,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let main_next = writer
             .append(NewNode {
@@ -8715,7 +8772,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("beta", &main_first).unwrap();
         let beta_first = writer
@@ -8841,7 +8898,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("draft").unwrap();
         publisher.mark_changed();
@@ -8930,7 +8987,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("main").unwrap();
         publisher.mark_changed();
@@ -9058,7 +9115,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("beta").unwrap();
         publisher.mark_changed();
@@ -9112,7 +9169,7 @@ mod tests {
     async fn cache_drops_legacy_snapshot_materialization_tables() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_legacy_snapshot_materialization_tables(&database_path);
 
         let publisher = ConsolePublisher::new();
@@ -9148,10 +9205,7 @@ mod tests {
         T: Send + 'static,
         F: FnOnce(&mut diesel::sqlite::SqliteConnection) -> T + Send + 'static,
     {
-        let store_path = database_path
-            .parent()
-            .expect("SQLite database path should have a store directory");
-        coco_mem::SqliteDatabase::open_store_path(store_path)
+        coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
             .unwrap()
             .with_sync_connection(
                 |connection| Ok(operation(connection)),

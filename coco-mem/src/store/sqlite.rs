@@ -301,6 +301,10 @@ impl SqliteDatabase {
         Self::open(sqlite_database_path(path.as_ref()))
     }
 
+    pub fn open_unshared_file_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_uncached(path.as_ref().to_owned())
+    }
+
     fn open(database_path: PathBuf) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let databases = SQLITE_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -331,6 +335,27 @@ impl SqliteDatabase {
         });
         databases.insert(database_path, Arc::downgrade(&inner));
         Ok(Self { inner })
+    }
+
+    fn open_uncached(database_path: PathBuf) -> Result<Self> {
+        let database_path = sqlite_database_registry_path(&database_path)?;
+        let runtime = sqlite_runtime()?;
+        let connection = block_on_sqlite_runtime_with(runtime, async {
+            let mut connection = AsyncSqliteConnection::establish(&database_path.to_string_lossy())
+                .await
+                .context(ConnectSqliteStoreSnafu {
+                    path: database_path.clone(),
+                })?;
+            configure_connection(&mut connection, &database_path).await?;
+            Ok(connection)
+        })?;
+        Ok(Self {
+            inner: Arc::new(SqliteDatabaseInner {
+                database_path,
+                runtime,
+                connection: Arc::new(tokio::sync::Mutex::new(connection)),
+            }),
+        })
     }
 
     fn connection(&self) -> &tokio::sync::Mutex<AsyncSqliteConnection> {
