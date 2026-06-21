@@ -13,8 +13,17 @@ use crate::layout::{lane_key, layout_graph};
 #[template(path = "graph_shell.html")]
 struct GraphShellTemplate;
 
+#[cfg(test)]
 pub fn render_index_page(snapshot: &GraphSnapshot) -> String {
     render_snapshot_document(snapshot, true)
+}
+
+pub fn render_loading_index_page(mode: GraphMode, version: u64) -> String {
+    render_document(render_loading_root(mode, version), true)
+}
+
+pub fn render_loading_fragment(mode: GraphMode, version: u64) -> String {
+    render_loading_root(mode, version).to_html()
 }
 
 #[cfg(test)]
@@ -26,6 +35,10 @@ pub fn render_fragment(snapshot: &GraphSnapshot) -> String {
     render_root(snapshot).to_html()
 }
 
+pub(crate) fn render_materialized_fragment(shell: &MaterializedGraphShell) -> String {
+    render_materialized_root(shell).to_html()
+}
+
 pub fn render_node_detail_fragment(snapshot: &GraphSnapshot, target: Option<&str>) -> String {
     match target {
         Some(target) => focused_node(snapshot, target)
@@ -34,6 +47,10 @@ pub fn render_node_detail_fragment(snapshot: &GraphSnapshot, target: Option<&str
             .to_html(),
         None => render_default_node_details().to_html(),
     }
+}
+
+pub fn render_graph_node_detail_fragment(node: &GraphNode) -> String {
+    render_node_details(FocusedNode::Graph(node)).to_html()
 }
 
 pub fn render_provider_context_fragment(
@@ -54,6 +71,14 @@ pub fn render_provider_context_fragment(
         },
         None => view! { <ProviderContextDefault/> }.to_html(),
     }
+}
+
+pub(crate) fn render_provider_context_items_fragment(items: Vec<ProviderContextItem>) -> String {
+    view! { <ProviderContextList items=items/> }.to_html()
+}
+
+pub(crate) fn render_provider_context_missing_fragment(target: &str) -> String {
+    view! { <ProviderContextMissing target=target.to_owned()/> }.to_html()
 }
 
 enum FocusedNode<'a> {
@@ -111,15 +136,45 @@ struct ProviderContextSelection<'a> {
 }
 
 #[derive(Clone)]
-struct ProviderContextItem {
-    context_target: String,
-    node: GraphProviderContextNode,
-    selected: bool,
-    point: Option<Point>,
+pub(crate) struct ProviderContextItem {
+    pub context_target: String,
+    pub node: GraphProviderContextNode,
+    pub selected: bool,
+    pub point: Option<Point>,
 }
 
+#[derive(Clone)]
+pub(crate) struct MaterializedGraphShell {
+    pub version: u64,
+    pub mode: GraphMode,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub branches: Vec<MaterializedGraphShellBranch>,
+    pub time_ticks: Vec<MaterializedGraphShellTick>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MaterializedGraphShellBranch {
+    pub name: String,
+    pub key: String,
+    pub lane_y: Option<i32>,
+    pub head_short_id: String,
+    pub state: SessionState,
+}
+
+#[derive(Clone)]
+pub(crate) struct MaterializedGraphShellTick {
+    pub time_ns: i128,
+    pub label: String,
+    pub graph_x: f64,
+}
+
+#[cfg(test)]
 fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> String {
-    let root = render_root(snapshot);
+    render_document(render_root(snapshot), include_client)
+}
+
+fn render_document(root: AnyView, include_client: bool) -> String {
     let client_script = include_client
         .then(|| view! { <script type="module" src="/pkg/coco_console.js"></script> }.into_any())
         .into_iter()
@@ -142,6 +197,72 @@ fn render_snapshot_document(snapshot: &GraphSnapshot, include_client: bool) -> S
     format!("<!doctype html>{}", rendered.to_html())
 }
 
+fn render_loading_root(mode: GraphMode, version: u64) -> AnyView {
+    let stats = format!("Loading graph / {} / version {}", mode.label(), version);
+    let selection_style = render_selection_style();
+    let graph_shell = render_graph_shell();
+    let mode_value = mode.as_query_value();
+    let mode_switch = render_mode_switch(mode);
+
+    view! {
+        <main id="console-root" class="shell" data-version=version.to_string() data-graph-mode=mode_value>
+            <style id="selection-style">{selection_style}</style>
+            <header class="topbar">
+                <section class="brand">
+                    <h1>"CoCo Console"</h1>
+                    <p>"Live node relationship graph from the daemon store."</p>
+                </section>
+                <section class="topbar-actions">
+                    {mode_switch}
+                    <p class="stats">{stats}</p>
+                </section>
+            </header>
+            <section class="content">
+                <div class="graph-shell">
+                    <div class="graph-surface" inner_html=graph_shell></div>
+                    {render_empty_time_scale("Loading graph...")}
+                </div>
+                <ProviderContextPanel/>
+                {render_loading_side()}
+            </section>
+        </main>
+    }
+    .into_any()
+}
+
+fn render_materialized_root(shell: &MaterializedGraphShell) -> AnyView {
+    let stats = format!(
+        "{} nodes / {} edges / {} / version {}",
+        shell.node_count,
+        shell.edge_count,
+        shell.mode.label(),
+        shell.version
+    );
+    let selection_style = render_selection_style();
+    let content = render_materialized_content(shell);
+    let version = shell.version.to_string();
+    let mode = shell.mode.as_query_value();
+    let mode_switch = render_mode_switch(shell.mode);
+
+    view! {
+        <main id="console-root" class="shell" data-version=version data-graph-mode=mode>
+            <style id="selection-style">{selection_style}</style>
+            <header class="topbar">
+                <section class="brand">
+                    <h1>"CoCo Console"</h1>
+                    <p>"Live node relationship graph from the daemon store."</p>
+                </section>
+                <section class="topbar-actions">
+                    {mode_switch}
+                    <p class="stats">{stats}</p>
+                </section>
+            </header>
+            {content}
+        </main>
+    }
+    .into_any()
+}
+
 fn render_root(snapshot: &GraphSnapshot) -> AnyView {
     let stats = format!(
         "{} nodes / {} edges / {} / version {}",
@@ -150,7 +271,7 @@ fn render_root(snapshot: &GraphSnapshot) -> AnyView {
         snapshot.mode.label(),
         snapshot.version
     );
-    let selection_style = render_selection_style(snapshot);
+    let selection_style = render_selection_style();
     let content = render_content(snapshot);
     let version = snapshot.version.to_string();
     let mode = snapshot.mode.as_query_value();
@@ -214,6 +335,24 @@ fn render_content(snapshot: &GraphSnapshot) -> AnyView {
     .into_any()
 }
 
+fn render_materialized_content(shell: &MaterializedGraphShell) -> AnyView {
+    let graph_shell = render_graph_shell();
+    let time_scale = render_materialized_time_scale(shell);
+    let side = render_materialized_side(shell);
+
+    view! {
+        <section class="content">
+            <div class="graph-shell">
+                <div class="graph-surface" inner_html=graph_shell></div>
+                {time_scale}
+            </div>
+            <ProviderContextPanel/>
+            {side}
+        </section>
+    }
+    .into_any()
+}
+
 fn render_graph_shell() -> String {
     GraphShellTemplate
         .render()
@@ -222,21 +361,35 @@ fn render_graph_shell() -> String {
 
 fn render_time_scale(snapshot: &GraphSnapshot) -> AnyView {
     let ticks = time_scale_ticks(snapshot);
+    render_time_scale_ticks(ticks)
+}
+
+fn render_materialized_time_scale(shell: &MaterializedGraphShell) -> AnyView {
+    let mut ticks = shell
+        .time_ticks
+        .iter()
+        .map(|tick| TimeScaleTick {
+            time_ns: tick.time_ns,
+            label: tick.label.clone(),
+            graph_x: tick.graph_x,
+            position: 0.0,
+        })
+        .collect::<Vec<_>>();
+    ticks.sort_by(|left, right| {
+        left.time_ns
+            .cmp(&right.time_ns)
+            .then_with(|| left.graph_x.total_cmp(&right.graph_x))
+    });
+    let tick_count = ticks.len();
+    for (index, tick) in ticks.iter_mut().enumerate() {
+        tick.position = time_scale_position_for_index(index, tick_count);
+    }
+    render_time_scale_ticks(ticks)
+}
+
+fn render_time_scale_ticks(ticks: Vec<TimeScaleTick>) -> AnyView {
     let Some(first) = ticks.first() else {
-        return view! {
-            <nav class="time-scale time-scale-empty" aria-label="Graph time navigator">
-                <div class="time-scale-track">
-                    <div class="time-scale-cursor" style="left: 50%;">
-                        <span class="time-scale-label">"No time data"</span>
-                    </div>
-                </div>
-                <div class="time-scale-extents">
-                    <span>"-"</span>
-                    <span>"-"</span>
-                </div>
-            </nav>
-        }
-        .into_any();
+        return render_empty_time_scale("No time data");
     };
     let cursor_label = first.label.clone();
     let tick_views = ticks
@@ -334,7 +487,24 @@ fn time_scale_position_for_index(index: usize, tick_count: usize) -> f64 {
     }
 }
 
-fn render_selection_style(_snapshot: &GraphSnapshot) -> String {
+fn render_empty_time_scale(label: &'static str) -> AnyView {
+    view! {
+        <nav class="time-scale time-scale-empty" aria-label="Graph time navigator">
+            <div class="time-scale-track">
+                <div class="time-scale-cursor" style="left: 50%;">
+                    <span class="time-scale-label">{label}</span>
+                </div>
+            </div>
+            <div class="time-scale-extents">
+                <span>"-"</span>
+                <span>"-"</span>
+            </div>
+        </nav>
+    }
+    .into_any()
+}
+
+fn render_selection_style() -> String {
     String::new()
 }
 
@@ -350,6 +520,31 @@ fn ProviderContextPanel() -> impl IntoView {
 fn render_side(snapshot: &GraphSnapshot) -> AnyView {
     let default_details = render_default_node_details();
     let branches = render_branches(snapshot);
+
+    view! {
+        <aside class="side">
+            <div class="node-detail-slot">{default_details}</div>
+            {branches}
+        </aside>
+    }
+    .into_any()
+}
+
+fn render_loading_side() -> AnyView {
+    let default_details = render_default_node_details();
+
+    view! {
+        <aside class="side">
+            <div class="node-detail-slot">{default_details}</div>
+            <section class="branch-section"><h2>"Branches"</h2><ul class="branch-list"></ul></section>
+        </aside>
+    }
+    .into_any()
+}
+
+fn render_materialized_side(shell: &MaterializedGraphShell) -> AnyView {
+    let default_details = render_default_node_details();
+    let branches = render_materialized_branches(shell);
 
     view! {
         <aside class="side">
@@ -634,6 +829,29 @@ fn render_branches(snapshot: &GraphSnapshot) -> AnyView {
                 .map(i32::to_string)
                 .unwrap_or_default();
             let head = format!("head {}", shorten_id(&branch.head_id));
+            let state = format_session_state(&branch.state);
+            view! {
+                <li class="branch" data-lane-key=key data-lane-y=lane_y>
+                    <strong>{name}</strong>
+                    <span>{head}</span>
+                    <span>{state}</span>
+                </li>
+            }
+        })
+        .collect::<Vec<_>>();
+
+    view! { <section class="branch-section"><h2>"Branches"</h2><ul class="branch-list">{items}</ul></section> }.into_any()
+}
+
+fn render_materialized_branches(shell: &MaterializedGraphShell) -> AnyView {
+    let items = shell
+        .branches
+        .iter()
+        .map(|branch| {
+            let name = branch.name.clone();
+            let key = branch.key.clone();
+            let lane_y = branch.lane_y.map(|y| y.to_string()).unwrap_or_default();
+            let head = format!("head {}", branch.head_short_id);
             let state = format_session_state(&branch.state);
             view! {
                 <li class="branch" data-lane-key=key data-lane-y=lane_y>

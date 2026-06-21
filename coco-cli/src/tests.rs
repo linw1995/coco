@@ -6191,7 +6191,7 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
             channel_configs: &ChannelConfigs::default(),
             console_config: None,
             console_publisher: None,
-            console_graph_store_path: None,
+            console_graph_store_path: store_path.clone(),
         },
     ) {
         Ok(server) => server,

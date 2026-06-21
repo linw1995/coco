@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use snafu::prelude::*;
 
@@ -25,6 +26,24 @@ pub enum Error {
         mode: &'static str,
         source_version: u64,
         message: String,
+    },
+
+    #[snafu(display("Console graph snapshot store {} query failed: {source}", path.display()))]
+    QueryGraphSnapshotStore {
+        path: PathBuf,
+        source: diesel::result::Error,
+    },
+
+    #[snafu(display("Failed to connect console graph snapshot store {}: {source}", path.display()))]
+    ConnectGraphSnapshotStore {
+        path: PathBuf,
+        source: diesel::ConnectionError,
+    },
+
+    #[snafu(display("Failed to parse console graph snapshot store value {column}: {source}"))]
+    ParseGraphSnapshotStoreValue {
+        column: &'static str,
+        source: serde_json::Error,
     },
 
     #[snafu(display("{source}"))]

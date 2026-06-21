@@ -18,7 +18,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::Result;
-use crate::api::{GraphCanvas, GraphViewportDiffResponse, GraphViewportResponse};
+use crate::api::{
+    GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportItems,
+    GraphViewportResponse,
+};
 use crate::config::ConsoleConfig;
 use crate::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
@@ -26,11 +29,12 @@ use crate::error::{
 use crate::graph::{GraphMode, GraphSnapshot};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::cache::ConsoleGraphCache;
-use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
 use crate::publisher::ConsolePublisher;
 use crate::render::{
-    render_fragment, render_index_page, render_node_detail_fragment,
-    render_provider_context_fragment,
+    render_fragment, render_graph_node_detail_fragment, render_loading_fragment,
+    render_loading_index_page, render_materialized_fragment, render_node_detail_fragment,
+    render_provider_context_fragment, render_provider_context_items_fragment,
+    render_provider_context_missing_fragment,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -73,7 +77,8 @@ impl ConsoleServerHandle {
     }
 }
 
-pub fn start_console_server<S>(
+#[cfg(test)]
+fn start_console_server<S>(
     config: ConsoleConfig,
     store: S,
     publisher: ConsolePublisher,
@@ -81,14 +86,26 @@ pub fn start_console_server<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    start_console_server_with_graph_store_path(config, store, publisher, None)
+    start_console_server_with_cache(config, ConsoleGraphCache::new(store, publisher))
 }
 
 pub fn start_console_server_with_graph_store_path<S>(
     config: ConsoleConfig,
     store: S,
     publisher: ConsolePublisher,
-    graph_store_path: Option<PathBuf>,
+    graph_store_path: PathBuf,
+) -> Result<ConsoleServerHandle>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let cache =
+        ConsoleGraphCache::new_with_persistent_store_path(store, publisher, graph_store_path)?;
+    start_console_server_with_cache(config, cache)
+}
+
+fn start_console_server_with_cache<S>(
+    config: ConsoleConfig,
+    cache: ConsoleGraphCache<S>,
 ) -> Result<ConsoleServerHandle>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -103,10 +120,6 @@ where
     let addr = listener
         .local_addr()
         .context(ConfigureConsoleSocketSnafu { addr: config.addr })?;
-    let cache = match graph_store_path {
-        Some(path) => ConsoleGraphCache::new_with_persistent_store_path(store, publisher, path),
-        None => ConsoleGraphCache::new(store, publisher),
-    };
     let state = AppState { cache };
     let task = tokio::spawn(async move {
         serve_console(listener, state)
@@ -220,11 +233,10 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
-    let snapshot = match state.cache.snapshot_current(mode).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return plain_error(error.to_string()),
-    };
-    html_response(render_index_page(&snapshot))
+    html_response(render_loading_index_page(
+        mode,
+        state.cache.current_viewport_version(mode),
+    ))
 }
 
 async fn style_css() -> Response {
@@ -240,15 +252,24 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let snapshot = match state
-        .cache
-        .snapshot_current(graph_mode_from_query(&query))
-        .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => return plain_error(error.to_string()),
-    };
-    json_response(&snapshot, "graph")
+    let mode = graph_mode_from_query(&query);
+    if state.cache.has_materialized_viewports() {
+        let _ = state
+            .cache
+            .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
+        return json_response(
+            &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+            "graph",
+        );
+    }
+
+    match state.cache.snapshot_current_ready_or_schedule(mode) {
+        Some(snapshot) => json_response(&snapshot, "graph"),
+        None => json_response(
+            &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+            "graph",
+        ),
+    }
 }
 
 async fn graph_viewport<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
@@ -257,22 +278,39 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
-    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return plain_error(error.to_string()),
-    };
-    let response = match layout_graph_viewport_with_cache(
-        &state.cache,
-        mode,
-        snapshot,
-        viewport_request_from_query(&query),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => return plain_error(error.to_string()),
+    let request = viewport_request_from_query(&query);
+    let response = match query.version() {
+        Some(version) => match state.cache.viewport_after(mode, version, request).await {
+            Ok(response) => response,
+            Err(error) => return plain_error(error.to_string()),
+        },
+        None => match state
+            .cache
+            .viewport_current_ready_or_schedule(mode, request)
+        {
+            Some(response) => response,
+            None => {
+                return json_response(
+                    &empty_graph_viewport_response(
+                        state.cache.current_viewport_version(mode),
+                        request,
+                    ),
+                    "graph viewport",
+                );
+            }
+        },
     };
     json_response(&response, "graph viewport")
+}
+
+fn empty_graph_viewport_diff_pending_response(
+    version: u64,
+    request: GraphViewportDiffRequest,
+) -> Response {
+    json_response(
+        &empty_graph_viewport_diff_response(version, request),
+        "graph viewport diff",
+    )
 }
 
 async fn graph_viewport_diff_get<S>(
@@ -331,15 +369,18 @@ where
 {
     let request = viewport_diff_request_from_query(&query);
     let mode = graph_mode_from_query(&query);
-    let snapshot = match state.cache.snapshot_current(mode).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return plain_error(error.to_string()),
+    let response = match state
+        .cache
+        .viewport_diff_current_ready_or_schedule(mode, request.clone())
+    {
+        Some(response) => response,
+        None => {
+            return empty_graph_viewport_diff_pending_response(
+                state.cache.current_viewport_version(mode),
+                request,
+            );
+        }
     };
-    let response =
-        match layout_graph_viewport_diff_with_cache(&state.cache, mode, snapshot, request).await {
-            Ok(response) => response,
-            Err(error) => return plain_error(error.to_string()),
-        };
     json_response(&response, "graph viewport diff")
 }
 
@@ -376,17 +417,10 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     loop {
-        let snapshot = match state.cache.snapshot_after(mode, observed_version).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return plain_error(error.to_string()),
-        };
-        let response = match layout_graph_viewport_diff_with_cache(
-            &state.cache,
-            mode,
-            snapshot,
-            request.clone(),
-        )
-        .await
+        let response = match state
+            .cache
+            .viewport_diff_after(mode, observed_version, request.clone())
+            .await
         {
             Ok(response) => response,
             Err(error) => return plain_error(error.to_string()),
@@ -437,45 +471,76 @@ fn viewport_diff_has_fingerprint_changes(
     })
 }
 
-async fn layout_graph_viewport_with_cache<S>(
-    cache: &ConsoleGraphCache<S>,
-    _mode: GraphMode,
-    snapshot: Arc<GraphSnapshot>,
-    request: GraphViewportRequest,
-) -> Result<GraphViewportResponse>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    cache
-        .run_blocking_graph_compute(move || layout_graph_viewport(&snapshot, request))
-        .await
-}
-
-async fn layout_graph_viewport_diff_with_cache<S>(
-    cache: &ConsoleGraphCache<S>,
-    _mode: GraphMode,
-    snapshot: Arc<GraphSnapshot>,
-    request: GraphViewportDiffRequest,
-) -> Result<GraphViewportDiffResponse>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    cache
-        .run_blocking_graph_compute(move || layout_graph_viewport_diff(&snapshot, request))
-        .await
-}
-
 async fn fragment<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let snapshot =
-        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return plain_error(error.to_string()),
+    let mode = graph_mode_from_query(&query);
+    if state.cache.has_materialized_viewports() {
+        match query.version() {
+            Some(version) => {
+                if let Err(error) = state
+                    .cache
+                    .viewport_after(mode, version, GraphViewportRequest::default())
+                    .await
+                {
+                    return plain_error(error.to_string());
+                }
+            }
+            None => {
+                let _ = state
+                    .cache
+                    .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
+            }
+        }
+        return match state
+            .cache
+            .materialized_fragment_current_ready_or_schedule(mode)
+        {
+            Ok(Some(shell)) => html_response(render_materialized_fragment(&shell)),
+            Ok(None) => html_response(render_loading_fragment(
+                mode,
+                state.cache.current_viewport_version(mode),
+            )),
+            Err(error) => plain_error(error.to_string()),
         };
-    html_response(render_fragment(&snapshot))
+    }
+    match query.version() {
+        Some(version) => {
+            if let Some(snapshot) = state.cache.snapshot_current_ready(mode)
+                && snapshot.version > version
+            {
+                return html_response(render_fragment(&snapshot));
+            }
+            let materialized = match state
+                .cache
+                .viewport_after(mode, version, GraphViewportRequest::default())
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => return plain_error(error.to_string()),
+            };
+            if let Some(snapshot) = state.cache.snapshot_current_ready(mode)
+                && snapshot.version >= materialized.version
+            {
+                return html_response(render_fragment(&snapshot));
+            }
+            html_response(render_loading_fragment(mode, materialized.version))
+        }
+        None => {
+            if let Some(snapshot) = state.cache.snapshot_current_ready(mode) {
+                return html_response(render_fragment(&snapshot));
+            }
+            let _ = state
+                .cache
+                .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
+            html_response(render_loading_fragment(
+                mode,
+                state.cache.current_viewport_version(mode),
+            ))
+        }
+    }
 }
 
 async fn node_detail<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
@@ -483,11 +548,36 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let snapshot =
-        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return plain_error(error.to_string()),
+    let mode = graph_mode_from_query(&query);
+    if state.cache.has_materialized_viewports() {
+        let Some(target) = query.get("target") else {
+            return html_response(render_node_detail_fragment(
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+                None,
+            ));
         };
+        return match state
+            .cache
+            .node_detail_current_ready_or_schedule(mode, target)
+        {
+            Ok(Some(node)) => html_response(render_graph_node_detail_fragment(&node)),
+            Ok(None) => html_response(render_node_detail_fragment(
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+                Some(target),
+            )),
+            Err(error) => plain_error(error.to_string()),
+        };
+    }
+    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return html_response(render_node_detail_fragment(
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+                query.get("target"),
+            ));
+        }
+        Err(error) => return plain_error(error.to_string()),
+    };
     html_response(render_node_detail_fragment(&snapshot, query.get("target")))
 }
 
@@ -499,11 +589,39 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let snapshot =
-        match graph_snapshot_for_query(&state.cache, graph_mode_from_query(&query), &query).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return plain_error(error.to_string()),
+    let mode = graph_mode_from_query(&query);
+    if query.get("target").is_none() {
+        return html_response(render_provider_context_fragment(
+            &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+            None,
+            query.get("context"),
+        ));
+    }
+    if state.cache.has_materialized_viewports() {
+        let target = query
+            .get("target")
+            .expect("target was checked before materialized provider context lookup");
+        return match state.cache.provider_context_current_ready_or_schedule(
+            mode,
+            target,
+            query.get("context"),
+        ) {
+            Ok(Some(items)) => html_response(render_provider_context_items_fragment(items)),
+            Ok(None) => html_response(render_provider_context_missing_fragment(target)),
+            Err(error) => plain_error(error.to_string()),
         };
+    }
+    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return html_response(render_provider_context_fragment(
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+                query.get("target"),
+                query.get("context"),
+            ));
+        }
+        Err(error) => return plain_error(error.to_string()),
+    };
     html_response(render_provider_context_fragment(
         &snapshot,
         query.get("target"),
@@ -581,17 +699,86 @@ where
     Event::default().event("graph-progress").data(data)
 }
 
+fn loading_snapshot(mode: GraphMode, version: u64) -> GraphSnapshot {
+    GraphSnapshot {
+        version,
+        mode,
+        root_id: String::new(),
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        branches: Vec::new(),
+        provider_contexts: Vec::new(),
+    }
+}
+
+fn empty_graph_viewport_response(
+    version: u64,
+    request: GraphViewportRequest,
+) -> GraphViewportResponse {
+    let request = request.normalized();
+    GraphViewportResponse {
+        version,
+        canvas: empty_graph_canvas(request),
+        viewport: GraphViewport {
+            x: request.x,
+            y: request.y,
+            width: request.width,
+            height: request.height,
+            overscan: request.overscan,
+        },
+        lanes: Vec::new(),
+        nodes: Vec::new(),
+        edges: Vec::new(),
+    }
+}
+
+fn empty_graph_viewport_diff_response(
+    version: u64,
+    request: GraphViewportDiffRequest,
+) -> GraphViewportDiffResponse {
+    let previous = request.previous.normalized();
+    let current = request.current.normalized();
+    GraphViewportDiffResponse {
+        version,
+        canvas: empty_graph_canvas(current),
+        previous_viewport: GraphViewport {
+            x: previous.x,
+            y: previous.y,
+            width: previous.width,
+            height: previous.height,
+            overscan: previous.overscan,
+        },
+        viewport: GraphViewport {
+            x: current.x,
+            y: current.y,
+            width: current.width,
+            height: current.height,
+            overscan: current.overscan,
+        },
+        added: GraphViewportItems::default(),
+        updated: GraphViewportItems::default(),
+        removed: Vec::new(),
+    }
+}
+
+fn empty_graph_canvas(request: GraphViewportRequest) -> GraphCanvas {
+    GraphCanvas {
+        width: request.width.max(1),
+        height: request.height.max(1),
+    }
+}
+
 async fn graph_snapshot_for_query<S>(
     cache: &ConsoleGraphCache<S>,
     mode: GraphMode,
     query: &QueryParams,
-) -> Result<Arc<GraphSnapshot>>
+) -> Result<Option<Arc<GraphSnapshot>>>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
     match query.version() {
-        Some(version) => cache.snapshot_after(mode, version).await,
-        None => cache.snapshot_current(mode).await,
+        Some(version) => cache.snapshot_after(mode, version).await.map(Some),
+        None => Ok(cache.snapshot_current_ready_or_schedule(mode)),
     }
 }
 
@@ -823,20 +1010,29 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, graph_viewport_diff_response, graph_viewport_items_diff_response_from_query,
-        parse_query, start_console_server, viewport_diff_has_changes,
+        AppState, fragment, graph_json, graph_viewport_diff_response,
+        graph_viewport_items_diff_response_from_query, index_page, node_detail, parse_query,
+        provider_context, start_console_server, viewport_diff_has_changes,
         viewport_diff_request_from_query,
     };
     use crate::api::{
         GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
         GraphViewportItems, GraphViewportRemovedItem, Point,
     };
-    use crate::graph::{GraphMode, build_graph_snapshot};
+    use crate::graph::{GraphMode, build_graph_snapshot, node_target_id};
     use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
+    use crate::host::cache::ConsoleGraphCache;
     use crate::layout::layout_graph_viewport;
-    use crate::{ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleStore};
-    use coco_mem::{BranchStore, Kind, MemoryStore, NewNode, NodeStore, Role, Store};
+    use crate::{ConsoleConfig, ConsolePublisher, ConsoleStore};
+    use axum::body::to_bytes;
+    use axum::extract::{RawQuery, State};
+    use coco_mem::{
+        Anchor, BranchStore, Kind, MemoryStore, NewNode, NodeStore, PersistentStore, PromptAnchor,
+        Role, SessionAnchor, SessionRole, Store,
+    };
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
 
@@ -896,6 +1092,34 @@ mod tests {
     {
         AppState {
             cache: ConsoleGraphCache::new(store, publisher),
+        }
+    }
+
+    fn temp_store_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "coco-console-server-test-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn test_session_anchor() -> SessionAnchor {
+        SessionAnchor {
+            role: SessionRole::Orchestrator,
+            provider_profile: None,
+            provider: Some("openai".to_owned()),
+            model: "gpt-4.1-mini".to_owned(),
+            tools: Vec::new(),
+            system_prompt: "You are helpful.".to_owned(),
+            prompt: "Start".to_owned(),
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+            enable_coco_shim: false,
+            active_skill: None,
         }
     }
 
@@ -1166,8 +1390,11 @@ mod tests {
         .await;
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"kind\":\"node\""), "{response}");
-        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(response.contains("\"removed\":[]"), "{response}");
+        assert!(
+            !response.contains("\"key\":\"node:stale\""),
+            "pending snapshots must not remove previously rendered items: {response}"
+        );
     }
 
     #[tokio::test]
@@ -1181,8 +1408,11 @@ mod tests {
         let response = response_from(request.as_bytes()).await;
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"kind\":\"node\""), "{response}");
-        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(response.contains("\"removed\":[]"), "{response}");
+        assert!(
+            !response.contains("\"key\":\"node:stale\""),
+            "pending snapshots must not remove previously rendered items: {response}"
+        );
     }
 
     #[test]
@@ -1344,11 +1574,13 @@ mod tests {
         let response = response_from(request.as_bytes()).await;
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"kind\":\"node\""), "{response}");
-        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
-        assert!(response.contains("\"kind\":\"edge\""), "{response}");
         assert!(
-            response.contains("\"key\":\"edge:primary_parent:base:stale\""),
+            response.contains("\"removed\":[]"),
+            "pending snapshots must not remove previously rendered items: {response}"
+        );
+        assert!(!response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(
+            !response.contains("\"key\":\"edge:primary_parent:base:stale\""),
             "{response}"
         );
     }
@@ -1412,6 +1644,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_json_schedules_materialization_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        writer.fork("main", &writer.root_id()).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+
+        let response = graph_json(State(state.clone()), RawQuery(None)).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(json.contains("\"root_id\":\"\""));
+        assert!(json.contains("\"nodes\":[]"));
+        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graph_json_ignores_cached_full_snapshot_in_materialized_mode() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("cached full snapshot node".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &root, &text).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        state.cache.current_snapshot(GraphMode::All).await;
+
+        let response =
+            graph_json(State(state.clone()), RawQuery(Some("mode=all".to_owned()))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(json.contains("\"nodes\":[]"), "{json}");
+        assert!(!json.contains("cached full snapshot node"), "{json}");
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_page_uses_mode_specific_loading_version() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("all mode only".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &root, &text).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        let all = state
+            .cache
+            .viewport_after(GraphMode::All, 0, GraphViewportRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            state.cache.current_viewport_version(GraphMode::All),
+            all.version
+        );
+        assert_eq!(state.cache.current_viewport_version(GraphMode::Anchors), 0);
+
+        let response = index_page(
+            State(state.clone()),
+            RawQuery(Some("mode=anchors".to_owned())),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("data-version=\"0\""), "{html}");
+
+        drop(state);
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn handle_connection_serves_graph_viewport_json() {
         let response = response_from(
             get_request("/api/graph/viewport?x=10&y=20&width=640&height=360&overscan=40")
@@ -1462,11 +1812,13 @@ mod tests {
         .await;
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"kind\":\"node\""), "{response}");
-        assert!(response.contains("\"key\":\"node:stale\""), "{response}");
-        assert!(response.contains("\"kind\":\"edge\""), "{response}");
         assert!(
-            response.contains("\"key\":\"edge:primary_parent:base:stale\""),
+            response.contains("\"removed\":[]"),
+            "pending snapshots must not remove previously rendered items: {response}"
+        );
+        assert!(!response.contains("\"key\":\"node:stale\""), "{response}");
+        assert!(
+            !response.contains("\"key\":\"edge:primary_parent:base:stale\""),
             "{response}"
         );
     }
@@ -1522,6 +1874,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fragment_schedules_materialization_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        writer.fork("main", &writer.root_id()).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+
+        let response = fragment(State(state.clone()), RawQuery(None)).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("Loading graph"));
+        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fragment_uses_materialized_shell_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let prompt = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "visible shell prompt".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &prompt).unwrap();
+        publisher.mark_changed();
+        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        seed_cache.current_snapshot(GraphMode::Anchors).await;
+        drop(seed_cache);
+
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+
+        let response = fragment(
+            State(state.clone()),
+            RawQuery(Some("mode=anchors".to_owned())),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("2 nodes / 1 edges / Anchors"), "{html}");
+        assert!(html.contains("<strong>main</strong>"), "{html}");
+        assert!(html.contains("time-scale-tick"), "{html}");
+        assert!(!html.contains("Loading graph / Anchors"), "{html}");
+        assert!(
+            state
+                .cache
+                .snapshot_current_ready(GraphMode::Anchors)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn handle_connection_serves_node_detail_fragment() {
         let response = response_from(get_request("/api/node-detail").as_bytes()).await;
 
@@ -1537,6 +1988,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_detail_uses_materialized_facts_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("single node detail".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &root, &text).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        let query = format!("target={}&mode=all", node_target_id(&text));
+
+        let response = node_detail(State(state.clone()), RawQuery(Some(query))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("single node detail"), "{html}");
+        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_detail_reads_hidden_context_node_incrementally() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let hidden_text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("hidden targeted materialized detail".to_owned()),
+            })
+            .unwrap();
+        let prompt = writer
+            .append(NewNode {
+                parent: hidden_text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "visible prompt after hidden detail".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &prompt).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        state.cache.current_snapshot(GraphMode::Anchors).await;
+        let query = format!("mode=anchors&target={}", node_target_id(&hidden_text));
+
+        let response = node_detail(State(state.clone()), RawQuery(Some(query))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            html.contains("hidden targeted materialized detail"),
+            "{html}"
+        );
+        assert!(html.contains("<dd>None</dd>"), "{html}");
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_detail_ignores_hidden_node_outside_current_materialized_context() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let hidden_text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("stale hidden materialized detail".to_owned()),
+            })
+            .unwrap();
+        let prompt = writer
+            .append(NewNode {
+                parent: hidden_text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "visible prompt before rewind".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &prompt).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher.clone(),
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        let initial = state.cache.current_snapshot(GraphMode::Anchors).await;
+        writer.set_branch_head("main", &prompt, &session).unwrap();
+        publisher.mark_changed();
+        state
+            .cache
+            .viewport_after(
+                GraphMode::Anchors,
+                initial.version,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        let detail = state
+            .cache
+            .node_detail_current_ready_or_schedule(
+                GraphMode::Anchors,
+                &node_target_id(&hidden_text),
+            )
+            .unwrap();
+
+        assert!(detail.is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn handle_connection_serves_provider_context_fragment() {
         let response = response_from(get_request("/api/provider-context").as_bytes()).await;
 
@@ -1549,6 +2176,135 @@ mod tests {
             response.contains("Select a node to inspect its provider context."),
             "{response}"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_context_default_avoids_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        writer.fork("main", &writer.root_id()).unwrap();
+        publisher.mark_changed();
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+
+        let response = provider_context(State(state.clone()), RawQuery(None)).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            html.contains("Select a node to inspect its provider context."),
+            "{html}"
+        );
+        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_context_uses_materialized_facts_without_full_snapshot() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let hidden_text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("hidden context item".to_owned()),
+            })
+            .unwrap();
+        let prompt = writer
+            .append(NewNode {
+                parent: hidden_text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "visible context prompt".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &prompt).unwrap();
+        publisher.mark_changed();
+        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        seed_cache.current_snapshot(GraphMode::Anchors).await;
+        drop(seed_cache);
+
+        let state = AppState {
+            cache: ConsoleGraphCache::new_with_persistent_store_path(
+                MemoryStore::new(),
+                publisher,
+                path.clone(),
+            )
+            .unwrap(),
+        };
+        let visible_query = format!("mode=anchors&target={}", node_target_id(&prompt));
+
+        let response = provider_context(State(state.clone()), RawQuery(Some(visible_query))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let visible_html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            visible_html.contains("visible context prompt"),
+            "{visible_html}"
+        );
+        assert!(
+            visible_html.contains("hidden context item"),
+            "{visible_html}"
+        );
+        assert!(visible_html.contains("data-node-x="), "{visible_html}");
+        assert!(
+            state
+                .cache
+                .snapshot_current_ready(GraphMode::Anchors)
+                .is_none()
+        );
+
+        let hidden_query = format!("mode=anchors&target={}", node_target_id(&hidden_text));
+        let response = provider_context(State(state.clone()), RawQuery(Some(hidden_query))).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let hidden_html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(hidden_html.contains("hidden context item"), "{hidden_html}");
+        assert!(
+            hidden_html.contains("class=\"provider-context-node selected\""),
+            "{hidden_html}"
+        );
+        assert!(
+            state
+                .cache
+                .snapshot_current_ready(GraphMode::Anchors)
+                .is_none()
+        );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]

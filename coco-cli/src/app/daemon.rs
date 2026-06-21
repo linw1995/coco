@@ -10,8 +10,8 @@ use coco_channel::{
 };
 use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{
-    ConsoleConfig, ConsoleGraphCache, ConsolePublisher, ConsoleServerHandle, GraphMode,
-    GraphSnapshot, start_console_server_with_graph_store_path,
+    ConsoleConfig, ConsolePublisher, ConsoleServerHandle, GraphMode, GraphSnapshot,
+    build_graph_snapshot_with_mode, start_console_server_with_graph_store_path,
 };
 use coco_core::{
     ConversationEngine, CoreService, EngineError, FixedBranchResolver, SYSTEM_EVENT_QUEUE,
@@ -84,7 +84,7 @@ pub struct DaemonServerOptions<'a> {
     pub channel_configs: &'a ChannelConfigs,
     pub console_config: Option<ConsoleConfig>,
     pub console_publisher: Option<ConsolePublisher>,
-    pub console_graph_store_path: Option<PathBuf>,
+    pub console_graph_store_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,7 +105,7 @@ pub async fn run_daemon_command<B, S>(
     provider_profiles: &ProviderProfiles,
     channel_configs: &ChannelConfigs,
     console_publisher: Option<ConsolePublisher>,
-    console_graph_store_path: Option<PathBuf>,
+    console_graph_store_path: PathBuf,
 ) -> Result<Option<String>>
 where
     B: CompletionBackend + 'static,
@@ -181,12 +181,8 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let mode = daemon_profile_graph_mode(command);
-    let cache = ConsoleGraphCache::new(shared_store.clone(), ConsolePublisher::new());
     let started_at = Instant::now();
-    let snapshot = cache
-        .snapshot_for_current_source(mode)
-        .await
-        .context(ConsoleSnafu)?;
+    let snapshot = build_graph_snapshot_with_mode(shared_store, 0, mode).context(ConsoleSnafu)?;
     let result = daemon_graph_profile_result(mode, &snapshot, started_at.elapsed());
 
     if command.json {
@@ -551,7 +547,7 @@ where
                 options
                     .console_publisher
                     .expect("console publisher should exist when console is enabled"),
-                options.console_graph_store_path.clone(),
+                options.console_graph_store_path,
             )
             .context(ConsoleSnafu)?,
         ),
@@ -2335,7 +2331,7 @@ mod tests {
             &provider_profiles(),
             &ChannelConfigs::default(),
             None,
-            None,
+            PathBuf::from(".coco-store"),
         )
         .await
         .unwrap()
@@ -2403,7 +2399,7 @@ mod tests {
             &provider_profiles(),
             &ChannelConfigs::default(),
             None,
-            None,
+            PathBuf::from(".coco-store"),
         )
         .await
         .unwrap_err();

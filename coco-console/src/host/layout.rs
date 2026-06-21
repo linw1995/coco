@@ -487,13 +487,92 @@ pub fn layout_graph_viewport(
     }
 }
 
+#[cfg(test)]
+pub fn materialize_graph_viewport(snapshot: &GraphSnapshot) -> GraphViewportResponse {
+    let layout = layout_graph(snapshot);
+    let nodes_by_id = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    let lanes = layout
+        .lanes
+        .iter()
+        .map(|lane| GraphViewportLane {
+            key: lane_key(&lane.label),
+            label: lane.label.clone(),
+            y: lane.y,
+        })
+        .collect();
+    let nodes = layout
+        .occurrences
+        .iter()
+        .filter_map(|occurrence| {
+            let node = nodes_by_id.get(occurrence.node_id.as_str())?;
+            Some(GraphViewportNode {
+                key: node_key(&node.id, occurrence.point),
+                id: node.id.clone(),
+                node_target: occurrence.node_target.clone(),
+                short_id: node.short_id.clone(),
+                kind: node.kind.clone(),
+                summary: node.summary.clone(),
+                labels: node.labels.clone(),
+                x: occurrence.point.x,
+                y: occurrence.point.y,
+            })
+        })
+        .collect();
+    let edges = layout
+        .primary_edges
+        .iter()
+        .chain(layout.fork_edges.iter())
+        .chain(layout.merge_edges.iter())
+        .map(|edge| GraphViewportEdge {
+            key: edge_key(edge),
+            kind: edge.kind.into(),
+            source_id: edge.source_node_id.clone(),
+            target_id: edge.target_node_id.clone(),
+            source: edge.source,
+            target: edge.target,
+            route_slot: edge.route_slot,
+            target_port_offset: edge.target_port_offset,
+        })
+        .collect();
+
+    GraphViewportResponse {
+        version: snapshot.version,
+        canvas: GraphCanvas {
+            width: layout.width,
+            height: layout.height,
+        },
+        viewport: GraphViewport {
+            x: 0,
+            y: 0,
+            width: layout.width,
+            height: layout.height,
+            overscan: 0,
+        },
+        lanes,
+        nodes,
+        edges,
+    }
+}
+
 pub fn layout_graph_viewport_diff(
     snapshot: &GraphSnapshot,
     request: GraphViewportDiffRequest,
 ) -> GraphViewportDiffResponse {
     let previous = layout_graph_viewport(snapshot, request.previous);
     let current = layout_graph_viewport(snapshot, request.current);
-    let (added, updated, removed) = if let Some(known) = &request.known {
+    diff_graph_viewport_responses(previous, current, request.known.as_ref())
+}
+
+pub fn diff_graph_viewport_responses(
+    previous: GraphViewportResponse,
+    current: GraphViewportResponse,
+    known: Option<&GraphViewportKnownItems>,
+) -> GraphViewportDiffResponse {
+    let (added, updated, removed) = if let Some(known) = known {
         diff_known_items(known, &current)
     } else {
         diff_viewport_responses(&previous, &current)

@@ -510,6 +510,7 @@ dependencies = [
  "askama",
  "axum",
  "coco-mem",
+ "diesel",
  "futures-util",
  "js-sys",
  "leptos",

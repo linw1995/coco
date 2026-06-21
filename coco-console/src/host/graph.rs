@@ -4,7 +4,7 @@ use coco_mem::{
     Anchor, AnchorPayload, BranchStore, Kind, ManyOrOne, MergeParent, Node, NodeStore, PauseReason,
     SessionAnchor, SessionState, SessionStore, ToolResult, ToolUse,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
 use crate::Result;
@@ -12,7 +12,7 @@ use crate::error::StoreSnafu;
 
 const SUMMARY_LIMIT: usize = 140;
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphMode {
     Anchors,
@@ -35,7 +35,7 @@ impl GraphMode {
     }
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct GraphSnapshot {
     pub version: u64,
     pub mode: GraphMode,
@@ -46,7 +46,7 @@ pub struct GraphSnapshot {
     pub provider_contexts: Vec<GraphProviderContext>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphBuildPhase {
     Branches,
@@ -66,14 +66,14 @@ impl GraphBuildPhase {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphBuildProgress {
     pub phase: GraphBuildPhase,
     pub processed: usize,
     pub total: usize,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct GraphNode {
     pub id: String,
     pub short_id: String,
@@ -87,13 +87,13 @@ pub struct GraphNode {
     pub provider_context_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphProviderContext {
     pub id: String,
     pub nodes: Vec<GraphProviderContextNode>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphProviderContextNode {
     pub id: String,
     pub short_id: String,
@@ -106,14 +106,20 @@ pub struct GraphProviderContextNode {
     pub visible: bool,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphProviderContextSelection {
+    pub context: GraphProviderContext,
+    pub selected_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphEdge {
     pub source: String,
     pub target: String,
     pub kind: GraphEdgeKind,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphEdgeKind {
     Primary,
@@ -121,7 +127,7 @@ pub enum GraphEdgeKind {
     Shadow,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct GraphBranch {
     pub name: String,
     pub head_id: String,
@@ -176,7 +182,6 @@ pub fn build_graph_snapshot(
     build_graph_snapshot_with_mode(store, version, GraphMode::All)
 }
 
-#[cfg(test)]
 pub fn build_graph_snapshot_with_mode(
     store: &(impl BranchStore + NodeStore + SessionStore),
     version: u64,
@@ -310,17 +315,29 @@ fn graph_merge_edge_kind(parent: &MergeParent) -> GraphEdgeKind {
 }
 
 fn graph_node_from_entry(entry: GraphNodeEntry) -> GraphNode {
+    graph_node_from_node(
+        entry.node,
+        render_graph_labels(&entry.labels),
+        entry.provider_context_ids,
+    )
+}
+
+pub(crate) fn graph_node_from_node(
+    node: Node,
+    labels: Vec<String>,
+    provider_context_ids: Vec<String>,
+) -> GraphNode {
     GraphNode {
-        id: entry.node.id.clone(),
-        short_id: shorten_id(&entry.node.id),
-        kind: graph_kind_name(&entry.node).to_owned(),
-        role: format!("{:?}", entry.node.role),
-        created_at: entry.node.created_at.to_string(),
-        created_at_ns: entry.node.created_at.as_nanosecond(),
-        content: render_node_content(&entry.node),
-        summary: summarize_node(&entry.node),
-        labels: render_graph_labels(&entry.labels),
-        provider_context_ids: entry.provider_context_ids,
+        id: node.id.clone(),
+        short_id: shorten_id(&node.id),
+        kind: graph_kind_name(&node).to_owned(),
+        role: format!("{:?}", node.role),
+        created_at: node.created_at.to_string(),
+        created_at_ns: node.created_at.as_nanosecond(),
+        content: render_node_content(&node),
+        summary: summarize_node(&node),
+        labels,
+        provider_context_ids,
     }
 }
 
@@ -666,6 +683,50 @@ fn sorted_session_states(store: &impl SessionStore) -> Result<Vec<(String, Sessi
     Ok(branches)
 }
 
+pub(crate) fn provider_context_for_node(
+    store: &(impl BranchStore + NodeStore + SessionStore),
+    target_node_id: &str,
+    context_id: Option<&str>,
+) -> Result<Option<GraphProviderContextSelection>> {
+    let mut contexts = HashMap::<String, GraphProviderContext>::new();
+    for (branch_name, _) in sorted_session_states(store)? {
+        let head_id = store.get_branch_head(&branch_name).context(StoreSnafu)?;
+        let ancestry = store.ancestry(&head_id).context(StoreSnafu)?;
+        for context_nodes in provider_contexts_from_head(ancestry) {
+            let Some(id) = provider_context_id(&branch_name, &context_nodes) else {
+                continue;
+            };
+            if context_id.is_some_and(|selected| selected != id) {
+                continue;
+            }
+            if !context_nodes.iter().any(|node| node.id == target_node_id) {
+                continue;
+            }
+            let nodes = context_nodes
+                .iter()
+                .map(|node| graph_provider_context_node(node, false))
+                .collect();
+            contexts
+                .entry(id.clone())
+                .or_insert(GraphProviderContext { id, nodes });
+        }
+    }
+
+    let mut contexts = contexts.into_values().collect::<Vec<_>>();
+    contexts.sort_by(provider_context_order);
+    Ok(contexts.into_iter().find_map(|context| {
+        let selected_id = context
+            .nodes
+            .iter()
+            .find(|node| node.id == target_node_id)
+            .map(|node| node.id.clone())?;
+        Some(GraphProviderContextSelection {
+            selected_id,
+            context,
+        })
+    }))
+}
+
 fn node_anchor(node: &Node) -> Option<&Anchor> {
     match &node.kind {
         Kind::Anchor(anchor) => Some(anchor),
@@ -743,19 +804,26 @@ fn collect_provider_context_node_ids(
 }
 
 fn provider_context_node_ids(ancestry: Vec<Node>) -> BTreeSet<String> {
-    ancestry
+    provider_context_ancestry_nodes(ancestry)
         .into_iter()
-        .take_while(|node| !node.is_root())
-        .scan(false, provider_context_node_id)
+        .map(|node| node.id)
         .collect()
 }
 
-fn provider_context_node_id(done: &mut bool, node: Node) -> Option<String> {
+pub(crate) fn provider_context_ancestry_nodes(ancestry: Vec<Node>) -> Vec<Node> {
+    ancestry
+        .into_iter()
+        .take_while(|node| !node.is_root())
+        .scan(false, provider_context_node)
+        .collect()
+}
+
+fn provider_context_node(done: &mut bool, node: Node) -> Option<Node> {
     if *done {
         return None;
     }
     *done = is_provider_context_start(&node);
-    Some(node.id)
+    Some(node)
 }
 
 fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
@@ -887,6 +955,73 @@ fn is_visible_graph_node(node: &Node, mode: GraphMode) -> bool {
     }
 }
 
+pub(crate) fn initial_visible_graph_lane_nodes(
+    _store: &impl NodeStore,
+    mode: GraphMode,
+    ancestry: Vec<Node>,
+) -> Result<Vec<Node>> {
+    let mut nodes = Vec::new();
+    let mut seen = BTreeSet::new();
+    let ancestry = match mode {
+        GraphMode::Anchors => provider_context_ancestry_nodes(ancestry),
+        GraphMode::All => ancestry,
+    };
+    for node in ancestry.into_iter().rev() {
+        push_initial_lane_node(mode, node.clone(), &mut seen, &mut nodes);
+    }
+    Ok(nodes)
+}
+
+pub(crate) fn visible_skill_invocation_subtree_nodes(
+    store: &impl NodeStore,
+    mode: GraphMode,
+    parent_id: &str,
+) -> Result<Vec<Node>> {
+    let mut nodes = Vec::new();
+    let mut seen = BTreeSet::new();
+    push_initial_skill_invocation_subtrees(store, mode, parent_id, &mut seen, &mut nodes)?;
+    Ok(nodes)
+}
+
+fn push_initial_skill_invocation_subtrees(
+    store: &impl NodeStore,
+    mode: GraphMode,
+    parent_id: &str,
+    seen: &mut BTreeSet<String>,
+    nodes: &mut Vec<Node>,
+) -> Result<()> {
+    for node_id in skill_invocation_children(store, parent_id)? {
+        push_initial_subtree_node(store, mode, &node_id, seen, nodes)?;
+    }
+    Ok(())
+}
+
+fn push_initial_subtree_node(
+    store: &impl NodeStore,
+    mode: GraphMode,
+    node_id: &str,
+    seen: &mut BTreeSet<String>,
+    nodes: &mut Vec<Node>,
+) -> Result<()> {
+    let node = store.get_node(node_id).context(StoreSnafu)?;
+    push_initial_lane_node(mode, node.clone(), seen, nodes);
+    for child_id in child_ids(store, &node.id)? {
+        push_initial_subtree_node(store, mode, &child_id, seen, nodes)?;
+    }
+    Ok(())
+}
+
+fn push_initial_lane_node(
+    mode: GraphMode,
+    node: Node,
+    seen: &mut BTreeSet<String>,
+    nodes: &mut Vec<Node>,
+) {
+    if !node.is_root() && is_visible_graph_node(&node, mode) && seen.insert(node.id.clone()) {
+        nodes.push(node);
+    }
+}
+
 fn collect_visible_skill_invocation_subtrees(
     store: &impl NodeStore,
     parent_id: &str,
@@ -987,7 +1122,7 @@ fn visible_merge_parent(parent: &MergeParent, node_id: String) -> MergeParent {
     }
 }
 
-fn graph_kind_name(node: &Node) -> &'static str {
+pub(crate) fn graph_kind_name(node: &Node) -> &'static str {
     match &node.kind {
         Kind::Anchor(anchor) => match &anchor.payload {
             AnchorPayload::Session(_) => "session",
@@ -1003,7 +1138,7 @@ fn graph_kind_name(node: &Node) -> &'static str {
     }
 }
 
-fn summarize_node(node: &Node) -> String {
+pub(crate) fn summarize_node(node: &Node) -> String {
     truncate_summary(&render_node_content(node))
 }
 

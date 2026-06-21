@@ -75,7 +75,7 @@ where
                 &provider_profiles,
                 &channel_configs,
                 Some(console_publisher),
-                Some(shared_store.store_path().to_path_buf()),
+                shared_store.store_path().to_path_buf(),
             )
             .await
         }
