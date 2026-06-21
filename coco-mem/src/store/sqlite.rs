@@ -66,6 +66,7 @@ struct SqliteDatabaseInner {
     runtime: &'static Runtime,
     pool: AsyncSqlitePool<AsyncSqliteConnection>,
     ensure_wal: Arc<AtomicBool>,
+    initialization: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -347,6 +348,7 @@ impl SqliteDatabase {
             runtime,
             pool,
             ensure_wal: ensure_wal_flag,
+            initialization: Mutex::new(()),
         });
         databases.insert(database_path, Arc::downgrade(&inner));
         let database = Self { inner };
@@ -367,6 +369,7 @@ impl SqliteDatabase {
                 runtime,
                 pool,
                 ensure_wal: ensure_wal_flag,
+                initialization: Mutex::new(()),
             }),
         };
         if ensure_wal {
@@ -434,6 +437,18 @@ impl SqliteDatabase {
             ensure_wal_journal_mode(&mut connection, &self.inner.database_path).await
         })
     }
+
+    fn with_initialization_lock<T, F>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let _guard = self
+            .inner
+            .initialization
+            .lock()
+            .expect("SQLite database initialization lock poisoned");
+        operation()
+    }
 }
 
 impl SqliteStore {
@@ -463,10 +478,12 @@ impl SqliteStore {
             sqlite_migration_database_path(path),
             StoreAccess::ReadWrite,
         )?;
-        store.run_migrations()?;
-        store.persist_state_snapshot(&state)?;
-        store.persist_fs_migration_complete_marker()?;
-        store.prepare_database_for_atomic_rename()?;
+        store.database.with_initialization_lock(|| {
+            store.run_migrations()?;
+            store.persist_state_snapshot(&state)?;
+            store.persist_fs_migration_complete_marker()?;
+            store.prepare_database_for_atomic_rename()
+        })?;
         let migration_database_path = store.database_path.clone();
         drop(store);
         fs::rename(&migration_database_path, sqlite_database_path(path)).context(
@@ -476,7 +493,9 @@ impl SqliteStore {
         )?;
 
         let migrated = Self::new(path, StoreAccess::ReadWrite)?;
-        migrated.load_state()?;
+        migrated
+            .database
+            .with_initialization_lock(|| migrated.load_state())?;
         Ok(migrated)
     }
 
@@ -495,8 +514,10 @@ impl SqliteStore {
         let path = path.as_ref();
         prepare_store_directory(path)?;
         let store = Self::new(path, StoreAccess::ReadWrite)?;
-        store.run_migrations()?;
-        store.load_or_initialize_state()?;
+        store.database.with_initialization_lock(|| {
+            store.run_migrations()?;
+            store.load_or_initialize_state()
+        })?;
         Ok(store)
     }
 
@@ -2877,6 +2898,7 @@ mod tests {
     use diesel::sql_query;
     use diesel::sql_types::{Integer, Nullable, Text};
     use diesel_async::RunQueryDsl;
+    use std::sync::{Arc, Barrier};
 
     #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
     struct NodeRelationRow {
@@ -2986,6 +3008,40 @@ VALUES (?, ?, ?, ?, ?, ?)
 
         assert!(store.database_path().is_file());
         assert_eq!(store.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn concurrent_open_serializes_sqlite_initialization() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let workers = 16;
+        let barrier = Arc::new(Barrier::new(workers));
+
+        let handles = (0..workers)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SqliteStore::open(&path).map(|store| store.root_id())
+                })
+            })
+            .collect::<Vec<_>>();
+        let root_ids = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(root_ids.iter().all(|root_id| root_id == &root_ids[0]));
+
+        let store = SqliteStore::open(&path).unwrap();
+        let node_count = store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            super::node_count(&mut connection, &store.database_path)
+                .await
+                .unwrap()
+        });
+        assert_eq!(node_count, 1);
     }
 
     #[test]
