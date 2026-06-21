@@ -636,39 +636,43 @@ LIMIT 1
 
         let this = self.clone();
         self.with_connection(move |connection| {
-            let has_materialization = this
-                .latest_materialization_row_in_connection(connection, mode)?
-                .is_some();
-            let materialization_is_empty = !has_materialization
-                || this
-                    .materialized_node_rows_in_connection(connection, mode)?
-                    .is_empty();
-            this.begin_write_transaction(connection)?;
             let result = if session_states.is_empty() {
+                this.begin_write_transaction(connection)?;
                 this.put_empty_materialization_in_transaction(connection, source_version, mode)
-            } else if materialization_is_empty {
-                this.try_seed_initial_branch_materialization_in_transaction(
-                    connection,
-                    &source,
-                    source_version,
-                    mode,
-                    &session_states,
-                )
             } else {
-                match mode {
-                    GraphMode::Anchors => this.try_update_anchor_materialization_in_transaction(
-                        connection,
-                        &source,
-                        source_version,
-                        &session_states,
-                    ),
-                    GraphMode::All => this.try_append_linear_branches_in_transaction(
+                let has_materialization = this
+                    .latest_materialization_row_in_connection(connection, mode)?
+                    .is_some();
+                let materialization_is_empty = !has_materialization
+                    || this
+                        .materialized_node_rows_in_connection(connection, mode)?
+                        .is_empty();
+                this.begin_write_transaction(connection)?;
+                if materialization_is_empty {
+                    this.try_seed_initial_branch_materialization_in_transaction(
                         connection,
                         &source,
                         source_version,
                         mode,
                         &session_states,
-                    ),
+                    )
+                } else {
+                    match mode {
+                        GraphMode::Anchors => this
+                            .try_update_anchor_materialization_in_transaction(
+                                connection,
+                                &source,
+                                source_version,
+                                &session_states,
+                            ),
+                        GraphMode::All => this.try_append_linear_branches_in_transaction(
+                            connection,
+                            &source,
+                            source_version,
+                            mode,
+                            &session_states,
+                        ),
+                    }
                 }
             };
             match result {
