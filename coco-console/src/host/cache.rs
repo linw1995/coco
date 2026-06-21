@@ -1212,8 +1212,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let process_id = std::process::id();
         let counter = TEMP_STORE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("coco-console-graph-{nanos}-{counter}"));
+        let path =
+            std::env::temp_dir().join(format!("coco-console-graph-{process_id}-{nanos}-{counter}"));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
