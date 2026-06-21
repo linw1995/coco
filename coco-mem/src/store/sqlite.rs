@@ -9,6 +9,10 @@ use diesel::result::OptionalExtension;
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::sqlite::SqliteConnection;
+use diesel_async::pooled_connection::bb8::{
+    Pool as AsyncSqlitePool, PooledConnection as AsyncSqlitePooledConnection,
+};
+use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 use snafu::prelude::*;
@@ -22,10 +26,11 @@ use super::{
 };
 use crate::StoreResult as Result;
 use crate::error::{
-    AmbiguousNodePrefixSnafu, BranchNotFoundSnafu, ConnectSqliteStoreSnafu, CorruptedStoreSnafu,
-    NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu,
-    RefsNotConnectedSnafu, StartSqliteRuntimeSnafu, StorePathIsNotDirectorySnafu,
-    StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+    AcquireSqliteConnectionSnafu, AmbiguousNodePrefixSnafu, BranchNotFoundSnafu,
+    CorruptedStoreSnafu, CreateSqlitePoolSnafu, NotFoundSnafu, ParentNotFoundSnafu,
+    ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu,
+    StartSqliteRuntimeSnafu, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu,
+    WriteStoreDirectorySnafu,
 };
 use crate::{
     Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Preset,
@@ -39,6 +44,7 @@ const SQLITE_INCOMPLETE_DATABASE_FILE_NAME: &str = "store.sqlite3.incomplete";
 const LEGACY_FS_META_FILE_NAME: &str = "meta.json";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
 const SQLITE_SCHEMA_VERSION: i32 = 2;
+const SQLITE_POOL_MAX_SIZE: u32 = 4;
 
 static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SQLITE_RUNTIME_INIT: Mutex<()> = Mutex::new(());
@@ -47,7 +53,7 @@ static SQLITE_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<SqliteDatabaseInne
 
 type AsyncSqliteConnection = SyncConnectionWrapper<SqliteConnection>;
 
-type AsyncSqliteConnectionGuard<'a> = tokio::sync::MutexGuard<'a, AsyncSqliteConnection>;
+type AsyncSqliteConnectionGuard<'a> = AsyncSqlitePooledConnection<'a, AsyncSqliteConnection>;
 
 #[derive(Clone)]
 pub struct SqliteDatabase {
@@ -57,7 +63,7 @@ pub struct SqliteDatabase {
 struct SqliteDatabaseInner {
     database_path: PathBuf,
     runtime: &'static Runtime,
-    connection: Arc<tokio::sync::Mutex<AsyncSqliteConnection>>,
+    pool: AsyncSqlitePool<AsyncSqliteConnection>,
 }
 
 #[derive(Clone)]
@@ -319,19 +325,11 @@ impl SqliteDatabase {
         }
 
         let runtime = sqlite_runtime()?;
-        let connection = block_on_sqlite_runtime_with(runtime, async {
-            let mut connection = AsyncSqliteConnection::establish(&database_path.to_string_lossy())
-                .await
-                .context(ConnectSqliteStoreSnafu {
-                    path: database_path.clone(),
-                })?;
-            configure_connection(&mut connection, &database_path).await?;
-            Ok(connection)
-        })?;
+        let pool = build_sqlite_pool(runtime, &database_path, false)?;
         let inner = Arc::new(SqliteDatabaseInner {
             database_path: database_path.clone(),
             runtime,
-            connection: Arc::new(tokio::sync::Mutex::new(connection)),
+            pool,
         });
         databases.insert(database_path, Arc::downgrade(&inner));
         Ok(Self { inner })
@@ -340,55 +338,58 @@ impl SqliteDatabase {
     fn open_uncached(database_path: PathBuf) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let runtime = sqlite_runtime()?;
-        let connection = block_on_sqlite_runtime_with(runtime, async {
-            let mut connection = AsyncSqliteConnection::establish(&database_path.to_string_lossy())
-                .await
-                .context(ConnectSqliteStoreSnafu {
-                    path: database_path.clone(),
-                })?;
-            configure_connection(&mut connection, &database_path).await?;
-            ensure_wal_journal_mode(&mut connection, &database_path).await?;
-            Ok(connection)
-        })?;
+        let pool = build_sqlite_pool(runtime, &database_path, true)?;
         Ok(Self {
             inner: Arc::new(SqliteDatabaseInner {
                 database_path,
                 runtime,
-                connection: Arc::new(tokio::sync::Mutex::new(connection)),
+                pool,
             }),
         })
     }
 
-    fn connection(&self) -> &tokio::sync::Mutex<AsyncSqliteConnection> {
-        &self.inner.connection
+    async fn connection(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
+        self.inner
+            .pool
+            .get()
+            .await
+            .context(AcquireSqliteConnectionSnafu {
+                path: self.inner.database_path.clone(),
+            })
     }
 
-    pub fn with_sync_connection<T, E, F, M>(
+    pub fn with_sync_connection<T, E, F, P, M>(
         &self,
         operation: F,
+        map_pool_error: P,
         map_connection_error: M,
     ) -> std::result::Result<T, E>
     where
         T: Send + 'static,
         E: Send + 'static,
         F: FnOnce(&mut SqliteConnection) -> std::result::Result<T, E> + Send + 'static,
+        P: FnOnce(crate::StoreError) -> E + Send,
         M: FnOnce(diesel::result::Error) -> E,
     {
         let result = self.block_on(async {
-            let mut connection = self.connection().lock().await;
-            connection
+            let mut connection = match self.connection().await {
+                Ok(connection) => connection,
+                Err(error) => return Err(map_pool_error(error)),
+            };
+            Ok(connection
                 .spawn_blocking(move |connection| Ok(operation(connection)))
-                .await
+                .await)
         });
         match result {
-            Ok(result) => result,
-            Err(error) => Err(map_connection_error(error)),
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(map_connection_error(error)),
+            Err(error) => Err(error),
         }
     }
 
     #[cfg(test)]
-    fn shared_connection(&self) -> &Arc<tokio::sync::Mutex<AsyncSqliteConnection>> {
-        &self.inner.connection
+    fn shared_pool(&self) -> &AsyncSqlitePool<AsyncSqliteConnection> {
+        &self.inner.pool
     }
 
     fn block_on<F>(&self, future: F) -> F::Output
@@ -672,7 +673,7 @@ PRAGMA journal_mode = DELETE;
     }
 
     async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
-        Ok(self.database.connection().lock().await)
+        self.database.connection().await
     }
 
     #[cfg(test)]
@@ -742,7 +743,7 @@ impl SqliteGraphStore {
     }
 
     async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
-        Ok(self.database.connection().lock().await)
+        self.database.connection().await
     }
 
     fn ensure_read_only<T>(&self) -> Result<T> {
@@ -1014,6 +1015,54 @@ fn ensure_existing_database_file(path: &Path) -> Result<()> {
         }
     );
     Ok(())
+}
+
+fn build_sqlite_pool(
+    runtime: &'static Runtime,
+    database_path: &Path,
+    ensure_wal: bool,
+) -> Result<AsyncSqlitePool<AsyncSqliteConnection>> {
+    let manager = AsyncDieselConnectionManager::<AsyncSqliteConnection>::new_with_config(
+        database_path.to_string_lossy().into_owned(),
+        sqlite_pool_manager_config(database_path.to_owned(), ensure_wal),
+    );
+    block_on_sqlite_runtime_with(runtime, async {
+        AsyncSqlitePool::builder()
+            .max_size(SQLITE_POOL_MAX_SIZE)
+            .build(manager)
+            .await
+            .context(CreateSqlitePoolSnafu {
+                path: database_path.to_owned(),
+            })
+    })
+}
+
+fn sqlite_pool_manager_config(
+    database_path: PathBuf,
+    ensure_wal: bool,
+) -> ManagerConfig<AsyncSqliteConnection> {
+    let mut config = ManagerConfig::default();
+    config.custom_setup = Box::new(move |url| {
+        let url = url.to_owned();
+        let database_path = database_path.clone();
+        Box::pin(async move {
+            let mut connection = AsyncSqliteConnection::establish(&url).await?;
+            configure_connection(&mut connection, &database_path)
+                .await
+                .map_err(sqlite_connection_setup_error)?;
+            if ensure_wal {
+                ensure_wal_journal_mode(&mut connection, &database_path)
+                    .await
+                    .map_err(sqlite_connection_setup_error)?;
+            }
+            Ok(connection)
+        })
+    });
+    config
+}
+
+fn sqlite_connection_setup_error(error: crate::StoreError) -> diesel::ConnectionError {
+    diesel::ConnectionError::BadConnection(error.to_string())
 }
 
 async fn configure_connection(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
@@ -2789,7 +2838,6 @@ mod tests {
     use diesel::sql_query;
     use diesel::sql_types::{Integer, Nullable, Text};
     use diesel_async::RunQueryDsl;
-    use std::sync::Arc;
 
     #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
     struct NodeRelationRow {
@@ -2902,21 +2950,21 @@ VALUES (?, ?, ?, ?, ?, ?)
     }
 
     #[test]
-    fn cloned_sqlite_store_shares_database_instance() {
+    fn cloned_sqlite_store_shares_database_pool() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
 
         let store = SqliteStore::open(&path).unwrap();
         let cloned = store.clone();
 
-        assert!(Arc::ptr_eq(
-            store.database.shared_connection(),
-            cloned.database.shared_connection()
+        assert!(std::ptr::eq(
+            store.database.shared_pool(),
+            cloned.database.shared_pool()
         ));
     }
 
     #[test]
-    fn reopened_sqlite_handles_share_database_instance() {
+    fn reopened_sqlite_handles_share_database_pool() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
 
@@ -2925,17 +2973,17 @@ VALUES (?, ?, ?, ?, ?, ?)
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
         let lexical_read_only = SqliteStore::open_read_only(path.join(".")).unwrap();
 
-        assert!(Arc::ptr_eq(
-            store.database.shared_connection(),
-            read_only.database.shared_connection()
+        assert!(std::ptr::eq(
+            store.database.shared_pool(),
+            read_only.database.shared_pool()
         ));
-        assert!(Arc::ptr_eq(
-            store.database.shared_connection(),
-            graph.database.shared_connection()
+        assert!(std::ptr::eq(
+            store.database.shared_pool(),
+            graph.database.shared_pool()
         ));
-        assert!(Arc::ptr_eq(
-            store.database.shared_connection(),
-            lexical_read_only.database.shared_connection()
+        assert!(std::ptr::eq(
+            store.database.shared_pool(),
+            lexical_read_only.database.shared_pool()
         ));
     }
 
@@ -3881,6 +3929,7 @@ THIS IS NOT SQL;
                     .unwrap()
                     .journal_mode)
                 },
+                |source| panic!("{source}"),
                 std::convert::identity,
             )
             .unwrap();

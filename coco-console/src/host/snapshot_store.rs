@@ -475,9 +475,9 @@ struct SqliteInteger {
 
 impl ConsoleGraphSnapshotStore {
     pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
+        let dir = dir.as_ref();
         let path = database_path(dir);
-        let database =
-            SqliteDatabase::open_unshared_file_path(&path).context(crate::error::StoreSnafu)?;
+        let database = SqliteDatabase::open_store_path(dir).context(crate::error::StoreSnafu)?;
         let store = Self {
             path: Arc::new(path),
             database,
@@ -634,62 +634,166 @@ LIMIT 1
         });
         let source = MaterializationSourceSnapshot::from_store(store, &session_states)?;
 
+        if session_states.is_empty() {
+            let this = self.clone();
+            return self.with_connection(move |connection| {
+                this.run_write_transaction(connection, |this, connection| {
+                    this.put_empty_materialization_in_transaction(connection, source_version, mode)
+                })
+            });
+        }
+
+        let this = self.clone();
+        let materialization_is_empty = self.with_connection(move |connection| {
+            let has_materialization = this
+                .latest_materialization_row_in_connection(connection, mode)?
+                .is_some();
+            Ok(!has_materialization
+                || this
+                    .materialized_node_rows_in_connection(connection, mode)?
+                    .is_empty())
+        })?;
+
+        if materialization_is_empty {
+            return self.try_seed_initial_branch_materialization_in_batches(
+                source,
+                source_version,
+                mode,
+                session_states,
+            );
+        }
+
         let this = self.clone();
         self.with_connection(move |connection| {
-            let result = if session_states.is_empty() {
-                this.begin_write_transaction(connection)?;
-                this.put_empty_materialization_in_transaction(connection, source_version, mode)
-            } else {
-                let has_materialization = this
-                    .latest_materialization_row_in_connection(connection, mode)?
-                    .is_some();
-                let materialization_is_empty = !has_materialization
-                    || this
-                        .materialized_node_rows_in_connection(connection, mode)?
-                        .is_empty();
-                this.begin_write_transaction(connection)?;
-                if materialization_is_empty {
-                    this.try_seed_initial_branch_materialization_in_transaction(
-                        connection,
-                        &source,
-                        source_version,
+            this.run_write_transaction(connection, |this, connection| match mode {
+                GraphMode::Anchors => this.try_update_anchor_materialization_in_transaction(
+                    connection,
+                    &source,
+                    source_version,
+                    &session_states,
+                ),
+                GraphMode::All => this.try_append_linear_branches_in_transaction(
+                    connection,
+                    &source,
+                    source_version,
+                    mode,
+                    &session_states,
+                ),
+            })
+        })
+    }
+
+    fn try_seed_initial_branch_materialization_in_batches(
+        &self,
+        source: MaterializationSourceSnapshot,
+        source_version: u64,
+        mode: GraphMode,
+        session_states: Vec<(String, SessionState)>,
+    ) -> crate::Result<bool> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            let Some(first_index) =
+                this.first_visible_initial_branch_index(&source, mode, &session_states)?
+            else {
+                return this.run_write_transaction(connection, |this, connection| {
+                    this.delete_materialization_meta(connection, mode)?;
+                    this.put_empty_materialization_in_transaction(connection, source_version, mode)
+                });
+            };
+
+            this.run_write_transaction(connection, |this, connection| {
+                this.delete_materialization_meta(connection, mode)?;
+                this.clear_materialized_mode_facts(connection, mode)
+            })?;
+
+            let (first_branch, first_state) = &session_states[first_index];
+            if !this.run_write_transaction(connection, |this, connection| {
+                this.try_seed_first_branch_materialization_in_transaction(
+                    connection,
+                    &source,
+                    mode,
+                    first_branch,
+                    first_state,
+                )
+            })? {
+                return Ok(false);
+            }
+
+            let mut next_lane_y = crate::layout::GRAPH_TOP_Y + GRAPH_LANE_HEIGHT;
+            for (branch, state) in session_states[first_index..].iter().skip(1) {
+                if !this.branch_has_initial_visible_nodes(&source, mode, branch)? {
+                    continue;
+                }
+                let head_id = source
+                    .get_branch_head(branch)
+                    .context(crate::error::StoreSnafu)?;
+                let appended = this.run_write_transaction(connection, |this, connection| {
+                    this.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
+                    let input = AppendLinearBranchInput {
                         mode,
-                        &session_states,
-                    )
-                } else {
+                        branch,
+                        state,
+                        head_id: &head_id,
+                    };
                     match mode {
                         GraphMode::Anchors => this
-                            .try_update_anchor_materialization_in_transaction(
+                            .try_append_new_anchor_branch_lane_in_transaction(
                                 connection,
                                 &source,
-                                source_version,
-                                &session_states,
+                                input,
+                                next_lane_y,
                             ),
-                        GraphMode::All => this.try_append_linear_branches_in_transaction(
+                        GraphMode::All => this.try_append_new_branch_lane_in_transaction(
                             connection,
                             &source,
-                            source_version,
-                            mode,
-                            &session_states,
+                            input,
+                            next_lane_y,
                         ),
                     }
+                })?;
+                if !appended {
+                    return Ok(false);
                 }
-            };
-            match result {
-                Ok(true) => {
-                    this.commit_transaction(connection)?;
-                    Ok(true)
-                }
-                Ok(false) => {
-                    let _ = this.rollback_transaction(connection);
-                    Ok(false)
-                }
-                Err(error) => {
-                    let _ = this.rollback_transaction(connection);
-                    Err(error)
-                }
+                next_lane_y += GRAPH_LANE_HEIGHT;
             }
+
+            this.run_write_transaction(connection, |this, connection| {
+                this.rebalance_routed_edge_slots(connection, mode)?;
+                if this
+                    .refresh_materialized_node_labels(connection, &source, mode, &session_states)?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                this.put_materialization_meta_from_materialized_rows(
+                    connection,
+                    source_version,
+                    mode,
+                )?;
+                Ok(true)
+            })
         })
+    }
+
+    fn run_write_transaction<T, F>(
+        &self,
+        connection: &mut SqliteConnection,
+        operation: F,
+    ) -> crate::Result<T>
+    where
+        F: FnOnce(&Self, &mut SqliteConnection) -> crate::Result<T>,
+    {
+        self.begin_write_transaction(connection)?;
+        match operation(self, connection) {
+            Ok(value) => {
+                self.commit_transaction(connection)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.rollback_transaction(connection);
+                Err(error)
+            }
+        }
     }
 
     fn put_empty_materialization_in_transaction(
@@ -710,48 +814,6 @@ LIMIT 1
                 world_max_y: crate::layout::GRAPH_TOP_Y + 120,
             },
         )?;
-        Ok(true)
-    }
-
-    fn try_seed_initial_branch_materialization_in_transaction(
-        &self,
-        connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
-        source_version: u64,
-        mode: GraphMode,
-        session_states: &[(String, SessionState)],
-    ) -> crate::Result<bool> {
-        let Some(first_index) =
-            self.first_visible_initial_branch_index(store, mode, session_states)?
-        else {
-            return self.put_empty_materialization_in_transaction(connection, source_version, mode);
-        };
-        let (first_branch, first_state) = &session_states[first_index];
-        if !self.try_seed_first_branch_materialization_in_transaction(
-            connection,
-            store,
-            mode,
-            first_branch,
-            first_state,
-        )? {
-            return Ok(false);
-        }
-        if !self.try_seed_remaining_branch_materializations_in_transaction(
-            connection,
-            store,
-            mode,
-            &session_states[first_index..],
-        )? {
-            return Ok(false);
-        }
-        self.rebalance_routed_edge_slots(connection, mode)?;
-        if self
-            .refresh_materialized_node_labels(connection, store, mode, session_states)?
-            .is_none()
-        {
-            return Ok(false);
-        }
-        self.put_materialization_meta_from_materialized_rows(connection, source_version, mode)?;
         Ok(true)
     }
 
@@ -903,51 +965,6 @@ LIMIT 1
                 return Ok(false);
             }
             previous = Some((node.id, point));
-        }
-
-        Ok(true)
-    }
-
-    fn try_seed_remaining_branch_materializations_in_transaction(
-        &self,
-        connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
-        mode: GraphMode,
-        session_states: &[(String, SessionState)],
-    ) -> crate::Result<bool> {
-        let mut next_lane_y = crate::layout::GRAPH_TOP_Y + GRAPH_LANE_HEIGHT;
-        for (branch, state) in session_states.iter().skip(1) {
-            if !self.branch_has_initial_visible_nodes(store, mode, branch)? {
-                continue;
-            }
-            self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
-            let head_id = store
-                .get_branch_head(branch)
-                .context(crate::error::StoreSnafu)?;
-            let input = AppendLinearBranchInput {
-                mode,
-                branch,
-                state,
-                head_id: &head_id,
-            };
-            let appended = match mode {
-                GraphMode::Anchors => self.try_append_new_anchor_branch_lane_in_transaction(
-                    connection,
-                    store,
-                    input,
-                    next_lane_y,
-                )?,
-                GraphMode::All => self.try_append_new_branch_lane_in_transaction(
-                    connection,
-                    store,
-                    input,
-                    next_lane_y,
-                )?,
-            };
-            if !appended {
-                return Ok(false);
-            }
-            next_lane_y += GRAPH_LANE_HEIGHT;
         }
 
         Ok(true)
@@ -3065,11 +3082,11 @@ ORDER BY
     }
 
     fn begin_write_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
-        sql_query("BEGIN IMMEDIATE TRANSACTION")
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
+        sql_query("BEGIN TRANSACTION").execute(connection).context(
+            QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
-            })?;
+            },
+        )?;
         Ok(())
     }
 
@@ -3244,6 +3261,20 @@ ON CONFLICT(mode) DO UPDATE SET
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })?;
+        Ok(())
+    }
+
+    fn delete_materialization_meta(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<()> {
+        sql_query("DELETE FROM console_graph_materializations WHERE mode = ?")
+            .bind::<Text, _>(mode.as_query_value())
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         Ok(())
     }
 
@@ -5083,9 +5114,20 @@ ORDER BY min_y, min_x, edge_key
         F: FnOnce(&mut SqliteConnection) -> crate::Result<T> + Send + 'static,
     {
         let path = self.path.as_ref().clone();
-        self.database.with_sync_connection(operation, |source| {
-            crate::Error::QueryGraphSnapshotStore { path, source }
-        })
+        self.database.with_sync_connection(
+            operation,
+            |source| crate::Error::Store { source },
+            |source| crate::Error::QueryGraphSnapshotStore { path, source },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_connection_for_tests<T, F>(&self, operation: F) -> crate::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut SqliteConnection) -> crate::Result<T> + Send + 'static,
+    {
+        self.with_connection(operation)
     }
 }
 

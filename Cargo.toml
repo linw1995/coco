@@ -39,7 +39,7 @@ diesel = { version = "2.3.10", features = [
   "sqlite",
   "returning_clauses_for_sqlite_3_35",
 ] }
-diesel-async = { version = "0.9.1", features = ["sqlite"] }
+diesel-async = { version = "0.9.1", features = ["sqlite", "bb8"] }
 libsqlite3-sys = { version = "0.37.0", features = ["bundled"] }
 
 # Error handling.

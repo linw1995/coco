@@ -1263,9 +1263,9 @@ mod tests {
     use crate::ConsoleStore;
     use crate::host::snapshot_store::ConsoleGraphSnapshotStore;
     use coco_mem::{
-        Anchor, BranchStore, Kind, MemoryStore, MergeParent, NewNode, NodeStore, PersistentStore,
-        PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor, SkillInvocationMode,
-        SkillResultAnchor, Tool, ToolUse,
+        Anchor, BranchStore, JobStore, Kind, MemoryStore, MergeParent, NewNode, NodeStore,
+        PersistentStore, PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor,
+        SkillInvocationMode, SkillResultAnchor, Tool, ToolUse,
     };
     use diesel::QueryableByName;
     use serde_json::json;
@@ -9194,6 +9194,52 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    #[test]
+    fn snapshot_write_transaction_allows_store_write_after_short_lock() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
+        let snapshot = ConsoleGraphSnapshotStore::open(&path).unwrap();
+        let base = root.clone();
+        coco_mem::SqliteDatabase::open_store_path(&path)
+            .unwrap()
+            .with_sync_connection(
+                |connection| {
+                    use diesel::connection::SimpleConnection;
+
+                    connection.batch_execute("PRAGMA busy_timeout = 50")
+                },
+                |source| panic!("{source}"),
+                std::convert::identity,
+            )
+            .unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let transaction = std::thread::spawn(move || {
+            snapshot
+                .with_connection_for_tests(move |connection| {
+                    use diesel::connection::SimpleConnection;
+
+                    connection
+                        .batch_execute("BEGIN IMMEDIATE TRANSACTION")
+                        .unwrap();
+                    started_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(200));
+                    connection.batch_execute("COMMIT").unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        writer.submit_job("main", &base).unwrap();
+        transaction.join().unwrap();
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[derive(QueryableByName)]
     struct SqliteCount {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -9209,6 +9255,7 @@ mod tests {
             .unwrap()
             .with_sync_connection(
                 |connection| Ok(operation(connection)),
+                |source| panic!("{source}"),
                 std::convert::identity,
             )
             .unwrap()
