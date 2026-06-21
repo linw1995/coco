@@ -1521,6 +1521,15 @@ async fn load_root_id(connection: &mut AsyncSqliteConnection, path: &Path) -> Re
 }
 
 async fn load_state(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<StoreState> {
+    begin_read_transaction(connection, path).await?;
+    let result = load_state_without_transaction(connection, path).await;
+    finish_transaction(connection, path, result).await
+}
+
+async fn load_state_without_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<StoreState> {
     let root_id = load_root_id(connection, path).await?;
     let mut rows = load_node_rows(connection, path).await?;
     let root_index =
@@ -1612,6 +1621,15 @@ async fn begin_immediate_transaction(
 ) -> Result<()> {
     connection
         .batch_execute("BEGIN IMMEDIATE")
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn begin_read_transaction(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
+    connection
+        .batch_execute("BEGIN")
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
@@ -3179,6 +3197,52 @@ VALUES (?, ?, ?, ?, ?, ?)
             reopened.list_children(&reopened.root_id()).unwrap().len(),
             8
         );
+    }
+
+    #[test]
+    fn load_state_reads_from_one_snapshot() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+
+        let (snapshot, child_id) = store.block_on(async {
+            let mut reader = store.connect().await.unwrap();
+            super::begin_read_transaction(&mut reader, &store.database_path)
+                .await
+                .unwrap();
+            assert_eq!(
+                super::load_root_id(&mut reader, &store.database_path)
+                    .await
+                    .unwrap(),
+                root_id
+            );
+
+            let writer = store.clone();
+            let child_parent = root_id.clone();
+            let handle = std::thread::spawn(move || {
+                writer
+                    .append(NewNode {
+                        parent: child_parent,
+                        role: Role::User,
+                        metadata: None,
+                        kind: Kind::Text("concurrent child".to_owned()),
+                    })
+                    .unwrap()
+            });
+            let child_id = handle.join().unwrap();
+
+            let snapshot = super::load_state_without_transaction(&mut reader, &store.database_path)
+                .await
+                .unwrap();
+            super::commit_transaction(&mut reader, &store.database_path)
+                .await
+                .unwrap();
+            (snapshot, child_id)
+        });
+
+        assert!(snapshot.get_node(&child_id).is_err());
+        assert!(store.get_node(&child_id).is_ok());
     }
 
     #[test]
