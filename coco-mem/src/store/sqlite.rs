@@ -441,8 +441,8 @@ impl SqliteStore {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         ensure_existing_store_directory(path)?;
+        ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
-        ensure_existing_database_file(&store.database_path)?;
         store.ensure_current_schema()?;
         store.load_state()?;
         Ok(store)
@@ -659,8 +659,8 @@ impl SqliteGraphStore {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         ensure_existing_store_directory(path)?;
+        ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path)?;
-        ensure_existing_database_file(&store.database_path)?;
         store.ensure_current_schema()?;
         let root_id = store.block_on(async {
             let mut connection = store.connect().await?;
@@ -3366,6 +3366,19 @@ THIS IS NOT SQL;
         let err = SqliteStore::open_read_only(&path).unwrap_err();
 
         assert!(err.to_string().contains("SQLite"));
+        assert!(!super::sqlite_database_path(&path).exists());
+    }
+
+    #[test]
+    fn graph_open_read_only_rejects_missing_schema_without_creating_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = SqliteGraphStore::open_read_only(&path).unwrap_err();
+
+        assert!(err.to_string().contains("SQLite"));
+        assert!(!super::sqlite_database_path(&path).exists());
     }
 
     #[test]
