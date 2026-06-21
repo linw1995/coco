@@ -529,40 +529,9 @@ impl ConsoleGraphSnapshotStore {
         let this = self.clone();
         let target = target.to_owned();
         self.with_connection(move |connection| {
-            if this
-                .latest_materialization_row_in_connection(connection, mode)?
-                .is_none()
-            {
-                return Ok(None);
-            }
-            let row = sql_query(
-                r#"
-SELECT node_key, node_id, node_target, short_id, node_kind, summary, labels_json, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND node_target = ?
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-            )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(target)
-            .get_result::<NodeLocationRow>(connection)
-            .optional()
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            row.map(|row| {
-                let labels = serde_json::from_str::<Vec<String>>(&row.labels_json).context(
-                    ParseGraphSnapshotStoreValueSnafu {
-                        column: "console_graph_node_locations.labels_json",
-                    },
-                )?;
-                Ok(MaterializedNodeReference {
-                    node_id: row.node_id,
-                    labels,
-                })
+            this.run_read_transaction(connection, |this, connection| {
+                this.materialized_node_reference_in_connection(connection, mode, &target)
             })
-            .transpose()
         })
     }
 
@@ -574,21 +543,9 @@ LIMIT 1
         let this = self.clone();
         let node_ids = node_ids.clone();
         self.with_connection(move |connection| {
-            if this
-                .latest_materialization_row_in_connection(connection, mode)?
-                .is_none()
-            {
-                return Ok(BTreeMap::new());
-            }
-            let mut points = BTreeMap::new();
-            for node_id in node_ids {
-                if let Some(point) =
-                    this.materialized_node_point_in_connection(connection, mode, &node_id)?
-                {
-                    points.insert(node_id, point);
-                }
-            }
-            Ok(points)
+            this.run_read_transaction(connection, |this, connection| {
+                this.materialized_node_points_in_connection(connection, mode, &node_ids)
+            })
         })
     }
 
@@ -611,35 +568,37 @@ LIMIT 1
     ) -> crate::Result<Option<MaterializedGraphShellFacts>> {
         let this = self.clone();
         self.with_connection(move |connection| {
-            let Some(meta) = this.latest_materialization_row_in_connection(connection, mode)?
-            else {
-                return Ok(None);
-            };
-            let lanes = this
-                .materialized_lanes_in_connection(connection, mode)?
-                .into_iter()
-                .map(|row| GraphViewportLane {
-                    key: row.lane_key,
-                    label: row.lane_label,
-                    y: row.lane_y,
-                })
-                .collect();
-            let mut nodes_by_id = BTreeMap::new();
-            for row in this.materialized_node_rows_in_connection(connection, mode)? {
-                nodes_by_id
-                    .entry(row.node_id)
-                    .or_insert(Point { x: row.x, y: row.y });
-            }
-            let nodes = nodes_by_id
-                .into_iter()
-                .map(|(node_id, point)| MaterializedGraphShellNode { node_id, point })
-                .collect();
-            Ok(Some(MaterializedGraphShellFacts {
-                version: meta.source_version.max(0) as u64,
-                lanes,
-                nodes,
-                edge_count: this.materialized_edge_count_in_connection(connection, mode)?,
-            }))
+            this.run_read_transaction(connection, |this, connection| {
+                let Some(meta) = this.latest_materialization_row_in_connection(connection, mode)?
+                else {
+                    return Ok(None);
+                };
+                let lanes = this
+                    .materialized_lanes_in_connection(connection, mode)?
+                    .into_iter()
+                    .map(|row| GraphViewportLane {
+                        key: row.lane_key,
+                        label: row.lane_label,
+                        y: row.lane_y,
+                    })
+                    .collect();
+                let mut nodes_by_id = BTreeMap::new();
+                for row in this.materialized_node_rows_in_connection(connection, mode)? {
+                    nodes_by_id
+                        .entry(row.node_id)
+                        .or_insert(Point { x: row.x, y: row.y });
+                }
+                let nodes = nodes_by_id
+                    .into_iter()
+                    .map(|(node_id, point)| MaterializedGraphShellNode { node_id, point })
+                    .collect();
+                Ok(Some(MaterializedGraphShellFacts {
+                    version: meta.source_version.max(0) as u64,
+                    lanes,
+                    nodes,
+                    edge_count: this.materialized_edge_count_in_connection(connection, mode)?,
+                }))
+            })
         })
     }
 
@@ -4964,6 +4923,71 @@ LIMIT 1
         })
     }
 
+    fn materialized_node_reference_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        target: &str,
+    ) -> crate::Result<Option<MaterializedNodeReference>> {
+        if self
+            .latest_materialization_row_in_connection(connection, mode)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let row = sql_query(
+            r#"
+SELECT node_key, node_id, node_target, short_id, node_kind, summary, labels_json, x, y
+FROM console_graph_node_locations
+WHERE mode = ? AND node_target = ?
+ORDER BY y, x, node_key
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(target)
+        .get_result::<NodeLocationRow>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        row.map(|row| {
+            let labels = serde_json::from_str::<Vec<String>>(&row.labels_json).context(
+                ParseGraphSnapshotStoreValueSnafu {
+                    column: "console_graph_node_locations.labels_json",
+                },
+            )?;
+            Ok(MaterializedNodeReference {
+                node_id: row.node_id,
+                labels,
+            })
+        })
+        .transpose()
+    }
+
+    fn materialized_node_points_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_ids: &BTreeSet<String>,
+    ) -> crate::Result<BTreeMap<String, Point>> {
+        if self
+            .latest_materialization_row_in_connection(connection, mode)?
+            .is_none()
+        {
+            return Ok(BTreeMap::new());
+        }
+        let mut points = BTreeMap::new();
+        for node_id in node_ids {
+            if let Some(point) =
+                self.materialized_node_point_in_connection(connection, mode, node_id)?
+            {
+                points.insert(node_id.clone(), point);
+            }
+        }
+        Ok(points)
+    }
+
     fn materialized_edge_count_in_connection(
         &self,
         connection: &mut SqliteConnection,
@@ -6181,6 +6205,91 @@ mod tests {
 
         assert_eq!(response.version, 7);
         assert!(response.nodes.is_empty());
+
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn meta_gated_materialized_node_lookups_read_from_one_snapshot() {
+        let path = temp_store_path();
+        let _writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let store = snapshots.clone();
+        snapshots
+            .with_connection_for_tests(move |connection| {
+                store.run_bool_write_transaction(connection, |this, connection| {
+                    this.put_empty_materialization_in_transaction(connection, 7, GraphMode::All)
+                })
+            })
+            .unwrap();
+
+        let reader = snapshots.clone();
+        let writer = snapshots.clone();
+        let (reference, points) = snapshots
+            .with_connection_for_tests(move |connection| {
+                reader.run_read_transaction(connection, |this, connection| {
+                    assert!(
+                        this.latest_materialization_row_in_connection(connection, GraphMode::All)?
+                            .is_some()
+                    );
+
+                    let writer_store = writer.clone();
+                    writer.with_connection_for_tests(move |writer_connection| {
+                        writer_store.run_write_transaction(
+                            writer_connection,
+                            |this, writer_connection| {
+                                this.delete_materialization_meta(
+                                    writer_connection,
+                                    GraphMode::All,
+                                )?;
+                                let lane = GraphViewportLane {
+                                    key: "main".to_owned(),
+                                    label: "main".to_owned(),
+                                    y: crate::layout::GRAPH_TOP_Y,
+                                };
+                                let node = GraphViewportNode {
+                                    key: "node:test:0:0".to_owned(),
+                                    id: "test".to_owned(),
+                                    node_target: "test".to_owned(),
+                                    short_id: "test".to_owned(),
+                                    kind: "text".to_owned(),
+                                    summary: "test".to_owned(),
+                                    labels: vec!["main".to_owned()],
+                                    x: GRAPH_LEFT_X,
+                                    y: lane.y,
+                                };
+                                this.insert_node_location(
+                                    writer_connection,
+                                    NodeLocationInsert {
+                                        mode: GraphMode::All,
+                                        node: &node,
+                                        lane: &lane,
+                                        bounds: node_bounds(&node),
+                                    },
+                                )?;
+                                Ok(())
+                            },
+                        )
+                    })?;
+
+                    let reference = this.materialized_node_reference_in_connection(
+                        connection,
+                        GraphMode::All,
+                        "test",
+                    )?;
+                    let points = this.materialized_node_points_in_connection(
+                        connection,
+                        GraphMode::All,
+                        &BTreeSet::from(["test".to_owned()]),
+                    )?;
+                    Ok((reference, points))
+                })
+            })
+            .unwrap();
+
+        assert!(reference.is_none());
+        assert!(points.is_empty());
 
         std::fs::remove_dir_all(path).unwrap();
     }
