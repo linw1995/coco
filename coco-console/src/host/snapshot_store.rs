@@ -477,7 +477,8 @@ impl ConsoleGraphSnapshotStore {
     pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
         let dir = dir.as_ref();
         let path = database_path(dir);
-        let database = SqliteDatabase::open_store_path(dir).context(crate::error::StoreSnafu)?;
+        let database =
+            SqliteDatabase::open_writable_store_path(dir).context(crate::error::StoreSnafu)?;
         let store = Self {
             path: Arc::new(path),
             database,
@@ -3165,11 +3166,11 @@ ORDER BY
     }
 
     fn begin_write_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
-        sql_query("BEGIN TRANSACTION").execute(connection).context(
-            QueryGraphSnapshotStoreSnafu {
+        sql_query("BEGIN IMMEDIATE")
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
-            },
-        )?;
+            })?;
         Ok(())
     }
 

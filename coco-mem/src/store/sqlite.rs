@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use diesel::prelude::*;
@@ -64,6 +65,7 @@ struct SqliteDatabaseInner {
     database_path: PathBuf,
     runtime: &'static Runtime,
     pool: AsyncSqlitePool<AsyncSqliteConnection>,
+    ensure_wal: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -304,14 +306,22 @@ impl std::fmt::Debug for SqliteDatabase {
 
 impl SqliteDatabase {
     pub fn open_store_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(sqlite_database_path(path.as_ref()))
+        Self::open(sqlite_database_path(path.as_ref()), false)
+    }
+
+    pub fn open_writable_store_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_writable_file_path(sqlite_database_path(path.as_ref()))
     }
 
     pub fn open_unshared_file_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_uncached(path.as_ref().to_owned())
+        Self::open_uncached(path.as_ref().to_owned(), true)
     }
 
-    fn open(database_path: PathBuf) -> Result<Self> {
+    fn open_writable_file_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(path.as_ref().to_owned(), true)
+    }
+
+    fn open(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let databases = SQLITE_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
         let mut databases = databases
@@ -321,31 +331,48 @@ impl SqliteDatabase {
             .get(&database_path)
             .and_then(std::sync::Weak::upgrade)
         {
-            return Ok(Self { inner });
+            let database = Self { inner };
+            drop(databases);
+            if ensure_wal {
+                database.request_wal_journal_mode()?;
+            }
+            return Ok(database);
         }
 
         let runtime = sqlite_runtime()?;
-        let pool = build_sqlite_pool(runtime, &database_path, false)?;
+        let ensure_wal_flag = Arc::new(AtomicBool::new(ensure_wal));
+        let pool = build_sqlite_pool(runtime, &database_path, ensure_wal_flag.clone())?;
         let inner = Arc::new(SqliteDatabaseInner {
             database_path: database_path.clone(),
             runtime,
             pool,
+            ensure_wal: ensure_wal_flag,
         });
         databases.insert(database_path, Arc::downgrade(&inner));
-        Ok(Self { inner })
+        let database = Self { inner };
+        if ensure_wal {
+            database.request_wal_journal_mode()?;
+        }
+        Ok(database)
     }
 
-    fn open_uncached(database_path: PathBuf) -> Result<Self> {
+    fn open_uncached(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let runtime = sqlite_runtime()?;
-        let pool = build_sqlite_pool(runtime, &database_path, true)?;
-        Ok(Self {
+        let ensure_wal_flag = Arc::new(AtomicBool::new(ensure_wal));
+        let pool = build_sqlite_pool(runtime, &database_path, ensure_wal_flag.clone())?;
+        let database = Self {
             inner: Arc::new(SqliteDatabaseInner {
-                database_path,
+                database_path: database_path.clone(),
                 runtime,
                 pool,
+                ensure_wal: ensure_wal_flag,
             }),
-        })
+        };
+        if ensure_wal {
+            database.request_wal_journal_mode()?;
+        }
+        Ok(database)
     }
 
     async fn connection(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
@@ -398,6 +425,14 @@ impl SqliteDatabase {
         F::Output: Send,
     {
         block_on_sqlite_runtime_with(self.inner.runtime, future)
+    }
+
+    fn request_wal_journal_mode(&self) -> Result<()> {
+        self.inner.ensure_wal.store(true, Ordering::SeqCst);
+        self.block_on(async {
+            let mut connection = self.connection().await?;
+            ensure_wal_journal_mode(&mut connection, &self.inner.database_path).await
+        })
     }
 }
 
@@ -504,7 +539,10 @@ impl SqliteStore {
         database_path: PathBuf,
         access: StoreAccess,
     ) -> Result<Self> {
-        let database = SqliteDatabase::open(database_path.clone())?;
+        let database = match access {
+            StoreAccess::ReadWrite => SqliteDatabase::open_writable_file_path(&database_path)?,
+            StoreAccess::ReadOnly => SqliteDatabase::open(database_path.clone(), false)?,
+        };
         let lock_file = if access == StoreAccess::ReadWrite {
             Some(super::fs::open_store_lock(path)?)
         } else {
@@ -702,7 +740,7 @@ impl SqliteGraphStore {
 
     fn new(path: &Path) -> Result<Self> {
         let database_path = sqlite_database_path(path);
-        let database = SqliteDatabase::open(database_path.clone())?;
+        let database = SqliteDatabase::open(database_path.clone(), false)?;
         Ok(Self {
             dir: path.to_owned(),
             database_path,
@@ -1020,7 +1058,7 @@ fn ensure_existing_database_file(path: &Path) -> Result<()> {
 fn build_sqlite_pool(
     runtime: &'static Runtime,
     database_path: &Path,
-    ensure_wal: bool,
+    ensure_wal: Arc<AtomicBool>,
 ) -> Result<AsyncSqlitePool<AsyncSqliteConnection>> {
     let manager = AsyncDieselConnectionManager::<AsyncSqliteConnection>::new_with_config(
         database_path.to_string_lossy().into_owned(),
@@ -1039,18 +1077,19 @@ fn build_sqlite_pool(
 
 fn sqlite_pool_manager_config(
     database_path: PathBuf,
-    ensure_wal: bool,
+    ensure_wal: Arc<AtomicBool>,
 ) -> ManagerConfig<AsyncSqliteConnection> {
     let mut config = ManagerConfig::default();
     config.custom_setup = Box::new(move |url| {
         let url = url.to_owned();
         let database_path = database_path.clone();
+        let ensure_wal = ensure_wal.clone();
         Box::pin(async move {
             let mut connection = AsyncSqliteConnection::establish(&url).await?;
             configure_connection(&mut connection, &database_path)
                 .await
                 .map_err(sqlite_connection_setup_error)?;
-            if ensure_wal {
+            if ensure_wal.as_ref().load(Ordering::SeqCst) {
                 ensure_wal_journal_mode(&mut connection, &database_path)
                     .await
                     .map_err(sqlite_connection_setup_error)?;
@@ -3895,7 +3934,7 @@ THIS IS NOT SQL;
     }
 
     #[test]
-    fn unshared_open_enables_wal_after_fs_migration() {
+    fn writable_open_enables_wal_after_fs_migration() {
         use diesel::sql_query;
         use diesel_async::RunQueryDsl;
 
@@ -3916,9 +3955,13 @@ THIS IS NOT SQL;
                 .unwrap()
                 .journal_mode
         });
-        assert_eq!(journal_mode, "delete");
+        assert_eq!(journal_mode, "wal");
 
-        let database = SqliteDatabase::open_unshared_file_path(migrated.database_path()).unwrap();
+        let database = SqliteDatabase::open_store_path(&path).unwrap();
+        assert!(std::ptr::eq(
+            migrated.database.shared_pool(),
+            database.shared_pool()
+        ));
         let journal_mode = database
             .with_sync_connection(
                 |connection| {
