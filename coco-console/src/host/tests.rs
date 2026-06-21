@@ -11,6 +11,7 @@ use crate::api::{GraphViewportItemKind, Point};
 use crate::graph::{
     GraphBranch, GraphEdge, GraphEdgeKind, GraphMode, GraphNode, GraphSnapshot,
     build_graph_snapshot, build_graph_snapshot_with_mode, node_target_id,
+    visible_skill_invocation_subtree_nodes,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::layout::{
@@ -671,6 +672,70 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
         ]
     );
     assert!(!skill_context.nodes.iter().any(|node| node.id == tool_use));
+}
+
+#[test]
+fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
+    let store = MemoryStore::new();
+    let root = store.root_id();
+    let session = store
+        .append(NewNode {
+            parent: root,
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        })
+        .unwrap();
+    let tool_use = store
+        .append(NewNode {
+            parent: session,
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::tool_use(ToolUse {
+                id: "tool-1".to_owned(),
+                name: "skill".to_owned(),
+                input: json!({}),
+            }),
+        })
+        .unwrap();
+    let invocation = store
+        .append(NewNode {
+            parent: tool_use.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_invocation(
+                Vec::new(),
+                SkillInvocationAnchor {
+                    skill_name: "fast-rust".to_owned(),
+                    mode: SkillInvocationMode::InheritContext,
+                },
+            )),
+        })
+        .unwrap();
+    let mut parent = invocation.clone();
+    let depth = 20_000;
+    for index in 0..depth {
+        parent = store
+            .append(NewNode {
+                parent,
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text(format!("delegated context {index}")),
+            })
+            .unwrap();
+    }
+
+    let nodes = visible_skill_invocation_subtree_nodes(&store, GraphMode::All, &tool_use).unwrap();
+
+    assert_eq!(nodes.len(), depth + 1);
+    assert_eq!(
+        nodes.first().map(|node| node.id.as_str()),
+        Some(invocation.as_str())
+    );
+    assert_eq!(
+        nodes.last().map(|node| node.id.as_str()),
+        Some(parent.as_str())
+    );
 }
 
 #[test]

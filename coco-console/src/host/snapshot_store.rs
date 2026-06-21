@@ -5144,10 +5144,10 @@ fn visible_skill_invocation_linear_subtrees(
     let mut subtrees = Vec::<Vec<Node>>::new();
     for root_id in roots {
         push_visible_skill_invocation_paths(
+            source_id,
             &root_id,
             &nodes_by_id,
             &child_ids_by_parent,
-            Vec::new(),
             &mut subtrees,
         )?;
     }
@@ -5155,32 +5155,64 @@ fn visible_skill_invocation_linear_subtrees(
 }
 
 fn push_visible_skill_invocation_paths(
+    source_id: &str,
     node_id: &str,
     nodes_by_id: &BTreeMap<String, Node>,
     child_ids_by_parent: &BTreeMap<String, Vec<String>>,
-    mut path: Vec<Node>,
     subtrees: &mut Vec<Vec<Node>>,
 ) -> Option<()> {
-    let node = nodes_by_id.get(node_id)?;
-    path.push(node.clone());
-    let child_ids = child_ids_by_parent.get(node_id);
-    match child_ids {
-        Some(child_ids) if !child_ids.is_empty() => {
-            for child_id in child_ids {
-                push_visible_skill_invocation_paths(
-                    child_id,
-                    nodes_by_id,
-                    child_ids_by_parent,
-                    path.clone(),
-                    subtrees,
-                )?;
-            }
+    let mut pending = vec![node_id.to_owned()];
+    let mut visited = BTreeSet::new();
+
+    while let Some(node_id) = pending.pop() {
+        if !visited.insert(node_id.clone()) {
+            return None;
         }
-        _ => {
-            subtrees.push(path);
+        nodes_by_id.get(&node_id)?;
+        let Some(child_ids) = child_ids_by_parent.get(&node_id) else {
+            subtrees.push(visible_skill_invocation_path(
+                source_id,
+                &node_id,
+                nodes_by_id,
+            )?);
+            continue;
+        };
+        if child_ids.is_empty() {
+            subtrees.push(visible_skill_invocation_path(
+                source_id,
+                &node_id,
+                nodes_by_id,
+            )?);
+            continue;
+        }
+        for child_id in child_ids.iter().rev() {
+            pending.push(child_id.clone());
         }
     }
     Some(())
+}
+
+fn visible_skill_invocation_path(
+    source_id: &str,
+    leaf_id: &str,
+    nodes_by_id: &BTreeMap<String, Node>,
+) -> Option<Vec<Node>> {
+    let mut path = Vec::new();
+    let mut node_id = leaf_id;
+    let mut visited = BTreeSet::new();
+    loop {
+        let node = nodes_by_id.get(node_id)?;
+        if !visited.insert(node.id.clone()) {
+            return None;
+        }
+        path.push(node.clone());
+        if node.parent == source_id {
+            break;
+        }
+        node_id = &node.parent;
+    }
+    path.reverse();
+    Some(path)
 }
 
 fn required_column_gap(
@@ -5302,4 +5334,49 @@ fn parse_edge_kind(value: &str) -> crate::Result<GraphViewportEdgeKind> {
     serde_json::from_str(&json).context(ParseGraphSnapshotStoreValueSnafu {
         column: "console_graph_edge_routes.edge_kind",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use coco_mem::{MemoryStore, NewNode, NodeStore, Role};
+
+    #[test]
+    fn visible_skill_invocation_linear_subtrees_handles_deep_chain() {
+        let store = MemoryStore::new();
+        let source_id = store.root_id();
+        let depth = 20_000;
+        let mut node_ids = Vec::with_capacity(depth);
+        let mut parent = source_id.clone();
+        for index in 0..depth {
+            parent = store
+                .append(NewNode {
+                    parent,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text(format!("node {index}")),
+                })
+                .unwrap();
+            node_ids.push(parent.clone());
+        }
+        let nodes = node_ids
+            .iter()
+            .map(|node_id| store.get_node(node_id).unwrap())
+            .collect();
+
+        let subtrees = visible_skill_invocation_linear_subtrees(&source_id, nodes).unwrap();
+        let expected_last = node_ids.last().unwrap();
+
+        assert_eq!(subtrees.len(), 1);
+        assert_eq!(subtrees[0].len(), depth);
+        assert_eq!(
+            subtrees[0].first().map(|node| node.id.as_str()),
+            node_ids.first().map(String::as_str)
+        );
+        assert_eq!(
+            subtrees[0].last().map(|node| node.id.as_str()),
+            Some(expected_last.as_str())
+        );
+    }
 }
