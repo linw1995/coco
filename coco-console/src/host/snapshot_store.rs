@@ -517,6 +517,12 @@ impl ConsoleGraphSnapshotStore {
         let this = self.clone();
         let target = target.to_owned();
         self.with_connection(move |connection| {
+            if this
+                .latest_materialization_row_in_connection(connection, mode)?
+                .is_none()
+            {
+                return Ok(None);
+            }
             let row = sql_query(
                 r#"
 SELECT node_key, node_id, node_target, short_id, node_kind, summary, labels_json, x, y
@@ -556,6 +562,12 @@ LIMIT 1
         let this = self.clone();
         let node_ids = node_ids.clone();
         self.with_connection(move |connection| {
+            if this
+                .latest_materialization_row_in_connection(connection, mode)?
+                .is_none()
+            {
+                return Ok(BTreeMap::new());
+            }
             let mut points = BTreeMap::new();
             for node_id in node_ids {
                 if let Some(point) =
@@ -5998,6 +6010,59 @@ mod tests {
 
         assert_eq!(restored_version, 7);
         assert_eq!(row_count, 0);
+
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn direct_materialized_node_lookups_ignore_rows_without_meta() {
+        let path = temp_store_path();
+        let _writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let store = snapshots.clone();
+        snapshots
+            .with_connection_for_tests(move |connection| {
+                store.run_write_transaction(connection, |this, connection| {
+                    this.delete_materialization_meta(connection, GraphMode::All)?;
+                    let lane = GraphViewportLane {
+                        key: "main".to_owned(),
+                        label: "main".to_owned(),
+                        y: crate::layout::GRAPH_TOP_Y,
+                    };
+                    let node = GraphViewportNode {
+                        key: "node:test:0:0".to_owned(),
+                        id: "test".to_owned(),
+                        node_target: "test".to_owned(),
+                        short_id: "test".to_owned(),
+                        kind: "text".to_owned(),
+                        summary: "test".to_owned(),
+                        labels: vec!["main".to_owned()],
+                        x: GRAPH_LEFT_X,
+                        y: lane.y,
+                    };
+                    this.insert_node_location(
+                        connection,
+                        NodeLocationInsert {
+                            mode: GraphMode::All,
+                            node: &node,
+                            lane: &lane,
+                            bounds: node_bounds(&node),
+                        },
+                    )?;
+                    Ok(())
+                })
+            })
+            .unwrap();
+
+        let reference = snapshots
+            .materialized_node_reference(GraphMode::All, "test")
+            .unwrap();
+        let points = snapshots
+            .materialized_node_points(GraphMode::All, &BTreeSet::from(["test".to_owned()]))
+            .unwrap();
+        assert!(reference.is_none());
+        assert!(points.is_empty());
 
         std::fs::remove_dir_all(path).unwrap();
     }
