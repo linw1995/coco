@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
@@ -40,15 +42,30 @@ const SQLITE_SCHEMA_VERSION: i32 = 2;
 
 static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SQLITE_RUNTIME_INIT: Mutex<()> = Mutex::new(());
+static SQLITE_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<SqliteDatabaseInner>>>> =
+    OnceLock::new();
 
 type AsyncSqliteConnection = SyncConnectionWrapper<SqliteConnection>;
+
+type AsyncSqliteConnectionGuard<'a> = tokio::sync::MutexGuard<'a, AsyncSqliteConnection>;
+
+#[derive(Clone)]
+pub struct SqliteDatabase {
+    inner: Arc<SqliteDatabaseInner>,
+}
+
+struct SqliteDatabaseInner {
+    database_path: PathBuf,
+    runtime: &'static Runtime,
+    connection: Arc<tokio::sync::Mutex<AsyncSqliteConnection>>,
+}
 
 #[derive(Clone)]
 pub struct SqliteStore {
     dir: PathBuf,
     database_path: PathBuf,
+    database: SqliteDatabase,
     access: StoreAccess,
-    runtime: &'static Runtime,
     inner: Arc<RwLock<StoreState>>,
     _lock_file: Option<Arc<std::fs::File>>,
 }
@@ -57,7 +74,7 @@ pub struct SqliteStore {
 pub struct SqliteGraphStore {
     dir: PathBuf,
     database_path: PathBuf,
-    runtime: &'static Runtime,
+    database: SqliteDatabase,
     root_id: String,
 }
 
@@ -270,6 +287,93 @@ impl std::fmt::Debug for SqliteStore {
     }
 }
 
+impl std::fmt::Debug for SqliteDatabase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SqliteDatabase")
+            .field("database_path", &self.inner.database_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SqliteDatabase {
+    pub fn open_store_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(sqlite_database_path(path.as_ref()))
+    }
+
+    fn open(database_path: PathBuf) -> Result<Self> {
+        let database_path = sqlite_database_registry_path(&database_path)?;
+        let databases = SQLITE_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut databases = databases
+            .lock()
+            .expect("SQLite database registry lock poisoned");
+        if let Some(inner) = databases
+            .get(&database_path)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(Self { inner });
+        }
+
+        let runtime = sqlite_runtime()?;
+        let connection = block_on_sqlite_runtime_with(runtime, async {
+            let mut connection = AsyncSqliteConnection::establish(&database_path.to_string_lossy())
+                .await
+                .context(ConnectSqliteStoreSnafu {
+                    path: database_path.clone(),
+                })?;
+            configure_connection(&mut connection, &database_path).await?;
+            Ok(connection)
+        })?;
+        let inner = Arc::new(SqliteDatabaseInner {
+            database_path: database_path.clone(),
+            runtime,
+            connection: Arc::new(tokio::sync::Mutex::new(connection)),
+        });
+        databases.insert(database_path, Arc::downgrade(&inner));
+        Ok(Self { inner })
+    }
+
+    fn connection(&self) -> &tokio::sync::Mutex<AsyncSqliteConnection> {
+        &self.inner.connection
+    }
+
+    pub fn with_sync_connection<T, E, F, M>(
+        &self,
+        operation: F,
+        map_connection_error: M,
+    ) -> std::result::Result<T, E>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(&mut SqliteConnection) -> std::result::Result<T, E> + Send + 'static,
+        M: FnOnce(diesel::result::Error) -> E,
+    {
+        let result = self.block_on(async {
+            let mut connection = self.connection().lock().await;
+            connection
+                .spawn_blocking(move |connection| Ok(operation(connection)))
+                .await
+        });
+        match result {
+            Ok(result) => result,
+            Err(error) => Err(map_connection_error(error)),
+        }
+    }
+
+    #[cfg(test)]
+    fn shared_connection(&self) -> &Arc<tokio::sync::Mutex<AsyncSqliteConnection>> {
+        &self.inner.connection
+    }
+
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        block_on_sqlite_runtime_with(self.inner.runtime, future)
+    }
+}
+
 impl SqliteStore {
     pub fn open_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -301,9 +405,11 @@ impl SqliteStore {
         store.persist_state_snapshot(&state)?;
         store.persist_fs_migration_complete_marker()?;
         store.prepare_database_for_atomic_rename()?;
-        fs::rename(&store.database_path, sqlite_database_path(path)).context(
+        let migration_database_path = store.database_path.clone();
+        drop(store);
+        fs::rename(&migration_database_path, sqlite_database_path(path)).context(
             WriteStoreDirectorySnafu {
-                path: store.database_path.clone(),
+                path: migration_database_path.clone(),
             },
         )?;
 
@@ -335,8 +441,8 @@ impl SqliteStore {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         ensure_existing_store_directory(path)?;
+        ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
-        ensure_existing_database_file(&store.database_path)?;
         store.ensure_current_schema()?;
         store.load_state()?;
         Ok(store)
@@ -371,6 +477,7 @@ impl SqliteStore {
         database_path: PathBuf,
         access: StoreAccess,
     ) -> Result<Self> {
+        let database = SqliteDatabase::open(database_path.clone())?;
         let lock_file = if access == StoreAccess::ReadWrite {
             Some(super::fs::open_store_lock(path)?)
         } else {
@@ -378,9 +485,9 @@ impl SqliteStore {
         };
         Ok(Self {
             dir: path.to_owned(),
-            database_path,
+            database_path: database_path.clone(),
+            database,
             access,
-            runtime: sqlite_runtime()?,
             inner: Arc::new(RwLock::new(StoreState::new())),
             _lock_file: lock_file,
         })
@@ -465,15 +572,7 @@ impl SqliteStore {
         F: std::future::Future + Send,
         F::Output: Send,
     {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return std::thread::scope(|scope| {
-                scope
-                    .spawn(|| self.runtime.block_on(future))
-                    .join()
-                    .expect("SQLite store worker thread should not panic")
-            });
-        }
-        self.runtime.block_on(future)
+        self.database.block_on(future)
     }
 
     fn load_or_initialize_state(&self) -> Result<()> {
@@ -546,15 +645,8 @@ PRAGMA journal_mode = DELETE;
         })
     }
 
-    async fn connect(&self) -> Result<AsyncSqliteConnection> {
-        let database_url = self.database_path.to_string_lossy().into_owned();
-        let mut connection = AsyncSqliteConnection::establish(&database_url)
-            .await
-            .context(ConnectSqliteStoreSnafu {
-                path: self.database_path.clone(),
-            })?;
-        configure_connection(&mut connection, &self.database_path).await?;
-        Ok(connection)
+    async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
+        Ok(self.database.connection().lock().await)
     }
 
     #[cfg(test)]
@@ -567,8 +659,8 @@ impl SqliteGraphStore {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         ensure_existing_store_directory(path)?;
+        ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path)?;
-        ensure_existing_database_file(&store.database_path)?;
         store.ensure_current_schema()?;
         let root_id = store.block_on(async {
             let mut connection = store.connect().await?;
@@ -582,10 +674,12 @@ impl SqliteGraphStore {
     }
 
     fn new(path: &Path) -> Result<Self> {
+        let database_path = sqlite_database_path(path);
+        let database = SqliteDatabase::open(database_path.clone())?;
         Ok(Self {
             dir: path.to_owned(),
-            database_path: sqlite_database_path(path),
-            runtime: sqlite_runtime()?,
+            database_path,
+            database,
             root_id: String::new(),
         })
     }
@@ -618,26 +712,11 @@ impl SqliteGraphStore {
         F: std::future::Future + Send,
         F::Output: Send,
     {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return std::thread::scope(|scope| {
-                scope
-                    .spawn(|| self.runtime.block_on(future))
-                    .join()
-                    .expect("SQLite graph store worker thread should not panic")
-            });
-        }
-        self.runtime.block_on(future)
+        self.database.block_on(future)
     }
 
-    async fn connect(&self) -> Result<AsyncSqliteConnection> {
-        let database_url = self.database_path.to_string_lossy().into_owned();
-        let mut connection = AsyncSqliteConnection::establish(&database_url)
-            .await
-            .context(ConnectSqliteStoreSnafu {
-                path: self.database_path.clone(),
-            })?;
-        configure_connection(&mut connection, &self.database_path).await?;
-        Ok(connection)
+    async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
+        Ok(self.database.connection().lock().await)
     }
 
     fn ensure_read_only<T>(&self) -> Result<T> {
@@ -759,6 +838,22 @@ pub(super) fn sqlite_database_path(path: &Path) -> PathBuf {
     path.join(SQLITE_DATABASE_FILE_NAME)
 }
 
+fn sqlite_database_registry_path(database_path: &Path) -> Result<PathBuf> {
+    let Some(parent) = database_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return Ok(database_path.to_owned());
+    };
+    let Some(file_name) = database_path.file_name() else {
+        return Ok(database_path.to_owned());
+    };
+    let parent = parent
+        .canonicalize()
+        .context(WriteStoreDirectorySnafu { path: parent })?;
+    Ok(parent.join(file_name))
+}
+
 fn sqlite_migration_database_path(path: &Path) -> PathBuf {
     path.join(SQLITE_MIGRATION_DATABASE_FILE_NAME)
 }
@@ -834,6 +929,22 @@ fn sqlite_runtime() -> Result<&'static Runtime> {
     Ok(SQLITE_RUNTIME
         .get()
         .expect("SQLite runtime should be initialized"))
+}
+
+fn block_on_sqlite_runtime_with<F>(runtime: &'static Runtime, future: F) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::scope(|scope| {
+            scope
+                .spawn(|| runtime.block_on(future))
+                .join()
+                .expect("SQLite store worker thread should not panic")
+        });
+    }
+    runtime.block_on(future)
 }
 
 fn prepare_store_directory(path: &Path) -> Result<()> {
@@ -2645,6 +2756,7 @@ mod tests {
     use diesel::sql_query;
     use diesel::sql_types::{Integer, Nullable, Text};
     use diesel_async::RunQueryDsl;
+    use std::sync::Arc;
 
     #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
     struct NodeRelationRow {
@@ -2748,6 +2860,90 @@ VALUES (?, ?, ?, ?, ?, ?)
 
         assert!(store.database_path().is_file());
         assert_eq!(store.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn cloned_sqlite_store_shares_database_instance() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+
+        let store = SqliteStore::open(&path).unwrap();
+        let cloned = store.clone();
+
+        assert!(Arc::ptr_eq(
+            store.database.shared_connection(),
+            cloned.database.shared_connection()
+        ));
+    }
+
+    #[test]
+    fn reopened_sqlite_handles_share_database_instance() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+
+        let store = SqliteStore::open(&path).unwrap();
+        let read_only = SqliteStore::open_read_only(&path).unwrap();
+        let graph = SqliteGraphStore::open_read_only(&path).unwrap();
+        let lexical_read_only = SqliteStore::open_read_only(path.join(".")).unwrap();
+
+        assert!(Arc::ptr_eq(
+            store.database.shared_connection(),
+            read_only.database.shared_connection()
+        ));
+        assert!(Arc::ptr_eq(
+            store.database.shared_connection(),
+            graph.database.shared_connection()
+        ));
+        assert!(Arc::ptr_eq(
+            store.database.shared_connection(),
+            lexical_read_only.database.shared_connection()
+        ));
+    }
+
+    #[test]
+    fn sqlite_store_serializes_concurrent_writes_on_shared_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+
+        let handles = (0..8)
+            .map(|index| {
+                let store = store.clone();
+                let root_id = root_id.clone();
+                std::thread::spawn(move || {
+                    store
+                        .append(NewNode {
+                            parent: root_id,
+                            role: Role::User,
+                            metadata: None,
+                            kind: Kind::Text(format!("child-{index}")),
+                        })
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut node_ids = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        node_ids.sort();
+
+        let mut children = store
+            .list_children(&store.root_id())
+            .unwrap()
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        children.sort();
+
+        assert_eq!(children, node_ids);
+        let reopened = SqliteStore::open_read_only(&path).unwrap();
+        assert_eq!(
+            reopened.list_children(&reopened.root_id()).unwrap().len(),
+            8
+        );
     }
 
     #[test]
@@ -3170,6 +3366,19 @@ THIS IS NOT SQL;
         let err = SqliteStore::open_read_only(&path).unwrap_err();
 
         assert!(err.to_string().contains("SQLite"));
+        assert!(!super::sqlite_database_path(&path).exists());
+    }
+
+    #[test]
+    fn graph_open_read_only_rejects_missing_schema_without_creating_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = SqliteGraphStore::open_read_only(&path).unwrap_err();
+
+        assert!(err.to_string().contains("SQLite"));
+        assert!(!super::sqlite_database_path(&path).exists());
     }
 
     #[test]

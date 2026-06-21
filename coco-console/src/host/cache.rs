@@ -8987,16 +8987,21 @@ mod tests {
         count: i64,
     }
 
-    fn sqlite_test_connection(database_path: &std::path::Path) -> diesel::sqlite::SqliteConnection {
-        use diesel::connection::SimpleConnection;
-        use diesel::prelude::*;
-
-        let database_url = database_path.to_string_lossy().into_owned();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(&database_url).unwrap();
-        connection
-            .batch_execute("PRAGMA busy_timeout = 5000;")
-            .unwrap();
-        connection
+    fn with_sqlite_test_connection<T, F>(database_path: &std::path::Path, operation: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut diesel::sqlite::SqliteConnection) -> T + Send + 'static,
+    {
+        let store_path = database_path
+            .parent()
+            .expect("SQLite database path should have a store directory");
+        coco_mem::SqliteDatabase::open_store_path(store_path)
+            .unwrap()
+            .with_sync_connection(
+                |connection| Ok(operation(connection)),
+                std::convert::identity,
+            )
+            .unwrap()
     }
 
     fn sqlite_table_exists(database_path: &std::path::Path, table: &str) -> bool {
@@ -9004,25 +9009,29 @@ mod tests {
         use diesel::sql_query;
         use diesel::sql_types::Text;
 
-        let mut connection = sqlite_test_connection(database_path);
-        let row = sql_query(
-            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind::<Text, _>(table)
-        .get_result::<SqliteCount>(&mut connection)
-        .unwrap();
-        row.count > 0
+        let table = table.to_owned();
+        with_sqlite_test_connection(database_path, move |connection| {
+            let row = sql_query(
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind::<Text, _>(table)
+            .get_result::<SqliteCount>(connection)
+            .unwrap();
+            row.count > 0
+        })
     }
 
     fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
         use diesel::prelude::*;
         use diesel::sql_query;
 
-        let mut connection = sqlite_test_connection(database_path);
-        sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
-            .get_result::<SqliteCount>(&mut connection)
-            .unwrap()
-            .count
+        let table = table.to_owned();
+        with_sqlite_test_connection(database_path, move |connection| {
+            sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
+                .get_result::<SqliteCount>(connection)
+                .unwrap()
+                .count
+        })
     }
 
     fn sqlite_audit_row_count(database_path: &std::path::Path, kind: &str) -> i64 {
@@ -9030,12 +9039,14 @@ mod tests {
         use diesel::sql_query;
         use diesel::sql_types::Text;
 
-        let mut connection = sqlite_test_connection(database_path);
-        sql_query("SELECT COUNT(*) AS count FROM console_graph_fact_audit WHERE kind = ?")
-            .bind::<Text, _>(kind)
-            .get_result::<SqliteCount>(&mut connection)
-            .unwrap()
-            .count
+        let kind = kind.to_owned();
+        with_sqlite_test_connection(database_path, move |connection| {
+            sql_query("SELECT COUNT(*) AS count FROM console_graph_fact_audit WHERE kind = ?")
+                .bind::<Text, _>(kind)
+                .get_result::<SqliteCount>(connection)
+                .unwrap()
+                .count
+        })
     }
 
     fn sqlite_table_has_column(database_path: &std::path::Path, table: &str, column: &str) -> bool {
@@ -9043,40 +9054,44 @@ mod tests {
         use diesel::sql_query;
         use diesel::sql_types::Text;
 
-        let mut connection = sqlite_test_connection(database_path);
-        let row = sql_query(format!(
-            "SELECT COUNT(*) AS count FROM pragma_table_info('{table}') WHERE name = ?"
-        ))
-        .bind::<Text, _>(column)
-        .get_result::<SqliteCount>(&mut connection)
-        .unwrap();
-        row.count > 0
+        let table = table.to_owned();
+        let column = column.to_owned();
+        with_sqlite_test_connection(database_path, move |connection| {
+            let row = sql_query(format!(
+                "SELECT COUNT(*) AS count FROM pragma_table_info('{table}') WHERE name = ?"
+            ))
+            .bind::<Text, _>(column)
+            .get_result::<SqliteCount>(connection)
+            .unwrap();
+            row.count > 0
+        })
     }
 
     fn create_legacy_snapshot_materialization_tables(database_path: &std::path::Path) {
         use diesel::connection::SimpleConnection;
 
-        let mut connection = sqlite_test_connection(database_path);
-        connection
-            .batch_execute(
-                r#"
+        with_sqlite_test_connection(database_path, |connection| {
+            connection
+                .batch_execute(
+                    r#"
 CREATE TABLE console_graph_snapshots (mode TEXT PRIMARY KEY NOT NULL);
 CREATE TABLE console_graph_viewports (mode TEXT PRIMARY KEY NOT NULL);
 CREATE TABLE console_graph_viewport_lanes (mode TEXT NOT NULL);
 CREATE TABLE console_graph_viewport_nodes (mode TEXT NOT NULL);
 CREATE TABLE console_graph_viewport_edges (mode TEXT NOT NULL);
 "#,
-            )
-            .unwrap();
+                )
+                .unwrap();
+        });
     }
 
     fn create_graph_fact_audit_triggers(database_path: &std::path::Path) {
         use diesel::connection::SimpleConnection;
 
-        let mut connection = sqlite_test_connection(database_path);
-        connection
-            .batch_execute(
-                r#"
+        with_sqlite_test_connection(database_path, |connection| {
+            connection
+                .batch_execute(
+                    r#"
 CREATE TABLE console_graph_fact_audit (kind TEXT NOT NULL);
 CREATE TRIGGER console_graph_node_delete_audit
 AFTER DELETE ON console_graph_node_locations
@@ -9099,8 +9114,9 @@ BEGIN
     INSERT INTO console_graph_fact_audit (kind) VALUES ('edge_update');
 END;
 "#,
-            )
-            .unwrap();
+                )
+                .unwrap();
+        });
     }
 
     #[tokio::test]

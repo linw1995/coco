@@ -11,7 +11,7 @@ mod tests;
 
 pub use fs::FsStore;
 pub use memory::MemoryStore;
-pub use sqlite::{SqliteGraphStore, SqliteStore};
+pub use sqlite::{SqliteDatabase, SqliteGraphStore, SqliteStore};
 
 use crate::{
     Job, JobStatus, MessageQueueItem, NewNode, Node, Preset, PresetRecord, SessionAnchorPatch,
