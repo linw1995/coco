@@ -692,87 +692,145 @@ LIMIT 1
     ) -> crate::Result<bool> {
         let this = self.clone();
         self.with_connection(move |connection| {
-            let Some(first_index) =
-                this.first_visible_initial_branch_index(&source, mode, &session_states)?
-            else {
-                return this.run_bool_write_transaction(connection, |this, connection| {
-                    this.delete_materialization_meta(connection, mode)?;
-                    this.put_empty_materialization_in_transaction(connection, source_version, mode)
-                });
-            };
-
-            this.run_write_transaction(connection, |this, connection| {
-                this.delete_materialization_meta(connection, mode)?;
-                this.clear_materialized_mode_facts(connection, mode)
-            })?;
-
-            let (first_branch, first_state) = &session_states[first_index];
-            if !this.run_bool_write_transaction(connection, |this, connection| {
-                this.try_seed_first_branch_materialization_in_transaction(
-                    connection,
-                    &source,
-                    mode,
-                    first_branch,
-                    first_state,
-                )
-            })? {
-                return Ok(false);
-            }
-
-            let mut next_lane_y = crate::layout::GRAPH_TOP_Y + GRAPH_LANE_HEIGHT;
-            for (branch, state) in session_states[first_index..].iter().skip(1) {
-                if !this.branch_has_initial_visible_nodes(&source, mode, branch)? {
-                    continue;
-                }
-                let head_id = source
-                    .get_branch_head(branch)
-                    .context(crate::error::StoreSnafu)?;
-                let appended =
-                    this.run_bool_write_transaction(connection, |this, connection| {
-                        this.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
-                        let input = AppendLinearBranchInput {
+            let previous_meta = this.latest_materialization_row_in_connection(connection, mode)?;
+            let result = (|| {
+                let Some(first_index) =
+                    this.first_visible_initial_branch_index(&source, mode, &session_states)?
+                else {
+                    return this.run_bool_write_transaction(connection, |this, connection| {
+                        this.delete_materialization_meta(connection, mode)?;
+                        this.put_empty_materialization_in_transaction(
+                            connection,
+                            source_version,
                             mode,
-                            branch,
-                            state,
-                            head_id: &head_id,
-                        };
-                        match mode {
-                            GraphMode::Anchors => this
-                                .try_append_new_anchor_branch_lane_in_transaction(
+                        )
+                    });
+                };
+
+                this.run_write_transaction(connection, |this, connection| {
+                    this.delete_materialization_meta(connection, mode)?;
+                    this.clear_materialized_mode_facts(connection, mode)
+                })?;
+
+                let (first_branch, first_state) = &session_states[first_index];
+                if !this.run_bool_write_transaction(connection, |this, connection| {
+                    this.try_seed_first_branch_materialization_in_transaction(
+                        connection,
+                        &source,
+                        mode,
+                        first_branch,
+                        first_state,
+                    )
+                })? {
+                    return Ok(false);
+                }
+
+                let mut next_lane_y = crate::layout::GRAPH_TOP_Y + GRAPH_LANE_HEIGHT;
+                for (branch, state) in session_states[first_index..].iter().skip(1) {
+                    if !this.branch_has_initial_visible_nodes(&source, mode, branch)? {
+                        continue;
+                    }
+                    let head_id = source
+                        .get_branch_head(branch)
+                        .context(crate::error::StoreSnafu)?;
+                    let appended =
+                        this.run_bool_write_transaction(connection, |this, connection| {
+                            this.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
+                            let input = AppendLinearBranchInput {
+                                mode,
+                                branch,
+                                state,
+                                head_id: &head_id,
+                            };
+                            match mode {
+                                GraphMode::Anchors => this
+                                    .try_append_new_anchor_branch_lane_in_transaction(
+                                        connection,
+                                        &source,
+                                        input,
+                                        next_lane_y,
+                                    ),
+                                GraphMode::All => this.try_append_new_branch_lane_in_transaction(
                                     connection,
                                     &source,
                                     input,
                                     next_lane_y,
                                 ),
-                            GraphMode::All => this.try_append_new_branch_lane_in_transaction(
-                                connection,
-                                &source,
-                                input,
-                                next_lane_y,
-                            ),
-                        }
-                    })?;
-                if !appended {
-                    return Ok(false);
+                            }
+                        })?;
+                    if !appended {
+                        return Ok(false);
+                    }
+                    next_lane_y += GRAPH_LANE_HEIGHT;
                 }
-                next_lane_y += GRAPH_LANE_HEIGHT;
-            }
 
-            this.run_bool_write_transaction(connection, |this, connection| {
-                this.rebalance_routed_edge_slots(connection, mode)?;
-                if this
-                    .refresh_materialized_node_labels(connection, &source, mode, &session_states)?
-                    .is_none()
-                {
-                    return Ok(false);
+                this.run_bool_write_transaction(connection, |this, connection| {
+                    this.rebalance_routed_edge_slots(connection, mode)?;
+                    if this
+                        .refresh_materialized_node_labels(
+                            connection,
+                            &source,
+                            mode,
+                            &session_states,
+                        )?
+                        .is_none()
+                    {
+                        return Ok(false);
+                    }
+                    this.put_materialization_meta_from_materialized_rows(
+                        connection,
+                        source_version,
+                        mode,
+                    )?;
+                    Ok(true)
+                })
+            })();
+
+            match result {
+                Ok(true) => Ok(true),
+                Ok(false) => {
+                    this.restore_empty_materialization_after_failed_batch_seed(
+                        connection,
+                        mode,
+                        previous_meta,
+                    )?;
+                    Ok(false)
                 }
-                this.put_materialization_meta_from_materialized_rows(
+                Err(error) => {
+                    let _ = this.restore_empty_materialization_after_failed_batch_seed(
+                        connection,
+                        mode,
+                        previous_meta,
+                    );
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    fn restore_empty_materialization_after_failed_batch_seed(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        previous_meta: Option<MaterializationRow>,
+    ) -> crate::Result<()> {
+        self.run_write_transaction(connection, |this, connection| {
+            this.delete_materialization_meta(connection, mode)?;
+            this.clear_materialized_mode_facts(connection, mode)?;
+            if let Some(meta) = previous_meta {
+                this.put_materialization_meta(
                     connection,
-                    source_version,
-                    mode,
+                    MaterializationMetaInput {
+                        source_version: meta.source_version.max(0) as u64,
+                        mode,
+                        world_min_x: meta.world_min_x,
+                        world_min_y: meta.world_min_y,
+                        world_max_x: meta.world_max_x,
+                        world_max_y: meta.world_max_y,
+                    },
                 )?;
-                Ok(true)
-            })
+            }
+            Ok(())
         })
     }
 
@@ -842,7 +900,6 @@ LIMIT 1
         )?;
         Ok(true)
     }
-
     fn first_visible_initial_branch_index(
         &self,
         store: &(impl BranchStore + NodeStore),
@@ -5876,6 +5933,70 @@ mod tests {
             })
             .unwrap();
         assert!(row.is_none());
+
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn failed_batch_seed_clears_committed_facts_and_restores_empty_meta() {
+        let path = temp_store_path();
+        let _writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let store = snapshots.clone();
+        let (restored_version, row_count) = snapshots
+            .with_connection_for_tests(move |connection| {
+                store.run_bool_write_transaction(connection, |this, connection| {
+                    this.put_empty_materialization_in_transaction(connection, 7, GraphMode::All)
+                })?;
+                let previous_meta =
+                    store.latest_materialization_row_in_connection(connection, GraphMode::All)?;
+                store.run_write_transaction(connection, |this, connection| {
+                    this.delete_materialization_meta(connection, GraphMode::All)?;
+                    let lane = GraphViewportLane {
+                        key: "main".to_owned(),
+                        label: "main".to_owned(),
+                        y: crate::layout::GRAPH_TOP_Y,
+                    };
+                    let node = GraphViewportNode {
+                        key: "node:test:0:0".to_owned(),
+                        id: "test".to_owned(),
+                        node_target: "test".to_owned(),
+                        short_id: "test".to_owned(),
+                        kind: "text".to_owned(),
+                        summary: "test".to_owned(),
+                        labels: Vec::new(),
+                        x: GRAPH_LEFT_X,
+                        y: lane.y,
+                    };
+                    this.insert_node_location(
+                        connection,
+                        NodeLocationInsert {
+                            mode: GraphMode::All,
+                            node: &node,
+                            lane: &lane,
+                            bounds: node_bounds(&node),
+                        },
+                    )?;
+                    Ok(())
+                })?;
+
+                store.restore_empty_materialization_after_failed_batch_seed(
+                    connection,
+                    GraphMode::All,
+                    previous_meta,
+                )?;
+                let restored = store
+                    .latest_materialization_row_in_connection(connection, GraphMode::All)?
+                    .expect("empty materialization meta should be restored");
+                let rows =
+                    store.materialized_node_rows_in_connection(connection, GraphMode::All)?;
+                Ok((restored.source_version, rows.len()))
+            })
+            .unwrap();
+
+        assert_eq!(restored_version, 7);
+        assert_eq!(row_count, 0);
 
         std::fs::remove_dir_all(path).unwrap();
     }
