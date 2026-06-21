@@ -475,9 +475,9 @@ struct SqliteInteger {
 
 impl ConsoleGraphSnapshotStore {
     pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
-        let path = dir.as_ref().join(SQLITE_DATABASE_FILE_NAME);
+        let path = database_path(dir);
         let database =
-            SqliteDatabase::open_store_path(dir.as_ref()).context(crate::error::StoreSnafu)?;
+            SqliteDatabase::open_unshared_file_path(&path).context(crate::error::StoreSnafu)?;
         let store = Self {
             path: Arc::new(path),
             database,
@@ -636,39 +636,43 @@ LIMIT 1
 
         let this = self.clone();
         self.with_connection(move |connection| {
-            this.begin_write_transaction(connection)?;
-            let has_materialization = this
-                .latest_materialization_row_in_connection(connection, mode)?
-                .is_some();
             let result = if session_states.is_empty() {
+                this.begin_write_transaction(connection)?;
                 this.put_empty_materialization_in_transaction(connection, source_version, mode)
-            } else if !has_materialization
-                || this
-                    .materialized_node_rows_in_connection(connection, mode)?
-                    .is_empty()
-            {
-                this.try_seed_initial_branch_materialization_in_transaction(
-                    connection,
-                    &source,
-                    source_version,
-                    mode,
-                    &session_states,
-                )
             } else {
-                match mode {
-                    GraphMode::Anchors => this.try_update_anchor_materialization_in_transaction(
-                        connection,
-                        &source,
-                        source_version,
-                        &session_states,
-                    ),
-                    GraphMode::All => this.try_append_linear_branches_in_transaction(
+                let has_materialization = this
+                    .latest_materialization_row_in_connection(connection, mode)?
+                    .is_some();
+                let materialization_is_empty = !has_materialization
+                    || this
+                        .materialized_node_rows_in_connection(connection, mode)?
+                        .is_empty();
+                this.begin_write_transaction(connection)?;
+                if materialization_is_empty {
+                    this.try_seed_initial_branch_materialization_in_transaction(
                         connection,
                         &source,
                         source_version,
                         mode,
                         &session_states,
-                    ),
+                    )
+                } else {
+                    match mode {
+                        GraphMode::Anchors => this
+                            .try_update_anchor_materialization_in_transaction(
+                                connection,
+                                &source,
+                                source_version,
+                                &session_states,
+                            ),
+                        GraphMode::All => this.try_append_linear_branches_in_transaction(
+                            connection,
+                            &source,
+                            source_version,
+                            mode,
+                            &session_states,
+                        ),
+                    }
                 }
             };
             match result {
@@ -5083,6 +5087,10 @@ ORDER BY min_y, min_x, edge_key
             crate::Error::QueryGraphSnapshotStore { path, source }
         })
     }
+}
+
+pub(crate) fn database_path(dir: impl AsRef<Path>) -> PathBuf {
+    dir.as_ref().join(SQLITE_DATABASE_FILE_NAME)
 }
 
 #[derive(Clone, Copy)]

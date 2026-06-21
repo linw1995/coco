@@ -72,6 +72,53 @@ struct CachedGraphSnapshot {
     snapshot: Arc<GraphSnapshot>,
 }
 
+macro_rules! log_rebuild_status {
+    ($status:expr) => {{
+        let status = &$status;
+        if status.state == ConsoleGraphRebuildState::Failed {
+            tracing::warn!(
+                mode = ?status.mode,
+                source_version = status.source_version,
+                phase = ?status.phase,
+                processed = status.processed,
+                total = status.total,
+                message = %status.message,
+                "console graph rebuild failed",
+            );
+        } else if should_log_rebuild_status_at_info(status) {
+            tracing::info!(
+                mode = ?status.mode,
+                source_version = status.source_version,
+                state = ?status.state,
+                phase = ?status.phase,
+                processed = status.processed,
+                total = status.total,
+                message = %status.message,
+                "console graph rebuild status",
+            );
+        } else {
+            tracing::debug!(
+                mode = ?status.mode,
+                source_version = status.source_version,
+                state = ?status.state,
+                phase = ?status.phase,
+                processed = status.processed,
+                total = status.total,
+                message = %status.message,
+                "console graph rebuild progress",
+            );
+        }
+    }};
+}
+
+macro_rules! set_rebuild_status {
+    ($cache:expr, $status:expr) => {{
+        let status = $status;
+        log_rebuild_status!(status);
+        $cache.set_rebuild_status(status);
+    }};
+}
+
 impl<S> ConsoleGraphCache<S>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -207,43 +254,52 @@ where
         }
         let graph_version = source_version;
         let source = self.source.clone();
-        self.set_rebuild_status(rebuild_status(
-            mode,
-            source_version,
-            ConsoleGraphRebuildState::Building,
-            None,
-            0,
-            0,
-            "Building graph snapshot",
-        ));
+        set_rebuild_status!(
+            self,
+            rebuild_status(
+                mode,
+                source_version,
+                ConsoleGraphRebuildState::Building,
+                None,
+                0,
+                0,
+                "Building graph snapshot",
+            )
+        );
         let progress_cache = self.clone();
         let snapshot = self
             .run_blocking_graph_compute(move || {
                 source.build_snapshot_with_progress(mode, graph_version, |progress| {
-                    progress_cache.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Building,
-                        Some(progress.phase),
-                        progress.processed,
-                        progress.total,
-                        progress.phase.label(),
-                    ));
+                    set_rebuild_status!(
+                        progress_cache,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Building,
+                            Some(progress.phase),
+                            progress.processed,
+                            progress.total,
+                            progress.phase.label(),
+                        )
+                    );
                 })
             })
             .await??;
         let snapshot = Arc::new(snapshot);
         self.store_cached_snapshot(mode, source_version, snapshot.clone());
         self.publish_ready_version(source_version);
-        self.set_rebuild_status(rebuild_status(
-            mode,
-            source_version,
-            ConsoleGraphRebuildState::Ready,
-            None,
-            1,
-            1,
-            "Graph snapshot ready",
-        ));
+        set_rebuild_status!(
+            self,
+            rebuild_status(
+                mode,
+                source_version,
+                ConsoleGraphRebuildState::Ready,
+                None,
+                1,
+                1,
+                "Graph snapshot ready",
+            )
+        );
         Ok(snapshot)
     }
 
@@ -656,15 +712,18 @@ where
     fn ensure_snapshot_current(&self, mode: GraphMode) {
         let source_version = self.invalidations.current_version();
         if self.cached_snapshot(mode, source_version).is_some() {
-            self.set_rebuild_status(rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Ready,
-                None,
-                1,
-                1,
-                "Graph snapshot ready",
-            ));
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Ready,
+                    None,
+                    1,
+                    1,
+                    "Graph snapshot ready",
+                )
+            );
             return;
         }
         if !self.mark_rebuild_scheduled(mode, source_version) {
@@ -682,15 +741,18 @@ where
         if (self.snapshots.is_none() && self.cached_snapshot(mode, source_version).is_some())
             || self.materialization_current(mode, source_version)
         {
-            self.set_rebuild_status(rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Ready,
-                None,
-                1,
-                1,
-                "Graph materialization ready",
-            ));
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Ready,
+                    None,
+                    1,
+                    1,
+                    "Graph materialization ready",
+                )
+            );
             return;
         }
         if !self.mark_rebuild_scheduled(mode, source_version) {
@@ -705,19 +767,22 @@ where
 
     async fn rebuild_snapshot(&self, mode: GraphMode, source_version: u64) {
         let uses_materialized_store = self.snapshots.is_some();
-        self.set_rebuild_status(rebuild_status(
-            mode,
-            source_version,
-            ConsoleGraphRebuildState::Building,
-            None,
-            0,
-            0,
-            if uses_materialized_store {
-                "Building graph materialization"
-            } else {
-                "Building graph snapshot"
-            },
-        ));
+        set_rebuild_status!(
+            self,
+            rebuild_status(
+                mode,
+                source_version,
+                ConsoleGraphRebuildState::Building,
+                None,
+                0,
+                0,
+                if uses_materialized_store {
+                    "Building graph materialization"
+                } else {
+                    "Building graph snapshot"
+                },
+            )
+        );
         if let Some(snapshots) = self.snapshots.clone() {
             let has_materialization = snapshots.has_materialization(mode);
             let source = self.source.clone();
@@ -729,44 +794,71 @@ where
             match incremental_result {
                 Ok(Ok(true)) => {
                     self.publish_ready_version(source_version);
-                    self.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Ready,
-                        None,
-                        1,
-                        1,
-                        "Graph materialization updated",
-                    ));
+                    set_rebuild_status!(
+                        self,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Ready,
+                            None,
+                            1,
+                            1,
+                            "Graph materialization updated",
+                        )
+                    );
                     return;
                 }
                 Ok(Ok(false)) => match has_materialization {
                     Ok(true) => {
-                        self.set_rebuild_status(rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Failed,
-                            None,
-                            0,
-                            0,
-                            "Incremental graph materialization could not apply this store change",
-                        ));
+                        set_rebuild_status!(
+                            self,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Failed,
+                                None,
+                                0,
+                                0,
+                                "Incremental graph materialization could not apply this store change",
+                            )
+                        );
                         return;
                     }
                     Ok(false) => {
-                        self.set_rebuild_status(rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Failed,
-                            None,
-                            0,
-                            0,
-                            "Incremental graph materialization could not seed this store state",
-                        ));
+                        set_rebuild_status!(
+                            self,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Failed,
+                                None,
+                                0,
+                                0,
+                                "Incremental graph materialization could not seed this store state",
+                            )
+                        );
                         return;
                     }
                     Err(error) => {
-                        self.set_rebuild_status(rebuild_status(
+                        set_rebuild_status!(
+                            self,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Failed,
+                                None,
+                                0,
+                                0,
+                                error.to_string(),
+                            )
+                        );
+                        return;
+                    }
+                },
+                Ok(Err(error)) => {
+                    set_rebuild_status!(
+                        self,
+                        rebuild_status(
                             mode,
                             source_version,
                             ConsoleGraphRebuildState::Failed,
@@ -774,32 +866,23 @@ where
                             0,
                             0,
                             error.to_string(),
-                        ));
-                        return;
-                    }
-                },
-                Ok(Err(error)) => {
-                    self.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Failed,
-                        None,
-                        0,
-                        0,
-                        error.to_string(),
-                    ));
+                        )
+                    );
                     return;
                 }
                 Err(error) => {
-                    self.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Failed,
-                        None,
-                        0,
-                        0,
-                        error.to_string(),
-                    ));
+                    set_rebuild_status!(
+                        self,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Failed,
+                            None,
+                            0,
+                            0,
+                            error.to_string(),
+                        )
+                    );
                     return;
                 }
             }
@@ -809,15 +892,18 @@ where
         let result = self
             .run_blocking_graph_compute(move || {
                 source.build_snapshot_with_progress(mode, source_version, |progress| {
-                    progress_cache.set_rebuild_status(rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Building,
-                        Some(progress.phase),
-                        progress.processed,
-                        progress.total,
-                        progress.phase.label(),
-                    ));
+                    set_rebuild_status!(
+                        progress_cache,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Building,
+                            Some(progress.phase),
+                            progress.processed,
+                            progress.total,
+                            progress.phase.label(),
+                        )
+                    );
                 })
             })
             .await;
@@ -825,34 +911,47 @@ where
             Ok(Ok(snapshot)) => {
                 self.store_cached_snapshot(mode, source_version, Arc::new(snapshot));
                 self.publish_ready_version(source_version);
-                self.set_rebuild_status(rebuild_status(
-                    mode,
-                    source_version,
-                    ConsoleGraphRebuildState::Ready,
-                    None,
-                    1,
-                    1,
-                    "Graph snapshot ready",
-                ));
+                set_rebuild_status!(
+                    self,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Ready,
+                        None,
+                        1,
+                        1,
+                        "Graph snapshot ready",
+                    )
+                );
             }
-            Ok(Err(error)) => self.set_rebuild_status(rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Failed,
-                None,
-                0,
-                0,
-                error.to_string(),
-            )),
-            Err(error) => self.set_rebuild_status(rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Failed,
-                None,
-                0,
-                0,
-                error.to_string(),
-            )),
+            Ok(Err(error)) => {
+                set_rebuild_status!(
+                    self,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Failed,
+                        None,
+                        0,
+                        0,
+                        error.to_string(),
+                    )
+                );
+            }
+            Err(error) => {
+                set_rebuild_status!(
+                    self,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Failed,
+                        None,
+                        0,
+                        0,
+                        error.to_string(),
+                    )
+                );
+            }
         }
     }
 
@@ -915,7 +1014,7 @@ where
         }) {
             return false;
         }
-        *state.rebuild_slot_mut(mode) = Some(rebuild_status(
+        let status = rebuild_status(
             mode,
             source_version,
             ConsoleGraphRebuildState::Scheduled,
@@ -923,7 +1022,9 @@ where
             0,
             0,
             "Graph snapshot scheduled",
-        ));
+        );
+        log_rebuild_status!(status);
+        *state.rebuild_slot_mut(mode) = Some(status);
         drop(state);
         self.progress.mark_changed();
         true
@@ -939,6 +1040,16 @@ where
         drop(state);
         self.progress.mark_changed();
     }
+}
+
+fn should_log_rebuild_status_at_info(status: &ConsoleGraphRebuildStatus) -> bool {
+    if status.state != ConsoleGraphRebuildState::Building {
+        return true;
+    }
+
+    status
+        .phase
+        .is_some_and(|_| status.processed == 0 || status.processed == status.total)
 }
 
 impl CacheState {
@@ -1268,6 +1379,51 @@ mod tests {
         assert_eq!(branches[0].lane_y, None);
     }
 
+    #[test]
+    fn graph_rebuild_status_logs_phase_boundaries_at_info() {
+        let phase_start = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Building,
+            Some(crate::graph::GraphBuildPhase::Entries),
+            0,
+            10,
+            "Building graph entries",
+        );
+        let phase_progress = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Building,
+            Some(crate::graph::GraphBuildPhase::Entries),
+            5,
+            10,
+            "Building graph entries",
+        );
+        let phase_complete = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Building,
+            Some(crate::graph::GraphBuildPhase::Entries),
+            10,
+            10,
+            "Building graph entries",
+        );
+        let ready = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Ready,
+            None,
+            1,
+            1,
+            "Graph snapshot ready",
+        );
+
+        assert!(should_log_rebuild_status_at_info(&phase_start));
+        assert!(!should_log_rebuild_status_at_info(&phase_progress));
+        assert!(should_log_rebuild_status_at_info(&phase_complete));
+        assert!(should_log_rebuild_status_at_info(&ready));
+    }
+
     #[tokio::test]
     async fn cache_builds_snapshots_per_mode_on_demand() {
         let publisher = ConsolePublisher::new();
@@ -1514,7 +1670,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         let materialized = materialized.expect("materialized viewport should be stored");
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         assert_eq!(
             sqlite_table_row_count(&database_path, "console_graph_materializations"),
             1
@@ -1570,13 +1726,70 @@ mod tests {
                 .is_none()
         );
         assert!(reopened.is_none());
-        assert!(!path.join("console-graph-snapshots.sqlite3").exists());
         assert!(
             reopened_materialized
                 .nodes
                 .iter()
                 .any(|node| node.id == session)
         );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn graph_materialization_preflight_read_does_not_block_store_writes() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
+        let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
+        let transaction = std::thread::spawn(move || {
+            use diesel::connection::SimpleConnection;
+            use diesel::prelude::*;
+            use diesel::sql_query;
+
+            with_sqlite_test_connection(&graph_database_path, move |connection| {
+                connection.batch_execute("BEGIN TRANSACTION").unwrap();
+                assert_eq!(
+                    sql_query("SELECT COUNT(*) AS count FROM console_graph_materializations")
+                        .get_result::<SqliteCount>(connection)
+                        .unwrap()
+                        .count,
+                    0,
+                );
+                transaction_started_tx.send(()).unwrap();
+                release_transaction_rx.recv().unwrap();
+                connection.batch_execute("ROLLBACK").unwrap();
+            });
+        });
+        transaction_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("graph materialization preflight read should start");
+
+        let writer_for_thread = writer.clone();
+        let root = writer.root_id();
+        let (write_tx, write_rx) = mpsc::channel();
+        let write = std::thread::spawn(move || {
+            let node = writer_for_thread
+                .append(NewNode {
+                    parent: root,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("store write while graph db is locked".to_owned()),
+                })
+                .unwrap();
+            write_tx.send(node).unwrap();
+        });
+
+        let written = write_rx.recv_timeout(Duration::from_secs(1));
+        release_transaction_tx.send(()).unwrap();
+        transaction.join().unwrap();
+        write.join().unwrap();
+        let written = written.expect("store write should not wait for graph transaction release");
+        assert_eq!(writer.get_node(&written).unwrap().id, written);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -3381,7 +3594,7 @@ mod tests {
         publisher.mark_changed();
 
         cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let next = writer
             .append(NewNode {
@@ -3463,7 +3676,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let second = writer
             .append(NewNode {
@@ -4870,7 +5083,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let merge_anchor = writer
             .append(NewNode {
@@ -4990,7 +5203,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let merge_anchor = writer
             .append(NewNode {
@@ -5091,7 +5304,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let orphan_parent = writer
             .append(NewNode {
@@ -6269,7 +6482,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let second = writer
             .append(NewNode {
@@ -6339,7 +6552,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let prompt = writer
             .append(NewNode {
@@ -6458,7 +6671,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer
             .set_branch_head("main", &second_prompt, &first_prompt)
@@ -6556,7 +6769,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("draft").unwrap();
         publisher.mark_changed();
@@ -6651,7 +6864,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &session).unwrap();
         let draft_anchor = writer
@@ -6796,7 +7009,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &current_session).unwrap();
         let draft_anchor = writer
@@ -6892,7 +7105,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let current_session = writer
             .append(NewNode {
@@ -7085,7 +7298,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &main_anchor).unwrap();
         publisher.mark_changed();
@@ -7219,7 +7432,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let merge_anchor = writer
             .append(NewNode {
@@ -7457,7 +7670,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.set_branch_head("main", &second, &first).unwrap();
         publisher.mark_changed();
@@ -7548,7 +7761,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer
             .set_branch_head("main", &main_second, &main_first)
@@ -7691,7 +7904,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("draft").unwrap();
         publisher.mark_changed();
@@ -7772,7 +7985,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let main_second = writer
             .append(NewNode {
@@ -7871,7 +8084,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &main_first).unwrap();
         let draft_first = writer
@@ -8180,7 +8393,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &main_first).unwrap();
         let draft_merge = writer
@@ -8280,7 +8493,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &main_first).unwrap();
         publisher.mark_changed();
@@ -8376,7 +8589,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("draft", &session).unwrap();
         publisher.mark_changed();
@@ -8457,7 +8670,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         let main_next = writer
             .append(NewNode {
@@ -8559,7 +8772,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.fork("beta", &main_first).unwrap();
         let beta_first = writer
@@ -8685,7 +8898,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("draft").unwrap();
         publisher.mark_changed();
@@ -8774,7 +8987,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("main").unwrap();
         publisher.mark_changed();
@@ -8902,7 +9115,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_graph_fact_audit_triggers(&database_path);
         writer.delete_branch("beta").unwrap();
         publisher.mark_changed();
@@ -8956,7 +9169,7 @@ mod tests {
     async fn cache_drops_legacy_snapshot_materialization_tables() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
-        let database_path = path.join("store.sqlite3");
+        let database_path = crate::host::snapshot_store::database_path(&path);
         create_legacy_snapshot_materialization_tables(&database_path);
 
         let publisher = ConsolePublisher::new();
@@ -8992,10 +9205,7 @@ mod tests {
         T: Send + 'static,
         F: FnOnce(&mut diesel::sqlite::SqliteConnection) -> T + Send + 'static,
     {
-        let store_path = database_path
-            .parent()
-            .expect("SQLite database path should have a store directory");
-        coco_mem::SqliteDatabase::open_store_path(store_path)
+        coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
             .unwrap()
             .with_sync_connection(
                 |connection| Ok(operation(connection)),
