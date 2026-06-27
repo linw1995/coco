@@ -39,6 +39,7 @@ in {
     ];
     packages = with pkgs; [
       prek
+      diesel-cli
       grcov
 
       cargo-nextest
@@ -58,6 +59,7 @@ in {
     ];
     packages = with pkgs; [
       prek
+      diesel-cli
       wasm-bindgen-cli
       ruff
       taplo

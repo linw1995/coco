@@ -7,6 +7,7 @@ version.workspace = true
 # Storage.
 diesel.workspace = true
 diesel-async.workspace = true
+diesel_migrations.workspace = true
 libsqlite3-sys.workspace = true
 tokio.workspace = true
 
