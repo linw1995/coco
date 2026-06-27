@@ -175,6 +175,12 @@ pub enum StoreError {
         source: diesel::result::Error,
     },
 
+    #[snafu(display("Failed to run SQLite store migrations for {path:?}: {source}"))]
+    MigrateSqliteStore {
+        path: PathBuf,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to parse SQLite store value {column:?} in {path:?}: {source}"))]
     ParseSqliteStoreValue {
         path: PathBuf,

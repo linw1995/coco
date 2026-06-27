@@ -11,6 +11,7 @@ use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::sqlite::SqliteConnection;
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use snafu::prelude::*;
 use tokio::runtime::Runtime;
 
@@ -23,7 +24,7 @@ use crate::StoreResult as Result;
 use crate::error::{
     AmbiguousNodePrefixSnafu, BranchNotFoundSnafu, ConnectSqliteStoreSnafu, CorruptedStoreSnafu,
     LegacyJsonStoreSnafu, NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu,
-    QuerySqliteStoreSnafu, RefsNotConnectedSnafu, StartSqliteRuntimeSnafu,
+    QuerySqliteStoreSnafu, RefsNotConnectedSnafu, StartSqliteRuntimeSnafu, StoreError,
     StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::{
@@ -34,8 +35,11 @@ use crate::{
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const SQLITE_SCHEMA_VERSION: i32 = 2;
+const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
+const LEGACY_MIGRATION_TABLE_NAME: &str = "store_schema_migrations";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
 const LEGACY_JSON_STORE_MARKERS: &[&str] = &["meta.json", "nodes.jsonl"];
+const STORE_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SQLITE_RUNTIME_INIT: Mutex<()> = Mutex::new(());
@@ -81,12 +85,6 @@ enum StoreAccess {
     ReadOnly,
 }
 
-struct SqliteMigration {
-    version: i32,
-    name: &'static str,
-    sql: &'static str,
-}
-
 #[derive(QueryableByName)]
 struct TableCount {
     #[diesel(sql_type = BigInt)]
@@ -95,8 +93,8 @@ struct TableCount {
 
 #[derive(QueryableByName)]
 struct CurrentSchemaVersion {
-    #[diesel(sql_type = Nullable<Integer>)]
-    version: Option<i32>,
+    #[diesel(sql_type = Nullable<Text>)]
+    version: Option<String>,
 }
 
 #[derive(QueryableByName)]
@@ -170,108 +168,6 @@ struct SkillRow {
     #[diesel(sql_type = Text)]
     record_json: String,
 }
-
-const SQLITE_MIGRATIONS: &[SqliteMigration] = &[
-    SqliteMigration {
-        version: 1,
-        name: "initial-store-schema",
-        sql: r#"
-CREATE TABLE store_meta (
-    key TEXT PRIMARY KEY NOT NULL,
-    value_json TEXT NOT NULL
-);
-
-CREATE TABLE nodes (
-    id TEXT PRIMARY KEY NOT NULL,
-    parent_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    role TEXT NOT NULL,
-    metadata_json TEXT,
-    kind_json TEXT NOT NULL
-);
-
-CREATE INDEX nodes_parent_idx ON nodes(parent_id);
-CREATE INDEX nodes_created_at_id_idx ON nodes(created_at, id);
-
-CREATE TABLE node_edges (
-    parent_id TEXT NOT NULL,
-    child_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    PRIMARY KEY (parent_id, child_id, kind),
-    FOREIGN KEY (child_id) REFERENCES nodes(id)
-);
-
-CREATE INDEX node_edges_parent_idx ON node_edges(parent_id);
-
-CREATE TABLE branches (
-    name TEXT PRIMARY KEY NOT NULL,
-    head_id TEXT NOT NULL,
-    FOREIGN KEY (head_id) REFERENCES nodes(id)
-);
-
-CREATE TABLE sessions (
-    branch_name TEXT PRIMARY KEY NOT NULL,
-    state_json TEXT NOT NULL,
-    FOREIGN KEY (branch_name) REFERENCES branches(name) ON DELETE CASCADE
-);
-
-CREATE TABLE jobs (
-    job_id TEXT PRIMARY KEY NOT NULL,
-    payload_json TEXT NOT NULL
-);
-
-CREATE TABLE message_queue_items (
-    queue TEXT NOT NULL,
-    message_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    PRIMARY KEY (queue, message_id)
-);
-
-CREATE INDEX message_queue_items_dequeue_idx ON message_queue_items(queue, created_at, message_id);
-
-CREATE TABLE presets (
-    name TEXT PRIMARY KEY NOT NULL,
-    record_json TEXT NOT NULL
-);
-
-CREATE TABLE skills (
-    role TEXT NOT NULL,
-    name TEXT NOT NULL,
-    record_json TEXT NOT NULL,
-    PRIMARY KEY (role, name)
-);
-"#,
-    },
-    SqliteMigration {
-        version: 2,
-        name: "node-relations",
-        sql: r#"
-CREATE TABLE node_relations (
-    child_node_id TEXT NOT NULL,
-    parent_node_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    PRIMARY KEY (child_node_id, kind, ordinal),
-    FOREIGN KEY (child_node_id) REFERENCES nodes(id),
-    FOREIGN KEY (parent_node_id) REFERENCES nodes(id)
-);
-
-INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal)
-SELECT
-    child_id,
-    parent_id,
-    kind,
-    ROW_NUMBER() OVER (PARTITION BY child_id, kind ORDER BY rowid) - 1
-FROM node_edges;
-
-CREATE INDEX node_relations_child_kind_idx ON node_relations(child_node_id, kind);
-CREATE INDEX node_relations_parent_kind_idx ON node_relations(parent_node_id, kind);
-
-DROP TABLE node_edges;
-"#,
-    },
-];
 
 impl std::fmt::Debug for SqliteStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -506,10 +402,10 @@ impl SqliteStore {
             let mut connection = self.connect().await?;
             configure_writable_connection(&mut connection, &self.database_path).await?;
             ensure_migration_table(&mut connection, &self.database_path).await?;
+            bootstrap_diesel_migrations_from_legacy_table(&mut connection, &self.database_path)
+                .await?;
             reject_newer_schema_version(&mut connection, &self.database_path).await?;
-            for migration in SQLITE_MIGRATIONS {
-                apply_migration_if_needed(&mut connection, &self.database_path, migration).await?;
-            }
+            run_embedded_migrations(&mut connection, &self.database_path).await?;
             Ok(())
         })
     }
@@ -541,15 +437,19 @@ impl SqliteStore {
         ensure_existing_store_directory(path)?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
         ensure_existing_database_file(&store.database_path)?;
-        let version = store.block_on(async {
+        let (version, has_diesel_migration_table) = store.block_on(async {
             let mut connection = store.connect().await?;
-            ensure_migration_table_exists(&mut connection, &store.database_path).await?;
-            current_schema_version(&mut connection, &store.database_path)
-                .await?
-                .context(CorruptedStoreSnafu {
-                    path: store.database_path.clone(),
-                    message: "missing SQLite schema version".to_owned(),
-                })
+            let has_diesel_migration_table = table_count(
+                &mut connection,
+                &store.database_path,
+                DIESEL_MIGRATION_TABLE_NAME,
+            )
+            .await?
+                == 1;
+            let version =
+                existing_schema_version_for_upgrade_check(&mut connection, &store.database_path)
+                    .await?;
+            Ok((version, has_diesel_migration_table))
         })?;
         ensure!(
             version <= SQLITE_SCHEMA_VERSION,
@@ -560,6 +460,9 @@ impl SqliteStore {
                 ),
             }
         );
+        if !has_diesel_migration_table {
+            return Ok(true);
+        }
         Ok(version < SQLITE_SCHEMA_VERSION)
     }
 
@@ -1006,10 +909,9 @@ async fn ensure_migration_table(connection: &mut AsyncSqliteConnection, path: &P
     connection
         .batch_execute(
             r#"
-CREATE TABLE IF NOT EXISTS store_schema_migrations (
-    version INTEGER PRIMARY KEY NOT NULL,
-    name TEXT NOT NULL,
-    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+CREATE TABLE IF NOT EXISTS __diesel_schema_migrations (
+    version VARCHAR(50) PRIMARY KEY NOT NULL,
+    run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 "#,
         )
@@ -1023,12 +925,12 @@ async fn ensure_migration_table_exists(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<()> {
-    let count = table_count(connection, path, "store_schema_migrations").await?;
+    let count = table_count(connection, path, DIESEL_MIGRATION_TABLE_NAME).await?;
     ensure!(
         count == 1,
         CorruptedStoreSnafu {
             path: path.to_owned(),
-            message: "missing SQLite schema migration table".to_owned(),
+            message: "missing SQLite Diesel schema migration table".to_owned(),
         }
     );
     Ok(())
@@ -1053,13 +955,59 @@ async fn current_schema_version(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<Option<i32>> {
-    sql_query("SELECT MAX(version) AS version FROM store_schema_migrations")
+    sql_query("SELECT MAX(version) AS version FROM __diesel_schema_migrations")
         .get_result::<CurrentSchemaVersion>(connection)
         .await
-        .map(|row| row.version)
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
-        })
+        })?
+        .version
+        .map(|version| migration_version_to_schema_version(&version, path))
+        .transpose()
+}
+
+async fn existing_schema_version_for_upgrade_check(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<i32> {
+    if table_count(connection, path, DIESEL_MIGRATION_TABLE_NAME).await? == 1 {
+        return current_schema_version(connection, path)
+            .await?
+            .context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: "missing SQLite schema version".to_owned(),
+            });
+    }
+
+    if table_count(connection, path, LEGACY_MIGRATION_TABLE_NAME).await? == 1 {
+        return current_legacy_schema_version(connection, path)
+            .await?
+            .context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: "missing legacy SQLite schema version".to_owned(),
+            });
+    }
+
+    CorruptedStoreSnafu {
+        path: path.to_owned(),
+        message: "missing SQLite schema migration table".to_owned(),
+    }
+    .fail()
+}
+
+async fn current_legacy_schema_version(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<Option<i32>> {
+    sql_query("SELECT CAST(MAX(version) AS TEXT) AS version FROM store_schema_migrations")
+        .get_result::<CurrentSchemaVersion>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .version
+        .map(|version| migration_version_to_schema_version(&version, path))
+        .transpose()
 }
 
 async fn reject_newer_schema_version(
@@ -1081,71 +1029,55 @@ async fn reject_newer_schema_version(
     Ok(())
 }
 
-async fn apply_migration_if_needed(
+async fn run_embedded_migrations(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
-    migration: &SqliteMigration,
 ) -> Result<()> {
-    if migration_applied(connection, path, migration.version).await? {
+    let path = path.to_owned();
+    let result = connection
+        .spawn_blocking(move |connection| {
+            Ok(connection
+                .run_pending_migrations(STORE_MIGRATIONS)
+                .map(|_| ()))
+        })
+        .await
+        .context(QuerySqliteStoreSnafu { path: path.clone() })?;
+    result.map_err(|source| StoreError::MigrateSqliteStore { path, source })
+}
+
+async fn bootstrap_diesel_migrations_from_legacy_table(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<()> {
+    if table_count(connection, path, LEGACY_MIGRATION_TABLE_NAME).await? == 0 {
         return Ok(());
     }
 
-    connection
-        .batch_execute("BEGIN IMMEDIATE")
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
-
-    let result = apply_migration_in_transaction(connection, path, migration).await;
-    match result {
-        Ok(()) => connection
-            .batch_execute("COMMIT")
-            .await
-            .context(QuerySqliteStoreSnafu {
-                path: path.to_owned(),
-            }),
-        Err(error) => {
-            let _ = connection.batch_execute("ROLLBACK").await;
-            Err(error)
-        }
-    }
-}
-
-async fn apply_migration_in_transaction(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    migration: &SqliteMigration,
-) -> Result<()> {
-    connection
-        .batch_execute(migration.sql)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
-    sql_query("INSERT INTO store_schema_migrations (version, name) VALUES (?, ?)")
-        .bind::<Integer, _>(migration.version)
-        .bind::<diesel::sql_types::Text, _>(migration.name)
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
+    sql_query(
+        r#"
+INSERT OR IGNORE INTO __diesel_schema_migrations (version, run_on)
+SELECT printf('%014d', version), applied_at
+FROM store_schema_migrations
+"#,
+    )
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
     Ok(())
 }
 
-async fn migration_applied(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    version: i32,
-) -> Result<bool> {
-    sql_query("SELECT COUNT(*) AS count FROM store_schema_migrations WHERE version = ?")
-        .bind::<Integer, _>(version)
-        .get_result::<TableCount>(connection)
-        .await
-        .map(|row| row.count > 0)
-        .context(QuerySqliteStoreSnafu {
+fn migration_version_to_schema_version(version: &str, path: &Path) -> Result<i32> {
+    let trimmed = version.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    trimmed
+        .parse::<i32>()
+        .map_err(|source| StoreError::CorruptedStore {
             path: path.to_owned(),
+            message: format!("invalid SQLite migration version {version:?}: {source}"),
         })
 }
 
@@ -2649,8 +2581,8 @@ impl ProcessShareableStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        AsyncSqliteConnection, MessageQueueItem, NodeRow, SqliteGraphStore, SqliteMigration,
-        SqliteStore, StoreAccess, persist_root_metadata,
+        AsyncSqliteConnection, MessageQueueItem, NodeRow, SqliteGraphStore, SqliteStore,
+        StoreAccess, persist_root_metadata,
     };
     use crate::{
         Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, NewNode,
@@ -2659,7 +2591,7 @@ mod tests {
     };
     use diesel::sql_query;
     use diesel::sql_types::{Integer, Nullable, Text};
-    use diesel_async::RunQueryDsl;
+    use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
@@ -2750,6 +2682,62 @@ ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
             .await
             .unwrap();
         });
+    }
+
+    async fn apply_v1_schema_for_test(
+        connection: &mut AsyncSqliteConnection,
+        store_path: &std::path::Path,
+    ) {
+        super::configure_writable_connection(connection, store_path)
+            .await
+            .unwrap();
+        super::ensure_migration_table(connection, store_path)
+            .await
+            .unwrap();
+        connection
+            .batch_execute(include_str!(
+                "../../migrations/00000000000001_initial_store_schema/up.sql"
+            ))
+            .await
+            .unwrap();
+        sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES (?)")
+            .bind::<Text, _>("00000000000001")
+            .execute(connection)
+            .await
+            .unwrap();
+    }
+
+    async fn apply_legacy_v1_schema_for_test(
+        connection: &mut AsyncSqliteConnection,
+        store_path: &std::path::Path,
+    ) {
+        super::configure_writable_connection(connection, store_path)
+            .await
+            .unwrap();
+        connection
+            .batch_execute(
+                r#"
+CREATE TABLE store_schema_migrations (
+    version INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+"#,
+            )
+            .await
+            .unwrap();
+        connection
+            .batch_execute(include_str!(
+                "../../migrations/00000000000001_initial_store_schema/up.sql"
+            ))
+            .await
+            .unwrap();
+        sql_query("INSERT INTO store_schema_migrations (version, name) VALUES (?, ?)")
+            .bind::<Integer, _>(1)
+            .bind::<Text, _>("initial-store-schema")
+            .execute(connection)
+            .await
+            .unwrap();
     }
 
     async fn insert_v1_node_row(
@@ -2913,52 +2901,6 @@ VALUES (?, ?, ?, ?, ?, ?)
             reopened.list_children(&reopened.root_id()).unwrap().len(),
             8
         );
-    }
-
-    #[test]
-    fn failed_schema_migration_rolls_back_ddl() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir.path().join("store");
-        std::fs::create_dir(&path).unwrap();
-        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
-        let migration = SqliteMigration {
-            version: 100,
-            name: "failing-test-migration",
-            sql: r#"
-CREATE TABLE rollback_probe (
-    id INTEGER PRIMARY KEY NOT NULL
-);
-THIS IS NOT SQL;
-"#,
-        };
-
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            super::configure_writable_connection(&mut connection, &store.database_path)
-                .await
-                .unwrap();
-            super::ensure_migration_table(&mut connection, &store.database_path)
-                .await
-                .unwrap();
-
-            let err =
-                super::apply_migration_if_needed(&mut connection, &store.database_path, &migration)
-                    .await
-                    .unwrap_err();
-
-            assert!(err.to_string().contains("SQLite"));
-            assert_eq!(
-                super::table_count(&mut connection, &store.database_path, "rollback_probe")
-                    .await
-                    .unwrap(),
-                0
-            );
-            assert!(
-                !super::migration_applied(&mut connection, &store.database_path, migration.version)
-                    .await
-                    .unwrap()
-            );
-        });
     }
 
     #[test]
@@ -3136,19 +3078,7 @@ THIS IS NOT SQL;
 
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
-            super::configure_writable_connection(&mut connection, &store.database_path)
-                .await
-                .unwrap();
-            super::ensure_migration_table(&mut connection, &store.database_path)
-                .await
-                .unwrap();
-            super::apply_migration_if_needed(
-                &mut connection,
-                &store.database_path,
-                &super::SQLITE_MIGRATIONS[0],
-            )
-            .await
-            .unwrap();
+            apply_v1_schema_for_test(&mut connection, &store.database_path).await;
             persist_root_metadata(&mut connection, &store.database_path, &root_id)
                 .await
                 .unwrap();
@@ -3180,7 +3110,8 @@ THIS IS NOT SQL;
         });
         drop(store);
 
-        let migrated = SqliteStore::open(&path).unwrap();
+        let crate::store::PersistentStore::Sqlite(migrated) =
+            crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
         assert_eq!(migrated.schema_version().unwrap(), 2);
         assert_eq!(
@@ -3229,19 +3160,7 @@ THIS IS NOT SQL;
 
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
-            super::configure_writable_connection(&mut connection, &store.database_path)
-                .await
-                .unwrap();
-            super::ensure_migration_table(&mut connection, &store.database_path)
-                .await
-                .unwrap();
-            super::apply_migration_if_needed(
-                &mut connection,
-                &store.database_path,
-                &super::SQLITE_MIGRATIONS[0],
-            )
-            .await
-            .unwrap();
+            apply_v1_schema_for_test(&mut connection, &store.database_path).await;
             persist_root_metadata(&mut connection, &store.database_path, &root_id)
                 .await
                 .unwrap();
@@ -3254,6 +3173,51 @@ THIS IS NOT SQL;
 
         assert_eq!(migrated.schema_version().unwrap(), 2);
         assert_eq!(migrated.root_id(), root_id);
+    }
+
+    #[test]
+    fn open_imports_legacy_schema_migration_records() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
+        let state = super::StoreState::new();
+        let root = state.root_node().clone();
+        let root_id = root.id.clone();
+
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            apply_legacy_v1_schema_for_test(&mut connection, &store.database_path).await;
+            persist_root_metadata(&mut connection, &store.database_path, &root_id)
+                .await
+                .unwrap();
+            insert_v1_node_row(&mut connection, &store.database_path, root).await;
+        });
+        drop(store);
+
+        let migrated = SqliteStore::open(&path).unwrap();
+
+        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(migrated.root_id(), root_id);
+        migrated.block_on(async {
+            let mut connection = migrated.connect().await.unwrap();
+            assert_eq!(
+                super::table_count(
+                    &mut connection,
+                    &migrated.database_path,
+                    "__diesel_schema_migrations",
+                )
+                .await
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                super::table_count(&mut connection, &migrated.database_path, "node_relations")
+                    .await
+                    .unwrap(),
+                1
+            );
+        });
     }
 
     #[test]
