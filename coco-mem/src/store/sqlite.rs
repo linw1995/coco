@@ -34,6 +34,7 @@ use crate::{
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const SQLITE_SCHEMA_VERSION: i32 = 2;
+const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
 const LEGACY_JSON_STORE_MARKERS: &[&str] = &["meta.json", "nodes.jsonl"];
 
 static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -436,7 +437,7 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         prepare_store_directory(path)?;
-        reject_legacy_json_store_without_sqlite(path)?;
+        reject_incomplete_legacy_json_store(path)?;
         let store = Self::new(path, StoreAccess::ReadWrite)?;
         store.run_migrations()?;
         store.load_or_initialize_state()?;
@@ -446,7 +447,7 @@ impl SqliteStore {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         ensure_existing_store_directory(path)?;
-        reject_legacy_json_store_without_sqlite(path)?;
+        reject_incomplete_legacy_json_store(path)?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
         store.ensure_current_schema()?;
@@ -935,21 +936,36 @@ fn ensure_existing_database_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn reject_legacy_json_store_without_sqlite(path: &Path) -> Result<()> {
-    if sqlite_database_path(path).exists() {
-        return Ok(());
-    }
-
+fn reject_incomplete_legacy_json_store(path: &Path) -> Result<()> {
     let has_legacy_marker = LEGACY_JSON_STORE_MARKERS
         .iter()
         .any(|file_name| path.join(file_name).exists());
-    ensure!(
-        !has_legacy_marker,
-        LegacyJsonStoreSnafu {
-            path: path.to_owned(),
-        }
-    );
-    Ok(())
+    if !has_legacy_marker {
+        return Ok(());
+    }
+
+    let database_path = sqlite_database_path(path);
+    if database_path.is_file() && fs_migration_complete_marker_exists(path)? {
+        return Ok(());
+    }
+
+    LegacyJsonStoreSnafu {
+        path: path.to_owned(),
+    }
+    .fail()
+}
+
+fn fs_migration_complete_marker_exists(path: &Path) -> Result<bool> {
+    let store = SqliteStore::new(path, StoreAccess::ReadOnly)?;
+    store.block_on(async {
+        let mut connection = store.connect().await?;
+        load_store_meta_bool(
+            &mut connection,
+            &store.database_path,
+            FS_MIGRATION_COMPLETE_META_KEY,
+        )
+        .await
+    })
 }
 
 async fn configure_connection(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
@@ -1166,6 +1182,31 @@ ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
         path: path.to_owned(),
     })?;
     Ok(())
+}
+
+async fn load_store_meta_bool(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    key: &str,
+) -> Result<bool> {
+    if table_count(connection, path, "store_meta").await? == 0 {
+        return Ok(false);
+    }
+    let Some(value) = sql_query("SELECT value_json FROM store_meta WHERE key = ?")
+        .bind::<Text, _>(key)
+        .get_result::<StoreMetaValue>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+    else {
+        return Ok(false);
+    };
+    serde_json::from_str(&value.value_json).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: format!("store_meta.{key}"),
+    })
 }
 
 async fn load_root_id(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<String> {
@@ -2692,6 +2733,25 @@ ORDER BY kind, ordinal, parent_node_id
         })
     }
 
+    fn persist_store_meta_bool_for_test(store: &SqliteStore, key: &str, value: bool) {
+        let value_json = serde_json::to_string(&value).unwrap();
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            sql_query(
+                r#"
+INSERT INTO store_meta (key, value_json)
+VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+"#,
+            )
+            .bind::<Text, _>(key)
+            .bind::<Text, _>(value_json)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        });
+    }
+
     async fn insert_v1_node_row(
         connection: &mut AsyncSqliteConnection,
         store_path: &std::path::Path,
@@ -3289,6 +3349,36 @@ THIS IS NOT SQL;
             matches!(err, crate::StoreError::LegacyJsonStore { path: legacy } if legacy == path)
         );
         assert!(!super::sqlite_database_path(&path).exists());
+    }
+
+    #[test]
+    fn open_rejects_legacy_json_store_with_unmarked_sqlite_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        SqliteStore::open(&path).unwrap();
+        std::fs::write(path.join("meta.json"), "{}").unwrap();
+        std::fs::write(path.join("nodes.jsonl"), "").unwrap();
+
+        let err = SqliteStore::open(&path).unwrap_err();
+
+        assert!(
+            matches!(err, crate::StoreError::LegacyJsonStore { path: legacy } if legacy == path)
+        );
+    }
+
+    #[test]
+    fn open_accepts_legacy_json_store_after_completed_sqlite_migration() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        persist_store_meta_bool_for_test(&store, super::FS_MIGRATION_COMPLETE_META_KEY, true);
+        drop(store);
+        std::fs::write(path.join("meta.json"), "{}").unwrap();
+        std::fs::write(path.join("nodes.jsonl"), "").unwrap();
+
+        let reopened = SqliteStore::open(&path).unwrap();
+
+        assert_eq!(reopened.schema_version().unwrap(), 2);
     }
 
     #[test]
