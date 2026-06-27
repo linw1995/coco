@@ -464,9 +464,7 @@ impl SqliteStore {
             },
         )?;
 
-        let migrated = Self::new(path, StoreAccess::ReadWrite)?;
-        migrated.load_state()?;
-        Ok(migrated)
+        Self::open(path)
     }
 
     pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> Result<Self> {
@@ -3992,7 +3990,7 @@ THIS IS NOT SQL;
     }
 
     #[test]
-    fn unshared_open_enables_wal_after_fs_migration() {
+    fn open_or_migrate_fs_enables_wal_after_fs_migration() {
         use diesel::sql_query;
         use diesel_async::RunQueryDsl;
 
@@ -4013,7 +4011,7 @@ THIS IS NOT SQL;
                 .unwrap()
                 .journal_mode
         });
-        assert_eq!(journal_mode, "delete");
+        assert_eq!(journal_mode, "wal");
 
         let database = SqliteDatabase::open_unshared_file_path(migrated.database_path()).unwrap();
         let journal_mode = database
