@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
 use diesel::sql_query;
-use diesel::sql_types::{BigInt, Integer, Nullable, Text};
+use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel::sqlite::SqliteConnection;
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -26,6 +26,10 @@ use crate::error::{
     LegacyJsonStoreSnafu, NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu,
     QuerySqliteStoreSnafu, RefsNotConnectedSnafu, StartSqliteRuntimeSnafu, StoreError,
     StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+};
+use crate::schema::{
+    branches, jobs, message_queue_items, node_relations, nodes, presets, sessions, skills,
+    store_meta,
 };
 use crate::{
     Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Preset,
@@ -98,18 +102,12 @@ struct CurrentSchemaVersion {
 }
 
 #[derive(QueryableByName)]
-struct StoreMetaValue {
-    #[diesel(sql_type = Text)]
-    value_json: String,
-}
-
-#[derive(QueryableByName)]
 struct NodeIdRow {
     #[diesel(sql_type = Text)]
     id: String,
 }
 
-#[derive(QueryableByName)]
+#[derive(Queryable, QueryableByName)]
 struct NodeRow {
     #[diesel(sql_type = Text)]
     id: String,
@@ -125,7 +123,7 @@ struct NodeRow {
     kind_json: String,
 }
 
-#[derive(QueryableByName)]
+#[derive(Queryable, QueryableByName)]
 struct BranchRow {
     #[diesel(sql_type = Text)]
     name: String,
@@ -133,18 +131,12 @@ struct BranchRow {
     head_id: String,
 }
 
-#[derive(QueryableByName)]
+#[derive(Queryable, QueryableByName)]
 struct SessionRow {
     #[diesel(sql_type = Text)]
     branch_name: String,
     #[diesel(sql_type = Text)]
     state_json: String,
-}
-
-#[derive(QueryableByName)]
-struct JobRow {
-    #[diesel(sql_type = Text)]
-    payload_json: String,
 }
 
 #[derive(QueryableByName)]
@@ -155,13 +147,7 @@ struct MessageQueueItemRow {
     item_json: String,
 }
 
-#[derive(QueryableByName)]
-struct PresetRow {
-    #[diesel(sql_type = Text)]
-    record_json: String,
-}
-
-#[derive(QueryableByName)]
+#[derive(Queryable, QueryableByName)]
 struct SkillRow {
     #[diesel(sql_type = Text)]
     role: String,
@@ -1082,10 +1068,10 @@ fn migration_version_to_schema_version(version: &str, path: &Path) -> Result<i32
 }
 
 async fn node_count(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<i64> {
-    sql_query("SELECT COUNT(*) AS count FROM nodes")
-        .get_result::<TableCount>(connection)
+    nodes::table
+        .select(diesel::dsl::count_star())
+        .first(connection)
         .await
-        .map(|row| row.count)
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })
@@ -1100,19 +1086,19 @@ async fn persist_root_metadata(
         path: path.to_owned(),
         column: "store_meta.root_id".to_owned(),
     })?;
-    sql_query(
-        r#"
-INSERT INTO store_meta (key, value_json)
-VALUES ('root_id', ?)
-ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
-"#,
-    )
-    .bind::<Text, _>(root_json)
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
+    diesel::insert_into(store_meta::table)
+        .values((
+            store_meta::key.eq("root_id"),
+            store_meta::value_json.eq(root_json),
+        ))
+        .on_conflict(store_meta::key)
+        .do_update()
+        .set(store_meta::value_json.eq(diesel::upsert::excluded(store_meta::value_json)))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
     Ok(())
 }
 
@@ -1124,9 +1110,10 @@ async fn load_store_meta_bool(
     if table_count(connection, path, "store_meta").await? == 0 {
         return Ok(false);
     }
-    let Some(value) = sql_query("SELECT value_json FROM store_meta WHERE key = ?")
-        .bind::<Text, _>(key)
-        .get_result::<StoreMetaValue>(connection)
+    let Some(value) = store_meta::table
+        .filter(store_meta::key.eq(key))
+        .select(store_meta::value_json)
+        .first::<String>(connection)
         .await
         .optional()
         .context(QuerySqliteStoreSnafu {
@@ -1135,15 +1122,17 @@ async fn load_store_meta_bool(
     else {
         return Ok(false);
     };
-    serde_json::from_str(&value.value_json).context(ParseSqliteStoreValueSnafu {
+    serde_json::from_str(&value).context(ParseSqliteStoreValueSnafu {
         path: path.to_owned(),
         column: format!("store_meta.{key}"),
     })
 }
 
 async fn load_root_id(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<String> {
-    let Some(value) = sql_query("SELECT value_json FROM store_meta WHERE key = 'root_id'")
-        .get_result::<StoreMetaValue>(connection)
+    let Some(value) = store_meta::table
+        .filter(store_meta::key.eq("root_id"))
+        .select(store_meta::value_json)
+        .first::<String>(connection)
         .await
         .optional()
         .context(QuerySqliteStoreSnafu {
@@ -1156,7 +1145,7 @@ async fn load_root_id(connection: &mut AsyncSqliteConnection, path: &Path) -> Re
         }
         .fail();
     };
-    serde_json::from_str(&value.value_json).context(ParseSqliteStoreValueSnafu {
+    serde_json::from_str(&value).context(ParseSqliteStoreValueSnafu {
         path: path.to_owned(),
         column: "store_meta.root_id".to_owned(),
     })
@@ -1196,18 +1185,21 @@ async fn load_node_rows(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<Vec<NodeRow>> {
-    sql_query(
-        r#"
-SELECT id, parent_id, created_at, role, metadata_json, kind_json
-FROM nodes
-ORDER BY created_at, id
-"#,
-    )
-    .load::<NodeRow>(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })
+    nodes::table
+        .select((
+            nodes::id,
+            nodes::parent_id,
+            nodes::created_at,
+            nodes::role,
+            nodes::metadata_json,
+            nodes::kind_json,
+        ))
+        .order((nodes::created_at, nodes::id))
+        .load::<NodeRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
 }
 
 fn insert_node_rows(state: &mut StoreState, mut rows: Vec<NodeRow>, path: &Path) -> Result<()> {
@@ -1254,40 +1246,34 @@ async fn persist_node(
     node: &Node,
 ) -> Result<()> {
     let row = NodeRow::from_node(node.clone(), path)?;
-    sql_query(
-        r#"
-INSERT INTO nodes (id, parent_id, created_at, role, metadata_json, kind_json)
-VALUES (?, ?, ?, ?, ?, ?)
-"#,
-    )
-    .bind::<Text, _>(row.id)
-    .bind::<Text, _>(row.parent_id)
-    .bind::<Text, _>(row.created_at)
-    .bind::<Text, _>(row.role)
-    .bind::<Nullable<Text>, _>(row.metadata_json)
-    .bind::<Text, _>(row.kind_json)
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
-
-    for relation in node_relations(node) {
-        sql_query(
-            r#"
-INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal)
-VALUES (?, ?, ?, ?)
-"#,
-        )
-        .bind::<Text, _>(relation.child_node_id)
-        .bind::<Text, _>(relation.parent_node_id)
-        .bind::<Text, _>(relation.kind)
-        .bind::<Integer, _>(relation.ordinal)
+    diesel::insert_into(nodes::table)
+        .values((
+            nodes::id.eq(row.id),
+            nodes::parent_id.eq(row.parent_id),
+            nodes::created_at.eq(row.created_at),
+            nodes::role.eq(row.role),
+            nodes::metadata_json.eq(row.metadata_json),
+            nodes::kind_json.eq(row.kind_json),
+        ))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
+
+    for relation in node_relations(node) {
+        diesel::insert_into(node_relations::table)
+            .values((
+                node_relations::child_node_id.eq(relation.child_node_id),
+                node_relations::parent_node_id.eq(relation.parent_node_id),
+                node_relations::kind.eq(relation.kind),
+                node_relations::ordinal.eq(relation.ordinal),
+            ))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
     }
     Ok(())
 }
@@ -1298,32 +1284,31 @@ async fn upsert_node(
     node: &Node,
 ) -> Result<()> {
     let row = NodeRow::from_node(node.clone(), path)?;
-    sql_query(
-        r#"
-INSERT INTO nodes (id, parent_id, created_at, role, metadata_json, kind_json)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    parent_id = excluded.parent_id,
-    created_at = excluded.created_at,
-    role = excluded.role,
-    metadata_json = excluded.metadata_json,
-    kind_json = excluded.kind_json
-"#,
-    )
-    .bind::<Text, _>(row.id)
-    .bind::<Text, _>(row.parent_id)
-    .bind::<Text, _>(row.created_at)
-    .bind::<Text, _>(row.role)
-    .bind::<Nullable<Text>, _>(row.metadata_json)
-    .bind::<Text, _>(row.kind_json)
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
+    diesel::insert_into(nodes::table)
+        .values((
+            nodes::id.eq(row.id),
+            nodes::parent_id.eq(row.parent_id),
+            nodes::created_at.eq(row.created_at),
+            nodes::role.eq(row.role),
+            nodes::metadata_json.eq(row.metadata_json),
+            nodes::kind_json.eq(row.kind_json),
+        ))
+        .on_conflict(nodes::id)
+        .do_update()
+        .set((
+            nodes::parent_id.eq(diesel::upsert::excluded(nodes::parent_id)),
+            nodes::created_at.eq(diesel::upsert::excluded(nodes::created_at)),
+            nodes::role.eq(diesel::upsert::excluded(nodes::role)),
+            nodes::metadata_json.eq(diesel::upsert::excluded(nodes::metadata_json)),
+            nodes::kind_json.eq(diesel::upsert::excluded(nodes::kind_json)),
+        ))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
 
-    sql_query("DELETE FROM node_relations WHERE child_node_id = ?")
-        .bind::<Text, _>(&node.id)
+    diesel::delete(node_relations::table.filter(node_relations::child_node_id.eq(&node.id)))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1331,21 +1316,18 @@ ON CONFLICT(id) DO UPDATE SET
         })?;
 
     for relation in node_relations(node) {
-        sql_query(
-            r#"
-INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal)
-VALUES (?, ?, ?, ?)
-"#,
-        )
-        .bind::<Text, _>(relation.child_node_id)
-        .bind::<Text, _>(relation.parent_node_id)
-        .bind::<Text, _>(relation.kind)
-        .bind::<Integer, _>(relation.ordinal)
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
+        diesel::insert_into(node_relations::table)
+            .values((
+                node_relations::child_node_id.eq(relation.child_node_id),
+                node_relations::parent_node_id.eq(relation.parent_node_id),
+                node_relations::kind.eq(relation.kind),
+                node_relations::ordinal.eq(relation.ordinal),
+            ))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
     }
     Ok(())
 }
@@ -1471,7 +1453,9 @@ async fn load_branches(
     path: &Path,
     state: &mut StoreState,
 ) -> Result<()> {
-    let branches = sql_query("SELECT name, head_id FROM branches ORDER BY name")
+    let branches = branches::table
+        .select((branches::name, branches::head_id))
+        .order(branches::name)
         .load::<BranchRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1488,7 +1472,9 @@ async fn load_sessions(
     path: &Path,
     state: &mut StoreState,
 ) -> Result<()> {
-    let sessions = sql_query("SELECT branch_name, state_json FROM sessions ORDER BY branch_name")
+    let sessions = sessions::table
+        .select((sessions::branch_name, sessions::state_json))
+        .order(sessions::branch_name)
         .load::<SessionRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1513,9 +1499,8 @@ async fn persist_branch(
     branch: &str,
     head_id: &str,
 ) -> Result<()> {
-    sql_query("INSERT INTO branches (name, head_id) VALUES (?, ?)")
-        .bind::<Text, _>(branch)
-        .bind::<Text, _>(head_id)
+    diesel::insert_into(branches::table)
+        .values((branches::name.eq(branch), branches::head_id.eq(head_id)))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1567,20 +1552,19 @@ async fn persist_session_state(
         path: path.to_owned(),
         column: "sessions.state_json".to_owned(),
     })?;
-    sql_query(
-        r#"
-INSERT INTO sessions (branch_name, state_json)
-VALUES (?, ?)
-ON CONFLICT(branch_name) DO UPDATE SET state_json = excluded.state_json
-"#,
-    )
-    .bind::<Text, _>(branch)
-    .bind::<Text, _>(state_json)
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
+    diesel::insert_into(sessions::table)
+        .values((
+            sessions::branch_name.eq(branch),
+            sessions::state_json.eq(state_json),
+        ))
+        .on_conflict(sessions::branch_name)
+        .do_update()
+        .set(sessions::state_json.eq(diesel::upsert::excluded(sessions::state_json)))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
     Ok(())
 }
 
@@ -1591,15 +1575,17 @@ async fn update_branch_head(
     expected_old_head: &str,
     new_head: &str,
 ) -> Result<usize> {
-    sql_query("UPDATE branches SET head_id = ? WHERE name = ? AND head_id = ?")
-        .bind::<Text, _>(new_head)
-        .bind::<Text, _>(branch)
-        .bind::<Text, _>(expected_old_head)
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
+    diesel::update(
+        branches::table
+            .filter(branches::name.eq(branch))
+            .filter(branches::head_id.eq(expected_old_head)),
+    )
+    .set(branches::head_id.eq(new_head))
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })
 }
 
 async fn delete_branch_record(
@@ -1607,8 +1593,7 @@ async fn delete_branch_record(
     path: &Path,
     branch: &str,
 ) -> Result<()> {
-    sql_query("DELETE FROM branches WHERE name = ?")
-        .bind::<Text, _>(branch)
+    diesel::delete(branches::table.filter(branches::name.eq(branch)))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1682,16 +1667,18 @@ async fn load_jobs(
     path: &Path,
     state: &mut StoreState,
 ) -> Result<()> {
-    let jobs = sql_query("SELECT payload_json FROM jobs ORDER BY job_id")
-        .load::<JobRow>(connection)
+    let jobs = jobs::table
+        .select(jobs::payload_json)
+        .order(jobs::job_id)
+        .load::<String>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
     state.jobs.clear();
-    for row in jobs {
+    for payload_json in jobs {
         let job =
-            serde_json::from_str::<Job>(&row.payload_json).context(ParseSqliteStoreValueSnafu {
+            serde_json::from_str::<Job>(&payload_json).context(ParseSqliteStoreValueSnafu {
                 path: path.to_owned(),
                 column: "jobs.payload_json".to_owned(),
             })?;
@@ -1705,20 +1692,19 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
         path: path.to_owned(),
         column: "jobs.payload_json".to_owned(),
     })?;
-    sql_query(
-        r#"
-INSERT INTO jobs (job_id, payload_json)
-VALUES (?, ?)
-ON CONFLICT(job_id) DO UPDATE SET payload_json = excluded.payload_json
-"#,
-    )
-    .bind::<Text, _>(&job.job_id)
-    .bind::<Text, _>(payload_json)
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
+    diesel::insert_into(jobs::table)
+        .values((
+            jobs::job_id.eq(&job.job_id),
+            jobs::payload_json.eq(payload_json),
+        ))
+        .on_conflict(jobs::job_id)
+        .do_update()
+        .set(jobs::payload_json.eq(diesel::upsert::excluded(jobs::payload_json)))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
     Ok(())
 }
 
@@ -1775,32 +1761,13 @@ async fn persist_message_queue_item(
         path: path.to_owned(),
         column: "message_queue_items.payload_json".to_owned(),
     })?;
-    sql_query(
-        r#"
-INSERT INTO message_queue_items (queue, message_id, created_at, payload_json)
-VALUES (?, ?, ?, ?)
-"#,
-    )
-    .bind::<Text, _>(&item.queue)
-    .bind::<Text, _>(&item.message_id)
-    .bind::<Text, _>(item.created_at.to_string())
-    .bind::<Text, _>(item_json)
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
-    Ok(())
-}
-
-async fn delete_message_queue_item(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    item: &MessageQueueItem,
-) -> Result<()> {
-    sql_query("DELETE FROM message_queue_items WHERE queue = ? AND message_id = ?")
-        .bind::<Text, _>(&item.queue)
-        .bind::<Text, _>(&item.message_id)
+    diesel::insert_into(message_queue_items::table)
+        .values((
+            message_queue_items::queue.eq(&item.queue),
+            message_queue_items::message_id.eq(&item.message_id),
+            message_queue_items::created_at.eq(item.created_at.to_string()),
+            message_queue_items::payload_json.eq(item_json),
+        ))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1809,20 +1776,40 @@ async fn delete_message_queue_item(
     Ok(())
 }
 
+async fn delete_message_queue_item(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    item: &MessageQueueItem,
+) -> Result<()> {
+    diesel::delete(
+        message_queue_items::table
+            .filter(message_queue_items::queue.eq(&item.queue))
+            .filter(message_queue_items::message_id.eq(&item.message_id)),
+    )
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    Ok(())
+}
+
 async fn load_presets(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     state: &mut StoreState,
 ) -> Result<()> {
-    let rows = sql_query("SELECT record_json FROM presets ORDER BY name")
-        .load::<PresetRow>(connection)
+    let rows = presets::table
+        .select(presets::record_json)
+        .order(presets::name)
+        .load::<String>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
     state.presets.clear();
-    for row in rows {
-        let record = serde_json::from_str::<PresetRecord>(&row.record_json).context(
+    for record_json in rows {
+        let record = serde_json::from_str::<PresetRecord>(&record_json).context(
             ParseSqliteStoreValueSnafu {
                 path: path.to_owned(),
                 column: "presets.record_json".to_owned(),
@@ -1842,20 +1829,19 @@ async fn persist_preset(
         path: path.to_owned(),
         column: "presets.record_json".to_owned(),
     })?;
-    sql_query(
-        r#"
-INSERT INTO presets (name, record_json)
-VALUES (?, ?)
-ON CONFLICT(name) DO UPDATE SET record_json = excluded.record_json
-"#,
-    )
-    .bind::<Text, _>(&record.name)
-    .bind::<Text, _>(record_json)
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
+    diesel::insert_into(presets::table)
+        .values((
+            presets::name.eq(&record.name),
+            presets::record_json.eq(record_json),
+        ))
+        .on_conflict(presets::name)
+        .do_update()
+        .set(presets::record_json.eq(diesel::upsert::excluded(presets::record_json)))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
     Ok(())
 }
 
@@ -1864,8 +1850,7 @@ async fn delete_preset_record(
     path: &Path,
     name: &str,
 ) -> Result<()> {
-    sql_query("DELETE FROM presets WHERE name = ?")
-        .bind::<Text, _>(name)
+    diesel::delete(presets::table.filter(presets::name.eq(name)))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1879,7 +1864,9 @@ async fn load_skills(
     path: &Path,
     state: &mut StoreState,
 ) -> Result<()> {
-    let rows = sql_query("SELECT role, record_json FROM skills ORDER BY role, name")
+    let rows = skills::table
+        .select((skills::role, skills::record_json))
+        .order((skills::role, skills::name))
         .load::<SkillRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1911,21 +1898,20 @@ async fn persist_skill(
         path: path.to_owned(),
         column: "skills.record_json".to_owned(),
     })?;
-    sql_query(
-        r#"
-INSERT INTO skills (role, name, record_json)
-VALUES (?, ?, ?)
-ON CONFLICT(role, name) DO UPDATE SET record_json = excluded.record_json
-"#,
-    )
-    .bind::<Text, _>(role.as_str())
-    .bind::<Text, _>(&record.name)
-    .bind::<Text, _>(record_json)
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
+    diesel::insert_into(skills::table)
+        .values((
+            skills::role.eq(role.as_str()),
+            skills::name.eq(&record.name),
+            skills::record_json.eq(record_json),
+        ))
+        .on_conflict((skills::role, skills::name))
+        .do_update()
+        .set(skills::record_json.eq(diesel::upsert::excluded(skills::record_json)))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
     Ok(())
 }
 

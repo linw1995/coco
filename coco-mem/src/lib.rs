@@ -1,6 +1,7 @@
 // CoCo Memory Implementation
 
 mod error;
+mod schema;
 pub mod store;
 mod types;
 
