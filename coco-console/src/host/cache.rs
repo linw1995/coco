@@ -13,7 +13,9 @@ use crate::host::render::{
     MaterializedGraphShell, MaterializedGraphShellBranch, MaterializedGraphShellTick,
     ProviderContextItem,
 };
-use crate::layout::{lane_key, layout_graph_viewport, layout_graph_viewport_diff};
+use crate::layout::{
+    lane_key, layout_graph_viewport, layout_graph_viewport_diff, materialize_graph_viewport,
+};
 use crate::publisher::ConsolePublisher;
 use coco_mem::{BranchStore, NodeStore, SessionState, SessionStore, SqliteGraphStore, Store};
 use serde::Serialize;
@@ -794,7 +796,7 @@ where
                     source.try_append_linear_materialization(snapshots, mode, source_version)
                 })
                 .await;
-            match incremental_result {
+            let fallback_message = match incremental_result {
                 Ok(Ok(true)) => {
                     self.publish_ready_version(source_version);
                     set_rebuild_status!(
@@ -828,19 +830,7 @@ where
                         return;
                     }
                     Ok(false) => {
-                        set_rebuild_status!(
-                            self,
-                            rebuild_status(
-                                mode,
-                                source_version,
-                                ConsoleGraphRebuildState::Failed,
-                                None,
-                                0,
-                                0,
-                                "Incremental graph materialization could not seed this store state",
-                            )
-                        );
-                        return;
+                        "Incremental graph materialization could not seed this store state; rebuilding full materialization"
                     }
                     Err(error) => {
                         set_rebuild_status!(
@@ -888,26 +878,47 @@ where
                     );
                     return;
                 }
-            }
+            };
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Building,
+                    None,
+                    0,
+                    0,
+                    fallback_message,
+                )
+            );
         }
         let source = self.source.clone();
         let progress_cache = self.clone();
+        let snapshots = self.snapshots.clone();
         let result = self
             .run_blocking_graph_compute(move || {
-                source.build_snapshot_with_progress(mode, source_version, |progress| {
-                    set_rebuild_status!(
-                        progress_cache,
-                        rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Building,
-                            Some(progress.phase),
-                            progress.processed,
-                            progress.total,
-                            progress.phase.label(),
-                        )
-                    );
-                })
+                let snapshot =
+                    source.build_snapshot_with_progress(mode, source_version, |progress| {
+                        set_rebuild_status!(
+                            progress_cache,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Building,
+                                Some(progress.phase),
+                                progress.processed,
+                                progress.total,
+                                progress.phase.label(),
+                            )
+                        );
+                    })?;
+                if let Some(snapshots) = snapshots {
+                    snapshots.replace_materialization_from_viewport(
+                        mode,
+                        materialize_graph_viewport(&snapshot),
+                    )?;
+                }
+                crate::Result::Ok(snapshot)
             })
             .await;
         match result {
@@ -3900,6 +3911,63 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_replaces_materialization_from_full_snapshot_layout() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("full materialization fallback".to_owned()),
+            })
+            .unwrap();
+        writer.set_branch_head("main", &session, &text).unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let snapshot = cache.snapshot_current(GraphMode::All).await.unwrap();
+        let viewport = materialize_graph_viewport(&snapshot);
+        ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .replace_materialization_from_viewport(GraphMode::All, viewport)
+            .unwrap();
+        let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .latest_viewport(
+                GraphMode::All,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(materialized.version, target_version);
+        assert!(materialized.nodes.iter().any(|node| node.id == session));
+        assert!(materialized.nodes.iter().any(|node| node.id == text));
+        assert!(materialized.edges.iter().any(|edge| edge.target_id == text));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

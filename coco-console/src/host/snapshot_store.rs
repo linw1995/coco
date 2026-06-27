@@ -707,6 +707,83 @@ LIMIT 1
         })
     }
 
+    pub fn replace_materialization_from_viewport(
+        &self,
+        mode: GraphMode,
+        viewport: GraphViewportResponse,
+    ) -> crate::Result<()> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            this.begin_write_transaction(connection)?;
+            let result = this
+                .replace_materialization_from_viewport_in_transaction(connection, mode, viewport);
+            match result {
+                Ok(()) => this.commit_transaction(connection),
+                Err(error) => {
+                    let _ = this.rollback_transaction(connection);
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    fn replace_materialization_from_viewport_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        viewport: GraphViewportResponse,
+    ) -> crate::Result<()> {
+        let lanes_by_y = viewport
+            .lanes
+            .iter()
+            .map(|lane| (lane.y, lane))
+            .collect::<BTreeMap<_, _>>();
+        self.clear_materialized_mode_facts(connection, mode)?;
+        for node in &viewport.nodes {
+            let fallback_lane;
+            let lane = if let Some(lane) = lanes_by_y.get(&node.y) {
+                lane
+            } else {
+                fallback_lane = GraphViewportLane {
+                    key: format!("layout:y:{}", node.y),
+                    label: String::new(),
+                    y: node.y,
+                };
+                &fallback_lane
+            };
+            self.insert_node_location(
+                connection,
+                NodeLocationInsert {
+                    mode,
+                    node,
+                    lane,
+                    bounds: node_bounds(node),
+                },
+            )?;
+        }
+        for edge in &viewport.edges {
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge,
+                    bounds: edge_bounds(edge),
+                },
+            )?;
+        }
+        self.put_materialization_meta(
+            connection,
+            MaterializationMetaInput {
+                source_version: viewport.version,
+                mode,
+                world_min_x: 0,
+                world_min_y: 0,
+                world_max_x: viewport.canvas.width,
+                world_max_y: viewport.canvas.height,
+            },
+        )
+    }
+
     fn put_empty_materialization_in_transaction(
         &self,
         connection: &mut SqliteConnection,
