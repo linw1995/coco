@@ -789,7 +789,7 @@ where
             )
         );
         if let Some(snapshots) = self.snapshots.clone() {
-            let has_materialization = snapshots.has_materialization(mode);
+            let has_non_empty_materialization = snapshots.has_non_empty_materialization(mode);
             let source = self.source.clone();
             let incremental_result = self
                 .run_blocking_graph_compute(move || {
@@ -813,7 +813,7 @@ where
                     );
                     return;
                 }
-                Ok(Ok(false)) => match has_materialization {
+                Ok(Ok(false)) => match has_non_empty_materialization {
                     Ok(true) => {
                         set_rebuild_status!(
                             self,
@@ -913,9 +913,15 @@ where
                         );
                     })?;
                 if let Some(snapshots) = snapshots {
+                    let branch_labels = snapshot
+                        .branches
+                        .iter()
+                        .map(|branch| branch.name.clone())
+                        .collect();
                     snapshots.replace_materialization_from_viewport(
                         mode,
                         materialize_graph_viewport(&snapshot),
+                        branch_labels,
                     )?;
                 }
                 crate::Result::Ok(snapshot)
@@ -3970,14 +3976,31 @@ mod tests {
         writer
             .set_branch_head("main", &session, &merge_anchor)
             .unwrap();
+        writer.fork("orphan branch", &session).unwrap();
+        let reserved_label_branch_head = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("reserved label branch".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("orphan branch", &session, &reserved_label_branch_head)
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
         let snapshot = cache.snapshot_current(GraphMode::All).await.unwrap();
+        let branch_labels = snapshot
+            .branches
+            .iter()
+            .map(|branch| branch.name.clone())
+            .collect();
         let viewport = materialize_graph_viewport(&snapshot);
         ConsoleGraphSnapshotStore::open(&path)
             .unwrap()
-            .replace_materialization_from_viewport(GraphMode::All, viewport)
+            .replace_materialization_from_viewport(GraphMode::All, viewport, branch_labels)
             .unwrap();
         let materialized = ConsoleGraphSnapshotStore::open(&path)
             .unwrap()
@@ -3997,8 +4020,17 @@ mod tests {
                 .iter()
                 .any(|node| node.id == merge_anchor)
         );
+        assert!(
+            materialized
+                .nodes
+                .iter()
+                .any(|node| node.id == reserved_label_branch_head)
+        );
         assert!(materialized.nodes.iter().any(|node| node.id == orphan));
         assert!(materialized.edges.iter().any(|edge| edge.target_id == text));
+        assert!(materialized.lanes.iter().any(|lane| {
+            lane.key == lane_key("orphan branch") && lane.label == "orphan branch"
+        }));
         assert!(materialized.lanes.iter().any(|lane| {
             lane.key == format!("derived:orphan:{orphan}") && lane.label.starts_with("orphan ")
         }));
@@ -4640,6 +4672,12 @@ mod tests {
         assert!(materialized.edges.is_empty());
         assert!(materialized.lanes.is_empty());
         assert!(
+            !ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .has_non_empty_materialization(GraphMode::All)
+                .unwrap()
+        );
+        assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
@@ -4676,6 +4714,12 @@ mod tests {
         assert!(non_empty.nodes.iter().any(|node| node.id == session));
         assert!(non_empty.nodes.iter().any(|node| node.id == text));
         assert!(non_empty.lanes.iter().any(|lane| lane.label == "main"));
+        assert!(
+            ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .has_non_empty_materialization(GraphMode::All)
+                .unwrap()
+        );
 
         writer.delete_branch("main").unwrap();
         publisher.mark_changed();

@@ -586,6 +586,18 @@ LIMIT 1
         Ok(self.latest_materialization_row(mode)?.is_some())
     }
 
+    pub(crate) fn has_non_empty_materialization(&self, mode: GraphMode) -> crate::Result<bool> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            Ok(this
+                .latest_materialization_row_in_connection(connection, mode)?
+                .is_some()
+                && !this
+                    .materialized_node_rows_in_connection(connection, mode)?
+                    .is_empty())
+        })
+    }
+
     pub(crate) fn latest_materialization_version(
         &self,
         mode: GraphMode,
@@ -711,12 +723,17 @@ LIMIT 1
         &self,
         mode: GraphMode,
         viewport: GraphViewportResponse,
+        branch_labels: BTreeSet<String>,
     ) -> crate::Result<()> {
         let this = self.clone();
         self.with_connection(move |connection| {
             this.begin_write_transaction(connection)?;
-            let result = this
-                .replace_materialization_from_viewport_in_transaction(connection, mode, viewport);
+            let result = this.replace_materialization_from_viewport_in_transaction(
+                connection,
+                mode,
+                viewport,
+                branch_labels,
+            );
             match result {
                 Ok(()) => this.commit_transaction(connection),
                 Err(error) => {
@@ -732,6 +749,7 @@ LIMIT 1
         connection: &mut SqliteConnection,
         mode: GraphMode,
         viewport: GraphViewportResponse,
+        branch_labels: BTreeSet<String>,
     ) -> crate::Result<()> {
         let mut nodes_by_y = BTreeMap::<i32, Vec<&GraphViewportNode>>::new();
         for node in &viewport.nodes {
@@ -740,7 +758,12 @@ LIMIT 1
         let lanes_by_y = viewport
             .lanes
             .iter()
-            .map(|lane| (lane.y, full_layout_materialization_lane(lane, &nodes_by_y)))
+            .map(|lane| {
+                (
+                    lane.y,
+                    full_layout_materialization_lane(lane, &nodes_by_y, &branch_labels),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         self.clear_materialized_mode_facts(connection, mode)?;
         for node in &viewport.nodes {
@@ -5187,7 +5210,11 @@ fn main_store_database_path(dir: impl AsRef<Path>) -> PathBuf {
 fn full_layout_materialization_lane(
     lane: &GraphViewportLane,
     nodes_by_y: &BTreeMap<i32, Vec<&GraphViewportNode>>,
+    branch_labels: &BTreeSet<String>,
 ) -> GraphViewportLane {
+    if branch_labels.contains(&lane.label) {
+        return lane.clone();
+    }
     let derived_prefix = if lane.label.starts_with("orphan ") {
         Some(DERIVED_ORPHAN_LANE_KEY_PREFIX)
     } else if lane.label.starts_with("skill ") {
