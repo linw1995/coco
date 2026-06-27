@@ -348,12 +348,7 @@ impl SqliteStore {
     pub fn schema_version(&self) -> Result<i32> {
         self.block_on(async {
             let mut connection = self.connect().await?;
-            current_schema_version(&mut connection, &self.database_path)
-                .await?
-                .context(CorruptedStoreSnafu {
-                    path: self.database_path.clone(),
-                    message: "missing SQLite schema version".to_owned(),
-                })
+            existing_schema_version(&mut connection, &self.database_path).await
         })
     }
 
@@ -399,13 +394,7 @@ impl SqliteStore {
     fn ensure_current_schema(&self) -> Result<()> {
         self.block_on(async {
             let mut connection = self.connect().await?;
-            ensure_migration_table_exists(&mut connection, &self.database_path).await?;
-            let version = current_schema_version(&mut connection, &self.database_path)
-                .await?
-                .context(CorruptedStoreSnafu {
-                    path: self.database_path.clone(),
-                    message: "missing SQLite schema version".to_owned(),
-                })?;
+            let version = existing_schema_version(&mut connection, &self.database_path).await?;
             ensure!(
                 version == SQLITE_SCHEMA_VERSION,
                 CorruptedStoreSnafu {
@@ -543,13 +532,7 @@ impl SqliteGraphStore {
     fn ensure_current_schema(&self) -> Result<()> {
         self.block_on(async {
             let mut connection = self.connect().await?;
-            ensure_migration_table_exists(&mut connection, &self.database_path).await?;
-            let version = current_schema_version(&mut connection, &self.database_path)
-                .await?
-                .context(CorruptedStoreSnafu {
-                    path: self.database_path.clone(),
-                    message: "missing SQLite schema version".to_owned(),
-                })?;
+            let version = existing_schema_version(&mut connection, &self.database_path).await?;
             ensure!(
                 version == SQLITE_SCHEMA_VERSION,
                 CorruptedStoreSnafu {
@@ -907,21 +890,6 @@ CREATE TABLE IF NOT EXISTS __diesel_schema_migrations (
         })
 }
 
-async fn ensure_migration_table_exists(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-) -> Result<()> {
-    let count = table_count(connection, path, DIESEL_MIGRATION_TABLE_NAME).await?;
-    ensure!(
-        count == 1,
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: "missing SQLite Diesel schema migration table".to_owned(),
-        }
-    );
-    Ok(())
-}
-
 async fn table_count(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -953,6 +921,13 @@ async fn current_schema_version(
 }
 
 async fn existing_schema_version_for_upgrade_check(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<i32> {
+    existing_schema_version(connection, path).await
+}
+
+async fn existing_schema_version(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<i32> {
@@ -2898,6 +2873,42 @@ VALUES (?, ?, ?, ?, ?, ?)
         let store = SqliteStore::open_read_only(&path).unwrap();
 
         assert_eq!(store.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn open_read_only_accepts_legacy_current_schema() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            connection
+                .batch_execute(
+                    r#"
+CREATE TABLE store_schema_migrations (
+    version INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+INSERT INTO store_schema_migrations (version, name)
+VALUES
+    (1, 'initial-store-schema'),
+    (2, 'node-relations');
+DROP TABLE __diesel_schema_migrations;
+"#,
+                )
+                .await
+                .unwrap();
+        });
+        drop(store);
+
+        let store = SqliteStore::open_read_only(&path).unwrap();
+        let graph = SqliteGraphStore::open_read_only(&path).unwrap();
+
+        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.root_id(), root_id);
+        assert_eq!(graph.root_id, root_id);
     }
 
     #[test]
