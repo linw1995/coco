@@ -913,11 +913,7 @@ where
                         );
                     })?;
                 if let Some(snapshots) = snapshots {
-                    let branch_labels = snapshot
-                        .branches
-                        .iter()
-                        .map(|branch| branch.name.clone())
-                        .collect();
+                    let branch_labels = visible_full_layout_branch_labels(&snapshot);
                     snapshots.replace_materialization_from_viewport(
                         mode,
                         materialize_graph_viewport(&snapshot),
@@ -1154,6 +1150,25 @@ fn latest_persistent_materialization_version(
                 (None, right) => right,
             })
         })
+}
+
+fn visible_full_layout_branch_labels(snapshot: &GraphSnapshot) -> BTreeSet<String> {
+    let node_ids = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    snapshot
+        .branches
+        .iter()
+        .filter(|branch| {
+            branch
+                .visible_head_id
+                .as_deref()
+                .is_some_and(|head_id| node_ids.contains(head_id))
+        })
+        .map(|branch| branch.name.clone())
+        .collect()
 }
 
 fn node_id_from_graph_target(target: &str) -> Option<String> {
@@ -3959,6 +3974,8 @@ mod tests {
                 kind: Kind::Text("full materialization orphan".to_owned()),
             })
             .unwrap();
+        let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan));
+        writer.fork(&orphan_lane, &root).unwrap();
         let merge_anchor = writer
             .append(NewNode {
                 parent: text.clone(),
@@ -3992,11 +4009,7 @@ mod tests {
         let target_version = publisher.current_version();
 
         let snapshot = cache.snapshot_current(GraphMode::All).await.unwrap();
-        let branch_labels = snapshot
-            .branches
-            .iter()
-            .map(|branch| branch.name.clone())
-            .collect();
+        let branch_labels = visible_full_layout_branch_labels(&snapshot);
         let viewport = materialize_graph_viewport(&snapshot);
         ConsoleGraphSnapshotStore::open(&path)
             .unwrap()
@@ -4032,7 +4045,7 @@ mod tests {
             lane.key == lane_key("orphan branch") && lane.label == "orphan branch"
         }));
         assert!(materialized.lanes.iter().any(|lane| {
-            lane.key == format!("derived:orphan:{orphan}") && lane.label.starts_with("orphan ")
+            lane.key == format!("derived:orphan:{orphan}") && lane.label == orphan_lane
         }));
 
         drop(writer);
