@@ -305,6 +305,10 @@ impl SqliteDatabase {
         Self::open_uncached(path.as_ref().to_owned())
     }
 
+    fn open_unshared_read_only_file_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_uncached_read_only(path.as_ref().to_owned())
+    }
+
     fn open(database_path: PathBuf) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let databases = SQLITE_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -348,6 +352,27 @@ impl SqliteDatabase {
                 })?;
             configure_connection(&mut connection, &database_path).await?;
             ensure_wal_journal_mode(&mut connection, &database_path).await?;
+            Ok(connection)
+        })?;
+        Ok(Self {
+            inner: Arc::new(SqliteDatabaseInner {
+                database_path,
+                runtime,
+                connection: Arc::new(tokio::sync::Mutex::new(connection)),
+            }),
+        })
+    }
+
+    fn open_uncached_read_only(database_path: PathBuf) -> Result<Self> {
+        let database_path = sqlite_database_registry_path(&database_path)?;
+        let runtime = sqlite_runtime()?;
+        let connection = block_on_sqlite_runtime_with(runtime, async {
+            let mut connection = AsyncSqliteConnection::establish(&database_path.to_string_lossy())
+                .await
+                .context(ConnectSqliteStoreSnafu {
+                    path: database_path.clone(),
+                })?;
+            configure_connection(&mut connection, &database_path).await?;
             Ok(connection)
         })?;
         Ok(Self {
@@ -701,7 +726,7 @@ impl SqliteGraphStore {
 
     fn new(path: &Path) -> Result<Self> {
         let database_path = sqlite_database_path(path);
-        let database = SqliteDatabase::open(database_path.clone())?;
+        let database = SqliteDatabase::open_unshared_read_only_file_path(database_path.clone())?;
         Ok(Self {
             dir: path.to_owned(),
             database_path,
@@ -2789,7 +2814,8 @@ mod tests {
     use diesel::sql_query;
     use diesel::sql_types::{Integer, Nullable, Text};
     use diesel_async::RunQueryDsl;
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
 
     #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
     struct NodeRelationRow {
@@ -2929,7 +2955,7 @@ VALUES (?, ?, ?, ?, ?, ?)
             store.database.shared_connection(),
             read_only.database.shared_connection()
         ));
-        assert!(Arc::ptr_eq(
+        assert!(!Arc::ptr_eq(
             store.database.shared_connection(),
             graph.database.shared_connection()
         ));
@@ -2937,6 +2963,51 @@ VALUES (?, ?, ?, ?, ?, ?)
             store.database.shared_connection(),
             lexical_read_only.database.shared_connection()
         ));
+    }
+
+    #[test]
+    fn graph_store_connection_contention_does_not_block_writer() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let graph = SqliteGraphStore::open_read_only(&path).unwrap();
+        let graph_connection = graph.database.shared_connection().clone();
+        let graph_database = graph.database.clone();
+        let (graph_locked_tx, graph_locked_rx) = mpsc::channel();
+        let (release_graph_tx, release_graph_rx) = mpsc::channel();
+        let graph_lock = std::thread::spawn(move || {
+            graph_database.block_on(async move {
+                let _guard = graph_connection.lock().await;
+                graph_locked_tx.send(()).unwrap();
+                release_graph_rx.recv().unwrap();
+            });
+        });
+        graph_locked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("graph connection lock should be held");
+
+        let writer = store.clone();
+        let root = store.root_id();
+        let (write_tx, write_rx) = mpsc::channel();
+        let write = std::thread::spawn(move || {
+            let node = writer
+                .append(NewNode {
+                    parent: root,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("write while graph rebuild holds its connection".to_owned()),
+                })
+                .unwrap();
+            write_tx.send(node).unwrap();
+        });
+
+        let written = write_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer should not wait for graph connection release");
+        release_graph_tx.send(()).unwrap();
+        graph_lock.join().unwrap();
+        write.join().unwrap();
+        assert_eq!(store.get_node(&written).unwrap().id, written);
     }
 
     #[test]
