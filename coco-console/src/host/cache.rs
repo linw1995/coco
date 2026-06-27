@@ -82,6 +82,7 @@ macro_rules! log_rebuild_status {
                 phase = ?status.phase,
                 processed = status.processed,
                 total = status.total,
+                progress_percent = rebuild_progress_percent(status),
                 message = %status.message,
                 "console graph rebuild failed",
             );
@@ -93,6 +94,7 @@ macro_rules! log_rebuild_status {
                 phase = ?status.phase,
                 processed = status.processed,
                 total = status.total,
+                progress_percent = rebuild_progress_percent(status),
                 message = %status.message,
                 "console graph rebuild status",
             );
@@ -104,6 +106,7 @@ macro_rules! log_rebuild_status {
                 phase = ?status.phase,
                 processed = status.processed,
                 total = status.total,
+                progress_percent = rebuild_progress_percent(status),
                 message = %status.message,
                 "console graph rebuild progress",
             );
@@ -1047,9 +1050,28 @@ fn should_log_rebuild_status_at_info(status: &ConsoleGraphRebuildStatus) -> bool
         return true;
     }
 
-    status
-        .phase
-        .is_some_and(|_| status.processed == 0 || status.processed == status.total)
+    status.phase.is_some_and(|_| {
+        status.processed == 0
+            || status.processed == status.total
+            || rebuild_progress_crosses_info_bucket(status)
+    })
+}
+
+fn rebuild_progress_percent(status: &ConsoleGraphRebuildStatus) -> usize {
+    if status.total == 0 {
+        return 0;
+    }
+    status.processed.saturating_mul(100) / status.total
+}
+
+fn rebuild_progress_crosses_info_bucket(status: &ConsoleGraphRebuildStatus) -> bool {
+    if status.total == 0 || status.processed == 0 {
+        return false;
+    }
+    let previous = status.processed.saturating_sub(1);
+    let previous_bucket = previous.saturating_mul(10) / status.total;
+    let current_bucket = status.processed.saturating_mul(10) / status.total;
+    current_bucket > previous_bucket
 }
 
 impl CacheState {
@@ -1380,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_rebuild_status_logs_phase_boundaries_at_info() {
+    fn graph_rebuild_status_logs_phase_boundaries_and_progress_buckets_at_info() {
         let phase_start = rebuild_status(
             GraphMode::All,
             1,
@@ -1390,13 +1412,22 @@ mod tests {
             10,
             "Building graph entries",
         );
-        let phase_progress = rebuild_status(
+        let phase_progress_before_bucket = rebuild_status(
             GraphMode::All,
             1,
             ConsoleGraphRebuildState::Building,
             Some(crate::graph::GraphBuildPhase::Entries),
-            5,
+            4,
+            100,
+            "Building graph entries",
+        );
+        let phase_progress_bucket = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Building,
+            Some(crate::graph::GraphBuildPhase::Entries),
             10,
+            100,
             "Building graph entries",
         );
         let phase_complete = rebuild_status(
@@ -1419,9 +1450,13 @@ mod tests {
         );
 
         assert!(should_log_rebuild_status_at_info(&phase_start));
-        assert!(!should_log_rebuild_status_at_info(&phase_progress));
+        assert!(!should_log_rebuild_status_at_info(
+            &phase_progress_before_bucket
+        ));
+        assert!(should_log_rebuild_status_at_info(&phase_progress_bucket));
         assert!(should_log_rebuild_status_at_info(&phase_complete));
         assert!(should_log_rebuild_status_at_info(&ready));
+        assert_eq!(rebuild_progress_percent(&phase_progress_bucket), 10);
     }
 
     #[tokio::test]
