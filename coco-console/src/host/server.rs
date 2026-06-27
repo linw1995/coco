@@ -1646,7 +1646,7 @@ mod tests {
     #[tokio::test]
     async fn graph_json_schedules_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         writer.fork("main", &writer.root_id()).unwrap();
         publisher.mark_changed();
@@ -1674,7 +1674,7 @@ mod tests {
     #[tokio::test]
     async fn graph_json_ignores_cached_full_snapshot_in_materialized_mode() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
@@ -1713,7 +1713,7 @@ mod tests {
     #[tokio::test]
     async fn index_page_uses_mode_specific_loading_version() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
@@ -1876,7 +1876,7 @@ mod tests {
     #[tokio::test]
     async fn fragment_schedules_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         writer.fork("main", &writer.root_id()).unwrap();
         publisher.mark_changed();
@@ -1903,7 +1903,7 @@ mod tests {
     #[tokio::test]
     async fn fragment_uses_materialized_shell_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -1990,7 +1990,7 @@ mod tests {
     #[tokio::test]
     async fn node_detail_uses_materialized_facts_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
@@ -2028,7 +2028,7 @@ mod tests {
     #[tokio::test]
     async fn node_detail_reads_hidden_context_node_incrementally() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -2092,7 +2092,7 @@ mod tests {
     #[tokio::test]
     async fn node_detail_ignores_hidden_node_outside_current_materialized_context() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -2181,7 +2181,7 @@ mod tests {
     #[tokio::test]
     async fn provider_context_default_avoids_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         writer.fork("main", &writer.root_id()).unwrap();
         publisher.mark_changed();
@@ -2211,7 +2211,7 @@ mod tests {
     #[tokio::test]
     async fn provider_context_uses_materialized_facts_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer

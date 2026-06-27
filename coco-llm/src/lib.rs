@@ -4352,7 +4352,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::time::Duration;
 
-    use coco_mem::{BranchStore, FsStore, MemoryStore, NodeStore, SessionStore};
+    use coco_mem::{BranchStore, MemoryStore, NodeStore, SessionStore, SqliteStore};
     use rig::completion::{
         CompletionError, CompletionModel, CompletionRequestBuilder, CompletionResponse,
         ToolDefinition,
@@ -5279,7 +5279,7 @@ mod tests {
                 "main",
                 vec![Ok(turn), Ok(BackendTurn::finished("done"))],
             )]);
-            let store = FsStore::open(&store_path).unwrap();
+            let store = SqliteStore::open(&store_path).unwrap();
             let first_done = Arc::new(Notify::new());
             let release_second = Arc::new(Notify::new());
             let service = LlmService::builder(store, backend)
@@ -5304,7 +5304,7 @@ mod tests {
             assert_eq!(prompt.await.unwrap().unwrap().text, "done");
         }
 
-        let reopened = FsStore::open(&store_path).unwrap();
+        let reopened = SqliteStore::open(&store_path).unwrap();
         let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
         let session = service.resolve_session("main").unwrap();
         let tool_result_message = session
@@ -5357,7 +5357,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let store_path = temp_dir.path().join("store");
         {
-            let store = FsStore::open(&store_path).unwrap();
+            let store = SqliteStore::open(&store_path).unwrap();
             let service = LlmService::new(store.clone(), FakeBackend::with_turns(vec![]));
             service
                 .create_session(SessionConfig {
@@ -5411,7 +5411,7 @@ mod tests {
                 .unwrap();
         }
 
-        let reopened = FsStore::open(&store_path).unwrap();
+        let reopened = SqliteStore::open(&store_path).unwrap();
         let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
         let session = service.resolve_session("main").unwrap();
         let tool_result_message = session

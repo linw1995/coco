@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-mod fs;
+mod lock;
 mod memory;
 mod sqlite;
 mod state;
@@ -9,7 +9,6 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use fs::FsStore;
 pub use memory::MemoryStore;
 pub use sqlite::{SqliteDatabase, SqliteGraphStore, SqliteStore};
 
@@ -220,34 +219,20 @@ impl<T> Store for T where
 
 #[derive(Clone, Debug)]
 pub enum PersistentStore {
-    Fs(FsStore),
     Sqlite(SqliteStore),
 }
 
 impl PersistentStore {
-    pub fn open_or_migrate_fs(path: impl AsRef<Path>) -> StoreResult<Self> {
-        SqliteStore::open_or_migrate_fs(path).map(Self::Sqlite)
+    pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        SqliteStore::open(path).map(Self::Sqlite)
     }
 
-    pub fn open_read_only_or_migrate_fs(path: impl AsRef<Path>) -> StoreResult<Self> {
-        let path = path.as_ref();
-        if sqlite::sqlite_database_path(path).is_file()
-            && sqlite::fs_migration_complete_marker_exists(path)?
-        {
-            return SqliteStore::open_read_only_or_migrate_fs(path).map(Self::Sqlite);
-        }
-        if sqlite::sqlite_database_path(path).is_file() && !sqlite::legacy_fs_store_exists(path) {
-            return SqliteStore::open_read_only_or_migrate_fs(path).map(Self::Sqlite);
-        }
-        if sqlite::legacy_fs_store_exists(path) {
-            return FsStore::open_read_only(path).map(Self::Fs);
-        }
-        SqliteStore::open_read_only_or_migrate_fs(path).map(Self::Sqlite)
+    pub fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> StoreResult<Self> {
+        SqliteStore::open_read_only_or_upgrade_schema(path).map(Self::Sqlite)
     }
 
     pub fn store_path(&self) -> &Path {
         match self {
-            Self::Fs(store) => store.store_path(),
             Self::Sqlite(store) => store.store_path(),
         }
     }
@@ -256,7 +241,6 @@ impl PersistentStore {
 macro_rules! delegate_persistent_store {
     ($self:expr, $store:ident, $body:expr) => {
         match $self {
-            PersistentStore::Fs($store) => $body,
             PersistentStore::Sqlite($store) => $body,
         }
     };
