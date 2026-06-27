@@ -733,10 +733,14 @@ LIMIT 1
         mode: GraphMode,
         viewport: GraphViewportResponse,
     ) -> crate::Result<()> {
+        let mut nodes_by_y = BTreeMap::<i32, Vec<&GraphViewportNode>>::new();
+        for node in &viewport.nodes {
+            nodes_by_y.entry(node.y).or_default().push(node);
+        }
         let lanes_by_y = viewport
             .lanes
             .iter()
-            .map(|lane| (lane.y, lane))
+            .map(|lane| (lane.y, full_layout_materialization_lane(lane, &nodes_by_y)))
             .collect::<BTreeMap<_, _>>();
         self.clear_materialized_mode_facts(connection, mode)?;
         for node in &viewport.nodes {
@@ -5178,6 +5182,34 @@ pub(crate) fn database_path(dir: impl AsRef<Path>) -> PathBuf {
 
 fn main_store_database_path(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join(MAIN_STORE_DATABASE_FILE_NAME)
+}
+
+fn full_layout_materialization_lane(
+    lane: &GraphViewportLane,
+    nodes_by_y: &BTreeMap<i32, Vec<&GraphViewportNode>>,
+) -> GraphViewportLane {
+    let derived_prefix = if lane.label.starts_with("orphan ") {
+        Some(DERIVED_ORPHAN_LANE_KEY_PREFIX)
+    } else if lane.label.starts_with("skill ") {
+        Some(DERIVED_SKILL_LANE_KEY_PREFIX)
+    } else {
+        None
+    };
+    let Some(prefix) = derived_prefix else {
+        return lane.clone();
+    };
+    let Some(source_id) = nodes_by_y
+        .get(&lane.y)
+        .and_then(|nodes| nodes.iter().max_by_key(|node| node.x))
+        .map(|node| node.id.as_str())
+    else {
+        return lane.clone();
+    };
+    GraphViewportLane {
+        key: format!("{prefix}{source_id}"),
+        label: lane.label.clone(),
+        y: lane.y,
+    }
 }
 
 fn drop_main_store_materialization_tables(path: &Path) -> crate::Result<()> {

@@ -1658,7 +1658,7 @@ mod tests {
         let root = writer.root_id();
         let session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -1697,7 +1697,7 @@ mod tests {
         let root = writer.root_id();
         let session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -3930,7 +3930,7 @@ mod tests {
         let root = writer.root_id();
         let session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -3945,7 +3945,31 @@ mod tests {
                 kind: Kind::Text("full materialization fallback".to_owned()),
             })
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        let orphan = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("full materialization orphan".to_owned()),
+            })
+            .unwrap();
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan.clone())],
+                    PromptAnchor {
+                        prompt: "merge full materialization orphan".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &merge_anchor)
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -3967,7 +3991,17 @@ mod tests {
         assert_eq!(materialized.version, target_version);
         assert!(materialized.nodes.iter().any(|node| node.id == session));
         assert!(materialized.nodes.iter().any(|node| node.id == text));
+        assert!(
+            materialized
+                .nodes
+                .iter()
+                .any(|node| node.id == merge_anchor)
+        );
+        assert!(materialized.nodes.iter().any(|node| node.id == orphan));
         assert!(materialized.edges.iter().any(|edge| edge.target_id == text));
+        assert!(materialized.lanes.iter().any(|lane| {
+            lane.key == format!("derived:orphan:{orphan}") && lane.label.starts_with("orphan ")
+        }));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
