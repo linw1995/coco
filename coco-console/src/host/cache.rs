@@ -13,7 +13,9 @@ use crate::host::render::{
     MaterializedGraphShell, MaterializedGraphShellBranch, MaterializedGraphShellTick,
     ProviderContextItem,
 };
-use crate::layout::{lane_key, layout_graph_viewport, layout_graph_viewport_diff};
+use crate::layout::{
+    lane_key, layout_graph_viewport, layout_graph_viewport_diff, materialize_graph_viewport,
+};
 use crate::publisher::ConsolePublisher;
 use coco_mem::{BranchStore, NodeStore, SessionState, SessionStore, SqliteGraphStore, Store};
 use serde::Serialize;
@@ -787,14 +789,14 @@ where
             )
         );
         if let Some(snapshots) = self.snapshots.clone() {
-            let has_materialization = snapshots.has_materialization(mode);
+            let has_non_empty_materialization = snapshots.has_non_empty_materialization(mode);
             let source = self.source.clone();
             let incremental_result = self
                 .run_blocking_graph_compute(move || {
                     source.try_append_linear_materialization(snapshots, mode, source_version)
                 })
                 .await;
-            match incremental_result {
+            let fallback_message = match incremental_result {
                 Ok(Ok(true)) => {
                     self.publish_ready_version(source_version);
                     set_rebuild_status!(
@@ -811,7 +813,7 @@ where
                     );
                     return;
                 }
-                Ok(Ok(false)) => match has_materialization {
+                Ok(Ok(false)) => match has_non_empty_materialization {
                     Ok(true) => {
                         set_rebuild_status!(
                             self,
@@ -828,19 +830,7 @@ where
                         return;
                     }
                     Ok(false) => {
-                        set_rebuild_status!(
-                            self,
-                            rebuild_status(
-                                mode,
-                                source_version,
-                                ConsoleGraphRebuildState::Failed,
-                                None,
-                                0,
-                                0,
-                                "Incremental graph materialization could not seed this store state",
-                            )
-                        );
-                        return;
+                        "Incremental graph materialization could not seed this store state; rebuilding full materialization"
                     }
                     Err(error) => {
                         set_rebuild_status!(
@@ -888,26 +878,49 @@ where
                     );
                     return;
                 }
-            }
+            };
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Building,
+                    None,
+                    0,
+                    0,
+                    fallback_message,
+                )
+            );
         }
         let source = self.source.clone();
         let progress_cache = self.clone();
+        let snapshots = self.snapshots.clone();
         let result = self
             .run_blocking_graph_compute(move || {
-                source.build_snapshot_with_progress(mode, source_version, |progress| {
-                    set_rebuild_status!(
-                        progress_cache,
-                        rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Building,
-                            Some(progress.phase),
-                            progress.processed,
-                            progress.total,
-                            progress.phase.label(),
-                        )
-                    );
-                })
+                let snapshot =
+                    source.build_snapshot_with_progress(mode, source_version, |progress| {
+                        set_rebuild_status!(
+                            progress_cache,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Building,
+                                Some(progress.phase),
+                                progress.processed,
+                                progress.total,
+                                progress.phase.label(),
+                            )
+                        );
+                    })?;
+                if let Some(snapshots) = snapshots {
+                    let branch_labels = visible_full_layout_branch_labels(&snapshot);
+                    snapshots.replace_materialization_from_viewport(
+                        mode,
+                        materialize_graph_viewport(&snapshot),
+                        branch_labels,
+                    )?;
+                }
+                crate::Result::Ok(snapshot)
             })
             .await;
         match result {
@@ -1137,6 +1150,25 @@ fn latest_persistent_materialization_version(
                 (None, right) => right,
             })
         })
+}
+
+fn visible_full_layout_branch_labels(snapshot: &GraphSnapshot) -> BTreeSet<String> {
+    let node_ids = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    snapshot
+        .branches
+        .iter()
+        .filter(|branch| {
+            branch
+                .visible_head_id
+                .as_deref()
+                .is_some_and(|head_id| node_ids.contains(head_id))
+        })
+        .map(|branch| branch.name.clone())
+        .collect()
 }
 
 fn node_id_from_graph_target(target: &str) -> Option<String> {
@@ -1647,7 +1679,7 @@ mod tests {
         let root = writer.root_id();
         let session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -1686,7 +1718,7 @@ mod tests {
         let root = writer.root_id();
         let session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -3906,6 +3938,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_replaces_materialization_from_full_snapshot_layout() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("full materialization fallback".to_owned()),
+            })
+            .unwrap();
+        let orphan = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("full materialization orphan".to_owned()),
+            })
+            .unwrap();
+        let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan));
+        writer.fork(&orphan_lane, &root).unwrap();
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan.clone())],
+                    PromptAnchor {
+                        prompt: "merge full materialization orphan".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &merge_anchor)
+            .unwrap();
+        writer.fork("orphan branch", &session).unwrap();
+        let reserved_label_branch_head = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("reserved label branch".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("orphan branch", &session, &reserved_label_branch_head)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let snapshot = cache.snapshot_current(GraphMode::All).await.unwrap();
+        let branch_labels = visible_full_layout_branch_labels(&snapshot);
+        let viewport = materialize_graph_viewport(&snapshot);
+        ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .replace_materialization_from_viewport(GraphMode::All, viewport, branch_labels)
+            .unwrap();
+        let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .latest_viewport(
+                GraphMode::All,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(materialized.version, target_version);
+        assert!(materialized.nodes.iter().any(|node| node.id == session));
+        assert!(materialized.nodes.iter().any(|node| node.id == text));
+        assert!(
+            materialized
+                .nodes
+                .iter()
+                .any(|node| node.id == merge_anchor)
+        );
+        assert!(
+            materialized
+                .nodes
+                .iter()
+                .any(|node| node.id == reserved_label_branch_head)
+        );
+        assert!(materialized.nodes.iter().any(|node| node.id == orphan));
+        assert!(materialized.edges.iter().any(|edge| edge.target_id == text));
+        assert!(materialized.lanes.iter().any(|lane| {
+            lane.key == lane_key("orphan branch") && lane.label == "orphan branch"
+        }));
+        assert!(materialized.lanes.iter().any(|lane| {
+            lane.key == format!("derived:orphan:{orphan}") && lane.label == orphan_lane
+        }));
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_seeds_multiple_branch_materialization_without_full_snapshot() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
@@ -4538,6 +4685,12 @@ mod tests {
         assert!(materialized.edges.is_empty());
         assert!(materialized.lanes.is_empty());
         assert!(
+            !ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .has_non_empty_materialization(GraphMode::All)
+                .unwrap()
+        );
+        assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
@@ -4574,6 +4727,12 @@ mod tests {
         assert!(non_empty.nodes.iter().any(|node| node.id == session));
         assert!(non_empty.nodes.iter().any(|node| node.id == text));
         assert!(non_empty.lanes.iter().any(|lane| lane.label == "main"));
+        assert!(
+            ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .has_non_empty_materialization(GraphMode::All)
+                .unwrap()
+        );
 
         writer.delete_branch("main").unwrap();
         publisher.mark_changed();
