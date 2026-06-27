@@ -9306,6 +9306,37 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    #[test]
+    fn cache_drops_main_store_materialization_tables() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let main_database_path = path.join("store.sqlite3");
+        create_current_graph_materialization_tables(&main_database_path);
+        create_legacy_snapshot_materialization_tables(&main_database_path);
+
+        ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        for table in [
+            "console_graph_materializations",
+            "console_graph_node_locations",
+            "console_graph_edge_routes",
+            "console_graph_snapshots",
+            "console_graph_viewports",
+            "console_graph_viewport_lanes",
+            "console_graph_viewport_nodes",
+            "console_graph_viewport_edges",
+        ] {
+            assert!(!sqlite_table_exists(&main_database_path, table));
+        }
+        assert!(sqlite_table_exists(
+            &crate::host::snapshot_store::database_path(&path),
+            "console_graph_materializations"
+        ));
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[derive(QueryableByName)]
     struct SqliteCount {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -9401,6 +9432,22 @@ CREATE TABLE console_graph_viewports (mode TEXT PRIMARY KEY NOT NULL);
 CREATE TABLE console_graph_viewport_lanes (mode TEXT NOT NULL);
 CREATE TABLE console_graph_viewport_nodes (mode TEXT NOT NULL);
 CREATE TABLE console_graph_viewport_edges (mode TEXT NOT NULL);
+"#,
+                )
+                .unwrap();
+        });
+    }
+
+    fn create_current_graph_materialization_tables(database_path: &std::path::Path) {
+        use diesel::connection::SimpleConnection;
+
+        with_sqlite_test_connection(database_path, |connection| {
+            connection
+                .batch_execute(
+                    r#"
+CREATE TABLE console_graph_materializations (mode TEXT);
+CREATE TABLE console_graph_node_locations (mode TEXT);
+CREATE TABLE console_graph_edge_routes (mode TEXT);
 "#,
                 )
                 .unwrap();
