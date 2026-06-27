@@ -770,6 +770,42 @@ impl SqliteGraphStore {
         Ok(self.database.connection().lock().await)
     }
 
+    pub fn begin_read_transaction(&self) -> Result<()> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            connection
+                .batch_execute("BEGIN TRANSACTION")
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })
+        })
+    }
+
+    pub fn commit_read_transaction(&self) -> Result<()> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            connection
+                .batch_execute("COMMIT")
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })
+        })
+    }
+
+    pub fn rollback_read_transaction(&self) -> Result<()> {
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            connection
+                .batch_execute("ROLLBACK")
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })
+        })
+    }
+
     fn ensure_read_only<T>(&self) -> Result<T> {
         StoreReadOnlySnafu {
             path: self.dir.clone(),
@@ -1877,6 +1913,44 @@ async fn delete_branch_record(
 }
 
 async fn persist_session_nodes_and_branch_head(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    expected_old_head: &str,
+    new_head: &str,
+    nodes: &[Node],
+) -> Result<()> {
+    connection
+        .batch_execute("BEGIN IMMEDIATE")
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    let result = persist_session_nodes_and_branch_head_in_transaction(
+        connection,
+        path,
+        branch,
+        expected_old_head,
+        new_head,
+        nodes,
+    )
+    .await;
+    match result {
+        Ok(()) => connection
+            .batch_execute("COMMIT")
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            }),
+        Err(error) => {
+            let _ = connection.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
+async fn persist_session_nodes_and_branch_head_in_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     branch: &str,

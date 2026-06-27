@@ -1166,7 +1166,9 @@ where
             Self::PersistentStorePath(path) => {
                 let store =
                     SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
+                run_sqlite_graph_read_transaction(&store, || {
+                    build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
+                })
             }
         }
     }
@@ -1182,7 +1184,9 @@ where
             Self::PersistentStorePath(path) => {
                 let store =
                     SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                snapshots.try_append_linear_branch(source_version, mode, &store)
+                run_sqlite_graph_read_transaction(&store, || {
+                    snapshots.try_append_linear_branch(source_version, mode, &store)
+                })
             }
         }
     }
@@ -1224,6 +1228,28 @@ where
                     SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
                 materialized_shell_branches(&store, lanes)
             }
+        }
+    }
+}
+
+fn run_sqlite_graph_read_transaction<T>(
+    store: &SqliteGraphStore,
+    operation: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    store
+        .begin_read_transaction()
+        .context(crate::error::StoreSnafu)?;
+    let result = operation();
+    match result {
+        Ok(value) => {
+            store
+                .commit_read_transaction()
+                .context(crate::error::StoreSnafu)?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = store.rollback_read_transaction();
+            Err(error)
         }
     }
 }
