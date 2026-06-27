@@ -1673,7 +1673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_persists_graph_locations_to_sqlite_store_database() {
+    async fn cache_persists_graph_locations_to_sqlite_graph_database() {
         let path = temp_store_path();
         let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
         let publisher = ConsolePublisher::new();
@@ -1829,6 +1829,57 @@ mod tests {
         transaction_started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("graph materialization preflight read should start");
+
+        let writer_for_thread = writer.clone();
+        let root = writer.root_id();
+        let (write_tx, write_rx) = mpsc::channel();
+        let write = std::thread::spawn(move || {
+            let node = writer_for_thread
+                .append(NewNode {
+                    parent: root,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("store write while graph db is locked".to_owned()),
+                })
+                .unwrap();
+            write_tx.send(node).unwrap();
+        });
+
+        let written = write_rx.recv_timeout(Duration::from_secs(1));
+        release_transaction_tx.send(()).unwrap();
+        transaction.join().unwrap();
+        write.join().unwrap();
+        let written = written.expect("store write should not wait for graph transaction release");
+        assert_eq!(writer.get_node(&written).unwrap().id, written);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn graph_materialization_write_does_not_block_store_writes() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
+        let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
+        let transaction = std::thread::spawn(move || {
+            use diesel::connection::SimpleConnection;
+
+            with_sqlite_test_connection(&graph_database_path, move |connection| {
+                connection
+                    .batch_execute("BEGIN IMMEDIATE TRANSACTION")
+                    .unwrap();
+                transaction_started_tx.send(()).unwrap();
+                release_transaction_rx.recv().unwrap();
+                connection.batch_execute("ROLLBACK").unwrap();
+            });
+        });
+        transaction_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("graph materialization write transaction should start");
 
         let writer_for_thread = writer.clone();
         let root = writer.root_id();

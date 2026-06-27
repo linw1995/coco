@@ -28,7 +28,7 @@ use coco_mem::{
     SessionState, SessionStore, SqliteDatabase,
 };
 
-const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
+const SQLITE_DATABASE_FILE_NAME: &str = "console-graph.sqlite3";
 const COORDINATE_SPACE: &str = "graph_layout_v1";
 const NODE_RADIUS: i32 = 26;
 const EDGE_TARGET_APPROACH: i32 = 48;
