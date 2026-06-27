@@ -22,9 +22,9 @@ use super::{
 use crate::StoreResult as Result;
 use crate::error::{
     AmbiguousNodePrefixSnafu, BranchNotFoundSnafu, ConnectSqliteStoreSnafu, CorruptedStoreSnafu,
-    NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu,
-    RefsNotConnectedSnafu, StartSqliteRuntimeSnafu, StorePathIsNotDirectorySnafu,
-    StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+    LegacyJsonStoreSnafu, NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu,
+    QuerySqliteStoreSnafu, RefsNotConnectedSnafu, StartSqliteRuntimeSnafu,
+    StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::{
     Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Preset,
@@ -34,6 +34,7 @@ use crate::{
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const SQLITE_SCHEMA_VERSION: i32 = 2;
+const LEGACY_JSON_STORE_MARKERS: &[&str] = &["meta.json", "nodes.jsonl"];
 
 static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SQLITE_RUNTIME_INIT: Mutex<()> = Mutex::new(());
@@ -435,6 +436,7 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         prepare_store_directory(path)?;
+        reject_legacy_json_store_without_sqlite(path)?;
         let store = Self::new(path, StoreAccess::ReadWrite)?;
         store.run_migrations()?;
         store.load_or_initialize_state()?;
@@ -444,6 +446,7 @@ impl SqliteStore {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         ensure_existing_store_directory(path)?;
+        reject_legacy_json_store_without_sqlite(path)?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
         store.ensure_current_schema()?;
@@ -927,6 +930,23 @@ fn ensure_existing_database_file(path: &Path) -> Result<()> {
         CorruptedStoreSnafu {
             path: path.to_owned(),
             message: "missing SQLite database file".to_owned(),
+        }
+    );
+    Ok(())
+}
+
+fn reject_legacy_json_store_without_sqlite(path: &Path) -> Result<()> {
+    if sqlite_database_path(path).exists() {
+        return Ok(());
+    }
+
+    let has_legacy_marker = LEGACY_JSON_STORE_MARKERS
+        .iter()
+        .any(|file_name| path.join(file_name).exists());
+    ensure!(
+        !has_legacy_marker,
+        LegacyJsonStoreSnafu {
+            path: path.to_owned(),
         }
     );
     Ok(())
@@ -3253,6 +3273,36 @@ THIS IS NOT SQL;
 
         assert!(err.to_string().contains("SQLite"));
         assert!(!super::sqlite_database_path(&path).exists());
+    }
+
+    #[test]
+    fn open_rejects_legacy_json_store_without_creating_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("meta.json"), "{}").unwrap();
+        std::fs::write(path.join("nodes.jsonl"), "").unwrap();
+
+        let err = SqliteStore::open(&path).unwrap_err();
+
+        assert!(
+            matches!(err, crate::StoreError::LegacyJsonStore { path: legacy } if legacy == path)
+        );
+        assert!(!super::sqlite_database_path(&path).exists());
+    }
+
+    #[test]
+    fn open_read_only_rejects_legacy_json_store() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("nodes.jsonl"), "").unwrap();
+
+        let err = SqliteStore::open_read_only(&path).unwrap_err();
+
+        assert!(
+            matches!(err, crate::StoreError::LegacyJsonStore { path: legacy } if legacy == path)
+        );
     }
 
     #[test]
