@@ -1889,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_materialization_write_blocks_store_writes_until_released() {
+    fn graph_materialization_write_does_not_block_store_writes() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
         ConsoleGraphSnapshotStore::open(&path).unwrap();
@@ -1928,16 +1928,11 @@ mod tests {
             write_tx.send(node).unwrap();
         });
 
-        let pending = write_rx.recv_timeout(Duration::from_millis(100));
-        assert!(
-            pending.is_err(),
-            "store write should wait while graph materialization holds the write transaction"
-        );
-        release_transaction_tx.send(()).unwrap();
-        transaction.join().unwrap();
         let written = write_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("store write should finish after graph transaction release");
+            .expect("store write should not wait for graph transaction release");
+        release_transaction_tx.send(()).unwrap();
+        transaction.join().unwrap();
         write.join().unwrap();
         assert_eq!(writer.get_node(&written).unwrap().id, written);
 
@@ -9472,51 +9467,52 @@ mod tests {
     }
 
     #[test]
-    fn cache_uses_main_store_materialization_tables() {
+    fn cache_uses_snapshot_materialization_database() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
         let main_database_path = path.join("store.sqlite3");
+        let graph_database_path = path.join("console-graph.sqlite3");
 
         ConsoleGraphSnapshotStore::open(&path).unwrap();
 
         assert_eq!(
             crate::host::snapshot_store::database_path(&path),
-            main_database_path
+            graph_database_path
         );
         for table in [
             "console_graph_materializations",
             "console_graph_node_locations",
             "console_graph_edge_routes",
         ] {
-            assert!(sqlite_table_exists(&main_database_path, table));
+            assert!(sqlite_table_exists(&graph_database_path, table));
+            assert!(!sqlite_table_exists(&main_database_path, table));
         }
-        assert!(!path.join("console-graph.sqlite3").exists());
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
-    fn cache_drops_stale_main_store_materialization_tables_before_reuse() {
+    fn cache_drops_stale_snapshot_materialization_tables_before_reuse() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
-        let main_database_path = path.join("store.sqlite3");
-        create_current_graph_materialization_tables(&main_database_path);
+        let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        create_current_graph_materialization_tables(&graph_database_path);
 
         ConsoleGraphSnapshotStore::open(&path).unwrap();
 
         assert!(sqlite_table_has_column(
-            &main_database_path,
+            &graph_database_path,
             "console_graph_materializations",
             "source_version"
         ));
         assert!(sqlite_table_has_column(
-            &main_database_path,
+            &graph_database_path,
             "console_graph_node_locations",
             "node_target"
         ));
         assert!(sqlite_table_has_column(
-            &main_database_path,
+            &graph_database_path,
             "console_graph_edge_routes",
             "edge_kind"
         ));

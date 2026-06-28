@@ -29,7 +29,6 @@ use coco_mem::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "console-graph.sqlite3";
-const MAIN_STORE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const COORDINATE_SPACE: &str = "graph_layout_v1";
 const NODE_RADIUS: i32 = 26;
 const EDGE_TARGET_APPROACH: i32 = 48;
@@ -495,11 +494,10 @@ struct SqliteTableColumn {
 impl ConsoleGraphSnapshotStore {
     pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
         let dir = dir.as_ref();
-        drop_stale_main_store_materialization_tables(&main_store_database_path(dir))?;
-        drop_legacy_snapshot_materialization_tables(&legacy_snapshot_database_path(dir))?;
         let path = database_path(dir);
+        drop_stale_snapshot_materialization_tables(&path)?;
         let database =
-            SqliteDatabase::open_writable_store_path(dir).context(crate::error::StoreSnafu)?;
+            SqliteDatabase::open_unshared_file_path(&path).context(crate::error::StoreSnafu)?;
         let store = Self {
             path: Arc::new(path),
             database,
@@ -5407,15 +5405,7 @@ ORDER BY min_y, min_x, edge_key
 }
 
 pub(crate) fn database_path(dir: impl AsRef<Path>) -> PathBuf {
-    main_store_database_path(dir)
-}
-
-fn legacy_snapshot_database_path(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join(SQLITE_DATABASE_FILE_NAME)
-}
-
-fn main_store_database_path(dir: impl AsRef<Path>) -> PathBuf {
-    dir.as_ref().join(MAIN_STORE_DATABASE_FILE_NAME)
 }
 
 fn full_layout_materialization_lane(
@@ -5450,7 +5440,7 @@ fn full_layout_materialization_lane(
     }
 }
 
-fn drop_legacy_snapshot_materialization_tables(path: &Path) -> crate::Result<()> {
+fn drop_stale_snapshot_materialization_tables(path: &Path) -> crate::Result<()> {
     if !path.is_file() {
         return Ok(());
     }
@@ -5460,31 +5450,10 @@ fn drop_legacy_snapshot_materialization_tables(path: &Path) -> crate::Result<()>
     let error_path = path.clone();
     database.with_sync_connection(
         move |connection| {
-            drop_tables(connection, &path, MATERIALIZATION_TABLES)?;
-            drop_tables(connection, &path, LEGACY_MATERIALIZATION_TABLES)
-        },
-        |source| crate::Error::Store { source },
-        |source| crate::Error::QueryGraphSnapshotStore {
-            path: error_path,
-            source,
-        },
-    )
-}
-
-fn drop_stale_main_store_materialization_tables(path: &Path) -> crate::Result<()> {
-    if !path.is_file() {
-        return Ok(());
-    }
-    let database =
-        SqliteDatabase::open_unshared_file_path(path).context(crate::error::StoreSnafu)?;
-    let path = path.to_owned();
-    let error_path = path.clone();
-    database.with_sync_connection(
-        move |connection| {
-            if materialization_tables_have_current_schema(connection, &path)? {
-                return Ok(());
+            if !materialization_tables_have_current_schema(connection, &path)? {
+                drop_tables(connection, &path, MATERIALIZATION_TABLES)?;
             }
-            drop_tables(connection, &path, MATERIALIZATION_TABLES)
+            drop_tables(connection, &path, LEGACY_MATERIALIZATION_TABLES)
         },
         |source| crate::Error::Store { source },
         |source| crate::Error::QueryGraphSnapshotStore {
