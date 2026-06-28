@@ -6,6 +6,7 @@ use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Double, Integer, Text};
 use diesel::sqlite::SqliteConnection;
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use snafu::prelude::*;
 
 use crate::api::{
@@ -52,6 +53,7 @@ const LEGACY_MATERIALIZATION_TABLES: &[&str] = &[
     "console_graph_viewport_nodes",
     "console_graph_viewport_edges",
 ];
+const CONSOLE_GRAPH_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 #[derive(Clone, Debug)]
 pub struct ConsoleGraphSnapshotStore {
@@ -3330,99 +3332,13 @@ ORDER BY
         let this = self.clone();
         self.with_connection(move |connection| {
             this.drop_legacy_materialization_tables(connection)?;
-            sql_query(
-                r#"
-CREATE TABLE IF NOT EXISTS console_graph_materializations (
-    mode TEXT PRIMARY KEY NOT NULL,
-    source_version INTEGER NOT NULL,
-    coordinate_space TEXT NOT NULL,
-    world_min_x INTEGER NOT NULL,
-    world_min_y INTEGER NOT NULL,
-    world_max_x INTEGER NOT NULL,
-    world_max_y INTEGER NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-)
-"#,
-            )
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            sql_query(
-                r#"
-CREATE TABLE IF NOT EXISTS console_graph_node_locations (
-    mode TEXT NOT NULL,
-    node_key TEXT NOT NULL,
-    node_id TEXT NOT NULL,
-    node_target TEXT NOT NULL,
-    short_id TEXT NOT NULL,
-    node_kind TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    labels_json TEXT NOT NULL,
-    lane_key TEXT NOT NULL,
-    lane_label TEXT NOT NULL,
-    lane_y INTEGER NOT NULL,
-    x INTEGER NOT NULL,
-    y INTEGER NOT NULL,
-    min_x INTEGER NOT NULL,
-    min_y INTEGER NOT NULL,
-    max_x INTEGER NOT NULL,
-    max_y INTEGER NOT NULL,
-    PRIMARY KEY (mode, node_key)
-)
-"#,
-            )
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            sql_query(
-                "CREATE INDEX IF NOT EXISTS console_graph_node_locations_viewport_idx ON console_graph_node_locations(mode, min_x, min_y, max_x, max_y)",
-            )
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            sql_query(
-                "CREATE INDEX IF NOT EXISTS console_graph_node_locations_lane_idx ON console_graph_node_locations(mode, lane_y, lane_key)",
-            )
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            sql_query(
-                r#"
-CREATE TABLE IF NOT EXISTS console_graph_edge_routes (
-    mode TEXT NOT NULL,
-    edge_key TEXT NOT NULL,
-    edge_kind TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    source_x INTEGER NOT NULL,
-    source_y INTEGER NOT NULL,
-    target_x INTEGER NOT NULL,
-    target_y INTEGER NOT NULL,
-    route_slot INTEGER NOT NULL,
-    target_port_offset REAL NOT NULL,
-    min_x INTEGER NOT NULL,
-    min_y INTEGER NOT NULL,
-    max_x INTEGER NOT NULL,
-    max_y INTEGER NOT NULL,
-    PRIMARY KEY (mode, edge_key)
-)
-"#,
-            )
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            sql_query(
-                "CREATE INDEX IF NOT EXISTS console_graph_edge_routes_viewport_idx ON console_graph_edge_routes(mode, min_x, min_y, max_x, max_y)",
-            )
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
+            connection
+                .run_pending_migrations(CONSOLE_GRAPH_MIGRATIONS)
+                .map(|_| ())
+                .map_err(|source| crate::Error::MigrateGraphSnapshotStore {
+                    path: this.path.as_ref().clone(),
+                    source,
+                })?;
             Ok(())
         })
     }

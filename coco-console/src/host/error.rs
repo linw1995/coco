@@ -34,6 +34,12 @@ pub enum Error {
         source: diesel::result::Error,
     },
 
+    #[snafu(display("Console graph snapshot store {} migration failed: {source}", path.display()))]
+    MigrateGraphSnapshotStore {
+        path: PathBuf,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to connect console graph snapshot store {}: {source}", path.display()))]
     ConnectGraphSnapshotStore {
         path: PathBuf,
