@@ -135,6 +135,14 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Finished => "finished",
+        }
+    }
+
     pub fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -872,6 +880,55 @@ impl AnchorPayloadKind {
             Self::Prompt => "prompt",
             Self::SkillInvocation => "skill_invocation",
             Self::SkillResult => "skill_result",
+        }
+    }
+}
+
+impl PauseReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Merged { .. } => "merged",
+            Self::Closed => "closed",
+        }
+    }
+
+    pub fn merged_anchor_id(&self) -> Option<&str> {
+        match self {
+            Self::Merged { merged_anchor_id } => Some(merged_anchor_id),
+            Self::Closed => None,
+        }
+    }
+}
+
+impl SessionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Attached { .. } => "attached",
+            Self::Paused { .. } => "paused",
+        }
+    }
+
+    pub fn target_branch(&self) -> Option<&str> {
+        match self {
+            Self::Active => None,
+            Self::Attached { target_branch, .. } | Self::Paused { target_branch, .. } => {
+                Some(target_branch)
+            }
+        }
+    }
+
+    pub fn base_head_id(&self) -> Option<&str> {
+        match self {
+            Self::Attached { base_head_id, .. } => Some(base_head_id),
+            Self::Active | Self::Paused { .. } => None,
+        }
+    }
+
+    pub fn pause_reason(&self) -> Option<&PauseReason> {
+        match self {
+            Self::Paused { reason, .. } => Some(reason),
+            Self::Active | Self::Attached { .. } => None,
         }
     }
 }

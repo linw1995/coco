@@ -10,6 +10,12 @@ diesel::table! {
 diesel::table! {
     jobs (job_id) {
         job_id -> Text,
+        created_at -> Text,
+        finished_at -> Nullable<Text>,
+        branch -> Text,
+        work_branch -> Text,
+        base -> Text,
+        status -> Text,
         payload_json -> Text,
     }
 }
@@ -55,6 +61,11 @@ diesel::table! {
 diesel::table! {
     sessions (branch_name) {
         branch_name -> Text,
+        state -> Text,
+        target_branch -> Nullable<Text>,
+        base_head_id -> Nullable<Text>,
+        pause_reason -> Nullable<Text>,
+        merged_anchor_id -> Nullable<Text>,
         state_json -> Text,
     }
 }
