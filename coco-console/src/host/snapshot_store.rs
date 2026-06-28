@@ -29,7 +29,6 @@ use coco_mem::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "console-graph.sqlite3";
-const MAIN_STORE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const COORDINATE_SPACE: &str = "graph_layout_v1";
 const NODE_RADIUS: i32 = 26;
 const EDGE_TARGET_APPROACH: i32 = 48;
@@ -486,11 +485,17 @@ struct SqliteInteger {
     value: i32,
 }
 
+#[derive(QueryableByName)]
+struct SqliteTableColumn {
+    #[diesel(sql_type = Text)]
+    name: String,
+}
+
 impl ConsoleGraphSnapshotStore {
     pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
         let dir = dir.as_ref();
-        drop_main_store_materialization_tables(&main_store_database_path(dir))?;
         let path = database_path(dir);
+        drop_stale_snapshot_materialization_tables(&path)?;
         let database =
             SqliteDatabase::open_unshared_file_path(&path).context(crate::error::StoreSnafu)?;
         let store = Self {
@@ -506,10 +511,16 @@ impl ConsoleGraphSnapshotStore {
         mode: GraphMode,
         request: GraphViewportRequest,
     ) -> crate::Result<Option<GraphViewportResponse>> {
-        let Some(meta) = self.latest_materialization_row(mode)? else {
-            return Ok(None);
-        };
-        self.viewport_from_row(mode, meta, request)
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            this.run_read_transaction(connection, |this, connection| {
+                let Some(meta) = this.latest_materialization_row_in_connection(connection, mode)?
+                else {
+                    return Ok(None);
+                };
+                this.viewport_from_row(connection, mode, meta, request)
+            })
+        })
     }
 
     pub fn latest_viewport_diff(
@@ -517,10 +528,16 @@ impl ConsoleGraphSnapshotStore {
         mode: GraphMode,
         request: GraphViewportDiffRequest,
     ) -> crate::Result<Option<GraphViewportDiffResponse>> {
-        let Some(meta) = self.latest_materialization_row(mode)? else {
-            return Ok(None);
-        };
-        self.viewport_diff_from_row(mode, meta, request)
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            this.run_read_transaction(connection, |this, connection| {
+                let Some(meta) = this.latest_materialization_row_in_connection(connection, mode)?
+                else {
+                    return Ok(None);
+                };
+                this.viewport_diff_from_row(connection, mode, meta, request)
+            })
+        })
     }
 
     pub(crate) fn materialized_node_reference(
@@ -531,34 +548,9 @@ impl ConsoleGraphSnapshotStore {
         let this = self.clone();
         let target = target.to_owned();
         self.with_connection(move |connection| {
-            let row = sql_query(
-                r#"
-SELECT node_key, node_id, node_target, short_id, node_kind, summary, labels_json, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND node_target = ?
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-            )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(target)
-            .get_result::<NodeLocationRow>(connection)
-            .optional()
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            row.map(|row| {
-                let labels = serde_json::from_str::<Vec<String>>(&row.labels_json).context(
-                    ParseGraphSnapshotStoreValueSnafu {
-                        column: "console_graph_node_locations.labels_json",
-                    },
-                )?;
-                Ok(MaterializedNodeReference {
-                    node_id: row.node_id,
-                    labels,
-                })
+            this.run_read_transaction(connection, |this, connection| {
+                this.materialized_node_reference_in_connection(connection, mode, &target)
             })
-            .transpose()
         })
     }
 
@@ -570,15 +562,9 @@ LIMIT 1
         let this = self.clone();
         let node_ids = node_ids.clone();
         self.with_connection(move |connection| {
-            let mut points = BTreeMap::new();
-            for node_id in node_ids {
-                if let Some(point) =
-                    this.materialized_node_point_in_connection(connection, mode, &node_id)?
-                {
-                    points.insert(node_id, point);
-                }
-            }
-            Ok(points)
+            this.run_read_transaction(connection, |this, connection| {
+                this.materialized_node_points_in_connection(connection, mode, &node_ids)
+            })
         })
     }
 
@@ -613,35 +599,37 @@ LIMIT 1
     ) -> crate::Result<Option<MaterializedGraphShellFacts>> {
         let this = self.clone();
         self.with_connection(move |connection| {
-            let Some(meta) = this.latest_materialization_row_in_connection(connection, mode)?
-            else {
-                return Ok(None);
-            };
-            let lanes = this
-                .materialized_lanes_in_connection(connection, mode)?
-                .into_iter()
-                .map(|row| GraphViewportLane {
-                    key: row.lane_key,
-                    label: row.lane_label,
-                    y: row.lane_y,
-                })
-                .collect();
-            let mut nodes_by_id = BTreeMap::new();
-            for row in this.materialized_node_rows_in_connection(connection, mode)? {
-                nodes_by_id
-                    .entry(row.node_id)
-                    .or_insert(Point { x: row.x, y: row.y });
-            }
-            let nodes = nodes_by_id
-                .into_iter()
-                .map(|(node_id, point)| MaterializedGraphShellNode { node_id, point })
-                .collect();
-            Ok(Some(MaterializedGraphShellFacts {
-                version: meta.source_version.max(0) as u64,
-                lanes,
-                nodes,
-                edge_count: this.materialized_edge_count_in_connection(connection, mode)?,
-            }))
+            this.run_read_transaction(connection, |this, connection| {
+                let Some(meta) = this.latest_materialization_row_in_connection(connection, mode)?
+                else {
+                    return Ok(None);
+                };
+                let lanes = this
+                    .materialized_lanes_in_connection(connection, mode)?
+                    .into_iter()
+                    .map(|row| GraphViewportLane {
+                        key: row.lane_key,
+                        label: row.lane_label,
+                        y: row.lane_y,
+                    })
+                    .collect();
+                let mut nodes_by_id = BTreeMap::new();
+                for row in this.materialized_node_rows_in_connection(connection, mode)? {
+                    nodes_by_id
+                        .entry(row.node_id)
+                        .or_insert(Point { x: row.x, y: row.y });
+                }
+                let nodes = nodes_by_id
+                    .into_iter()
+                    .map(|(node_id, point)| MaterializedGraphShellNode { node_id, point })
+                    .collect();
+                Ok(Some(MaterializedGraphShellFacts {
+                    version: meta.source_version.max(0) as u64,
+                    lanes,
+                    nodes,
+                    edge_count: this.materialized_edge_count_in_connection(connection, mode)?,
+                }))
+            })
         })
     }
 
@@ -661,62 +649,236 @@ LIMIT 1
         });
         let source = MaterializationSourceSnapshot::from_store(store, &session_states)?;
 
+        if session_states.is_empty() {
+            let this = self.clone();
+            return self.with_connection(move |connection| {
+                this.run_bool_write_transaction(connection, |this, connection| {
+                    this.put_empty_materialization_in_transaction(connection, source_version, mode)
+                })
+            });
+        }
+
+        let this = self.clone();
+        let materialization_is_empty = self.with_connection(move |connection| {
+            let has_materialization = this
+                .latest_materialization_row_in_connection(connection, mode)?
+                .is_some();
+            Ok(!has_materialization
+                || this
+                    .materialized_node_rows_in_connection(connection, mode)?
+                    .is_empty())
+        })?;
+
+        if materialization_is_empty {
+            return self.try_seed_initial_branch_materialization_in_batches(
+                source,
+                source_version,
+                mode,
+                session_states,
+            );
+        }
+
         let this = self.clone();
         self.with_connection(move |connection| {
-            let result = if session_states.is_empty() {
-                this.begin_write_transaction(connection)?;
-                this.put_empty_materialization_in_transaction(connection, source_version, mode)
-            } else {
-                let has_materialization = this
-                    .latest_materialization_row_in_connection(connection, mode)?
-                    .is_some();
-                let materialization_is_empty = !has_materialization
-                    || this
-                        .materialized_node_rows_in_connection(connection, mode)?
-                        .is_empty();
-                this.begin_write_transaction(connection)?;
-                if materialization_is_empty {
-                    this.try_seed_initial_branch_materialization_in_transaction(
+            this.run_bool_write_transaction(connection, |this, connection| match mode {
+                GraphMode::Anchors => this.try_update_anchor_materialization_in_transaction(
+                    connection,
+                    &source,
+                    source_version,
+                    &session_states,
+                ),
+                GraphMode::All => this.try_append_linear_branches_in_transaction(
+                    connection,
+                    &source,
+                    source_version,
+                    mode,
+                    &session_states,
+                ),
+            })
+        })
+    }
+
+    fn try_seed_initial_branch_materialization_in_batches(
+        &self,
+        source: MaterializationSourceSnapshot,
+        source_version: u64,
+        mode: GraphMode,
+        session_states: Vec<(String, SessionState)>,
+    ) -> crate::Result<bool> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            this.run_bool_write_transaction(connection, |this, connection| {
+                let Some(first_index) =
+                    this.first_visible_initial_branch_index(&source, mode, &session_states)?
+                else {
+                    this.delete_materialization_meta(connection, mode)?;
+                    return this.put_empty_materialization_in_transaction(
                         connection,
-                        &source,
                         source_version,
                         mode,
-                        &session_states,
-                    )
-                } else {
-                    match mode {
+                    );
+                };
+
+                this.delete_materialization_meta(connection, mode)?;
+                this.clear_materialized_mode_facts(connection, mode)?;
+
+                let (first_branch, first_state) = &session_states[first_index];
+                if !this.try_seed_first_branch_materialization_in_transaction(
+                    connection,
+                    &source,
+                    mode,
+                    first_branch,
+                    first_state,
+                )? {
+                    return Ok(false);
+                }
+
+                let mut next_lane_y = crate::layout::GRAPH_TOP_Y + GRAPH_LANE_HEIGHT;
+                for (branch, state) in session_states[first_index..].iter().skip(1) {
+                    if !this.branch_has_initial_visible_nodes(&source, mode, branch)? {
+                        continue;
+                    }
+                    let head_id = source
+                        .get_branch_head(branch)
+                        .context(crate::error::StoreSnafu)?;
+                    this.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
+                    let input = AppendLinearBranchInput {
+                        mode,
+                        branch,
+                        state,
+                        head_id: &head_id,
+                    };
+                    let appended = match mode {
                         GraphMode::Anchors => this
-                            .try_update_anchor_materialization_in_transaction(
+                            .try_append_new_anchor_branch_lane_in_transaction(
                                 connection,
                                 &source,
-                                source_version,
-                                &session_states,
+                                input,
+                                next_lane_y,
                             ),
-                        GraphMode::All => this.try_append_linear_branches_in_transaction(
+                        GraphMode::All => this.try_append_new_branch_lane_in_transaction(
                             connection,
                             &source,
-                            source_version,
-                            mode,
-                            &session_states,
+                            input,
+                            next_lane_y,
                         ),
+                    }?;
+                    if !appended {
+                        return Ok(false);
                     }
+                    next_lane_y += GRAPH_LANE_HEIGHT;
                 }
-            };
-            match result {
-                Ok(true) => {
-                    this.commit_transaction(connection)?;
-                    Ok(true)
+
+                this.rebalance_routed_edge_slots(connection, mode)?;
+                if this
+                    .refresh_materialized_node_labels(connection, &source, mode, &session_states)?
+                    .is_none()
+                {
+                    return Ok(false);
                 }
-                Ok(false) => {
-                    let _ = this.rollback_transaction(connection);
-                    Ok(false)
-                }
-                Err(error) => {
-                    let _ = this.rollback_transaction(connection);
-                    Err(error)
-                }
-            }
+                this.put_materialization_meta_from_materialized_rows(
+                    connection,
+                    source_version,
+                    mode,
+                )?;
+                Ok(true)
+            })
         })
+    }
+
+    #[cfg(test)]
+    fn restore_empty_materialization_after_failed_batch_seed(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        previous_meta: Option<MaterializationRow>,
+    ) -> crate::Result<()> {
+        self.run_write_transaction(connection, |this, connection| {
+            this.delete_materialization_meta(connection, mode)?;
+            this.clear_materialized_mode_facts(connection, mode)?;
+            if let Some(meta) = previous_meta {
+                this.put_materialization_meta(
+                    connection,
+                    MaterializationMetaInput {
+                        source_version: meta.source_version.max(0) as u64,
+                        mode,
+                        world_min_x: meta.world_min_x,
+                        world_min_y: meta.world_min_y,
+                        world_max_x: meta.world_max_x,
+                        world_max_y: meta.world_max_y,
+                    },
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    fn run_write_transaction<T, F>(
+        &self,
+        connection: &mut SqliteConnection,
+        operation: F,
+    ) -> crate::Result<T>
+    where
+        F: FnOnce(&Self, &mut SqliteConnection) -> crate::Result<T>,
+    {
+        self.begin_write_transaction(connection)?;
+        match operation(self, connection) {
+            Ok(value) => {
+                self.commit_transaction(connection)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.rollback_transaction(connection);
+                Err(error)
+            }
+        }
+    }
+
+    fn run_read_transaction<T, F>(
+        &self,
+        connection: &mut SqliteConnection,
+        operation: F,
+    ) -> crate::Result<T>
+    where
+        F: FnOnce(&Self, &mut SqliteConnection) -> crate::Result<T>,
+    {
+        self.begin_read_transaction(connection)?;
+        match operation(self, connection) {
+            Ok(value) => {
+                self.commit_transaction(connection)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.rollback_transaction(connection);
+                Err(error)
+            }
+        }
+    }
+
+    fn run_bool_write_transaction<F>(
+        &self,
+        connection: &mut SqliteConnection,
+        operation: F,
+    ) -> crate::Result<bool>
+    where
+        F: FnOnce(&Self, &mut SqliteConnection) -> crate::Result<bool>,
+    {
+        self.begin_write_transaction(connection)?;
+        match operation(self, connection) {
+            Ok(true) => {
+                self.commit_transaction(connection)?;
+                Ok(true)
+            }
+            Ok(false) => {
+                let _ = self.rollback_transaction(connection);
+                Ok(false)
+            }
+            Err(error) => {
+                let _ = self.rollback_transaction(connection);
+                Err(error)
+            }
+        }
     }
 
     pub fn replace_materialization_from_viewport(
@@ -829,48 +991,6 @@ LIMIT 1
                 world_max_y: crate::layout::GRAPH_TOP_Y + 120,
             },
         )?;
-        Ok(true)
-    }
-
-    fn try_seed_initial_branch_materialization_in_transaction(
-        &self,
-        connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
-        source_version: u64,
-        mode: GraphMode,
-        session_states: &[(String, SessionState)],
-    ) -> crate::Result<bool> {
-        let Some(first_index) =
-            self.first_visible_initial_branch_index(store, mode, session_states)?
-        else {
-            return self.put_empty_materialization_in_transaction(connection, source_version, mode);
-        };
-        let (first_branch, first_state) = &session_states[first_index];
-        if !self.try_seed_first_branch_materialization_in_transaction(
-            connection,
-            store,
-            mode,
-            first_branch,
-            first_state,
-        )? {
-            return Ok(false);
-        }
-        if !self.try_seed_remaining_branch_materializations_in_transaction(
-            connection,
-            store,
-            mode,
-            &session_states[first_index..],
-        )? {
-            return Ok(false);
-        }
-        self.rebalance_routed_edge_slots(connection, mode)?;
-        if self
-            .refresh_materialized_node_labels(connection, store, mode, session_states)?
-            .is_none()
-        {
-            return Ok(false);
-        }
-        self.put_materialization_meta_from_materialized_rows(connection, source_version, mode)?;
         Ok(true)
     }
 
@@ -1022,51 +1142,6 @@ LIMIT 1
                 return Ok(false);
             }
             previous = Some((node.id, point));
-        }
-
-        Ok(true)
-    }
-
-    fn try_seed_remaining_branch_materializations_in_transaction(
-        &self,
-        connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
-        mode: GraphMode,
-        session_states: &[(String, SessionState)],
-    ) -> crate::Result<bool> {
-        let mut next_lane_y = crate::layout::GRAPH_TOP_Y + GRAPH_LANE_HEIGHT;
-        for (branch, state) in session_states.iter().skip(1) {
-            if !self.branch_has_initial_visible_nodes(store, mode, branch)? {
-                continue;
-            }
-            self.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
-            let head_id = store
-                .get_branch_head(branch)
-                .context(crate::error::StoreSnafu)?;
-            let input = AppendLinearBranchInput {
-                mode,
-                branch,
-                state,
-                head_id: &head_id,
-            };
-            let appended = match mode {
-                GraphMode::Anchors => self.try_append_new_anchor_branch_lane_in_transaction(
-                    connection,
-                    store,
-                    input,
-                    next_lane_y,
-                )?,
-                GraphMode::All => self.try_append_new_branch_lane_in_transaction(
-                    connection,
-                    store,
-                    input,
-                    next_lane_y,
-                )?,
-            };
-            if !appended {
-                return Ok(false);
-            }
-            next_lane_y += GRAPH_LANE_HEIGHT;
         }
 
         Ok(true)
@@ -3192,6 +3267,15 @@ ORDER BY
         Ok(())
     }
 
+    fn begin_read_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
+        sql_query("BEGIN")
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+        Ok(())
+    }
+
     fn commit_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
         sql_query("COMMIT")
             .execute(connection)
@@ -3320,6 +3404,20 @@ CREATE TABLE IF NOT EXISTS console_graph_edge_routes (
             self.path.as_ref(),
             LEGACY_MATERIALIZATION_TABLES,
         )
+    }
+
+    fn delete_materialization_meta(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<()> {
+        sql_query("DELETE FROM console_graph_materializations WHERE mode = ?")
+            .bind::<Text, _>(mode.as_query_value())
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+        Ok(())
     }
 
     fn put_materialization_meta(
@@ -4905,6 +5003,71 @@ LIMIT 1
         })
     }
 
+    fn materialized_node_reference_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        target: &str,
+    ) -> crate::Result<Option<MaterializedNodeReference>> {
+        if self
+            .latest_materialization_row_in_connection(connection, mode)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let row = sql_query(
+            r#"
+SELECT node_key, node_id, node_target, short_id, node_kind, summary, labels_json, x, y
+FROM console_graph_node_locations
+WHERE mode = ? AND node_target = ?
+ORDER BY y, x, node_key
+LIMIT 1
+"#,
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(target)
+        .get_result::<NodeLocationRow>(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        row.map(|row| {
+            let labels = serde_json::from_str::<Vec<String>>(&row.labels_json).context(
+                ParseGraphSnapshotStoreValueSnafu {
+                    column: "console_graph_node_locations.labels_json",
+                },
+            )?;
+            Ok(MaterializedNodeReference {
+                node_id: row.node_id,
+                labels,
+            })
+        })
+        .transpose()
+    }
+
+    fn materialized_node_points_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        node_ids: &BTreeSet<String>,
+    ) -> crate::Result<BTreeMap<String, Point>> {
+        if self
+            .latest_materialization_row_in_connection(connection, mode)?
+            .is_none()
+        {
+            return Ok(BTreeMap::new());
+        }
+        let mut points = BTreeMap::new();
+        for node_id in node_ids {
+            if let Some(point) =
+                self.materialized_node_point_in_connection(connection, mode, node_id)?
+            {
+                points.insert(node_id.clone(), point);
+            }
+        }
+        Ok(points)
+    }
+
     fn materialized_edge_count_in_connection(
         &self,
         connection: &mut SqliteConnection,
@@ -5000,6 +5163,7 @@ WHERE mode = ?
 
     fn viewport_from_row(
         &self,
+        connection: &mut SqliteConnection,
         mode: GraphMode,
         meta: MaterializationRow,
         request: GraphViewportRequest,
@@ -5019,23 +5183,24 @@ WHERE mode = ?
                 height: request.height,
                 overscan: request.overscan,
             },
-            lanes: self.viewport_lanes(mode, bounds)?,
-            nodes: self.viewport_nodes(mode, bounds)?,
-            edges: self.viewport_edges(mode, bounds)?,
+            lanes: self.viewport_lanes(connection, mode, bounds)?,
+            nodes: self.viewport_nodes(connection, mode, bounds)?,
+            edges: self.viewport_edges(connection, mode, bounds)?,
         }))
     }
 
     fn viewport_diff_from_row(
         &self,
+        connection: &mut SqliteConnection,
         mode: GraphMode,
         meta: MaterializationRow,
         request: GraphViewportDiffRequest,
     ) -> crate::Result<Option<GraphViewportDiffResponse>> {
         let previous = self
-            .viewport_from_row(mode, meta.clone(), request.previous)?
+            .viewport_from_row(connection, mode, meta.clone(), request.previous)?
             .expect("viewport metadata should produce a response");
         let current = self
-            .viewport_from_row(mode, meta, request.current)?
+            .viewport_from_row(connection, mode, meta, request.current)?
             .expect("viewport metadata should produce a response");
         Ok(Some(diff_graph_viewport_responses(
             previous,
@@ -5046,13 +5211,12 @@ WHERE mode = ?
 
     fn viewport_lanes(
         &self,
+        connection: &mut SqliteConnection,
         mode: GraphMode,
         bounds: ViewportItemBounds,
     ) -> crate::Result<Vec<GraphViewportLane>> {
-        let this = self.clone();
-        self.with_connection(move |connection| {
-            let rows = sql_query(
-                r#"
+        let rows = sql_query(
+            r#"
 SELECT DISTINCT lane_key, lane_label, lane_y
 FROM console_graph_node_locations
 WHERE mode = ?
@@ -5062,38 +5226,36 @@ WHERE mode = ?
   AND lane_y + 24 >= ?
 ORDER BY lane_y, lane_key
 "#,
-            )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Integer, _>(0)
-            .bind::<Integer, _>(bounds.right)
-            .bind::<Integer, _>(crate::layout::GRAPH_LEFT_X)
-            .bind::<Integer, _>(bounds.left)
-            .bind::<Integer, _>(bounds.bottom)
-            .bind::<Integer, _>(bounds.top)
-            .load::<LaneRow>(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            Ok(rows
-                .into_iter()
-                .map(|row| GraphViewportLane {
-                    key: row.lane_key,
-                    label: row.lane_label,
-                    y: row.lane_y,
-                })
-                .collect())
-        })
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Integer, _>(0)
+        .bind::<Integer, _>(bounds.right)
+        .bind::<Integer, _>(crate::layout::GRAPH_LEFT_X)
+        .bind::<Integer, _>(bounds.left)
+        .bind::<Integer, _>(bounds.bottom)
+        .bind::<Integer, _>(bounds.top)
+        .load::<LaneRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| GraphViewportLane {
+                key: row.lane_key,
+                label: row.lane_label,
+                y: row.lane_y,
+            })
+            .collect())
     }
 
     fn viewport_nodes(
         &self,
+        connection: &mut SqliteConnection,
         mode: GraphMode,
         bounds: ViewportItemBounds,
     ) -> crate::Result<Vec<GraphViewportNode>> {
-        let this = self.clone();
-        self.with_connection(move |connection| {
-            let rows = sql_query(
-                r#"
+        let rows = sql_query(
+            r#"
 SELECT node_key, node_id, node_target, short_id, node_kind, summary, labels_json, x, y
 FROM console_graph_node_locations
 WHERE mode = ?
@@ -5103,48 +5265,46 @@ WHERE mode = ?
   AND max_y >= ?
 ORDER BY y, x, node_key
 "#,
-            )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Integer, _>(bounds.right)
-            .bind::<Integer, _>(bounds.left)
-            .bind::<Integer, _>(bounds.bottom)
-            .bind::<Integer, _>(bounds.top)
-            .load::<NodeLocationRow>(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            rows.into_iter()
-                .map(|row| {
-                    let labels = serde_json::from_str(&row.labels_json).context(
-                        ParseGraphSnapshotStoreValueSnafu {
-                            column: "console_graph_node_locations.labels_json",
-                        },
-                    )?;
-                    Ok(GraphViewportNode {
-                        key: row.node_key,
-                        id: row.node_id,
-                        node_target: row.node_target,
-                        short_id: row.short_id,
-                        kind: row.node_kind,
-                        summary: row.summary,
-                        labels,
-                        x: row.x,
-                        y: row.y,
-                    })
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Integer, _>(bounds.right)
+        .bind::<Integer, _>(bounds.left)
+        .bind::<Integer, _>(bounds.bottom)
+        .bind::<Integer, _>(bounds.top)
+        .load::<NodeLocationRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        rows.into_iter()
+            .map(|row| {
+                let labels = serde_json::from_str(&row.labels_json).context(
+                    ParseGraphSnapshotStoreValueSnafu {
+                        column: "console_graph_node_locations.labels_json",
+                    },
+                )?;
+                Ok(GraphViewportNode {
+                    key: row.node_key,
+                    id: row.node_id,
+                    node_target: row.node_target,
+                    short_id: row.short_id,
+                    kind: row.node_kind,
+                    summary: row.summary,
+                    labels,
+                    x: row.x,
+                    y: row.y,
                 })
-                .collect()
-        })
+            })
+            .collect()
     }
 
     fn viewport_edges(
         &self,
+        connection: &mut SqliteConnection,
         mode: GraphMode,
         bounds: ViewportItemBounds,
     ) -> crate::Result<Vec<GraphViewportEdge>> {
-        let this = self.clone();
-        self.with_connection(move |connection| {
-            let rows = sql_query(
-                r#"
+        let rows = sql_query(
+            r#"
 SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
 FROM console_graph_edge_routes
 WHERE mode = ?
@@ -5154,37 +5314,36 @@ WHERE mode = ?
   AND max_y >= ?
 ORDER BY min_y, min_x, edge_key
 "#,
-            )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Integer, _>(bounds.right)
-            .bind::<Integer, _>(bounds.left)
-            .bind::<Integer, _>(bounds.bottom)
-            .bind::<Integer, _>(bounds.top)
-            .load::<EdgeRouteRow>(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            rows.into_iter()
-                .map(|row| {
-                    Ok(GraphViewportEdge {
-                        key: row.edge_key,
-                        kind: parse_edge_kind(&row.edge_kind)?,
-                        source_id: row.source_id,
-                        target_id: row.target_id,
-                        source: Point {
-                            x: row.source_x,
-                            y: row.source_y,
-                        },
-                        target: Point {
-                            x: row.target_x,
-                            y: row.target_y,
-                        },
-                        route_slot: row.route_slot,
-                        target_port_offset: row.target_port_offset,
-                    })
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Integer, _>(bounds.right)
+        .bind::<Integer, _>(bounds.left)
+        .bind::<Integer, _>(bounds.bottom)
+        .bind::<Integer, _>(bounds.top)
+        .load::<EdgeRouteRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(GraphViewportEdge {
+                    key: row.edge_key,
+                    kind: parse_edge_kind(&row.edge_kind)?,
+                    source_id: row.source_id,
+                    target_id: row.target_id,
+                    source: Point {
+                        x: row.source_x,
+                        y: row.source_y,
+                    },
+                    target: Point {
+                        x: row.target_x,
+                        y: row.target_y,
+                    },
+                    route_slot: row.route_slot,
+                    target_port_offset: row.target_port_offset,
                 })
-                .collect()
-        })
+            })
+            .collect()
     }
 
     fn with_connection<T, F>(&self, operation: F) -> crate::Result<T>
@@ -5193,18 +5352,25 @@ ORDER BY min_y, min_x, edge_key
         F: FnOnce(&mut SqliteConnection) -> crate::Result<T> + Send + 'static,
     {
         let path = self.path.as_ref().clone();
-        self.database.with_sync_connection(operation, |source| {
-            crate::Error::QueryGraphSnapshotStore { path, source }
-        })
+        self.database.with_sync_connection(
+            operation,
+            |source| crate::Error::Store { source },
+            |source| crate::Error::QueryGraphSnapshotStore { path, source },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_connection_for_tests<T, F>(&self, operation: F) -> crate::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut SqliteConnection) -> crate::Result<T> + Send + 'static,
+    {
+        self.with_connection(operation)
     }
 }
 
 pub(crate) fn database_path(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join(SQLITE_DATABASE_FILE_NAME)
-}
-
-fn main_store_database_path(dir: impl AsRef<Path>) -> PathBuf {
-    dir.as_ref().join(MAIN_STORE_DATABASE_FILE_NAME)
 }
 
 fn full_layout_materialization_lane(
@@ -5239,7 +5405,7 @@ fn full_layout_materialization_lane(
     }
 }
 
-fn drop_main_store_materialization_tables(path: &Path) -> crate::Result<()> {
+fn drop_stale_snapshot_materialization_tables(path: &Path) -> crate::Result<()> {
     if !path.is_file() {
         return Ok(());
     }
@@ -5249,14 +5415,65 @@ fn drop_main_store_materialization_tables(path: &Path) -> crate::Result<()> {
     let error_path = path.clone();
     database.with_sync_connection(
         move |connection| {
-            drop_tables(connection, &path, MATERIALIZATION_TABLES)?;
+            if !materialization_tables_have_current_schema(connection, &path)? {
+                drop_tables(connection, &path, MATERIALIZATION_TABLES)?;
+            }
             drop_tables(connection, &path, LEGACY_MATERIALIZATION_TABLES)
         },
+        |source| crate::Error::Store { source },
         |source| crate::Error::QueryGraphSnapshotStore {
             path: error_path,
             source,
         },
     )
+}
+
+fn materialization_tables_have_current_schema(
+    connection: &mut SqliteConnection,
+    path: &Path,
+) -> crate::Result<bool> {
+    for (table, column) in [
+        ("console_graph_materializations", "source_version"),
+        ("console_graph_node_locations", "node_target"),
+        ("console_graph_edge_routes", "edge_kind"),
+    ] {
+        if sqlite_table_exists(connection, path, table)?
+            && !sqlite_table_has_column(connection, path, table, column)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn sqlite_table_exists(
+    connection: &mut SqliteConnection,
+    path: &Path,
+    table: &str,
+) -> crate::Result<bool> {
+    let count =
+        sql_query("SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind::<Text, _>(table)
+            .get_result::<SqliteInteger>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: path.to_owned(),
+            })?
+            .value;
+    Ok(count > 0)
+}
+
+fn sqlite_table_has_column(
+    connection: &mut SqliteConnection,
+    path: &Path,
+    table: &str,
+    column: &str,
+) -> crate::Result<bool> {
+    let columns = sql_query(format!("PRAGMA table_info({table})"))
+        .load::<SqliteTableColumn>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(columns.iter().any(|info| info.name == column))
 }
 
 fn drop_tables(
@@ -5756,8 +5973,10 @@ mod tests {
     use super::*;
 
     use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use coco_mem::{MemoryStore, NewNode, NodeStore, Role};
+    use coco_mem::{MemoryStore, NewNode, NodeStore, PersistentStore, Role};
 
     struct BranchAdvanceDuringWalkStore {
         root: Node,
@@ -5923,6 +6142,21 @@ mod tests {
         }
     }
 
+    fn temp_store_path() -> PathBuf {
+        static TEMP_STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let process_id = std::process::id();
+        let counter = TEMP_STORE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "coco-console-snapshot-{process_id}-{nanos}-{counter}"
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     #[test]
     fn materialization_source_snapshot_captures_branch_heads_before_node_walk() {
         let store = BranchAdvanceDuringWalkStore::new();
@@ -5936,6 +6170,288 @@ mod tests {
         assert_eq!(store.get_branch_head("main").unwrap(), store.new_head_id);
         assert_eq!(snapshot.get_branch_head("main").unwrap(), store.old_head.id);
         assert_eq!(snapshot.ancestry("main").unwrap()[0].id, store.old_head.id);
+    }
+
+    #[test]
+    fn failed_batch_seed_clears_committed_facts_and_restores_empty_meta() {
+        let path = temp_store_path();
+        let _writer = PersistentStore::open(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let store = snapshots.clone();
+        let (restored_version, row_count) = snapshots
+            .with_connection_for_tests(move |connection| {
+                store.run_bool_write_transaction(connection, |this, connection| {
+                    this.put_empty_materialization_in_transaction(connection, 7, GraphMode::All)
+                })?;
+                let previous_meta =
+                    store.latest_materialization_row_in_connection(connection, GraphMode::All)?;
+                store.run_write_transaction(connection, |this, connection| {
+                    this.delete_materialization_meta(connection, GraphMode::All)?;
+                    let lane = GraphViewportLane {
+                        key: "main".to_owned(),
+                        label: "main".to_owned(),
+                        y: crate::layout::GRAPH_TOP_Y,
+                    };
+                    let node = GraphViewportNode {
+                        key: "node:test:0:0".to_owned(),
+                        id: "test".to_owned(),
+                        node_target: "test".to_owned(),
+                        short_id: "test".to_owned(),
+                        kind: "text".to_owned(),
+                        summary: "test".to_owned(),
+                        labels: Vec::new(),
+                        x: GRAPH_LEFT_X,
+                        y: lane.y,
+                    };
+                    this.insert_node_location(
+                        connection,
+                        NodeLocationInsert {
+                            mode: GraphMode::All,
+                            node: &node,
+                            lane: &lane,
+                            bounds: node_bounds(&node),
+                        },
+                    )?;
+                    Ok(())
+                })?;
+
+                store.restore_empty_materialization_after_failed_batch_seed(
+                    connection,
+                    GraphMode::All,
+                    previous_meta,
+                )?;
+                let restored = store
+                    .latest_materialization_row_in_connection(connection, GraphMode::All)?
+                    .expect("empty materialization meta should be restored");
+                let rows =
+                    store.materialized_node_rows_in_connection(connection, GraphMode::All)?;
+                Ok((restored.source_version, rows.len()))
+            })
+            .unwrap();
+
+        assert_eq!(restored_version, 7);
+        assert_eq!(row_count, 0);
+
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn direct_materialized_node_lookups_ignore_rows_without_meta() {
+        let path = temp_store_path();
+        let _writer = PersistentStore::open(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let store = snapshots.clone();
+        snapshots
+            .with_connection_for_tests(move |connection| {
+                store.run_write_transaction(connection, |this, connection| {
+                    this.delete_materialization_meta(connection, GraphMode::All)?;
+                    let lane = GraphViewportLane {
+                        key: "main".to_owned(),
+                        label: "main".to_owned(),
+                        y: crate::layout::GRAPH_TOP_Y,
+                    };
+                    let node = GraphViewportNode {
+                        key: "node:test:0:0".to_owned(),
+                        id: "test".to_owned(),
+                        node_target: "test".to_owned(),
+                        short_id: "test".to_owned(),
+                        kind: "text".to_owned(),
+                        summary: "test".to_owned(),
+                        labels: vec!["main".to_owned()],
+                        x: GRAPH_LEFT_X,
+                        y: lane.y,
+                    };
+                    this.insert_node_location(
+                        connection,
+                        NodeLocationInsert {
+                            mode: GraphMode::All,
+                            node: &node,
+                            lane: &lane,
+                            bounds: node_bounds(&node),
+                        },
+                    )?;
+                    Ok(())
+                })
+            })
+            .unwrap();
+
+        let reference = snapshots
+            .materialized_node_reference(GraphMode::All, "test")
+            .unwrap();
+        let points = snapshots
+            .materialized_node_points(GraphMode::All, &BTreeSet::from(["test".to_owned()]))
+            .unwrap();
+        assert!(reference.is_none());
+        assert!(points.is_empty());
+
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn latest_viewport_reads_meta_and_rows_from_one_snapshot() {
+        let path = temp_store_path();
+        let _writer = PersistentStore::open(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let store = snapshots.clone();
+        snapshots
+            .with_connection_for_tests(move |connection| {
+                store.run_bool_write_transaction(connection, |this, connection| {
+                    this.put_empty_materialization_in_transaction(connection, 7, GraphMode::All)
+                })
+            })
+            .unwrap();
+
+        let reader = snapshots.clone();
+        let writer = snapshots.clone();
+        let response = snapshots
+            .with_connection_for_tests(move |connection| {
+                reader.run_read_transaction(connection, |this, connection| {
+                    let meta = this
+                        .latest_materialization_row_in_connection(connection, GraphMode::All)?
+                        .expect("empty materialization meta should exist");
+
+                    let writer_store = writer.clone();
+                    writer.with_connection_for_tests(move |writer_connection| {
+                        writer_store.run_write_transaction(
+                            writer_connection,
+                            |this, writer_connection| {
+                                this.delete_materialization_meta(
+                                    writer_connection,
+                                    GraphMode::All,
+                                )?;
+                                let lane = GraphViewportLane {
+                                    key: "main".to_owned(),
+                                    label: "main".to_owned(),
+                                    y: crate::layout::GRAPH_TOP_Y,
+                                };
+                                let node = GraphViewportNode {
+                                    key: "node:test:0:0".to_owned(),
+                                    id: "test".to_owned(),
+                                    node_target: "test".to_owned(),
+                                    short_id: "test".to_owned(),
+                                    kind: "text".to_owned(),
+                                    summary: "test".to_owned(),
+                                    labels: vec!["main".to_owned()],
+                                    x: GRAPH_LEFT_X,
+                                    y: lane.y,
+                                };
+                                this.insert_node_location(
+                                    writer_connection,
+                                    NodeLocationInsert {
+                                        mode: GraphMode::All,
+                                        node: &node,
+                                        lane: &lane,
+                                        bounds: node_bounds(&node),
+                                    },
+                                )?;
+                                Ok(())
+                            },
+                        )
+                    })?;
+
+                    this.viewport_from_row(
+                        connection,
+                        GraphMode::All,
+                        meta,
+                        GraphViewportRequest::default(),
+                    )
+                })
+            })
+            .unwrap()
+            .expect("viewport should be available");
+
+        assert_eq!(response.version, 7);
+        assert!(response.nodes.is_empty());
+
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn meta_gated_materialized_node_lookups_read_from_one_snapshot() {
+        let path = temp_store_path();
+        let _writer = PersistentStore::open(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let store = snapshots.clone();
+        snapshots
+            .with_connection_for_tests(move |connection| {
+                store.run_bool_write_transaction(connection, |this, connection| {
+                    this.put_empty_materialization_in_transaction(connection, 7, GraphMode::All)
+                })
+            })
+            .unwrap();
+
+        let reader = snapshots.clone();
+        let writer = snapshots.clone();
+        let (reference, points) = snapshots
+            .with_connection_for_tests(move |connection| {
+                reader.run_read_transaction(connection, |this, connection| {
+                    assert!(
+                        this.latest_materialization_row_in_connection(connection, GraphMode::All)?
+                            .is_some()
+                    );
+
+                    let writer_store = writer.clone();
+                    writer.with_connection_for_tests(move |writer_connection| {
+                        writer_store.run_write_transaction(
+                            writer_connection,
+                            |this, writer_connection| {
+                                this.delete_materialization_meta(
+                                    writer_connection,
+                                    GraphMode::All,
+                                )?;
+                                let lane = GraphViewportLane {
+                                    key: "main".to_owned(),
+                                    label: "main".to_owned(),
+                                    y: crate::layout::GRAPH_TOP_Y,
+                                };
+                                let node = GraphViewportNode {
+                                    key: "node:test:0:0".to_owned(),
+                                    id: "test".to_owned(),
+                                    node_target: "test".to_owned(),
+                                    short_id: "test".to_owned(),
+                                    kind: "text".to_owned(),
+                                    summary: "test".to_owned(),
+                                    labels: vec!["main".to_owned()],
+                                    x: GRAPH_LEFT_X,
+                                    y: lane.y,
+                                };
+                                this.insert_node_location(
+                                    writer_connection,
+                                    NodeLocationInsert {
+                                        mode: GraphMode::All,
+                                        node: &node,
+                                        lane: &lane,
+                                        bounds: node_bounds(&node),
+                                    },
+                                )?;
+                                Ok(())
+                            },
+                        )
+                    })?;
+
+                    let reference = this.materialized_node_reference_in_connection(
+                        connection,
+                        GraphMode::All,
+                        "test",
+                    )?;
+                    let points = this.materialized_node_points_in_connection(
+                        connection,
+                        GraphMode::All,
+                        &BTreeSet::from(["test".to_owned()]),
+                    )?;
+                    Ok((reference, points))
+                })
+            })
+            .unwrap();
+
+        assert!(reference.is_none());
+        assert!(points.is_empty());
+
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

@@ -1343,9 +1343,9 @@ mod tests {
     use crate::ConsoleStore;
     use crate::host::snapshot_store::ConsoleGraphSnapshotStore;
     use coco_mem::{
-        Anchor, BranchStore, Kind, MemoryStore, MergeParent, NewNode, NodeStore, PersistentStore,
-        PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor, SkillInvocationMode,
-        SkillResultAnchor, Tool, ToolUse,
+        Anchor, BranchStore, JobStore, Kind, MemoryStore, MergeParent, NewNode, NodeStore,
+        PersistentStore, PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor,
+        SkillInvocationMode, SkillResultAnchor, Tool, ToolUse,
     };
     use diesel::QueryableByName;
     use serde_json::json;
@@ -1928,11 +1928,12 @@ mod tests {
             write_tx.send(node).unwrap();
         });
 
-        let written = write_rx.recv_timeout(Duration::from_secs(1));
+        let written = write_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("store write should not wait for graph transaction release");
         release_transaction_tx.send(()).unwrap();
         transaction.join().unwrap();
         write.join().unwrap();
-        let written = written.expect("store write should not wait for graph transaction release");
         assert_eq!(writer.get_node(&written).unwrap().id, written);
 
         drop(writer);
@@ -9440,8 +9441,8 @@ mod tests {
     async fn cache_drops_legacy_snapshot_materialization_tables() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
-        let database_path = crate::host::snapshot_store::database_path(&path);
-        create_legacy_snapshot_materialization_tables(&database_path);
+        let legacy_database_path = path.join("console-graph.sqlite3");
+        create_legacy_snapshot_materialization_tables(&legacy_database_path);
 
         let publisher = ConsolePublisher::new();
         let _cache = ConsoleGraphCache::new_with_persistent_store_path(
@@ -9458,7 +9459,7 @@ mod tests {
             "console_graph_viewport_nodes",
             "console_graph_viewport_edges",
         ] {
-            assert!(!sqlite_table_exists(&database_path, table));
+            assert!(!sqlite_table_exists(&legacy_database_path, table));
         }
 
         drop(writer);
@@ -9466,31 +9467,101 @@ mod tests {
     }
 
     #[test]
-    fn cache_drops_main_store_materialization_tables() {
+    fn cache_uses_snapshot_materialization_database() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
         let main_database_path = path.join("store.sqlite3");
-        create_current_graph_materialization_tables(&main_database_path);
-        create_legacy_snapshot_materialization_tables(&main_database_path);
+        let graph_database_path = path.join("console-graph.sqlite3");
 
         ConsoleGraphSnapshotStore::open(&path).unwrap();
 
+        assert_eq!(
+            crate::host::snapshot_store::database_path(&path),
+            graph_database_path
+        );
         for table in [
             "console_graph_materializations",
             "console_graph_node_locations",
             "console_graph_edge_routes",
-            "console_graph_snapshots",
-            "console_graph_viewports",
-            "console_graph_viewport_lanes",
-            "console_graph_viewport_nodes",
-            "console_graph_viewport_edges",
         ] {
+            assert!(sqlite_table_exists(&graph_database_path, table));
             assert!(!sqlite_table_exists(&main_database_path, table));
         }
-        assert!(sqlite_table_exists(
-            &crate::host::snapshot_store::database_path(&path),
-            "console_graph_materializations"
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn cache_drops_stale_snapshot_materialization_tables_before_reuse() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).unwrap();
+        let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        create_current_graph_materialization_tables(&graph_database_path);
+
+        ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        assert!(sqlite_table_has_column(
+            &graph_database_path,
+            "console_graph_materializations",
+            "source_version"
         ));
+        assert!(sqlite_table_has_column(
+            &graph_database_path,
+            "console_graph_node_locations",
+            "node_target"
+        ));
+        assert!(sqlite_table_has_column(
+            &graph_database_path,
+            "console_graph_edge_routes",
+            "edge_kind"
+        ));
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_write_transaction_allows_store_write_after_short_lock() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).unwrap();
+        let snapshot = ConsoleGraphSnapshotStore::open(&path).unwrap();
+        let base = root.clone();
+        coco_mem::SqliteDatabase::open_store_path(&path)
+            .unwrap()
+            .with_sync_connection(
+                |connection| {
+                    use diesel::connection::SimpleConnection;
+
+                    connection.batch_execute("PRAGMA busy_timeout = 50")
+                },
+                |source| panic!("{source}"),
+                std::convert::identity,
+            )
+            .unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let transaction = std::thread::spawn(move || {
+            snapshot
+                .with_connection_for_tests(move |connection| {
+                    use diesel::connection::SimpleConnection;
+
+                    connection
+                        .batch_execute("BEGIN IMMEDIATE TRANSACTION")
+                        .unwrap();
+                    started_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(200));
+                    connection.batch_execute("COMMIT").unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        writer.submit_job("main", &base).unwrap();
+        transaction.join().unwrap();
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9511,6 +9582,7 @@ mod tests {
             .unwrap()
             .with_sync_connection(
                 |connection| Ok(operation(connection)),
+                |source| panic!("{source}"),
                 std::convert::identity,
             )
             .unwrap()

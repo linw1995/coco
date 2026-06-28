@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use diesel::prelude::*;
@@ -9,6 +10,10 @@ use diesel::result::OptionalExtension;
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel::sqlite::SqliteConnection;
+use diesel_async::pooled_connection::bb8::{
+    Pool as AsyncSqlitePool, PooledConnection as AsyncSqlitePooledConnection,
+};
+use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
@@ -22,10 +27,11 @@ use super::{
 };
 use crate::StoreResult as Result;
 use crate::error::{
-    AmbiguousNodePrefixSnafu, BranchNotFoundSnafu, ConnectSqliteStoreSnafu, CorruptedStoreSnafu,
-    LegacyJsonStoreSnafu, NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu,
-    QuerySqliteStoreSnafu, RefsNotConnectedSnafu, StartSqliteRuntimeSnafu, StoreError,
-    StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+    AcquireSqliteConnectionSnafu, AmbiguousNodePrefixSnafu, BranchNotFoundSnafu,
+    CorruptedStoreSnafu, CreateSqlitePoolSnafu, LegacyJsonStoreSnafu, NotFoundSnafu,
+    ParentNotFoundSnafu, ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu,
+    StartSqliteRuntimeSnafu, StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu,
+    WriteStoreDirectorySnafu,
 };
 use crate::schema::{
     branches, jobs, message_queue_items, node_metadata, node_relations, nodes, presets, sessions,
@@ -44,6 +50,7 @@ const LEGACY_MIGRATION_TABLE_NAME: &str = "store_schema_migrations";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
 const LEGACY_JSON_STORE_MARKERS: &[&str] = &["meta.json", "nodes.jsonl"];
 const STORE_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+const SQLITE_POOL_MAX_SIZE: u32 = 4;
 
 static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SQLITE_RUNTIME_INIT: Mutex<()> = Mutex::new(());
@@ -52,7 +59,9 @@ static SQLITE_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<SqliteDatabaseInne
 
 type AsyncSqliteConnection = SyncConnectionWrapper<SqliteConnection>;
 
-type AsyncSqliteConnectionGuard<'a> = tokio::sync::MutexGuard<'a, AsyncSqliteConnection>;
+type AsyncSqliteConnectionGuard<'a> = AsyncSqlitePooledConnection<'a, AsyncSqliteConnection>;
+type SqliteGraphConnectionFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
 
 #[derive(Clone)]
 pub struct SqliteDatabase {
@@ -62,7 +71,9 @@ pub struct SqliteDatabase {
 struct SqliteDatabaseInner {
     database_path: PathBuf,
     runtime: &'static Runtime,
-    connection: Arc<tokio::sync::Mutex<AsyncSqliteConnection>>,
+    pool: AsyncSqlitePool<AsyncSqliteConnection>,
+    ensure_wal: Arc<AtomicBool>,
+    initialization: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -75,12 +86,23 @@ pub struct SqliteStore {
     _lock_file: Option<Arc<std::fs::File>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SqliteGraphStore {
     dir: PathBuf,
     database_path: PathBuf,
     database: SqliteDatabase,
     root_id: String,
+    read_transaction: Arc<Mutex<Option<AsyncSqliteConnectionGuard<'static>>>>,
+}
+
+impl std::fmt::Debug for SqliteGraphStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteGraphStore")
+            .field("dir", &self.dir)
+            .field("database_path", &self.database_path)
+            .field("root_id", &self.root_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,18 +242,22 @@ impl std::fmt::Debug for SqliteDatabase {
 
 impl SqliteDatabase {
     pub fn open_store_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(sqlite_database_path(path.as_ref()))
+        Self::open(sqlite_database_path(path.as_ref()), false)
+    }
+
+    pub fn open_writable_store_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(sqlite_database_path(path.as_ref()), true)
     }
 
     pub fn open_unshared_file_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_uncached(path.as_ref().to_owned())
+        Self::open_uncached(path.as_ref().to_owned(), true)
     }
 
-    fn open_unshared_read_only_file_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_uncached_read_only(path.as_ref().to_owned())
+    fn open_writable_file_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(path.as_ref().to_owned(), true)
     }
 
-    fn open(database_path: PathBuf) -> Result<Self> {
+    fn open(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let databases = SQLITE_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
         let mut databases = databases
@@ -241,101 +267,97 @@ impl SqliteDatabase {
             .get(&database_path)
             .and_then(std::sync::Weak::upgrade)
         {
-            return Ok(Self { inner });
+            let database = Self { inner };
+            drop(databases);
+            if ensure_wal {
+                database.request_wal_journal_mode()?;
+            }
+            return Ok(database);
         }
 
         let runtime = sqlite_runtime()?;
-        let connection = block_on_sqlite_runtime_with(runtime, async {
-            let mut connection = AsyncSqliteConnection::establish(&database_path.to_string_lossy())
-                .await
-                .context(ConnectSqliteStoreSnafu {
-                    path: database_path.clone(),
-                })?;
-            configure_connection(&mut connection, &database_path).await?;
-            Ok(connection)
-        })?;
+        let ensure_wal_flag = Arc::new(AtomicBool::new(ensure_wal));
+        let pool = build_sqlite_pool(runtime, &database_path, ensure_wal_flag.clone())?;
         let inner = Arc::new(SqliteDatabaseInner {
             database_path: database_path.clone(),
             runtime,
-            connection: Arc::new(tokio::sync::Mutex::new(connection)),
+            pool,
+            ensure_wal: ensure_wal_flag,
+            initialization: Mutex::new(()),
         });
         databases.insert(database_path, Arc::downgrade(&inner));
-        Ok(Self { inner })
+        let database = Self { inner };
+        if ensure_wal {
+            database.request_wal_journal_mode()?;
+        }
+        Ok(database)
     }
 
-    fn open_uncached(database_path: PathBuf) -> Result<Self> {
+    fn open_uncached(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let runtime = sqlite_runtime()?;
-        let connection = block_on_sqlite_runtime_with(runtime, async {
-            let mut connection = AsyncSqliteConnection::establish(&database_path.to_string_lossy())
-                .await
-                .context(ConnectSqliteStoreSnafu {
-                    path: database_path.clone(),
-                })?;
-            configure_connection(&mut connection, &database_path).await?;
-            ensure_wal_journal_mode(&mut connection, &database_path).await?;
-            Ok(connection)
-        })?;
-        Ok(Self {
+        let ensure_wal_flag = Arc::new(AtomicBool::new(ensure_wal));
+        let pool = build_sqlite_pool(runtime, &database_path, ensure_wal_flag.clone())?;
+        let database = Self {
             inner: Arc::new(SqliteDatabaseInner {
-                database_path,
+                database_path: database_path.clone(),
                 runtime,
-                connection: Arc::new(tokio::sync::Mutex::new(connection)),
+                pool,
+                ensure_wal: ensure_wal_flag,
+                initialization: Mutex::new(()),
             }),
-        })
+        };
+        if ensure_wal {
+            database.request_wal_journal_mode()?;
+        }
+        Ok(database)
     }
 
-    fn open_uncached_read_only(database_path: PathBuf) -> Result<Self> {
-        let database_path = sqlite_database_registry_path(&database_path)?;
-        let runtime = sqlite_runtime()?;
-        let connection = block_on_sqlite_runtime_with(runtime, async {
-            let mut connection = AsyncSqliteConnection::establish(&database_path.to_string_lossy())
-                .await
-                .context(ConnectSqliteStoreSnafu {
-                    path: database_path.clone(),
-                })?;
-            configure_connection(&mut connection, &database_path).await?;
-            Ok(connection)
-        })?;
-        Ok(Self {
-            inner: Arc::new(SqliteDatabaseInner {
-                database_path,
-                runtime,
-                connection: Arc::new(tokio::sync::Mutex::new(connection)),
-            }),
-        })
+    async fn connection(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
+        self.inner
+            .pool
+            .get()
+            .await
+            .context(AcquireSqliteConnectionSnafu {
+                path: self.inner.database_path.clone(),
+            })
     }
 
-    fn connection(&self) -> &tokio::sync::Mutex<AsyncSqliteConnection> {
-        &self.inner.connection
-    }
-
-    pub fn with_sync_connection<T, E, F, M>(
+    pub fn with_sync_connection<T, E, F, P, M>(
         &self,
         operation: F,
+        map_pool_error: P,
         map_connection_error: M,
     ) -> std::result::Result<T, E>
     where
         T: Send + 'static,
         E: Send + 'static,
         F: FnOnce(&mut SqliteConnection) -> std::result::Result<T, E> + Send + 'static,
-        M: FnOnce(diesel::result::Error) -> E,
+        P: FnOnce(StoreError) -> E + Send,
+        M: FnOnce(diesel::result::Error) -> E + Send,
     {
         let result = self.block_on(async {
-            let mut connection = self.connection().lock().await;
-            connection
+            let mut connection = match self.connection().await {
+                Ok(connection) => connection,
+                Err(error) => return Err(map_pool_error(error)),
+            };
+            match connection
                 .spawn_blocking(move |connection| Ok(operation(connection)))
                 .await
+            {
+                Ok(result) => Ok(result),
+                Err(error) => Err(map_connection_error(error)),
+            }
         });
         match result {
             Ok(result) => result,
-            Err(error) => Err(map_connection_error(error)),
+            Err(error) => Err(error),
         }
     }
 
     #[cfg(test)]
-    fn shared_connection(&self) -> &Arc<tokio::sync::Mutex<AsyncSqliteConnection>> {
-        &self.inner.connection
+    fn shared_pool(&self) -> &AsyncSqlitePool<AsyncSqliteConnection> {
+        &self.inner.pool
     }
 
     fn block_on<F>(&self, future: F) -> F::Output
@@ -344,6 +366,26 @@ impl SqliteDatabase {
         F::Output: Send,
     {
         block_on_sqlite_runtime_with(self.inner.runtime, future)
+    }
+
+    fn request_wal_journal_mode(&self) -> Result<()> {
+        self.inner.ensure_wal.store(true, Ordering::SeqCst);
+        self.block_on(async {
+            let mut connection = self.connection().await?;
+            ensure_wal_journal_mode(&mut connection, &self.inner.database_path).await
+        })
+    }
+
+    fn with_initialization_lock<T, F>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let _guard = self
+            .inner
+            .initialization
+            .lock()
+            .expect("SQLite database initialization lock poisoned");
+        operation()
     }
 }
 
@@ -364,8 +406,10 @@ impl SqliteStore {
         prepare_store_directory(path)?;
         reject_incomplete_legacy_json_store(path)?;
         let store = Self::new(path, StoreAccess::ReadWrite)?;
-        store.run_migrations()?;
-        store.load_or_initialize_state()?;
+        store.database.with_initialization_lock(|| {
+            store.run_migrations()?;
+            store.load_or_initialize_state()
+        })?;
         Ok(store)
     }
 
@@ -375,8 +419,10 @@ impl SqliteStore {
         reject_incomplete_legacy_json_store(path)?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
-        store.ensure_current_schema()?;
-        store.load_state()?;
+        store.database.with_initialization_lock(|| {
+            store.ensure_current_schema()?;
+            store.load_state()
+        })?;
         Ok(store)
     }
 
@@ -404,7 +450,10 @@ impl SqliteStore {
         database_path: PathBuf,
         access: StoreAccess,
     ) -> Result<Self> {
-        let database = SqliteDatabase::open(database_path.clone())?;
+        let database = match access {
+            StoreAccess::ReadWrite => SqliteDatabase::open_writable_file_path(&database_path)?,
+            StoreAccess::ReadOnly => SqliteDatabase::open(database_path.clone(), false)?,
+        };
         let lock_file = if access == StoreAccess::ReadWrite {
             Some(super::lock::open_store_lock(path)?)
         } else {
@@ -455,20 +504,25 @@ impl SqliteStore {
         ensure_existing_store_directory(path)?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
         ensure_existing_database_file(&store.database_path)?;
-        let (version, has_diesel_migration_table) = store.block_on(async {
-            let mut connection = store.connect().await?;
-            let has_diesel_migration_table = table_count(
-                &mut connection,
-                &store.database_path,
-                DIESEL_MIGRATION_TABLE_NAME,
-            )
-            .await?
-                == 1;
-            let version =
-                existing_schema_version_for_upgrade_check(&mut connection, &store.database_path)
+        let (version, has_diesel_migration_table) =
+            store.database.with_initialization_lock(|| {
+                store.block_on(async {
+                    let mut connection = store.connect().await?;
+                    let has_diesel_migration_table = table_count(
+                        &mut connection,
+                        &store.database_path,
+                        DIESEL_MIGRATION_TABLE_NAME,
+                    )
+                    .await?
+                        == 1;
+                    let version = existing_schema_version_for_upgrade_check(
+                        &mut connection,
+                        &store.database_path,
+                    )
                     .await?;
-            Ok((version, has_diesel_migration_table))
-        })?;
+                    Ok((version, has_diesel_migration_table))
+                })
+            })?;
         ensure!(
             version <= SQLITE_SCHEMA_VERSION,
             CorruptedStoreSnafu {
@@ -509,9 +563,19 @@ impl SqliteStore {
             if node_count(&mut connection, &self.database_path).await? == 0 {
                 self.ensure_writable()?;
                 let state = StoreState::new();
-                persist_root_metadata(&mut connection, &self.database_path, state.root_id())
-                    .await?;
-                persist_node(&mut connection, &self.database_path, state.root_node()).await?;
+                begin_immediate_transaction(&mut connection, &self.database_path).await?;
+                let result = async {
+                    persist_root_metadata(&mut connection, &self.database_path, state.root_id())
+                        .await?;
+                    persist_node_without_transaction(
+                        &mut connection,
+                        &self.database_path,
+                        state.root_node(),
+                    )
+                    .await
+                }
+                .await;
+                finish_transaction(&mut connection, &self.database_path, result).await?;
                 return Ok(state);
             }
             load_state(&mut connection, &self.database_path).await
@@ -534,7 +598,7 @@ impl SqliteStore {
     }
 
     async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
-        Ok(self.database.connection().lock().await)
+        self.database.connection().await
     }
 
     #[cfg(test)]
@@ -549,10 +613,12 @@ impl SqliteGraphStore {
         ensure_existing_store_directory(path)?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path)?;
-        store.ensure_current_schema()?;
-        let root_id = store.block_on(async {
-            let mut connection = store.connect().await?;
-            load_root_id(&mut connection, &store.database_path).await
+        let root_id = store.database.with_initialization_lock(|| {
+            store.ensure_current_schema()?;
+            store.block_on(async {
+                let mut connection = store.connect().await?;
+                load_root_id(&mut connection, &store.database_path).await
+            })
         })?;
         Ok(Self { root_id, ..store })
     }
@@ -563,12 +629,13 @@ impl SqliteGraphStore {
 
     fn new(path: &Path) -> Result<Self> {
         let database_path = sqlite_database_path(path);
-        let database = SqliteDatabase::open_unshared_read_only_file_path(database_path.clone())?;
+        let database = SqliteDatabase::open(database_path.clone(), false)?;
         Ok(Self {
             dir: path.to_owned(),
             database_path,
             database,
             root_id: String::new(),
+            read_transaction: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -598,24 +665,97 @@ impl SqliteGraphStore {
     }
 
     async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
-        Ok(self.database.connection().lock().await)
+        self.database.connection().await
+    }
+
+    fn with_connection<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send,
+        F: for<'a> FnOnce(&'a mut AsyncSqliteConnection) -> SqliteGraphConnectionFuture<'a, T>
+            + Send,
+    {
+        let mut read_transaction = self
+            .read_transaction
+            .lock()
+            .expect("graph store transaction lock poisoned");
+        if let Some(connection) = read_transaction.as_mut() {
+            return self.block_on(operation(&mut *connection));
+        }
+        drop(read_transaction);
+
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            operation(&mut connection).await
+        })
     }
 
     pub fn begin_read_transaction(&self) -> Result<()> {
+        ensure!(
+            self.read_transaction
+                .lock()
+                .expect("graph store transaction lock poisoned")
+                .is_none(),
+            CorruptedStoreSnafu {
+                path: self.database_path.clone(),
+                message: "SQLite graph read transaction already active".to_owned(),
+            }
+        );
+
         self.block_on(async {
-            let mut connection = self.connect().await?;
+            let mut connection = self.database.inner.pool.get_owned().await.context(
+                AcquireSqliteConnectionSnafu {
+                    path: self.database_path.clone(),
+                },
+            )?;
             connection
                 .batch_execute("BEGIN TRANSACTION")
                 .await
                 .context(QuerySqliteStoreSnafu {
                     path: self.database_path.clone(),
-                })
+                })?;
+            let mut connection = Some(connection);
+            let transaction_already_active = {
+                let mut read_transaction = self
+                    .read_transaction
+                    .lock()
+                    .expect("graph store transaction lock poisoned");
+                if read_transaction.is_some() {
+                    true
+                } else {
+                    *read_transaction = connection.take();
+                    false
+                }
+            };
+            if transaction_already_active {
+                let mut connection = connection.expect("pending graph read connection is missing");
+                connection
+                    .batch_execute("ROLLBACK")
+                    .await
+                    .context(QuerySqliteStoreSnafu {
+                        path: self.database_path.clone(),
+                    })?;
+                return CorruptedStoreSnafu {
+                    path: self.database_path.clone(),
+                    message: "SQLite graph read transaction already active".to_owned(),
+                }
+                .fail();
+            }
+            Ok(())
         })
     }
 
     pub fn commit_read_transaction(&self) -> Result<()> {
+        let mut connection = self
+            .read_transaction
+            .lock()
+            .expect("graph store transaction lock poisoned")
+            .take()
+            .context(CorruptedStoreSnafu {
+                path: self.database_path.clone(),
+                message: "SQLite graph read transaction is not active".to_owned(),
+            })?;
+
         self.block_on(async {
-            let mut connection = self.connect().await?;
             connection
                 .batch_execute("COMMIT")
                 .await
@@ -626,8 +766,16 @@ impl SqliteGraphStore {
     }
 
     pub fn rollback_read_transaction(&self) -> Result<()> {
+        let Some(mut connection) = self
+            .read_transaction
+            .lock()
+            .expect("graph store transaction lock poisoned")
+            .take()
+        else {
+            return Ok(());
+        };
+
         self.block_on(async {
-            let mut connection = self.connect().await?;
             connection
                 .batch_execute("ROLLBACK")
                 .await
@@ -645,29 +793,27 @@ impl SqliteGraphStore {
     }
 
     fn get_node_by_exact_id(&self, id: &str) -> Result<Node> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            let row = nodes::table
-                .filter(nodes::id.eq(id))
-                .select(node_row_columns!())
-                .get_result::<NodeRow>(&mut connection)
-                .await
-                .optional()
-                .context(QuerySqliteStoreSnafu {
-                    path: self.database_path.clone(),
-                })?
-                .context(NotFoundSnafu { id: id.to_owned() })?;
-            let node_id = row.id.clone();
-            let metadata_rows = load_node_metadata_rows_for_ids(
-                &mut connection,
-                &self.database_path,
-                Some(std::slice::from_ref(&node_id)),
-            )
-            .await?;
-            row.into_node(
-                &self.database_path,
-                node_metadata_slice(&metadata_rows, &node_id),
-            )
+        let id = id.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move {
+                let row = nodes::table
+                    .filter(nodes::id.eq(&id))
+                    .select(node_row_columns!())
+                    .get_result::<NodeRow>(connection)
+                    .await
+                    .optional()
+                    .context(QuerySqliteStoreSnafu { path: path.clone() })?
+                    .context(NotFoundSnafu { id })?;
+                let node_id = row.id.clone();
+                let metadata_rows = load_node_metadata_rows_for_ids(
+                    connection,
+                    &path,
+                    Some(std::slice::from_ref(&node_id)),
+                )
+                .await?;
+                row.into_node(&path, node_metadata_slice(&metadata_rows, &node_id))
+            })
         })
     }
 
@@ -686,32 +832,34 @@ impl SqliteGraphStore {
     }
 
     fn branch_head(&self, name: &str) -> Result<Option<String>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            branches::table
-                .filter(branches::name.eq(name))
-                .select(branches::head_id)
-                .get_result::<String>(&mut connection)
-                .await
-                .optional()
-                .context(QuerySqliteStoreSnafu {
-                    path: self.database_path.clone(),
-                })
+        let name = name.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move {
+                branches::table
+                    .filter(branches::name.eq(name))
+                    .select(branches::head_id)
+                    .get_result::<String>(connection)
+                    .await
+                    .optional()
+                    .context(QuerySqliteStoreSnafu { path })
+            })
         })
     }
 
     fn node_exists(&self, id: &str) -> Result<bool> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            let count = nodes::table
-                .filter(nodes::id.eq(id))
-                .count()
-                .get_result::<i64>(&mut connection)
-                .await
-                .context(QuerySqliteStoreSnafu {
-                    path: self.database_path.clone(),
-                })?;
-            Ok(count > 0)
+        let id = id.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move {
+                let count = nodes::table
+                    .filter(nodes::id.eq(id))
+                    .count()
+                    .get_result::<i64>(connection)
+                    .await
+                    .context(QuerySqliteStoreSnafu { path })?;
+                Ok(count > 0)
+            })
         })
     }
 
@@ -743,17 +891,18 @@ impl SqliteGraphStore {
     }
 
     fn node_ids_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            nodes::table
-                .filter(nodes::id.like(format!("{prefix}%")))
-                .select(nodes::id)
-                .order(nodes::id)
-                .load::<String>(&mut connection)
-                .await
-                .context(QuerySqliteStoreSnafu {
-                    path: self.database_path.clone(),
-                })
+        let prefix = prefix.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move {
+                nodes::table
+                    .filter(nodes::id.like(format!("{prefix}%")))
+                    .select(nodes::id)
+                    .order(nodes::id)
+                    .load::<String>(connection)
+                    .await
+                    .context(QuerySqliteStoreSnafu { path })
+            })
         })
     }
 }
@@ -887,6 +1036,55 @@ fn fs_migration_complete_marker_exists(path: &Path) -> Result<bool> {
         )
         .await
     })
+}
+
+fn build_sqlite_pool(
+    runtime: &'static Runtime,
+    database_path: &Path,
+    ensure_wal: Arc<AtomicBool>,
+) -> Result<AsyncSqlitePool<AsyncSqliteConnection>> {
+    let manager = AsyncDieselConnectionManager::<AsyncSqliteConnection>::new_with_config(
+        database_path.to_string_lossy().into_owned(),
+        sqlite_pool_manager_config(database_path.to_owned(), ensure_wal),
+    );
+    block_on_sqlite_runtime_with(runtime, async {
+        AsyncSqlitePool::builder()
+            .max_size(SQLITE_POOL_MAX_SIZE)
+            .build(manager)
+            .await
+            .context(CreateSqlitePoolSnafu {
+                path: database_path.to_owned(),
+            })
+    })
+}
+
+fn sqlite_pool_manager_config(
+    database_path: PathBuf,
+    ensure_wal: Arc<AtomicBool>,
+) -> ManagerConfig<AsyncSqliteConnection> {
+    let mut config = ManagerConfig::default();
+    config.custom_setup = Box::new(move |url| {
+        let url = url.to_owned();
+        let database_path = database_path.clone();
+        let ensure_wal = ensure_wal.clone();
+        Box::pin(async move {
+            let mut connection = AsyncSqliteConnection::establish(&url).await?;
+            configure_connection(&mut connection, &database_path)
+                .await
+                .map_err(sqlite_connection_setup_error)?;
+            if ensure_wal.as_ref().load(Ordering::SeqCst) {
+                ensure_wal_journal_mode(&mut connection, &database_path)
+                    .await
+                    .map_err(sqlite_connection_setup_error)?;
+            }
+            Ok(connection)
+        })
+    });
+    config
+}
+
+fn sqlite_connection_setup_error(error: crate::StoreError) -> diesel::ConnectionError {
+    diesel::ConnectionError::BadConnection(error.to_string())
 }
 
 async fn configure_connection(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
@@ -1180,6 +1378,15 @@ async fn load_root_id(connection: &mut AsyncSqliteConnection, path: &Path) -> Re
 }
 
 async fn load_state(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<StoreState> {
+    begin_read_transaction(connection, path).await?;
+    let result = load_state_without_transaction(connection, path).await;
+    finish_transaction(connection, path, result).await
+}
+
+async fn load_state_without_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<StoreState> {
     let root_id = load_root_id(connection, path).await?;
     let mut rows = load_node_rows(connection, path).await?;
     let metadata_rows = load_node_metadata_rows(connection, path).await?;
@@ -1348,7 +1555,64 @@ fn node_references_known_parents(state: &StoreState, node: &Node) -> bool {
         .all(|parent| state.nodes.contains_key(parent.node_id()))
 }
 
+async fn begin_immediate_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<()> {
+    connection
+        .batch_execute("BEGIN IMMEDIATE")
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn begin_read_transaction(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
+    connection
+        .batch_execute("BEGIN")
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn commit_transaction(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
+    connection
+        .batch_execute("COMMIT")
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn finish_transaction<T>(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => {
+            commit_transaction(connection, path).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = connection.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
 async fn persist_node(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    begin_immediate_transaction(connection, path).await?;
+    let result = persist_node_without_transaction(connection, path, node).await;
+    finish_transaction(connection, path, result).await
+}
+
+async fn persist_node_without_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     node: &Node,
@@ -1389,7 +1653,7 @@ async fn persist_node(
     Ok(())
 }
 
-async fn upsert_node(
+async fn upsert_node_without_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     node: &Node,
@@ -1740,30 +2004,13 @@ async fn persist_branch_and_session_state(
     head_id: &str,
     session_state: &SessionState,
 ) -> Result<()> {
-    connection
-        .batch_execute("BEGIN IMMEDIATE")
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
-
+    begin_immediate_transaction(connection, path).await?;
     let result = async {
         persist_branch(connection, path, branch, head_id).await?;
         persist_session_state(connection, path, branch, session_state).await
     }
     .await;
-    match result {
-        Ok(()) => connection
-            .batch_execute("COMMIT")
-            .await
-            .context(QuerySqliteStoreSnafu {
-                path: path.to_owned(),
-            }),
-        Err(error) => {
-            let _ = connection.batch_execute("ROLLBACK").await;
-            Err(error)
-        }
-    }
+    finish_transaction(connection, path, result).await
 }
 
 async fn persist_session_state(
@@ -1878,13 +2125,7 @@ async fn persist_session_nodes_and_branch_head(
     new_head: &str,
     nodes: &[Node],
 ) -> Result<()> {
-    connection
-        .batch_execute("BEGIN IMMEDIATE")
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
-
+    begin_immediate_transaction(connection, path).await?;
     let result = persist_session_nodes_and_branch_head_in_transaction(
         connection,
         path,
@@ -1894,18 +2135,7 @@ async fn persist_session_nodes_and_branch_head(
         nodes,
     )
     .await;
-    match result {
-        Ok(()) => connection
-            .batch_execute("COMMIT")
-            .await
-            .context(QuerySqliteStoreSnafu {
-                path: path.to_owned(),
-            }),
-        Err(error) => {
-            let _ = connection.batch_execute("ROLLBACK").await;
-            Err(error)
-        }
-    }
+    finish_transaction(connection, path, result).await
 }
 
 async fn persist_session_nodes_and_branch_head_in_transaction(
@@ -1917,7 +2147,7 @@ async fn persist_session_nodes_and_branch_head_in_transaction(
     nodes: &[Node],
 ) -> Result<()> {
     for node in nodes {
-        upsert_node(connection, path, node).await?;
+        upsert_node_without_transaction(connection, path, node).await?;
     }
     let updated = update_branch_head(connection, path, branch, expected_old_head, new_head).await?;
     ensure!(
@@ -2294,10 +2524,11 @@ impl NodeStore for SqliteGraphStore {
 
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
         let head_id = self.resolve_ref_id(head_ref)?;
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            let rows = sql_query(
-                r#"
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move {
+                let rows = sql_query(
+                    r#"
 WITH RECURSIVE ancestry(id, depth) AS (
     SELECT ? AS id, 0 AS depth
     UNION ALL
@@ -2311,24 +2542,23 @@ FROM ancestry
 JOIN nodes ON nodes.id = ancestry.id
 ORDER BY ancestry.depth
 "#,
-            )
-            .bind::<Text, _>(&head_id)
-            .load::<NodeRow>(&mut connection)
-            .await
-            .context(QuerySqliteStoreSnafu {
-                path: self.database_path.clone(),
-            })?;
+                )
+                .bind::<Text, _>(&head_id)
+                .load::<NodeRow>(connection)
+                .await
+                .context(QuerySqliteStoreSnafu { path: path.clone() })?;
 
-            let nodes = node_rows_into_nodes(&mut connection, &self.database_path, rows).await?;
-            if let Some(last) = nodes.last()
-                && !last.is_root()
-            {
-                return ParentNotFoundSnafu {
-                    id: last.parent.clone(),
+                let nodes = node_rows_into_nodes(connection, &path, rows).await?;
+                if let Some(last) = nodes.last()
+                    && !last.is_root()
+                {
+                    return ParentNotFoundSnafu {
+                        id: last.parent.clone(),
+                    }
+                    .fail();
                 }
-                .fail();
-            }
-            Ok(nodes)
+                Ok(nodes)
+            })
         })
     }
 
@@ -2352,19 +2582,20 @@ ORDER BY ancestry.depth
 
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
         self.get_node_by_exact_id(node_id)?;
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            let rows = node_relations::table
-                .inner_join(nodes::table.on(nodes::id.eq(node_relations::child_node_id)))
-                .filter(node_relations::parent_node_id.eq(node_id))
-                .select(node_row_columns!())
-                .order((nodes::created_at, nodes::id))
-                .load::<NodeRow>(&mut connection)
-                .await
-                .context(QuerySqliteStoreSnafu {
-                    path: self.database_path.clone(),
-                })?;
-            node_rows_into_nodes(&mut connection, &self.database_path, rows).await
+        let node_id = node_id.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move {
+                let rows = node_relations::table
+                    .inner_join(nodes::table.on(nodes::id.eq(node_relations::child_node_id)))
+                    .filter(node_relations::parent_node_id.eq(node_id))
+                    .select(node_row_columns!())
+                    .order((nodes::created_at, nodes::id))
+                    .load::<NodeRow>(connection)
+                    .await
+                    .context(QuerySqliteStoreSnafu { path: path.clone() })?;
+                node_rows_into_nodes(connection, &path, rows).await
+            })
         })
     }
 }
@@ -2396,37 +2627,36 @@ impl BranchStore for SqliteGraphStore {
 
 impl SessionStore for SqliteGraphStore {
     fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            let sessions = sessions::table
-                .select((
-                    sessions::branch_name,
-                    sessions::state,
-                    sessions::target_branch,
-                    sessions::base_head_id,
-                    sessions::pause_reason,
-                    sessions::merged_anchor_id,
-                    sessions::state_json,
-                ))
-                .order(sessions::branch_name)
-                .load::<SessionRow>(&mut connection)
-                .await
-                .context(QuerySqliteStoreSnafu {
-                    path: self.database_path.clone(),
-                })?;
-            sessions
-                .into_iter()
-                .map(|session| {
-                    let state = serde_json::from_str::<SessionState>(&session.state_json).context(
-                        ParseSqliteStoreValueSnafu {
-                            path: self.database_path.clone(),
-                            column: "sessions.state_json".to_owned(),
-                        },
-                    )?;
-                    validate_session_row_summary(&session, &state, &self.database_path)?;
-                    Ok((session.branch_name, state))
-                })
-                .collect()
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move {
+                let sessions = sessions::table
+                    .select((
+                        sessions::branch_name,
+                        sessions::state,
+                        sessions::target_branch,
+                        sessions::base_head_id,
+                        sessions::pause_reason,
+                        sessions::merged_anchor_id,
+                        sessions::state_json,
+                    ))
+                    .order(sessions::branch_name)
+                    .load::<SessionRow>(connection)
+                    .await
+                    .context(QuerySqliteStoreSnafu { path: path.clone() })?;
+                sessions
+                    .into_iter()
+                    .map(|session| {
+                        let state = serde_json::from_str::<SessionState>(&session.state_json)
+                            .context(ParseSqliteStoreValueSnafu {
+                                path: path.clone(),
+                                column: "sessions.state_json".to_owned(),
+                            })?;
+                        validate_session_row_summary(&session, &state, &path)?;
+                        Ok((session.branch_name, state))
+                    })
+                    .collect()
+            })
         })
     }
 
@@ -2939,7 +3169,7 @@ mod tests {
     use diesel::sql_query;
     use diesel::sql_types::{Integer, Nullable, Text};
     use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
-    use std::sync::{Arc, mpsc};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
@@ -3221,9 +3451,9 @@ VALUES (?, ?, ?, ?, ?, ?)
         let store = SqliteStore::open(&path).unwrap();
         let cloned = store.clone();
 
-        assert!(Arc::ptr_eq(
-            store.database.shared_connection(),
-            cloned.database.shared_connection()
+        assert!(std::ptr::eq(
+            store.database.shared_pool(),
+            cloned.database.shared_pool()
         ));
     }
 
@@ -3237,17 +3467,17 @@ VALUES (?, ?, ?, ?, ?, ?)
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
         let lexical_read_only = SqliteStore::open_read_only(path.join(".")).unwrap();
 
-        assert!(Arc::ptr_eq(
-            store.database.shared_connection(),
-            read_only.database.shared_connection()
+        assert!(std::ptr::eq(
+            store.database.shared_pool(),
+            read_only.database.shared_pool()
         ));
-        assert!(!Arc::ptr_eq(
-            store.database.shared_connection(),
-            graph.database.shared_connection()
+        assert!(std::ptr::eq(
+            store.database.shared_pool(),
+            graph.database.shared_pool()
         ));
-        assert!(Arc::ptr_eq(
-            store.database.shared_connection(),
-            lexical_read_only.database.shared_connection()
+        assert!(std::ptr::eq(
+            store.database.shared_pool(),
+            lexical_read_only.database.shared_pool()
         ));
     }
 
@@ -3257,13 +3487,13 @@ VALUES (?, ?, ?, ?, ?, ?)
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
-        let graph_connection = graph.database.shared_connection().clone();
         let graph_database = graph.database.clone();
+        let graph_connection_database = graph_database.clone();
         let (graph_locked_tx, graph_locked_rx) = mpsc::channel();
         let (release_graph_tx, release_graph_rx) = mpsc::channel();
         let graph_lock = std::thread::spawn(move || {
             graph_database.block_on(async move {
-                let _guard = graph_connection.lock().await;
+                let _connection = graph_connection_database.connection().await.unwrap();
                 graph_locked_tx.send(()).unwrap();
                 release_graph_rx.recv().unwrap();
             });
@@ -3340,6 +3570,52 @@ VALUES (?, ?, ?, ?, ?, ?)
             reopened.list_children(&reopened.root_id()).unwrap().len(),
             8
         );
+    }
+
+    #[test]
+    fn load_state_reads_from_one_snapshot() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+
+        let (snapshot, child_id) = store.block_on(async {
+            let mut reader = store.connect().await.unwrap();
+            super::begin_read_transaction(&mut reader, &store.database_path)
+                .await
+                .unwrap();
+            assert_eq!(
+                super::load_root_id(&mut reader, &store.database_path)
+                    .await
+                    .unwrap(),
+                root_id
+            );
+
+            let writer = store.clone();
+            let child_parent = root_id.clone();
+            let handle = std::thread::spawn(move || {
+                writer
+                    .append(NewNode {
+                        parent: child_parent,
+                        role: Role::User,
+                        metadata: None,
+                        kind: Kind::Text("concurrent child".to_owned()),
+                    })
+                    .unwrap()
+            });
+            let child_id = handle.join().unwrap();
+
+            let snapshot = super::load_state_without_transaction(&mut reader, &store.database_path)
+                .await
+                .unwrap();
+            super::commit_transaction(&mut reader, &store.database_path)
+                .await
+                .unwrap();
+            (snapshot, child_id)
+        });
+
+        assert!(snapshot.get_node(&child_id).is_err());
+        assert!(store.get_node(&child_id).is_ok());
     }
 
     #[test]

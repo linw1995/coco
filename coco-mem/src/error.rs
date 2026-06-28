@@ -169,6 +169,18 @@ pub enum StoreError {
         source: diesel::ConnectionError,
     },
 
+    #[snafu(display("Failed to create SQLite store connection pool {path:?}: {source}"))]
+    CreateSqlitePool {
+        path: PathBuf,
+        source: diesel_async::pooled_connection::PoolError,
+    },
+
+    #[snafu(display("Failed to acquire SQLite store connection {path:?}: {source}"))]
+    AcquireSqliteConnection {
+        path: PathBuf,
+        source: diesel_async::pooled_connection::bb8::RunError,
+    },
+
     #[snafu(display("Failed to query SQLite store {path:?}: {source}"))]
     QuerySqliteStore {
         path: PathBuf,
