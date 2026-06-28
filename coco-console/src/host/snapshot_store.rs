@@ -23,6 +23,9 @@ use crate::layout::{
     EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LEFT_X, diff_graph_viewport_responses,
     lane_key,
 };
+use crate::schema::{
+    console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
+};
 use coco_mem::{
     BranchStore, Kind, MergeParent, NewNode, Node, NodeStore, PauseReason, SessionAnchorPatch,
     SessionState, SessionStore, SqliteDatabase,
@@ -267,7 +270,7 @@ impl SessionStore for MaterializationSourceSnapshot {
     }
 }
 
-#[derive(Clone, QueryableByName)]
+#[derive(Clone, Queryable, QueryableByName)]
 struct MaterializationRow {
     #[diesel(sql_type = BigInt)]
     source_version: i64,
@@ -281,7 +284,7 @@ struct MaterializationRow {
     world_max_y: i32,
 }
 
-#[derive(Clone, QueryableByName)]
+#[derive(Clone, Queryable, QueryableByName)]
 struct LaneRow {
     #[diesel(sql_type = Text)]
     lane_key: String,
@@ -291,7 +294,7 @@ struct LaneRow {
     lane_y: i32,
 }
 
-#[derive(QueryableByName)]
+#[derive(Queryable, QueryableByName)]
 struct NodeLocationRow {
     #[diesel(sql_type = Text)]
     node_key: String,
@@ -313,7 +316,7 @@ struct NodeLocationRow {
     y: i32,
 }
 
-#[derive(QueryableByName)]
+#[derive(Queryable, QueryableByName)]
 struct EdgeRouteRow {
     #[diesel(sql_type = Text)]
     edge_key: String,
@@ -337,7 +340,7 @@ struct EdgeRouteRow {
     target_port_offset: f64,
 }
 
-#[derive(Clone, QueryableByName)]
+#[derive(Clone, Queryable, QueryableByName)]
 struct MaterializedTailNodeRow {
     #[diesel(sql_type = Text)]
     node_key: String,
@@ -355,7 +358,7 @@ struct MaterializedTailNodeRow {
     y: i32,
 }
 
-#[derive(QueryableByName)]
+#[derive(Queryable, QueryableByName)]
 struct MaterializedNodePointRow {
     #[diesel(sql_type = Integer)]
     x: i32,
@@ -382,6 +385,18 @@ struct NodeLocationInsert<'a> {
     node: &'a GraphViewportNode,
     lane: &'a GraphViewportLane,
     bounds: ItemBounds,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = console_graph_materializations)]
+struct MaterializationInsert<'a> {
+    mode: &'a str,
+    source_version: i64,
+    coordinate_space: &'a str,
+    world_min_x: i32,
+    world_min_y: i32,
+    world_max_x: i32,
+    world_max_y: i32,
 }
 
 pub(crate) struct MaterializedNodeReference {
@@ -2164,20 +2179,26 @@ impl ConsoleGraphSnapshotStore {
         mode: GraphMode,
         node_id: &str,
     ) -> crate::Result<Vec<LaneRow>> {
-        sql_query(
-            r#"
-SELECT DISTINCT lane_key, lane_label, lane_y
-FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ? AND lane_key LIKE 'derived:orphan:%'
-ORDER BY lane_y
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .load::<LaneRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_id.eq(node_id))
+                    .and(node_locations::lane_key.like("derived:orphan:%")),
+            )
+            .select((
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+            ))
+            .distinct()
+            .order(node_locations::lane_y)
+            .load::<LaneRow>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn outgoing_edge_routes_from_lanes(
@@ -2206,20 +2227,31 @@ ORDER BY lane_y
         node_id: &str,
         lane_y: i32,
     ) -> crate::Result<Vec<EdgeRouteRow>> {
-        sql_query(
-            r#"
-SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
-FROM console_graph_edge_routes
-WHERE mode = ? AND source_id = ? AND source_y = ?
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .bind::<Integer, _>(lane_y)
-        .load::<EdgeRouteRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_edge_routes::dsl as edge_routes;
+
+        edge_routes::console_graph_edge_routes
+            .filter(
+                edge_routes::mode
+                    .eq(mode.as_query_value())
+                    .and(edge_routes::source_id.eq(node_id))
+                    .and(edge_routes::source_y.eq(lane_y)),
+            )
+            .select((
+                edge_routes::edge_key,
+                edge_routes::edge_kind,
+                edge_routes::source_id,
+                edge_routes::target_id,
+                edge_routes::source_x,
+                edge_routes::source_y,
+                edge_routes::target_x,
+                edge_routes::target_y,
+                edge_routes::route_slot,
+                edge_routes::target_port_offset,
+            ))
+            .load::<EdgeRouteRow>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn insert_migrated_outgoing_edge_routes(
@@ -3411,12 +3443,16 @@ CREATE TABLE IF NOT EXISTS console_graph_edge_routes (
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<()> {
-        sql_query("DELETE FROM console_graph_materializations WHERE mode = ?")
-            .bind::<Text, _>(mode.as_query_value())
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
+        use console_graph_materializations::dsl as materializations;
+
+        diesel::delete(
+            materializations::console_graph_materializations
+                .filter(materializations::mode.eq(mode.as_query_value())),
+        )
+        .execute(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
         Ok(())
     }
 
@@ -3425,33 +3461,42 @@ CREATE TABLE IF NOT EXISTS console_graph_edge_routes (
         connection: &mut SqliteConnection,
         input: MaterializationMetaInput,
     ) -> crate::Result<()> {
-        sql_query(
-            r#"
-INSERT INTO console_graph_materializations (
-    mode, source_version, coordinate_space, world_min_x, world_min_y, world_max_x, world_max_y
-)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(mode) DO UPDATE SET
-    source_version = excluded.source_version,
-    coordinate_space = excluded.coordinate_space,
-    world_min_x = excluded.world_min_x,
-    world_min_y = excluded.world_min_y,
-    world_max_x = excluded.world_max_x,
-    world_max_y = excluded.world_max_y,
-    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-"#,
-        )
-        .bind::<Text, _>(input.mode.as_query_value())
-        .bind::<BigInt, _>(input.source_version as i64)
-        .bind::<Text, _>(COORDINATE_SPACE)
-        .bind::<Integer, _>(input.world_min_x)
-        .bind::<Integer, _>(input.world_min_y)
-        .bind::<Integer, _>(input.world_max_x)
-        .bind::<Integer, _>(input.world_max_y)
-        .execute(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_materializations::dsl as materializations;
+
+        let row = MaterializationInsert {
+            mode: input.mode.as_query_value(),
+            source_version: input.source_version as i64,
+            coordinate_space: COORDINATE_SPACE,
+            world_min_x: input.world_min_x,
+            world_min_y: input.world_min_y,
+            world_max_x: input.world_max_x,
+            world_max_y: input.world_max_y,
+        };
+        diesel::insert_into(materializations::console_graph_materializations)
+            .values(&row)
+            .on_conflict(materializations::mode)
+            .do_update()
+            .set((
+                materializations::source_version
+                    .eq(diesel::upsert::excluded(materializations::source_version)),
+                materializations::coordinate_space
+                    .eq(diesel::upsert::excluded(materializations::coordinate_space)),
+                materializations::world_min_x
+                    .eq(diesel::upsert::excluded(materializations::world_min_x)),
+                materializations::world_min_y
+                    .eq(diesel::upsert::excluded(materializations::world_min_y)),
+                materializations::world_max_x
+                    .eq(diesel::upsert::excluded(materializations::world_max_x)),
+                materializations::world_max_y
+                    .eq(diesel::upsert::excluded(materializations::world_max_y)),
+                materializations::updated_at.eq(diesel::dsl::sql::<Text>(
+                    "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                )),
+            ))
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         Ok(())
     }
 
@@ -3604,17 +3649,17 @@ WHERE console_graph_edge_routes.edge_kind IS NOT excluded.edge_kind
             serde_json::to_string(&labels).context(ParseGraphSnapshotStoreValueSnafu {
                 column: "console_graph_node_locations.labels_json",
             })?;
-        sql_query(
-            r#"
-UPDATE console_graph_node_locations
-SET labels_json = ?
-WHERE mode = ? AND node_key = ? AND labels_json IS NOT ?
-"#,
+        use console_graph_node_locations::dsl as node_locations;
+
+        diesel::update(
+            node_locations::console_graph_node_locations.filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_key.eq(node_key))
+                    .and(node_locations::labels_json.ne(&labels_json)),
+            ),
         )
-        .bind::<Text, _>(&labels_json)
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_key)
-        .bind::<Text, _>(&labels_json)
+        .set(node_locations::labels_json.eq(&labels_json))
         .execute(connection)
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
@@ -3633,17 +3678,17 @@ WHERE mode = ? AND node_key = ? AND labels_json IS NOT ?
             serde_json::to_string(&labels).context(ParseGraphSnapshotStoreValueSnafu {
                 column: "console_graph_node_locations.labels_json",
             })?;
-        sql_query(
-            r#"
-UPDATE console_graph_node_locations
-SET labels_json = ?
-WHERE mode = ? AND node_id = ? AND labels_json IS NOT ?
-"#,
+        use console_graph_node_locations::dsl as node_locations;
+
+        diesel::update(
+            node_locations::console_graph_node_locations.filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_id.eq(node_id))
+                    .and(node_locations::labels_json.ne(&labels_json)),
+            ),
         )
-        .bind::<Text, _>(&labels_json)
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .bind::<Text, _>(&labels_json)
+        .set(node_locations::labels_json.eq(&labels_json))
         .execute(connection)
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
@@ -3657,28 +3702,22 @@ WHERE mode = ? AND node_id = ? AND labels_json IS NOT ?
         mode: GraphMode,
         node_id: &str,
     ) -> crate::Result<BTreeSet<String>> {
-        #[derive(QueryableByName)]
-        struct LabelsRow {
-            #[diesel(sql_type = Text)]
-            labels_json: String,
-        }
+        use console_graph_node_locations::dsl as node_locations;
 
-        let rows = sql_query(
-            r#"
-SELECT labels_json
-FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ?
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .load::<LabelsRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        let rows = node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_id.eq(node_id)),
+            )
+            .select(node_locations::labels_json)
+            .load::<String>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         let mut labels = BTreeSet::new();
-        for row in rows {
-            let row_labels = serde_json::from_str::<Vec<String>>(&row.labels_json).context(
+        for labels_json in rows {
+            let row_labels = serde_json::from_str::<Vec<String>>(&labels_json).context(
                 ParseGraphSnapshotStoreValueSnafu {
                     column: "console_graph_node_locations.labels_json",
                 },
@@ -3695,27 +3734,29 @@ WHERE mode = ? AND node_id = ?
         lanes: &[LaneRow],
     ) -> crate::Result<()> {
         for lane in lanes {
-            sql_query(
-                r#"
-DELETE FROM console_graph_edge_routes
-WHERE mode = ? AND (source_y = ? OR target_y = ?)
-"#,
+            use console_graph_edge_routes::dsl as edge_routes;
+            use console_graph_node_locations::dsl as node_locations;
+
+            diesel::delete(
+                edge_routes::console_graph_edge_routes.filter(
+                    edge_routes::mode.eq(mode.as_query_value()).and(
+                        edge_routes::source_y
+                            .eq(lane.lane_y)
+                            .or(edge_routes::target_y.eq(lane.lane_y)),
+                    ),
+                ),
             )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Integer, _>(lane.lane_y)
-            .bind::<Integer, _>(lane.lane_y)
             .execute(&mut *connection)
             .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
             })?;
-            sql_query(
-                r#"
-DELETE FROM console_graph_node_locations
-WHERE mode = ? AND lane_key = ?
-"#,
+            diesel::delete(
+                node_locations::console_graph_node_locations.filter(
+                    node_locations::mode
+                        .eq(mode.as_query_value())
+                        .and(node_locations::lane_key.eq(&lane.lane_key)),
+                ),
             )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(&lane.lane_key)
             .execute(&mut *connection)
             .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
@@ -3731,35 +3772,34 @@ WHERE mode = ? AND lane_key = ?
         nodes: &[MaterializedTailNodeRow],
     ) -> crate::Result<()> {
         for node in nodes {
-            sql_query(
-                r#"
-DELETE FROM console_graph_edge_routes
-WHERE mode = ?
-  AND (
-    (source_id = ? AND source_x = ? AND source_y = ?)
-    OR (target_id = ? AND target_x = ? AND target_y = ?)
-  )
-"#,
+            use console_graph_edge_routes::dsl as edge_routes;
+            use console_graph_node_locations::dsl as node_locations;
+
+            diesel::delete(
+                edge_routes::console_graph_edge_routes.filter(
+                    edge_routes::mode.eq(mode.as_query_value()).and(
+                        edge_routes::source_id
+                            .eq(&node.node_id)
+                            .and(edge_routes::source_x.eq(node.x))
+                            .and(edge_routes::source_y.eq(node.y))
+                            .or(edge_routes::target_id
+                                .eq(&node.node_id)
+                                .and(edge_routes::target_x.eq(node.x))
+                                .and(edge_routes::target_y.eq(node.y))),
+                    ),
+                ),
             )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(&node.node_id)
-            .bind::<Integer, _>(node.x)
-            .bind::<Integer, _>(node.y)
-            .bind::<Text, _>(&node.node_id)
-            .bind::<Integer, _>(node.x)
-            .bind::<Integer, _>(node.y)
             .execute(&mut *connection)
             .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
             })?;
-            sql_query(
-                r#"
-DELETE FROM console_graph_node_locations
-WHERE mode = ? AND node_key = ?
-"#,
+            diesel::delete(
+                node_locations::console_graph_node_locations.filter(
+                    node_locations::mode
+                        .eq(mode.as_query_value())
+                        .and(node_locations::node_key.eq(&node.node_key)),
+                ),
             )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(&node.node_key)
             .execute(&mut *connection)
             .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
@@ -4246,14 +4286,25 @@ LIMIT 1
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<()> {
-        for table in ["console_graph_edge_routes", "console_graph_node_locations"] {
-            sql_query(format!("DELETE FROM {table} WHERE mode = ?"))
-                .bind::<Text, _>(mode.as_query_value())
-                .execute(&mut *connection)
-                .context(QueryGraphSnapshotStoreSnafu {
-                    path: self.path.as_ref().clone(),
-                })?;
-        }
+        use console_graph_edge_routes::dsl as edge_routes;
+        use console_graph_node_locations::dsl as node_locations;
+
+        diesel::delete(
+            edge_routes::console_graph_edge_routes
+                .filter(edge_routes::mode.eq(mode.as_query_value())),
+        )
+        .execute(&mut *connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        diesel::delete(
+            node_locations::console_graph_node_locations
+                .filter(node_locations::mode.eq(mode.as_query_value())),
+        )
+        .execute(&mut *connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
         Ok(())
     }
 
@@ -4341,6 +4392,7 @@ LIMIT 1
         branch: &str,
         head_x: i32,
     ) -> crate::Result<()> {
+        let branch_lane_key = lane_key(branch);
         sql_query(
             r#"
 DELETE FROM console_graph_edge_routes
@@ -4370,23 +4422,24 @@ WHERE mode = ?
 "#,
         )
         .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(lane_key(branch))
+        .bind::<Text, _>(&branch_lane_key)
         .bind::<Integer, _>(head_x)
-        .bind::<Text, _>(lane_key(branch))
+        .bind::<Text, _>(&branch_lane_key)
         .bind::<Integer, _>(head_x)
         .execute(&mut *connection)
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })?;
-        sql_query(
-            r#"
-DELETE FROM console_graph_node_locations
-WHERE mode = ? AND lane_key = ? AND x > ?
-"#,
+        use console_graph_node_locations::dsl as node_locations;
+
+        diesel::delete(
+            node_locations::console_graph_node_locations.filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::lane_key.eq(&branch_lane_key))
+                    .and(node_locations::x.gt(head_x)),
+            ),
         )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(lane_key(branch))
-        .bind::<Integer, _>(head_x)
         .execute(connection)
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
@@ -4492,28 +4545,44 @@ WHERE mode = ? AND lane_key = ?
         lane_y: i32,
         delta: i32,
     ) -> crate::Result<()> {
-        let rows = sql_query(
-            r#"
-SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
-FROM console_graph_edge_routes
-WHERE mode = ? AND (source_y = ? OR target_y = ?)
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Integer, _>(lane_y)
-        .bind::<Integer, _>(lane_y)
-        .load::<EdgeRouteRow>(&mut *connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_edge_routes::dsl as edge_routes;
+
+        let rows = edge_routes::console_graph_edge_routes
+            .filter(
+                edge_routes::mode.eq(mode.as_query_value()).and(
+                    edge_routes::source_y
+                        .eq(lane_y)
+                        .or(edge_routes::target_y.eq(lane_y)),
+                ),
+            )
+            .select((
+                edge_routes::edge_key,
+                edge_routes::edge_kind,
+                edge_routes::source_id,
+                edge_routes::target_id,
+                edge_routes::source_x,
+                edge_routes::source_y,
+                edge_routes::target_x,
+                edge_routes::target_y,
+                edge_routes::route_slot,
+                edge_routes::target_port_offset,
+            ))
+            .load::<EdgeRouteRow>(&mut *connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         for row in rows {
-            sql_query("DELETE FROM console_graph_edge_routes WHERE mode = ? AND edge_key = ?")
-                .bind::<Text, _>(mode.as_query_value())
-                .bind::<Text, _>(&row.edge_key)
-                .execute(&mut *connection)
-                .context(QueryGraphSnapshotStoreSnafu {
-                    path: self.path.as_ref().clone(),
-                })?;
+            diesel::delete(
+                edge_routes::console_graph_edge_routes.filter(
+                    edge_routes::mode
+                        .eq(mode.as_query_value())
+                        .and(edge_routes::edge_key.eq(&row.edge_key)),
+                ),
+            )
+            .execute(&mut *connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
             let kind = parse_edge_kind(&row.edge_kind)?;
             let source = Point {
                 x: row.source_x,
@@ -4568,20 +4637,26 @@ WHERE mode = ? AND (source_y = ? OR target_y = ?)
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<Option<MaterializationRow>> {
-        sql_query(
-            r#"
-SELECT source_version, world_min_x, world_min_y, world_max_x, world_max_y
-FROM console_graph_materializations
-WHERE mode = ? AND coordinate_space = ?
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(COORDINATE_SPACE)
-        .get_result::<MaterializationRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_materializations::dsl as materializations;
+
+        materializations::console_graph_materializations
+            .filter(
+                materializations::mode
+                    .eq(mode.as_query_value())
+                    .and(materializations::coordinate_space.eq(COORDINATE_SPACE)),
+            )
+            .select((
+                materializations::source_version,
+                materializations::world_min_x,
+                materializations::world_min_y,
+                materializations::world_max_x,
+                materializations::world_max_y,
+            ))
+            .get_result::<MaterializationRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn latest_lane_tail_in_connection(
@@ -4590,22 +4665,7 @@ WHERE mode = ? AND coordinate_space = ?
         mode: GraphMode,
         branch: &str,
     ) -> crate::Result<Option<MaterializedTailNodeRow>> {
-        sql_query(
-            r#"
-SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND lane_key = ?
-ORDER BY x DESC, node_key DESC
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(lane_key(branch))
-        .get_result::<MaterializedTailNodeRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        self.latest_lane_tail_by_key_in_connection(connection, mode, &lane_key(branch))
     }
 
     fn materialized_lane_node_in_connection(
@@ -4615,23 +4675,31 @@ LIMIT 1
         branch: &str,
         node_id: &str,
     ) -> crate::Result<Option<MaterializedTailNodeRow>> {
-        sql_query(
-            r#"
-SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND lane_key = ? AND node_id = ?
-ORDER BY x DESC, node_key DESC
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(lane_key(branch))
-        .bind::<Text, _>(node_id)
-        .get_result::<MaterializedTailNodeRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::lane_key.eq(lane_key(branch)))
+                    .and(node_locations::node_id.eq(node_id)),
+            )
+            .select((
+                node_locations::node_key,
+                node_locations::node_id,
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+                node_locations::x,
+                node_locations::y,
+            ))
+            .order((node_locations::x.desc(), node_locations::node_key.desc()))
+            .limit(1)
+            .get_result::<MaterializedTailNodeRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn materialized_lanes_in_connection(
@@ -4639,19 +4707,21 @@ LIMIT 1
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<Vec<LaneRow>> {
-        sql_query(
-            r#"
-SELECT DISTINCT lane_key, lane_label, lane_y
-FROM console_graph_node_locations
-WHERE mode = ?
-ORDER BY lane_y, lane_key
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .load::<LaneRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(node_locations::mode.eq(mode.as_query_value()))
+            .select((
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+            ))
+            .distinct()
+            .order((node_locations::lane_y, node_locations::lane_key))
+            .load::<LaneRow>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn next_materialized_lane_y(
@@ -4752,22 +4822,30 @@ ORDER BY lane_y, lane_key
         mode: GraphMode,
         lane_key: &str,
     ) -> crate::Result<Option<MaterializedTailNodeRow>> {
-        sql_query(
-            r#"
-SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND lane_key = ?
-ORDER BY x DESC, node_key DESC
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(lane_key)
-        .get_result::<MaterializedTailNodeRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::lane_key.eq(lane_key)),
+            )
+            .select((
+                node_locations::node_key,
+                node_locations::node_id,
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+                node_locations::x,
+                node_locations::y,
+            ))
+            .order((node_locations::x.desc(), node_locations::node_key.desc()))
+            .limit(1)
+            .get_result::<MaterializedTailNodeRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn materialized_node_row_by_id_on_lane_in_connection(
@@ -4777,23 +4855,35 @@ LIMIT 1
         node_id: &str,
         lane_key: &str,
     ) -> crate::Result<Option<MaterializedTailNodeRow>> {
-        sql_query(
-            r#"
-SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ? AND lane_key = ?
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .bind::<Text, _>(lane_key)
-        .get_result::<MaterializedTailNodeRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_id.eq(node_id))
+                    .and(node_locations::lane_key.eq(lane_key)),
+            )
+            .select((
+                node_locations::node_key,
+                node_locations::node_id,
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+                node_locations::x,
+                node_locations::y,
+            ))
+            .order((
+                node_locations::y,
+                node_locations::x,
+                node_locations::node_key,
+            ))
+            .limit(1)
+            .get_result::<MaterializedTailNodeRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn materialized_node_row_by_id_with_lane_prefix_in_connection(
@@ -4803,23 +4893,35 @@ LIMIT 1
         node_id: &str,
         lane_key_prefix: &str,
     ) -> crate::Result<Option<MaterializedTailNodeRow>> {
-        sql_query(
-            r#"
-SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ? AND lane_key LIKE ?
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .bind::<Text, _>(format!("{lane_key_prefix}%"))
-        .get_result::<MaterializedTailNodeRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_id.eq(node_id))
+                    .and(node_locations::lane_key.like(format!("{lane_key_prefix}%"))),
+            )
+            .select((
+                node_locations::node_key,
+                node_locations::node_id,
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+                node_locations::x,
+                node_locations::y,
+            ))
+            .order((
+                node_locations::y,
+                node_locations::x,
+                node_locations::node_key,
+            ))
+            .limit(1)
+            .get_result::<MaterializedTailNodeRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn materialized_non_skill_node_row_by_id_in_connection(
@@ -4828,22 +4930,35 @@ LIMIT 1
         mode: GraphMode,
         node_id: &str,
     ) -> crate::Result<Option<MaterializedTailNodeRow>> {
-        sql_query(
-            r#"
-SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ? AND lane_key NOT LIKE 'derived:skill:%'
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .get_result::<MaterializedTailNodeRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_id.eq(node_id))
+                    .and(node_locations::lane_key.not_like("derived:skill:%")),
+            )
+            .select((
+                node_locations::node_key,
+                node_locations::node_id,
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+                node_locations::x,
+                node_locations::y,
+            ))
+            .order((
+                node_locations::y,
+                node_locations::x,
+                node_locations::node_key,
+            ))
+            .limit(1)
+            .get_result::<MaterializedTailNodeRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn materialized_node_rows_in_connection(
@@ -4851,19 +4966,28 @@ LIMIT 1
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<Vec<MaterializedTailNodeRow>> {
-        sql_query(
-            r#"
-SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
-FROM console_graph_node_locations
-WHERE mode = ?
-ORDER BY y, x, node_key
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .load::<MaterializedTailNodeRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(node_locations::mode.eq(mode.as_query_value()))
+            .select((
+                node_locations::node_key,
+                node_locations::node_id,
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+                node_locations::x,
+                node_locations::y,
+            ))
+            .order((
+                node_locations::y,
+                node_locations::x,
+                node_locations::node_key,
+            ))
+            .load::<MaterializedTailNodeRow>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn materialized_node_rows_by_lane_key_in_connection(
@@ -4872,20 +4996,28 @@ ORDER BY y, x, node_key
         mode: GraphMode,
         lane_key: &str,
     ) -> crate::Result<Vec<MaterializedTailNodeRow>> {
-        sql_query(
-            r#"
-SELECT node_key, node_id, lane_key, lane_label, lane_y, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND lane_key = ?
-ORDER BY x, node_key
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(lane_key)
-        .load::<MaterializedTailNodeRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::lane_key.eq(lane_key)),
+            )
+            .select((
+                node_locations::node_key,
+                node_locations::node_id,
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+                node_locations::x,
+                node_locations::y,
+            ))
+            .order((node_locations::x, node_locations::node_key))
+            .load::<MaterializedTailNodeRow>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn materialized_branch_node_point_in_connection(
@@ -4894,25 +5026,28 @@ ORDER BY x, node_key
         mode: GraphMode,
         node_id: &str,
     ) -> crate::Result<Option<Point>> {
-        let row = sql_query(
-            r#"
-SELECT x, y
-FROM console_graph_node_locations
-WHERE mode = ?
-  AND node_id = ?
-  AND lane_key NOT LIKE 'derived:orphan:%'
-  AND lane_key NOT LIKE 'derived:skill:%'
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .get_result::<MaterializedNodePointRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_node_locations::dsl as node_locations;
+
+        let row = node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_id.eq(node_id))
+                    .and(node_locations::lane_key.not_like("derived:orphan:%"))
+                    .and(node_locations::lane_key.not_like("derived:skill:%")),
+            )
+            .select((node_locations::x, node_locations::y))
+            .order((
+                node_locations::y,
+                node_locations::x,
+                node_locations::node_key,
+            ))
+            .limit(1)
+            .get_result::<MaterializedNodePointRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         Ok(row.map(|row| Point { x: row.x, y: row.y }))
     }
 
@@ -4923,27 +5058,29 @@ LIMIT 1
         node_id: &str,
         before_lane_y: i32,
     ) -> crate::Result<Option<Point>> {
-        let row = sql_query(
-            r#"
-SELECT x, y
-FROM console_graph_node_locations
-WHERE mode = ?
-  AND node_id = ?
-  AND y < ?
-  AND lane_key NOT LIKE 'derived:orphan:%'
-  AND lane_key NOT LIKE 'derived:skill:%'
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .bind::<Integer, _>(before_lane_y)
-        .get_result::<MaterializedNodePointRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_node_locations::dsl as node_locations;
+
+        let row = node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_id.eq(node_id))
+                    .and(node_locations::y.lt(before_lane_y))
+                    .and(node_locations::lane_key.not_like("derived:orphan:%"))
+                    .and(node_locations::lane_key.not_like("derived:skill:%")),
+            )
+            .select((node_locations::x, node_locations::y))
+            .order((
+                node_locations::y,
+                node_locations::x,
+                node_locations::node_key,
+            ))
+            .limit(1)
+            .get_result::<MaterializedNodePointRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         Ok(row.map(|row| Point { x: row.x, y: row.y }))
     }
 
@@ -4955,27 +5092,35 @@ LIMIT 1
         x: i32,
         y: i32,
     ) -> crate::Result<Option<EdgeRouteRow>> {
-        sql_query(
-            r#"
-SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
-FROM console_graph_edge_routes
-WHERE mode = ?
-  AND edge_kind = 'primary_parent'
-  AND target_id = ?
-  AND target_x = ?
-  AND target_y = ?
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .bind::<Integer, _>(x)
-        .bind::<Integer, _>(y)
-        .get_result::<EdgeRouteRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_edge_routes::dsl as edge_routes;
+
+        edge_routes::console_graph_edge_routes
+            .filter(
+                edge_routes::mode
+                    .eq(mode.as_query_value())
+                    .and(edge_routes::edge_kind.eq("primary_parent"))
+                    .and(edge_routes::target_id.eq(node_id))
+                    .and(edge_routes::target_x.eq(x))
+                    .and(edge_routes::target_y.eq(y)),
+            )
+            .select((
+                edge_routes::edge_key,
+                edge_routes::edge_kind,
+                edge_routes::source_id,
+                edge_routes::target_id,
+                edge_routes::source_x,
+                edge_routes::source_y,
+                edge_routes::target_x,
+                edge_routes::target_y,
+                edge_routes::route_slot,
+                edge_routes::target_port_offset,
+            ))
+            .limit(1)
+            .get_result::<EdgeRouteRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn materialized_node_point_in_connection(
@@ -4984,23 +5129,27 @@ LIMIT 1
         mode: GraphMode,
         node_id: &str,
     ) -> crate::Result<Option<Point>> {
-        sql_query(
-            r#"
-SELECT x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND node_id = ?
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(node_id)
-        .get_result::<MaterializedNodePointRow>(connection)
-        .optional()
-        .map(|row| row.map(|row| Point { x: row.x, y: row.y }))
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        use console_graph_node_locations::dsl as node_locations;
+
+        node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_id.eq(node_id)),
+            )
+            .select((node_locations::x, node_locations::y))
+            .order((
+                node_locations::y,
+                node_locations::x,
+                node_locations::node_key,
+            ))
+            .limit(1)
+            .get_result::<MaterializedNodePointRow>(connection)
+            .optional()
+            .map(|row| row.map(|row| Point { x: row.x, y: row.y }))
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn materialized_node_reference_in_connection(
@@ -5015,22 +5164,36 @@ LIMIT 1
         {
             return Ok(None);
         }
-        let row = sql_query(
-            r#"
-SELECT node_key, node_id, node_target, short_id, node_kind, summary, labels_json, x, y
-FROM console_graph_node_locations
-WHERE mode = ? AND node_target = ?
-ORDER BY y, x, node_key
-LIMIT 1
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(target)
-        .get_result::<NodeLocationRow>(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_node_locations::dsl as node_locations;
+
+        let row = node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::node_target.eq(target)),
+            )
+            .select((
+                node_locations::node_key,
+                node_locations::node_id,
+                node_locations::node_target,
+                node_locations::short_id,
+                node_locations::node_kind,
+                node_locations::summary,
+                node_locations::labels_json,
+                node_locations::x,
+                node_locations::y,
+            ))
+            .order((
+                node_locations::y,
+                node_locations::x,
+                node_locations::node_key,
+            ))
+            .limit(1)
+            .get_result::<NodeLocationRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         row.map(|row| {
             let labels = serde_json::from_str::<Vec<String>>(&row.labels_json).context(
                 ParseGraphSnapshotStoreValueSnafu {
@@ -5073,25 +5236,16 @@ LIMIT 1
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<usize> {
-        #[derive(QueryableByName)]
-        struct CountRow {
-            #[diesel(sql_type = BigInt)]
-            value: i64,
-        }
+        use console_graph_edge_routes::dsl as edge_routes;
 
-        sql_query(
-            r#"
-SELECT COUNT(DISTINCT edge_key) AS value
-FROM console_graph_edge_routes
-WHERE mode = ?
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .get_result::<CountRow>(connection)
-        .map(|row| row.value.max(0) as usize)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        edge_routes::console_graph_edge_routes
+            .filter(edge_routes::mode.eq(mode.as_query_value()))
+            .select(diesel::dsl::count(edge_routes::edge_key).aggregate_distinct())
+            .get_result::<i64>(connection)
+            .map(|count| count.max(0) as usize)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn event_order_by_materialized_and_new_nodes(
@@ -5215,29 +5369,31 @@ WHERE mode = ?
         mode: GraphMode,
         bounds: ViewportItemBounds,
     ) -> crate::Result<Vec<GraphViewportLane>> {
-        let rows = sql_query(
-            r#"
-SELECT DISTINCT lane_key, lane_label, lane_y
-FROM console_graph_node_locations
-WHERE mode = ?
-  AND ? <= ?
-  AND ? >= ?
-  AND lane_y - 24 <= ?
-  AND lane_y + 24 >= ?
-ORDER BY lane_y, lane_key
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Integer, _>(0)
-        .bind::<Integer, _>(bounds.right)
-        .bind::<Integer, _>(crate::layout::GRAPH_LEFT_X)
-        .bind::<Integer, _>(bounds.left)
-        .bind::<Integer, _>(bounds.bottom)
-        .bind::<Integer, _>(bounds.top)
-        .load::<LaneRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_node_locations::dsl as node_locations;
+
+        if bounds.right < 0 || bounds.left > crate::layout::GRAPH_LEFT_X {
+            return Ok(Vec::new());
+        }
+        let lane_top = bounds.top.saturating_sub(24);
+        let lane_bottom = bounds.bottom.saturating_add(24);
+        let rows = node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::lane_y.le(lane_bottom))
+                    .and(node_locations::lane_y.ge(lane_top)),
+            )
+            .select((
+                node_locations::lane_key,
+                node_locations::lane_label,
+                node_locations::lane_y,
+            ))
+            .distinct()
+            .order((node_locations::lane_y, node_locations::lane_key))
+            .load::<LaneRow>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         Ok(rows
             .into_iter()
             .map(|row| GraphViewportLane {
@@ -5254,27 +5410,37 @@ ORDER BY lane_y, lane_key
         mode: GraphMode,
         bounds: ViewportItemBounds,
     ) -> crate::Result<Vec<GraphViewportNode>> {
-        let rows = sql_query(
-            r#"
-SELECT node_key, node_id, node_target, short_id, node_kind, summary, labels_json, x, y
-FROM console_graph_node_locations
-WHERE mode = ?
-  AND min_x <= ?
-  AND max_x >= ?
-  AND min_y <= ?
-  AND max_y >= ?
-ORDER BY y, x, node_key
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Integer, _>(bounds.right)
-        .bind::<Integer, _>(bounds.left)
-        .bind::<Integer, _>(bounds.bottom)
-        .bind::<Integer, _>(bounds.top)
-        .load::<NodeLocationRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_node_locations::dsl as node_locations;
+
+        let rows = node_locations::console_graph_node_locations
+            .filter(
+                node_locations::mode
+                    .eq(mode.as_query_value())
+                    .and(node_locations::min_x.le(bounds.right))
+                    .and(node_locations::max_x.ge(bounds.left))
+                    .and(node_locations::min_y.le(bounds.bottom))
+                    .and(node_locations::max_y.ge(bounds.top)),
+            )
+            .select((
+                node_locations::node_key,
+                node_locations::node_id,
+                node_locations::node_target,
+                node_locations::short_id,
+                node_locations::node_kind,
+                node_locations::summary,
+                node_locations::labels_json,
+                node_locations::x,
+                node_locations::y,
+            ))
+            .order((
+                node_locations::y,
+                node_locations::x,
+                node_locations::node_key,
+            ))
+            .load::<NodeLocationRow>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         rows.into_iter()
             .map(|row| {
                 let labels = serde_json::from_str(&row.labels_json).context(
@@ -5303,27 +5469,38 @@ ORDER BY y, x, node_key
         mode: GraphMode,
         bounds: ViewportItemBounds,
     ) -> crate::Result<Vec<GraphViewportEdge>> {
-        let rows = sql_query(
-            r#"
-SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
-FROM console_graph_edge_routes
-WHERE mode = ?
-  AND min_x <= ?
-  AND max_x >= ?
-  AND min_y <= ?
-  AND max_y >= ?
-ORDER BY min_y, min_x, edge_key
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Integer, _>(bounds.right)
-        .bind::<Integer, _>(bounds.left)
-        .bind::<Integer, _>(bounds.bottom)
-        .bind::<Integer, _>(bounds.top)
-        .load::<EdgeRouteRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_edge_routes::dsl as edge_routes;
+
+        let rows = edge_routes::console_graph_edge_routes
+            .filter(
+                edge_routes::mode
+                    .eq(mode.as_query_value())
+                    .and(edge_routes::min_x.le(bounds.right))
+                    .and(edge_routes::max_x.ge(bounds.left))
+                    .and(edge_routes::min_y.le(bounds.bottom))
+                    .and(edge_routes::max_y.ge(bounds.top)),
+            )
+            .select((
+                edge_routes::edge_key,
+                edge_routes::edge_kind,
+                edge_routes::source_id,
+                edge_routes::target_id,
+                edge_routes::source_x,
+                edge_routes::source_y,
+                edge_routes::target_x,
+                edge_routes::target_y,
+                edge_routes::route_slot,
+                edge_routes::target_port_offset,
+            ))
+            .order((
+                edge_routes::min_y,
+                edge_routes::min_x,
+                edge_routes::edge_key,
+            ))
+            .load::<EdgeRouteRow>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         rows.into_iter()
             .map(|row| {
                 Ok(GraphViewportEdge {
