@@ -55,6 +55,13 @@ diesel::table! {
         role -> Text,
         kind -> Text,
         anchor_kind -> Nullable<Text>,
+        anchor_session_role -> Nullable<Text>,
+        anchor_provider_profile -> Nullable<Text>,
+        anchor_provider -> Nullable<Text>,
+        anchor_model -> Nullable<Text>,
+        anchor_prompt -> Nullable<Text>,
+        anchor_skill_name -> Nullable<Text>,
+        anchor_skill_invocation_mode -> Nullable<Text>,
         metadata_json -> Nullable<Text>,
         kind_json -> Text,
     }
