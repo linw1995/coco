@@ -101,12 +101,6 @@ struct CurrentSchemaVersion {
     version: Option<String>,
 }
 
-#[derive(QueryableByName)]
-struct NodeIdRow {
-    #[diesel(sql_type = Text)]
-    id: String,
-}
-
 #[derive(Queryable, QueryableByName)]
 struct NodeRow {
     #[diesel(sql_type = Text)]
@@ -163,6 +157,21 @@ struct JobRow {
     base: String,
     status: String,
     payload_json: String,
+}
+
+macro_rules! node_row_columns {
+    () => {
+        (
+            nodes::id,
+            nodes::parent_id,
+            nodes::created_at,
+            nodes::role,
+            nodes::kind,
+            nodes::anchor_kind,
+            nodes::metadata_json,
+            nodes::kind_json,
+        )
+    };
 }
 
 #[derive(QueryableByName)]
@@ -630,21 +639,16 @@ impl SqliteGraphStore {
     fn get_node_by_exact_id(&self, id: &str) -> Result<Node> {
         self.block_on(async {
             let mut connection = self.connect().await?;
-            let row = sql_query(
-                r#"
-SELECT id, parent_id, created_at, role, kind, anchor_kind, metadata_json, kind_json
-FROM nodes
-WHERE id = ?
-"#,
-            )
-            .bind::<Text, _>(id)
-            .get_result::<NodeRow>(&mut connection)
-            .await
-            .optional()
-            .context(QuerySqliteStoreSnafu {
-                path: self.database_path.clone(),
-            })?
-            .context(NotFoundSnafu { id: id.to_owned() })?;
+            let row = nodes::table
+                .filter(nodes::id.eq(id))
+                .select(node_row_columns!())
+                .get_result::<NodeRow>(&mut connection)
+                .await
+                .optional()
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })?
+                .context(NotFoundSnafu { id: id.to_owned() })?;
             row.into_node(&self.database_path)
         })
     }
@@ -666,29 +670,29 @@ WHERE id = ?
     fn branch_head(&self, name: &str) -> Result<Option<String>> {
         self.block_on(async {
             let mut connection = self.connect().await?;
-            sql_query("SELECT head_id AS id FROM branches WHERE name = ?")
-                .bind::<Text, _>(name)
-                .get_result::<NodeIdRow>(&mut connection)
+            branches::table
+                .filter(branches::name.eq(name))
+                .select(branches::head_id)
+                .get_result::<String>(&mut connection)
                 .await
                 .optional()
                 .context(QuerySqliteStoreSnafu {
                     path: self.database_path.clone(),
                 })
-                .map(|row| row.map(|row| row.id))
         })
     }
 
     fn node_exists(&self, id: &str) -> Result<bool> {
         self.block_on(async {
             let mut connection = self.connect().await?;
-            let count = sql_query("SELECT COUNT(*) AS count FROM nodes WHERE id = ?")
-                .bind::<Text, _>(id)
-                .get_result::<TableCount>(&mut connection)
+            let count = nodes::table
+                .filter(nodes::id.eq(id))
+                .count()
+                .get_result::<i64>(&mut connection)
                 .await
                 .context(QuerySqliteStoreSnafu {
                     path: self.database_path.clone(),
-                })?
-                .count;
+                })?;
             Ok(count > 0)
         })
     }
@@ -723,14 +727,15 @@ WHERE id = ?
     fn node_ids_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         self.block_on(async {
             let mut connection = self.connect().await?;
-            sql_query("SELECT id FROM nodes WHERE id LIKE ? ORDER BY id")
-                .bind::<Text, _>(format!("{prefix}%"))
-                .load::<NodeIdRow>(&mut connection)
+            nodes::table
+                .filter(nodes::id.like(format!("{prefix}%")))
+                .select(nodes::id)
+                .order(nodes::id)
+                .load::<String>(&mut connection)
                 .await
                 .context(QuerySqliteStoreSnafu {
                     path: self.database_path.clone(),
                 })
-                .map(|rows| rows.into_iter().map(|row| row.id).collect())
         })
     }
 }
@@ -2184,21 +2189,16 @@ ORDER BY ancestry.depth
         self.get_node_by_exact_id(node_id)?;
         self.block_on(async {
             let mut connection = self.connect().await?;
-            let rows = sql_query(
-                r#"
-SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.kind, nodes.anchor_kind, nodes.metadata_json, nodes.kind_json
-FROM node_relations
-JOIN nodes ON nodes.id = node_relations.child_node_id
-WHERE node_relations.parent_node_id = ?
-ORDER BY nodes.created_at, nodes.id
-"#,
-            )
-            .bind::<Text, _>(node_id)
-            .load::<NodeRow>(&mut connection)
-            .await
-            .context(QuerySqliteStoreSnafu {
-                path: self.database_path.clone(),
-            })?;
+            let rows = node_relations::table
+                .inner_join(nodes::table.on(nodes::id.eq(node_relations::child_node_id)))
+                .filter(node_relations::parent_node_id.eq(node_id))
+                .select(node_row_columns!())
+                .order((nodes::created_at, nodes::id))
+                .load::<NodeRow>(&mut connection)
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })?;
             rows.into_iter()
                 .map(|row| row.into_node(&self.database_path))
                 .collect()
@@ -2763,7 +2763,7 @@ mod tests {
         AsyncSqliteConnection, MessageQueueItem, NodeRow, SqliteGraphStore, SqliteStore,
         StoreAccess, persist_root_metadata,
     };
-    use crate::schema::{jobs, sessions};
+    use crate::schema::{branches, jobs, node_relations, nodes, sessions, store_meta};
     use crate::{
         Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, NewNode,
         Node, NodeStore, PauseReason, Preset, PresetStore, Role, SessionAnchor, SessionAnchorPatch,
@@ -2776,23 +2776,17 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
+    #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
     struct NodeRelationRow {
-        #[diesel(sql_type = Text)]
         child_node_id: String,
-        #[diesel(sql_type = Text)]
         parent_node_id: String,
-        #[diesel(sql_type = Text)]
         kind: String,
-        #[diesel(sql_type = Integer)]
         ordinal: i32,
     }
 
-    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
+    #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
     struct NodeKindRow {
-        #[diesel(sql_type = Text)]
         kind: String,
-        #[diesel(sql_type = Nullable<Text>)]
         anchor_kind: Option<String>,
     }
 
@@ -2858,26 +2852,31 @@ mod tests {
     fn node_relation_rows(store: &SqliteStore, child_node_id: &str) -> Vec<NodeRelationRow> {
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
-            sql_query(
-                r#"
-SELECT child_node_id, parent_node_id, kind, ordinal
-FROM node_relations
-WHERE child_node_id = ?
-ORDER BY kind, ordinal, parent_node_id
-"#,
-            )
-            .bind::<Text, _>(child_node_id)
-            .load::<NodeRelationRow>(&mut connection)
-            .await
-            .unwrap()
+            node_relations::table
+                .filter(node_relations::child_node_id.eq(child_node_id))
+                .select((
+                    node_relations::child_node_id,
+                    node_relations::parent_node_id,
+                    node_relations::kind,
+                    node_relations::ordinal,
+                ))
+                .order((
+                    node_relations::kind,
+                    node_relations::ordinal,
+                    node_relations::parent_node_id,
+                ))
+                .load::<NodeRelationRow>(&mut connection)
+                .await
+                .unwrap()
         })
     }
 
     fn node_kinds(store: &SqliteStore, node_id: &str) -> (String, Option<String>) {
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
-            let row = sql_query("SELECT kind, anchor_kind FROM nodes WHERE id = ?")
-                .bind::<Text, _>(node_id)
+            let row = nodes::table
+                .filter(nodes::id.eq(node_id))
+                .select((nodes::kind, nodes::anchor_kind))
                 .get_result::<NodeKindRow>(&mut connection)
                 .await
                 .unwrap();
@@ -2926,18 +2925,17 @@ ORDER BY kind, ordinal, parent_node_id
         let value_json = serde_json::to_string(&value).unwrap();
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
-            sql_query(
-                r#"
-INSERT INTO store_meta (key, value_json)
-VALUES (?, ?)
-ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
-"#,
-            )
-            .bind::<Text, _>(key)
-            .bind::<Text, _>(value_json)
-            .execute(&mut connection)
-            .await
-            .unwrap();
+            diesel::insert_into(store_meta::table)
+                .values((
+                    store_meta::key.eq(key),
+                    store_meta::value_json.eq(value_json),
+                ))
+                .on_conflict(store_meta::key)
+                .do_update()
+                .set(store_meta::value_json.eq(diesel::upsert::excluded(store_meta::value_json)))
+                .execute(&mut connection)
+                .await
+                .unwrap();
         });
     }
 
@@ -3905,10 +3903,6 @@ DELETE FROM __diesel_schema_migrations;
 
     #[test]
     fn fork_persistence_rolls_back_branch_when_session_insert_fails() {
-        use diesel::sql_query;
-        use diesel::sql_types::Text;
-        use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
-
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -3930,12 +3924,12 @@ DELETE FROM __diesel_schema_migrations;
             )
             .await
             .unwrap_err();
-            let count = sql_query("SELECT COUNT(*) AS count FROM branches WHERE name = ?")
-                .bind::<Text, _>("main")
-                .get_result::<super::TableCount>(&mut connection)
+            let count = branches::table
+                .filter(branches::name.eq("main"))
+                .count()
+                .get_result::<i64>(&mut connection)
                 .await
-                .unwrap()
-                .count;
+                .unwrap();
 
             assert!(err.to_string().contains("SQLite"));
             assert_eq!(count, 0);
