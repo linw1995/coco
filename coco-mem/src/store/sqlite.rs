@@ -12,6 +12,7 @@ use diesel::sqlite::SqliteConnection;
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+use serde_json::{Map, Value};
 use snafu::prelude::*;
 use tokio::runtime::Runtime;
 
@@ -1622,19 +1623,12 @@ impl NodeRow {
                     })
                 })
                 .transpose()?,
-            kind_json: serde_json::to_string(&node.kind).context(ParseSqliteStoreValueSnafu {
-                path: path.to_owned(),
-                column: "nodes.kind_json".to_owned(),
-            })?,
+            kind_json: kind_residual_json(&node.kind, path)?,
         })
     }
 
     fn into_node(self, path: &Path, metadata_rows: &[NodeMetadataRow]) -> Result<Node> {
-        let kind: Kind =
-            serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
-                path: path.to_owned(),
-                column: "nodes.kind_json".to_owned(),
-            })?;
+        let kind = self.kind_from_residual_json(path)?;
         ensure!(
             self.kind == kind.tag().as_str(),
             CorruptedStoreSnafu {
@@ -1682,6 +1676,199 @@ impl NodeRow {
             kind,
         })
     }
+
+    fn kind_from_residual_json(&self, path: &Path) -> Result<Kind> {
+        let mut value: Value =
+            serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
+                path: path.to_owned(),
+                column: "nodes.kind_json".to_owned(),
+            })?;
+        restore_kind_anchor_summary(self, &mut value, path)?;
+        serde_json::from_value(value).context(ParseSqliteStoreValueSnafu {
+            path: path.to_owned(),
+            column: "nodes.kind_json".to_owned(),
+        })
+    }
+}
+
+fn kind_residual_json(kind: &Kind, path: &Path) -> Result<String> {
+    let mut value = serde_json::to_value(kind).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "nodes.kind_json".to_owned(),
+    })?;
+    remove_kind_anchor_summary(&mut value);
+    serde_json::to_string(&value).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "nodes.kind_json".to_owned(),
+    })
+}
+
+fn remove_kind_anchor_summary(value: &mut Value) {
+    if let Some(payload) = anchor_payload_object_mut(value, "Session") {
+        payload.remove("role");
+        payload.remove("provider_profile");
+        payload.remove("provider");
+        payload.remove("model");
+        payload.remove("prompt");
+    }
+    if let Some(payload) = anchor_payload_object_mut(value, "Prompt") {
+        payload.remove("prompt");
+    }
+    if let Some(payload) = anchor_payload_object_mut(value, "SkillInvocation") {
+        payload.remove("skill_name");
+        if let Some(mode) = payload.get_mut("mode").and_then(Value::as_object_mut) {
+            mode.remove("kind");
+            mode.remove("prompt");
+        }
+    }
+    if let Some(payload) = anchor_payload_object_mut(value, "SkillResult") {
+        payload.remove("skill_name");
+    }
+}
+
+fn restore_kind_anchor_summary(row: &NodeRow, value: &mut Value, path: &Path) -> Result<()> {
+    if let Some(payload) = anchor_payload_object_mut(value, "Session") {
+        ensure_absent(path, "nodes.kind_json", payload, "role")?;
+        ensure_absent(path, "nodes.kind_json", payload, "provider_profile")?;
+        ensure_absent(path, "nodes.kind_json", payload, "provider")?;
+        ensure_absent(path, "nodes.kind_json", payload, "model")?;
+        ensure_absent(path, "nodes.kind_json", payload, "prompt")?;
+        payload.insert(
+            "role".to_owned(),
+            session_role_json_value(
+                row.anchor_session_role
+                    .as_deref()
+                    .context(CorruptedStoreSnafu {
+                        path: path.to_owned(),
+                        message: "missing SQLite node anchor_session_role".to_owned(),
+                    })?,
+                path,
+            )?,
+        );
+        insert_optional_string(
+            payload,
+            "provider_profile",
+            row.anchor_provider_profile.as_deref(),
+        );
+        insert_optional_string(payload, "provider", row.anchor_provider.as_deref());
+        payload.insert(
+            "model".to_owned(),
+            Value::String(required_anchor_summary(
+                path,
+                "anchor_model",
+                row.anchor_model.as_deref(),
+            )?),
+        );
+        payload.insert(
+            "prompt".to_owned(),
+            Value::String(required_anchor_summary(
+                path,
+                "anchor_prompt",
+                row.anchor_prompt.as_deref(),
+            )?),
+        );
+    }
+    if let Some(payload) = anchor_payload_object_mut(value, "Prompt") {
+        ensure_absent(path, "nodes.kind_json", payload, "prompt")?;
+        payload.insert(
+            "prompt".to_owned(),
+            Value::String(required_anchor_summary(
+                path,
+                "anchor_prompt",
+                row.anchor_prompt.as_deref(),
+            )?),
+        );
+    }
+    if let Some(payload) = anchor_payload_object_mut(value, "SkillInvocation") {
+        ensure_absent(path, "nodes.kind_json", payload, "skill_name")?;
+        payload.insert(
+            "skill_name".to_owned(),
+            Value::String(required_anchor_summary(
+                path,
+                "anchor_skill_name",
+                row.anchor_skill_name.as_deref(),
+            )?),
+        );
+        let mode = payload
+            .get_mut("mode")
+            .and_then(Value::as_object_mut)
+            .context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: "missing SQLite node skill invocation mode".to_owned(),
+            })?;
+        ensure_absent(path, "nodes.kind_json", mode, "kind")?;
+        ensure_absent(path, "nodes.kind_json", mode, "prompt")?;
+        let mode_kind = required_anchor_summary(
+            path,
+            "anchor_skill_invocation_mode",
+            row.anchor_skill_invocation_mode.as_deref(),
+        )?;
+        mode.insert("kind".to_owned(), Value::String(mode_kind.clone()));
+        if mode_kind == "handoff" {
+            mode.insert(
+                "prompt".to_owned(),
+                Value::String(required_anchor_summary(
+                    path,
+                    "anchor_prompt",
+                    row.anchor_prompt.as_deref(),
+                )?),
+            );
+        }
+    }
+    if let Some(payload) = anchor_payload_object_mut(value, "SkillResult") {
+        ensure_absent(path, "nodes.kind_json", payload, "skill_name")?;
+        payload.insert(
+            "skill_name".to_owned(),
+            Value::String(required_anchor_summary(
+                path,
+                "anchor_skill_name",
+                row.anchor_skill_name.as_deref(),
+            )?),
+        );
+    }
+    Ok(())
+}
+
+fn anchor_payload_object_mut<'a>(
+    value: &'a mut Value,
+    payload_kind: &str,
+) -> Option<&'a mut Map<String, Value>> {
+    value
+        .get_mut("Anchor")?
+        .get_mut("payload")?
+        .get_mut(payload_kind)?
+        .as_object_mut()
+}
+
+fn ensure_absent(path: &Path, column: &str, object: &Map<String, Value>, key: &str) -> Result<()> {
+    ensure!(
+        !object.contains_key(key),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("SQLite {column} duplicates column-owned field {key:?}"),
+        }
+    );
+    Ok(())
+}
+
+fn insert_optional_string(object: &mut Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        object.insert(key.to_owned(), Value::String(value.to_owned()));
+    }
+}
+
+fn required_anchor_summary(path: &Path, column: &str, value: Option<&str>) -> Result<String> {
+    value.map(str::to_owned).context(CorruptedStoreSnafu {
+        path: path.to_owned(),
+        message: format!("missing SQLite node {column}"),
+    })
+}
+
+fn session_role_json_value(role: &str, path: &Path) -> Result<Value> {
+    Ok(Value::String(match parse_session_role(role, path)? {
+        SessionRole::Orchestrator => "orchestrator".to_owned(),
+        SessionRole::Runner => "runner".to_owned(),
+    }))
 }
 
 #[derive(Default)]
@@ -1709,13 +1896,7 @@ impl NodeAnchorSummary {
                 prompt: Some(anchor.prompt.clone()),
                 ..Self::default()
             },
-            AnchorPayload::SessionPatch(patch) => Self {
-                session_role: patch.role.map(|role| role.as_str().to_owned()),
-                provider_profile: patch.provider_profile.clone().flatten(),
-                provider: patch.provider.clone().flatten(),
-                model: patch.model.clone(),
-                ..Self::default()
-            },
+            AnchorPayload::SessionPatch(_) => Self::default(),
             AnchorPayload::Prompt(anchor) => Self {
                 prompt: Some(anchor.prompt.clone()),
                 ..Self::default()
@@ -3246,6 +3427,19 @@ mod tests {
         })
     }
 
+    fn node_kind_json(store: &SqliteStore, node_id: &str) -> serde_json::Value {
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            let kind_json = nodes::table
+                .filter(nodes::id.eq(node_id))
+                .select(nodes::kind_json)
+                .get_result::<String>(&mut connection)
+                .await
+                .unwrap();
+            serde_json::from_str(&kind_json).unwrap()
+        })
+    }
+
     fn node_anchor_summary(store: &SqliteStore, node_id: &str) -> NodeAnchorSummaryRow {
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
@@ -3382,6 +3576,7 @@ CREATE TABLE store_schema_migrations (
         store_path: &std::path::Path,
         node: Node,
     ) {
+        let kind_json = serde_json::to_string(&node.kind).unwrap();
         let row = NodeRow::from_node(node, store_path).unwrap();
         sql_query(
             r#"
@@ -3394,7 +3589,7 @@ VALUES (?, ?, ?, ?, ?, ?)
         .bind::<Text, _>(row.created_at)
         .bind::<Text, _>(row.role)
         .bind::<Nullable<Text>, _>(row.metadata_json)
-        .bind::<Text, _>(row.kind_json)
+        .bind::<Text, _>(kind_json)
         .execute(connection)
         .await
         .unwrap();
@@ -3841,6 +4036,27 @@ DELETE FROM __diesel_schema_migrations;
                 anchor_skill_invocation_mode: None,
             }
         );
+        let session_kind_json = node_kind_json(&store, &session);
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/role"),
+            None
+        );
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/provider_profile"),
+            None
+        );
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/provider"),
+            None
+        );
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/model"),
+            None
+        );
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/prompt"),
+            None
+        );
         assert_eq!(
             node_anchor_summary(&store, &prompt),
             NodeAnchorSummaryRow {
@@ -3852,6 +4068,11 @@ DELETE FROM __diesel_schema_migrations;
                 anchor_skill_name: None,
                 anchor_skill_invocation_mode: None,
             }
+        );
+        let prompt_kind_json = node_kind_json(&store, &prompt);
+        assert_eq!(
+            prompt_kind_json.pointer("/Anchor/payload/Prompt/prompt"),
+            None
         );
     }
 
@@ -4166,7 +4387,7 @@ DELETE FROM __diesel_schema_migrations;
         let state = super::StoreState::new();
         let root = state.root_node().clone();
         let root_id = root.id.clone();
-        let child = Node::new(
+        let session = Node::new(
             root_id.clone(),
             Role::System,
             None,
@@ -4189,7 +4410,51 @@ DELETE FROM __diesel_schema_migrations;
             )),
             "1970-01-01T00:00:01Z".parse().unwrap(),
         );
-        let child_id = child.id.clone();
+        let session_id = session.id.clone();
+        let prompt = Node::new(
+            root_id.clone(),
+            Role::User,
+            None,
+            Kind::Anchor(Anchor::prompt(
+                vec![],
+                crate::PromptAnchor {
+                    prompt: "migration detached prompt".to_owned(),
+                    attachments: vec![],
+                },
+            )),
+            "1970-01-01T00:00:02Z".parse().unwrap(),
+        );
+        let prompt_id = prompt.id.clone();
+        let skill_invocation = Node::new(
+            root_id.clone(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_invocation(
+                vec![],
+                crate::SkillInvocationAnchor {
+                    skill_name: "migration-review".to_owned(),
+                    mode: crate::SkillInvocationMode::Handoff {
+                        prompt: "migration handoff prompt".to_owned(),
+                    },
+                },
+            )),
+            "1970-01-01T00:00:03Z".parse().unwrap(),
+        );
+        let skill_invocation_id = skill_invocation.id.clone();
+        let skill_result = Node::new(
+            root_id.clone(),
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::skill_result(
+                vec![],
+                crate::SkillResultAnchor {
+                    skill_name: "migration-review".to_owned(),
+                    output: "migration output".to_owned(),
+                },
+            )),
+            "1970-01-01T00:00:04Z".parse().unwrap(),
+        );
+        let skill_result_id = skill_result.id.clone();
 
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
@@ -4198,7 +4463,10 @@ DELETE FROM __diesel_schema_migrations;
                 .await
                 .unwrap();
             insert_v1_node_row(&mut connection, &store.database_path, root).await;
-            insert_v1_node_row(&mut connection, &store.database_path, child).await;
+            insert_v1_node_row(&mut connection, &store.database_path, session).await;
+            insert_v1_node_row(&mut connection, &store.database_path, prompt).await;
+            insert_v1_node_row(&mut connection, &store.database_path, skill_invocation).await;
+            insert_v1_node_row(&mut connection, &store.database_path, skill_result).await;
         });
         drop(store);
 
@@ -4207,7 +4475,7 @@ DELETE FROM __diesel_schema_migrations;
 
         assert_eq!(migrated.schema_version().unwrap(), 6);
         assert_eq!(
-            node_anchor_summary(&migrated, &child_id),
+            node_anchor_summary(&migrated, &session_id),
             NodeAnchorSummaryRow {
                 anchor_session_role: Some("orchestrator".to_owned()),
                 anchor_provider_profile: Some("migration-profile".to_owned()),
@@ -4217,6 +4485,86 @@ DELETE FROM __diesel_schema_migrations;
                 anchor_skill_name: None,
                 anchor_skill_invocation_mode: None,
             }
+        );
+        let session_kind_json = node_kind_json(&migrated, &session_id);
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/role"),
+            None
+        );
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/provider_profile"),
+            None
+        );
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/provider"),
+            None
+        );
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/model"),
+            None
+        );
+        assert_eq!(
+            session_kind_json.pointer("/Anchor/payload/Session/prompt"),
+            None
+        );
+        assert_eq!(
+            node_anchor_summary(&migrated, &prompt_id),
+            NodeAnchorSummaryRow {
+                anchor_session_role: None,
+                anchor_provider_profile: None,
+                anchor_provider: None,
+                anchor_model: None,
+                anchor_prompt: Some("migration detached prompt".to_owned()),
+                anchor_skill_name: None,
+                anchor_skill_invocation_mode: None,
+            }
+        );
+        let prompt_kind_json = node_kind_json(&migrated, &prompt_id);
+        assert_eq!(
+            prompt_kind_json.pointer("/Anchor/payload/Prompt/prompt"),
+            None
+        );
+        assert_eq!(
+            node_anchor_summary(&migrated, &skill_invocation_id),
+            NodeAnchorSummaryRow {
+                anchor_session_role: None,
+                anchor_provider_profile: None,
+                anchor_provider: None,
+                anchor_model: None,
+                anchor_prompt: Some("migration handoff prompt".to_owned()),
+                anchor_skill_name: Some("migration-review".to_owned()),
+                anchor_skill_invocation_mode: Some("handoff".to_owned()),
+            }
+        );
+        let skill_invocation_kind_json = node_kind_json(&migrated, &skill_invocation_id);
+        assert_eq!(
+            skill_invocation_kind_json.pointer("/Anchor/payload/SkillInvocation/skill_name"),
+            None
+        );
+        assert_eq!(
+            skill_invocation_kind_json.pointer("/Anchor/payload/SkillInvocation/mode/kind"),
+            None
+        );
+        assert_eq!(
+            skill_invocation_kind_json.pointer("/Anchor/payload/SkillInvocation/mode/prompt"),
+            None
+        );
+        assert_eq!(
+            node_anchor_summary(&migrated, &skill_result_id),
+            NodeAnchorSummaryRow {
+                anchor_session_role: None,
+                anchor_provider_profile: None,
+                anchor_provider: None,
+                anchor_model: None,
+                anchor_prompt: None,
+                anchor_skill_name: Some("migration-review".to_owned()),
+                anchor_skill_invocation_mode: None,
+            }
+        );
+        let skill_result_kind_json = node_kind_json(&migrated, &skill_result_id);
+        assert_eq!(
+            skill_result_kind_json.pointer("/Anchor/payload/SkillResult/skill_name"),
+            None
         );
     }
 
