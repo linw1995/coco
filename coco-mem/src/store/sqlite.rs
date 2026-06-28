@@ -419,8 +419,10 @@ impl SqliteStore {
         reject_incomplete_legacy_json_store(path)?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
-        store.ensure_current_schema()?;
-        store.load_state()?;
+        store.database.with_initialization_lock(|| {
+            store.ensure_current_schema()?;
+            store.load_state()
+        })?;
         Ok(store)
     }
 
@@ -502,20 +504,25 @@ impl SqliteStore {
         ensure_existing_store_directory(path)?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
         ensure_existing_database_file(&store.database_path)?;
-        let (version, has_diesel_migration_table) = store.block_on(async {
-            let mut connection = store.connect().await?;
-            let has_diesel_migration_table = table_count(
-                &mut connection,
-                &store.database_path,
-                DIESEL_MIGRATION_TABLE_NAME,
-            )
-            .await?
-                == 1;
-            let version =
-                existing_schema_version_for_upgrade_check(&mut connection, &store.database_path)
+        let (version, has_diesel_migration_table) =
+            store.database.with_initialization_lock(|| {
+                store.block_on(async {
+                    let mut connection = store.connect().await?;
+                    let has_diesel_migration_table = table_count(
+                        &mut connection,
+                        &store.database_path,
+                        DIESEL_MIGRATION_TABLE_NAME,
+                    )
+                    .await?
+                        == 1;
+                    let version = existing_schema_version_for_upgrade_check(
+                        &mut connection,
+                        &store.database_path,
+                    )
                     .await?;
-            Ok((version, has_diesel_migration_table))
-        })?;
+                    Ok((version, has_diesel_migration_table))
+                })
+            })?;
         ensure!(
             version <= SQLITE_SCHEMA_VERSION,
             CorruptedStoreSnafu {
@@ -606,10 +613,12 @@ impl SqliteGraphStore {
         ensure_existing_store_directory(path)?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path)?;
-        store.ensure_current_schema()?;
-        let root_id = store.block_on(async {
-            let mut connection = store.connect().await?;
-            load_root_id(&mut connection, &store.database_path).await
+        let root_id = store.database.with_initialization_lock(|| {
+            store.ensure_current_schema()?;
+            store.block_on(async {
+                let mut connection = store.connect().await?;
+                load_root_id(&mut connection, &store.database_path).await
+            })
         })?;
         Ok(Self { root_id, ..store })
     }

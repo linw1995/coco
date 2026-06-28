@@ -707,36 +707,29 @@ impl ConsoleGraphSnapshotStore {
     ) -> crate::Result<bool> {
         let this = self.clone();
         self.with_connection(move |connection| {
-            let previous_meta = this.latest_materialization_row_in_connection(connection, mode)?;
-            let result = (|| {
+            this.run_bool_write_transaction(connection, |this, connection| {
                 let Some(first_index) =
                     this.first_visible_initial_branch_index(&source, mode, &session_states)?
                 else {
-                    return this.run_bool_write_transaction(connection, |this, connection| {
-                        this.delete_materialization_meta(connection, mode)?;
-                        this.put_empty_materialization_in_transaction(
-                            connection,
-                            source_version,
-                            mode,
-                        )
-                    });
+                    this.delete_materialization_meta(connection, mode)?;
+                    return this.put_empty_materialization_in_transaction(
+                        connection,
+                        source_version,
+                        mode,
+                    );
                 };
 
-                this.run_write_transaction(connection, |this, connection| {
-                    this.delete_materialization_meta(connection, mode)?;
-                    this.clear_materialized_mode_facts(connection, mode)
-                })?;
+                this.delete_materialization_meta(connection, mode)?;
+                this.clear_materialized_mode_facts(connection, mode)?;
 
                 let (first_branch, first_state) = &session_states[first_index];
-                if !this.run_bool_write_transaction(connection, |this, connection| {
-                    this.try_seed_first_branch_materialization_in_transaction(
-                        connection,
-                        &source,
-                        mode,
-                        first_branch,
-                        first_state,
-                    )
-                })? {
+                if !this.try_seed_first_branch_materialization_in_transaction(
+                    connection,
+                    &source,
+                    mode,
+                    first_branch,
+                    first_state,
+                )? {
                     return Ok(false);
                 }
 
@@ -748,81 +741,52 @@ impl ConsoleGraphSnapshotStore {
                     let head_id = source
                         .get_branch_head(branch)
                         .context(crate::error::StoreSnafu)?;
-                    let appended =
-                        this.run_bool_write_transaction(connection, |this, connection| {
-                            this.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
-                            let input = AppendLinearBranchInput {
-                                mode,
-                                branch,
-                                state,
-                                head_id: &head_id,
-                            };
-                            match mode {
-                                GraphMode::Anchors => this
-                                    .try_append_new_anchor_branch_lane_in_transaction(
-                                        connection,
-                                        &source,
-                                        input,
-                                        next_lane_y,
-                                    ),
-                                GraphMode::All => this.try_append_new_branch_lane_in_transaction(
-                                    connection,
-                                    &source,
-                                    input,
-                                    next_lane_y,
-                                ),
-                            }
-                        })?;
+                    this.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
+                    let input = AppendLinearBranchInput {
+                        mode,
+                        branch,
+                        state,
+                        head_id: &head_id,
+                    };
+                    let appended = match mode {
+                        GraphMode::Anchors => this
+                            .try_append_new_anchor_branch_lane_in_transaction(
+                                connection,
+                                &source,
+                                input,
+                                next_lane_y,
+                            ),
+                        GraphMode::All => this.try_append_new_branch_lane_in_transaction(
+                            connection,
+                            &source,
+                            input,
+                            next_lane_y,
+                        ),
+                    }?;
                     if !appended {
                         return Ok(false);
                     }
                     next_lane_y += GRAPH_LANE_HEIGHT;
                 }
 
-                this.run_bool_write_transaction(connection, |this, connection| {
-                    this.rebalance_routed_edge_slots(connection, mode)?;
-                    if this
-                        .refresh_materialized_node_labels(
-                            connection,
-                            &source,
-                            mode,
-                            &session_states,
-                        )?
-                        .is_none()
-                    {
-                        return Ok(false);
-                    }
-                    this.put_materialization_meta_from_materialized_rows(
-                        connection,
-                        source_version,
-                        mode,
-                    )?;
-                    Ok(true)
-                })
-            })();
-
-            match result {
-                Ok(true) => Ok(true),
-                Ok(false) => {
-                    this.restore_empty_materialization_after_failed_batch_seed(
-                        connection,
-                        mode,
-                        previous_meta,
-                    )?;
-                    Ok(false)
+                this.rebalance_routed_edge_slots(connection, mode)?;
+                if this
+                    .refresh_materialized_node_labels(connection, &source, mode, &session_states)?
+                    .is_none()
+                {
+                    return Ok(false);
                 }
-                Err(error) => {
-                    let _ = this.restore_empty_materialization_after_failed_batch_seed(
-                        connection,
-                        mode,
-                        previous_meta,
-                    );
-                    Err(error)
-                }
-            }
+                this.put_materialization_meta_from_materialized_rows(
+                    connection,
+                    source_version,
+                    mode,
+                )?;
+                Ok(true)
+            })
         })
     }
 
+    #[cfg(test)]
     fn restore_empty_materialization_after_failed_batch_seed(
         &self,
         connection: &mut SqliteConnection,
@@ -849,6 +813,7 @@ impl ConsoleGraphSnapshotStore {
         })
     }
 
+    #[cfg(test)]
     fn run_write_transaction<T, F>(
         &self,
         connection: &mut SqliteConnection,
