@@ -13,7 +13,9 @@ use crate::host::render::{
     MaterializedGraphShell, MaterializedGraphShellBranch, MaterializedGraphShellTick,
     ProviderContextItem,
 };
-use crate::layout::{lane_key, layout_graph_viewport, layout_graph_viewport_diff};
+use crate::layout::{
+    lane_key, layout_graph_viewport, layout_graph_viewport_diff, materialize_graph_viewport,
+};
 use crate::publisher::ConsolePublisher;
 use coco_mem::{BranchStore, NodeStore, SessionState, SessionStore, SqliteGraphStore, Store};
 use serde::Serialize;
@@ -82,6 +84,7 @@ macro_rules! log_rebuild_status {
                 phase = ?status.phase,
                 processed = status.processed,
                 total = status.total,
+                progress_percent = rebuild_progress_percent(status),
                 message = %status.message,
                 "console graph rebuild failed",
             );
@@ -93,6 +96,7 @@ macro_rules! log_rebuild_status {
                 phase = ?status.phase,
                 processed = status.processed,
                 total = status.total,
+                progress_percent = rebuild_progress_percent(status),
                 message = %status.message,
                 "console graph rebuild status",
             );
@@ -104,6 +108,7 @@ macro_rules! log_rebuild_status {
                 phase = ?status.phase,
                 processed = status.processed,
                 total = status.total,
+                progress_percent = rebuild_progress_percent(status),
                 message = %status.message,
                 "console graph rebuild progress",
             );
@@ -784,14 +789,14 @@ where
             )
         );
         if let Some(snapshots) = self.snapshots.clone() {
-            let has_materialization = snapshots.has_materialization(mode);
+            let has_non_empty_materialization = snapshots.has_non_empty_materialization(mode);
             let source = self.source.clone();
             let incremental_result = self
                 .run_blocking_graph_compute(move || {
                     source.try_append_linear_materialization(snapshots, mode, source_version)
                 })
                 .await;
-            match incremental_result {
+            let fallback_message = match incremental_result {
                 Ok(Ok(true)) => {
                     self.publish_ready_version(source_version);
                     set_rebuild_status!(
@@ -808,7 +813,7 @@ where
                     );
                     return;
                 }
-                Ok(Ok(false)) => match has_materialization {
+                Ok(Ok(false)) => match has_non_empty_materialization {
                     Ok(true) => {
                         set_rebuild_status!(
                             self,
@@ -825,19 +830,7 @@ where
                         return;
                     }
                     Ok(false) => {
-                        set_rebuild_status!(
-                            self,
-                            rebuild_status(
-                                mode,
-                                source_version,
-                                ConsoleGraphRebuildState::Failed,
-                                None,
-                                0,
-                                0,
-                                "Incremental graph materialization could not seed this store state",
-                            )
-                        );
-                        return;
+                        "Incremental graph materialization could not seed this store state; rebuilding full materialization"
                     }
                     Err(error) => {
                         set_rebuild_status!(
@@ -885,26 +878,49 @@ where
                     );
                     return;
                 }
-            }
+            };
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Building,
+                    None,
+                    0,
+                    0,
+                    fallback_message,
+                )
+            );
         }
         let source = self.source.clone();
         let progress_cache = self.clone();
+        let snapshots = self.snapshots.clone();
         let result = self
             .run_blocking_graph_compute(move || {
-                source.build_snapshot_with_progress(mode, source_version, |progress| {
-                    set_rebuild_status!(
-                        progress_cache,
-                        rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Building,
-                            Some(progress.phase),
-                            progress.processed,
-                            progress.total,
-                            progress.phase.label(),
-                        )
-                    );
-                })
+                let snapshot =
+                    source.build_snapshot_with_progress(mode, source_version, |progress| {
+                        set_rebuild_status!(
+                            progress_cache,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Building,
+                                Some(progress.phase),
+                                progress.processed,
+                                progress.total,
+                                progress.phase.label(),
+                            )
+                        );
+                    })?;
+                if let Some(snapshots) = snapshots {
+                    let branch_labels = visible_full_layout_branch_labels(&snapshot);
+                    snapshots.replace_materialization_from_viewport(
+                        mode,
+                        materialize_graph_viewport(&snapshot),
+                        branch_labels,
+                    )?;
+                }
+                crate::Result::Ok(snapshot)
             })
             .await;
         match result {
@@ -1047,9 +1063,28 @@ fn should_log_rebuild_status_at_info(status: &ConsoleGraphRebuildStatus) -> bool
         return true;
     }
 
-    status
-        .phase
-        .is_some_and(|_| status.processed == 0 || status.processed == status.total)
+    status.phase.is_some_and(|_| {
+        status.processed == 0
+            || status.processed == status.total
+            || rebuild_progress_crosses_info_bucket(status)
+    })
+}
+
+fn rebuild_progress_percent(status: &ConsoleGraphRebuildStatus) -> usize {
+    if status.total == 0 {
+        return 0;
+    }
+    status.processed.saturating_mul(100) / status.total
+}
+
+fn rebuild_progress_crosses_info_bucket(status: &ConsoleGraphRebuildStatus) -> bool {
+    if status.total == 0 || status.processed == 0 {
+        return false;
+    }
+    let previous = status.processed.saturating_sub(1);
+    let previous_bucket = previous.saturating_mul(10) / status.total;
+    let current_bucket = status.processed.saturating_mul(10) / status.total;
+    current_bucket > previous_bucket
 }
 
 impl CacheState {
@@ -1117,6 +1152,25 @@ fn latest_persistent_materialization_version(
         })
 }
 
+fn visible_full_layout_branch_labels(snapshot: &GraphSnapshot) -> BTreeSet<String> {
+    let node_ids = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    snapshot
+        .branches
+        .iter()
+        .filter(|branch| {
+            branch
+                .visible_head_id
+                .as_deref()
+                .is_some_and(|head_id| node_ids.contains(head_id))
+        })
+        .map(|branch| branch.name.clone())
+        .collect()
+}
+
 fn node_id_from_graph_target(target: &str) -> Option<String> {
     target
         .strip_prefix("detail-")
@@ -1144,7 +1198,9 @@ where
             Self::PersistentStorePath(path) => {
                 let store =
                     SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
+                run_sqlite_graph_read_transaction(&store, || {
+                    build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
+                })
             }
         }
     }
@@ -1160,7 +1216,9 @@ where
             Self::PersistentStorePath(path) => {
                 let store =
                     SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                snapshots.try_append_linear_branch(source_version, mode, &store)
+                run_sqlite_graph_read_transaction(&store, || {
+                    snapshots.try_append_linear_branch(source_version, mode, &store)
+                })
             }
         }
     }
@@ -1202,6 +1260,28 @@ where
                     SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
                 materialized_shell_branches(&store, lanes)
             }
+        }
+    }
+}
+
+fn run_sqlite_graph_read_transaction<T>(
+    store: &SqliteGraphStore,
+    operation: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    store
+        .begin_read_transaction()
+        .context(crate::error::StoreSnafu)?;
+    let result = operation();
+    match result {
+        Ok(value) => {
+            store
+                .commit_read_transaction()
+                .context(crate::error::StoreSnafu)?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = store.rollback_read_transaction();
+            Err(error)
         }
     }
 }
@@ -1380,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_rebuild_status_logs_phase_boundaries_at_info() {
+    fn graph_rebuild_status_logs_phase_boundaries_and_progress_buckets_at_info() {
         let phase_start = rebuild_status(
             GraphMode::All,
             1,
@@ -1390,13 +1470,22 @@ mod tests {
             10,
             "Building graph entries",
         );
-        let phase_progress = rebuild_status(
+        let phase_progress_before_bucket = rebuild_status(
             GraphMode::All,
             1,
             ConsoleGraphRebuildState::Building,
             Some(crate::graph::GraphBuildPhase::Entries),
-            5,
+            4,
+            100,
+            "Building graph entries",
+        );
+        let phase_progress_bucket = rebuild_status(
+            GraphMode::All,
+            1,
+            ConsoleGraphRebuildState::Building,
+            Some(crate::graph::GraphBuildPhase::Entries),
             10,
+            100,
             "Building graph entries",
         );
         let phase_complete = rebuild_status(
@@ -1419,9 +1508,13 @@ mod tests {
         );
 
         assert!(should_log_rebuild_status_at_info(&phase_start));
-        assert!(!should_log_rebuild_status_at_info(&phase_progress));
+        assert!(!should_log_rebuild_status_at_info(
+            &phase_progress_before_bucket
+        ));
+        assert!(should_log_rebuild_status_at_info(&phase_progress_bucket));
         assert!(should_log_rebuild_status_at_info(&phase_complete));
         assert!(should_log_rebuild_status_at_info(&ready));
+        assert_eq!(rebuild_progress_percent(&phase_progress_bucket), 10);
     }
 
     #[tokio::test]
@@ -1509,7 +1602,7 @@ mod tests {
     #[tokio::test]
     async fn cache_reports_viewport_version_per_materialized_mode() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -1575,7 +1668,7 @@ mod tests {
     #[tokio::test]
     async fn cache_reopens_persistent_store_path_for_latest_graph_state() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -1586,7 +1679,7 @@ mod tests {
         let root = writer.root_id();
         let session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -1612,9 +1705,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_persists_graph_locations_to_sqlite_store_database() {
+    async fn cache_persists_graph_locations_to_sqlite_graph_database() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -1625,7 +1718,7 @@ mod tests {
         let root = writer.root_id();
         let session = writer
             .append(NewNode {
-                parent: root,
+                parent: root.clone(),
                 role: Role::System,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
@@ -1740,7 +1833,7 @@ mod tests {
     #[test]
     fn graph_materialization_preflight_read_does_not_block_store_writes() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         ConsoleGraphSnapshotStore::open(&path).unwrap();
 
         let graph_database_path = crate::host::snapshot_store::database_path(&path);
@@ -1795,10 +1888,67 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    #[test]
+    fn graph_materialization_write_blocks_store_writes_until_released() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).unwrap();
+        ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
+        let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
+        let transaction = std::thread::spawn(move || {
+            use diesel::connection::SimpleConnection;
+
+            with_sqlite_test_connection(&graph_database_path, move |connection| {
+                connection
+                    .batch_execute("BEGIN IMMEDIATE TRANSACTION")
+                    .unwrap();
+                transaction_started_tx.send(()).unwrap();
+                release_transaction_rx.recv().unwrap();
+                connection.batch_execute("ROLLBACK").unwrap();
+            });
+        });
+        transaction_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("graph materialization write transaction should start");
+
+        let writer_for_thread = writer.clone();
+        let root = writer.root_id();
+        let (write_tx, write_rx) = mpsc::channel();
+        let write = std::thread::spawn(move || {
+            let node = writer_for_thread
+                .append(NewNode {
+                    parent: root,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("store write while graph db is locked".to_owned()),
+                })
+                .unwrap();
+            write_tx.send(node).unwrap();
+        });
+
+        let pending = write_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            pending.is_err(),
+            "store write should wait while graph materialization holds the write transaction"
+        );
+        release_transaction_tx.send(()).unwrap();
+        transaction.join().unwrap();
+        let written = write_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("store write should finish after graph transaction release");
+        write.join().unwrap();
+        assert_eq!(writer.get_node(&written).unwrap().id, written);
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[tokio::test]
     async fn cache_seeds_initial_materialization_with_skill_invocation_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -1926,7 +2076,7 @@ mod tests {
     #[tokio::test]
     async fn cache_falls_back_when_unchanged_head_gains_skill_invocation_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -2054,7 +2204,7 @@ mod tests {
     #[tokio::test]
     async fn cache_falls_back_when_appended_tool_use_has_skill_invocation_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -2179,7 +2329,7 @@ mod tests {
     #[tokio::test]
     async fn cache_adopts_skill_lane_when_branch_forks_at_skill_result() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -2307,7 +2457,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_missing_skill_result_to_derived_lane_when_branch_has_invocation() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -2432,7 +2582,7 @@ mod tests {
     #[tokio::test]
     async fn cache_prunes_skill_lane_when_tool_use_source_is_rewound() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -2532,7 +2682,7 @@ mod tests {
     #[tokio::test]
     async fn cache_materializes_sibling_skill_invocation_subtrees() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -2692,7 +2842,7 @@ mod tests {
     #[tokio::test]
     async fn cache_materializes_branched_skill_invocation_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -2822,7 +2972,7 @@ mod tests {
     #[tokio::test]
     async fn cache_prunes_branch_suffix_when_rewound_tool_use_keeps_skill_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -2942,7 +3092,7 @@ mod tests {
     #[tokio::test]
     async fn cache_refreshes_tail_tool_use_skill_subtree_before_branch_append() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -3050,7 +3200,7 @@ mod tests {
     #[tokio::test]
     async fn cache_compacts_lanes_after_pruning_derived_skill_lane() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -3218,7 +3368,7 @@ mod tests {
     #[tokio::test]
     async fn cache_trims_skill_prefix_when_branch_adopts_result_middle() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -3379,7 +3529,7 @@ mod tests {
     #[tokio::test]
     async fn cache_reserves_new_branch_lane_when_seeding_merge_orphan() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -3471,7 +3621,7 @@ mod tests {
     #[tokio::test]
     async fn cache_prunes_anchor_orphan_merge_parent_after_rewind_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -3564,7 +3714,7 @@ mod tests {
     #[tokio::test]
     async fn cache_refreshes_graph_locations_incrementally() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -3646,7 +3796,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_linear_graph_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -3723,7 +3873,7 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_single_branch_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -3794,9 +3944,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_replaces_materialization_from_full_snapshot_layout() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            MemoryStore::new(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .unwrap();
+        writer.fork("main", &session).unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("full materialization fallback".to_owned()),
+            })
+            .unwrap();
+        let orphan = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("full materialization orphan".to_owned()),
+            })
+            .unwrap();
+        let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan));
+        writer.fork(&orphan_lane, &root).unwrap();
+        let merge_anchor = writer
+            .append(NewNode {
+                parent: text.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(orphan.clone())],
+                    PromptAnchor {
+                        prompt: "merge full materialization orphan".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &merge_anchor)
+            .unwrap();
+        writer.fork("orphan branch", &session).unwrap();
+        let reserved_label_branch_head = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("reserved label branch".to_owned()),
+            })
+            .unwrap();
+        writer
+            .set_branch_head("orphan branch", &session, &reserved_label_branch_head)
+            .unwrap();
+        publisher.mark_changed();
+        let target_version = publisher.current_version();
+
+        let snapshot = cache.snapshot_current(GraphMode::All).await.unwrap();
+        let branch_labels = visible_full_layout_branch_labels(&snapshot);
+        let viewport = materialize_graph_viewport(&snapshot);
+        ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .replace_materialization_from_viewport(GraphMode::All, viewport, branch_labels)
+            .unwrap();
+        let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .unwrap()
+            .latest_viewport(
+                GraphMode::All,
+                crate::host::api::GraphViewportRequest::default(),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(materialized.version, target_version);
+        assert!(materialized.nodes.iter().any(|node| node.id == session));
+        assert!(materialized.nodes.iter().any(|node| node.id == text));
+        assert!(
+            materialized
+                .nodes
+                .iter()
+                .any(|node| node.id == merge_anchor)
+        );
+        assert!(
+            materialized
+                .nodes
+                .iter()
+                .any(|node| node.id == reserved_label_branch_head)
+        );
+        assert!(materialized.nodes.iter().any(|node| node.id == orphan));
+        assert!(materialized.edges.iter().any(|edge| edge.target_id == text));
+        assert!(materialized.lanes.iter().any(|lane| {
+            lane.key == lane_key("orphan branch") && lane.label == "orphan branch"
+        }));
+        assert!(materialized.lanes.iter().any(|lane| {
+            lane.key == format!("derived:orphan:{orphan}") && lane.label == orphan_lane
+        }));
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_seeds_multiple_branch_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -3902,7 +4167,7 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_initial_materialization_rebalances_derived_route_slots() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4030,7 +4295,7 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_anchor_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4118,7 +4383,7 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_anchor_alias_labels_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4171,7 +4436,7 @@ mod tests {
     #[tokio::test]
     async fn cache_preserves_branches_named_like_derived_lanes() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4256,7 +4521,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_branch_named_like_exact_orphan_lane_label() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4381,7 +4646,7 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_empty_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4426,6 +4691,12 @@ mod tests {
         assert!(materialized.edges.is_empty());
         assert!(materialized.lanes.is_empty());
         assert!(
+            !ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .has_non_empty_materialization(GraphMode::All)
+                .unwrap()
+        );
+        assert!(
             cache
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
@@ -4462,6 +4733,12 @@ mod tests {
         assert!(non_empty.nodes.iter().any(|node| node.id == session));
         assert!(non_empty.nodes.iter().any(|node| node.id == text));
         assert!(non_empty.lanes.iter().any(|lane| lane.label == "main"));
+        assert!(
+            ConsoleGraphSnapshotStore::open(&path)
+                .unwrap()
+                .has_non_empty_materialization(GraphMode::All)
+                .unwrap()
+        );
 
         writer.delete_branch("main").unwrap();
         publisher.mark_changed();
@@ -4488,7 +4765,7 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_root_only_leading_branch_when_seeding_materialization() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4546,7 +4823,7 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_root_only_trailing_branch_when_seeding_materialization() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4605,7 +4882,7 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_root_only_new_branch_when_appending_materialization() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4673,7 +4950,7 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_branch_lane_rewound_to_root_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4740,7 +5017,7 @@ mod tests {
     #[tokio::test]
     async fn pending_viewport_after_refreshes_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4804,7 +5081,7 @@ mod tests {
     #[tokio::test]
     async fn pending_viewport_diff_after_refreshes_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -4872,7 +5149,7 @@ mod tests {
     #[tokio::test]
     async fn cache_does_not_full_rebuild_when_incremental_materialization_cannot_apply() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -5025,7 +5302,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_linear_graph_merge_route_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -5148,7 +5425,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_merge_after_farther_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -5272,7 +5549,7 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_orphan_merge_parent_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -5369,7 +5646,7 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_orphan_tool_use_skill_subtree_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -5519,7 +5796,7 @@ mod tests {
     #[tokio::test]
     async fn cache_drops_orphan_lane_when_branch_adopts_merge_parent() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -5636,7 +5913,7 @@ mod tests {
     #[tokio::test]
     async fn cache_preserves_orphan_ancestry_when_branch_adopts_chain_tail() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -5779,7 +6056,7 @@ mod tests {
     #[tokio::test]
     async fn cache_trims_orphan_prefix_when_branch_adopts_chain_middle() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -5949,7 +6226,7 @@ mod tests {
     #[tokio::test]
     async fn cache_adopts_root_started_orphan_chain_tail_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -6081,7 +6358,7 @@ mod tests {
     #[tokio::test]
     async fn cache_prunes_orphan_merge_parent_after_rewind_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -6192,7 +6469,7 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_initial_merge_after_orphan_parent_column_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -6327,7 +6604,7 @@ mod tests {
     #[tokio::test]
     async fn cache_applies_merge_constraints_to_orphan_lane_nodes() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -6452,7 +6729,7 @@ mod tests {
     #[tokio::test]
     async fn cache_updates_anchor_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -6531,7 +6808,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_anchor_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -6616,7 +6893,7 @@ mod tests {
     #[tokio::test]
     async fn cache_rewinds_anchor_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -6713,7 +6990,7 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_anchor_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -6809,7 +7086,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_new_anchor_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -6943,7 +7220,7 @@ mod tests {
     #[tokio::test]
     async fn cache_scopes_new_anchor_branch_lane_to_current_context_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -7067,7 +7344,7 @@ mod tests {
     #[tokio::test]
     async fn cache_scopes_existing_anchor_branch_append_to_current_context_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -7173,7 +7450,7 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_hidden_new_anchor_branch_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -7260,7 +7537,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_anchor_branch_alias_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -7343,7 +7620,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_anchor_merge_route_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -7516,7 +7793,7 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_anchor_merge_parent_outside_current_context_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -7631,7 +7908,7 @@ mod tests {
     #[tokio::test]
     async fn cache_rewinds_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -7706,7 +7983,7 @@ mod tests {
     #[tokio::test]
     async fn cache_rejects_branch_rewind_that_orphans_dependent_lane() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -7835,7 +8112,7 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_branch_with_orphan_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -7941,7 +8218,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_multiple_linear_graph_materializations_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8041,7 +8318,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_new_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8144,7 +8421,7 @@ mod tests {
     #[tokio::test]
     async fn cache_inserts_sorted_new_branch_from_earlier_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8255,7 +8532,7 @@ mod tests {
     #[tokio::test]
     async fn cache_trims_lower_anchor_lane_after_earlier_branch_insert() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8350,7 +8627,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_new_branch_merge_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8461,7 +8738,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_new_branch_alias_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8568,7 +8845,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_first_visible_branch_alias_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8639,7 +8916,7 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_from_duplicated_branch_tail_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8728,7 +9005,7 @@ mod tests {
     #[tokio::test]
     async fn cache_inserts_middle_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8854,7 +9131,7 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_trailing_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -8932,7 +9209,7 @@ mod tests {
     #[tokio::test]
     async fn cache_rejects_branch_delete_that_orphans_dependent_lane() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -9059,7 +9336,7 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_middle_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),
@@ -9168,9 +9445,9 @@ mod tests {
     #[tokio::test]
     async fn cache_drops_legacy_snapshot_materialization_tables() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
-        let database_path = crate::host::snapshot_store::database_path(&path);
-        create_legacy_snapshot_materialization_tables(&database_path);
+        let writer = PersistentStore::open(&path).unwrap();
+        let legacy_database_path = path.join("console-graph.sqlite3");
+        create_legacy_snapshot_materialization_tables(&legacy_database_path);
 
         let publisher = ConsolePublisher::new();
         let _cache = ConsoleGraphCache::new_with_persistent_store_path(
@@ -9187,8 +9464,33 @@ mod tests {
             "console_graph_viewport_nodes",
             "console_graph_viewport_edges",
         ] {
-            assert!(!sqlite_table_exists(&database_path, table));
+            assert!(!sqlite_table_exists(&legacy_database_path, table));
         }
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn cache_uses_main_store_materialization_tables() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).unwrap();
+        let main_database_path = path.join("store.sqlite3");
+
+        ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        assert_eq!(
+            crate::host::snapshot_store::database_path(&path),
+            main_database_path
+        );
+        for table in [
+            "console_graph_materializations",
+            "console_graph_node_locations",
+            "console_graph_edge_routes",
+        ] {
+            assert!(sqlite_table_exists(&main_database_path, table));
+        }
+        assert!(!path.join("console-graph.sqlite3").exists());
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9197,7 +9499,7 @@ mod tests {
     #[test]
     fn snapshot_write_transaction_allows_store_write_after_short_lock() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
         let snapshot = ConsoleGraphSnapshotStore::open(&path).unwrap();
@@ -9379,7 +9681,7 @@ END;
     #[tokio::test]
     async fn cache_current_snapshot_does_not_rewrite_materialized_facts() {
         let path = temp_store_path();
-        let writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             MemoryStore::new(),

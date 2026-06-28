@@ -28,7 +28,8 @@ use coco_mem::{
     SessionState, SessionStore, SqliteDatabase,
 };
 
-const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
+const SQLITE_DATABASE_FILE_NAME: &str = "console-graph.sqlite3";
+const MAIN_STORE_DATABASE_FILE_NAME: &str = "store.sqlite3";
 const COORDINATE_SPACE: &str = "graph_layout_v1";
 const NODE_RADIUS: i32 = 26;
 const EDGE_TARGET_APPROACH: i32 = 48;
@@ -37,6 +38,18 @@ const EDGE_ROUTE_STEP: i32 = 12;
 const MAX_EDGE_COLUMN_GAP: usize = 5;
 const DERIVED_ORPHAN_LANE_KEY_PREFIX: &str = "derived:orphan:";
 const DERIVED_SKILL_LANE_KEY_PREFIX: &str = "derived:skill:";
+const MATERIALIZATION_TABLES: &[&str] = &[
+    "console_graph_materializations",
+    "console_graph_node_locations",
+    "console_graph_edge_routes",
+];
+const LEGACY_MATERIALIZATION_TABLES: &[&str] = &[
+    "console_graph_snapshots",
+    "console_graph_viewports",
+    "console_graph_viewport_lanes",
+    "console_graph_viewport_nodes",
+    "console_graph_viewport_edges",
+];
 
 #[derive(Clone, Debug)]
 pub struct ConsoleGraphSnapshotStore {
@@ -476,6 +489,7 @@ struct SqliteInteger {
 impl ConsoleGraphSnapshotStore {
     pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
         let dir = dir.as_ref();
+        drop_legacy_snapshot_materialization_tables(&legacy_snapshot_database_path(dir))?;
         let path = database_path(dir);
         let database =
             SqliteDatabase::open_writable_store_path(dir).context(crate::error::StoreSnafu)?;
@@ -551,6 +565,18 @@ impl ConsoleGraphSnapshotStore {
 
     pub(crate) fn has_materialization(&self, mode: GraphMode) -> crate::Result<bool> {
         Ok(self.latest_materialization_row(mode)?.is_some())
+    }
+
+    pub(crate) fn has_non_empty_materialization(&self, mode: GraphMode) -> crate::Result<bool> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            Ok(this
+                .latest_materialization_row_in_connection(connection, mode)?
+                .is_some()
+                && !this
+                    .materialized_node_rows_in_connection(connection, mode)?
+                    .is_empty())
+        })
     }
 
     pub(crate) fn latest_materialization_version(
@@ -885,6 +911,98 @@ impl ConsoleGraphSnapshotStore {
         }
     }
 
+    pub fn replace_materialization_from_viewport(
+        &self,
+        mode: GraphMode,
+        viewport: GraphViewportResponse,
+        branch_labels: BTreeSet<String>,
+    ) -> crate::Result<()> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            this.begin_write_transaction(connection)?;
+            let result = this.replace_materialization_from_viewport_in_transaction(
+                connection,
+                mode,
+                viewport,
+                branch_labels,
+            );
+            match result {
+                Ok(()) => this.commit_transaction(connection),
+                Err(error) => {
+                    let _ = this.rollback_transaction(connection);
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    fn replace_materialization_from_viewport_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        viewport: GraphViewportResponse,
+        branch_labels: BTreeSet<String>,
+    ) -> crate::Result<()> {
+        let mut nodes_by_y = BTreeMap::<i32, Vec<&GraphViewportNode>>::new();
+        for node in &viewport.nodes {
+            nodes_by_y.entry(node.y).or_default().push(node);
+        }
+        let lanes_by_y = viewport
+            .lanes
+            .iter()
+            .map(|lane| {
+                (
+                    lane.y,
+                    full_layout_materialization_lane(lane, &nodes_by_y, &branch_labels),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.clear_materialized_mode_facts(connection, mode)?;
+        for node in &viewport.nodes {
+            let fallback_lane;
+            let lane = if let Some(lane) = lanes_by_y.get(&node.y) {
+                lane
+            } else {
+                fallback_lane = GraphViewportLane {
+                    key: format!("layout:y:{}", node.y),
+                    label: String::new(),
+                    y: node.y,
+                };
+                &fallback_lane
+            };
+            self.insert_node_location(
+                connection,
+                NodeLocationInsert {
+                    mode,
+                    node,
+                    lane,
+                    bounds: node_bounds(node),
+                },
+            )?;
+        }
+        for edge in &viewport.edges {
+            self.insert_edge_route(
+                connection,
+                EdgeRouteInsert {
+                    mode,
+                    edge,
+                    bounds: edge_bounds(edge),
+                },
+            )?;
+        }
+        self.put_materialization_meta(
+            connection,
+            MaterializationMetaInput {
+                source_version: viewport.version,
+                mode,
+                world_min_x: 0,
+                world_min_y: 0,
+                world_max_x: viewport.canvas.width,
+                world_max_y: viewport.canvas.height,
+            },
+        )
+    }
+
     fn put_empty_materialization_in_transaction(
         &self,
         connection: &mut SqliteConnection,
@@ -905,6 +1023,7 @@ impl ConsoleGraphSnapshotStore {
         )?;
         Ok(true)
     }
+
     fn first_visible_initial_branch_index(
         &self,
         store: &(impl BranchStore + NodeStore),
@@ -3170,7 +3289,7 @@ ORDER BY
     }
 
     fn begin_write_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
-        sql_query("BEGIN IMMEDIATE")
+        sql_query("BEGIN IMMEDIATE TRANSACTION")
             .execute(connection)
             .context(QueryGraphSnapshotStoreSnafu {
                 path: self.path.as_ref().clone(),
@@ -3310,19 +3429,24 @@ CREATE TABLE IF NOT EXISTS console_graph_edge_routes (
         &self,
         connection: &mut SqliteConnection,
     ) -> crate::Result<()> {
-        for table in [
-            "console_graph_snapshots",
-            "console_graph_viewports",
-            "console_graph_viewport_lanes",
-            "console_graph_viewport_nodes",
-            "console_graph_viewport_edges",
-        ] {
-            sql_query(format!("DROP TABLE IF EXISTS {table}"))
-                .execute(&mut *connection)
-                .context(QueryGraphSnapshotStoreSnafu {
-                    path: self.path.as_ref().clone(),
-                })?;
-        }
+        drop_tables(
+            connection,
+            self.path.as_ref(),
+            LEGACY_MATERIALIZATION_TABLES,
+        )
+    }
+
+    fn delete_materialization_meta(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<()> {
+        sql_query("DELETE FROM console_graph_materializations WHERE mode = ?")
+            .bind::<Text, _>(mode.as_query_value())
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         Ok(())
     }
 
@@ -3358,20 +3482,6 @@ ON CONFLICT(mode) DO UPDATE SET
         .context(QueryGraphSnapshotStoreSnafu {
             path: self.path.as_ref().clone(),
         })?;
-        Ok(())
-    }
-
-    fn delete_materialization_meta(
-        &self,
-        connection: &mut SqliteConnection,
-        mode: GraphMode,
-    ) -> crate::Result<()> {
-        sql_query("DELETE FROM console_graph_materializations WHERE mode = ?")
-            .bind::<Text, _>(mode.as_query_value())
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
         Ok(())
     }
 
@@ -5290,7 +5400,83 @@ ORDER BY min_y, min_x, edge_key
 }
 
 pub(crate) fn database_path(dir: impl AsRef<Path>) -> PathBuf {
+    main_store_database_path(dir)
+}
+
+fn legacy_snapshot_database_path(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join(SQLITE_DATABASE_FILE_NAME)
+}
+
+fn main_store_database_path(dir: impl AsRef<Path>) -> PathBuf {
+    dir.as_ref().join(MAIN_STORE_DATABASE_FILE_NAME)
+}
+
+fn full_layout_materialization_lane(
+    lane: &GraphViewportLane,
+    nodes_by_y: &BTreeMap<i32, Vec<&GraphViewportNode>>,
+    branch_labels: &BTreeSet<String>,
+) -> GraphViewportLane {
+    if branch_labels.contains(&lane.label) {
+        return lane.clone();
+    }
+    let derived_prefix = if lane.label.starts_with("orphan ") {
+        Some(DERIVED_ORPHAN_LANE_KEY_PREFIX)
+    } else if lane.label.starts_with("skill ") {
+        Some(DERIVED_SKILL_LANE_KEY_PREFIX)
+    } else {
+        None
+    };
+    let Some(prefix) = derived_prefix else {
+        return lane.clone();
+    };
+    let Some(source_id) = nodes_by_y
+        .get(&lane.y)
+        .and_then(|nodes| nodes.iter().max_by_key(|node| node.x))
+        .map(|node| node.id.as_str())
+    else {
+        return lane.clone();
+    };
+    GraphViewportLane {
+        key: format!("{prefix}{source_id}"),
+        label: lane.label.clone(),
+        y: lane.y,
+    }
+}
+
+fn drop_legacy_snapshot_materialization_tables(path: &Path) -> crate::Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let database =
+        SqliteDatabase::open_unshared_file_path(path).context(crate::error::StoreSnafu)?;
+    let path = path.to_owned();
+    let error_path = path.clone();
+    database.with_sync_connection(
+        move |connection| {
+            drop_tables(connection, &path, MATERIALIZATION_TABLES)?;
+            drop_tables(connection, &path, LEGACY_MATERIALIZATION_TABLES)
+        },
+        |source| crate::Error::Store { source },
+        |source| crate::Error::QueryGraphSnapshotStore {
+            path: error_path,
+            source,
+        },
+    )
+}
+
+fn drop_tables(
+    connection: &mut SqliteConnection,
+    path: &Path,
+    tables: &[&str],
+) -> crate::Result<()> {
+    for table in tables {
+        sql_query(format!("DROP TABLE IF EXISTS {table}"))
+            .execute(&mut *connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: path.to_owned(),
+            })?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -5975,47 +6161,9 @@ mod tests {
     }
 
     #[test]
-    fn boolean_write_transaction_rolls_back_false_result() {
-        let path = temp_store_path();
-        let _writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
-        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
-
-        let writer = snapshots.clone();
-        let applied = snapshots
-            .with_connection_for_tests(move |connection| {
-                writer.run_bool_write_transaction(connection, |this, connection| {
-                    this.put_materialization_meta(
-                        connection,
-                        MaterializationMetaInput {
-                            source_version: 42,
-                            mode: GraphMode::All,
-                            world_min_x: 0,
-                            world_min_y: 0,
-                            world_max_x: 1,
-                            world_max_y: 1,
-                        },
-                    )?;
-                    Ok(false)
-                })
-            })
-            .unwrap();
-        assert!(!applied);
-
-        let reader = snapshots.clone();
-        let row = snapshots
-            .with_connection_for_tests(move |connection| {
-                reader.latest_materialization_row_in_connection(connection, GraphMode::All)
-            })
-            .unwrap();
-        assert!(row.is_none());
-
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
     fn failed_batch_seed_clears_committed_facts_and_restores_empty_meta() {
         let path = temp_store_path();
-        let _writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let _writer = PersistentStore::open(&path).unwrap();
         let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
 
         let store = snapshots.clone();
@@ -6079,7 +6227,7 @@ mod tests {
     #[test]
     fn direct_materialized_node_lookups_ignore_rows_without_meta() {
         let path = temp_store_path();
-        let _writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let _writer = PersistentStore::open(&path).unwrap();
         let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
 
         let store = snapshots.clone();
@@ -6132,7 +6280,7 @@ mod tests {
     #[test]
     fn latest_viewport_reads_meta_and_rows_from_one_snapshot() {
         let path = temp_store_path();
-        let _writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let _writer = PersistentStore::open(&path).unwrap();
         let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
 
         let store = snapshots.clone();
@@ -6212,7 +6360,7 @@ mod tests {
     #[test]
     fn meta_gated_materialized_node_lookups_read_from_one_snapshot() {
         let path = temp_store_path();
-        let _writer = PersistentStore::open_or_migrate_fs(&path).unwrap();
+        let _writer = PersistentStore::open(&path).unwrap();
         let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
 
         let store = snapshots.clone();

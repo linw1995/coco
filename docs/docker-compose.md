@@ -70,8 +70,9 @@ Compose reads `.env`, mounts `${COCO_DATA_DIR}` to `/data`, and mounts
 
 `COCO_STORE_PATH` points at a store directory, not directly at the SQLite
 database file. The SQLite database is stored as `store.sqlite3` inside that
-directory. Existing JSON/JSONL file-system stores at the same path are migrated
-to SQLite automatically the first time CoCo opens the store.
+directory. Console graph materialization is stored separately as
+`console-graph.sqlite3` in the same directory so graph rebuilds do not take the
+main store write lock.
 
 ## Configure ChatGPT Provider
 

@@ -40,6 +40,15 @@ pub enum Kind {
     Failure(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindTag {
+    Anchor,
+    ToolUse,
+    ToolResult,
+    Text,
+    Failure,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ManyOrOne<T> {
@@ -67,6 +76,15 @@ pub enum AnchorPayload {
     Prompt(PromptAnchor),
     SkillInvocation(SkillInvocationAnchor),
     SkillResult(SkillResultAnchor),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorPayloadKind {
+    Session,
+    SessionPatch,
+    Prompt,
+    SkillInvocation,
+    SkillResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -117,6 +135,14 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Finished => "finished",
+        }
+    }
+
     pub fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -779,6 +805,10 @@ impl Anchor {
             .collect()
     }
 
+    pub fn payload_kind(&self) -> AnchorPayloadKind {
+        self.payload.kind()
+    }
+
     pub fn as_session(&self) -> Option<&SessionAnchor> {
         match &self.payload {
             AnchorPayload::Session(anchor) => Some(anchor.as_ref()),
@@ -826,6 +856,79 @@ impl Anchor {
             | AnchorPayload::Prompt(_)
             | AnchorPayload::SkillInvocation(_) => None,
             AnchorPayload::SkillResult(anchor) => Some(anchor),
+        }
+    }
+}
+
+impl AnchorPayload {
+    pub fn kind(&self) -> AnchorPayloadKind {
+        match self {
+            Self::Session(_) => AnchorPayloadKind::Session,
+            Self::SessionPatch(_) => AnchorPayloadKind::SessionPatch,
+            Self::Prompt(_) => AnchorPayloadKind::Prompt,
+            Self::SkillInvocation(_) => AnchorPayloadKind::SkillInvocation,
+            Self::SkillResult(_) => AnchorPayloadKind::SkillResult,
+        }
+    }
+}
+
+impl AnchorPayloadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::SessionPatch => "session_patch",
+            Self::Prompt => "prompt",
+            Self::SkillInvocation => "skill_invocation",
+            Self::SkillResult => "skill_result",
+        }
+    }
+}
+
+impl PauseReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Merged { .. } => "merged",
+            Self::Closed => "closed",
+        }
+    }
+
+    pub fn merged_anchor_id(&self) -> Option<&str> {
+        match self {
+            Self::Merged { merged_anchor_id } => Some(merged_anchor_id),
+            Self::Closed => None,
+        }
+    }
+}
+
+impl SessionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Attached { .. } => "attached",
+            Self::Paused { .. } => "paused",
+        }
+    }
+
+    pub fn target_branch(&self) -> Option<&str> {
+        match self {
+            Self::Active => None,
+            Self::Attached { target_branch, .. } | Self::Paused { target_branch, .. } => {
+                Some(target_branch)
+            }
+        }
+    }
+
+    pub fn base_head_id(&self) -> Option<&str> {
+        match self {
+            Self::Attached { base_head_id, .. } => Some(base_head_id),
+            Self::Active | Self::Paused { .. } => None,
+        }
+    }
+
+    pub fn pause_reason(&self) -> Option<&PauseReason> {
+        match self {
+            Self::Paused { reason, .. } => Some(reason),
+            Self::Active | Self::Attached { .. } => None,
         }
     }
 }
@@ -1110,6 +1213,37 @@ impl Node {
 
     pub fn is_root(&self) -> bool {
         self.parent.is_empty()
+    }
+}
+
+impl Kind {
+    pub fn tag(&self) -> KindTag {
+        match self {
+            Self::Anchor(_) => KindTag::Anchor,
+            Self::ToolUse(_) => KindTag::ToolUse,
+            Self::ToolResult(_) => KindTag::ToolResult,
+            Self::Text(_) => KindTag::Text,
+            Self::Failure(_) => KindTag::Failure,
+        }
+    }
+
+    pub fn anchor_payload_kind(&self) -> Option<AnchorPayloadKind> {
+        match self {
+            Self::Anchor(anchor) => Some(anchor.payload_kind()),
+            Self::ToolUse(_) | Self::ToolResult(_) | Self::Text(_) | Self::Failure(_) => None,
+        }
+    }
+}
+
+impl KindTag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anchor => "anchor",
+            Self::ToolUse => "tool_use",
+            Self::ToolResult => "tool_result",
+            Self::Text => "text",
+            Self::Failure => "failure",
+        }
     }
 }
 

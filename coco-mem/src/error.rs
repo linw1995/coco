@@ -118,6 +118,11 @@ pub enum StoreError {
     #[snafu(display("Store at {path:?} was opened read-only"))]
     StoreReadOnly { path: PathBuf },
 
+    #[snafu(display(
+        "Store at {path:?} uses the removed JSON/JSONL format; run a version that still supports migration first or choose a different COCO_STORE_PATH"
+    ))]
+    LegacyJsonStore { path: PathBuf },
+
     #[snafu(display("Failed to create or access store directory {path:?}: {source}"))]
     WriteStoreDirectory {
         path: PathBuf,
@@ -180,6 +185,12 @@ pub enum StoreError {
     QuerySqliteStore {
         path: PathBuf,
         source: diesel::result::Error,
+    },
+
+    #[snafu(display("Failed to run SQLite store migrations for {path:?}: {source}"))]
+    MigrateSqliteStore {
+        path: PathBuf,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Failed to parse SQLite store value {column:?} in {path:?}: {source}"))]
