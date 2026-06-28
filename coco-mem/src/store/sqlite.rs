@@ -2235,18 +2235,22 @@ impl SessionStore for SqliteGraphStore {
     fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
         self.block_on(async {
             let mut connection = self.connect().await?;
-            let sessions = sql_query(
-                r#"
-SELECT branch_name, state, target_branch, base_head_id, pause_reason, merged_anchor_id, state_json
-FROM sessions
-ORDER BY branch_name
-"#,
-            )
-            .load::<SessionRow>(&mut connection)
-            .await
-            .context(QuerySqliteStoreSnafu {
-                path: self.database_path.clone(),
-            })?;
+            let sessions = sessions::table
+                .select((
+                    sessions::branch_name,
+                    sessions::state,
+                    sessions::target_branch,
+                    sessions::base_head_id,
+                    sessions::pause_reason,
+                    sessions::merged_anchor_id,
+                    sessions::state_json,
+                ))
+                .order(sessions::branch_name)
+                .load::<SessionRow>(&mut connection)
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: self.database_path.clone(),
+                })?;
             sessions
                 .into_iter()
                 .map(|session| {
@@ -2759,11 +2763,13 @@ mod tests {
         AsyncSqliteConnection, MessageQueueItem, NodeRow, SqliteGraphStore, SqliteStore,
         StoreAccess, persist_root_metadata,
     };
+    use crate::schema::{jobs, sessions};
     use crate::{
         Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, NewNode,
         Node, NodeStore, PauseReason, Preset, PresetStore, Role, SessionAnchor, SessionAnchorPatch,
         SessionRole, SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
     };
+    use diesel::prelude::*;
     use diesel::sql_query;
     use diesel::sql_types::{Integer, Nullable, Text};
     use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
@@ -2790,33 +2796,22 @@ mod tests {
         anchor_kind: Option<String>,
     }
 
-    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
+    #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
     struct SessionSummaryRow {
-        #[diesel(sql_type = Text)]
         state: String,
-        #[diesel(sql_type = Nullable<Text>)]
         target_branch: Option<String>,
-        #[diesel(sql_type = Nullable<Text>)]
         base_head_id: Option<String>,
-        #[diesel(sql_type = Nullable<Text>)]
         pause_reason: Option<String>,
-        #[diesel(sql_type = Nullable<Text>)]
         merged_anchor_id: Option<String>,
     }
 
-    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
+    #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
     struct JobSummaryRow {
-        #[diesel(sql_type = Text)]
         created_at: String,
-        #[diesel(sql_type = Nullable<Text>)]
         finished_at: Option<String>,
-        #[diesel(sql_type = Text)]
         branch: String,
-        #[diesel(sql_type = Text)]
         work_branch: String,
-        #[diesel(sql_type = Text)]
         base: String,
-        #[diesel(sql_type = Text)]
         status: String,
     }
 
@@ -2893,34 +2888,37 @@ ORDER BY kind, ordinal, parent_node_id
     fn session_summary(store: &SqliteStore, branch: &str) -> SessionSummaryRow {
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
-            sql_query(
-                r#"
-SELECT state, target_branch, base_head_id, pause_reason, merged_anchor_id
-FROM sessions
-WHERE branch_name = ?
-"#,
-            )
-            .bind::<Text, _>(branch)
-            .get_result::<SessionSummaryRow>(&mut connection)
-            .await
-            .unwrap()
+            sessions::table
+                .filter(sessions::branch_name.eq(branch))
+                .select((
+                    sessions::state,
+                    sessions::target_branch,
+                    sessions::base_head_id,
+                    sessions::pause_reason,
+                    sessions::merged_anchor_id,
+                ))
+                .get_result::<SessionSummaryRow>(&mut connection)
+                .await
+                .unwrap()
         })
     }
 
     fn job_summary(store: &SqliteStore, job_id: &str) -> JobSummaryRow {
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
-            sql_query(
-                r#"
-SELECT created_at, finished_at, branch, work_branch, base, status
-FROM jobs
-WHERE job_id = ?
-"#,
-            )
-            .bind::<Text, _>(job_id)
-            .get_result::<JobSummaryRow>(&mut connection)
-            .await
-            .unwrap()
+            jobs::table
+                .filter(jobs::job_id.eq(job_id))
+                .select((
+                    jobs::created_at,
+                    jobs::finished_at,
+                    jobs::branch,
+                    jobs::work_branch,
+                    jobs::base,
+                    jobs::status,
+                ))
+                .get_result::<JobSummaryRow>(&mut connection)
+                .await
+                .unwrap()
         })
     }
 
