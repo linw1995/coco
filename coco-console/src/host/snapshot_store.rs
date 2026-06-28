@@ -13,7 +13,9 @@ use crate::api::{
     GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
     GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, GraphViewportResponse, Point,
 };
-use crate::error::{ParseGraphSnapshotStoreValueSnafu, QueryGraphSnapshotStoreSnafu};
+use crate::error::{
+    MigrateGraphSnapshotStoreSnafu, ParseGraphSnapshotStoreValueSnafu, QueryGraphSnapshotStoreSnafu,
+};
 use crate::graph::{
     GraphMode, graph_kind_name, initial_visible_graph_lane_nodes, node_target_id,
     provider_context_ancestry_nodes, shorten_id, summarize_node,
@@ -3335,9 +3337,8 @@ ORDER BY
             connection
                 .run_pending_migrations(CONSOLE_GRAPH_MIGRATIONS)
                 .map(|_| ())
-                .map_err(|source| crate::Error::MigrateGraphSnapshotStore {
+                .context(MigrateGraphSnapshotStoreSnafu {
                     path: this.path.as_ref().clone(),
-                    source,
                 })?;
             Ok(())
         })
