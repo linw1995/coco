@@ -38,6 +38,8 @@ diesel::table! {
         parent_id -> Text,
         created_at -> Text,
         role -> Text,
+        kind -> Text,
+        anchor_kind -> Nullable<Text>,
         metadata_json -> Nullable<Text>,
         kind_json -> Text,
     }

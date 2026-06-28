@@ -32,13 +32,13 @@ use crate::schema::{
     store_meta,
 };
 use crate::{
-    Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Preset,
-    PresetRecord, Role, SessionAnchorPatch, SessionRole, SessionState, SkillRecord,
-    SkillUpdatePatch, SkillVersionSpec,
+    AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node,
+    NodeMetadata, Preset, PresetRecord, Role, SessionAnchorPatch, SessionRole, SessionState,
+    SkillRecord, SkillUpdatePatch, SkillVersionSpec,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 2;
+const SQLITE_SCHEMA_VERSION: i32 = 3;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
 const LEGACY_MIGRATION_TABLE_NAME: &str = "store_schema_migrations";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
@@ -117,6 +117,10 @@ struct NodeRow {
     created_at: String,
     #[diesel(sql_type = Text)]
     role: String,
+    #[diesel(sql_type = Text)]
+    kind: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    anchor_kind: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     metadata_json: Option<String>,
     #[diesel(sql_type = Text)]
@@ -606,7 +610,7 @@ impl SqliteGraphStore {
             let mut connection = self.connect().await?;
             let row = sql_query(
                 r#"
-SELECT id, parent_id, created_at, role, metadata_json, kind_json
+SELECT id, parent_id, created_at, role, kind, anchor_kind, metadata_json, kind_json
 FROM nodes
 WHERE id = ?
 "#,
@@ -1170,6 +1174,8 @@ async fn load_node_rows(
             nodes::parent_id,
             nodes::created_at,
             nodes::role,
+            nodes::kind,
+            nodes::anchor_kind,
             nodes::metadata_json,
             nodes::kind_json,
         ))
@@ -1231,6 +1237,8 @@ async fn persist_node(
             nodes::parent_id.eq(row.parent_id),
             nodes::created_at.eq(row.created_at),
             nodes::role.eq(row.role),
+            nodes::kind.eq(row.kind),
+            nodes::anchor_kind.eq(row.anchor_kind),
             nodes::metadata_json.eq(row.metadata_json),
             nodes::kind_json.eq(row.kind_json),
         ))
@@ -1269,6 +1277,8 @@ async fn upsert_node(
             nodes::parent_id.eq(row.parent_id),
             nodes::created_at.eq(row.created_at),
             nodes::role.eq(row.role),
+            nodes::kind.eq(row.kind),
+            nodes::anchor_kind.eq(row.anchor_kind),
             nodes::metadata_json.eq(row.metadata_json),
             nodes::kind_json.eq(row.kind_json),
         ))
@@ -1278,6 +1288,8 @@ async fn upsert_node(
             nodes::parent_id.eq(diesel::upsert::excluded(nodes::parent_id)),
             nodes::created_at.eq(diesel::upsert::excluded(nodes::created_at)),
             nodes::role.eq(diesel::upsert::excluded(nodes::role)),
+            nodes::kind.eq(diesel::upsert::excluded(nodes::kind)),
+            nodes::anchor_kind.eq(diesel::upsert::excluded(nodes::anchor_kind)),
             nodes::metadata_json.eq(diesel::upsert::excluded(nodes::metadata_json)),
             nodes::kind_json.eq(diesel::upsert::excluded(nodes::kind_json)),
         ))
@@ -1355,11 +1367,15 @@ fn merge_parent_relation_kind(parent: &MergeParent) -> &'static str {
 
 impl NodeRow {
     fn from_node(node: Node, path: &Path) -> Result<Self> {
+        let kind = node_kind_name(&node.kind).to_owned();
+        let anchor_kind = node_anchor_kind_name(&node.kind).map(str::to_owned);
         Ok(Self {
             id: node.id,
             parent_id: node.parent,
             created_at: node.created_at.to_string(),
             role: role_name(&node.role).to_owned(),
+            kind,
+            anchor_kind,
             metadata_json: node
                 .metadata
                 .map(|metadata| {
@@ -1377,6 +1393,30 @@ impl NodeRow {
     }
 
     fn into_node(self, path: &Path) -> Result<Node> {
+        let kind = serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
+            path: path.to_owned(),
+            column: "nodes.kind_json".to_owned(),
+        })?;
+        ensure!(
+            self.kind == node_kind_name(&kind),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "SQLite node kind column {:?} does not match kind_json",
+                    self.kind
+                ),
+            }
+        );
+        ensure!(
+            self.anchor_kind.as_deref() == node_anchor_kind_name(&kind),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "SQLite node anchor_kind column {:?} does not match kind_json",
+                    self.anchor_kind
+                ),
+            }
+        );
         Ok(Node {
             id: self.id,
             parent: self.parent_id,
@@ -1398,10 +1438,7 @@ impl NodeRow {
                     )
                 })
                 .transpose()?,
-            kind: serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
-                path: path.to_owned(),
-                column: "nodes.kind_json".to_owned(),
-            })?,
+            kind,
         })
     }
 }
@@ -1412,6 +1449,29 @@ fn role_name(role: &Role) -> &'static str {
         Role::System => "system",
         Role::LLM => "llm",
     }
+}
+
+fn node_kind_name(kind: &Kind) -> &'static str {
+    match kind {
+        Kind::Anchor(_) => "anchor",
+        Kind::ToolUse(_) => "tool_use",
+        Kind::ToolResult(_) => "tool_result",
+        Kind::Text(_) => "text",
+        Kind::Failure(_) => "failure",
+    }
+}
+
+fn node_anchor_kind_name(kind: &Kind) -> Option<&'static str> {
+    let Kind::Anchor(anchor) = kind else {
+        return None;
+    };
+    Some(match &anchor.payload {
+        AnchorPayload::Session(_) => "session",
+        AnchorPayload::SessionPatch(_) => "session_patch",
+        AnchorPayload::Prompt(_) => "prompt",
+        AnchorPayload::SkillInvocation(_) => "skill_invocation",
+        AnchorPayload::SkillResult(_) => "skill_result",
+    })
 }
 
 fn parse_role(role: &str, path: &Path) -> Result<Role> {
@@ -1929,7 +1989,7 @@ WITH RECURSIVE ancestry(id, depth) AS (
     JOIN ancestry ON nodes.id = ancestry.id
     WHERE nodes.parent_id != ''
 )
-SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.metadata_json, nodes.kind_json
+SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.kind, nodes.anchor_kind, nodes.metadata_json, nodes.kind_json
 FROM ancestry
 JOIN nodes ON nodes.id = ancestry.id
 ORDER BY ancestry.depth
@@ -1982,7 +2042,7 @@ ORDER BY ancestry.depth
             let mut connection = self.connect().await?;
             let rows = sql_query(
                 r#"
-SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.metadata_json, nodes.kind_json
+SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.kind, nodes.anchor_kind, nodes.metadata_json, nodes.kind_json
 FROM node_relations
 JOIN nodes ON nodes.id = node_relations.child_node_id
 WHERE node_relations.parent_node_id = ?
@@ -2572,6 +2632,14 @@ mod tests {
         ordinal: i32,
     }
 
+    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
+    struct NodeKindRow {
+        #[diesel(sql_type = Text)]
+        kind: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        anchor_kind: Option<String>,
+    }
+
     fn session_anchor_node(parent: &str) -> NewNode {
         NewNode {
             parent: parent.to_owned(),
@@ -2627,6 +2695,18 @@ ORDER BY kind, ordinal, parent_node_id
             .load::<NodeRelationRow>(&mut connection)
             .await
             .unwrap()
+        })
+    }
+
+    fn node_kinds(store: &SqliteStore, node_id: &str) -> (String, Option<String>) {
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            let row = sql_query("SELECT kind, anchor_kind FROM nodes WHERE id = ?")
+                .bind::<Text, _>(node_id)
+                .get_result::<NodeKindRow>(&mut connection)
+                .await
+                .unwrap();
+            (row.kind, row.anchor_kind)
         })
     }
 
@@ -2736,7 +2816,7 @@ VALUES (?, ?, ?, ?, ?, ?)
         let store = SqliteStore::open(&path).unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -2876,7 +2956,7 @@ VALUES (?, ?, ?, ?, ?, ?)
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -2898,7 +2978,8 @@ CREATE TABLE store_schema_migrations (
 INSERT INTO store_schema_migrations (version, name)
 VALUES
     (1, 'initial-store-schema'),
-    (2, 'node-relations');
+    (2, 'node-relations'),
+    (3, 'node-kind');
 DROP TABLE __diesel_schema_migrations;
 "#,
                 )
@@ -2910,7 +2991,7 @@ DROP TABLE __diesel_schema_migrations;
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
         assert_eq!(store.root_id(), root_id);
         assert_eq!(graph.root_id, root_id);
     }
@@ -2934,7 +3015,8 @@ CREATE TABLE store_schema_migrations (
 INSERT INTO store_schema_migrations (version, name)
 VALUES
     (1, 'initial-store-schema'),
-    (2, 'node-relations');
+    (2, 'node-relations'),
+    (3, 'node-kind');
 DELETE FROM __diesel_schema_migrations;
 "#,
                 )
@@ -2946,7 +3028,7 @@ DELETE FROM __diesel_schema_migrations;
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
         assert_eq!(store.root_id(), root_id);
         assert_eq!(graph.root_id, root_id);
     }
@@ -3011,6 +3093,10 @@ DELETE FROM __diesel_schema_migrations;
 
         let relations = node_relation_rows(&store, &child);
 
+        assert_eq!(
+            node_kinds(&store, &child),
+            ("anchor".to_owned(), Some("session".to_owned()))
+        );
         assert_eq!(relations.len(), 3);
         assert!(relations.contains(&NodeRelationRow {
             child_node_id: child.clone(),
@@ -3080,7 +3166,7 @@ DELETE FROM __diesel_schema_migrations;
     }
 
     #[test]
-    fn schema_migration_backfills_node_relations_from_node_edges() {
+    fn schema_migration_backfills_node_relations_and_node_kind() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
@@ -3150,7 +3236,8 @@ DELETE FROM __diesel_schema_migrations;
         let crate::store::PersistentStore::Sqlite(migrated) =
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(migrated.schema_version().unwrap(), 3);
+        assert_eq!(node_kinds(&migrated, &child_id), ("text".to_owned(), None));
         assert_eq!(
             node_relation_rows(&migrated, &child_id),
             vec![
@@ -3208,7 +3295,7 @@ DELETE FROM __diesel_schema_migrations;
         let crate::store::PersistentStore::Sqlite(migrated) =
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(migrated.schema_version().unwrap(), 3);
         assert_eq!(migrated.root_id(), root_id);
     }
 
@@ -3234,7 +3321,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let migrated = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(migrated.schema_version().unwrap(), 3);
         assert_eq!(migrated.root_id(), root_id);
         migrated.block_on(async {
             let mut connection = migrated.connect().await.unwrap();
@@ -3321,7 +3408,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -3379,7 +3466,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let reopened = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(reopened.schema_version().unwrap(), 2);
+        assert_eq!(reopened.schema_version().unwrap(), 3);
     }
 
     #[test]
