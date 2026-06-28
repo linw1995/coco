@@ -30,6 +30,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    node_metadata (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> Integer,
+        execution_id -> Nullable<Text>,
+        call_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
     node_relations (child_node_id, kind, ordinal) {
         child_node_id -> Text,
         parent_node_id -> Text,
@@ -86,12 +95,14 @@ diesel::table! {
 }
 
 diesel::joinable!(branches -> nodes (head_id));
+diesel::joinable!(node_metadata -> nodes (node_id));
 diesel::joinable!(sessions -> branches (branch_name));
 
 diesel::allow_tables_to_appear_in_same_query!(
     branches,
     jobs,
     message_queue_items,
+    node_metadata,
     node_relations,
     nodes,
     presets,
