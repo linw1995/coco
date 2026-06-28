@@ -34,8 +34,8 @@ use crate::error::{
     WriteStoreDirectorySnafu,
 };
 use crate::schema::{
-    branches, jobs, message_queue_items, node_relations, nodes, presets, sessions, skills,
-    store_meta,
+    branches, jobs, message_queue_items, node_metadata, node_relations, nodes, presets, sessions,
+    skills, store_meta,
 };
 use crate::{
     Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Preset,
@@ -44,7 +44,7 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 4;
+const SQLITE_SCHEMA_VERSION: i32 = 5;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
 const LEGACY_MIGRATION_TABLE_NAME: &str = "store_schema_migrations";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
@@ -141,6 +141,14 @@ struct NodeRow {
     metadata_json: Option<String>,
     #[diesel(sql_type = Text)]
     kind_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct NodeMetadataRow {
+    node_id: String,
+    ordinal: i32,
+    execution_id: Option<String>,
+    call_id: Option<String>,
 }
 
 #[derive(Queryable, QueryableByName)]
@@ -788,7 +796,14 @@ impl SqliteGraphStore {
                     .optional()
                     .context(QuerySqliteStoreSnafu { path: path.clone() })?
                     .context(NotFoundSnafu { id })?;
-                row.into_node(&path)
+                let node_id = row.id.clone();
+                let metadata_rows = load_node_metadata_rows_for_ids(
+                    connection,
+                    &path,
+                    Some(std::slice::from_ref(&node_id)),
+                )
+                .await?;
+                row.into_node(&path, node_metadata_slice(&metadata_rows, &node_id))
             })
         })
     }
@@ -1365,6 +1380,7 @@ async fn load_state_without_transaction(
 ) -> Result<StoreState> {
     let root_id = load_root_id(connection, path).await?;
     let mut rows = load_node_rows(connection, path).await?;
+    let metadata_rows = load_node_metadata_rows(connection, path).await?;
     let root_index =
         rows.iter()
             .position(|row| row.id == root_id)
@@ -1372,7 +1388,9 @@ async fn load_state_without_transaction(
                 path: path.to_owned(),
                 message: format!("root node {root_id:?} is missing"),
             })?;
-    let root = rows.remove(root_index).into_node(path)?;
+    let root = rows
+        .remove(root_index)
+        .into_node(path, node_metadata_slice(&metadata_rows, &root_id))?;
     ensure!(
         root.is_root(),
         CorruptedStoreSnafu {
@@ -1382,7 +1400,7 @@ async fn load_state_without_transaction(
     );
 
     let mut state = StoreState::from_root(root);
-    insert_node_rows(&mut state, rows, path)?;
+    insert_node_rows(&mut state, rows, path, &metadata_rows)?;
     load_branches(connection, path, &mut state).await?;
     load_sessions(connection, path, &mut state).await?;
     load_presets(connection, path, &mut state).await?;
@@ -1415,12 +1433,87 @@ async fn load_node_rows(
         })
 }
 
-fn insert_node_rows(state: &mut StoreState, mut rows: Vec<NodeRow>, path: &Path) -> Result<()> {
+async fn load_node_metadata_rows(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<HashMap<String, Vec<NodeMetadataRow>>> {
+    load_node_metadata_rows_for_ids(connection, path, None).await
+}
+
+async fn load_node_metadata_rows_for_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node_ids: Option<&[String]>,
+) -> Result<HashMap<String, Vec<NodeMetadataRow>>> {
+    let mut query = node_metadata::table
+        .select((
+            node_metadata::node_id,
+            node_metadata::ordinal,
+            node_metadata::execution_id,
+            node_metadata::call_id,
+        ))
+        .into_boxed();
+    if let Some(node_ids) = node_ids {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        query = query.filter(node_metadata::node_id.eq_any(node_ids));
+    }
+    let rows = query
+        .order((node_metadata::node_id, node_metadata::ordinal))
+        .load::<NodeMetadataRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(group_node_metadata_rows(rows))
+}
+
+fn group_node_metadata_rows(rows: Vec<NodeMetadataRow>) -> HashMap<String, Vec<NodeMetadataRow>> {
+    let mut grouped = HashMap::new();
+    for row in rows {
+        grouped
+            .entry(row.node_id.clone())
+            .or_insert_with(Vec::new)
+            .push(row);
+    }
+    grouped
+}
+
+fn node_metadata_slice<'a>(
+    rows: &'a HashMap<String, Vec<NodeMetadataRow>>,
+    node_id: &str,
+) -> &'a [NodeMetadataRow] {
+    rows.get(node_id).map(Vec::as_slice).unwrap_or_default()
+}
+
+async fn node_rows_into_nodes(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    rows: Vec<NodeRow>,
+) -> Result<Vec<Node>> {
+    let node_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let metadata_rows = load_node_metadata_rows_for_ids(connection, path, Some(&node_ids)).await?;
+    rows.into_iter()
+        .map(|row| {
+            let node_id = row.id.clone();
+            row.into_node(path, node_metadata_slice(&metadata_rows, &node_id))
+        })
+        .collect()
+}
+
+fn insert_node_rows(
+    state: &mut StoreState,
+    mut rows: Vec<NodeRow>,
+    path: &Path,
+    metadata_rows: &HashMap<String, Vec<NodeMetadataRow>>,
+) -> Result<()> {
     while !rows.is_empty() {
         let initial_len = rows.len();
         let mut pending = Vec::new();
         for row in rows {
-            let node = row.into_node(path)?;
+            let node_id = row.id.clone();
+            let node = row.into_node(path, node_metadata_slice(metadata_rows, &node_id))?;
             if node_references_known_parents(state, &node) {
                 state.insert_existing_node(node)?;
             } else {
@@ -1547,6 +1640,7 @@ async fn persist_node_without_transaction(
                 path: path.to_owned(),
             })?;
     }
+    persist_node_metadata_rows(connection, path, node).await?;
     Ok(())
 }
 
@@ -1590,6 +1684,12 @@ async fn upsert_node_without_transaction(
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
+    diesel::delete(node_metadata::table.filter(node_metadata::node_id.eq(&node.id)))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
 
     for relation in node_relations(node) {
         diesel::insert_into(node_relations::table)
@@ -1605,6 +1705,29 @@ async fn upsert_node_without_transaction(
                 path: path.to_owned(),
             })?;
     }
+    persist_node_metadata_rows(connection, path, node).await?;
+    Ok(())
+}
+
+async fn persist_node_metadata_rows(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    for metadata_row in node_metadata_rows(node) {
+        diesel::insert_into(node_metadata::table)
+            .values((
+                node_metadata::node_id.eq(metadata_row.node_id),
+                node_metadata::ordinal.eq(metadata_row.ordinal),
+                node_metadata::execution_id.eq(metadata_row.execution_id),
+                node_metadata::call_id.eq(metadata_row.call_id),
+            ))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
+    }
     Ok(())
 }
 
@@ -1613,6 +1736,27 @@ struct NodeRelation {
     parent_node_id: String,
     kind: String,
     ordinal: i32,
+}
+
+fn node_metadata_rows(node: &Node) -> Vec<NodeMetadataRow> {
+    expected_node_metadata_rows(&node.id, node.metadata.as_ref())
+}
+
+fn expected_node_metadata_rows(
+    node_id: &str,
+    metadata: Option<&NodeMetadata>,
+) -> Vec<NodeMetadataRow> {
+    metadata
+        .into_iter()
+        .flat_map(|metadata| metadata.iter())
+        .enumerate()
+        .map(|(ordinal, metadata)| NodeMetadataRow {
+            node_id: node_id.to_owned(),
+            ordinal: ordinal as i32,
+            execution_id: metadata.execution_id.clone(),
+            call_id: metadata.call_id.clone(),
+        })
+        .collect()
 }
 
 fn node_relations(node: &Node) -> Vec<NodeRelation> {
@@ -1680,7 +1824,7 @@ impl NodeRow {
         })
     }
 
-    fn into_node(self, path: &Path) -> Result<Node> {
+    fn into_node(self, path: &Path, metadata_rows: &[NodeMetadataRow]) -> Result<Node> {
         let kind: Kind =
             serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
                 path: path.to_owned(),
@@ -1706,6 +1850,18 @@ impl NodeRow {
                 ),
             }
         );
+        let metadata = self
+            .metadata_json
+            .map(|metadata| {
+                serde_json::from_str::<NodeMetadata>(&metadata).context(
+                    ParseSqliteStoreValueSnafu {
+                        path: path.to_owned(),
+                        column: "nodes.metadata_json".to_owned(),
+                    },
+                )
+            })
+            .transpose()?;
+        validate_node_metadata_rows(path, &self.id, metadata.as_ref(), metadata_rows)?;
         Ok(Node {
             id: self.id,
             parent: self.parent_id,
@@ -1716,20 +1872,29 @@ impl NodeRow {
                 }
             })?,
             role: parse_role(&self.role, path)?,
-            metadata: self
-                .metadata_json
-                .map(|metadata| {
-                    serde_json::from_str::<NodeMetadata>(&metadata).context(
-                        ParseSqliteStoreValueSnafu {
-                            path: path.to_owned(),
-                            column: "nodes.metadata_json".to_owned(),
-                        },
-                    )
-                })
-                .transpose()?,
+            metadata,
             kind,
         })
     }
+}
+
+fn validate_node_metadata_rows(
+    path: &Path,
+    node_id: &str,
+    metadata: Option<&NodeMetadata>,
+    metadata_rows: &[NodeMetadataRow],
+) -> Result<()> {
+    let expected = expected_node_metadata_rows(node_id, metadata);
+    ensure!(
+        expected == metadata_rows,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "SQLite node metadata rows for {node_id:?} do not match metadata_json"
+            ),
+        }
+    );
+    Ok(())
 }
 
 fn role_name(role: &Role) -> &'static str {
@@ -2374,10 +2539,7 @@ ORDER BY ancestry.depth
                 .await
                 .context(QuerySqliteStoreSnafu { path: path.clone() })?;
 
-                let nodes = rows
-                    .into_iter()
-                    .map(|row| row.into_node(&path))
-                    .collect::<Result<Vec<_>>>()?;
+                let nodes = node_rows_into_nodes(connection, &path, rows).await?;
                 if let Some(last) = nodes.last()
                     && !last.is_root()
                 {
@@ -2423,7 +2585,7 @@ ORDER BY ancestry.depth
                     .load::<NodeRow>(connection)
                     .await
                     .context(QuerySqliteStoreSnafu { path: path.clone() })?;
-                rows.into_iter().map(|row| row.into_node(&path)).collect()
+                node_rows_into_nodes(connection, &path, rows).await
             })
         })
     }
@@ -2982,14 +3144,17 @@ impl ProcessShareableStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        AsyncSqliteConnection, MessageQueueItem, NodeRow, SqliteGraphStore, SqliteStore,
-        StoreAccess, persist_root_metadata,
+        AsyncSqliteConnection, MessageQueueItem, NodeMetadataRow, NodeRow, SqliteGraphStore,
+        SqliteStore, StoreAccess, persist_root_metadata,
     };
-    use crate::schema::{branches, jobs, node_relations, nodes, sessions, store_meta};
+    use crate::schema::{
+        branches, jobs, node_metadata, node_relations, nodes, sessions, store_meta,
+    };
     use crate::{
-        Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, NewNode,
-        Node, NodeStore, PauseReason, Preset, PresetStore, Role, SessionAnchor, SessionAnchorPatch,
-        SessionRole, SessionState, SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
+        Anchor, BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MergeParent,
+        MessageQueueStore, NewNode, Node, NodeMetadata, NodeStore, PauseReason, Preset,
+        PresetStore, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
+        SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
     };
     use diesel::prelude::*;
     use diesel::sql_query;
@@ -3088,6 +3253,24 @@ mod tests {
                     node_relations::parent_node_id,
                 ))
                 .load::<NodeRelationRow>(&mut connection)
+                .await
+                .unwrap()
+        })
+    }
+
+    fn node_metadata_rows(store: &SqliteStore, node_id: &str) -> Vec<NodeMetadataRow> {
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            node_metadata::table
+                .filter(node_metadata::node_id.eq(node_id))
+                .select((
+                    node_metadata::node_id,
+                    node_metadata::ordinal,
+                    node_metadata::execution_id,
+                    node_metadata::call_id,
+                ))
+                .order(node_metadata::ordinal)
+                .load::<NodeMetadataRow>(&mut connection)
                 .await
                 .unwrap()
         })
@@ -3248,7 +3431,7 @@ VALUES (?, ?, ?, ?, ?, ?)
         let store = SqliteStore::open(&path).unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -3434,7 +3617,7 @@ VALUES (?, ?, ?, ?, ?, ?)
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -3458,7 +3641,8 @@ VALUES
     (1, 'initial-store-schema'),
     (2, 'node-relations'),
     (3, 'node-kind'),
-    (4, 'session-job-summary');
+    (4, 'session-job-summary'),
+    (5, 'node-metadata');
 DROP TABLE __diesel_schema_migrations;
 "#,
                 )
@@ -3470,7 +3654,7 @@ DROP TABLE __diesel_schema_migrations;
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
         assert_eq!(store.root_id(), root_id);
         assert_eq!(graph.root_id, root_id);
     }
@@ -3496,7 +3680,8 @@ VALUES
     (1, 'initial-store-schema'),
     (2, 'node-relations'),
     (3, 'node-kind'),
-    (4, 'session-job-summary');
+    (4, 'session-job-summary'),
+    (5, 'node-metadata');
 DELETE FROM __diesel_schema_migrations;
 "#,
                 )
@@ -3508,7 +3693,7 @@ DELETE FROM __diesel_schema_migrations;
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
         assert_eq!(store.root_id(), root_id);
         assert_eq!(graph.root_id, root_id);
     }
@@ -3600,6 +3785,70 @@ DELETE FROM __diesel_schema_migrations;
             kind: "shadow".to_owned(),
             ordinal: 1,
         }));
+    }
+
+    #[test]
+    fn append_persists_node_metadata_rows() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).unwrap();
+        let root_id = store.root_id();
+        let single_metadata = BackendMetadata {
+            execution_id: Some("execution-single".to_owned()),
+            call_id: Some("call-single".to_owned()),
+        };
+        let single = store
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::User,
+                metadata: Some(NodeMetadata::one(single_metadata)),
+                kind: Kind::Text("single metadata".to_owned()),
+            })
+            .unwrap();
+        let many = store
+            .append(NewNode {
+                parent: root_id,
+                role: Role::LLM,
+                metadata: Some(NodeMetadata::many(vec![
+                    BackendMetadata {
+                        execution_id: Some("execution-many".to_owned()),
+                        call_id: Some("call-a".to_owned()),
+                    },
+                    BackendMetadata {
+                        execution_id: Some("execution-many".to_owned()),
+                        call_id: Some("call-b".to_owned()),
+                    },
+                ])),
+                kind: Kind::Text("many metadata".to_owned()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            node_metadata_rows(&store, &single),
+            vec![NodeMetadataRow {
+                node_id: single,
+                ordinal: 0,
+                execution_id: Some("execution-single".to_owned()),
+                call_id: Some("call-single".to_owned()),
+            }]
+        );
+        assert_eq!(
+            node_metadata_rows(&store, &many),
+            vec![
+                NodeMetadataRow {
+                    node_id: many.clone(),
+                    ordinal: 0,
+                    execution_id: Some("execution-many".to_owned()),
+                    call_id: Some("call-a".to_owned()),
+                },
+                NodeMetadataRow {
+                    node_id: many,
+                    ordinal: 1,
+                    execution_id: Some("execution-many".to_owned()),
+                    call_id: Some("call-b".to_owned()),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -3727,7 +3976,7 @@ DELETE FROM __diesel_schema_migrations;
         let crate::store::PersistentStore::Sqlite(migrated) =
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 4);
+        assert_eq!(migrated.schema_version().unwrap(), 5);
         assert_eq!(node_kinds(&migrated, &child_id), expected_child_kinds);
         assert_eq!(
             node_relation_rows(&migrated, &child_id),
@@ -3819,7 +4068,7 @@ DELETE FROM __diesel_schema_migrations;
         let crate::store::PersistentStore::Sqlite(migrated) =
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 4);
+        assert_eq!(migrated.schema_version().unwrap(), 5);
         assert_eq!(
             session_summary(&migrated, "main"),
             SessionSummaryRow {
@@ -3840,6 +4089,67 @@ DELETE FROM __diesel_schema_migrations;
                 base: state.root_id().to_owned(),
                 status: "queued".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn schema_migration_backfills_node_metadata_rows() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
+        let state = super::StoreState::new();
+        let root = state.root_node().clone();
+        let root_id = root.id.clone();
+        let child = Node::new(
+            root_id.clone(),
+            Role::LLM,
+            Some(NodeMetadata::many(vec![
+                BackendMetadata {
+                    execution_id: Some("execution-migration".to_owned()),
+                    call_id: Some("call-a".to_owned()),
+                },
+                BackendMetadata {
+                    execution_id: Some("execution-migration".to_owned()),
+                    call_id: Some("call-b".to_owned()),
+                },
+            ])),
+            Kind::Text("legacy metadata".to_owned()),
+            "1970-01-01T00:00:01Z".parse().unwrap(),
+        );
+        let child_id = child.id.clone();
+
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            apply_v1_schema_for_test(&mut connection, &store.database_path).await;
+            persist_root_metadata(&mut connection, &store.database_path, &root_id)
+                .await
+                .unwrap();
+            insert_v1_node_row(&mut connection, &store.database_path, root).await;
+            insert_v1_node_row(&mut connection, &store.database_path, child).await;
+        });
+        drop(store);
+
+        let crate::store::PersistentStore::Sqlite(migrated) =
+            crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
+
+        assert_eq!(migrated.schema_version().unwrap(), 5);
+        assert_eq!(
+            node_metadata_rows(&migrated, &child_id),
+            vec![
+                NodeMetadataRow {
+                    node_id: child_id.clone(),
+                    ordinal: 0,
+                    execution_id: Some("execution-migration".to_owned()),
+                    call_id: Some("call-a".to_owned()),
+                },
+                NodeMetadataRow {
+                    node_id: child_id,
+                    ordinal: 1,
+                    execution_id: Some("execution-migration".to_owned()),
+                    call_id: Some("call-b".to_owned()),
+                },
+            ]
         );
     }
 
@@ -3866,7 +4176,7 @@ DELETE FROM __diesel_schema_migrations;
         let crate::store::PersistentStore::Sqlite(migrated) =
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 4);
+        assert_eq!(migrated.schema_version().unwrap(), 5);
         assert_eq!(migrated.root_id(), root_id);
     }
 
@@ -3892,7 +4202,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let migrated = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 4);
+        assert_eq!(migrated.schema_version().unwrap(), 5);
         assert_eq!(migrated.root_id(), root_id);
         migrated.block_on(async {
             let mut connection = migrated.connect().await.unwrap();
@@ -3979,7 +4289,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -4037,7 +4347,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let reopened = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(reopened.schema_version().unwrap(), 4);
+        assert_eq!(reopened.schema_version().unwrap(), 5);
     }
 
     #[test]
