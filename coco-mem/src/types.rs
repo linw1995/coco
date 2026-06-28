@@ -40,6 +40,15 @@ pub enum Kind {
     Failure(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindTag {
+    Anchor,
+    ToolUse,
+    ToolResult,
+    Text,
+    Failure,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ManyOrOne<T> {
@@ -67,6 +76,15 @@ pub enum AnchorPayload {
     Prompt(PromptAnchor),
     SkillInvocation(SkillInvocationAnchor),
     SkillResult(SkillResultAnchor),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorPayloadKind {
+    Session,
+    SessionPatch,
+    Prompt,
+    SkillInvocation,
+    SkillResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -779,8 +797,8 @@ impl Anchor {
             .collect()
     }
 
-    pub fn payload_kind(&self) -> &'static str {
-        self.payload.as_str()
+    pub fn payload_kind(&self) -> AnchorPayloadKind {
+        self.payload.kind()
     }
 
     pub fn as_session(&self) -> Option<&SessionAnchor> {
@@ -835,13 +853,25 @@ impl Anchor {
 }
 
 impl AnchorPayload {
-    pub fn as_str(&self) -> &'static str {
+    pub fn kind(&self) -> AnchorPayloadKind {
         match self {
-            Self::Session(_) => "session",
-            Self::SessionPatch(_) => "session_patch",
-            Self::Prompt(_) => "prompt",
-            Self::SkillInvocation(_) => "skill_invocation",
-            Self::SkillResult(_) => "skill_result",
+            Self::Session(_) => AnchorPayloadKind::Session,
+            Self::SessionPatch(_) => AnchorPayloadKind::SessionPatch,
+            Self::Prompt(_) => AnchorPayloadKind::Prompt,
+            Self::SkillInvocation(_) => AnchorPayloadKind::SkillInvocation,
+            Self::SkillResult(_) => AnchorPayloadKind::SkillResult,
+        }
+    }
+}
+
+impl AnchorPayloadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::SessionPatch => "session_patch",
+            Self::Prompt => "prompt",
+            Self::SkillInvocation => "skill_invocation",
+            Self::SkillResult => "skill_result",
         }
     }
 }
@@ -1130,23 +1160,37 @@ impl Node {
 }
 
 impl Kind {
-    pub fn as_str(&self) -> &'static str {
+    pub fn tag(&self) -> KindTag {
         match self {
-            Self::Anchor(_) => "anchor",
-            Self::ToolUse(_) => "tool_use",
-            Self::ToolResult(_) => "tool_result",
-            Self::Text(_) => "text",
-            Self::Failure(_) => "failure",
+            Self::Anchor(_) => KindTag::Anchor,
+            Self::ToolUse(_) => KindTag::ToolUse,
+            Self::ToolResult(_) => KindTag::ToolResult,
+            Self::Text(_) => KindTag::Text,
+            Self::Failure(_) => KindTag::Failure,
         }
     }
 
-    pub fn anchor_payload_kind(&self) -> Option<&'static str> {
+    pub fn anchor_payload_kind(&self) -> Option<AnchorPayloadKind> {
         match self {
             Self::Anchor(anchor) => Some(anchor.payload_kind()),
             Self::ToolUse(_) | Self::ToolResult(_) | Self::Text(_) | Self::Failure(_) => None,
         }
     }
+}
 
+impl KindTag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anchor => "anchor",
+            Self::ToolUse => "tool_use",
+            Self::ToolResult => "tool_result",
+            Self::Text => "text",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+impl Kind {
     pub fn tool_use(tool_use: ToolUse) -> Self {
         Self::ToolUse(ManyOrOne::one(tool_use))
     }

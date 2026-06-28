@@ -1121,7 +1121,8 @@ fn visible_merge_parent(parent: &MergeParent, node_id: String) -> MergeParent {
 pub(crate) fn graph_kind_name(node: &Node) -> &'static str {
     node.kind
         .anchor_payload_kind()
-        .unwrap_or_else(|| node.kind.as_str())
+        .map(|kind| kind.as_str())
+        .unwrap_or_else(|| node.kind.tag().as_str())
 }
 
 pub(crate) fn summarize_node(node: &Node) -> String {

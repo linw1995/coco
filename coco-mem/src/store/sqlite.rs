@@ -1367,8 +1367,11 @@ fn merge_parent_relation_kind(parent: &MergeParent) -> &'static str {
 
 impl NodeRow {
     fn from_node(node: Node, path: &Path) -> Result<Self> {
-        let kind = node.kind.as_str().to_owned();
-        let anchor_kind = node.kind.anchor_payload_kind().map(str::to_owned);
+        let kind = node.kind.tag().as_str().to_owned();
+        let anchor_kind = node
+            .kind
+            .anchor_payload_kind()
+            .map(|kind| kind.as_str().to_owned());
         Ok(Self {
             id: node.id,
             parent_id: node.parent,
@@ -1399,7 +1402,7 @@ impl NodeRow {
                 column: "nodes.kind_json".to_owned(),
             })?;
         ensure!(
-            self.kind == kind.as_str(),
+            self.kind == kind.tag().as_str(),
             CorruptedStoreSnafu {
                 path: path.to_owned(),
                 message: format!(
@@ -1409,7 +1412,7 @@ impl NodeRow {
             }
         );
         ensure!(
-            self.anchor_kind.as_deref() == kind.anchor_payload_kind(),
+            self.anchor_kind.as_deref() == kind.anchor_payload_kind().map(|kind| kind.as_str()),
             CorruptedStoreSnafu {
                 path: path.to_owned(),
                 message: format!(
@@ -3062,8 +3065,10 @@ DELETE FROM __diesel_schema_migrations;
             },
         ));
         let expected_node_kinds = (
-            child_kind.as_str().to_owned(),
-            child_kind.anchor_payload_kind().map(str::to_owned),
+            child_kind.tag().as_str().to_owned(),
+            child_kind
+                .anchor_payload_kind()
+                .map(|kind| kind.as_str().to_owned()),
         );
         let child = store
             .append(NewNode {
@@ -3162,8 +3167,11 @@ DELETE FROM __diesel_schema_migrations;
         );
         let child_id = child.id.clone();
         let expected_child_kinds = (
-            child.kind.as_str().to_owned(),
-            child.kind.anchor_payload_kind().map(str::to_owned),
+            child.kind.tag().as_str().to_owned(),
+            child
+                .kind
+                .anchor_payload_kind()
+                .map(|kind| kind.as_str().to_owned()),
         );
         let root_id = root.id.clone();
         let merge_parent_a = Node::new(
