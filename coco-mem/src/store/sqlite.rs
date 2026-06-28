@@ -696,18 +696,33 @@ impl SqliteGraphStore {
                 .context(QuerySqliteStoreSnafu {
                     path: self.database_path.clone(),
                 })?;
-            let mut read_transaction = self
-                .read_transaction
-                .lock()
-                .expect("graph store transaction lock poisoned");
-            ensure!(
-                read_transaction.is_none(),
-                CorruptedStoreSnafu {
+            let mut connection = Some(connection);
+            let transaction_already_active = {
+                let mut read_transaction = self
+                    .read_transaction
+                    .lock()
+                    .expect("graph store transaction lock poisoned");
+                if read_transaction.is_some() {
+                    true
+                } else {
+                    *read_transaction = connection.take();
+                    false
+                }
+            };
+            if transaction_already_active {
+                let mut connection = connection.expect("pending graph read connection is missing");
+                connection
+                    .batch_execute("ROLLBACK")
+                    .await
+                    .context(QuerySqliteStoreSnafu {
+                        path: self.database_path.clone(),
+                    })?;
+                return CorruptedStoreSnafu {
                     path: self.database_path.clone(),
                     message: "SQLite graph read transaction already active".to_owned(),
                 }
-            );
-            *read_transaction = Some(connection);
+                .fail();
+            }
             Ok(())
         })
     }
