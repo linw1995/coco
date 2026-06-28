@@ -38,7 +38,7 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 3;
+const SQLITE_SCHEMA_VERSION: i32 = 4;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
 const LEGACY_MIGRATION_TABLE_NAME: &str = "store_schema_migrations";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
@@ -140,7 +140,29 @@ struct SessionRow {
     #[diesel(sql_type = Text)]
     branch_name: String,
     #[diesel(sql_type = Text)]
+    state: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    target_branch: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    base_head_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pause_reason: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    merged_anchor_id: Option<String>,
+    #[diesel(sql_type = Text)]
     state_json: String,
+}
+
+#[derive(Queryable)]
+struct JobRow {
+    job_id: String,
+    created_at: String,
+    finished_at: Option<String>,
+    branch: String,
+    work_branch: String,
+    base: String,
+    status: String,
+    payload_json: String,
 }
 
 #[derive(QueryableByName)]
@@ -1493,7 +1515,15 @@ async fn load_sessions(
     state: &mut StoreState,
 ) -> Result<()> {
     let sessions = sessions::table
-        .select((sessions::branch_name, sessions::state_json))
+        .select((
+            sessions::branch_name,
+            sessions::state,
+            sessions::target_branch,
+            sessions::base_head_id,
+            sessions::pause_reason,
+            sessions::merged_anchor_id,
+            sessions::state_json,
+        ))
         .order(sessions::branch_name)
         .load::<SessionRow>(connection)
         .await
@@ -1508,6 +1538,7 @@ async fn load_sessions(
                 column: "sessions.state_json".to_owned(),
             },
         )?;
+        validate_session_row_summary(&session, &state_json, path)?;
         state.sessions.insert(session.branch_name, state_json);
     }
     state.validate_session_records()
@@ -1572,20 +1603,64 @@ async fn persist_session_state(
         path: path.to_owned(),
         column: "sessions.state_json".to_owned(),
     })?;
+    let pause_reason = state.pause_reason();
     diesel::insert_into(sessions::table)
         .values((
             sessions::branch_name.eq(branch),
+            sessions::state.eq(state.as_str()),
+            sessions::target_branch.eq(state.target_branch()),
+            sessions::base_head_id.eq(state.base_head_id()),
+            sessions::pause_reason.eq(pause_reason.map(|reason| reason.as_str())),
+            sessions::merged_anchor_id
+                .eq(pause_reason.and_then(|reason| reason.merged_anchor_id())),
             sessions::state_json.eq(state_json),
         ))
         .on_conflict(sessions::branch_name)
         .do_update()
-        .set(sessions::state_json.eq(diesel::upsert::excluded(sessions::state_json)))
+        .set((
+            sessions::state.eq(diesel::upsert::excluded(sessions::state)),
+            sessions::target_branch.eq(diesel::upsert::excluded(sessions::target_branch)),
+            sessions::base_head_id.eq(diesel::upsert::excluded(sessions::base_head_id)),
+            sessions::pause_reason.eq(diesel::upsert::excluded(sessions::pause_reason)),
+            sessions::merged_anchor_id.eq(diesel::upsert::excluded(sessions::merged_anchor_id)),
+            sessions::state_json.eq(diesel::upsert::excluded(sessions::state_json)),
+        ))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
     Ok(())
+}
+
+fn validate_session_row_summary(row: &SessionRow, state: &SessionState, path: &Path) -> Result<()> {
+    validate_text_summary(path, "sessions.state", &row.state, state.as_str())?;
+    validate_optional_text_summary(
+        path,
+        "sessions.target_branch",
+        row.target_branch.as_deref(),
+        state.target_branch(),
+    )?;
+    validate_optional_text_summary(
+        path,
+        "sessions.base_head_id",
+        row.base_head_id.as_deref(),
+        state.base_head_id(),
+    )?;
+
+    let pause_reason = state.pause_reason();
+    validate_optional_text_summary(
+        path,
+        "sessions.pause_reason",
+        row.pause_reason.as_deref(),
+        pause_reason.map(|reason| reason.as_str()),
+    )?;
+    validate_optional_text_summary(
+        path,
+        "sessions.merged_anchor_id",
+        row.merged_anchor_id.as_deref(),
+        pause_reason.and_then(|reason| reason.merged_anchor_id()),
+    )
 }
 
 async fn update_branch_head(
@@ -1688,26 +1763,43 @@ async fn load_jobs(
     state: &mut StoreState,
 ) -> Result<()> {
     let jobs = jobs::table
-        .select(jobs::payload_json)
+        .select((
+            jobs::job_id,
+            jobs::created_at,
+            jobs::finished_at,
+            jobs::branch,
+            jobs::work_branch,
+            jobs::base,
+            jobs::status,
+            jobs::payload_json,
+        ))
         .order(jobs::job_id)
-        .load::<String>(connection)
+        .load::<JobRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
     state.jobs.clear();
-    for payload_json in jobs {
-        let job =
-            serde_json::from_str::<Job>(&payload_json).context(ParseSqliteStoreValueSnafu {
+    for row in jobs {
+        let mut job =
+            serde_json::from_str::<Job>(&row.payload_json).context(ParseSqliteStoreValueSnafu {
                 path: path.to_owned(),
                 column: "jobs.payload_json".to_owned(),
             })?;
+        job.normalize_work_branch();
+        validate_job_row_summary(&row, &job, path)?;
         state.jobs.insert(job.job_id.clone(), job);
     }
     Ok(())
 }
 
 async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &Job) -> Result<()> {
+    let mut summary = job.clone();
+    summary.normalize_work_branch();
+    let finished_at = summary
+        .finished_at
+        .as_ref()
+        .map(std::string::ToString::to_string);
     let payload_json = serde_json::to_string(job).context(ParseSqliteStoreValueSnafu {
         path: path.to_owned(),
         column: "jobs.payload_json".to_owned(),
@@ -1715,16 +1807,87 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
     diesel::insert_into(jobs::table)
         .values((
             jobs::job_id.eq(&job.job_id),
+            jobs::created_at.eq(summary.created_at.to_string()),
+            jobs::finished_at.eq(finished_at),
+            jobs::branch.eq(&summary.branch),
+            jobs::work_branch.eq(&summary.work_branch),
+            jobs::base.eq(&summary.base),
+            jobs::status.eq(summary.status.as_str()),
             jobs::payload_json.eq(payload_json),
         ))
         .on_conflict(jobs::job_id)
         .do_update()
-        .set(jobs::payload_json.eq(diesel::upsert::excluded(jobs::payload_json)))
+        .set((
+            jobs::created_at.eq(diesel::upsert::excluded(jobs::created_at)),
+            jobs::finished_at.eq(diesel::upsert::excluded(jobs::finished_at)),
+            jobs::branch.eq(diesel::upsert::excluded(jobs::branch)),
+            jobs::work_branch.eq(diesel::upsert::excluded(jobs::work_branch)),
+            jobs::base.eq(diesel::upsert::excluded(jobs::base)),
+            jobs::status.eq(diesel::upsert::excluded(jobs::status)),
+            jobs::payload_json.eq(diesel::upsert::excluded(jobs::payload_json)),
+        ))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
+    Ok(())
+}
+
+fn validate_job_row_summary(row: &JobRow, job: &Job, path: &Path) -> Result<()> {
+    let finished_at = job
+        .finished_at
+        .as_ref()
+        .map(std::string::ToString::to_string);
+
+    validate_text_summary(path, "jobs.job_id", &row.job_id, &job.job_id)?;
+    validate_text_summary(
+        path,
+        "jobs.created_at",
+        &row.created_at,
+        &job.created_at.to_string(),
+    )?;
+    validate_optional_text_summary(
+        path,
+        "jobs.finished_at",
+        row.finished_at.as_deref(),
+        finished_at.as_deref(),
+    )?;
+    validate_text_summary(path, "jobs.branch", &row.branch, &job.branch)?;
+    validate_text_summary(path, "jobs.work_branch", &row.work_branch, &job.work_branch)?;
+    validate_text_summary(path, "jobs.base", &row.base, &job.base)?;
+    validate_text_summary(path, "jobs.status", &row.status, job.status.as_str())
+}
+
+fn validate_text_summary(
+    path: &Path,
+    column: &'static str,
+    actual: &str,
+    expected: &str,
+) -> Result<()> {
+    ensure!(
+        actual == expected,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("{column} value {actual:?} does not match JSON value {expected:?}"),
+        }
+    );
+    Ok(())
+}
+
+fn validate_optional_text_summary(
+    path: &Path,
+    column: &'static str,
+    actual: Option<&str>,
+    expected: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        actual == expected,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("{column} value {actual:?} does not match JSON value {expected:?}"),
+        }
+    );
     Ok(())
 }
 
@@ -2072,13 +2235,18 @@ impl SessionStore for SqliteGraphStore {
     fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
         self.block_on(async {
             let mut connection = self.connect().await?;
-            let sessions =
-                sql_query("SELECT branch_name, state_json FROM sessions ORDER BY branch_name")
-                    .load::<SessionRow>(&mut connection)
-                    .await
-                    .context(QuerySqliteStoreSnafu {
-                        path: self.database_path.clone(),
-                    })?;
+            let sessions = sql_query(
+                r#"
+SELECT branch_name, state, target_branch, base_head_id, pause_reason, merged_anchor_id, state_json
+FROM sessions
+ORDER BY branch_name
+"#,
+            )
+            .load::<SessionRow>(&mut connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?;
             sessions
                 .into_iter()
                 .map(|session| {
@@ -2088,6 +2256,7 @@ impl SessionStore for SqliteGraphStore {
                             column: "sessions.state_json".to_owned(),
                         },
                     )?;
+                    validate_session_row_summary(&session, &state, &self.database_path)?;
                     Ok((session.branch_name, state))
                 })
                 .collect()
@@ -2621,6 +2790,36 @@ mod tests {
         anchor_kind: Option<String>,
     }
 
+    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
+    struct SessionSummaryRow {
+        #[diesel(sql_type = Text)]
+        state: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        target_branch: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        base_head_id: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        pause_reason: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        merged_anchor_id: Option<String>,
+    }
+
+    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
+    struct JobSummaryRow {
+        #[diesel(sql_type = Text)]
+        created_at: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        finished_at: Option<String>,
+        #[diesel(sql_type = Text)]
+        branch: String,
+        #[diesel(sql_type = Text)]
+        work_branch: String,
+        #[diesel(sql_type = Text)]
+        base: String,
+        #[diesel(sql_type = Text)]
+        status: String,
+    }
+
     fn session_anchor_node(parent: &str) -> NewNode {
         NewNode {
             parent: parent.to_owned(),
@@ -2688,6 +2887,40 @@ ORDER BY kind, ordinal, parent_node_id
                 .await
                 .unwrap();
             (row.kind, row.anchor_kind)
+        })
+    }
+
+    fn session_summary(store: &SqliteStore, branch: &str) -> SessionSummaryRow {
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            sql_query(
+                r#"
+SELECT state, target_branch, base_head_id, pause_reason, merged_anchor_id
+FROM sessions
+WHERE branch_name = ?
+"#,
+            )
+            .bind::<Text, _>(branch)
+            .get_result::<SessionSummaryRow>(&mut connection)
+            .await
+            .unwrap()
+        })
+    }
+
+    fn job_summary(store: &SqliteStore, job_id: &str) -> JobSummaryRow {
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            sql_query(
+                r#"
+SELECT created_at, finished_at, branch, work_branch, base, status
+FROM jobs
+WHERE job_id = ?
+"#,
+            )
+            .bind::<Text, _>(job_id)
+            .get_result::<JobSummaryRow>(&mut connection)
+            .await
+            .unwrap()
         })
     }
 
@@ -2797,7 +3030,7 @@ VALUES (?, ?, ?, ?, ?, ?)
         let store = SqliteStore::open(&path).unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -2937,7 +3170,7 @@ VALUES (?, ?, ?, ?, ?, ?)
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -2960,7 +3193,8 @@ INSERT INTO store_schema_migrations (version, name)
 VALUES
     (1, 'initial-store-schema'),
     (2, 'node-relations'),
-    (3, 'node-kind');
+    (3, 'node-kind'),
+    (4, 'session-job-summary');
 DROP TABLE __diesel_schema_migrations;
 "#,
                 )
@@ -2972,7 +3206,7 @@ DROP TABLE __diesel_schema_migrations;
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
         assert_eq!(store.root_id(), root_id);
         assert_eq!(graph.root_id, root_id);
     }
@@ -2997,7 +3231,8 @@ INSERT INTO store_schema_migrations (version, name)
 VALUES
     (1, 'initial-store-schema'),
     (2, 'node-relations'),
-    (3, 'node-kind');
+    (3, 'node-kind'),
+    (4, 'session-job-summary');
 DELETE FROM __diesel_schema_migrations;
 "#,
                 )
@@ -3009,7 +3244,7 @@ DELETE FROM __diesel_schema_migrations;
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
         assert_eq!(store.root_id(), root_id);
         assert_eq!(graph.root_id, root_id);
     }
@@ -3228,7 +3463,7 @@ DELETE FROM __diesel_schema_migrations;
         let crate::store::PersistentStore::Sqlite(migrated) =
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 3);
+        assert_eq!(migrated.schema_version().unwrap(), 4);
         assert_eq!(node_kinds(&migrated, &child_id), expected_child_kinds);
         assert_eq!(
             node_relation_rows(&migrated, &child_id),
@@ -3265,6 +3500,86 @@ DELETE FROM __diesel_schema_migrations;
     }
 
     #[test]
+    fn schema_migration_backfills_session_and_job_summary() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
+        let state = super::StoreState::new();
+        let root = state.root_node().clone();
+        let root_id = root.id.clone();
+        let session_state = SessionState::Attached {
+            target_branch: "main".to_owned(),
+            base_head_id: root_id.clone(),
+        };
+        let session_state_json = serde_json::to_string(&session_state).unwrap();
+        let job_json = serde_json::json!({
+            "job_id": "job-test",
+            "created_at": "2026-01-01T00:00:00Z",
+            "finished_at": null,
+            "branch": "main",
+            "work_branch": "",
+            "base": root_id,
+            "status": "queued"
+        })
+        .to_string();
+
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            apply_v1_schema_for_test(&mut connection, &store.database_path).await;
+            persist_root_metadata(&mut connection, &store.database_path, state.root_id())
+                .await
+                .unwrap();
+            insert_v1_node_row(&mut connection, &store.database_path, root).await;
+            sql_query("INSERT INTO branches (name, head_id) VALUES (?, ?)")
+                .bind::<Text, _>("main")
+                .bind::<Text, _>(state.root_id())
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sql_query("INSERT INTO sessions (branch_name, state_json) VALUES (?, ?)")
+                .bind::<Text, _>("main")
+                .bind::<Text, _>(session_state_json)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sql_query("INSERT INTO jobs (job_id, payload_json) VALUES (?, ?)")
+                .bind::<Text, _>("job-test")
+                .bind::<Text, _>(job_json)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        });
+        drop(store);
+
+        let crate::store::PersistentStore::Sqlite(migrated) =
+            crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
+
+        assert_eq!(migrated.schema_version().unwrap(), 4);
+        assert_eq!(
+            session_summary(&migrated, "main"),
+            SessionSummaryRow {
+                state: "attached".to_owned(),
+                target_branch: Some("main".to_owned()),
+                base_head_id: Some(state.root_id().to_owned()),
+                pause_reason: None,
+                merged_anchor_id: None,
+            }
+        );
+        assert_eq!(
+            job_summary(&migrated, "job-test"),
+            JobSummaryRow {
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                finished_at: None,
+                branch: "main".to_owned(),
+                work_branch: "main".to_owned(),
+                base: state.root_id().to_owned(),
+                status: "queued".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn persistent_read_only_open_upgrades_sqlite_schema() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -3287,7 +3602,7 @@ DELETE FROM __diesel_schema_migrations;
         let crate::store::PersistentStore::Sqlite(migrated) =
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 3);
+        assert_eq!(migrated.schema_version().unwrap(), 4);
         assert_eq!(migrated.root_id(), root_id);
     }
 
@@ -3313,7 +3628,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let migrated = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 3);
+        assert_eq!(migrated.schema_version().unwrap(), 4);
         assert_eq!(migrated.root_id(), root_id);
         migrated.block_on(async {
             let mut connection = migrated.connect().await.unwrap();
@@ -3400,7 +3715,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -3458,7 +3773,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let reopened = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(reopened.schema_version().unwrap(), 3);
+        assert_eq!(reopened.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -3656,6 +3971,16 @@ DELETE FROM __diesel_schema_migrations;
                 },
             )
             .unwrap();
+        assert_eq!(
+            session_summary(&store, "main"),
+            SessionSummaryRow {
+                state: "paused".to_owned(),
+                target_branch: Some(String::new()),
+                base_head_id: None,
+                pause_reason: Some("closed".to_owned()),
+                merged_anchor_id: None,
+            }
+        );
 
         let rebased = store
             .rebase_session(
@@ -3701,6 +4026,17 @@ DELETE FROM __diesel_schema_migrations;
             .set_job_status("job-test", JobStatus::Queued, JobStatus::Running)
             .unwrap();
         assert_eq!(job.status, JobStatus::Running);
+        assert_eq!(
+            job_summary(&store, "job-test"),
+            JobSummaryRow {
+                created_at: job.created_at.to_string(),
+                finished_at: None,
+                branch: "main".to_owned(),
+                work_branch: "main".to_owned(),
+                base: session.clone(),
+                status: "running".to_owned(),
+            }
+        );
 
         let reopened = SqliteStore::open(&path).unwrap();
         let job = reopened.get_job("job-test").unwrap();
