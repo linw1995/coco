@@ -779,6 +779,10 @@ impl Anchor {
             .collect()
     }
 
+    pub fn payload_kind(&self) -> &'static str {
+        self.payload.as_str()
+    }
+
     pub fn as_session(&self) -> Option<&SessionAnchor> {
         match &self.payload {
             AnchorPayload::Session(anchor) => Some(anchor.as_ref()),
@@ -826,6 +830,18 @@ impl Anchor {
             | AnchorPayload::Prompt(_)
             | AnchorPayload::SkillInvocation(_) => None,
             AnchorPayload::SkillResult(anchor) => Some(anchor),
+        }
+    }
+}
+
+impl AnchorPayload {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Session(_) => "session",
+            Self::SessionPatch(_) => "session_patch",
+            Self::Prompt(_) => "prompt",
+            Self::SkillInvocation(_) => "skill_invocation",
+            Self::SkillResult(_) => "skill_result",
         }
     }
 }
@@ -1114,6 +1130,23 @@ impl Node {
 }
 
 impl Kind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Anchor(_) => "anchor",
+            Self::ToolUse(_) => "tool_use",
+            Self::ToolResult(_) => "tool_result",
+            Self::Text(_) => "text",
+            Self::Failure(_) => "failure",
+        }
+    }
+
+    pub fn anchor_payload_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::Anchor(anchor) => Some(anchor.payload_kind()),
+            Self::ToolUse(_) | Self::ToolResult(_) | Self::Text(_) | Self::Failure(_) => None,
+        }
+    }
+
     pub fn tool_use(tool_use: ToolUse) -> Self {
         Self::ToolUse(ManyOrOne::one(tool_use))
     }

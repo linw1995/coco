@@ -32,9 +32,9 @@ use crate::schema::{
     store_meta,
 };
 use crate::{
-    AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node,
-    NodeMetadata, Preset, PresetRecord, Role, SessionAnchorPatch, SessionRole, SessionState,
-    SkillRecord, SkillUpdatePatch, SkillVersionSpec,
+    Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node, NodeMetadata, Preset,
+    PresetRecord, Role, SessionAnchorPatch, SessionRole, SessionState, SkillRecord,
+    SkillUpdatePatch, SkillVersionSpec,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -1367,8 +1367,8 @@ fn merge_parent_relation_kind(parent: &MergeParent) -> &'static str {
 
 impl NodeRow {
     fn from_node(node: Node, path: &Path) -> Result<Self> {
-        let kind = node_kind_name(&node.kind).to_owned();
-        let anchor_kind = node_anchor_kind_name(&node.kind).map(str::to_owned);
+        let kind = node.kind.as_str().to_owned();
+        let anchor_kind = node.kind.anchor_payload_kind().map(str::to_owned);
         Ok(Self {
             id: node.id,
             parent_id: node.parent,
@@ -1393,12 +1393,13 @@ impl NodeRow {
     }
 
     fn into_node(self, path: &Path) -> Result<Node> {
-        let kind = serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
-            path: path.to_owned(),
-            column: "nodes.kind_json".to_owned(),
-        })?;
+        let kind: Kind =
+            serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
+                path: path.to_owned(),
+                column: "nodes.kind_json".to_owned(),
+            })?;
         ensure!(
-            self.kind == node_kind_name(&kind),
+            self.kind == kind.as_str(),
             CorruptedStoreSnafu {
                 path: path.to_owned(),
                 message: format!(
@@ -1408,7 +1409,7 @@ impl NodeRow {
             }
         );
         ensure!(
-            self.anchor_kind.as_deref() == node_anchor_kind_name(&kind),
+            self.anchor_kind.as_deref() == kind.anchor_payload_kind(),
             CorruptedStoreSnafu {
                 path: path.to_owned(),
                 message: format!(
@@ -1449,29 +1450,6 @@ fn role_name(role: &Role) -> &'static str {
         Role::System => "system",
         Role::LLM => "llm",
     }
-}
-
-fn node_kind_name(kind: &Kind) -> &'static str {
-    match kind {
-        Kind::Anchor(_) => "anchor",
-        Kind::ToolUse(_) => "tool_use",
-        Kind::ToolResult(_) => "tool_result",
-        Kind::Text(_) => "text",
-        Kind::Failure(_) => "failure",
-    }
-}
-
-fn node_anchor_kind_name(kind: &Kind) -> Option<&'static str> {
-    let Kind::Anchor(anchor) = kind else {
-        return None;
-    };
-    Some(match &anchor.payload {
-        AnchorPayload::Session(_) => "session",
-        AnchorPayload::SessionPatch(_) => "session_patch",
-        AnchorPayload::Prompt(_) => "prompt",
-        AnchorPayload::SkillInvocation(_) => "skill_invocation",
-        AnchorPayload::SkillResult(_) => "skill_result",
-    })
 }
 
 fn parse_role(role: &str, path: &Path) -> Result<Role> {
@@ -3063,40 +3041,42 @@ DELETE FROM __diesel_schema_migrations;
                 kind: Kind::Text("shadow parent".to_owned()),
             })
             .unwrap();
+        let child_kind = Kind::Anchor(Anchor::session(
+            vec![
+                MergeParent::merge(merge_parent.clone()),
+                MergeParent::shadow(shadow_parent.clone()),
+            ],
+            SessionAnchor {
+                role: SessionRole::Orchestrator,
+                provider_profile: None,
+                provider: Some("openai".to_owned()),
+                model: "gpt-5.4".to_owned(),
+                tools: vec![],
+                system_prompt: "system".to_owned(),
+                prompt: "prompt".to_owned(),
+                temperature: Some(0.1),
+                max_tokens: Some(64),
+                additional_params: None,
+                enable_coco_shim: false,
+                active_skill: None,
+            },
+        ));
+        let expected_node_kinds = (
+            child_kind.as_str().to_owned(),
+            child_kind.anchor_payload_kind().map(str::to_owned),
+        );
         let child = store
             .append(NewNode {
                 parent: primary_parent.clone(),
                 role: Role::System,
                 metadata: None,
-                kind: Kind::Anchor(Anchor::session(
-                    vec![
-                        MergeParent::merge(merge_parent.clone()),
-                        MergeParent::shadow(shadow_parent.clone()),
-                    ],
-                    SessionAnchor {
-                        role: SessionRole::Orchestrator,
-                        provider_profile: None,
-                        provider: Some("openai".to_owned()),
-                        model: "gpt-5.4".to_owned(),
-                        tools: vec![],
-                        system_prompt: "system".to_owned(),
-                        prompt: "prompt".to_owned(),
-                        temperature: Some(0.1),
-                        max_tokens: Some(64),
-                        additional_params: None,
-                        enable_coco_shim: false,
-                        active_skill: None,
-                    },
-                )),
+                kind: child_kind,
             })
             .unwrap();
 
         let relations = node_relation_rows(&store, &child);
 
-        assert_eq!(
-            node_kinds(&store, &child),
-            ("anchor".to_owned(), Some("session".to_owned()))
-        );
+        assert_eq!(node_kinds(&store, &child), expected_node_kinds);
         assert_eq!(relations.len(), 3);
         assert!(relations.contains(&NodeRelationRow {
             child_node_id: child.clone(),
@@ -3181,6 +3161,10 @@ DELETE FROM __diesel_schema_migrations;
             "1970-01-01T00:00:01Z".parse().unwrap(),
         );
         let child_id = child.id.clone();
+        let expected_child_kinds = (
+            child.kind.as_str().to_owned(),
+            child.kind.anchor_payload_kind().map(str::to_owned),
+        );
         let root_id = root.id.clone();
         let merge_parent_a = Node::new(
             root_id.clone(),
@@ -3237,7 +3221,7 @@ DELETE FROM __diesel_schema_migrations;
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
         assert_eq!(migrated.schema_version().unwrap(), 3);
-        assert_eq!(node_kinds(&migrated, &child_id), ("text".to_owned(), None));
+        assert_eq!(node_kinds(&migrated, &child_id), expected_child_kinds);
         assert_eq!(
             node_relation_rows(&migrated, &child_id),
             vec![
