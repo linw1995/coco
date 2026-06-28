@@ -9497,6 +9497,35 @@ mod tests {
     }
 
     #[test]
+    fn cache_drops_stale_main_store_materialization_tables_before_reuse() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).unwrap();
+        let main_database_path = path.join("store.sqlite3");
+        create_current_graph_materialization_tables(&main_database_path);
+
+        ConsoleGraphSnapshotStore::open(&path).unwrap();
+
+        assert!(sqlite_table_has_column(
+            &main_database_path,
+            "console_graph_materializations",
+            "source_version"
+        ));
+        assert!(sqlite_table_has_column(
+            &main_database_path,
+            "console_graph_node_locations",
+            "node_target"
+        ));
+        assert!(sqlite_table_has_column(
+            &main_database_path,
+            "console_graph_edge_routes",
+            "edge_kind"
+        ));
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn snapshot_write_transaction_allows_store_write_after_short_lock() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
@@ -9638,6 +9667,22 @@ CREATE TABLE console_graph_viewports (mode TEXT PRIMARY KEY NOT NULL);
 CREATE TABLE console_graph_viewport_lanes (mode TEXT NOT NULL);
 CREATE TABLE console_graph_viewport_nodes (mode TEXT NOT NULL);
 CREATE TABLE console_graph_viewport_edges (mode TEXT NOT NULL);
+"#,
+                )
+                .unwrap();
+        });
+    }
+
+    fn create_current_graph_materialization_tables(database_path: &std::path::Path) {
+        use diesel::connection::SimpleConnection;
+
+        with_sqlite_test_connection(database_path, |connection| {
+            connection
+                .batch_execute(
+                    r#"
+CREATE TABLE console_graph_materializations (mode TEXT);
+CREATE TABLE console_graph_node_locations (mode TEXT);
+CREATE TABLE console_graph_edge_routes (mode TEXT);
 "#,
                 )
                 .unwrap();

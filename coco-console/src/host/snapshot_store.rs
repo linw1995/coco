@@ -486,9 +486,16 @@ struct SqliteInteger {
     value: i32,
 }
 
+#[derive(QueryableByName)]
+struct SqliteTableColumn {
+    #[diesel(sql_type = Text)]
+    name: String,
+}
+
 impl ConsoleGraphSnapshotStore {
     pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
         let dir = dir.as_ref();
+        drop_stale_main_store_materialization_tables(&main_store_database_path(dir))?;
         drop_legacy_snapshot_materialization_tables(&legacy_snapshot_database_path(dir))?;
         let path = database_path(dir);
         let database =
@@ -5462,6 +5469,77 @@ fn drop_legacy_snapshot_materialization_tables(path: &Path) -> crate::Result<()>
             source,
         },
     )
+}
+
+fn drop_stale_main_store_materialization_tables(path: &Path) -> crate::Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let database =
+        SqliteDatabase::open_unshared_file_path(path).context(crate::error::StoreSnafu)?;
+    let path = path.to_owned();
+    let error_path = path.clone();
+    database.with_sync_connection(
+        move |connection| {
+            if materialization_tables_have_current_schema(connection, &path)? {
+                return Ok(());
+            }
+            drop_tables(connection, &path, MATERIALIZATION_TABLES)
+        },
+        |source| crate::Error::Store { source },
+        |source| crate::Error::QueryGraphSnapshotStore {
+            path: error_path,
+            source,
+        },
+    )
+}
+
+fn materialization_tables_have_current_schema(
+    connection: &mut SqliteConnection,
+    path: &Path,
+) -> crate::Result<bool> {
+    for (table, column) in [
+        ("console_graph_materializations", "source_version"),
+        ("console_graph_node_locations", "node_target"),
+        ("console_graph_edge_routes", "edge_kind"),
+    ] {
+        if sqlite_table_exists(connection, path, table)?
+            && !sqlite_table_has_column(connection, path, table, column)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn sqlite_table_exists(
+    connection: &mut SqliteConnection,
+    path: &Path,
+    table: &str,
+) -> crate::Result<bool> {
+    let count =
+        sql_query("SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind::<Text, _>(table)
+            .get_result::<SqliteInteger>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: path.to_owned(),
+            })?
+            .value;
+    Ok(count > 0)
+}
+
+fn sqlite_table_has_column(
+    connection: &mut SqliteConnection,
+    path: &Path,
+    table: &str,
+    column: &str,
+) -> crate::Result<bool> {
+    let columns = sql_query(format!("PRAGMA table_info({table})"))
+        .load::<SqliteTableColumn>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(columns.iter().any(|info| info.name == column))
 }
 
 fn drop_tables(
