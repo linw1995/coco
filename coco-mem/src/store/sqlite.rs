@@ -38,7 +38,7 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 2;
+const SQLITE_SCHEMA_VERSION: i32 = 3;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
 const LEGACY_MIGRATION_TABLE_NAME: &str = "store_schema_migrations";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
@@ -117,6 +117,10 @@ struct NodeRow {
     created_at: String,
     #[diesel(sql_type = Text)]
     role: String,
+    #[diesel(sql_type = Text)]
+    kind: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    anchor_kind: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     metadata_json: Option<String>,
     #[diesel(sql_type = Text)]
@@ -606,7 +610,7 @@ impl SqliteGraphStore {
             let mut connection = self.connect().await?;
             let row = sql_query(
                 r#"
-SELECT id, parent_id, created_at, role, metadata_json, kind_json
+SELECT id, parent_id, created_at, role, kind, anchor_kind, metadata_json, kind_json
 FROM nodes
 WHERE id = ?
 "#,
@@ -1170,6 +1174,8 @@ async fn load_node_rows(
             nodes::parent_id,
             nodes::created_at,
             nodes::role,
+            nodes::kind,
+            nodes::anchor_kind,
             nodes::metadata_json,
             nodes::kind_json,
         ))
@@ -1231,6 +1237,8 @@ async fn persist_node(
             nodes::parent_id.eq(row.parent_id),
             nodes::created_at.eq(row.created_at),
             nodes::role.eq(row.role),
+            nodes::kind.eq(row.kind),
+            nodes::anchor_kind.eq(row.anchor_kind),
             nodes::metadata_json.eq(row.metadata_json),
             nodes::kind_json.eq(row.kind_json),
         ))
@@ -1269,6 +1277,8 @@ async fn upsert_node(
             nodes::parent_id.eq(row.parent_id),
             nodes::created_at.eq(row.created_at),
             nodes::role.eq(row.role),
+            nodes::kind.eq(row.kind),
+            nodes::anchor_kind.eq(row.anchor_kind),
             nodes::metadata_json.eq(row.metadata_json),
             nodes::kind_json.eq(row.kind_json),
         ))
@@ -1278,6 +1288,8 @@ async fn upsert_node(
             nodes::parent_id.eq(diesel::upsert::excluded(nodes::parent_id)),
             nodes::created_at.eq(diesel::upsert::excluded(nodes::created_at)),
             nodes::role.eq(diesel::upsert::excluded(nodes::role)),
+            nodes::kind.eq(diesel::upsert::excluded(nodes::kind)),
+            nodes::anchor_kind.eq(diesel::upsert::excluded(nodes::anchor_kind)),
             nodes::metadata_json.eq(diesel::upsert::excluded(nodes::metadata_json)),
             nodes::kind_json.eq(diesel::upsert::excluded(nodes::kind_json)),
         ))
@@ -1355,11 +1367,18 @@ fn merge_parent_relation_kind(parent: &MergeParent) -> &'static str {
 
 impl NodeRow {
     fn from_node(node: Node, path: &Path) -> Result<Self> {
+        let kind = node.kind.tag().as_str().to_owned();
+        let anchor_kind = node
+            .kind
+            .anchor_payload_kind()
+            .map(|kind| kind.as_str().to_owned());
         Ok(Self {
             id: node.id,
             parent_id: node.parent,
             created_at: node.created_at.to_string(),
             role: role_name(&node.role).to_owned(),
+            kind,
+            anchor_kind,
             metadata_json: node
                 .metadata
                 .map(|metadata| {
@@ -1377,6 +1396,31 @@ impl NodeRow {
     }
 
     fn into_node(self, path: &Path) -> Result<Node> {
+        let kind: Kind =
+            serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
+                path: path.to_owned(),
+                column: "nodes.kind_json".to_owned(),
+            })?;
+        ensure!(
+            self.kind == kind.tag().as_str(),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "SQLite node kind column {:?} does not match kind_json",
+                    self.kind
+                ),
+            }
+        );
+        ensure!(
+            self.anchor_kind.as_deref() == kind.anchor_payload_kind().map(|kind| kind.as_str()),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "SQLite node anchor_kind column {:?} does not match kind_json",
+                    self.anchor_kind
+                ),
+            }
+        );
         Ok(Node {
             id: self.id,
             parent: self.parent_id,
@@ -1398,10 +1442,7 @@ impl NodeRow {
                     )
                 })
                 .transpose()?,
-            kind: serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
-                path: path.to_owned(),
-                column: "nodes.kind_json".to_owned(),
-            })?,
+            kind,
         })
     }
 }
@@ -1929,7 +1970,7 @@ WITH RECURSIVE ancestry(id, depth) AS (
     JOIN ancestry ON nodes.id = ancestry.id
     WHERE nodes.parent_id != ''
 )
-SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.metadata_json, nodes.kind_json
+SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.kind, nodes.anchor_kind, nodes.metadata_json, nodes.kind_json
 FROM ancestry
 JOIN nodes ON nodes.id = ancestry.id
 ORDER BY ancestry.depth
@@ -1982,7 +2023,7 @@ ORDER BY ancestry.depth
             let mut connection = self.connect().await?;
             let rows = sql_query(
                 r#"
-SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.metadata_json, nodes.kind_json
+SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.kind, nodes.anchor_kind, nodes.metadata_json, nodes.kind_json
 FROM node_relations
 JOIN nodes ON nodes.id = node_relations.child_node_id
 WHERE node_relations.parent_node_id = ?
@@ -2572,6 +2613,14 @@ mod tests {
         ordinal: i32,
     }
 
+    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
+    struct NodeKindRow {
+        #[diesel(sql_type = Text)]
+        kind: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        anchor_kind: Option<String>,
+    }
+
     fn session_anchor_node(parent: &str) -> NewNode {
         NewNode {
             parent: parent.to_owned(),
@@ -2627,6 +2676,18 @@ ORDER BY kind, ordinal, parent_node_id
             .load::<NodeRelationRow>(&mut connection)
             .await
             .unwrap()
+        })
+    }
+
+    fn node_kinds(store: &SqliteStore, node_id: &str) -> (String, Option<String>) {
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            let row = sql_query("SELECT kind, anchor_kind FROM nodes WHERE id = ?")
+                .bind::<Text, _>(node_id)
+                .get_result::<NodeKindRow>(&mut connection)
+                .await
+                .unwrap();
+            (row.kind, row.anchor_kind)
         })
     }
 
@@ -2736,7 +2797,7 @@ VALUES (?, ?, ?, ?, ?, ?)
         let store = SqliteStore::open(&path).unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -2876,7 +2937,7 @@ VALUES (?, ?, ?, ?, ?, ?)
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -2898,7 +2959,8 @@ CREATE TABLE store_schema_migrations (
 INSERT INTO store_schema_migrations (version, name)
 VALUES
     (1, 'initial-store-schema'),
-    (2, 'node-relations');
+    (2, 'node-relations'),
+    (3, 'node-kind');
 DROP TABLE __diesel_schema_migrations;
 "#,
                 )
@@ -2910,7 +2972,7 @@ DROP TABLE __diesel_schema_migrations;
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
         assert_eq!(store.root_id(), root_id);
         assert_eq!(graph.root_id, root_id);
     }
@@ -2934,7 +2996,8 @@ CREATE TABLE store_schema_migrations (
 INSERT INTO store_schema_migrations (version, name)
 VALUES
     (1, 'initial-store-schema'),
-    (2, 'node-relations');
+    (2, 'node-relations'),
+    (3, 'node-kind');
 DELETE FROM __diesel_schema_migrations;
 "#,
                 )
@@ -2946,7 +3009,7 @@ DELETE FROM __diesel_schema_migrations;
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
         assert_eq!(store.root_id(), root_id);
         assert_eq!(graph.root_id, root_id);
     }
@@ -2981,36 +3044,44 @@ DELETE FROM __diesel_schema_migrations;
                 kind: Kind::Text("shadow parent".to_owned()),
             })
             .unwrap();
+        let child_kind = Kind::Anchor(Anchor::session(
+            vec![
+                MergeParent::merge(merge_parent.clone()),
+                MergeParent::shadow(shadow_parent.clone()),
+            ],
+            SessionAnchor {
+                role: SessionRole::Orchestrator,
+                provider_profile: None,
+                provider: Some("openai".to_owned()),
+                model: "gpt-5.4".to_owned(),
+                tools: vec![],
+                system_prompt: "system".to_owned(),
+                prompt: "prompt".to_owned(),
+                temperature: Some(0.1),
+                max_tokens: Some(64),
+                additional_params: None,
+                enable_coco_shim: false,
+                active_skill: None,
+            },
+        ));
+        let expected_node_kinds = (
+            child_kind.tag().as_str().to_owned(),
+            child_kind
+                .anchor_payload_kind()
+                .map(|kind| kind.as_str().to_owned()),
+        );
         let child = store
             .append(NewNode {
                 parent: primary_parent.clone(),
                 role: Role::System,
                 metadata: None,
-                kind: Kind::Anchor(Anchor::session(
-                    vec![
-                        MergeParent::merge(merge_parent.clone()),
-                        MergeParent::shadow(shadow_parent.clone()),
-                    ],
-                    SessionAnchor {
-                        role: SessionRole::Orchestrator,
-                        provider_profile: None,
-                        provider: Some("openai".to_owned()),
-                        model: "gpt-5.4".to_owned(),
-                        tools: vec![],
-                        system_prompt: "system".to_owned(),
-                        prompt: "prompt".to_owned(),
-                        temperature: Some(0.1),
-                        max_tokens: Some(64),
-                        additional_params: None,
-                        enable_coco_shim: false,
-                        active_skill: None,
-                    },
-                )),
+                kind: child_kind,
             })
             .unwrap();
 
         let relations = node_relation_rows(&store, &child);
 
+        assert_eq!(node_kinds(&store, &child), expected_node_kinds);
         assert_eq!(relations.len(), 3);
         assert!(relations.contains(&NodeRelationRow {
             child_node_id: child.clone(),
@@ -3080,7 +3151,7 @@ DELETE FROM __diesel_schema_migrations;
     }
 
     #[test]
-    fn schema_migration_backfills_node_relations_from_node_edges() {
+    fn schema_migration_backfills_node_relations_and_node_kind() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
@@ -3095,6 +3166,13 @@ DELETE FROM __diesel_schema_migrations;
             "1970-01-01T00:00:01Z".parse().unwrap(),
         );
         let child_id = child.id.clone();
+        let expected_child_kinds = (
+            child.kind.tag().as_str().to_owned(),
+            child
+                .kind
+                .anchor_payload_kind()
+                .map(|kind| kind.as_str().to_owned()),
+        );
         let root_id = root.id.clone();
         let merge_parent_a = Node::new(
             root_id.clone(),
@@ -3150,7 +3228,8 @@ DELETE FROM __diesel_schema_migrations;
         let crate::store::PersistentStore::Sqlite(migrated) =
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(migrated.schema_version().unwrap(), 3);
+        assert_eq!(node_kinds(&migrated, &child_id), expected_child_kinds);
         assert_eq!(
             node_relation_rows(&migrated, &child_id),
             vec![
@@ -3208,7 +3287,7 @@ DELETE FROM __diesel_schema_migrations;
         let crate::store::PersistentStore::Sqlite(migrated) =
             crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(migrated.schema_version().unwrap(), 3);
         assert_eq!(migrated.root_id(), root_id);
     }
 
@@ -3234,7 +3313,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let migrated = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(migrated.schema_version().unwrap(), 2);
+        assert_eq!(migrated.schema_version().unwrap(), 3);
         assert_eq!(migrated.root_id(), root_id);
         migrated.block_on(async {
             let mut connection = migrated.connect().await.unwrap();
@@ -3321,7 +3400,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -3379,7 +3458,7 @@ DELETE FROM __diesel_schema_migrations;
 
         let reopened = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(reopened.schema_version().unwrap(), 2);
+        assert_eq!(reopened.schema_version().unwrap(), 3);
     }
 
     #[test]

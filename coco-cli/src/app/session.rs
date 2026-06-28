@@ -1563,19 +1563,10 @@ fn format_state_suffix(state: &SessionState) -> String {
 }
 
 fn graph_kind_name(node: &Node) -> &'static str {
-    match &node.kind {
-        Kind::Anchor(anchor) => match &anchor.payload {
-            AnchorPayload::Session(_) => "session",
-            AnchorPayload::SessionPatch(_) => "session_patch",
-            AnchorPayload::Prompt(_) => "prompt",
-            AnchorPayload::SkillInvocation(_) => "skill_invocation",
-            AnchorPayload::SkillResult(_) => "skill_result",
-        },
-        Kind::ToolUse(_) => "tool_use",
-        Kind::ToolResult(_) => "tool_result",
-        Kind::Text(_) => "text",
-        Kind::Failure(_) => "failure",
-    }
+    node.kind
+        .anchor_payload_kind()
+        .map(|kind| kind.as_str())
+        .unwrap_or_else(|| node.kind.tag().as_str())
 }
 
 fn summarize_node(node: &Node) -> String {
