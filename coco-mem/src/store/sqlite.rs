@@ -14,7 +14,7 @@ use diesel_async::pooled_connection::bb8::{
 };
 use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
-use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
+use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection, TransactionManager};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use serde_json::{Map, Value};
 use snafu::{IntoError, prelude::*};
@@ -782,12 +782,7 @@ impl SqliteGraphStore {
                     path: self.database_path.clone(),
                 },
             )?;
-            connection
-                .batch_execute("BEGIN TRANSACTION")
-                .await
-                .context(QuerySqliteStoreSnafu {
-                    path: self.database_path.clone(),
-                })?;
+            begin_deferred_transaction(&mut connection, &self.database_path).await?;
             let mut connection = Some(connection);
             let transaction_already_active = {
                 let mut read_transaction = self
@@ -803,12 +798,7 @@ impl SqliteGraphStore {
             };
             if transaction_already_active {
                 let mut connection = connection.expect("pending graph read connection is missing");
-                connection
-                    .batch_execute("ROLLBACK")
-                    .await
-                    .context(QuerySqliteStoreSnafu {
-                        path: self.database_path.clone(),
-                    })?;
+                rollback_deferred_transaction(&mut connection, &self.database_path).await?;
                 return CorruptedStoreSnafu {
                     path: self.database_path.clone(),
                     message: "SQLite graph read transaction already active".to_owned(),
@@ -831,12 +821,7 @@ impl SqliteGraphStore {
             })?;
 
         self.block_on(async {
-            connection
-                .batch_execute("COMMIT")
-                .await
-                .context(QuerySqliteStoreSnafu {
-                    path: self.database_path.clone(),
-                })
+            commit_deferred_transaction(&mut connection, &self.database_path).await
         })
     }
 
@@ -851,12 +836,7 @@ impl SqliteGraphStore {
         };
 
         self.block_on(async {
-            connection
-                .batch_execute("ROLLBACK")
-                .await
-                .context(QuerySqliteStoreSnafu {
-                    path: self.database_path.clone(),
-                })
+            rollback_deferred_transaction(&mut connection, &self.database_path).await
         })
     }
 
@@ -1651,6 +1631,39 @@ fn node_references_known_parents(state: &StoreState, node: &Node) -> bool {
         .merge_parents()
         .iter()
         .all(|parent| state.nodes.contains_key(parent.node_id()))
+}
+
+async fn begin_deferred_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<()> {
+    <AsyncSqliteConnection as AsyncConnection>::TransactionManager::begin_transaction(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn commit_deferred_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<()> {
+    <AsyncSqliteConnection as AsyncConnection>::TransactionManager::commit_transaction(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn rollback_deferred_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<()> {
+    <AsyncSqliteConnection as AsyncConnection>::TransactionManager::rollback_transaction(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
 }
 
 async fn persist_node(
