@@ -5226,36 +5226,41 @@ DELETE FROM __diesel_schema_migrations;
     }
 
     #[test]
-    fn fork_persistence_rolls_back_branch_when_session_insert_fails() {
+    fn persist_session_nodes_rolls_back_node_when_branch_head_mismatch() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
         let root_id = store.root_id();
+        store.fork("main", &root_id).unwrap();
+        let node = Node::new(
+            root_id.clone(),
+            Role::User,
+            None,
+            Kind::Text("rolled back node".to_owned()),
+            "1970-01-01T00:00:01Z".parse().unwrap(),
+        );
+        let node_id = node.id.clone();
 
         store.block_on(async {
             let mut connection = store.connect().await.unwrap();
-            connection
-                .batch_execute("DROP TABLE sessions")
-                .await
-                .unwrap();
-
-            let err = super::persist_branch_and_session_state(
+            let err = super::persist_session_nodes_and_branch_head(
                 &mut connection,
                 &store.database_path,
                 "main",
-                &root_id,
-                &SessionState::Active,
+                "stale-head",
+                &node_id,
+                std::slice::from_ref(&node),
             )
             .await
             .unwrap_err();
-            let count = branches::table
-                .filter(branches::name.eq("main"))
+            let count = nodes::table
+                .filter(nodes::id.eq(node_id))
                 .count()
                 .get_result::<i64>(&mut connection)
                 .await
                 .unwrap();
 
-            assert!(err.to_string().contains("SQLite"));
+            assert!(err.to_string().contains("did not match expected head"));
             assert_eq!(count, 0);
         });
     }
