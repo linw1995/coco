@@ -3559,6 +3559,7 @@ mod tests {
     };
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
+    use diesel_migrations::MigrationHarness;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -3794,20 +3795,7 @@ mod tests {
         super::configure_writable_connection(connection, store_path)
             .await
             .unwrap();
-        super::ensure_diesel_migration_metadata(connection, store_path)
-            .await
-            .unwrap();
-        connection
-            .batch_execute(include_str!(
-                "../../migrations/00000000000001_initial_store_schema/up.sql"
-            ))
-            .await
-            .unwrap();
-        diesel::insert_into(super::__diesel_schema_migrations::table)
-            .values(super::__diesel_schema_migrations::version.eq("00000000000001"))
-            .execute(connection)
-            .await
-            .unwrap();
+        run_store_migration_for_test(connection, "00000000000001", true).await;
     }
 
     async fn apply_legacy_v1_schema_for_test(
@@ -3829,12 +3817,7 @@ CREATE TABLE store_schema_migrations (
             )
             .await
             .unwrap();
-        connection
-            .batch_execute(include_str!(
-                "../../migrations/00000000000001_initial_store_schema/up.sql"
-            ))
-            .await
-            .unwrap();
+        run_store_migration_for_test(connection, "00000000000001", false).await;
         diesel::insert_into(super::store_schema_migrations::table)
             .values((
                 super::store_schema_migrations::version.eq(1),
@@ -3842,6 +3825,36 @@ CREATE TABLE store_schema_migrations (
             ))
             .execute(connection)
             .await
+            .unwrap();
+    }
+
+    async fn run_store_migration_for_test(
+        connection: &mut AsyncSqliteConnection,
+        version: &str,
+        record_diesel_migration: bool,
+    ) {
+        let version = version.to_owned();
+        connection
+            .spawn_blocking(move |connection| {
+                let migrations =
+                    <diesel_migrations::EmbeddedMigrations as diesel::migration::MigrationSource<
+                        diesel::sqlite::Sqlite,
+                    >>::migrations(&super::STORE_MIGRATIONS)
+                    .unwrap();
+                let migration = migrations
+                    .into_iter()
+                    .find(|migration| migration.name().version().to_string() == version)
+                    .unwrap_or_else(|| panic!("missing embedded test migration {version}"));
+                Ok(if record_diesel_migration {
+                    connection.applied_migrations().unwrap();
+                    connection.run_migration(&*migration).unwrap();
+                    Ok(())
+                } else {
+                    migration.run(connection)
+                })
+            })
+            .await
+            .unwrap()
             .unwrap();
     }
 
