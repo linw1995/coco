@@ -17,7 +17,7 @@ use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use serde_json::{Map, Value};
-use snafu::prelude::*;
+use snafu::{IntoError, prelude::*};
 use tokio::runtime::Runtime;
 
 use super::state::StoreState;
@@ -105,6 +105,29 @@ type AsyncSqliteConnection = SyncConnectionWrapper<SqliteConnection>;
 type AsyncSqliteConnectionGuard<'a> = AsyncSqlitePooledConnection<'a, AsyncSqliteConnection>;
 type SqliteGraphConnectionFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
+
+enum SqliteTransactionError {
+    Query(diesel::result::Error),
+    Operation(StoreError),
+}
+
+impl From<diesel::result::Error> for SqliteTransactionError {
+    fn from(source: diesel::result::Error) -> Self {
+        Self::Query(source)
+    }
+}
+
+impl SqliteTransactionError {
+    fn into_store_error(self, path: &Path) -> StoreError {
+        match self {
+            Self::Query(source) => QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            }
+            .into_error(source),
+            Self::Operation(error) => error,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct SqliteDatabase {
@@ -613,19 +636,21 @@ impl SqliteStore {
             if node_count(&mut connection, &self.database_path).await? == 0 {
                 self.ensure_writable()?;
                 let state = StoreState::new();
-                begin_immediate_transaction(&mut connection, &self.database_path).await?;
-                let result = async {
-                    persist_root_metadata(&mut connection, &self.database_path, state.root_id())
-                        .await?;
-                    persist_node_without_transaction(
-                        &mut connection,
-                        &self.database_path,
-                        state.root_node(),
-                    )
+                connection
+                    .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+                        persist_root_metadata(connection, &self.database_path, state.root_id())
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                        persist_node_without_transaction(
+                            connection,
+                            &self.database_path,
+                            state.root_node(),
+                        )
+                        .await
+                        .map_err(SqliteTransactionError::Operation)
+                    })
                     .await
-                }
-                .await;
-                finish_transaction(&mut connection, &self.database_path, result).await?;
+                    .map_err(|error| error.into_store_error(&self.database_path))?;
                 return Ok(state);
             }
             load_state(&mut connection, &self.database_path).await
@@ -1439,9 +1464,14 @@ async fn load_root_id(connection: &mut AsyncSqliteConnection, path: &Path) -> Re
 }
 
 async fn load_state(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<StoreState> {
-    begin_read_transaction(connection, path).await?;
-    let result = load_state_without_transaction(connection, path).await;
-    finish_transaction(connection, path, result).await
+    connection
+        .transaction::<StoreState, SqliteTransactionError, _>(async |connection| {
+            load_state_without_transaction(connection, path)
+                .await
+                .map_err(SqliteTransactionError::Operation)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
 }
 
 async fn load_state_without_transaction(
@@ -1623,61 +1653,19 @@ fn node_references_known_parents(state: &StoreState, node: &Node) -> bool {
         .all(|parent| state.nodes.contains_key(parent.node_id()))
 }
 
-async fn begin_immediate_transaction(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-) -> Result<()> {
-    connection
-        .batch_execute("BEGIN IMMEDIATE")
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
-}
-
-async fn begin_read_transaction(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
-    connection
-        .batch_execute("BEGIN")
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
-}
-
-async fn commit_transaction(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
-    connection
-        .batch_execute("COMMIT")
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
-}
-
-async fn finish_transaction<T>(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    result: Result<T>,
-) -> Result<T> {
-    match result {
-        Ok(value) => {
-            commit_transaction(connection, path).await?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = connection.batch_execute("ROLLBACK").await;
-            Err(error)
-        }
-    }
-}
-
 async fn persist_node(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     node: &Node,
 ) -> Result<()> {
-    begin_immediate_transaction(connection, path).await?;
-    let result = persist_node_without_transaction(connection, path, node).await;
-    finish_transaction(connection, path, result).await
+    connection
+        .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+            persist_node_without_transaction(connection, path, node)
+                .await
+                .map_err(SqliteTransactionError::Operation)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
 }
 
 async fn persist_node_without_transaction(
@@ -2391,13 +2379,17 @@ async fn persist_branch_and_session_state(
     head_id: &str,
     session_state: &SessionState,
 ) -> Result<()> {
-    begin_immediate_transaction(connection, path).await?;
-    let result = async {
-        persist_branch(connection, path, branch, head_id).await?;
-        persist_session_state(connection, path, branch, session_state).await
-    }
-    .await;
-    finish_transaction(connection, path, result).await
+    connection
+        .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+            persist_branch(connection, path, branch, head_id)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            persist_session_state(connection, path, branch, session_state)
+                .await
+                .map_err(SqliteTransactionError::Operation)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
 }
 
 async fn persist_session_state(
@@ -2512,17 +2504,21 @@ async fn persist_session_nodes_and_branch_head(
     new_head: &str,
     nodes: &[Node],
 ) -> Result<()> {
-    begin_immediate_transaction(connection, path).await?;
-    let result = persist_session_nodes_and_branch_head_in_transaction(
-        connection,
-        path,
-        branch,
-        expected_old_head,
-        new_head,
-        nodes,
-    )
-    .await;
-    finish_transaction(connection, path, result).await
+    connection
+        .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+            persist_session_nodes_and_branch_head_in_transaction(
+                connection,
+                path,
+                branch,
+                expected_old_head,
+                new_head,
+                nodes,
+            )
+            .await
+            .map_err(SqliteTransactionError::Operation)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
 }
 
 async fn persist_session_nodes_and_branch_head_in_transaction(
@@ -3553,7 +3549,7 @@ mod tests {
         SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
     };
     use diesel::prelude::*;
-    use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
+    use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -4010,37 +4006,38 @@ CREATE TABLE store_schema_migrations (
 
         let (snapshot, child_id) = store.block_on(async {
             let mut reader = store.connect().await.unwrap();
-            super::begin_read_transaction(&mut reader, &store.database_path)
-                .await
-                .unwrap();
-            assert_eq!(
-                super::load_root_id(&mut reader, &store.database_path)
-                    .await
-                    .unwrap(),
-                root_id
-            );
+            reader
+                .transaction::<_, super::SqliteTransactionError, _>(async |reader| {
+                    assert_eq!(
+                        super::load_root_id(reader, &store.database_path)
+                            .await
+                            .map_err(super::SqliteTransactionError::Operation)?,
+                        root_id
+                    );
 
-            let writer = store.clone();
-            let child_parent = root_id.clone();
-            let handle = std::thread::spawn(move || {
-                writer
-                    .append(NewNode {
-                        parent: child_parent,
-                        role: Role::User,
-                        metadata: None,
-                        kind: Kind::Text("concurrent child".to_owned()),
-                    })
-                    .unwrap()
-            });
-            let child_id = handle.join().unwrap();
+                    let writer = store.clone();
+                    let child_parent = root_id.clone();
+                    let handle = std::thread::spawn(move || {
+                        writer
+                            .append(NewNode {
+                                parent: child_parent,
+                                role: Role::User,
+                                metadata: None,
+                                kind: Kind::Text("concurrent child".to_owned()),
+                            })
+                            .unwrap()
+                    });
+                    let child_id = handle.join().unwrap();
 
-            let snapshot = super::load_state_without_transaction(&mut reader, &store.database_path)
+                    let snapshot =
+                        super::load_state_without_transaction(reader, &store.database_path)
+                            .await
+                            .map_err(super::SqliteTransactionError::Operation)?;
+                    Ok((snapshot, child_id))
+                })
                 .await
-                .unwrap();
-            super::commit_transaction(&mut reader, &store.database_path)
-                .await
-                .unwrap();
-            (snapshot, child_id)
+                .map_err(|error| error.into_store_error(&store.database_path))
+                .unwrap()
         });
 
         assert!(snapshot.get_node(&child_id).is_err());
