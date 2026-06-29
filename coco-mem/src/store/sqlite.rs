@@ -547,7 +547,7 @@ impl SqliteStore {
         self.block_on(async {
             let mut connection = self.connect().await?;
             configure_writable_connection(&mut connection, &self.database_path).await?;
-            ensure_migration_table(&mut connection, &self.database_path).await?;
+            ensure_diesel_migration_metadata(&mut connection, &self.database_path).await?;
             bootstrap_diesel_migrations_from_legacy_table(&mut connection, &self.database_path)
                 .await?;
             reject_newer_schema_version(&mut connection, &self.database_path).await?;
@@ -1176,20 +1176,16 @@ async fn ensure_wal_journal_mode(
     Ok(())
 }
 
-async fn ensure_migration_table(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
-    connection
-        .batch_execute(
-            r#"
-CREATE TABLE IF NOT EXISTS __diesel_schema_migrations (
-    version VARCHAR(50) PRIMARY KEY NOT NULL,
-    run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-"#,
-        )
+async fn ensure_diesel_migration_metadata(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<()> {
+    let path = path.to_owned();
+    let result = connection
+        .spawn_blocking(move |connection| Ok(connection.applied_migrations().map(|_| ())))
         .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
+        .context(QuerySqliteStoreSnafu { path: path.clone() })?;
+    result.map_err(|source| StoreError::MigrateSqliteStore { path, source })
 }
 
 async fn table_count(
@@ -3798,7 +3794,7 @@ mod tests {
         super::configure_writable_connection(connection, store_path)
             .await
             .unwrap();
-        super::ensure_migration_table(connection, store_path)
+        super::ensure_diesel_migration_metadata(connection, store_path)
             .await
             .unwrap();
         connection
