@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use diesel::prelude::*;
-use diesel::sql_query;
 use diesel::sql_types::{BigInt, Double, Integer, Text};
 use diesel::sqlite::SqliteConnection;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
@@ -14,7 +14,8 @@ use crate::api::{
     GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, GraphViewportResponse, Point,
 };
 use crate::error::{
-    MigrateGraphSnapshotStoreSnafu, ParseGraphSnapshotStoreValueSnafu, QueryGraphSnapshotStoreSnafu,
+    ManageGraphSnapshotStoreSnafu, MigrateGraphSnapshotStoreSnafu,
+    ParseGraphSnapshotStoreValueSnafu, QueryGraphSnapshotStoreSnafu,
 };
 use crate::graph::{
     GraphMode, graph_kind_name, initial_visible_graph_lane_nodes, node_target_id,
@@ -43,11 +44,6 @@ const EDGE_ROUTE_STEP: i32 = 12;
 const MAX_EDGE_COLUMN_GAP: usize = 5;
 const DERIVED_ORPHAN_LANE_KEY_PREFIX: &str = "derived:orphan:";
 const DERIVED_SKILL_LANE_KEY_PREFIX: &str = "derived:skill:";
-const MATERIALIZATION_TABLES: &[&str] = &[
-    "console_graph_materializations",
-    "console_graph_node_locations",
-    "console_graph_edge_routes",
-];
 const LEGACY_MATERIALIZATION_TABLES: &[&str] = &[
     "console_graph_snapshots",
     "console_graph_viewports",
@@ -3311,7 +3307,6 @@ impl ConsoleGraphSnapshotStore {
     fn ensure_schema(&self) -> crate::Result<()> {
         let this = self.clone();
         self.with_connection(move |connection| {
-            this.drop_legacy_materialization_tables(connection)?;
             connection
                 .run_pending_migrations(CONSOLE_GRAPH_MIGRATIONS)
                 .map(|_| ())
@@ -3320,17 +3315,6 @@ impl ConsoleGraphSnapshotStore {
                 })?;
             Ok(())
         })
-    }
-
-    fn drop_legacy_materialization_tables(
-        &self,
-        connection: &mut SqliteConnection,
-    ) -> crate::Result<()> {
-        drop_tables(
-            connection,
-            self.path.as_ref(),
-            LEGACY_MATERIALIZATION_TABLES,
-        )
     }
 
     fn delete_materialization_meta(
@@ -5453,21 +5437,33 @@ fn drop_stale_snapshot_materialization_tables(path: &Path) -> crate::Result<()> 
     }
     let database =
         SqliteDatabase::open_unshared_file_path(path).context(crate::error::StoreSnafu)?;
-    let path = path.to_owned();
-    let error_path = path.clone();
-    database.with_sync_connection(
+    let inspect_path = path.to_owned();
+    let error_path = inspect_path.clone();
+    let should_recreate = database.with_sync_connection(
         move |connection| {
-            if !materialization_tables_have_current_schema(connection, &path)? {
-                drop_tables(connection, &path, MATERIALIZATION_TABLES)?;
-            }
-            drop_tables(connection, &path, LEGACY_MATERIALIZATION_TABLES)
+            Ok(
+                !materialization_tables_have_current_schema(connection, &inspect_path)?
+                    || any_sqlite_table_exists(
+                        connection,
+                        &inspect_path,
+                        LEGACY_MATERIALIZATION_TABLES,
+                    )?,
+            )
         },
         |source| crate::Error::Store { source },
         |source| crate::Error::QueryGraphSnapshotStore {
             path: error_path,
             source,
         },
-    )
+    )?;
+    drop(database);
+
+    if should_recreate {
+        fs::remove_file(path).context(ManageGraphSnapshotStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    }
+    Ok(())
 }
 
 fn materialization_tables_have_current_schema(
@@ -5500,6 +5496,19 @@ fn sqlite_table_exists(
     Ok(count > 0)
 }
 
+fn any_sqlite_table_exists(
+    connection: &mut SqliteConnection,
+    path: &Path,
+    tables: &[&str],
+) -> crate::Result<bool> {
+    for table in tables {
+        if sqlite_table_exists(connection, path, table)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn materializations_have_source_version_column(connection: &mut SqliteConnection) -> bool {
     console_graph_materializations::table
         .select(console_graph_materializations::source_version)
@@ -5522,21 +5531,6 @@ fn edge_routes_have_edge_kind_column(connection: &mut SqliteConnection) -> bool 
         .limit(0)
         .load::<String>(connection)
         .is_ok()
-}
-
-fn drop_tables(
-    connection: &mut SqliteConnection,
-    path: &Path,
-    tables: &[&str],
-) -> crate::Result<()> {
-    for table in tables {
-        sql_query(format!("DROP TABLE IF EXISTS {table}"))
-            .execute(&mut *connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: path.to_owned(),
-            })?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy)]
