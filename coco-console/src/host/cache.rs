@@ -9529,18 +9529,6 @@ mod tests {
         writer.fork("main", &root).unwrap();
         let snapshot = ConsoleGraphSnapshotStore::open(&path).unwrap();
         let base = root.clone();
-        coco_mem::SqliteDatabase::open_store_path(&path)
-            .unwrap()
-            .with_sync_connection(
-                |connection| {
-                    use diesel::connection::SimpleConnection;
-
-                    connection.batch_execute("PRAGMA busy_timeout = 50")
-                },
-                |source| panic!("{source}"),
-                std::convert::identity,
-            )
-            .unwrap();
 
         let (started_tx, started_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
