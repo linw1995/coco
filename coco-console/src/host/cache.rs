@@ -1840,21 +1840,23 @@ mod tests {
         let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
             use crate::schema::console_graph_materializations::dsl as materializations;
-            use diesel::connection::SimpleConnection;
+            use diesel::Connection;
             use diesel::prelude::*;
 
             with_sqlite_test_connection(&graph_database_path, move |connection| {
-                connection.batch_execute("BEGIN TRANSACTION").unwrap();
-                assert_eq!(
-                    materializations::console_graph_materializations
-                        .count()
-                        .get_result::<i64>(connection)
-                        .unwrap(),
-                    0,
-                );
-                transaction_started_tx.send(()).unwrap();
-                release_transaction_rx.recv().unwrap();
-                connection.batch_execute("ROLLBACK").unwrap();
+                connection
+                    .transaction::<(), diesel::result::Error, _>(|connection| {
+                        assert_eq!(
+                            materializations::console_graph_materializations
+                                .count()
+                                .get_result::<i64>(connection)?,
+                            0,
+                        );
+                        transaction_started_tx.send(()).unwrap();
+                        release_transaction_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
             });
         });
         transaction_started_rx
@@ -1897,15 +1899,14 @@ mod tests {
         let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
         let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
-            use diesel::connection::SimpleConnection;
-
             with_sqlite_test_connection(&graph_database_path, move |connection| {
                 connection
-                    .batch_execute("BEGIN IMMEDIATE TRANSACTION")
+                    .immediate_transaction::<(), diesel::result::Error, _>(|_| {
+                        transaction_started_tx.send(()).unwrap();
+                        release_transaction_rx.recv().unwrap();
+                        Ok(())
+                    })
                     .unwrap();
-                transaction_started_tx.send(()).unwrap();
-                release_transaction_rx.recv().unwrap();
-                connection.batch_execute("ROLLBACK").unwrap();
             });
         });
         transaction_started_rx
@@ -9545,14 +9546,13 @@ mod tests {
         let transaction = std::thread::spawn(move || {
             snapshot
                 .with_connection_for_tests(move |connection| {
-                    use diesel::connection::SimpleConnection;
-
                     connection
-                        .batch_execute("BEGIN IMMEDIATE TRANSACTION")
+                        .immediate_transaction::<(), diesel::result::Error, _>(|_| {
+                            started_tx.send(()).unwrap();
+                            std::thread::sleep(Duration::from_millis(200));
+                            Ok(())
+                        })
                         .unwrap();
-                    started_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_millis(200));
-                    connection.batch_execute("COMMIT").unwrap();
                     Ok(())
                 })
                 .unwrap();
