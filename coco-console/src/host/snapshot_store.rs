@@ -3439,51 +3439,75 @@ impl ConsoleGraphSnapshotStore {
                 column: "console_graph_node_locations.labels_json",
             },
         )?;
-        diesel::insert_into(node_locations::console_graph_node_locations)
-            .values((
-                node_locations::mode.eq(insert.mode.as_query_value()),
-                node_locations::node_key.eq(&insert.node.key),
-                node_locations::node_id.eq(&insert.node.id),
-                node_locations::node_target.eq(&insert.node.node_target),
-                node_locations::short_id.eq(&insert.node.short_id),
-                node_locations::node_kind.eq(&insert.node.kind),
-                node_locations::summary.eq(&insert.node.summary),
-                node_locations::labels_json.eq(labels_json),
-                node_locations::lane_key.eq(&insert.lane.key),
-                node_locations::lane_label.eq(&insert.lane.label),
-                node_locations::lane_y.eq(insert.lane.y),
-                node_locations::x.eq(insert.node.x),
-                node_locations::y.eq(insert.node.y),
-                node_locations::min_x.eq(insert.bounds.left),
-                node_locations::min_y.eq(insert.bounds.top),
-                node_locations::max_x.eq(insert.bounds.right),
-                node_locations::max_y.eq(insert.bounds.bottom),
-            ))
-            .on_conflict((node_locations::mode, node_locations::node_key))
-            .do_update()
-            .set((
-                node_locations::node_id.eq(diesel::upsert::excluded(node_locations::node_id)),
-                node_locations::node_target
-                    .eq(diesel::upsert::excluded(node_locations::node_target)),
-                node_locations::short_id.eq(diesel::upsert::excluded(node_locations::short_id)),
-                node_locations::node_kind.eq(diesel::upsert::excluded(node_locations::node_kind)),
-                node_locations::summary.eq(diesel::upsert::excluded(node_locations::summary)),
-                node_locations::labels_json
-                    .eq(diesel::upsert::excluded(node_locations::labels_json)),
-                node_locations::lane_key.eq(diesel::upsert::excluded(node_locations::lane_key)),
-                node_locations::lane_label.eq(diesel::upsert::excluded(node_locations::lane_label)),
-                node_locations::lane_y.eq(diesel::upsert::excluded(node_locations::lane_y)),
-                node_locations::x.eq(diesel::upsert::excluded(node_locations::x)),
-                node_locations::y.eq(diesel::upsert::excluded(node_locations::y)),
-                node_locations::min_x.eq(diesel::upsert::excluded(node_locations::min_x)),
-                node_locations::min_y.eq(diesel::upsert::excluded(node_locations::min_y)),
-                node_locations::max_x.eq(diesel::upsert::excluded(node_locations::max_x)),
-                node_locations::max_y.eq(diesel::upsert::excluded(node_locations::max_y)),
-            ))
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
+        diesel::query_dsl::methods::FilterDsl::filter(
+            diesel::insert_into(node_locations::console_graph_node_locations)
+                .values((
+                    node_locations::mode.eq(insert.mode.as_query_value()),
+                    node_locations::node_key.eq(&insert.node.key),
+                    node_locations::node_id.eq(&insert.node.id),
+                    node_locations::node_target.eq(&insert.node.node_target),
+                    node_locations::short_id.eq(&insert.node.short_id),
+                    node_locations::node_kind.eq(&insert.node.kind),
+                    node_locations::summary.eq(&insert.node.summary),
+                    node_locations::labels_json.eq(labels_json),
+                    node_locations::lane_key.eq(&insert.lane.key),
+                    node_locations::lane_label.eq(&insert.lane.label),
+                    node_locations::lane_y.eq(insert.lane.y),
+                    node_locations::x.eq(insert.node.x),
+                    node_locations::y.eq(insert.node.y),
+                    node_locations::min_x.eq(insert.bounds.left),
+                    node_locations::min_y.eq(insert.bounds.top),
+                    node_locations::max_x.eq(insert.bounds.right),
+                    node_locations::max_y.eq(insert.bounds.bottom),
+                ))
+                .on_conflict((node_locations::mode, node_locations::node_key))
+                .do_update()
+                .set((
+                    node_locations::node_id.eq(diesel::upsert::excluded(node_locations::node_id)),
+                    node_locations::node_target
+                        .eq(diesel::upsert::excluded(node_locations::node_target)),
+                    node_locations::short_id.eq(diesel::upsert::excluded(node_locations::short_id)),
+                    node_locations::node_kind
+                        .eq(diesel::upsert::excluded(node_locations::node_kind)),
+                    node_locations::summary.eq(diesel::upsert::excluded(node_locations::summary)),
+                    node_locations::labels_json
+                        .eq(diesel::upsert::excluded(node_locations::labels_json)),
+                    node_locations::lane_key.eq(diesel::upsert::excluded(node_locations::lane_key)),
+                    node_locations::lane_label
+                        .eq(diesel::upsert::excluded(node_locations::lane_label)),
+                    node_locations::lane_y.eq(diesel::upsert::excluded(node_locations::lane_y)),
+                    node_locations::x.eq(diesel::upsert::excluded(node_locations::x)),
+                    node_locations::y.eq(diesel::upsert::excluded(node_locations::y)),
+                    node_locations::min_x.eq(diesel::upsert::excluded(node_locations::min_x)),
+                    node_locations::min_y.eq(diesel::upsert::excluded(node_locations::min_y)),
+                    node_locations::max_x.eq(diesel::upsert::excluded(node_locations::max_x)),
+                    node_locations::max_y.eq(diesel::upsert::excluded(node_locations::max_y)),
+                )),
+            node_locations::node_id
+                .ne(diesel::upsert::excluded(node_locations::node_id))
+                .or(node_locations::node_target
+                    .ne(diesel::upsert::excluded(node_locations::node_target)))
+                .or(node_locations::short_id.ne(diesel::upsert::excluded(node_locations::short_id)))
+                .or(node_locations::node_kind
+                    .ne(diesel::upsert::excluded(node_locations::node_kind)))
+                .or(node_locations::summary.ne(diesel::upsert::excluded(node_locations::summary)))
+                .or(node_locations::labels_json
+                    .ne(diesel::upsert::excluded(node_locations::labels_json)))
+                .or(node_locations::lane_key.ne(diesel::upsert::excluded(node_locations::lane_key)))
+                .or(node_locations::lane_label
+                    .ne(diesel::upsert::excluded(node_locations::lane_label)))
+                .or(node_locations::lane_y.ne(diesel::upsert::excluded(node_locations::lane_y)))
+                .or(node_locations::x.ne(diesel::upsert::excluded(node_locations::x)))
+                .or(node_locations::y.ne(diesel::upsert::excluded(node_locations::y)))
+                .or(node_locations::min_x.ne(diesel::upsert::excluded(node_locations::min_x)))
+                .or(node_locations::min_y.ne(diesel::upsert::excluded(node_locations::min_y)))
+                .or(node_locations::max_x.ne(diesel::upsert::excluded(node_locations::max_x)))
+                .or(node_locations::max_y.ne(diesel::upsert::excluded(node_locations::max_y))),
+        )
+        .execute(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
         Ok(())
     }
 
@@ -3494,46 +3518,63 @@ impl ConsoleGraphSnapshotStore {
     ) -> crate::Result<()> {
         use console_graph_edge_routes::dsl as edge_routes;
 
-        diesel::insert_into(edge_routes::console_graph_edge_routes)
-            .values((
-                edge_routes::mode.eq(insert.mode.as_query_value()),
-                edge_routes::edge_key.eq(&insert.edge.key),
-                edge_routes::edge_kind.eq(edge_kind_query_value(insert.edge.kind)),
-                edge_routes::source_id.eq(&insert.edge.source_id),
-                edge_routes::target_id.eq(&insert.edge.target_id),
-                edge_routes::source_x.eq(insert.edge.source.x),
-                edge_routes::source_y.eq(insert.edge.source.y),
-                edge_routes::target_x.eq(insert.edge.target.x),
-                edge_routes::target_y.eq(insert.edge.target.y),
-                edge_routes::route_slot.eq(insert.edge.route_slot),
-                edge_routes::target_port_offset.eq(insert.edge.target_port_offset),
-                edge_routes::min_x.eq(insert.bounds.left),
-                edge_routes::min_y.eq(insert.bounds.top),
-                edge_routes::max_x.eq(insert.bounds.right),
-                edge_routes::max_y.eq(insert.bounds.bottom),
-            ))
-            .on_conflict((edge_routes::mode, edge_routes::edge_key))
-            .do_update()
-            .set((
-                edge_routes::edge_kind.eq(diesel::upsert::excluded(edge_routes::edge_kind)),
-                edge_routes::source_id.eq(diesel::upsert::excluded(edge_routes::source_id)),
-                edge_routes::target_id.eq(diesel::upsert::excluded(edge_routes::target_id)),
-                edge_routes::source_x.eq(diesel::upsert::excluded(edge_routes::source_x)),
-                edge_routes::source_y.eq(diesel::upsert::excluded(edge_routes::source_y)),
-                edge_routes::target_x.eq(diesel::upsert::excluded(edge_routes::target_x)),
-                edge_routes::target_y.eq(diesel::upsert::excluded(edge_routes::target_y)),
-                edge_routes::route_slot.eq(diesel::upsert::excluded(edge_routes::route_slot)),
-                edge_routes::target_port_offset
-                    .eq(diesel::upsert::excluded(edge_routes::target_port_offset)),
-                edge_routes::min_x.eq(diesel::upsert::excluded(edge_routes::min_x)),
-                edge_routes::min_y.eq(diesel::upsert::excluded(edge_routes::min_y)),
-                edge_routes::max_x.eq(diesel::upsert::excluded(edge_routes::max_x)),
-                edge_routes::max_y.eq(diesel::upsert::excluded(edge_routes::max_y)),
-            ))
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
+        diesel::query_dsl::methods::FilterDsl::filter(
+            diesel::insert_into(edge_routes::console_graph_edge_routes)
+                .values((
+                    edge_routes::mode.eq(insert.mode.as_query_value()),
+                    edge_routes::edge_key.eq(&insert.edge.key),
+                    edge_routes::edge_kind.eq(edge_kind_query_value(insert.edge.kind)),
+                    edge_routes::source_id.eq(&insert.edge.source_id),
+                    edge_routes::target_id.eq(&insert.edge.target_id),
+                    edge_routes::source_x.eq(insert.edge.source.x),
+                    edge_routes::source_y.eq(insert.edge.source.y),
+                    edge_routes::target_x.eq(insert.edge.target.x),
+                    edge_routes::target_y.eq(insert.edge.target.y),
+                    edge_routes::route_slot.eq(insert.edge.route_slot),
+                    edge_routes::target_port_offset.eq(insert.edge.target_port_offset),
+                    edge_routes::min_x.eq(insert.bounds.left),
+                    edge_routes::min_y.eq(insert.bounds.top),
+                    edge_routes::max_x.eq(insert.bounds.right),
+                    edge_routes::max_y.eq(insert.bounds.bottom),
+                ))
+                .on_conflict((edge_routes::mode, edge_routes::edge_key))
+                .do_update()
+                .set((
+                    edge_routes::edge_kind.eq(diesel::upsert::excluded(edge_routes::edge_kind)),
+                    edge_routes::source_id.eq(diesel::upsert::excluded(edge_routes::source_id)),
+                    edge_routes::target_id.eq(diesel::upsert::excluded(edge_routes::target_id)),
+                    edge_routes::source_x.eq(diesel::upsert::excluded(edge_routes::source_x)),
+                    edge_routes::source_y.eq(diesel::upsert::excluded(edge_routes::source_y)),
+                    edge_routes::target_x.eq(diesel::upsert::excluded(edge_routes::target_x)),
+                    edge_routes::target_y.eq(diesel::upsert::excluded(edge_routes::target_y)),
+                    edge_routes::route_slot.eq(diesel::upsert::excluded(edge_routes::route_slot)),
+                    edge_routes::target_port_offset
+                        .eq(diesel::upsert::excluded(edge_routes::target_port_offset)),
+                    edge_routes::min_x.eq(diesel::upsert::excluded(edge_routes::min_x)),
+                    edge_routes::min_y.eq(diesel::upsert::excluded(edge_routes::min_y)),
+                    edge_routes::max_x.eq(diesel::upsert::excluded(edge_routes::max_x)),
+                    edge_routes::max_y.eq(diesel::upsert::excluded(edge_routes::max_y)),
+                )),
+            edge_routes::edge_kind
+                .ne(diesel::upsert::excluded(edge_routes::edge_kind))
+                .or(edge_routes::source_id.ne(diesel::upsert::excluded(edge_routes::source_id)))
+                .or(edge_routes::target_id.ne(diesel::upsert::excluded(edge_routes::target_id)))
+                .or(edge_routes::source_x.ne(diesel::upsert::excluded(edge_routes::source_x)))
+                .or(edge_routes::source_y.ne(diesel::upsert::excluded(edge_routes::source_y)))
+                .or(edge_routes::target_x.ne(diesel::upsert::excluded(edge_routes::target_x)))
+                .or(edge_routes::target_y.ne(diesel::upsert::excluded(edge_routes::target_y)))
+                .or(edge_routes::route_slot.ne(diesel::upsert::excluded(edge_routes::route_slot)))
+                .or(edge_routes::target_port_offset
+                    .ne(diesel::upsert::excluded(edge_routes::target_port_offset)))
+                .or(edge_routes::min_x.ne(diesel::upsert::excluded(edge_routes::min_x)))
+                .or(edge_routes::min_y.ne(diesel::upsert::excluded(edge_routes::min_y)))
+                .or(edge_routes::max_x.ne(diesel::upsert::excluded(edge_routes::max_x)))
+                .or(edge_routes::max_y.ne(diesel::upsert::excluded(edge_routes::max_y))),
+        )
+        .execute(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
         Ok(())
     }
 

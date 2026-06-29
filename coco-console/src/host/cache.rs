@@ -1347,7 +1347,6 @@ mod tests {
         PersistentStore, PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor,
         SkillInvocationMode, SkillResultAnchor, Tool, ToolUse,
     };
-    use diesel::QueryableByName;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1840,17 +1839,17 @@ mod tests {
         let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
         let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
+            use crate::schema::console_graph_materializations::dsl as materializations;
             use diesel::connection::SimpleConnection;
             use diesel::prelude::*;
-            use diesel::sql_query;
 
             with_sqlite_test_connection(&graph_database_path, move |connection| {
                 connection.batch_execute("BEGIN TRANSACTION").unwrap();
                 assert_eq!(
-                    sql_query("SELECT COUNT(*) AS count FROM console_graph_materializations")
-                        .get_result::<SqliteCount>(connection)
-                        .unwrap()
-                        .count,
+                    materializations::console_graph_materializations
+                        .count()
+                        .get_result::<i64>(connection)
+                        .unwrap(),
                     0,
                 );
                 transaction_started_tx.send(()).unwrap();
@@ -9567,10 +9566,18 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[derive(QueryableByName)]
-    struct SqliteCount {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        count: i64,
+    diesel::table! {
+        sqlite_master (name) {
+            #[sql_name = "type"]
+            object_type -> Text,
+            name -> Text,
+        }
+    }
+
+    diesel::table! {
+        console_graph_fact_audit (kind) {
+            kind -> Text,
+        }
     }
 
     fn with_sqlite_test_connection<T, F>(database_path: &std::path::Path, operation: F) -> T
@@ -9590,64 +9597,87 @@ mod tests {
 
     fn sqlite_table_exists(database_path: &std::path::Path, table: &str) -> bool {
         use diesel::prelude::*;
-        use diesel::sql_query;
-        use diesel::sql_types::Text;
 
         let table = table.to_owned();
         with_sqlite_test_connection(database_path, move |connection| {
-            let row = sql_query(
-                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?",
-            )
-            .bind::<Text, _>(table)
-            .get_result::<SqliteCount>(connection)
-            .unwrap();
-            row.count > 0
+            sqlite_master::table
+                .filter(sqlite_master::object_type.eq("table"))
+                .filter(sqlite_master::name.eq(table))
+                .count()
+                .get_result::<i64>(connection)
+                .unwrap()
+                > 0
         })
     }
 
     fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
+        use crate::schema::{
+            console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
+        };
         use diesel::prelude::*;
-        use diesel::sql_query;
 
         let table = table.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| {
-            sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
-                .get_result::<SqliteCount>(connection)
-                .unwrap()
-                .count
+        with_sqlite_test_connection(database_path, move |connection| match table.as_str() {
+            "console_graph_materializations" => console_graph_materializations::table
+                .count()
+                .get_result(connection)
+                .unwrap(),
+            "console_graph_node_locations" => console_graph_node_locations::table
+                .count()
+                .get_result(connection)
+                .unwrap(),
+            "console_graph_edge_routes" => console_graph_edge_routes::table
+                .count()
+                .get_result(connection)
+                .unwrap(),
+            table => panic!("unsupported test table {table}"),
         })
     }
 
     fn sqlite_audit_row_count(database_path: &std::path::Path, kind: &str) -> i64 {
         use diesel::prelude::*;
-        use diesel::sql_query;
-        use diesel::sql_types::Text;
 
         let kind = kind.to_owned();
         with_sqlite_test_connection(database_path, move |connection| {
-            sql_query("SELECT COUNT(*) AS count FROM console_graph_fact_audit WHERE kind = ?")
-                .bind::<Text, _>(kind)
-                .get_result::<SqliteCount>(connection)
+            console_graph_fact_audit::table
+                .filter(console_graph_fact_audit::kind.eq(kind))
+                .count()
+                .get_result::<i64>(connection)
                 .unwrap()
-                .count
         })
     }
 
     fn sqlite_table_has_column(database_path: &std::path::Path, table: &str, column: &str) -> bool {
+        use crate::schema::{
+            console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
+        };
         use diesel::prelude::*;
-        use diesel::sql_query;
-        use diesel::sql_types::Text;
 
         let table = table.to_owned();
         let column = column.to_owned();
         with_sqlite_test_connection(database_path, move |connection| {
-            let row = sql_query(format!(
-                "SELECT COUNT(*) AS count FROM pragma_table_info('{table}') WHERE name = ?"
-            ))
-            .bind::<Text, _>(column)
-            .get_result::<SqliteCount>(connection)
-            .unwrap();
-            row.count > 0
+            match (table.as_str(), column.as_str()) {
+                ("console_graph_materializations", "source_version") => {
+                    console_graph_materializations::table
+                        .select(console_graph_materializations::source_version)
+                        .limit(0)
+                        .load::<i64>(connection)
+                        .is_ok()
+                }
+                ("console_graph_node_locations", "node_target") => {
+                    console_graph_node_locations::table
+                        .select(console_graph_node_locations::node_target)
+                        .limit(0)
+                        .load::<String>(connection)
+                        .is_ok()
+                }
+                ("console_graph_edge_routes", "edge_kind") => console_graph_edge_routes::table
+                    .select(console_graph_edge_routes::edge_kind)
+                    .limit(0)
+                    .load::<String>(connection)
+                    .is_ok(),
+                _ => false,
+            }
         })
     }
 
