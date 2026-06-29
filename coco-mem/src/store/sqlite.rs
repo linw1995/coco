@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
-use diesel::sql_query;
-use diesel::sql_types::{BigInt, Nullable, Text};
+use diesel::sql_types::{Nullable, Text};
 use diesel::sqlite::SqliteConnection;
 use diesel_async::pooled_connection::bb8::{
     Pool as AsyncSqlitePool, PooledConnection as AsyncSqlitePooledConnection,
@@ -82,6 +81,17 @@ diesel::table! {
         parent_id -> Text,
         child_id -> Text,
         kind -> Text,
+    }
+}
+
+diesel::table! {
+    #[sql_name = "message_queue_items"]
+    message_queue_items_with_rowid (queue, message_id) {
+        rowid -> BigInt,
+        queue -> Text,
+        message_id -> Text,
+        created_at -> Text,
+        payload_json -> Text,
     }
 }
 
@@ -246,11 +256,9 @@ macro_rules! node_row_columns {
     };
 }
 
-#[derive(QueryableByName)]
+#[derive(Queryable)]
 struct MessageQueueItemRow {
-    #[diesel(sql_type = BigInt)]
     row_id: i64,
-    #[diesel(sql_type = Text)]
     item_json: String,
 }
 
@@ -2678,18 +2686,17 @@ async fn load_message_queue_items(
     path: &Path,
     state: &mut StoreState,
 ) -> Result<()> {
-    let rows = sql_query(
-        r#"
-SELECT rowid AS row_id, payload_json AS item_json
-FROM message_queue_items
-ORDER BY rowid
-"#,
-    )
-    .load::<MessageQueueItemRow>(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
+    let rows = message_queue_items_with_rowid::table
+        .select((
+            message_queue_items_with_rowid::rowid,
+            message_queue_items_with_rowid::payload_json,
+        ))
+        .order(message_queue_items_with_rowid::rowid)
+        .load::<MessageQueueItemRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
     state.message_queues.clear();
     let mut items = Vec::new();
     for row in rows {
@@ -2906,36 +2913,37 @@ impl NodeStore for SqliteGraphStore {
         let path = self.database_path.clone();
         self.with_connection(move |connection| {
             Box::pin(async move {
-                let rows = sql_query(
-                    r#"
-WITH RECURSIVE ancestry(id, depth) AS (
-    SELECT ? AS id, 0 AS depth
-    UNION ALL
-    SELECT nodes.parent_id, ancestry.depth + 1
-    FROM nodes
-    JOIN ancestry ON nodes.id = ancestry.id
-    WHERE nodes.parent_id != ''
-)
-SELECT nodes.id, nodes.parent_id, nodes.created_at, nodes.role, nodes.kind, nodes.anchor_kind, nodes.anchor_session_role, nodes.anchor_provider_profile, nodes.anchor_provider, nodes.anchor_model, nodes.anchor_prompt, nodes.anchor_skill_name, nodes.anchor_skill_invocation_mode, nodes.metadata_json, nodes.kind_json
-FROM ancestry
-JOIN nodes ON nodes.id = ancestry.id
-ORDER BY ancestry.depth
-"#,
-                )
-                .bind::<Text, _>(&head_id)
-                .load::<NodeRow>(connection)
-                .await
-                .context(QuerySqliteStoreSnafu { path: path.clone() })?;
+                let mut rows = Vec::new();
+                let mut seen = HashSet::new();
+                let mut current_id = head_id;
+                loop {
+                    ensure!(
+                        seen.insert(current_id.clone()),
+                        CorruptedStoreSnafu {
+                            path: path.clone(),
+                            message: "SQLite nodes contain cyclic parents".to_owned(),
+                        }
+                    );
+                    let row = nodes::table
+                        .filter(nodes::id.eq(&current_id))
+                        .select(node_row_columns!())
+                        .get_result::<NodeRow>(connection)
+                        .await
+                        .optional()
+                        .context(QuerySqliteStoreSnafu { path: path.clone() })?
+                        .context(ParentNotFoundSnafu {
+                            id: current_id.clone(),
+                        })?;
+                    let parent_id = row.parent_id.clone();
+                    let is_root = parent_id.is_empty();
+                    rows.push(row);
+                    if is_root {
+                        break;
+                    }
+                    current_id = parent_id;
+                }
 
                 let nodes = node_rows_into_nodes(connection, &path, rows).await?;
-                if let Some(last) = nodes.last()
-                    && !last.is_root()
-                {
-                    return ParentNotFoundSnafu {
-                        id: last.parent.clone(),
-                    }
-                    .fail();
-                }
                 Ok(nodes)
             })
         })
