@@ -26,6 +26,7 @@ leptos.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 diesel.workspace = true
+diesel_migrations.workspace = true
 
 # Error handling.
 snafu.workspace = true
