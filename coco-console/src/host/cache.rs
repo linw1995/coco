@@ -9894,37 +9894,14 @@ mod tests {
     }
 
     fn create_legacy_snapshot_materialization_tables(database_path: &std::path::Path) {
-        use diesel::connection::SimpleConnection;
-
-        with_sqlite_test_connection(database_path, |connection| {
-            connection
-                .batch_execute(
-                    r#"
-CREATE TABLE console_graph_snapshots (mode TEXT PRIMARY KEY NOT NULL);
-CREATE TABLE console_graph_viewports (mode TEXT PRIMARY KEY NOT NULL);
-CREATE TABLE console_graph_viewport_lanes (mode TEXT NOT NULL);
-CREATE TABLE console_graph_viewport_nodes (mode TEXT NOT NULL);
-CREATE TABLE console_graph_viewport_edges (mode TEXT NOT NULL);
-"#,
-                )
-                .unwrap();
-        });
+        let fixture =
+            include_bytes!("../../tests/fixtures/legacy_snapshot_materialization.sqlite3");
+        std::fs::write(database_path, fixture).unwrap();
     }
 
     fn create_current_graph_materialization_tables(database_path: &std::path::Path) {
-        use diesel::connection::SimpleConnection;
-
-        with_sqlite_test_connection(database_path, |connection| {
-            connection
-                .batch_execute(
-                    r#"
-CREATE TABLE console_graph_materializations (mode TEXT);
-CREATE TABLE console_graph_node_locations (mode TEXT);
-CREATE TABLE console_graph_edge_routes (mode TEXT);
-"#,
-                )
-                .unwrap();
-        });
+        let fixture = include_bytes!("../../tests/fixtures/stale_graph_materialization.sqlite3");
+        std::fs::write(database_path, fixture).unwrap();
     }
 
     #[tokio::test]
