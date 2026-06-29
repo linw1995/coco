@@ -14,7 +14,7 @@ use diesel_async::pooled_connection::bb8::{
 };
 use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
-use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection, TransactionManager};
+use diesel_async::{AsyncConnection, RunQueryDsl, TransactionManager};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use serde_json::{Map, Value};
 use snafu::{IntoError, prelude::*};
@@ -1143,17 +1143,19 @@ fn sqlite_connection_setup_error(error: crate::StoreError) -> diesel::Connection
 }
 
 async fn configure_connection(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
-    connection
-        .batch_execute(
-            r#"
-PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
-"#,
-        )
+    SqliteConnectionPragma::ForeignKeysOn
+        .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
-        })
+        })?;
+    SqliteConnectionPragma::BusyTimeout5000
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(())
 }
 
 async fn configure_writable_connection(
@@ -1167,13 +1169,41 @@ async fn ensure_wal_journal_mode(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<()> {
-    connection
-        .batch_execute("PRAGMA journal_mode = WAL;")
+    SqliteConnectionPragma::JournalModeWal
+        .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SqliteConnectionPragma {
+    ForeignKeysOn,
+    BusyTimeout5000,
+    JournalModeWal,
+}
+
+impl diesel::query_builder::QueryId for SqliteConnectionPragma {
+    type QueryId = Self;
+
+    const HAS_STATIC_QUERY_ID: bool = false;
+}
+
+impl diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite> for SqliteConnectionPragma {
+    fn walk_ast<'b>(
+        &'b self,
+        mut out: diesel::query_builder::AstPass<'_, 'b, diesel::sqlite::Sqlite>,
+    ) -> diesel::QueryResult<()> {
+        out.unsafe_to_cache_prepared();
+        match self {
+            Self::ForeignKeysOn => out.push_sql("PRAGMA foreign_keys = ON"),
+            Self::BusyTimeout5000 => out.push_sql("PRAGMA busy_timeout = 5000"),
+            Self::JournalModeWal => out.push_sql("PRAGMA journal_mode = WAL"),
+        }
+        Ok(())
+    }
 }
 
 async fn ensure_diesel_migration_metadata(
