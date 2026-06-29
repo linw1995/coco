@@ -2692,29 +2692,33 @@ impl ConsoleGraphSnapshotStore {
         mode: GraphMode,
         target: Point,
     ) -> crate::Result<()> {
-        let rows = sql_query(
-            r#"
-SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
-FROM console_graph_edge_routes
-WHERE mode = ?
-  AND target_x = ?
-  AND target_y = ?
-ORDER BY
-  CASE edge_kind
-    WHEN 'primary_parent' THEN 0
-    WHEN 'fork' THEN 1
-    ELSE 2
-  END,
-  edge_key
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Integer, _>(target.x)
-        .bind::<Integer, _>(target.y)
-        .load::<EdgeRouteRow>(&mut *connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_edge_routes::dsl as edge_routes;
+
+        let mut rows = edge_routes::console_graph_edge_routes
+            .filter(edge_routes::mode.eq(mode.as_query_value()))
+            .filter(edge_routes::target_x.eq(target.x))
+            .filter(edge_routes::target_y.eq(target.y))
+            .select((
+                edge_routes::edge_key,
+                edge_routes::edge_kind,
+                edge_routes::source_id,
+                edge_routes::target_id,
+                edge_routes::source_x,
+                edge_routes::source_y,
+                edge_routes::target_x,
+                edge_routes::target_y,
+                edge_routes::route_slot,
+                edge_routes::target_port_offset,
+            ))
+            .load::<EdgeRouteRow>(&mut *connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+        rows.sort_by(|left, right| {
+            target_port_rebalance_order(&left.edge_kind)
+                .cmp(&target_port_rebalance_order(&right.edge_kind))
+                .then_with(|| left.edge_key.cmp(&right.edge_key))
+        });
         let mut primary_edges = Vec::new();
         let mut secondary_edges = Vec::new();
         for row in rows {
@@ -2777,32 +2781,43 @@ ORDER BY
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<()> {
-        let rows = sql_query(
-            r#"
-SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, target_x, target_y, route_slot, target_port_offset
-FROM console_graph_edge_routes
-WHERE mode = ? AND edge_kind != 'primary_parent'
-ORDER BY
-  source_y,
-  CASE
-    WHEN target_y > source_y THEN 1
-    WHEN target_y < source_y THEN -1
-    ELSE 0
-  END,
-  CASE edge_kind
-    WHEN 'fork' THEN 0
-    ELSE 1
-  END,
-  target_y,
-  target_x,
-  edge_key
-"#,
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .load::<EdgeRouteRow>(&mut *connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_edge_routes::dsl as edge_routes;
+
+        let mut rows = edge_routes::console_graph_edge_routes
+            .filter(edge_routes::mode.eq(mode.as_query_value()))
+            .filter(edge_routes::edge_kind.ne("primary_parent"))
+            .select((
+                edge_routes::edge_key,
+                edge_routes::edge_kind,
+                edge_routes::source_id,
+                edge_routes::target_id,
+                edge_routes::source_x,
+                edge_routes::source_y,
+                edge_routes::target_x,
+                edge_routes::target_y,
+                edge_routes::route_slot,
+                edge_routes::target_port_offset,
+            ))
+            .load::<EdgeRouteRow>(&mut *connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+        rows.sort_by(|left, right| {
+            left.source_y
+                .cmp(&right.source_y)
+                .then_with(|| {
+                    (left.target_y - left.source_y)
+                        .signum()
+                        .cmp(&(right.target_y - right.source_y).signum())
+                })
+                .then_with(|| {
+                    routed_edge_kind_order(&left.edge_kind)
+                        .cmp(&routed_edge_kind_order(&right.edge_kind))
+                })
+                .then_with(|| left.target_y.cmp(&right.target_y))
+                .then_with(|| left.target_x.cmp(&right.target_x))
+                .then_with(|| left.edge_key.cmp(&right.edge_key))
+        });
         let mut next_slot_by_corridor = BTreeMap::<(i32, i32), i32>::new();
         for row in rows {
             let kind = parse_edge_kind(&row.edge_kind)?;
@@ -3389,6 +3404,7 @@ ORDER BY
             world_max_x: input.world_max_x,
             world_max_y: input.world_max_y,
         };
+        let updated_at = jiff::Timestamp::now().to_string();
         diesel::insert_into(materializations::console_graph_materializations)
             .values(&row)
             .on_conflict(materializations::mode)
@@ -3406,9 +3422,7 @@ ORDER BY
                     .eq(diesel::upsert::excluded(materializations::world_max_x)),
                 materializations::world_max_y
                     .eq(diesel::upsert::excluded(materializations::world_max_y)),
-                materializations::updated_at.eq(diesel::dsl::sql::<Text>(
-                    "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-                )),
+                materializations::updated_at.eq(updated_at),
             ))
             .execute(connection)
             .context(QueryGraphSnapshotStoreSnafu {
@@ -3422,72 +3436,58 @@ ORDER BY
         connection: &mut SqliteConnection,
         insert: NodeLocationInsert<'_>,
     ) -> crate::Result<()> {
+        use console_graph_node_locations::dsl as node_locations;
+
         let labels_json = serde_json::to_string(&insert.node.labels).context(
             ParseGraphSnapshotStoreValueSnafu {
                 column: "console_graph_node_locations.labels_json",
             },
         )?;
-        sql_query(
-            r#"
-INSERT INTO console_graph_node_locations (
-    mode, node_key, node_id, node_target, short_id, node_kind, summary,
-    labels_json, lane_key, lane_label, lane_y, x, y, min_x, min_y, max_x, max_y
-)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(mode, node_key) DO UPDATE SET
-    node_id = excluded.node_id,
-    node_target = excluded.node_target,
-    short_id = excluded.short_id,
-    node_kind = excluded.node_kind,
-    summary = excluded.summary,
-    labels_json = excluded.labels_json,
-    lane_key = excluded.lane_key,
-    lane_label = excluded.lane_label,
-    lane_y = excluded.lane_y,
-    x = excluded.x,
-    y = excluded.y,
-    min_x = excluded.min_x,
-    min_y = excluded.min_y,
-    max_x = excluded.max_x,
-    max_y = excluded.max_y
-WHERE console_graph_node_locations.node_id IS NOT excluded.node_id
-   OR console_graph_node_locations.node_target IS NOT excluded.node_target
-   OR console_graph_node_locations.short_id IS NOT excluded.short_id
-   OR console_graph_node_locations.node_kind IS NOT excluded.node_kind
-   OR console_graph_node_locations.summary IS NOT excluded.summary
-   OR console_graph_node_locations.labels_json IS NOT excluded.labels_json
-   OR console_graph_node_locations.lane_key IS NOT excluded.lane_key
-   OR console_graph_node_locations.lane_label IS NOT excluded.lane_label
-   OR console_graph_node_locations.lane_y IS NOT excluded.lane_y
-   OR console_graph_node_locations.x IS NOT excluded.x
-   OR console_graph_node_locations.y IS NOT excluded.y
-   OR console_graph_node_locations.min_x IS NOT excluded.min_x
-   OR console_graph_node_locations.min_y IS NOT excluded.min_y
-   OR console_graph_node_locations.max_x IS NOT excluded.max_x
-   OR console_graph_node_locations.max_y IS NOT excluded.max_y
-"#,
-        )
-        .bind::<Text, _>(insert.mode.as_query_value())
-        .bind::<Text, _>(&insert.node.key)
-        .bind::<Text, _>(&insert.node.id)
-        .bind::<Text, _>(&insert.node.node_target)
-        .bind::<Text, _>(&insert.node.short_id)
-        .bind::<Text, _>(&insert.node.kind)
-        .bind::<Text, _>(&insert.node.summary)
-        .bind::<Text, _>(labels_json)
-        .bind::<Text, _>(&insert.lane.key)
-        .bind::<Text, _>(&insert.lane.label)
-        .bind::<Integer, _>(insert.lane.y)
-        .bind::<Integer, _>(insert.node.x)
-        .bind::<Integer, _>(insert.node.y)
-        .bind::<Integer, _>(insert.bounds.left)
-        .bind::<Integer, _>(insert.bounds.top)
-        .bind::<Integer, _>(insert.bounds.right)
-        .bind::<Integer, _>(insert.bounds.bottom)
-        .execute(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        diesel::insert_into(node_locations::console_graph_node_locations)
+            .values((
+                node_locations::mode.eq(insert.mode.as_query_value()),
+                node_locations::node_key.eq(&insert.node.key),
+                node_locations::node_id.eq(&insert.node.id),
+                node_locations::node_target.eq(&insert.node.node_target),
+                node_locations::short_id.eq(&insert.node.short_id),
+                node_locations::node_kind.eq(&insert.node.kind),
+                node_locations::summary.eq(&insert.node.summary),
+                node_locations::labels_json.eq(labels_json),
+                node_locations::lane_key.eq(&insert.lane.key),
+                node_locations::lane_label.eq(&insert.lane.label),
+                node_locations::lane_y.eq(insert.lane.y),
+                node_locations::x.eq(insert.node.x),
+                node_locations::y.eq(insert.node.y),
+                node_locations::min_x.eq(insert.bounds.left),
+                node_locations::min_y.eq(insert.bounds.top),
+                node_locations::max_x.eq(insert.bounds.right),
+                node_locations::max_y.eq(insert.bounds.bottom),
+            ))
+            .on_conflict((node_locations::mode, node_locations::node_key))
+            .do_update()
+            .set((
+                node_locations::node_id.eq(diesel::upsert::excluded(node_locations::node_id)),
+                node_locations::node_target
+                    .eq(diesel::upsert::excluded(node_locations::node_target)),
+                node_locations::short_id.eq(diesel::upsert::excluded(node_locations::short_id)),
+                node_locations::node_kind.eq(diesel::upsert::excluded(node_locations::node_kind)),
+                node_locations::summary.eq(diesel::upsert::excluded(node_locations::summary)),
+                node_locations::labels_json
+                    .eq(diesel::upsert::excluded(node_locations::labels_json)),
+                node_locations::lane_key.eq(diesel::upsert::excluded(node_locations::lane_key)),
+                node_locations::lane_label.eq(diesel::upsert::excluded(node_locations::lane_label)),
+                node_locations::lane_y.eq(diesel::upsert::excluded(node_locations::lane_y)),
+                node_locations::x.eq(diesel::upsert::excluded(node_locations::x)),
+                node_locations::y.eq(diesel::upsert::excluded(node_locations::y)),
+                node_locations::min_x.eq(diesel::upsert::excluded(node_locations::min_x)),
+                node_locations::min_y.eq(diesel::upsert::excluded(node_locations::min_y)),
+                node_locations::max_x.eq(diesel::upsert::excluded(node_locations::max_x)),
+                node_locations::max_y.eq(diesel::upsert::excluded(node_locations::max_y)),
+            ))
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         Ok(())
     }
 
@@ -3496,62 +3496,48 @@ WHERE console_graph_node_locations.node_id IS NOT excluded.node_id
         connection: &mut SqliteConnection,
         insert: EdgeRouteInsert<'_>,
     ) -> crate::Result<()> {
-        sql_query(
-            r#"
-INSERT INTO console_graph_edge_routes (
-    mode, edge_key, edge_kind, source_id, target_id,
-    source_x, source_y, target_x, target_y, route_slot, target_port_offset,
-    min_x, min_y, max_x, max_y
-)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(mode, edge_key) DO UPDATE SET
-    edge_kind = excluded.edge_kind,
-    source_id = excluded.source_id,
-    target_id = excluded.target_id,
-    source_x = excluded.source_x,
-    source_y = excluded.source_y,
-    target_x = excluded.target_x,
-    target_y = excluded.target_y,
-    route_slot = excluded.route_slot,
-    target_port_offset = excluded.target_port_offset,
-    min_x = excluded.min_x,
-    min_y = excluded.min_y,
-    max_x = excluded.max_x,
-    max_y = excluded.max_y
-WHERE console_graph_edge_routes.edge_kind IS NOT excluded.edge_kind
-   OR console_graph_edge_routes.source_id IS NOT excluded.source_id
-   OR console_graph_edge_routes.target_id IS NOT excluded.target_id
-   OR console_graph_edge_routes.source_x IS NOT excluded.source_x
-   OR console_graph_edge_routes.source_y IS NOT excluded.source_y
-   OR console_graph_edge_routes.target_x IS NOT excluded.target_x
-   OR console_graph_edge_routes.target_y IS NOT excluded.target_y
-   OR console_graph_edge_routes.route_slot IS NOT excluded.route_slot
-   OR console_graph_edge_routes.target_port_offset IS NOT excluded.target_port_offset
-   OR console_graph_edge_routes.min_x IS NOT excluded.min_x
-   OR console_graph_edge_routes.min_y IS NOT excluded.min_y
-   OR console_graph_edge_routes.max_x IS NOT excluded.max_x
-   OR console_graph_edge_routes.max_y IS NOT excluded.max_y
-"#,
-        )
-        .bind::<Text, _>(insert.mode.as_query_value())
-        .bind::<Text, _>(&insert.edge.key)
-        .bind::<Text, _>(edge_kind_query_value(insert.edge.kind))
-        .bind::<Text, _>(&insert.edge.source_id)
-        .bind::<Text, _>(&insert.edge.target_id)
-        .bind::<Integer, _>(insert.edge.source.x)
-        .bind::<Integer, _>(insert.edge.source.y)
-        .bind::<Integer, _>(insert.edge.target.x)
-        .bind::<Integer, _>(insert.edge.target.y)
-        .bind::<Integer, _>(insert.edge.route_slot)
-        .bind::<Double, _>(insert.edge.target_port_offset)
-        .bind::<Integer, _>(insert.bounds.left)
-        .bind::<Integer, _>(insert.bounds.top)
-        .bind::<Integer, _>(insert.bounds.right)
-        .bind::<Integer, _>(insert.bounds.bottom)
-        .execute(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        use console_graph_edge_routes::dsl as edge_routes;
+
+        diesel::insert_into(edge_routes::console_graph_edge_routes)
+            .values((
+                edge_routes::mode.eq(insert.mode.as_query_value()),
+                edge_routes::edge_key.eq(&insert.edge.key),
+                edge_routes::edge_kind.eq(edge_kind_query_value(insert.edge.kind)),
+                edge_routes::source_id.eq(&insert.edge.source_id),
+                edge_routes::target_id.eq(&insert.edge.target_id),
+                edge_routes::source_x.eq(insert.edge.source.x),
+                edge_routes::source_y.eq(insert.edge.source.y),
+                edge_routes::target_x.eq(insert.edge.target.x),
+                edge_routes::target_y.eq(insert.edge.target.y),
+                edge_routes::route_slot.eq(insert.edge.route_slot),
+                edge_routes::target_port_offset.eq(insert.edge.target_port_offset),
+                edge_routes::min_x.eq(insert.bounds.left),
+                edge_routes::min_y.eq(insert.bounds.top),
+                edge_routes::max_x.eq(insert.bounds.right),
+                edge_routes::max_y.eq(insert.bounds.bottom),
+            ))
+            .on_conflict((edge_routes::mode, edge_routes::edge_key))
+            .do_update()
+            .set((
+                edge_routes::edge_kind.eq(diesel::upsert::excluded(edge_routes::edge_kind)),
+                edge_routes::source_id.eq(diesel::upsert::excluded(edge_routes::source_id)),
+                edge_routes::target_id.eq(diesel::upsert::excluded(edge_routes::target_id)),
+                edge_routes::source_x.eq(diesel::upsert::excluded(edge_routes::source_x)),
+                edge_routes::source_y.eq(diesel::upsert::excluded(edge_routes::source_y)),
+                edge_routes::target_x.eq(diesel::upsert::excluded(edge_routes::target_x)),
+                edge_routes::target_y.eq(diesel::upsert::excluded(edge_routes::target_y)),
+                edge_routes::route_slot.eq(diesel::upsert::excluded(edge_routes::route_slot)),
+                edge_routes::target_port_offset
+                    .eq(diesel::upsert::excluded(edge_routes::target_port_offset)),
+                edge_routes::min_x.eq(diesel::upsert::excluded(edge_routes::min_x)),
+                edge_routes::min_y.eq(diesel::upsert::excluded(edge_routes::min_y)),
+                edge_routes::max_x.eq(diesel::upsert::excluded(edge_routes::max_x)),
+                edge_routes::max_y.eq(diesel::upsert::excluded(edge_routes::max_y)),
+            ))
+            .execute(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         Ok(())
     }
 
@@ -6052,6 +6038,21 @@ fn edge_kind_query_value(kind: GraphViewportEdgeKind) -> &'static str {
         GraphViewportEdgeKind::PrimaryParent => "primary_parent",
         GraphViewportEdgeKind::Fork => "fork",
         GraphViewportEdgeKind::MergeParent => "merge_parent",
+    }
+}
+
+fn target_port_rebalance_order(kind: &str) -> i32 {
+    match kind {
+        "primary_parent" => 0,
+        "fork" => 1,
+        _ => 2,
+    }
+}
+
+fn routed_edge_kind_order(kind: &str) -> i32 {
+    match kind {
+        "fork" => 0,
+        _ => 1,
     }
 }
 
