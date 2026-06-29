@@ -40,6 +40,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Failed to manage console graph snapshot store {}: {source}", path.display()))]
+    ManageGraphSnapshotStore { path: PathBuf, source: io::Error },
+
     #[snafu(display("Failed to connect console graph snapshot store {}: {source}", path.display()))]
     ConnectGraphSnapshotStore {
         path: PathBuf,

@@ -1347,7 +1347,6 @@ mod tests {
         PersistentStore, PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor,
         SkillInvocationMode, SkillResultAnchor, Tool, ToolUse,
     };
-    use diesel::QueryableByName;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1840,22 +1839,24 @@ mod tests {
         let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
         let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
-            use diesel::connection::SimpleConnection;
+            use crate::schema::console_graph_materializations::dsl as materializations;
+            use diesel::Connection;
             use diesel::prelude::*;
-            use diesel::sql_query;
 
             with_sqlite_test_connection(&graph_database_path, move |connection| {
-                connection.batch_execute("BEGIN TRANSACTION").unwrap();
-                assert_eq!(
-                    sql_query("SELECT COUNT(*) AS count FROM console_graph_materializations")
-                        .get_result::<SqliteCount>(connection)
-                        .unwrap()
-                        .count,
-                    0,
-                );
-                transaction_started_tx.send(()).unwrap();
-                release_transaction_rx.recv().unwrap();
-                connection.batch_execute("ROLLBACK").unwrap();
+                connection
+                    .transaction::<(), diesel::result::Error, _>(|connection| {
+                        assert_eq!(
+                            materializations::console_graph_materializations
+                                .count()
+                                .get_result::<i64>(connection)?,
+                            0,
+                        );
+                        transaction_started_tx.send(()).unwrap();
+                        release_transaction_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
             });
         });
         transaction_started_rx
@@ -1898,15 +1899,14 @@ mod tests {
         let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
         let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
-            use diesel::connection::SimpleConnection;
-
             with_sqlite_test_connection(&graph_database_path, move |connection| {
                 connection
-                    .batch_execute("BEGIN IMMEDIATE TRANSACTION")
+                    .immediate_transaction::<(), diesel::result::Error, _>(|_| {
+                        transaction_started_tx.send(()).unwrap();
+                        release_transaction_rx.recv().unwrap();
+                        Ok(())
+                    })
                     .unwrap();
-                transaction_started_tx.send(()).unwrap();
-                release_transaction_rx.recv().unwrap();
-                connection.batch_execute("ROLLBACK").unwrap();
             });
         });
         transaction_started_rx
@@ -3740,7 +3740,7 @@ mod tests {
 
         cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let next = writer
             .append(NewNode {
                 parent: text.clone(),
@@ -3779,10 +3779,10 @@ mod tests {
         assert_eq!(materialized.version, target_version);
         assert!(materialized.nodes.iter().any(|node| node.id == next));
 
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -3822,7 +3822,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let second = writer
             .append(NewNode {
                 parent: first.clone(),
@@ -3851,10 +3851,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
         assert!(cache.rebuild_statuses().iter().any(|status| {
             status.mode == GraphMode::All
                 && status.source_version == target_version
@@ -5356,7 +5356,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let merge_anchor = writer
             .append(NewNode {
                 parent: main_hidden.clone(),
@@ -5408,10 +5408,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -5476,7 +5476,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let merge_anchor = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -5532,10 +5532,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -5577,7 +5577,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let orphan_parent = writer
             .append(NewNode {
                 parent: root,
@@ -5629,10 +5629,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -6755,7 +6755,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let second = writer
             .append(NewNode {
                 parent: first.clone(),
@@ -6791,10 +6791,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -6825,7 +6825,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let prompt = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6876,10 +6876,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 2);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -6944,7 +6944,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer
             .set_branch_head("main", &second_prompt, &first_prompt)
             .unwrap();
@@ -6973,10 +6973,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7042,7 +7042,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.delete_branch("draft").unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7069,10 +7069,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7137,7 +7137,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.fork("draft", &session).unwrap();
         let draft_anchor = writer
             .append(NewNode {
@@ -7203,10 +7203,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7282,7 +7282,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.fork("draft", &current_session).unwrap();
         let draft_anchor = writer
             .append(NewNode {
@@ -7328,8 +7328,8 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
 
         drop(cache);
         drop(writer);
@@ -7378,7 +7378,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let current_session = writer
             .append(NewNode {
                 parent: old_prompt.clone(),
@@ -7434,8 +7434,8 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 2);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 2);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
 
         drop(cache);
         drop(writer);
@@ -7571,7 +7571,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.fork("draft", &main_anchor).unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7603,10 +7603,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 2);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7705,7 +7705,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let merge_anchor = writer
             .append(NewNode {
                 parent: main_hidden.clone(),
@@ -7776,10 +7776,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 2);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7943,7 +7943,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.set_branch_head("main", &second, &first).unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7966,10 +7966,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8034,7 +8034,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer
             .set_branch_head("main", &main_second, &main_first)
             .unwrap();
@@ -8075,10 +8075,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
         let viewport_error = tokio::time::timeout(
             Duration::from_millis(200),
             cache.viewport_after(
@@ -8177,7 +8177,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.delete_branch("draft").unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8202,8 +8202,8 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert!(sqlite_audit_row_count(&database_path, "node_delete") >= 3);
-        assert!(sqlite_audit_row_count(&database_path, "edge_delete") >= 3);
+        assert!(audit.row_count(&database_path, "node_delete") >= 3);
+        assert!(audit.row_count(&database_path, "edge_delete") >= 3);
 
         drop(cache);
         drop(writer);
@@ -8258,7 +8258,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let main_second = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8301,10 +8301,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 2);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 2);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8357,7 +8357,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.fork("draft", &main_first).unwrap();
         let draft_first = writer
             .append(NewNode {
@@ -8404,10 +8404,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8666,7 +8666,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.fork("draft", &main_first).unwrap();
         let draft_merge = writer
             .append(NewNode {
@@ -8721,10 +8721,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 2);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8766,7 +8766,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.fork("draft", &main_first).unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8806,10 +8806,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         publisher.mark_changed();
         let refresh_version = publisher.current_version();
@@ -8831,7 +8831,7 @@ mod tests {
 
         assert_eq!(refreshed.version, refresh_version);
         assert_eq!(refreshed_alias_nodes, 2);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8862,7 +8862,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.fork("draft", &session).unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8899,10 +8899,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8943,7 +8943,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         let main_next = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -8988,10 +8988,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 3);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 2);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9045,7 +9045,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.fork("beta", &main_first).unwrap();
         let beta_first = writer
             .append(NewNode {
@@ -9114,10 +9114,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 2);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9171,7 +9171,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.delete_branch("draft").unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -9192,10 +9192,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9260,7 +9260,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.delete_branch("main").unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -9299,10 +9299,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 0);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
         let viewport_error = tokio::time::timeout(
             Duration::from_millis(200),
             cache.viewport_after(
@@ -9388,7 +9388,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        create_graph_fact_audit_triggers(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path);
         writer.delete_branch("beta").unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -9428,10 +9428,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_delete"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_delete"), 2);
-        assert_eq!(sqlite_audit_row_count(&database_path, "node_update"), 1);
-        assert_eq!(sqlite_audit_row_count(&database_path, "edge_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_delete"), 2);
+        assert_eq!(audit.row_count(&database_path, "edge_delete"), 2);
+        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9529,31 +9529,18 @@ mod tests {
         writer.fork("main", &root).unwrap();
         let snapshot = ConsoleGraphSnapshotStore::open(&path).unwrap();
         let base = root.clone();
-        coco_mem::SqliteDatabase::open_store_path(&path)
-            .unwrap()
-            .with_sync_connection(
-                |connection| {
-                    use diesel::connection::SimpleConnection;
-
-                    connection.batch_execute("PRAGMA busy_timeout = 50")
-                },
-                |source| panic!("{source}"),
-                std::convert::identity,
-            )
-            .unwrap();
 
         let (started_tx, started_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
             snapshot
                 .with_connection_for_tests(move |connection| {
-                    use diesel::connection::SimpleConnection;
-
                     connection
-                        .batch_execute("BEGIN IMMEDIATE TRANSACTION")
+                        .immediate_transaction::<(), diesel::result::Error, _>(|_| {
+                            started_tx.send(()).unwrap();
+                            std::thread::sleep(Duration::from_millis(200));
+                            Ok(())
+                        })
                         .unwrap();
-                    started_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_millis(200));
-                    connection.batch_execute("COMMIT").unwrap();
                     Ok(())
                 })
                 .unwrap();
@@ -9567,10 +9554,12 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[derive(QueryableByName)]
-    struct SqliteCount {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        count: i64,
+    diesel::table! {
+        sqlite_master (name) {
+            #[sql_name = "type"]
+            object_type -> Text,
+            name -> Text,
+        }
     }
 
     fn with_sqlite_test_connection<T, F>(database_path: &std::path::Path, operation: F) -> T
@@ -9588,135 +9577,331 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Clone, PartialEq)]
+    struct MaterializedNodeFact {
+        node_id: String,
+        node_target: String,
+        short_id: String,
+        node_kind: String,
+        summary: String,
+        labels_json: String,
+        lane_key: String,
+        lane_label: String,
+        lane_y: i32,
+        x: i32,
+        y: i32,
+        min_x: i32,
+        min_y: i32,
+        max_x: i32,
+        max_y: i32,
+    }
+
+    #[derive(Clone, PartialEq)]
+    struct MaterializedEdgeFact {
+        edge_kind: String,
+        source_id: String,
+        target_id: String,
+        source_x: i32,
+        source_y: i32,
+        target_x: i32,
+        target_y: i32,
+        route_slot: i32,
+        target_port_offset_bits: u64,
+        min_x: i32,
+        min_y: i32,
+        max_x: i32,
+        max_y: i32,
+    }
+
+    struct GraphFactAuditSnapshot {
+        nodes: BTreeMap<(String, String), MaterializedNodeFact>,
+        edges: BTreeMap<(String, String), MaterializedEdgeFact>,
+    }
+
+    impl GraphFactAuditSnapshot {
+        fn capture(database_path: &std::path::Path) -> Self {
+            use crate::schema::{console_graph_edge_routes, console_graph_node_locations};
+            use diesel::prelude::*;
+
+            with_sqlite_test_connection(database_path, |connection| {
+                let nodes = console_graph_node_locations::table
+                    .select((
+                        console_graph_node_locations::mode,
+                        console_graph_node_locations::node_key,
+                        console_graph_node_locations::node_id,
+                        console_graph_node_locations::node_target,
+                        console_graph_node_locations::short_id,
+                        console_graph_node_locations::node_kind,
+                        console_graph_node_locations::summary,
+                        console_graph_node_locations::labels_json,
+                        console_graph_node_locations::lane_key,
+                        console_graph_node_locations::lane_label,
+                        console_graph_node_locations::lane_y,
+                        console_graph_node_locations::x,
+                        console_graph_node_locations::y,
+                        console_graph_node_locations::min_x,
+                        console_graph_node_locations::min_y,
+                        console_graph_node_locations::max_x,
+                        console_graph_node_locations::max_y,
+                    ))
+                    .load::<(
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        i32,
+                        i32,
+                        i32,
+                        i32,
+                        i32,
+                        i32,
+                        i32,
+                    )>(connection)
+                    .unwrap()
+                    .into_iter()
+                    .map(
+                        |(
+                            mode,
+                            node_key,
+                            node_id,
+                            node_target,
+                            short_id,
+                            node_kind,
+                            summary,
+                            labels_json,
+                            lane_key,
+                            lane_label,
+                            lane_y,
+                            x,
+                            y,
+                            min_x,
+                            min_y,
+                            max_x,
+                            max_y,
+                        )| {
+                            (
+                                (mode, node_key),
+                                MaterializedNodeFact {
+                                    node_id,
+                                    node_target,
+                                    short_id,
+                                    node_kind,
+                                    summary,
+                                    labels_json,
+                                    lane_key,
+                                    lane_label,
+                                    lane_y,
+                                    x,
+                                    y,
+                                    min_x,
+                                    min_y,
+                                    max_x,
+                                    max_y,
+                                },
+                            )
+                        },
+                    )
+                    .collect();
+                let edges = console_graph_edge_routes::table
+                    .select((
+                        console_graph_edge_routes::mode,
+                        console_graph_edge_routes::edge_key,
+                        console_graph_edge_routes::edge_kind,
+                        console_graph_edge_routes::source_id,
+                        console_graph_edge_routes::target_id,
+                        console_graph_edge_routes::source_x,
+                        console_graph_edge_routes::source_y,
+                        console_graph_edge_routes::target_x,
+                        console_graph_edge_routes::target_y,
+                        console_graph_edge_routes::route_slot,
+                        console_graph_edge_routes::target_port_offset,
+                        console_graph_edge_routes::min_x,
+                        console_graph_edge_routes::min_y,
+                        console_graph_edge_routes::max_x,
+                        console_graph_edge_routes::max_y,
+                    ))
+                    .load::<(
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        i32,
+                        i32,
+                        i32,
+                        i32,
+                        i32,
+                        f64,
+                        i32,
+                        i32,
+                        i32,
+                        i32,
+                    )>(connection)
+                    .unwrap()
+                    .into_iter()
+                    .map(
+                        |(
+                            mode,
+                            edge_key,
+                            edge_kind,
+                            source_id,
+                            target_id,
+                            source_x,
+                            source_y,
+                            target_x,
+                            target_y,
+                            route_slot,
+                            target_port_offset,
+                            min_x,
+                            min_y,
+                            max_x,
+                            max_y,
+                        )| {
+                            (
+                                (mode, edge_key),
+                                MaterializedEdgeFact {
+                                    edge_kind,
+                                    source_id,
+                                    target_id,
+                                    source_x,
+                                    source_y,
+                                    target_x,
+                                    target_y,
+                                    route_slot,
+                                    target_port_offset_bits: target_port_offset.to_bits(),
+                                    min_x,
+                                    min_y,
+                                    max_x,
+                                    max_y,
+                                },
+                            )
+                        },
+                    )
+                    .collect();
+                Self { nodes, edges }
+            })
+        }
+
+        fn row_count(&self, database_path: &std::path::Path, kind: &str) -> i64 {
+            let next = Self::capture(database_path);
+            match kind {
+                "node_delete" => deleted_count(&self.nodes, &next.nodes),
+                "edge_delete" => deleted_count(&self.edges, &next.edges),
+                "node_update" => updated_count(&self.nodes, &next.nodes),
+                "edge_update" => updated_count(&self.edges, &next.edges),
+                kind => panic!("unsupported graph fact audit kind {kind}"),
+            }
+        }
+    }
+
+    fn deleted_count<T>(
+        before: &BTreeMap<(String, String), T>,
+        after: &BTreeMap<(String, String), T>,
+    ) -> i64 {
+        before
+            .keys()
+            .filter(|key| !after.contains_key(*key))
+            .count() as i64
+    }
+
+    fn updated_count<T: PartialEq>(
+        before: &BTreeMap<(String, String), T>,
+        after: &BTreeMap<(String, String), T>,
+    ) -> i64 {
+        before
+            .iter()
+            .filter(|(key, value)| after.get(*key).is_some_and(|next| next != *value))
+            .count() as i64
+    }
+
     fn sqlite_table_exists(database_path: &std::path::Path, table: &str) -> bool {
         use diesel::prelude::*;
-        use diesel::sql_query;
-        use diesel::sql_types::Text;
 
         let table = table.to_owned();
         with_sqlite_test_connection(database_path, move |connection| {
-            let row = sql_query(
-                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?",
-            )
-            .bind::<Text, _>(table)
-            .get_result::<SqliteCount>(connection)
-            .unwrap();
-            row.count > 0
+            sqlite_master::table
+                .filter(sqlite_master::object_type.eq("table"))
+                .filter(sqlite_master::name.eq(table))
+                .count()
+                .get_result::<i64>(connection)
+                .unwrap()
+                > 0
         })
     }
 
     fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
+        use crate::schema::{
+            console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
+        };
         use diesel::prelude::*;
-        use diesel::sql_query;
 
         let table = table.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| {
-            sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
-                .get_result::<SqliteCount>(connection)
-                .unwrap()
-                .count
-        })
-    }
-
-    fn sqlite_audit_row_count(database_path: &std::path::Path, kind: &str) -> i64 {
-        use diesel::prelude::*;
-        use diesel::sql_query;
-        use diesel::sql_types::Text;
-
-        let kind = kind.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| {
-            sql_query("SELECT COUNT(*) AS count FROM console_graph_fact_audit WHERE kind = ?")
-                .bind::<Text, _>(kind)
-                .get_result::<SqliteCount>(connection)
-                .unwrap()
-                .count
+        with_sqlite_test_connection(database_path, move |connection| match table.as_str() {
+            "console_graph_materializations" => console_graph_materializations::table
+                .count()
+                .get_result(connection)
+                .unwrap(),
+            "console_graph_node_locations" => console_graph_node_locations::table
+                .count()
+                .get_result(connection)
+                .unwrap(),
+            "console_graph_edge_routes" => console_graph_edge_routes::table
+                .count()
+                .get_result(connection)
+                .unwrap(),
+            table => panic!("unsupported test table {table}"),
         })
     }
 
     fn sqlite_table_has_column(database_path: &std::path::Path, table: &str, column: &str) -> bool {
+        use crate::schema::{
+            console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
+        };
         use diesel::prelude::*;
-        use diesel::sql_query;
-        use diesel::sql_types::Text;
 
         let table = table.to_owned();
         let column = column.to_owned();
         with_sqlite_test_connection(database_path, move |connection| {
-            let row = sql_query(format!(
-                "SELECT COUNT(*) AS count FROM pragma_table_info('{table}') WHERE name = ?"
-            ))
-            .bind::<Text, _>(column)
-            .get_result::<SqliteCount>(connection)
-            .unwrap();
-            row.count > 0
+            match (table.as_str(), column.as_str()) {
+                ("console_graph_materializations", "source_version") => {
+                    console_graph_materializations::table
+                        .select(console_graph_materializations::source_version)
+                        .limit(0)
+                        .load::<i64>(connection)
+                        .is_ok()
+                }
+                ("console_graph_node_locations", "node_target") => {
+                    console_graph_node_locations::table
+                        .select(console_graph_node_locations::node_target)
+                        .limit(0)
+                        .load::<String>(connection)
+                        .is_ok()
+                }
+                ("console_graph_edge_routes", "edge_kind") => console_graph_edge_routes::table
+                    .select(console_graph_edge_routes::edge_kind)
+                    .limit(0)
+                    .load::<String>(connection)
+                    .is_ok(),
+                _ => false,
+            }
         })
     }
 
     fn create_legacy_snapshot_materialization_tables(database_path: &std::path::Path) {
-        use diesel::connection::SimpleConnection;
-
-        with_sqlite_test_connection(database_path, |connection| {
-            connection
-                .batch_execute(
-                    r#"
-CREATE TABLE console_graph_snapshots (mode TEXT PRIMARY KEY NOT NULL);
-CREATE TABLE console_graph_viewports (mode TEXT PRIMARY KEY NOT NULL);
-CREATE TABLE console_graph_viewport_lanes (mode TEXT NOT NULL);
-CREATE TABLE console_graph_viewport_nodes (mode TEXT NOT NULL);
-CREATE TABLE console_graph_viewport_edges (mode TEXT NOT NULL);
-"#,
-                )
-                .unwrap();
-        });
+        let fixture =
+            include_bytes!("../../tests/fixtures/legacy_snapshot_materialization.sqlite3");
+        std::fs::write(database_path, fixture).unwrap();
     }
 
     fn create_current_graph_materialization_tables(database_path: &std::path::Path) {
-        use diesel::connection::SimpleConnection;
-
-        with_sqlite_test_connection(database_path, |connection| {
-            connection
-                .batch_execute(
-                    r#"
-CREATE TABLE console_graph_materializations (mode TEXT);
-CREATE TABLE console_graph_node_locations (mode TEXT);
-CREATE TABLE console_graph_edge_routes (mode TEXT);
-"#,
-                )
-                .unwrap();
-        });
-    }
-
-    fn create_graph_fact_audit_triggers(database_path: &std::path::Path) {
-        use diesel::connection::SimpleConnection;
-
-        with_sqlite_test_connection(database_path, |connection| {
-            connection
-                .batch_execute(
-                    r#"
-CREATE TABLE console_graph_fact_audit (kind TEXT NOT NULL);
-CREATE TRIGGER console_graph_node_delete_audit
-AFTER DELETE ON console_graph_node_locations
-BEGIN
-    INSERT INTO console_graph_fact_audit (kind) VALUES ('node_delete');
-END;
-CREATE TRIGGER console_graph_edge_delete_audit
-AFTER DELETE ON console_graph_edge_routes
-BEGIN
-    INSERT INTO console_graph_fact_audit (kind) VALUES ('edge_delete');
-END;
-CREATE TRIGGER console_graph_node_update_audit
-AFTER UPDATE ON console_graph_node_locations
-BEGIN
-    INSERT INTO console_graph_fact_audit (kind) VALUES ('node_update');
-END;
-CREATE TRIGGER console_graph_edge_update_audit
-AFTER UPDATE ON console_graph_edge_routes
-BEGIN
-    INSERT INTO console_graph_fact_audit (kind) VALUES ('edge_update');
-END;
-"#,
-                )
-                .unwrap();
-        });
+        let fixture = include_bytes!("../../tests/fixtures/stale_graph_materialization.sqlite3");
+        std::fs::write(database_path, fixture).unwrap();
     }
 
     #[tokio::test]
