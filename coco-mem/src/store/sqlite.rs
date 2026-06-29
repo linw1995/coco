@@ -3805,6 +3805,12 @@ mod tests {
         super::configure_writable_connection(connection, store_path)
             .await
             .unwrap();
+        create_legacy_schema_migration_table_for_test(connection).await;
+        run_store_migration_for_test(connection, "00000000000001", false).await;
+        insert_legacy_schema_migrations_for_test(connection, &[(1, "initial-store-schema")]).await;
+    }
+
+    async fn create_legacy_schema_migration_table_for_test(connection: &mut AsyncSqliteConnection) {
         connection
             .batch_execute(
                 r#"
@@ -3817,15 +3823,22 @@ CREATE TABLE store_schema_migrations (
             )
             .await
             .unwrap();
-        run_store_migration_for_test(connection, "00000000000001", false).await;
-        diesel::insert_into(super::store_schema_migrations::table)
-            .values((
-                super::store_schema_migrations::version.eq(1),
-                super::store_schema_migrations::name.eq("initial-store-schema"),
-            ))
-            .execute(connection)
-            .await
-            .unwrap();
+    }
+
+    async fn insert_legacy_schema_migrations_for_test(
+        connection: &mut AsyncSqliteConnection,
+        migrations: &[(i32, &'static str)],
+    ) {
+        for (version, name) in migrations {
+            diesel::insert_into(super::store_schema_migrations::table)
+                .values((
+                    super::store_schema_migrations::version.eq(*version),
+                    super::store_schema_migrations::name.eq(*name),
+                ))
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
     }
 
     async fn run_store_migration_for_test(
@@ -3856,6 +3869,72 @@ CREATE TABLE store_schema_migrations (
             .await
             .unwrap()
             .unwrap();
+    }
+
+    async fn apply_current_schema_without_diesel_migration_records_for_test(
+        connection: &mut AsyncSqliteConnection,
+        store_path: &std::path::Path,
+    ) {
+        super::configure_writable_connection(connection, store_path)
+            .await
+            .unwrap();
+        for version in [
+            "00000000000001",
+            "00000000000002",
+            "00000000000003",
+            "00000000000004",
+            "00000000000005",
+            "00000000000006",
+        ] {
+            run_store_migration_for_test(connection, version, false).await;
+        }
+    }
+
+    fn create_legacy_current_schema_store_for_test(
+        path: &std::path::Path,
+        with_empty_diesel_table: bool,
+    ) -> String {
+        std::fs::create_dir(path).unwrap();
+        let store = SqliteStore::new(path, StoreAccess::ReadWrite).unwrap();
+        let state = super::StoreState::new();
+        let root_id = state.root_id().to_owned();
+        store.block_on(async {
+            let mut connection = store.connect().await.unwrap();
+            apply_current_schema_without_diesel_migration_records_for_test(
+                &mut connection,
+                &store.database_path,
+            )
+            .await;
+            create_legacy_schema_migration_table_for_test(&mut connection).await;
+            insert_legacy_schema_migrations_for_test(
+                &mut connection,
+                &[
+                    (1, "initial-store-schema"),
+                    (2, "node-relations"),
+                    (3, "node-kind"),
+                    (4, "session-job-summary"),
+                    (5, "node-metadata"),
+                    (6, "node-anchor-summary"),
+                ],
+            )
+            .await;
+            if with_empty_diesel_table {
+                super::ensure_diesel_migration_metadata(&mut connection, &store.database_path)
+                    .await
+                    .unwrap();
+            }
+            persist_root_metadata(&mut connection, &store.database_path, &root_id)
+                .await
+                .unwrap();
+            super::persist_node_without_transaction(
+                &mut connection,
+                &store.database_path,
+                state.root_node(),
+            )
+            .await
+            .unwrap();
+        });
+        root_id
     }
 
     async fn insert_v1_node_row(
@@ -4081,33 +4160,7 @@ CREATE TABLE store_schema_migrations (
     fn open_read_only_accepts_legacy_current_schema() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
-        let root_id = store.root_id();
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            connection
-                .batch_execute(
-                    r#"
-CREATE TABLE store_schema_migrations (
-    version INTEGER PRIMARY KEY NOT NULL,
-    name TEXT NOT NULL,
-    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-INSERT INTO store_schema_migrations (version, name)
-VALUES
-    (1, 'initial-store-schema'),
-    (2, 'node-relations'),
-    (3, 'node-kind'),
-    (4, 'session-job-summary'),
-    (5, 'node-metadata'),
-    (6, 'node-anchor-summary');
-DROP TABLE __diesel_schema_migrations;
-"#,
-                )
-                .await
-                .unwrap();
-        });
-        drop(store);
+        let root_id = create_legacy_current_schema_store_for_test(&path, false);
 
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
@@ -4121,33 +4174,7 @@ DROP TABLE __diesel_schema_migrations;
     fn open_read_only_accepts_legacy_current_schema_with_empty_diesel_table() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
-        let root_id = store.root_id();
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            connection
-                .batch_execute(
-                    r#"
-CREATE TABLE store_schema_migrations (
-    version INTEGER PRIMARY KEY NOT NULL,
-    name TEXT NOT NULL,
-    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-INSERT INTO store_schema_migrations (version, name)
-VALUES
-    (1, 'initial-store-schema'),
-    (2, 'node-relations'),
-    (3, 'node-kind'),
-    (4, 'session-job-summary'),
-    (5, 'node-metadata'),
-    (6, 'node-anchor-summary');
-DELETE FROM __diesel_schema_migrations;
-"#,
-                )
-                .await
-                .unwrap();
-        });
-        drop(store);
+        let root_id = create_legacy_current_schema_store_for_test(&path, true);
 
         let store = SqliteStore::open_read_only(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
