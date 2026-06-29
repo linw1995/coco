@@ -57,6 +57,14 @@ const LEGACY_MATERIALIZATION_TABLES: &[&str] = &[
 ];
 const CONSOLE_GRAPH_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
+diesel::table! {
+    sqlite_master (name) {
+        #[sql_name = "type"]
+        object_type -> Text,
+        name -> Text,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ConsoleGraphSnapshotStore {
     path: Arc<PathBuf>,
@@ -496,18 +504,6 @@ struct MaterializationMetaInput {
     world_min_y: i32,
     world_max_x: i32,
     world_max_y: i32,
-}
-
-#[derive(QueryableByName)]
-struct SqliteInteger {
-    #[diesel(sql_type = Integer)]
-    value: i32,
-}
-
-#[derive(QueryableByName)]
-struct SqliteTableColumn {
-    #[diesel(sql_type = Text)]
-    name: String,
 }
 
 impl ConsoleGraphSnapshotStore {
@@ -5470,18 +5466,14 @@ fn materialization_tables_have_current_schema(
     connection: &mut SqliteConnection,
     path: &Path,
 ) -> crate::Result<bool> {
-    for (table, column) in [
-        ("console_graph_materializations", "source_version"),
-        ("console_graph_node_locations", "node_target"),
-        ("console_graph_edge_routes", "edge_kind"),
-    ] {
-        if sqlite_table_exists(connection, path, table)?
-            && !sqlite_table_has_column(connection, path, table, column)?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(
+        (!sqlite_table_exists(connection, path, "console_graph_materializations")?
+            || materializations_have_source_version_column(connection))
+            && (!sqlite_table_exists(connection, path, "console_graph_node_locations")?
+                || node_locations_have_node_target_column(connection))
+            && (!sqlite_table_exists(connection, path, "console_graph_edge_routes")?
+                || edge_routes_have_edge_kind_column(connection)),
+    )
 }
 
 fn sqlite_table_exists(
@@ -5489,29 +5481,39 @@ fn sqlite_table_exists(
     path: &Path,
     table: &str,
 ) -> crate::Result<bool> {
-    let count =
-        sql_query("SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = ?")
-            .bind::<Text, _>(table)
-            .get_result::<SqliteInteger>(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: path.to_owned(),
-            })?
-            .value;
-    Ok(count > 0)
-}
-
-fn sqlite_table_has_column(
-    connection: &mut SqliteConnection,
-    path: &Path,
-    table: &str,
-    column: &str,
-) -> crate::Result<bool> {
-    let columns = sql_query(format!("PRAGMA table_info({table})"))
-        .load::<SqliteTableColumn>(connection)
+    let count = sqlite_master::table
+        .filter(sqlite_master::object_type.eq("table"))
+        .filter(sqlite_master::name.eq(table))
+        .count()
+        .get_result::<i64>(connection)
         .context(QueryGraphSnapshotStoreSnafu {
             path: path.to_owned(),
         })?;
-    Ok(columns.iter().any(|info| info.name == column))
+    Ok(count > 0)
+}
+
+fn materializations_have_source_version_column(connection: &mut SqliteConnection) -> bool {
+    console_graph_materializations::table
+        .select(console_graph_materializations::source_version)
+        .limit(0)
+        .load::<i64>(connection)
+        .is_ok()
+}
+
+fn node_locations_have_node_target_column(connection: &mut SqliteConnection) -> bool {
+    console_graph_node_locations::table
+        .select(console_graph_node_locations::node_target)
+        .limit(0)
+        .load::<String>(connection)
+        .is_ok()
+}
+
+fn edge_routes_have_edge_kind_column(connection: &mut SqliteConnection) -> bool {
+    console_graph_edge_routes::table
+        .select(console_graph_edge_routes::edge_kind)
+        .limit(0)
+        .load::<String>(connection)
+        .is_ok()
 }
 
 fn drop_tables(
