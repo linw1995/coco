@@ -3558,10 +3558,13 @@ mod tests {
         SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
     };
     use diesel::prelude::*;
-    use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
+    use diesel_async::{AsyncConnection, RunQueryDsl};
     use diesel_migrations::MigrationHarness;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    const LEGACY_SCHEMA_METADATA_DATABASE: &[u8] =
+        include_bytes!("../../tests/fixtures/legacy_schema_metadata.sqlite3");
 
     #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
     struct NodeRelationRow {
@@ -3805,24 +3808,16 @@ mod tests {
         super::configure_writable_connection(connection, store_path)
             .await
             .unwrap();
-        create_legacy_schema_migration_table_for_test(connection).await;
         run_store_migration_for_test(connection, "00000000000001", false).await;
         insert_legacy_schema_migrations_for_test(connection, &[(1, "initial-store-schema")]).await;
     }
 
-    async fn create_legacy_schema_migration_table_for_test(connection: &mut AsyncSqliteConnection) {
-        connection
-            .batch_execute(
-                r#"
-CREATE TABLE store_schema_migrations (
-    version INTEGER PRIMARY KEY NOT NULL,
-    name TEXT NOT NULL,
-    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-"#,
-            )
-            .await
-            .unwrap();
+    fn write_legacy_schema_metadata_database_for_test(path: &std::path::Path) {
+        std::fs::write(
+            super::sqlite_database_path(path),
+            LEGACY_SCHEMA_METADATA_DATABASE,
+        )
+        .unwrap();
     }
 
     async fn insert_legacy_schema_migrations_for_test(
@@ -3895,6 +3890,7 @@ CREATE TABLE store_schema_migrations (
         with_empty_diesel_table: bool,
     ) -> String {
         std::fs::create_dir(path).unwrap();
+        write_legacy_schema_metadata_database_for_test(path);
         let store = SqliteStore::new(path, StoreAccess::ReadWrite).unwrap();
         let state = super::StoreState::new();
         let root_id = state.root_id().to_owned();
@@ -3905,7 +3901,6 @@ CREATE TABLE store_schema_migrations (
                 &store.database_path,
             )
             .await;
-            create_legacy_schema_migration_table_for_test(&mut connection).await;
             insert_legacy_schema_migrations_for_test(
                 &mut connection,
                 &[
@@ -4967,6 +4962,7 @@ CREATE TABLE store_schema_migrations (
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
+        write_legacy_schema_metadata_database_for_test(&path);
         let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
         let state = super::StoreState::new();
         let root = state.root_node().clone();
