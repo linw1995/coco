@@ -506,6 +506,18 @@ struct MaterializationMetaInput {
     world_max_y: i32,
 }
 
+enum SnapshotTransactionError {
+    Query(diesel::result::Error),
+    Operation(crate::Error),
+    RollbackFalse,
+}
+
+impl From<diesel::result::Error> for SnapshotTransactionError {
+    fn from(source: diesel::result::Error) -> Self {
+        Self::Query(source)
+    }
+}
+
 impl ConsoleGraphSnapshotStore {
     pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
         let dir = dir.as_ref();
@@ -837,17 +849,9 @@ impl ConsoleGraphSnapshotStore {
     where
         F: FnOnce(&Self, &mut SqliteConnection) -> crate::Result<T>,
     {
-        self.begin_write_transaction(connection)?;
-        match operation(self, connection) {
-            Ok(value) => {
-                self.commit_transaction(connection)?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = self.rollback_transaction(connection);
-                Err(error)
-            }
-        }
+        self.finish_transaction(connection.immediate_transaction(|connection| {
+            operation(self, connection).map_err(SnapshotTransactionError::Operation)
+        }))
     }
 
     fn run_read_transaction<T, F>(
@@ -858,17 +862,9 @@ impl ConsoleGraphSnapshotStore {
     where
         F: FnOnce(&Self, &mut SqliteConnection) -> crate::Result<T>,
     {
-        self.begin_read_transaction(connection)?;
-        match operation(self, connection) {
-            Ok(value) => {
-                self.commit_transaction(connection)?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = self.rollback_transaction(connection);
-                Err(error)
-            }
-        }
+        self.finish_transaction(connection.transaction(|connection| {
+            operation(self, connection).map_err(SnapshotTransactionError::Operation)
+        }))
     }
 
     fn run_bool_write_transaction<F>(
@@ -879,20 +875,14 @@ impl ConsoleGraphSnapshotStore {
     where
         F: FnOnce(&Self, &mut SqliteConnection) -> crate::Result<bool>,
     {
-        self.begin_write_transaction(connection)?;
-        match operation(self, connection) {
-            Ok(true) => {
-                self.commit_transaction(connection)?;
-                Ok(true)
-            }
-            Ok(false) => {
-                let _ = self.rollback_transaction(connection);
-                Ok(false)
-            }
-            Err(error) => {
-                let _ = self.rollback_transaction(connection);
-                Err(error)
-            }
+        match connection.immediate_transaction(|connection| match operation(self, connection) {
+            Ok(true) => Ok(true),
+            Ok(false) => Err(SnapshotTransactionError::RollbackFalse),
+            Err(error) => Err(SnapshotTransactionError::Operation(error)),
+        }) {
+            Ok(true) => Ok(true),
+            Err(SnapshotTransactionError::RollbackFalse) => Ok(false),
+            result => self.finish_transaction(result),
         }
     }
 
@@ -904,20 +894,15 @@ impl ConsoleGraphSnapshotStore {
     ) -> crate::Result<()> {
         let this = self.clone();
         self.with_connection(move |connection| {
-            this.begin_write_transaction(connection)?;
-            let result = this.replace_materialization_from_viewport_in_transaction(
-                connection,
-                mode,
-                viewport,
-                branch_labels,
-            );
-            match result {
-                Ok(()) => this.commit_transaction(connection),
-                Err(error) => {
-                    let _ = this.rollback_transaction(connection);
-                    Err(error)
-                }
-            }
+            this.finish_transaction(connection.immediate_transaction(|connection| {
+                this.replace_materialization_from_viewport_in_transaction(
+                    connection,
+                    mode,
+                    viewport,
+                    branch_labels,
+                )
+                .map_err(SnapshotTransactionError::Operation)
+            }))
         })
     }
 
@@ -3305,40 +3290,22 @@ impl ConsoleGraphSnapshotStore {
         Ok(true)
     }
 
-    fn begin_write_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
-        sql_query("BEGIN IMMEDIATE TRANSACTION")
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
+    fn finish_transaction<T>(
+        &self,
+        result: std::result::Result<T, SnapshotTransactionError>,
+    ) -> crate::Result<T> {
+        result.map_err(|error| match error {
+            SnapshotTransactionError::Query(source) => crate::Error::QueryGraphSnapshotStore {
                 path: self.path.as_ref().clone(),
-            })?;
-        Ok(())
-    }
-
-    fn begin_read_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
-        sql_query("BEGIN")
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
-        Ok(())
-    }
-
-    fn commit_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
-        sql_query("COMMIT")
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
-        Ok(())
-    }
-
-    fn rollback_transaction(&self, connection: &mut SqliteConnection) -> crate::Result<()> {
-        sql_query("ROLLBACK")
-            .execute(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
-        Ok(())
+                source,
+            },
+            SnapshotTransactionError::Operation(error) => error,
+            SnapshotTransactionError::RollbackFalse => crate::Error::ConsoleGraphRebuild {
+                mode: "unknown",
+                source_version: 0,
+                message: "unexpected rollback sentinel".to_owned(),
+            },
+        })
     }
 
     fn ensure_schema(&self) -> crate::Result<()> {
