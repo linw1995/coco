@@ -53,6 +53,38 @@ const LEGACY_JSON_STORE_MARKERS: &[&str] = &["meta.json", "nodes.jsonl"];
 const STORE_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 const SQLITE_POOL_MAX_SIZE: u32 = 4;
 
+diesel::table! {
+    __diesel_schema_migrations (version) {
+        version -> Text,
+        run_on -> Text,
+    }
+}
+
+diesel::table! {
+    store_schema_migrations (version) {
+        version -> Integer,
+        name -> Text,
+        applied_at -> Text,
+    }
+}
+
+diesel::table! {
+    sqlite_master (name) {
+        #[sql_name = "type"]
+        object_type -> Text,
+        name -> Text,
+    }
+}
+
+diesel::table! {
+    #[sql_name = "node_edges"]
+    legacy_node_edges (parent_id, child_id, kind) {
+        parent_id -> Text,
+        child_id -> Text,
+        kind -> Text,
+    }
+}
+
 static SQLITE_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SQLITE_RUNTIME_INIT: Mutex<()> = Mutex::new(());
 static SQLITE_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<SqliteDatabaseInner>>>> =
@@ -110,18 +142,6 @@ impl std::fmt::Debug for SqliteGraphStore {
 enum StoreAccess {
     ReadWrite,
     ReadOnly,
-}
-
-#[derive(QueryableByName)]
-struct TableCount {
-    #[diesel(sql_type = BigInt)]
-    count: i64,
-}
-
-#[derive(QueryableByName)]
-struct CurrentSchemaVersion {
-    #[diesel(sql_type = Nullable<Text>)]
-    version: Option<String>,
 }
 
 #[derive(Queryable, QueryableByName)]
@@ -1164,11 +1184,12 @@ async fn table_count(
     path: &Path,
     table_name: &str,
 ) -> Result<i64> {
-    sql_query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?")
-        .bind::<diesel::sql_types::Text, _>(table_name)
-        .get_result::<TableCount>(connection)
+    sqlite_master::table
+        .filter(sqlite_master::object_type.eq("table"))
+        .filter(sqlite_master::name.eq(table_name))
+        .count()
+        .get_result(connection)
         .await
-        .map(|row| row.count)
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })
@@ -1178,13 +1199,13 @@ async fn current_schema_version(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<Option<i32>> {
-    sql_query("SELECT MAX(version) AS version FROM __diesel_schema_migrations")
-        .get_result::<CurrentSchemaVersion>(connection)
+    __diesel_schema_migrations::table
+        .select(diesel::dsl::max(__diesel_schema_migrations::version))
+        .get_result::<Option<String>>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?
-        .version
         .map(|version| migration_version_to_schema_version(&version, path))
         .transpose()
 }
@@ -1233,15 +1254,13 @@ async fn current_legacy_schema_version(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<Option<i32>> {
-    sql_query("SELECT CAST(MAX(version) AS TEXT) AS version FROM store_schema_migrations")
-        .get_result::<CurrentSchemaVersion>(connection)
+    store_schema_migrations::table
+        .select(diesel::dsl::max(store_schema_migrations::version))
+        .get_result::<Option<i32>>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
-        })?
-        .version
-        .map(|version| migration_version_to_schema_version(&version, path))
-        .transpose()
+        })
 }
 
 async fn reject_newer_schema_version(
@@ -1287,18 +1306,30 @@ async fn bootstrap_diesel_migrations_from_legacy_table(
         return Ok(());
     }
 
-    sql_query(
-        r#"
-INSERT OR IGNORE INTO __diesel_schema_migrations (version, run_on)
-SELECT printf('%014d', version), applied_at
-FROM store_schema_migrations
-"#,
-    )
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
+    let rows = store_schema_migrations::table
+        .select((
+            store_schema_migrations::version,
+            store_schema_migrations::applied_at,
+        ))
+        .load::<(i32, String)>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    for (version, applied_at) in rows {
+        diesel::insert_into(__diesel_schema_migrations::table)
+            .values((
+                __diesel_schema_migrations::version.eq(format!("{version:014}")),
+                __diesel_schema_migrations::run_on.eq(applied_at),
+            ))
+            .on_conflict(__diesel_schema_migrations::version)
+            .do_nothing()
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
+    }
     Ok(())
 }
 
@@ -3514,8 +3545,6 @@ mod tests {
         SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec,
     };
     use diesel::prelude::*;
-    use diesel::sql_query;
-    use diesel::sql_types::{Integer, Nullable, Text};
     use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -3761,8 +3790,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES (?)")
-            .bind::<Text, _>("00000000000001")
+        diesel::insert_into(super::__diesel_schema_migrations::table)
+            .values(super::__diesel_schema_migrations::version.eq("00000000000001"))
             .execute(connection)
             .await
             .unwrap();
@@ -3793,9 +3822,11 @@ CREATE TABLE store_schema_migrations (
             ))
             .await
             .unwrap();
-        sql_query("INSERT INTO store_schema_migrations (version, name) VALUES (?, ?)")
-            .bind::<Integer, _>(1)
-            .bind::<Text, _>("initial-store-schema")
+        diesel::insert_into(super::store_schema_migrations::table)
+            .values((
+                super::store_schema_migrations::version.eq(1),
+                super::store_schema_migrations::name.eq("initial-store-schema"),
+            ))
             .execute(connection)
             .await
             .unwrap();
@@ -3808,21 +3839,18 @@ CREATE TABLE store_schema_migrations (
     ) {
         let kind_json = serde_json::to_string(&node.kind).unwrap();
         let row = NodeRow::from_node(node, store_path).unwrap();
-        sql_query(
-            r#"
-INSERT INTO nodes (id, parent_id, created_at, role, metadata_json, kind_json)
-VALUES (?, ?, ?, ?, ?, ?)
-"#,
-        )
-        .bind::<Text, _>(row.id)
-        .bind::<Text, _>(row.parent_id)
-        .bind::<Text, _>(row.created_at)
-        .bind::<Text, _>(row.role)
-        .bind::<Nullable<Text>, _>(row.metadata_json)
-        .bind::<Text, _>(kind_json)
-        .execute(connection)
-        .await
-        .unwrap();
+        diesel::insert_into(nodes::table)
+            .values((
+                nodes::id.eq(row.id),
+                nodes::parent_id.eq(row.parent_id),
+                nodes::created_at.eq(row.created_at),
+                nodes::role.eq(row.role),
+                nodes::metadata_json.eq(row.metadata_json),
+                nodes::kind_json.eq(kind_json),
+            ))
+            .execute(connection)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -4450,24 +4478,30 @@ DELETE FROM __diesel_schema_migrations;
             insert_v1_node_row(&mut connection, &store.database_path, merge_parent_a).await;
             insert_v1_node_row(&mut connection, &store.database_path, merge_parent_b).await;
             insert_v1_node_row(&mut connection, &store.database_path, child).await;
-            sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
-                .bind::<Text, _>(&root_id)
-                .bind::<Text, _>(&child_id)
-                .bind::<Text, _>("primary")
+            diesel::insert_into(super::legacy_node_edges::table)
+                .values((
+                    super::legacy_node_edges::parent_id.eq(&root_id),
+                    super::legacy_node_edges::child_id.eq(&child_id),
+                    super::legacy_node_edges::kind.eq("primary"),
+                ))
                 .execute(&mut connection)
                 .await
                 .unwrap();
-            sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
-                .bind::<Text, _>(&merge_parent_a_id)
-                .bind::<Text, _>(&child_id)
-                .bind::<Text, _>("merge")
+            diesel::insert_into(super::legacy_node_edges::table)
+                .values((
+                    super::legacy_node_edges::parent_id.eq(&merge_parent_a_id),
+                    super::legacy_node_edges::child_id.eq(&child_id),
+                    super::legacy_node_edges::kind.eq("merge"),
+                ))
                 .execute(&mut connection)
                 .await
                 .unwrap();
-            sql_query("INSERT INTO node_edges (parent_id, child_id, kind) VALUES (?, ?, ?)")
-                .bind::<Text, _>(&merge_parent_b_id)
-                .bind::<Text, _>(&child_id)
-                .bind::<Text, _>("merge")
+            diesel::insert_into(super::legacy_node_edges::table)
+                .values((
+                    super::legacy_node_edges::parent_id.eq(&merge_parent_b_id),
+                    super::legacy_node_edges::child_id.eq(&child_id),
+                    super::legacy_node_edges::kind.eq("merge"),
+                ))
                 .execute(&mut connection)
                 .await
                 .unwrap();
@@ -4545,21 +4579,24 @@ DELETE FROM __diesel_schema_migrations;
                 .await
                 .unwrap();
             insert_v1_node_row(&mut connection, &store.database_path, root).await;
-            sql_query("INSERT INTO branches (name, head_id) VALUES (?, ?)")
-                .bind::<Text, _>("main")
-                .bind::<Text, _>(state.root_id())
+            diesel::insert_into(branches::table)
+                .values((
+                    branches::name.eq("main"),
+                    branches::head_id.eq(state.root_id()),
+                ))
                 .execute(&mut connection)
                 .await
                 .unwrap();
-            sql_query("INSERT INTO sessions (branch_name, state_json) VALUES (?, ?)")
-                .bind::<Text, _>("main")
-                .bind::<Text, _>(session_state_json)
+            diesel::insert_into(sessions::table)
+                .values((
+                    sessions::branch_name.eq("main"),
+                    sessions::state_json.eq(session_state_json),
+                ))
                 .execute(&mut connection)
                 .await
                 .unwrap();
-            sql_query("INSERT INTO jobs (job_id, payload_json) VALUES (?, ?)")
-                .bind::<Text, _>("job-test")
-                .bind::<Text, _>(job_json)
+            diesel::insert_into(jobs::table)
+                .values((jobs::job_id.eq("job-test"), jobs::payload_json.eq(job_json)))
                 .execute(&mut connection)
                 .await
                 .unwrap();
