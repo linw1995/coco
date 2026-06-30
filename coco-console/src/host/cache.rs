@@ -9437,35 +9437,6 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[tokio::test]
-    async fn cache_drops_legacy_snapshot_materialization_tables() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
-        let legacy_database_path = path.join("console-graph.sqlite3");
-        create_legacy_snapshot_materialization_tables(&legacy_database_path);
-
-        let publisher = ConsolePublisher::new();
-        let _cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
-            publisher,
-            path.clone(),
-        )
-        .unwrap();
-
-        for table in [
-            "console_graph_snapshots",
-            "console_graph_viewports",
-            "console_graph_viewport_lanes",
-            "console_graph_viewport_nodes",
-            "console_graph_viewport_edges",
-        ] {
-            assert!(!sqlite_table_exists(&legacy_database_path, table));
-        }
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
     #[test]
     fn cache_uses_snapshot_materialization_database() {
         let path = temp_store_path();
@@ -9487,35 +9458,6 @@ mod tests {
             assert!(sqlite_table_exists(&graph_database_path, table));
             assert!(!sqlite_table_exists(&main_database_path, table));
         }
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn cache_drops_stale_snapshot_materialization_tables_before_reuse() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
-        let graph_database_path = crate::host::snapshot_store::database_path(&path);
-        create_current_graph_materialization_tables(&graph_database_path);
-
-        ConsoleGraphSnapshotStore::open(&path).unwrap();
-
-        assert!(sqlite_table_has_column(
-            &graph_database_path,
-            "console_graph_materializations",
-            "source_version"
-        ));
-        assert!(sqlite_table_has_column(
-            &graph_database_path,
-            "console_graph_node_locations",
-            "node_target"
-        ));
-        assert!(sqlite_table_has_column(
-            &graph_database_path,
-            "console_graph_edge_routes",
-            "edge_kind"
-        ));
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9835,30 +9777,6 @@ mod tests {
         })
     }
 
-    fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
-        use crate::schema::{
-            console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
-        };
-        use diesel::prelude::*;
-
-        let table = table.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| match table.as_str() {
-            "console_graph_materializations" => console_graph_materializations::table
-                .count()
-                .get_result(connection)
-                .unwrap(),
-            "console_graph_node_locations" => console_graph_node_locations::table
-                .count()
-                .get_result(connection)
-                .unwrap(),
-            "console_graph_edge_routes" => console_graph_edge_routes::table
-                .count()
-                .get_result(connection)
-                .unwrap(),
-            table => panic!("unsupported test table {table}"),
-        })
-    }
-
     fn sqlite_table_has_column(database_path: &std::path::Path, table: &str, column: &str) -> bool {
         use crate::schema::{
             console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
@@ -9893,15 +9811,28 @@ mod tests {
         })
     }
 
-    fn create_legacy_snapshot_materialization_tables(database_path: &std::path::Path) {
-        let fixture =
-            include_bytes!("../../tests/fixtures/legacy_snapshot_materialization.sqlite3");
-        std::fs::write(database_path, fixture).unwrap();
-    }
+    fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
+        use crate::schema::{
+            console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
+        };
+        use diesel::prelude::*;
 
-    fn create_current_graph_materialization_tables(database_path: &std::path::Path) {
-        let fixture = include_bytes!("../../tests/fixtures/stale_graph_materialization.sqlite3");
-        std::fs::write(database_path, fixture).unwrap();
+        let table = table.to_owned();
+        with_sqlite_test_connection(database_path, move |connection| match table.as_str() {
+            "console_graph_materializations" => console_graph_materializations::table
+                .count()
+                .get_result(connection)
+                .unwrap(),
+            "console_graph_node_locations" => console_graph_node_locations::table
+                .count()
+                .get_result(connection)
+                .unwrap(),
+            "console_graph_edge_routes" => console_graph_edge_routes::table
+                .count()
+                .get_result(connection)
+                .unwrap(),
+            table => panic!("unsupported test table {table}"),
+        })
     }
 
     #[tokio::test]
