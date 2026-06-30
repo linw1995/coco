@@ -529,7 +529,7 @@ impl SqliteStore {
         self.block_on(async {
             let mut connection = self.connect().await?;
             configure_writable_connection(&mut connection, &self.database_path).await?;
-            reject_newer_schema_version(&mut connection, &self.database_path).await?;
+            reject_unsupported_schema_version(&mut connection, &self.database_path).await?;
             run_embedded_migrations(&mut connection, &self.database_path).await?;
             Ok(())
         })
@@ -563,15 +563,15 @@ impl SqliteStore {
             })
         })?;
         ensure!(
-            version <= SQLITE_SCHEMA_VERSION,
+            version == SQLITE_SCHEMA_VERSION,
             CorruptedStoreSnafu {
                 path: store.database_path,
                 message: format!(
-                    "unsupported SQLite schema version {version}, expected at most {SQLITE_SCHEMA_VERSION}"
+                    "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
                 ),
             }
         );
-        Ok(version < SQLITE_SCHEMA_VERSION)
+        Ok(false)
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -1226,7 +1226,7 @@ async fn existing_schema_version(
     .fail()
 }
 
-async fn reject_newer_schema_version(
+async fn reject_unsupported_schema_version(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<()> {
@@ -1234,11 +1234,11 @@ async fn reject_newer_schema_version(
         return Ok(());
     };
     ensure!(
-        version <= SQLITE_SCHEMA_VERSION,
+        version == SQLITE_SCHEMA_VERSION,
         CorruptedStoreSnafu {
             path: path.to_owned(),
             message: format!(
-                "unsupported SQLite schema version {version}, expected at most {SQLITE_SCHEMA_VERSION}"
+                "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
             ),
         }
     );
@@ -3701,6 +3701,23 @@ mod tests {
         });
     }
 
+    fn create_diesel_migration_metadata_for_test(path: &std::path::Path, version: &str) {
+        use diesel::connection::SimpleConnection;
+
+        let database_path = super::sqlite_database_path(path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        connection
+            .batch_execute(&format!(
+                "CREATE TABLE __diesel_schema_migrations (
+                version VARCHAR(50) PRIMARY KEY NOT NULL,
+                run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO __diesel_schema_migrations (version) VALUES ('{version}');"
+            ))
+            .unwrap();
+    }
+
     #[test]
     fn open_creates_sqlite_database_and_schema() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -4273,6 +4290,36 @@ mod tests {
 
         assert!(err.to_string().contains("SQLite"));
         assert!(!super::sqlite_database_path(&path).exists());
+    }
+
+    #[test]
+    fn open_read_only_or_upgrade_schema_rejects_old_diesel_schema_version() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        create_diesel_migration_metadata_for_test(&path, "00000000000005");
+
+        let err = SqliteStore::open_read_only_or_upgrade_schema(&path).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("unsupported SQLite schema version 5, expected 6")
+        );
+    }
+
+    #[test]
+    fn open_rejects_old_diesel_schema_version() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        create_diesel_migration_metadata_for_test(&path, "00000000000005");
+
+        let err = SqliteStore::open(&path).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("unsupported SQLite schema version 5, expected 6")
+        );
     }
 
     #[test]
