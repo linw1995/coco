@@ -1,9 +1,10 @@
 DROP TABLE IF EXISTS skills;
 DROP TABLE IF EXISTS presets;
+DROP TABLE IF EXISTS node_metadata;
 DROP TABLE IF EXISTS message_queue_items;
 DROP TABLE IF EXISTS jobs;
 DROP TABLE IF EXISTS sessions;
 DROP TABLE IF EXISTS branches;
-DROP TABLE IF EXISTS node_edges;
+DROP TABLE IF EXISTS node_relations;
 DROP TABLE IF EXISTS nodes;
 DROP TABLE IF EXISTS store_meta;
