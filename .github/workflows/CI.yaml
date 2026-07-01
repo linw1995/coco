@@ -20,7 +20,7 @@ jobs:
       builtin_skill_scripts: ${{ steps.filter.outputs.builtin_skill_scripts }}
       nix_build: ${{ steps.filter.outputs.nix_build }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Detect changed paths
         id: filter
@@ -109,7 +109,7 @@ jobs:
     if: needs.changes.outputs.lint == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-nix
         with:
           dev-shell: ci-lint
@@ -124,7 +124,7 @@ jobs:
     if: ${{ always() && needs.changes.outputs.rust == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-nix
         with:
           cache-key-name: coverage
@@ -146,7 +146,7 @@ jobs:
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.wasm_coverage == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-nix
         with:
           cache-key-name: wasm-coverage
@@ -169,7 +169,7 @@ jobs:
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.coverage_native.result == 'success' && (needs.coverage_wasm.result == 'success' || needs.coverage_wasm.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download native coverage artifact
         uses: actions/download-artifact@v8
@@ -208,7 +208,7 @@ jobs:
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.coverage.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-nix
         with:
           cache-key-name: crap
@@ -236,7 +236,7 @@ jobs:
     if: ${{ always() && needs.changes.outputs.builtin_skill_scripts == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-nix
         with:
           cache-key-name: builtin-skill-scripts
@@ -252,7 +252,7 @@ jobs:
     if: ${{ always() && needs.changes.outputs.nix_build == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-nix
 
       - name: Build binary
