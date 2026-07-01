@@ -1,0 +1,3 @@
+-- Intentionally no-op because migration version 6 is reused for the squashed
+-- current schema migration. Existing stores that applied the old version 6
+-- must not run a destructive replacement down migration.

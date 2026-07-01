@@ -67,15 +67,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    #[sql_name = "node_edges"]
-    legacy_node_edges (parent_id, child_id, kind) {
-        parent_id -> Text,
-        child_id -> Text,
-        kind -> Text,
-    }
-}
-
-diesel::table! {
     #[sql_name = "message_queue_items"]
     message_queue_items_with_rowid (queue, message_id) {
         rowid -> BigInt,
@@ -538,8 +529,7 @@ impl SqliteStore {
         self.block_on(async {
             let mut connection = self.connect().await?;
             configure_writable_connection(&mut connection, &self.database_path).await?;
-            ensure_diesel_migration_metadata(&mut connection, &self.database_path).await?;
-            reject_newer_schema_version(&mut connection, &self.database_path).await?;
+            reject_unsupported_schema_version(&mut connection, &self.database_path).await?;
             run_embedded_migrations(&mut connection, &self.database_path).await?;
             Ok(())
         })
@@ -566,38 +556,22 @@ impl SqliteStore {
         ensure_existing_store_directory(path)?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
         ensure_existing_database_file(&store.database_path)?;
-        let (version, has_diesel_migration_table) =
-            store.database.with_initialization_lock(|| {
-                store.block_on(async {
-                    let mut connection = store.connect().await?;
-                    let has_diesel_migration_table = table_count(
-                        &mut connection,
-                        &store.database_path,
-                        DIESEL_MIGRATION_TABLE_NAME,
-                    )
-                    .await?
-                        == 1;
-                    let version = existing_schema_version_for_upgrade_check(
-                        &mut connection,
-                        &store.database_path,
-                    )
-                    .await?;
-                    Ok((version, has_diesel_migration_table))
-                })
-            })?;
+        let version = store.database.with_initialization_lock(|| {
+            store.block_on(async {
+                let mut connection = store.connect().await?;
+                existing_schema_version(&mut connection, &store.database_path).await
+            })
+        })?;
         ensure!(
-            version <= SQLITE_SCHEMA_VERSION,
+            version == SQLITE_SCHEMA_VERSION,
             CorruptedStoreSnafu {
                 path: store.database_path,
                 message: format!(
-                    "unsupported SQLite schema version {version}, expected at most {SQLITE_SCHEMA_VERSION}"
+                    "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
                 ),
             }
         );
-        if !has_diesel_migration_table {
-            return Ok(true);
-        }
-        Ok(version < SQLITE_SCHEMA_VERSION)
+        Ok(false)
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -1195,18 +1169,6 @@ impl diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite> for SqliteConn
     }
 }
 
-async fn ensure_diesel_migration_metadata(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-) -> Result<()> {
-    let path = path.to_owned();
-    let result = connection
-        .spawn_blocking(move |connection| Ok(connection.applied_migrations().map(|_| ())))
-        .await
-        .context(QuerySqliteStoreSnafu { path: path.clone() })?;
-    result.map_err(|source| StoreError::MigrateSqliteStore { path, source })
-}
-
 async fn table_count(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -1227,6 +1189,10 @@ async fn current_schema_version(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<Option<i32>> {
+    if table_count(connection, path, DIESEL_MIGRATION_TABLE_NAME).await? == 0 {
+        return Ok(None);
+    }
+
     __diesel_schema_migrations::table
         .select(diesel::dsl::max(__diesel_schema_migrations::version))
         .get_result::<Option<String>>(connection)
@@ -1236,13 +1202,6 @@ async fn current_schema_version(
         })?
         .map(|version| migration_version_to_schema_version(&version, path))
         .transpose()
-}
-
-async fn existing_schema_version_for_upgrade_check(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-) -> Result<i32> {
-    existing_schema_version(connection, path).await
 }
 
 async fn existing_schema_version(
@@ -1267,7 +1226,7 @@ async fn existing_schema_version(
     .fail()
 }
 
-async fn reject_newer_schema_version(
+async fn reject_unsupported_schema_version(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<()> {
@@ -1275,11 +1234,11 @@ async fn reject_newer_schema_version(
         return Ok(());
     };
     ensure!(
-        version <= SQLITE_SCHEMA_VERSION,
+        version == SQLITE_SCHEMA_VERSION,
         CorruptedStoreSnafu {
             path: path.to_owned(),
             message: format!(
-                "unsupported SQLite schema version {version}, expected at most {SQLITE_SCHEMA_VERSION}"
+                "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
             ),
         }
     );
@@ -3504,13 +3463,8 @@ impl ProcessShareableStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AsyncSqliteConnection, MessageQueueItem, NodeMetadataRow, NodeRow, SqliteGraphStore,
-        SqliteStore, StoreAccess, persist_root_metadata,
-    };
-    use crate::schema::{
-        branches, jobs, node_metadata, node_relations, nodes, sessions, store_meta,
-    };
+    use super::{MessageQueueItem, NodeMetadataRow, SqliteGraphStore, SqliteStore};
+    use crate::schema::{jobs, node_metadata, node_relations, nodes, sessions, store_meta};
     use crate::{
         Anchor, BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MergeParent,
         MessageQueueStore, NewNode, Node, NodeMetadata, NodeStore, PauseReason, Preset,
@@ -3519,7 +3473,6 @@ mod tests {
     };
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, RunQueryDsl};
-    use diesel_migrations::MigrationHarness;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -3748,64 +3701,20 @@ mod tests {
         });
     }
 
-    async fn apply_v1_schema_for_test(
-        connection: &mut AsyncSqliteConnection,
-        store_path: &std::path::Path,
-    ) {
-        super::configure_writable_connection(connection, store_path)
-            .await
-            .unwrap();
-        run_store_migration_for_test(connection, "00000000000001", true).await;
-    }
+    fn create_diesel_migration_metadata_for_test(path: &std::path::Path, version: &str) {
+        use diesel::connection::SimpleConnection;
 
-    async fn run_store_migration_for_test(
-        connection: &mut AsyncSqliteConnection,
-        version: &str,
-        record_diesel_migration: bool,
-    ) {
-        let version = version.to_owned();
+        let database_path = super::sqlite_database_path(path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
         connection
-            .spawn_blocking(move |connection| {
-                let migrations =
-                    <diesel_migrations::EmbeddedMigrations as diesel::migration::MigrationSource<
-                        diesel::sqlite::Sqlite,
-                    >>::migrations(&super::STORE_MIGRATIONS)
-                    .unwrap();
-                let migration = migrations
-                    .into_iter()
-                    .find(|migration| migration.name().version().to_string() == version)
-                    .unwrap_or_else(|| panic!("missing embedded test migration {version}"));
-                Ok(if record_diesel_migration {
-                    connection.applied_migrations().unwrap();
-                    connection.run_migration(&*migration).unwrap();
-                    Ok(())
-                } else {
-                    migration.run(connection)
-                })
-            })
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    async fn insert_v1_node_row(
-        connection: &mut AsyncSqliteConnection,
-        store_path: &std::path::Path,
-        node: Node,
-    ) {
-        let kind_json = serde_json::to_string(&node.kind).unwrap();
-        let row = NodeRow::from_node(node, store_path).unwrap();
-        diesel::insert_into(nodes::table)
-            .values((
-                nodes::id.eq(row.id),
-                nodes::parent_id.eq(row.parent_id),
-                nodes::created_at.eq(row.created_at),
-                nodes::role.eq(row.role),
-                nodes::metadata_json.eq(row.metadata_json),
-                nodes::kind_json.eq(kind_json),
+            .batch_execute(&format!(
+                "CREATE TABLE __diesel_schema_migrations (
+                version VARCHAR(50) PRIMARY KEY NOT NULL,
+                run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO __diesel_schema_migrations (version) VALUES ('{version}');"
             ))
-            .execute(connection)
-            .await
             .unwrap();
     }
 
@@ -4305,487 +4214,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_migration_backfills_node_relations_and_node_kind() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir.path().join("store");
-        std::fs::create_dir(&path).unwrap();
-        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
-        let state = super::StoreState::new();
-        let root = state.root_node().clone();
-        let child = Node::new(
-            root.id.clone(),
-            Role::User,
-            None,
-            Kind::Text("legacy child".to_owned()),
-            "1970-01-01T00:00:01Z".parse().unwrap(),
-        );
-        let child_id = child.id.clone();
-        let expected_child_kinds = (
-            child.kind.tag().as_str().to_owned(),
-            child
-                .kind
-                .anchor_payload_kind()
-                .map(|kind| kind.as_str().to_owned()),
-        );
-        let root_id = root.id.clone();
-        let merge_parent_a = Node::new(
-            root_id.clone(),
-            Role::LLM,
-            None,
-            Kind::Text("legacy merge parent a".to_owned()),
-            "1970-01-01T00:00:02Z".parse().unwrap(),
-        );
-        let merge_parent_a_id = merge_parent_a.id.clone();
-        let merge_parent_b = Node::new(
-            root_id.clone(),
-            Role::LLM,
-            None,
-            Kind::Text("legacy merge parent b".to_owned()),
-            "1970-01-01T00:00:03Z".parse().unwrap(),
-        );
-        let merge_parent_b_id = merge_parent_b.id.clone();
-
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            apply_v1_schema_for_test(&mut connection, &store.database_path).await;
-            persist_root_metadata(&mut connection, &store.database_path, &root_id)
-                .await
-                .unwrap();
-            insert_v1_node_row(&mut connection, &store.database_path, root).await;
-            insert_v1_node_row(&mut connection, &store.database_path, merge_parent_a).await;
-            insert_v1_node_row(&mut connection, &store.database_path, merge_parent_b).await;
-            insert_v1_node_row(&mut connection, &store.database_path, child).await;
-            diesel::insert_into(super::legacy_node_edges::table)
-                .values((
-                    super::legacy_node_edges::parent_id.eq(&root_id),
-                    super::legacy_node_edges::child_id.eq(&child_id),
-                    super::legacy_node_edges::kind.eq("primary"),
-                ))
-                .execute(&mut connection)
-                .await
-                .unwrap();
-            diesel::insert_into(super::legacy_node_edges::table)
-                .values((
-                    super::legacy_node_edges::parent_id.eq(&merge_parent_a_id),
-                    super::legacy_node_edges::child_id.eq(&child_id),
-                    super::legacy_node_edges::kind.eq("merge"),
-                ))
-                .execute(&mut connection)
-                .await
-                .unwrap();
-            diesel::insert_into(super::legacy_node_edges::table)
-                .values((
-                    super::legacy_node_edges::parent_id.eq(&merge_parent_b_id),
-                    super::legacy_node_edges::child_id.eq(&child_id),
-                    super::legacy_node_edges::kind.eq("merge"),
-                ))
-                .execute(&mut connection)
-                .await
-                .unwrap();
-        });
-        drop(store);
-
-        let crate::store::PersistentStore::Sqlite(migrated) =
-            crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
-
-        assert_eq!(migrated.schema_version().unwrap(), 6);
-        assert_eq!(node_kinds(&migrated, &child_id), expected_child_kinds);
-        assert_eq!(
-            node_relation_rows(&migrated, &child_id),
-            vec![
-                NodeRelationRow {
-                    child_node_id: child_id.clone(),
-                    parent_node_id: merge_parent_a_id,
-                    kind: "merge".to_owned(),
-                    ordinal: 0,
-                },
-                NodeRelationRow {
-                    child_node_id: child_id.clone(),
-                    parent_node_id: merge_parent_b_id,
-                    kind: "merge".to_owned(),
-                    ordinal: 1,
-                },
-                NodeRelationRow {
-                    child_node_id: child_id,
-                    parent_node_id: root_id,
-                    kind: "primary".to_owned(),
-                    ordinal: 0,
-                },
-            ]
-        );
-        migrated.block_on(async {
-            let mut connection = migrated.connect().await.unwrap();
-            assert_eq!(
-                super::table_count(&mut connection, &migrated.database_path, "node_edges")
-                    .await
-                    .unwrap(),
-                0
-            );
-        });
-    }
-
-    #[test]
-    fn schema_migration_backfills_session_and_job_summary() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir.path().join("store");
-        std::fs::create_dir(&path).unwrap();
-        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
-        let state = super::StoreState::new();
-        let root = state.root_node().clone();
-        let root_id = root.id.clone();
-        let session_state = SessionState::Attached {
-            target_branch: "main".to_owned(),
-            base_head_id: root_id.clone(),
-        };
-        let session_state_json = serde_json::to_string(&session_state).unwrap();
-        let job_json = serde_json::json!({
-            "job_id": "job-test",
-            "created_at": "2026-01-01T00:00:00Z",
-            "finished_at": null,
-            "branch": "main",
-            "work_branch": "",
-            "base": root_id,
-            "status": "queued"
-        })
-        .to_string();
-
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            apply_v1_schema_for_test(&mut connection, &store.database_path).await;
-            persist_root_metadata(&mut connection, &store.database_path, state.root_id())
-                .await
-                .unwrap();
-            insert_v1_node_row(&mut connection, &store.database_path, root).await;
-            diesel::insert_into(branches::table)
-                .values((
-                    branches::name.eq("main"),
-                    branches::head_id.eq(state.root_id()),
-                ))
-                .execute(&mut connection)
-                .await
-                .unwrap();
-            diesel::insert_into(sessions::table)
-                .values((
-                    sessions::branch_name.eq("main"),
-                    sessions::state_json.eq(session_state_json),
-                ))
-                .execute(&mut connection)
-                .await
-                .unwrap();
-            diesel::insert_into(jobs::table)
-                .values((jobs::job_id.eq("job-test"), jobs::payload_json.eq(job_json)))
-                .execute(&mut connection)
-                .await
-                .unwrap();
-        });
-        drop(store);
-
-        let crate::store::PersistentStore::Sqlite(migrated) =
-            crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
-
-        assert_eq!(migrated.schema_version().unwrap(), 6);
-        assert_eq!(
-            session_summary(&migrated, "main"),
-            SessionSummaryRow {
-                state: "attached".to_owned(),
-                target_branch: Some("main".to_owned()),
-                base_head_id: Some(state.root_id().to_owned()),
-                pause_reason: None,
-                merged_anchor_id: None,
-            }
-        );
-        assert_eq!(
-            job_summary(&migrated, "job-test"),
-            JobSummaryRow {
-                created_at: "2026-01-01T00:00:00Z".to_owned(),
-                finished_at: None,
-                branch: "main".to_owned(),
-                work_branch: "main".to_owned(),
-                base: state.root_id().to_owned(),
-                status: "queued".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn schema_migration_backfills_node_metadata_rows() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir.path().join("store");
-        std::fs::create_dir(&path).unwrap();
-        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
-        let state = super::StoreState::new();
-        let root = state.root_node().clone();
-        let root_id = root.id.clone();
-        let child = Node::new(
-            root_id.clone(),
-            Role::LLM,
-            Some(NodeMetadata::many(vec![
-                BackendMetadata {
-                    execution_id: Some("execution-migration".to_owned()),
-                    call_id: Some("call-a".to_owned()),
-                },
-                BackendMetadata {
-                    execution_id: Some("execution-migration".to_owned()),
-                    call_id: Some("call-b".to_owned()),
-                },
-            ])),
-            Kind::Text("legacy metadata".to_owned()),
-            "1970-01-01T00:00:01Z".parse().unwrap(),
-        );
-        let child_id = child.id.clone();
-
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            apply_v1_schema_for_test(&mut connection, &store.database_path).await;
-            persist_root_metadata(&mut connection, &store.database_path, &root_id)
-                .await
-                .unwrap();
-            insert_v1_node_row(&mut connection, &store.database_path, root).await;
-            insert_v1_node_row(&mut connection, &store.database_path, child).await;
-        });
-        drop(store);
-
-        let crate::store::PersistentStore::Sqlite(migrated) =
-            crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
-
-        assert_eq!(migrated.schema_version().unwrap(), 6);
-        assert_eq!(
-            node_metadata_rows(&migrated, &child_id),
-            vec![
-                NodeMetadataRow {
-                    node_id: child_id.clone(),
-                    ordinal: 0,
-                    execution_id: Some("execution-migration".to_owned()),
-                    call_id: Some("call-a".to_owned()),
-                },
-                NodeMetadataRow {
-                    node_id: child_id,
-                    ordinal: 1,
-                    execution_id: Some("execution-migration".to_owned()),
-                    call_id: Some("call-b".to_owned()),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn schema_migration_backfills_node_anchor_summary() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir.path().join("store");
-        std::fs::create_dir(&path).unwrap();
-        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
-        let state = super::StoreState::new();
-        let root = state.root_node().clone();
-        let root_id = root.id.clone();
-        let session = Node::new(
-            root_id.clone(),
-            Role::System,
-            None,
-            Kind::Anchor(Anchor::session(
-                vec![],
-                SessionAnchor {
-                    role: SessionRole::Orchestrator,
-                    provider_profile: Some("migration-profile".to_owned()),
-                    provider: Some("anthropic".to_owned()),
-                    model: "claude-sonnet-4".to_owned(),
-                    tools: vec![],
-                    system_prompt: "migration system".to_owned(),
-                    prompt: "migration prompt".to_owned(),
-                    temperature: Some(0.3),
-                    max_tokens: Some(256),
-                    additional_params: None,
-                    enable_coco_shim: true,
-                    active_skill: None,
-                },
-            )),
-            "1970-01-01T00:00:01Z".parse().unwrap(),
-        );
-        let session_id = session.id.clone();
-        let prompt = Node::new(
-            root_id.clone(),
-            Role::User,
-            None,
-            Kind::Anchor(Anchor::prompt(
-                vec![],
-                crate::PromptAnchor {
-                    prompt: "migration detached prompt".to_owned(),
-                    attachments: vec![],
-                },
-            )),
-            "1970-01-01T00:00:02Z".parse().unwrap(),
-        );
-        let prompt_id = prompt.id.clone();
-        let skill_invocation = Node::new(
-            root_id.clone(),
-            Role::System,
-            None,
-            Kind::Anchor(Anchor::skill_invocation(
-                vec![],
-                crate::SkillInvocationAnchor {
-                    skill_name: "migration-review".to_owned(),
-                    mode: crate::SkillInvocationMode::Handoff {
-                        prompt: "migration handoff prompt".to_owned(),
-                    },
-                },
-            )),
-            "1970-01-01T00:00:03Z".parse().unwrap(),
-        );
-        let skill_invocation_id = skill_invocation.id.clone();
-        let skill_result = Node::new(
-            root_id.clone(),
-            Role::System,
-            None,
-            Kind::Anchor(Anchor::skill_result(
-                vec![],
-                crate::SkillResultAnchor {
-                    skill_name: "migration-review".to_owned(),
-                    output: "migration output".to_owned(),
-                },
-            )),
-            "1970-01-01T00:00:04Z".parse().unwrap(),
-        );
-        let skill_result_id = skill_result.id.clone();
-
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            apply_v1_schema_for_test(&mut connection, &store.database_path).await;
-            persist_root_metadata(&mut connection, &store.database_path, &root_id)
-                .await
-                .unwrap();
-            insert_v1_node_row(&mut connection, &store.database_path, root).await;
-            insert_v1_node_row(&mut connection, &store.database_path, session).await;
-            insert_v1_node_row(&mut connection, &store.database_path, prompt).await;
-            insert_v1_node_row(&mut connection, &store.database_path, skill_invocation).await;
-            insert_v1_node_row(&mut connection, &store.database_path, skill_result).await;
-        });
-        drop(store);
-
-        let crate::store::PersistentStore::Sqlite(migrated) =
-            crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
-
-        assert_eq!(migrated.schema_version().unwrap(), 6);
-        assert_eq!(
-            node_anchor_summary(&migrated, &session_id),
-            NodeAnchorSummaryRow {
-                anchor_session_role: Some("orchestrator".to_owned()),
-                anchor_provider_profile: Some("migration-profile".to_owned()),
-                anchor_provider: Some("anthropic".to_owned()),
-                anchor_model: Some("claude-sonnet-4".to_owned()),
-                anchor_prompt: Some("migration prompt".to_owned()),
-                anchor_skill_name: None,
-                anchor_skill_invocation_mode: None,
-            }
-        );
-        let session_kind_json = node_kind_json(&migrated, &session_id);
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/role"),
-            None
-        );
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/provider_profile"),
-            None
-        );
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/provider"),
-            None
-        );
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/model"),
-            None
-        );
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/prompt"),
-            None
-        );
-        assert_eq!(
-            node_anchor_summary(&migrated, &prompt_id),
-            NodeAnchorSummaryRow {
-                anchor_session_role: None,
-                anchor_provider_profile: None,
-                anchor_provider: None,
-                anchor_model: None,
-                anchor_prompt: Some("migration detached prompt".to_owned()),
-                anchor_skill_name: None,
-                anchor_skill_invocation_mode: None,
-            }
-        );
-        let prompt_kind_json = node_kind_json(&migrated, &prompt_id);
-        assert_eq!(
-            prompt_kind_json.pointer("/Anchor/payload/Prompt/prompt"),
-            None
-        );
-        assert_eq!(
-            node_anchor_summary(&migrated, &skill_invocation_id),
-            NodeAnchorSummaryRow {
-                anchor_session_role: None,
-                anchor_provider_profile: None,
-                anchor_provider: None,
-                anchor_model: None,
-                anchor_prompt: Some("migration handoff prompt".to_owned()),
-                anchor_skill_name: Some("migration-review".to_owned()),
-                anchor_skill_invocation_mode: Some("handoff".to_owned()),
-            }
-        );
-        let skill_invocation_kind_json = node_kind_json(&migrated, &skill_invocation_id);
-        assert_eq!(
-            skill_invocation_kind_json.pointer("/Anchor/payload/SkillInvocation/skill_name"),
-            None
-        );
-        assert_eq!(
-            skill_invocation_kind_json.pointer("/Anchor/payload/SkillInvocation/mode/kind"),
-            None
-        );
-        assert_eq!(
-            skill_invocation_kind_json.pointer("/Anchor/payload/SkillInvocation/mode/prompt"),
-            None
-        );
-        assert_eq!(
-            node_anchor_summary(&migrated, &skill_result_id),
-            NodeAnchorSummaryRow {
-                anchor_session_role: None,
-                anchor_provider_profile: None,
-                anchor_provider: None,
-                anchor_model: None,
-                anchor_prompt: None,
-                anchor_skill_name: Some("migration-review".to_owned()),
-                anchor_skill_invocation_mode: None,
-            }
-        );
-        let skill_result_kind_json = node_kind_json(&migrated, &skill_result_id);
-        assert_eq!(
-            skill_result_kind_json.pointer("/Anchor/payload/SkillResult/skill_name"),
-            None
-        );
-    }
-
-    #[test]
-    fn persistent_read_only_open_upgrades_sqlite_schema() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir.path().join("store");
-        std::fs::create_dir(&path).unwrap();
-        let store = SqliteStore::new(&path, StoreAccess::ReadWrite).unwrap();
-        let state = super::StoreState::new();
-        let root = state.root_node().clone();
-        let root_id = root.id.clone();
-
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            apply_v1_schema_for_test(&mut connection, &store.database_path).await;
-            persist_root_metadata(&mut connection, &store.database_path, &root_id)
-                .await
-                .unwrap();
-            insert_v1_node_row(&mut connection, &store.database_path, root).await;
-        });
-        drop(store);
-
-        let crate::store::PersistentStore::Sqlite(migrated) =
-            crate::store::PersistentStore::open_read_only_or_upgrade_schema(&path).unwrap();
-
-        assert_eq!(migrated.schema_version().unwrap(), 6);
-        assert_eq!(migrated.root_id(), root_id);
-    }
-
-    #[test]
     fn open_read_only_rejects_writes() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -4862,6 +4290,36 @@ mod tests {
 
         assert!(err.to_string().contains("SQLite"));
         assert!(!super::sqlite_database_path(&path).exists());
+    }
+
+    #[test]
+    fn open_read_only_or_upgrade_schema_rejects_old_diesel_schema_version() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        create_diesel_migration_metadata_for_test(&path, "00000000000005");
+
+        let err = SqliteStore::open_read_only_or_upgrade_schema(&path).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("unsupported SQLite schema version 5, expected 6")
+        );
+    }
+
+    #[test]
+    fn open_rejects_old_diesel_schema_version() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        std::fs::create_dir(&path).unwrap();
+        create_diesel_migration_metadata_for_test(&path, "00000000000005");
+
+        let err = SqliteStore::open(&path).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("unsupported SQLite schema version 5, expected 6")
+        );
     }
 
     #[test]
