@@ -802,6 +802,11 @@ mod tests {
 
     use super::*;
 
+    fn test_store() -> coco_llm::coco_mem::SqliteStore {
+        coco_llm::coco_mem::SqliteStore::open_temporary()
+            .expect("temporary SQLite store should open")
+    }
+
     #[test]
     fn skill_execution_prompt_includes_skill_context() {
         let prompt = skill_execution_prompt(&SkillInvocationRequest {
@@ -874,7 +879,7 @@ mod tests {
 
     #[test]
     fn search_skills_finds_store_matches_by_name_and_description() {
-        let store = coco_llm::coco_mem::MemoryStore::new();
+        let store = test_store();
         store
             .add_skill(
                 SessionRole::Orchestrator,
@@ -917,7 +922,7 @@ description: "External skill."
 "#,
         )
         .unwrap();
-        let store = coco_llm::coco_mem::MemoryStore::new();
+        let store = test_store();
 
         let result = search_skills(
             root.path(),
@@ -933,7 +938,7 @@ description: "External skill."
 
     #[test]
     fn collect_store_skills_respects_role_hierarchy() {
-        let store = coco_llm::coco_mem::MemoryStore::new();
+        let store = test_store();
 
         let runner = collect_store_skills(&store, SessionRole::Runner).unwrap();
         let orchestrator = collect_store_skills(&store, SessionRole::Orchestrator).unwrap();
@@ -964,7 +969,7 @@ description: "External skill."
 
     #[test]
     fn collect_store_skills_prefers_current_role_on_name_conflict() {
-        let store = coco_llm::coco_mem::MemoryStore::new();
+        let store = test_store();
         for role in [SessionRole::Orchestrator, SessionRole::Runner] {
             store
                 .add_skill(

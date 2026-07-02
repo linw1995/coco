@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use super::memory::MemoryStore;
 use super::sqlite::SqliteStore;
-use super::state::StoreState;
 use crate::{
     Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueItem,
     MessageQueueStore, NewNode, NodeStore, PauseReason, Preset, PresetStore, PromptAnchor, Role,
@@ -135,14 +133,9 @@ where
     store.submit_job(branch, &prompt_anchor_id).unwrap()
 }
 
-trait InspectableStore {
-    fn snapshot_state(&self) -> StoreState;
-}
-
 trait TestStoreFactory {
     type Backend: PresetStore
         + BranchStore
-        + InspectableStore
         + JobStore
         + MessageQueueStore
         + NodeStore
@@ -152,37 +145,13 @@ trait TestStoreFactory {
     fn create() -> Self::Backend;
 }
 
-impl InspectableStore for MemoryStore {
-    fn snapshot_state(&self) -> StoreState {
-        self.snapshot_state()
-    }
-}
-impl InspectableStore for SqliteStore {
-    fn snapshot_state(&self) -> StoreState {
-        self.snapshot_state()
-    }
-}
-
-struct MemoryFactory;
-
-impl TestStoreFactory for MemoryFactory {
-    type Backend = MemoryStore;
-
-    fn create() -> Self::Backend {
-        MemoryStore::new()
-    }
-}
 struct SqliteFactory;
 
 impl TestStoreFactory for SqliteFactory {
     type Backend = SqliteStore;
 
     fn create() -> Self::Backend {
-        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
-        let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).expect("SQLite store should open");
-        std::mem::forget(tempdir);
-        store
+        SqliteStore::open_temporary().expect("temporary SQLite store should open")
     }
 }
 
@@ -191,8 +160,7 @@ where
     F: TestStoreFactory,
 {
     let store = F::create();
-    let snapshot = store.snapshot_state();
-    let root = snapshot.nodes.get(snapshot.root_id()).unwrap();
+    let root = store.get_node(&store.root_id()).unwrap();
 
     let Kind::Text(text) = &root.kind else {
         panic!("expected text root node");
@@ -211,16 +179,10 @@ where
 
     let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
 
-    let snapshot = store.snapshot_state();
-    let stored = snapshot.nodes.get(&child_id).unwrap();
+    let stored = store.get_node(&child_id).unwrap();
     assert_eq!(stored.parent, session_id);
-    assert!(
-        snapshot
-            .children
-            .get(&stored.parent)
-            .unwrap()
-            .contains(&child_id)
-    );
+    let children = store.list_children(&stored.parent).unwrap();
+    assert!(children.iter().any(|node| node.id == child_id));
 }
 
 fn assert_append_rejects_missing_parent<F>()
@@ -250,20 +212,19 @@ where
         .append(make_prompt_anchor_node(&session_id, &[&merge_parent_id]))
         .unwrap();
 
-    let snapshot = store.snapshot_state();
     assert!(
-        snapshot
-            .children
-            .get(&session_id)
+        store
+            .list_children(&session_id)
             .unwrap()
-            .contains(&anchor_id)
+            .iter()
+            .any(|node| node.id == anchor_id)
     );
     assert!(
-        snapshot
-            .children
-            .get(&merge_parent_id)
+        store
+            .list_children(&merge_parent_id)
             .unwrap()
-            .contains(&anchor_id)
+            .iter()
+            .any(|node| node.id == anchor_id)
     );
 }
 
@@ -284,13 +245,12 @@ where
         ))
         .unwrap();
 
-    let snapshot = store.snapshot_state();
     assert!(
-        snapshot
-            .children
-            .get(&merge_parent_id)
+        store
+            .list_children(&merge_parent_id)
             .unwrap()
-            .contains(&anchor_id)
+            .iter()
+            .any(|node| node.id == anchor_id)
     );
 }
 
@@ -401,12 +361,12 @@ where
         .append(make_prompt_anchor_node(&left_leaf, &[&right_leaf]))
         .unwrap();
 
-    let snapshot = store.snapshot_state();
     assert!(
-        snapshot
-            .children
-            .get(&right_leaf)
-            .is_some_and(|children| children.contains(&merge_id))
+        store
+            .list_children(&right_leaf)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == merge_id)
     );
 }
 
@@ -1273,7 +1233,8 @@ where
     let root_id = store.root_id();
     let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
     let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
-    let old_child = store.snapshot_state().nodes.get(&child_id).unwrap().clone();
+    let old_child = store.get_node(&child_id).unwrap();
+    let old_session = store.get_node(&session_id).unwrap();
     store.fork("main", &child_id).unwrap();
 
     let new_head = store
@@ -1302,19 +1263,9 @@ where
     assert_eq!(session.provider.as_deref(), Some("anthropic"));
     assert_eq!(session.model, "claude-sonnet-4-20250514");
     assert_eq!(session.temperature, None);
-    assert_eq!(
-        ancestry[1].created_at,
-        store
-            .snapshot_state()
-            .nodes
-            .get(&session_id)
-            .unwrap()
-            .created_at
-    );
+    assert_eq!(ancestry[1].created_at, old_session.created_at);
     assert_eq!(ancestry[2].id, root_id);
 
-    let snapshot = store.snapshot_state();
-    let old_session = snapshot.nodes.get(&session_id).unwrap();
     let Kind::Anchor(old_anchor) = &old_session.kind else {
         panic!("expected original session anchor");
     };
@@ -1332,6 +1283,7 @@ where
     let root_id = store.root_id();
     let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
     let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let old_session = store.get_node(&session_id).unwrap();
     store.fork("main", &child_id).unwrap();
 
     let new_head = store
@@ -1355,8 +1307,6 @@ where
     assert_eq!(session.model, "claude-sonnet-4-20250514");
     assert_eq!(session.system_prompt, "You are strict.");
 
-    let snapshot = store.snapshot_state();
-    let old_session = snapshot.nodes.get(&session_id).unwrap();
     let Kind::Anchor(old_anchor) = &old_session.kind else {
         panic!("expected original session anchor");
     };
@@ -1460,9 +1410,8 @@ where
     let root_id = store.root_id();
     let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
     let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
-    let snapshot = store.snapshot_state();
-    let session_created_at = snapshot.nodes.get(&session_id).unwrap().created_at;
-    let child_created_at = snapshot.nodes.get(&child_id).unwrap().created_at;
+    let session_created_at = store.get_node(&session_id).unwrap().created_at;
+    let child_created_at = store.get_node(&child_id).unwrap().created_at;
     store.fork("main", &child_id).unwrap();
 
     store
@@ -2532,44 +2481,4 @@ macro_rules! define_common_store_tests {
     };
 }
 
-define_common_store_tests!(memory_store, MemoryFactory);
 define_common_store_tests!(sqlite_store, SqliteFactory);
-
-#[test]
-fn log_returns_parent_not_found_when_chain_is_broken() {
-    let mut store = StoreState::new();
-    let root_id = store.root_id().to_owned();
-    let mut broken = store
-        .plan_append_node(make_session_anchor_node(&root_id))
-        .map(|_| {
-            crate::Node::new(
-                "missing".to_owned(),
-                Role::User,
-                None,
-                Kind::Text("broken".to_owned()),
-                "2026-03-25T09:10:11Z".parse().unwrap(),
-            )
-        })
-        .unwrap();
-    let broken_id = broken.id.clone();
-    store.nodes.insert(broken.id.clone(), broken.clone());
-
-    let err = store.log(&root_id, &broken_id).unwrap_err();
-
-    assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
-    broken.parent = root_id;
-}
-
-#[test]
-fn log_returns_not_found_when_branch_head_is_missing() {
-    let mut store = StoreState::new();
-    let root_id = store.root_id().to_owned();
-    let missing_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    store
-        .branches
-        .insert("main".to_owned(), missing_id.to_owned());
-
-    let err = store.log(&root_id, "main").unwrap_err();
-
-    assert!(matches!(err, Error::NotFound { id } if id == missing_id));
-}
