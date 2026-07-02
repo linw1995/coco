@@ -28,7 +28,8 @@ use super::{
 use crate::StoreResult as Result;
 use crate::error::{
     AcquireSqliteConnectionSnafu, AmbiguousNodePrefixSnafu, BranchNotFoundSnafu,
-    CorruptedStoreSnafu, CreateSqlitePoolSnafu, InvalidAnchorSnafu, LegacyJsonStoreSnafu,
+    CorruptedStoreSnafu, CreateSqlitePoolSnafu, DuplicateMergeParentSnafu, InvalidAnchorSnafu,
+    LegacyJsonStoreSnafu, MergeParentMatchesParentSnafu, MultipleShadowParentsSnafu,
     NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu,
     RefsNotConnectedSnafu, SessionStateMovedSnafu, StartSqliteRuntimeSnafu, StoreError,
     StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
@@ -810,28 +811,6 @@ impl SqliteGraphStore {
         .fail()
     }
 
-    fn get_node_by_exact_id(&self, id: &str) -> Result<Node> {
-        let id = id.to_owned();
-        let path = self.database_path.clone();
-        self.with_connection(move |connection| {
-            Box::pin(async move { load_node_by_exact_id(connection, &path, &id).await })
-        })
-    }
-
-    fn resolve_ref_id(&self, reference: &str) -> Result<String> {
-        if self.node_exists(reference)? {
-            return Ok(reference.to_owned());
-        }
-        if let Some(head_id) = self.branch_head(reference)? {
-            self.get_node_by_exact_id(&head_id)?;
-            return Ok(head_id);
-        }
-        NotFoundSnafu {
-            id: reference.to_owned(),
-        }
-        .fail()
-    }
-
     fn branch_head(&self, name: &str) -> Result<Option<String>> {
         let name = name.to_owned();
         let path = self.database_path.clone();
@@ -843,59 +822,16 @@ impl SqliteGraphStore {
                     .get_result::<String>(connection)
                     .await
                     .optional()
-                    .context(QuerySqliteStoreSnafu { path })
+                .context(QuerySqliteStoreSnafu { path })
             })
-        })
-    }
-
-    fn node_exists(&self, id: &str) -> Result<bool> {
-        let id = id.to_owned();
-        let path = self.database_path.clone();
-        self.with_connection(move |connection| {
-            Box::pin(async move { node_exists_by_id(connection, &path, &id).await })
         })
     }
 
     fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
-        if let Some(head_id) = self.branch_head(reference)? {
-            return self.get_node_by_exact_id(&head_id);
-        }
-
-        match self.get_node_by_exact_id(reference) {
-            Ok(node) => Ok(node),
-            Err(crate::StoreError::NotFound { .. }) => self.get_node_by_prefix(reference),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn get_node_by_prefix(&self, prefix: &str) -> Result<Node> {
-        match self.node_ids_by_prefix(prefix)?.as_slice() {
-            [matched] => self.get_node_by_exact_id(matched),
-            [] => NotFoundSnafu {
-                id: prefix.to_owned(),
-            }
-            .fail(),
-            matches => AmbiguousNodePrefixSnafu {
-                prefix: prefix.to_owned(),
-                matches: matches.to_vec(),
-            }
-            .fail(),
-        }
-    }
-
-    fn node_ids_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        let prefix = prefix.to_owned();
+        let reference = reference.to_owned();
         let path = self.database_path.clone();
         self.with_connection(move |connection| {
-            Box::pin(async move {
-                nodes::table
-                    .filter(nodes::id.like(format!("{prefix}%")))
-                    .select(nodes::id)
-                    .order(nodes::id)
-                    .load::<String>(connection)
-                    .await
-                    .context(QuerySqliteStoreSnafu { path })
-            })
+            Box::pin(async move { load_node_by_prefix_or_branch(connection, &path, &reference).await })
         })
     }
 }
@@ -1515,6 +1451,228 @@ async fn node_exists_by_id(
             path: path.to_owned(),
         })?;
     Ok(count > 0)
+}
+
+async fn load_node_by_prefix_or_branch(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    reference: &str,
+) -> Result<Node> {
+    if let Some(head_id) = maybe_load_branch_head(connection, path, reference).await? {
+        return load_node_by_exact_id(connection, path, &head_id).await;
+    }
+
+    match load_node_by_exact_id(connection, path, reference).await {
+        Ok(node) => Ok(node),
+        Err(crate::StoreError::NotFound { .. }) => {
+            load_node_by_prefix(connection, path, reference).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn load_node_by_prefix(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    prefix: &str,
+) -> Result<Node> {
+    match load_node_ids_by_prefix(connection, path, prefix)
+        .await?
+        .as_slice()
+    {
+        [matched] => load_node_by_exact_id(connection, path, matched).await,
+        [] => NotFoundSnafu {
+            id: prefix.to_owned(),
+        }
+        .fail(),
+        matches => AmbiguousNodePrefixSnafu {
+            prefix: prefix.to_owned(),
+            matches: matches.to_vec(),
+        }
+        .fail(),
+    }
+}
+
+async fn load_node_ids_by_prefix(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    prefix: &str,
+) -> Result<Vec<String>> {
+    nodes::table
+        .filter(nodes::id.like(format!("{prefix}%")))
+        .select(nodes::id)
+        .order(nodes::id)
+        .load::<String>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+async fn resolve_ref_id(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    reference: &str,
+) -> Result<String> {
+    if node_exists_by_id(connection, path, reference).await? {
+        return Ok(reference.to_owned());
+    }
+    if let Some(head_id) = maybe_load_branch_head(connection, path, reference).await? {
+        load_node_by_exact_id(connection, path, &head_id).await?;
+        return Ok(head_id);
+    }
+
+    if is_node_id(reference) {
+        return NotFoundSnafu {
+            id: reference.to_owned(),
+        }
+        .fail();
+    }
+    BranchNotFoundSnafu {
+        name: reference.to_owned(),
+    }
+    .fail()
+}
+
+async fn load_ancestry_nodes(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    head_ref: &str,
+) -> Result<Vec<Node>> {
+    let mut current_id = resolve_ref_id(connection, path, head_ref).await?;
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        ensure!(
+            seen.insert(current_id.clone()),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: "SQLite nodes contain cyclic parents".to_owned(),
+            }
+        );
+        let row = nodes::table
+            .filter(nodes::id.eq(&current_id))
+            .select(node_row_columns!())
+            .get_result::<NodeRow>(connection)
+            .await
+            .optional()
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?
+            .context(ParentNotFoundSnafu {
+                id: current_id.clone(),
+            })?;
+        let parent_id = row.parent_id.clone();
+        let is_root = parent_id.is_empty();
+        rows.push(row);
+        if is_root {
+            break;
+        }
+        current_id = parent_id;
+    }
+    node_rows_into_nodes(connection, path, rows).await
+}
+
+async fn load_log_nodes(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    base_ref: &str,
+    head_ref: &str,
+) -> Result<Vec<Node>> {
+    let base_id = resolve_ref_id(connection, path, base_ref).await?;
+    let mut nodes = load_ancestry_nodes(connection, path, head_ref).await?;
+    let Some(index) = nodes.iter().position(|node| node.id == base_id) else {
+        return RefsNotConnectedSnafu {
+            base_ref: base_ref.to_owned(),
+            head_ref: head_ref.to_owned(),
+        }
+        .fail();
+    };
+    nodes.truncate(index + 1);
+    Ok(nodes)
+}
+
+async fn load_child_nodes(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node_id: &str,
+) -> Result<Vec<Node>> {
+    load_node_by_exact_id(connection, path, node_id).await?;
+    let rows = node_relations::table
+        .inner_join(nodes::table.on(nodes::id.eq(node_relations::child_node_id)))
+        .filter(node_relations::parent_node_id.eq(node_id))
+        .select(node_row_columns!())
+        .order((nodes::created_at, nodes::id))
+        .load::<NodeRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    node_rows_into_nodes(connection, path, rows).await
+}
+
+async fn validate_new_node(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    ensure!(
+        node_exists_by_id(connection, path, &node.parent).await?,
+        ParentNotFoundSnafu {
+            id: node.parent.clone(),
+        }
+    );
+    validate_anchor_merge_parents(connection, path, &node.parent, &node.kind).await
+}
+
+async fn validate_anchor_merge_parents(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    parent: &str,
+    kind: &Kind,
+) -> Result<()> {
+    let Kind::Anchor(anchor) = kind else {
+        return Ok(());
+    };
+
+    let mut seen = HashSet::new();
+    let mut shadow_parents = Vec::new();
+    for merge_parent in anchor.merge_parents() {
+        let node_id = merge_parent.node_id();
+        ensure!(
+            node_id != parent,
+            MergeParentMatchesParentSnafu {
+                id: node_id.to_owned(),
+            }
+        );
+        ensure!(
+            seen.insert(node_id),
+            DuplicateMergeParentSnafu {
+                id: node_id.to_owned(),
+            }
+        );
+        ensure!(
+            node_exists_by_id(connection, path, node_id).await?,
+            ParentNotFoundSnafu {
+                id: node_id.to_owned(),
+            }
+        );
+        if merge_parent.is_shadow() {
+            shadow_parents.push(node_id.to_owned());
+        }
+    }
+    ensure!(
+        shadow_parents.len() <= 1,
+        MultipleShadowParentsSnafu {
+            ids: shadow_parents,
+        }
+    );
+
+    Ok(())
+}
+
+fn is_node_id(reference: &str) -> bool {
+    reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn insert_node_rows(
@@ -2569,6 +2727,18 @@ async fn load_branch_head(
     path: &Path,
     branch: &str,
 ) -> Result<String> {
+    maybe_load_branch_head(connection, path, branch)
+        .await?
+        .context(BranchNotFoundSnafu {
+            name: branch.to_owned(),
+        })
+}
+
+async fn maybe_load_branch_head(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+) -> Result<Option<String>> {
     branches::table
         .filter(branches::name.eq(branch))
         .select(branches::head_id)
@@ -2577,9 +2747,6 @@ async fn load_branch_head(
         .optional()
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
-        })?
-        .context(BranchNotFoundSnafu {
-            name: branch.to_owned(),
         })
 }
 
@@ -3064,58 +3231,20 @@ impl NodeStore for SqliteGraphStore {
     }
 
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        let head_id = self.resolve_ref_id(head_ref)?;
+        let head_ref = head_ref.to_owned();
         let path = self.database_path.clone();
         self.with_connection(move |connection| {
-            Box::pin(async move {
-                let mut rows = Vec::new();
-                let mut seen = HashSet::new();
-                let mut current_id = head_id;
-                loop {
-                    ensure!(
-                        seen.insert(current_id.clone()),
-                        CorruptedStoreSnafu {
-                            path: path.clone(),
-                            message: "SQLite nodes contain cyclic parents".to_owned(),
-                        }
-                    );
-                    let row = nodes::table
-                        .filter(nodes::id.eq(&current_id))
-                        .select(node_row_columns!())
-                        .get_result::<NodeRow>(connection)
-                        .await
-                        .optional()
-                        .context(QuerySqliteStoreSnafu { path: path.clone() })?
-                        .context(ParentNotFoundSnafu {
-                            id: current_id.clone(),
-                        })?;
-                    let parent_id = row.parent_id.clone();
-                    let is_root = parent_id.is_empty();
-                    rows.push(row);
-                    if is_root {
-                        break;
-                    }
-                    current_id = parent_id;
-                }
-
-                let nodes = node_rows_into_nodes(connection, &path, rows).await?;
-                Ok(nodes)
-            })
+            Box::pin(async move { load_ancestry_nodes(connection, &path, &head_ref).await })
         })
     }
 
     fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        let base_id = self.resolve_ref_id(base_ref)?;
-        let mut nodes = self.ancestry(head_ref)?;
-        let Some(index) = nodes.iter().position(|node| node.id == base_id) else {
-            return RefsNotConnectedSnafu {
-                base_ref: base_ref.to_owned(),
-                head_ref: head_ref.to_owned(),
-            }
-            .fail();
-        };
-        nodes.truncate(index + 1);
-        Ok(nodes)
+        let base_ref = base_ref.to_owned();
+        let head_ref = head_ref.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_log_nodes(connection, &path, &base_ref, &head_ref).await })
+        })
     }
 
     fn get_node(&self, id: &str) -> Result<Node> {
@@ -3123,21 +3252,10 @@ impl NodeStore for SqliteGraphStore {
     }
 
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
-        self.get_node_by_exact_id(node_id)?;
         let node_id = node_id.to_owned();
         let path = self.database_path.clone();
         self.with_connection(move |connection| {
-            Box::pin(async move {
-                let rows = node_relations::table
-                    .inner_join(nodes::table.on(nodes::id.eq(node_relations::child_node_id)))
-                    .filter(node_relations::parent_node_id.eq(node_id))
-                    .select(node_row_columns!())
-                    .order((nodes::created_at, nodes::id))
-                    .load::<NodeRow>(connection)
-                    .await
-                    .context(QuerySqliteStoreSnafu { path: path.clone() })?;
-                node_rows_into_nodes(connection, &path, rows).await
-            })
+            Box::pin(async move { load_child_nodes(connection, &path, &node_id).await })
         })
     }
 }
@@ -3208,49 +3326,58 @@ impl SessionStore for SqliteGraphStore {
 
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .root_id()
-            .to_owned()
+        self.block_on(async {
+            let mut connection = self.connect().await.expect("SQLite connection should open");
+            load_root_id(&mut connection, &self.database_path)
+                .await
+                .expect("SQLite root metadata should exist")
+        })
     }
 
     fn append(&self, node: NewNode) -> Result<String> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let node = state.plan_append_node(node)?;
+        let node = Node::new(
+            node.parent,
+            node.role,
+            node.metadata,
+            node.kind,
+            jiff::Timestamp::now(),
+        );
         self.block_on(async {
             let mut connection = self.connect().await?;
+            validate_new_node(&mut connection, &self.database_path, &node).await?;
             persist_node(&mut connection, &self.database_path, &node).await
         })?;
+        let mut state = self.inner.write().expect("store lock poisoned");
         state.insert_existing_node(node)
     }
 
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .ancestry(head_ref)
-            .map(|nodes| nodes.into_iter().cloned().collect())
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_ancestry_nodes(&mut connection, &self.database_path, head_ref).await
+        })
     }
 
     fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .log(base_ref, head_ref)
-            .map(|nodes| nodes.into_iter().cloned().collect())
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_log_nodes(&mut connection, &self.database_path, base_ref, head_ref).await
+        })
     }
 
     fn get_node(&self, id: &str) -> Result<Node> {
-        self.inner.read().expect("store lock poisoned").get_node(id)
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_node_by_prefix_or_branch(&mut connection, &self.database_path, id).await
+        })
     }
 
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .list_children(node_id)
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_child_nodes(&mut connection, &self.database_path, node_id).await
+        })
     }
 }
 
