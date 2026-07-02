@@ -4,7 +4,6 @@ use std::path::Path;
 mod lock;
 mod memory;
 mod sqlite;
-mod state;
 
 #[cfg(test)]
 mod tests;
