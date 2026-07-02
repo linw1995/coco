@@ -27,12 +27,13 @@ use super::{
 };
 use crate::StoreResult as Result;
 use crate::error::{
-    AcquireSqliteConnectionSnafu, AmbiguousNodePrefixSnafu, BranchNotFoundSnafu,
-    CorruptedStoreSnafu, CreateSqlitePoolSnafu, DuplicateMergeParentSnafu, InvalidAnchorSnafu,
-    LegacyJsonStoreSnafu, MergeParentMatchesParentSnafu, MultipleShadowParentsSnafu,
-    NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu,
-    RefsNotConnectedSnafu, SessionStateMovedSnafu, StartSqliteRuntimeSnafu, StoreError,
-    StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+    AcquireSqliteConnectionSnafu, AmbiguousNodePrefixSnafu, BranchExistsSnafu,
+    BranchHeadMovedSnafu, BranchNotFoundSnafu, CorruptedStoreSnafu, CreateSqlitePoolSnafu,
+    DuplicateMergeParentSnafu, InvalidAnchorSnafu, LegacyJsonStoreSnafu,
+    MergeParentMatchesParentSnafu, MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu,
+    ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu,
+    SessionStateMovedSnafu, StartSqliteRuntimeSnafu, StoreError, StorePathIsNotDirectorySnafu,
+    StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::schema::{
     branches, jobs, message_queue_items, node_metadata, node_relations, nodes, presets, sessions,
@@ -2532,21 +2533,36 @@ async fn persist_branch(
     Ok(())
 }
 
-async fn persist_branch_and_session_state(
+async fn create_branch(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     branch: &str,
-    head_id: &str,
-    session_state: &SessionState,
-) -> Result<()> {
+    from_ref: &str,
+) -> Result<String> {
     connection
-        .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
-            persist_branch(connection, path, branch, head_id)
+        .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
+            if maybe_load_branch_head(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?
+                .is_some()
+            {
+                return Err(SqliteTransactionError::Operation(
+                    BranchExistsSnafu {
+                        name: branch.to_owned(),
+                    }
+                    .build(),
+                ));
+            }
+            let head_id = resolve_ref_id(connection, path, from_ref)
                 .await
                 .map_err(SqliteTransactionError::Operation)?;
-            persist_session_state(connection, path, branch, session_state)
+            persist_branch(connection, path, branch, &head_id)
                 .await
-                .map_err(SqliteTransactionError::Operation)
+                .map_err(SqliteTransactionError::Operation)?;
+            persist_session_state(connection, path, branch, &SessionState::Active)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(head_id)
         })
         .await
         .map_err(|error| error.into_store_error(path))
@@ -2808,6 +2824,50 @@ async fn update_branch_head(
     })
 }
 
+async fn update_branch_head_checked(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    expected_old_head: &str,
+    new_head: &str,
+) -> Result<()> {
+    connection
+        .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+            let actual = load_branch_head(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            if actual != expected_old_head {
+                return Err(SqliteTransactionError::Operation(
+                    BranchHeadMovedSnafu {
+                        name: branch.to_owned(),
+                        expected: expected_old_head.to_owned(),
+                        actual,
+                    }
+                    .build(),
+                ));
+            }
+            load_node_by_exact_id(connection, path, new_head)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            let updated =
+                update_branch_head(connection, path, branch, expected_old_head, new_head)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+            if updated != 1 {
+                return Err(SqliteTransactionError::Operation(
+                    CorruptedStoreSnafu {
+                        path: path.to_owned(),
+                        message: format!("SQLite branch {branch:?} did not match expected head"),
+                    }
+                    .build(),
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
 async fn delete_branch_record(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -2820,6 +2880,15 @@ async fn delete_branch_record(
             path: path.to_owned(),
         })?;
     Ok(())
+}
+
+async fn delete_branch_checked(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+) -> Result<()> {
+    load_branch_head(connection, path, branch).await?;
+    delete_branch_record(connection, path, branch).await
 }
 
 async fn persist_session_nodes_and_branch_head(
@@ -3384,54 +3453,40 @@ impl NodeStore for SqliteStore {
 impl BranchStore for SqliteStore {
     fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let plan = state.plan_fork(name, from_ref)?;
-        let mut temp = state.clone();
-        temp.apply_fork(name.to_owned(), plan.head_id.clone())?;
-        let session_state = temp.get_session_state(name)?;
-        self.block_on(async {
+        let head_id = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_branch_and_session_state(
-                &mut connection,
-                &self.database_path,
-                name,
-                &plan.head_id,
-                &session_state,
-            )
-            .await
+            create_branch(&mut connection, &self.database_path, name, from_ref).await
         })?;
-        state.apply_fork(name.to_owned(), plan.head_id.clone())?;
-        Ok(plan.head_id)
+        let mut state = self.inner.write().expect("store lock poisoned");
+        state.branches.insert(name.to_owned(), head_id.clone());
+        state.sessions.insert(name.to_owned(), SessionState::Active);
+        Ok(head_id)
     }
 
     fn get_branch_head(&self, name: &str) -> Result<String> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_branch_head(name)
-            .map(str::to_owned)
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_branch_head(&mut connection, &self.database_path, name).await
+        })
     }
 
     fn delete_branch(&self, name: &str) -> Result<()> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        temp.delete_branch(name)?;
         self.block_on(async {
             let mut connection = self.connect().await?;
-            delete_branch_record(&mut connection, &self.database_path, name).await
+            delete_branch_checked(&mut connection, &self.database_path, name).await
         })?;
-        state.delete_branch(name)
+        let mut state = self.inner.write().expect("store lock poisoned");
+        state.branches.remove(name);
+        state.sessions.remove(name);
+        Ok(())
     }
 
     fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        temp.apply_set_branch_head(name.to_owned(), expected_old_head, new_head.to_owned())?;
-        let updated = self.block_on(async {
+        self.block_on(async {
             let mut connection = self.connect().await?;
-            update_branch_head(
+            update_branch_head_checked(
                 &mut connection,
                 &self.database_path,
                 name,
@@ -3440,14 +3495,12 @@ impl BranchStore for SqliteStore {
             )
             .await
         })?;
-        ensure!(
-            updated == 1,
-            CorruptedStoreSnafu {
-                path: self.database_path.clone(),
-                message: format!("SQLite branch {name:?} did not match expected head"),
-            }
-        );
-        state.apply_set_branch_head(name.to_owned(), expected_old_head, new_head.to_owned())
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .branches
+            .insert(name.to_owned(), new_head.to_owned());
+        Ok(())
     }
 }
 
