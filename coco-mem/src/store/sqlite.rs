@@ -30,13 +30,16 @@ use crate::error::{
     AcquireSqliteConnectionSnafu, AmbiguousNodePrefixSnafu, BranchExistsSnafu,
     BranchHeadMovedSnafu, BranchNotFoundSnafu, CorruptedStoreSnafu, CreateSqlitePoolSnafu,
     DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu,
-    LegacyJsonStoreSnafu, MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu,
+    InvalidSkillNameSnafu, LegacyJsonStoreSnafu, MergeParentMatchesParentSnafu,
+    MissingSessionAnchorSnafu,
     MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu,
     PresetNotFoundSnafu, PresetVersionNotFoundSnafu,
     PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
     PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
     QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu, StartSqliteRuntimeSnafu,
-    StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+    SkillAlreadyExistsSnafu, SkillNotFoundSnafu, SkillUpdateEmptySnafu,
+    SkillVersionNotFoundSnafu, StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu,
+    WriteStoreDirectorySnafu,
 };
 use crate::schema::{
     branches, jobs, message_queue_items, node_metadata, node_relations, nodes, presets, sessions,
@@ -45,7 +48,8 @@ use crate::schema::{
 use crate::{
     Anchor, AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node,
     NodeMetadata, PauseReason, Preset, PresetRecord, Role, SessionAnchorPatch, SessionRole,
-    SessionState, SkillInvocationMode, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
+    SessionState, SkillGroups, SkillInvocationMode, SkillRecord, SkillUpdatePatch,
+    SkillVersionSpec, default_skill_groups,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -3952,18 +3956,58 @@ async fn load_skills(
         })?;
     for row in rows {
         let role = parse_session_role(&row.role, path)?;
-        let record = serde_json::from_str::<SkillRecord>(&row.record_json).context(
-            ParseSqliteStoreValueSnafu {
-                path: path.to_owned(),
-                column: "skills.record_json".to_owned(),
-            },
-        )?;
+        let record = skill_record_from_json(path, &row.record_json)?;
         state
             .skill_groups
             .for_role_mut(role)
             .insert(record.name.clone(), record);
     }
     Ok(())
+}
+
+async fn load_skill_groups(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<SkillGroups> {
+    let mut groups = default_skill_groups();
+    let rows = skills::table
+        .select((skills::role, skills::record_json))
+        .order((skills::role, skills::name))
+        .load::<SkillRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    for row in rows {
+        let role = parse_session_role(&row.role, path)?;
+        let record = skill_record_from_json(path, &row.record_json)?;
+        groups.for_role_mut(role).insert(record.name.clone(), record);
+    }
+    Ok(groups)
+}
+
+async fn load_skill_record(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    role: SessionRole,
+    name: &str,
+) -> Result<SkillRecord> {
+    load_skill_groups(connection, path)
+        .await?
+        .for_role(role)
+        .get(name)
+        .cloned()
+        .context(SkillNotFoundSnafu {
+            role: role.as_str().to_owned(),
+            name: name.to_owned(),
+        })
+}
+
+fn skill_record_from_json(path: &Path, record_json: &str) -> Result<SkillRecord> {
+    serde_json::from_str::<SkillRecord>(record_json).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "skills.record_json".to_owned(),
+    })
 }
 
 async fn persist_skill(
@@ -3990,6 +4034,131 @@ async fn persist_skill(
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
+    Ok(())
+}
+
+async fn add_skill_record(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    role: SessionRole,
+    name: &str,
+    spec: SkillVersionSpec,
+) -> Result<SkillRecord> {
+    validate_skill_name(name)?;
+    connection
+        .immediate_transaction::<SkillRecord, SqliteTransactionError, _>(async |connection| {
+            let groups = load_skill_groups(connection, path)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            if groups.for_role(role).contains_key(name) {
+                return Err(SqliteTransactionError::Operation(
+                    SkillAlreadyExistsSnafu {
+                        role: role.as_str().to_owned(),
+                        name: name.to_owned(),
+                    }
+                    .build(),
+                ));
+            }
+            let record = SkillRecord::new(name.to_owned(), spec);
+            persist_skill(connection, path, role, &record)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(record)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn update_skill_record(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    role: SessionRole,
+    name: &str,
+    patch: &SkillUpdatePatch,
+) -> Result<SkillRecord> {
+    ensure!(
+        !patch.is_empty(),
+        SkillUpdateEmptySnafu {
+            role: role.as_str().to_owned(),
+            name: name.to_owned(),
+        }
+    );
+    connection
+        .immediate_transaction::<SkillRecord, SqliteTransactionError, _>(async |connection| {
+            let mut record = load_skill_record(connection, path, role, name)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            let current_version = record.current_version;
+            record
+                .update(patch)
+                .ok_or_else(|| {
+                    SqliteTransactionError::Operation(
+                        SkillVersionNotFoundSnafu {
+                            role: role.as_str().to_owned(),
+                            name: name.to_owned(),
+                            version: current_version,
+                        }
+                        .build(),
+                    )
+                })?;
+            persist_skill(connection, path, role, &record)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(record)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn rollback_skill_record(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    role: SessionRole,
+    name: &str,
+    target_version: u64,
+) -> Result<SkillRecord> {
+    connection
+        .immediate_transaction::<SkillRecord, SqliteTransactionError, _>(async |connection| {
+            let mut record = load_skill_record(connection, path, role, name)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            record
+                .rollback(target_version)
+                .ok_or_else(|| {
+                    SqliteTransactionError::Operation(
+                        SkillVersionNotFoundSnafu {
+                            role: role.as_str().to_owned(),
+                            name: name.to_owned(),
+                            version: target_version,
+                        }
+                        .build(),
+                    )
+                })?;
+            persist_skill(connection, path, role, &record)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(record)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+fn validate_skill_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    ensure!(
+        !trimmed.is_empty(),
+        InvalidSkillNameSnafu {
+            name: name.to_owned(),
+            message: "name must not be empty".to_owned(),
+        }
+    );
+    ensure!(
+        trimmed == name,
+        InvalidSkillNameSnafu {
+            name: name.to_owned(),
+            message: "name must not have leading or trailing whitespace".to_owned(),
+        }
+    );
     Ok(())
 }
 
@@ -4493,18 +4662,22 @@ impl PresetStore for SqliteStore {
 
 impl SkillStore for SqliteStore {
     fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .list_skills(role))
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            Ok(load_skill_groups(&mut connection, &self.database_path)
+                .await?
+                .for_role(role)
+                .values()
+                .cloned()
+                .collect())
+        })
     }
 
     fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_skill(role, name)
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_skill_record(&mut connection, &self.database_path, role, name).await
+        })
     }
 
     fn add_skill(
@@ -4514,14 +4687,16 @@ impl SkillStore for SqliteStore {
         spec: SkillVersionSpec,
     ) -> Result<SkillRecord> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let created = temp.add_skill(role, name, spec)?;
-        self.block_on(async {
+        let created = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_skill(&mut connection, &self.database_path, role, &created).await
+            add_skill_record(&mut connection, &self.database_path, role, name, spec).await
         })?;
-        state.skill_groups = temp.skill_groups;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .skill_groups
+            .for_role_mut(role)
+            .insert(name.to_owned(), created.clone());
         Ok(created)
     }
 
@@ -4532,14 +4707,16 @@ impl SkillStore for SqliteStore {
         patch: &SkillUpdatePatch,
     ) -> Result<SkillRecord> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let updated = temp.update_skill(role, name, patch)?;
-        self.block_on(async {
+        let updated = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_skill(&mut connection, &self.database_path, role, &updated).await
+            update_skill_record(&mut connection, &self.database_path, role, name, patch).await
         })?;
-        state.skill_groups = temp.skill_groups;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .skill_groups
+            .for_role_mut(role)
+            .insert(name.to_owned(), updated.clone());
         Ok(updated)
     }
 
@@ -4550,14 +4727,17 @@ impl SkillStore for SqliteStore {
         target_version: u64,
     ) -> Result<SkillRecord> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let updated = temp.rollback_skill(role, name, target_version)?;
-        self.block_on(async {
+        let updated = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_skill(&mut connection, &self.database_path, role, &updated).await
+            rollback_skill_record(&mut connection, &self.database_path, role, name, target_version)
+                .await
         })?;
-        state.skill_groups = temp.skill_groups;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .skill_groups
+            .for_role_mut(role)
+            .insert(name.to_owned(), updated.clone());
         Ok(updated)
     }
 }
