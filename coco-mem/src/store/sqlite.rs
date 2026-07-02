@@ -137,6 +137,7 @@ pub struct SqliteStore {
     database: SqliteDatabase,
     access: StoreAccess,
     _lock_file: Option<Arc<std::fs::File>>,
+    _owned_directory: Option<Arc<OwnedStoreDirectory>>,
 }
 
 #[derive(Clone)]
@@ -162,6 +163,16 @@ impl std::fmt::Debug for SqliteGraphStore {
 enum StoreAccess {
     ReadWrite,
     ReadOnly,
+}
+
+struct OwnedStoreDirectory {
+    path: PathBuf,
+}
+
+impl Drop for OwnedStoreDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 #[derive(Queryable, QueryableByName)]
@@ -466,6 +477,13 @@ impl SqliteStore {
         Ok(store)
     }
 
+    pub fn open_temporary() -> Result<Self> {
+        let directory = Arc::new(create_temporary_store_directory());
+        let mut store = Self::open(&directory.path)?;
+        store._owned_directory = Some(directory);
+        Ok(store)
+    }
+
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         ensure_existing_store_directory(path)?;
@@ -518,6 +536,7 @@ impl SqliteStore {
             database,
             access,
             _lock_file: lock_file,
+            _owned_directory: None,
         })
     }
 
@@ -851,6 +870,21 @@ fn initial_root_node() -> Node {
             .parse()
             .expect("root timestamp should parse"),
     )
+}
+
+fn create_temporary_store_directory() -> OwnedStoreDirectory {
+    let base = std::env::temp_dir();
+    loop {
+        let path = base.join(format!("coco-mem-{}", nanoid::nanoid!()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return OwnedStoreDirectory { path },
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!(
+                "failed to create temporary SQLite store at {:?}: {error}",
+                path
+            ),
+        }
+    }
 }
 
 fn sqlite_runtime() -> Result<&'static Runtime> {
@@ -4614,6 +4648,19 @@ mod tests {
 
         assert!(store.database_path().is_file());
         assert_eq!(store.schema_version().unwrap(), 6);
+    }
+
+    #[test]
+    fn open_temporary_removes_directory_after_last_store_drop() {
+        let store = SqliteStore::open_temporary().unwrap();
+        let path = store.store_path().to_owned();
+        let clone = store.clone();
+
+        assert!(path.exists());
+        drop(store);
+        assert!(path.exists());
+        drop(clone);
+        assert!(!path.exists());
     }
 
     #[test]
