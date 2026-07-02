@@ -32,6 +32,7 @@ use crate::error::{
     DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu,
     LegacyJsonStoreSnafu, MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu,
     MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu,
+    PresetNotFoundSnafu, PresetVersionNotFoundSnafu,
     PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
     PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
     QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu, StartSqliteRuntimeSnafu,
@@ -3758,15 +3759,57 @@ async fn load_presets(
         })?;
     state.presets.clear();
     for record_json in rows {
-        let record = serde_json::from_str::<PresetRecord>(&record_json).context(
-            ParseSqliteStoreValueSnafu {
-                path: path.to_owned(),
-                column: "presets.record_json".to_owned(),
-            },
-        )?;
+        let record = preset_record_from_json(path, &record_json)?;
         state.presets.insert(record.name.clone(), record);
     }
     Ok(())
+}
+
+async fn load_preset_records(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<HashMap<String, PresetRecord>> {
+    let rows = presets::table
+        .select(presets::record_json)
+        .order(presets::name)
+        .load::<String>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    rows.into_iter()
+        .map(|record_json| {
+            let record = preset_record_from_json(path, &record_json)?;
+            Ok((record.name.clone(), record))
+        })
+        .collect()
+}
+
+async fn load_preset_record(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    name: &str,
+) -> Result<PresetRecord> {
+    let record_json = presets::table
+        .filter(presets::name.eq(name))
+        .select(presets::record_json)
+        .get_result::<String>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .context(PresetNotFoundSnafu {
+            name: name.to_owned(),
+        })?;
+    preset_record_from_json(path, &record_json)
+}
+
+fn preset_record_from_json(path: &Path, record_json: &str) -> Result<PresetRecord> {
+    serde_json::from_str::<PresetRecord>(record_json).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "presets.record_json".to_owned(),
+    })
 }
 
 async fn persist_preset(
@@ -3794,6 +3837,83 @@ async fn persist_preset(
     Ok(())
 }
 
+async fn set_preset_record(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    name: &str,
+    config: Preset,
+) -> Result<PresetRecord> {
+    connection
+        .immediate_transaction::<PresetRecord, SqliteTransactionError, _>(async |connection| {
+            let record_json = presets::table
+                .filter(presets::name.eq(name))
+                .select(presets::record_json)
+                .get_result::<String>(connection)
+                .await
+                .optional()
+                .context(QuerySqliteStoreSnafu {
+                    path: path.to_owned(),
+                })
+                .map_err(SqliteTransactionError::Operation)?;
+            let record = if let Some(record_json) = record_json {
+                let mut record = preset_record_from_json(path, &record_json)
+                    .map_err(SqliteTransactionError::Operation)?;
+                let current_version = record.current_version;
+                record
+                    .update(config)
+                    .ok_or_else(|| {
+                        SqliteTransactionError::Operation(
+                            PresetVersionNotFoundSnafu {
+                                name: name.to_owned(),
+                                version: current_version,
+                            }
+                            .build(),
+                        )
+                    })?;
+                record
+            } else {
+                PresetRecord::new(name.to_owned(), config)
+            };
+            persist_preset(connection, path, &record)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(record)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn rollback_preset_record(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    name: &str,
+    target_version: u64,
+) -> Result<PresetRecord> {
+    connection
+        .immediate_transaction::<PresetRecord, SqliteTransactionError, _>(async |connection| {
+            let mut record = load_preset_record(connection, path, name)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            record
+                .rollback(target_version)
+                .ok_or_else(|| {
+                    SqliteTransactionError::Operation(
+                        PresetVersionNotFoundSnafu {
+                            name: name.to_owned(),
+                            version: target_version,
+                        }
+                        .build(),
+                    )
+                })?;
+            persist_preset(connection, path, &record)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(record)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
 async fn delete_preset_record(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -3806,6 +3926,15 @@ async fn delete_preset_record(
             path: path.to_owned(),
         })?;
     Ok(())
+}
+
+async fn delete_preset_record_checked(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    name: &str,
+) -> Result<()> {
+    load_preset_record(connection, path, name).await?;
+    delete_preset_record(connection, path, name).await
 }
 
 async fn load_skills(
@@ -4306,56 +4435,58 @@ impl MessageQueueStore for SqliteStore {
 
 impl PresetStore for SqliteStore {
     fn list_preset_records(&self) -> Result<std::collections::HashMap<String, PresetRecord>> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .list_preset_records())
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_preset_records(&mut connection, &self.database_path).await
+        })
     }
 
     fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_preset_record(name)
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_preset_record(&mut connection, &self.database_path, name).await
+        })
     }
 
     fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let updated = temp.set_preset(name, config)?;
-        self.block_on(async {
+        let updated = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_preset(&mut connection, &self.database_path, &updated).await
+            set_preset_record(&mut connection, &self.database_path, name, config).await
         })?;
-        state.presets = temp.presets;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .presets
+            .insert(name.to_owned(), updated.clone());
         Ok(updated)
     }
 
     fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let updated = temp.rollback_preset(name, target_version)?;
-        self.block_on(async {
+        let updated = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_preset(&mut connection, &self.database_path, &updated).await
+            rollback_preset_record(&mut connection, &self.database_path, name, target_version).await
         })?;
-        state.presets = temp.presets;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .presets
+            .insert(name.to_owned(), updated.clone());
         Ok(updated)
     }
 
     fn delete_preset(&self, name: &str) -> Result<()> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        temp.delete_preset(name)?;
         self.block_on(async {
             let mut connection = self.connect().await?;
-            delete_preset_record(&mut connection, &self.database_path, name).await
+            delete_preset_record_checked(&mut connection, &self.database_path, name).await
         })?;
-        state.presets = temp.presets;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .presets
+            .remove(name);
         Ok(())
     }
 }
