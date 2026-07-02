@@ -33,7 +33,7 @@ fn test_store() -> SqliteStore {
     let tempdir = tempfile::tempdir().expect("temporary directory should be created");
     let path = tempdir.path().join("store");
     let store = SqliteStore::open(&path).expect("SQLite store should open");
-    std::mem::forget(tempdir);
+    let _tempdir_path = tempdir.keep();
     store
 }
 
