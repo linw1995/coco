@@ -32,9 +32,10 @@ use crate::error::{
     DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu,
     LegacyJsonStoreSnafu, MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu,
     MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu,
-    QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
-    StartSqliteRuntimeSnafu, StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu,
-    WriteStoreDirectorySnafu,
+    PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
+    PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
+    QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu, StartSqliteRuntimeSnafu,
+    StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::schema::{
     branches, jobs, message_queue_items, node_metadata, node_relations, nodes, presets, sessions,
@@ -3145,16 +3146,79 @@ async fn load_jobs(
         })?;
     state.jobs.clear();
     for row in jobs {
-        let mut job =
-            serde_json::from_str::<Job>(&row.payload_json).context(ParseSqliteStoreValueSnafu {
-                path: path.to_owned(),
-                column: "jobs.payload_json".to_owned(),
-            })?;
-        job.normalize_work_branch();
-        validate_job_row_summary(&row, &job, path)?;
+        let job = job_row_into_job(path, row)?;
         state.jobs.insert(job.job_id.clone(), job);
     }
     Ok(())
+}
+
+async fn load_job_map(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<HashMap<String, Job>> {
+    let rows = jobs::table
+        .select((
+            jobs::job_id,
+            jobs::created_at,
+            jobs::finished_at,
+            jobs::branch,
+            jobs::work_branch,
+            jobs::base,
+            jobs::status,
+            jobs::payload_json,
+        ))
+        .order(jobs::job_id)
+        .load::<JobRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    rows.into_iter()
+        .map(|row| {
+            let job = job_row_into_job(path, row)?;
+            Ok((job.job_id.clone(), job))
+        })
+        .collect()
+}
+
+async fn load_job(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    job_id: &str,
+) -> Result<Job> {
+    let row = jobs::table
+        .filter(jobs::job_id.eq(job_id))
+        .select((
+            jobs::job_id,
+            jobs::created_at,
+            jobs::finished_at,
+            jobs::branch,
+            jobs::work_branch,
+            jobs::base,
+            jobs::status,
+            jobs::payload_json,
+        ))
+        .get_result::<JobRow>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .context(PromptJobNotFoundSnafu {
+            job_id: job_id.to_owned(),
+        })?;
+    job_row_into_job(path, row)
+}
+
+fn job_row_into_job(path: &Path, row: JobRow) -> Result<Job> {
+    let mut job =
+        serde_json::from_str::<Job>(&row.payload_json).context(ParseSqliteStoreValueSnafu {
+            path: path.to_owned(),
+            column: "jobs.payload_json".to_owned(),
+        })?;
+    job.normalize_work_branch();
+    validate_job_row_summary(&row, &job, path)?;
+    Ok(job)
 }
 
 async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &Job) -> Result<()> {
@@ -3196,6 +3260,232 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
             path: path.to_owned(),
         })?;
     Ok(())
+}
+
+async fn submit_job_in_sqlite(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<Job> {
+    connection
+        .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+            loop {
+                let job_id = format!("job-{}", nanoid::nanoid!());
+                if jobs::table
+                    .filter(jobs::job_id.eq(&job_id))
+                    .count()
+                    .get_result::<i64>(connection)
+                    .await
+                    .context(QuerySqliteStoreSnafu {
+                        path: path.to_owned(),
+                    })
+                    .map_err(SqliteTransactionError::Operation)?
+                    == 0
+                {
+                    return submit_job_with_id_in_transaction(
+                        connection, path, &job_id, branch, base,
+                    )
+                    .await;
+                }
+            }
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn submit_job_with_id_in_sqlite(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    job_id: &str,
+    branch: &str,
+    base: &str,
+) -> Result<Job> {
+    connection
+        .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+            submit_job_with_id_in_transaction(connection, path, job_id, branch, base).await
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn submit_job_with_id_in_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    job_id: &str,
+    branch: &str,
+    base: &str,
+) -> std::result::Result<Job, SqliteTransactionError> {
+    load_branch_head(connection, path, branch)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    load_node_by_exact_id(connection, path, base)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    if jobs::table
+        .filter(jobs::job_id.eq(job_id))
+        .count()
+        .get_result::<i64>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+        .map_err(SqliteTransactionError::Operation)?
+        != 0
+    {
+        return Err(SqliteTransactionError::Operation(
+            PromptJobAlreadyExistsSnafu {
+                job_id: job_id.to_owned(),
+            }
+            .build(),
+        ));
+    }
+    if let Some(active_job) = load_job_map(connection, path)
+        .await
+        .map_err(SqliteTransactionError::Operation)?
+        .values()
+        .find(|job| job_uses_active_branch(job, branch))
+    {
+        return Err(SqliteTransactionError::Operation(
+            PromptJobActiveOnBranchSnafu {
+                branch: branch.to_owned(),
+                job_id: active_job.job_id.clone(),
+            }
+            .build(),
+        ));
+    }
+    let job = Job::new(job_id, branch, base);
+    persist_job(connection, path, &job)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    Ok(job)
+}
+
+async fn update_job_status_in_sqlite(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    job_id: &str,
+    expected: JobStatus,
+    next: JobStatus,
+) -> Result<Job> {
+    connection
+        .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+            let mut job = load_job(connection, path, job_id)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            if job.status != expected {
+                return Err(SqliteTransactionError::Operation(
+                    PromptJobMovedSnafu {
+                        job_id: job_id.to_owned(),
+                        expected: format!("{expected:?}"),
+                        actual: format!("{:?}", job.status),
+                    }
+                    .build(),
+                ));
+            }
+            if !job.status.can_transition_to(next) {
+                return Err(SqliteTransactionError::Operation(
+                    PromptJobInvalidStatusTransitionSnafu {
+                        job_id: job_id.to_owned(),
+                        current: format!("{:?}", job.status),
+                        next: format!("{next:?}"),
+                    }
+                    .build(),
+                ));
+            }
+            job.status = next;
+            job.finished_at = match next {
+                JobStatus::Finished => Some(jiff::Timestamp::now()),
+                _ => None,
+            };
+            persist_job(connection, path, &job)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(job)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn update_job_work_branch_in_sqlite(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    job_id: &str,
+    expected_work_branch: &str,
+    next_work_branch: &str,
+) -> Result<Job> {
+    connection
+        .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+            load_branch_head(connection, path, next_work_branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            let jobs = load_job_map(connection, path)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            if let Some(active_job) = jobs
+                .values()
+                .find(|job| job.job_id != job_id && job_uses_active_branch(job, next_work_branch))
+            {
+                return Err(SqliteTransactionError::Operation(
+                    PromptJobActiveOnBranchSnafu {
+                        branch: next_work_branch.to_owned(),
+                        job_id: active_job.job_id.clone(),
+                    }
+                    .build(),
+                ));
+            }
+            let mut job = jobs
+                .get(job_id)
+                .cloned()
+                .ok_or_else(|| {
+                    SqliteTransactionError::Operation(
+                        PromptJobNotFoundSnafu {
+                            job_id: job_id.to_owned(),
+                        }
+                        .build(),
+                    )
+                })?;
+            job.normalize_work_branch();
+            if matches!(job.status, JobStatus::Finished) {
+                return Err(SqliteTransactionError::Operation(
+                    PromptJobInvalidStatusTransitionSnafu {
+                        job_id: job_id.to_owned(),
+                        current: format!("{:?}", job.status),
+                        next: "work_branch_changed".to_owned(),
+                    }
+                    .build(),
+                ));
+            }
+            if job.work_branch != expected_work_branch {
+                return Err(SqliteTransactionError::Operation(
+                    PromptJobMovedSnafu {
+                        job_id: job_id.to_owned(),
+                        expected: expected_work_branch.to_owned(),
+                        actual: job.work_branch.clone(),
+                    }
+                    .build(),
+                ));
+            }
+            job.work_branch = next_work_branch.to_owned();
+            persist_job(connection, path, &job)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(job)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+fn job_uses_active_branch(job: &Job, branch: &str) -> bool {
+    if matches!(job.status, JobStatus::Finished) {
+        return false;
+    }
+    let work_branch = if job.work_branch.is_empty() {
+        job.branch.as_str()
+    } else {
+        job.work_branch.as_str()
+    };
+    job.branch == branch || work_branch == branch
 }
 
 fn validate_job_row_summary(row: &JobRow, job: &Job, path: &Path) -> Result<()> {
@@ -3757,51 +4047,59 @@ impl SessionStore for SqliteStore {
 impl JobStore for SqliteStore {
     fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let created = temp.submit_job(branch, base)?;
-        self.block_on(async {
+        let created = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_job(&mut connection, &self.database_path, &created).await
+            submit_job_in_sqlite(&mut connection, &self.database_path, branch, base).await
         })?;
-        state.jobs = temp.jobs;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .jobs
+            .insert(created.job_id.clone(), created.clone());
         Ok(created)
     }
 
     fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let created = temp.submit_job_with_id(job_id, branch, base)?;
-        self.block_on(async {
+        let created = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_job(&mut connection, &self.database_path, &created).await
+            submit_job_with_id_in_sqlite(&mut connection, &self.database_path, job_id, branch, base)
+                .await
         })?;
-        state.jobs = temp.jobs;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .jobs
+            .insert(created.job_id.clone(), created.clone());
         Ok(created)
     }
 
     fn get_job(&self, job_id: &str) -> Result<Job> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_job(job_id)
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_job(&mut connection, &self.database_path, job_id).await
+        })
     }
 
     fn list_jobs(&self) -> Result<std::collections::HashMap<String, Job>> {
-        Ok(self.inner.read().expect("store lock poisoned").list_jobs())
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_job_map(&mut connection, &self.database_path).await
+        })
     }
 
     fn set_job_status(&self, job_id: &str, expected: JobStatus, next: JobStatus) -> Result<Job> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let updated = temp.set_job_status(job_id, expected, next)?;
-        self.block_on(async {
+        let updated = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_job(&mut connection, &self.database_path, &updated).await
+            update_job_status_in_sqlite(&mut connection, &self.database_path, job_id, expected, next)
+                .await
         })?;
-        state.jobs = temp.jobs;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .jobs
+            .insert(job_id.to_owned(), updated.clone());
         Ok(updated)
     }
 
@@ -3812,14 +4110,22 @@ impl JobStore for SqliteStore {
         next_work_branch: &str,
     ) -> Result<Job> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let updated = temp.set_job_work_branch(job_id, expected_work_branch, next_work_branch)?;
-        self.block_on(async {
+        let updated = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_job(&mut connection, &self.database_path, &updated).await
+            update_job_work_branch_in_sqlite(
+                &mut connection,
+                &self.database_path,
+                job_id,
+                expected_work_branch,
+                next_work_branch,
+            )
+            .await
         })?;
-        state.jobs = temp.jobs;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .jobs
+            .insert(job_id.to_owned(), updated.clone());
         Ok(updated)
     }
 }
