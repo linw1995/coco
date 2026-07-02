@@ -28,10 +28,10 @@ use super::{
 use crate::StoreResult as Result;
 use crate::error::{
     AcquireSqliteConnectionSnafu, AmbiguousNodePrefixSnafu, BranchNotFoundSnafu,
-    CorruptedStoreSnafu, CreateSqlitePoolSnafu, LegacyJsonStoreSnafu, NotFoundSnafu,
-    ParentNotFoundSnafu, ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu,
-    StartSqliteRuntimeSnafu, StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu,
-    WriteStoreDirectorySnafu,
+    CorruptedStoreSnafu, CreateSqlitePoolSnafu, InvalidAnchorSnafu, LegacyJsonStoreSnafu,
+    NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu,
+    RefsNotConnectedSnafu, SessionStateMovedSnafu, StartSqliteRuntimeSnafu, StoreError,
+    StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::schema::{
     branches, jobs, message_queue_items, node_metadata, node_relations, nodes, presets, sessions,
@@ -39,8 +39,8 @@ use crate::schema::{
 };
 use crate::{
     AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node,
-    NodeMetadata, Preset, PresetRecord, Role, SessionAnchorPatch, SessionRole, SessionState,
-    SkillInvocationMode, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
+    NodeMetadata, PauseReason, Preset, PresetRecord, Role, SessionAnchorPatch, SessionRole,
+    SessionState, SkillInvocationMode, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -814,24 +814,7 @@ impl SqliteGraphStore {
         let id = id.to_owned();
         let path = self.database_path.clone();
         self.with_connection(move |connection| {
-            Box::pin(async move {
-                let row = nodes::table
-                    .filter(nodes::id.eq(&id))
-                    .select(node_row_columns!())
-                    .get_result::<NodeRow>(connection)
-                    .await
-                    .optional()
-                    .context(QuerySqliteStoreSnafu { path: path.clone() })?
-                    .context(NotFoundSnafu { id })?;
-                let node_id = row.id.clone();
-                let metadata_rows = load_node_metadata_rows_for_ids(
-                    connection,
-                    &path,
-                    Some(std::slice::from_ref(&node_id)),
-                )
-                .await?;
-                row.into_node(&path, node_metadata_slice(&metadata_rows, &node_id))
-            })
+            Box::pin(async move { load_node_by_exact_id(connection, &path, &id).await })
         })
     }
 
@@ -869,15 +852,7 @@ impl SqliteGraphStore {
         let id = id.to_owned();
         let path = self.database_path.clone();
         self.with_connection(move |connection| {
-            Box::pin(async move {
-                let count = nodes::table
-                    .filter(nodes::id.eq(id))
-                    .count()
-                    .get_result::<i64>(connection)
-                    .await
-                    .context(QuerySqliteStoreSnafu { path })?;
-                Ok(count > 0)
-            })
+            Box::pin(async move { node_exists_by_id(connection, &path, &id).await })
         })
     }
 
@@ -1502,6 +1477,44 @@ async fn node_rows_into_nodes(
             row.into_node(path, node_metadata_slice(&metadata_rows, &node_id))
         })
         .collect()
+}
+
+async fn load_node_by_exact_id(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    id: &str,
+) -> Result<Node> {
+    let row = nodes::table
+        .filter(nodes::id.eq(id))
+        .select(node_row_columns!())
+        .get_result::<NodeRow>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .context(NotFoundSnafu { id: id.to_owned() })?;
+    let node_id = row.id.clone();
+    let metadata_rows =
+        load_node_metadata_rows_for_ids(connection, path, Some(std::slice::from_ref(&node_id)))
+            .await?;
+    row.into_node(path, node_metadata_slice(&metadata_rows, &node_id))
+}
+
+async fn node_exists_by_id(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    id: &str,
+) -> Result<bool> {
+    let count = nodes::table
+        .filter(nodes::id.eq(id))
+        .count()
+        .get_result::<i64>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(count > 0)
 }
 
 fn insert_node_rows(
@@ -2272,16 +2285,77 @@ async fn load_sessions(
         })?;
     state.sessions.clear();
     for session in sessions {
-        let state_json = serde_json::from_str::<SessionState>(&session.state_json).context(
+        let (branch, session_state) = session_row_into_state(path, session)?;
+        state.sessions.insert(branch, session_state);
+    }
+    state.validate_session_records()
+}
+
+async fn load_session_states(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<HashMap<String, SessionState>> {
+    let sessions = sessions::table
+        .select((
+            sessions::branch_name,
+            sessions::state,
+            sessions::target_branch,
+            sessions::base_head_id,
+            sessions::pause_reason,
+            sessions::merged_anchor_id,
+            sessions::state_json,
+        ))
+        .order(sessions::branch_name)
+        .load::<SessionRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    sessions
+        .into_iter()
+        .map(|session| session_row_into_state(path, session))
+        .collect()
+}
+
+async fn load_session_state(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    name: &str,
+) -> Result<SessionState> {
+    let session = sessions::table
+        .filter(sessions::branch_name.eq(name))
+        .select((
+            sessions::branch_name,
+            sessions::state,
+            sessions::target_branch,
+            sessions::base_head_id,
+            sessions::pause_reason,
+            sessions::merged_anchor_id,
+            sessions::state_json,
+        ))
+        .get_result::<SessionRow>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .context(BranchNotFoundSnafu {
+            name: name.to_owned(),
+        })?;
+    let (_, state) = session_row_into_state(path, session)?;
+    Ok(state)
+}
+
+fn session_row_into_state(path: &Path, session: SessionRow) -> Result<(String, SessionState)> {
+    let state =
+        serde_json::from_str::<SessionState>(&session.state_json).context(
             ParseSqliteStoreValueSnafu {
                 path: path.to_owned(),
                 column: "sessions.state_json".to_owned(),
             },
         )?;
-        validate_session_row_summary(&session, &state_json, path)?;
-        state.sessions.insert(session.branch_name, state_json);
-    }
-    state.validate_session_records()
+    validate_session_row_summary(&session, &state, path)?;
+    Ok((session.branch_name, state))
 }
 
 async fn persist_branch(
@@ -2360,6 +2434,42 @@ async fn persist_session_state(
     Ok(())
 }
 
+async fn update_session_state(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    expected: Option<&SessionState>,
+    next: SessionState,
+) -> Result<SessionState> {
+    connection
+        .immediate_transaction::<SessionState, SqliteTransactionError, _>(async |connection| {
+            let current = load_session_state(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            if let Some(expected) = expected {
+                if current != *expected {
+                    return Err(SqliteTransactionError::Operation(
+                        SessionStateMovedSnafu {
+                            name: branch.to_owned(),
+                            expected: format!("{expected:?}"),
+                            actual: format!("{current:?}"),
+                        }
+                        .build(),
+                    ));
+                }
+            }
+            validate_session_state(connection, path, &next)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            persist_session_state(connection, path, branch, &next)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(next)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
 fn validate_session_row_summary(row: &SessionRow, state: &SessionState, path: &Path) -> Result<()> {
     validate_text_summary(path, "sessions.state", &row.state, state.as_str())?;
     validate_optional_text_summary(
@@ -2388,6 +2498,127 @@ fn validate_session_row_summary(row: &SessionRow, state: &SessionState, path: &P
         row.merged_anchor_id.as_deref(),
         pause_reason.and_then(|reason| reason.merged_anchor_id()),
     )
+}
+
+async fn validate_session_state(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    state: &SessionState,
+) -> Result<()> {
+    match state {
+        SessionState::Active => Ok(()),
+        SessionState::Attached {
+            target_branch,
+            base_head_id,
+        } => validate_ref_on_branch(connection, path, target_branch, base_head_id).await,
+        SessionState::Paused {
+            target_branch,
+            reason,
+        } => match reason {
+            PauseReason::Merged { merged_anchor_id } => {
+                validate_anchor_on_branch(connection, path, target_branch, merged_anchor_id).await
+            }
+            PauseReason::Closed => {
+                if target_branch.is_empty() {
+                    return Ok(());
+                }
+                load_branch_head(connection, path, target_branch).await?;
+                Ok(())
+            }
+        },
+    }
+}
+
+async fn validate_ref_on_branch(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    node_id: &str,
+) -> Result<()> {
+    let head_id = load_branch_head(connection, path, branch).await?;
+    load_node_by_exact_id(connection, path, node_id).await?;
+    let visible = node_reachable_from_head(connection, path, &head_id, node_id).await?;
+    ensure!(
+        visible,
+        RefsNotConnectedSnafu {
+            base_ref: node_id.to_owned(),
+            head_ref: branch.to_owned(),
+        }
+    );
+    Ok(())
+}
+
+async fn validate_anchor_on_branch(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    node_id: &str,
+) -> Result<()> {
+    let node = load_node_by_exact_id(connection, path, node_id).await?;
+    ensure!(
+        matches!(node.kind, Kind::Anchor(_)),
+        InvalidAnchorSnafu {
+            id: node_id.to_owned(),
+        }
+    );
+    validate_ref_on_branch(connection, path, branch, node_id).await
+}
+
+async fn load_branch_head(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+) -> Result<String> {
+    branches::table
+        .filter(branches::name.eq(branch))
+        .select(branches::head_id)
+        .get_result::<String>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .context(BranchNotFoundSnafu {
+            name: branch.to_owned(),
+        })
+}
+
+async fn node_reachable_from_head(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    head_id: &str,
+    node_id: &str,
+) -> Result<bool> {
+    let mut current_id = head_id.to_owned();
+    let mut seen = HashSet::new();
+    loop {
+        if current_id == node_id {
+            return Ok(true);
+        }
+        ensure!(
+            seen.insert(current_id.clone()),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: "SQLite nodes contain cyclic parents".to_owned(),
+            }
+        );
+        let parent_id = nodes::table
+            .filter(nodes::id.eq(&current_id))
+            .select(nodes::parent_id)
+            .get_result::<String>(connection)
+            .await
+            .optional()
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?
+            .context(ParentNotFoundSnafu {
+                id: current_id.clone(),
+            })?;
+        if parent_id.is_empty() {
+            return Ok(false);
+        }
+        current_id = parent_id;
+    }
 }
 
 async fn update_branch_head(
@@ -2940,43 +3171,16 @@ impl SessionStore for SqliteGraphStore {
     fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
         let path = self.database_path.clone();
         self.with_connection(move |connection| {
-            Box::pin(async move {
-                let sessions = sessions::table
-                    .select((
-                        sessions::branch_name,
-                        sessions::state,
-                        sessions::target_branch,
-                        sessions::base_head_id,
-                        sessions::pause_reason,
-                        sessions::merged_anchor_id,
-                        sessions::state_json,
-                    ))
-                    .order(sessions::branch_name)
-                    .load::<SessionRow>(connection)
-                    .await
-                    .context(QuerySqliteStoreSnafu { path: path.clone() })?;
-                sessions
-                    .into_iter()
-                    .map(|session| {
-                        let state = serde_json::from_str::<SessionState>(&session.state_json)
-                            .context(ParseSqliteStoreValueSnafu {
-                                path: path.clone(),
-                                column: "sessions.state_json".to_owned(),
-                            })?;
-                        validate_session_row_summary(&session, &state, &path)?;
-                        Ok((session.branch_name, state))
-                    })
-                    .collect()
-            })
+            Box::pin(async move { load_session_states(connection, &path).await })
         })
     }
 
     fn get_session_state(&self, name: &str) -> Result<SessionState> {
-        self.list_session_states()?
-            .remove(name)
-            .context(BranchNotFoundSnafu {
-                name: name.to_owned(),
-            })
+        let name = name.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_session_state(connection, &path, &name).await })
+        })
     }
 
     fn set_session_state(
@@ -3122,18 +3326,17 @@ impl BranchStore for SqliteStore {
 
 impl SessionStore for SqliteStore {
     fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .list_session_states())
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_session_states(&mut connection, &self.database_path).await
+        })
     }
 
     fn get_session_state(&self, name: &str) -> Result<SessionState> {
-        self.inner
-            .read()
-            .expect("store lock poisoned")
-            .get_session_state(name)
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_session_state(&mut connection, &self.database_path, name).await
+        })
     }
 
     fn set_session_state(
@@ -3143,14 +3346,16 @@ impl SessionStore for SqliteStore {
         next: SessionState,
     ) -> Result<SessionState> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let updated = temp.set_session_state(name, expected, next)?;
-        self.block_on(async {
+        let updated = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_session_state(&mut connection, &self.database_path, name, &updated).await
+            update_session_state(&mut connection, &self.database_path, name, expected, next).await
         })?;
-        state.set_session_state(name, expected, updated)
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .sessions
+            .insert(name.to_owned(), updated.clone());
+        Ok(updated)
     }
 
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
