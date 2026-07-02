@@ -29,18 +29,19 @@ use crate::StoreResult as Result;
 use crate::error::{
     AcquireSqliteConnectionSnafu, AmbiguousNodePrefixSnafu, BranchExistsSnafu,
     BranchHeadMovedSnafu, BranchNotFoundSnafu, CorruptedStoreSnafu, CreateSqlitePoolSnafu,
-    DuplicateMergeParentSnafu, InvalidAnchorSnafu, LegacyJsonStoreSnafu,
-    MergeParentMatchesParentSnafu, MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu,
-    ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu,
-    SessionStateMovedSnafu, StartSqliteRuntimeSnafu, StoreError, StorePathIsNotDirectorySnafu,
-    StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+    DuplicateMergeParentSnafu, InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu,
+    LegacyJsonStoreSnafu, MergeParentMatchesParentSnafu, MissingSessionAnchorSnafu,
+    MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu, ParseSqliteStoreValueSnafu,
+    QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
+    StartSqliteRuntimeSnafu, StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu,
+    WriteStoreDirectorySnafu,
 };
 use crate::schema::{
     branches, jobs, message_queue_items, node_metadata, node_relations, nodes, presets, sessions,
     skills, store_meta,
 };
 use crate::{
-    AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node,
+    Anchor, AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node,
     NodeMetadata, PauseReason, Preset, PresetRecord, Role, SessionAnchorPatch, SessionRole,
     SessionState, SkillInvocationMode, SkillRecord, SkillUpdatePatch, SkillVersionSpec,
 };
@@ -2644,6 +2645,188 @@ async fn update_session_state(
         .map_err(|error| error.into_store_error(path))
 }
 
+async fn rebase_session_in_sqlite(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    patch: &SessionAnchorPatch,
+) -> Result<(String, Vec<Node>)> {
+    connection
+        .immediate_transaction::<(String, Vec<Node>), SqliteTransactionError, _>(
+            async |connection| {
+                let expected_old_head = load_branch_head(connection, path, branch)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                let mut chain = load_session_chain(connection, path, branch)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                chain.reverse();
+                let session_node = chain
+                    .as_slice()
+                    .first()
+                    .expect("session chain should not be empty");
+                let session_anchor = session_anchor_from_node(path, session_node)
+                    .map_err(SqliteTransactionError::Operation)?;
+                let rebased_session_anchor = session_anchor.apply_patch(patch);
+
+                let mut previous_new_id = None;
+                let mut new_head = String::new();
+                let mut nodes = Vec::with_capacity(chain.len());
+                for (index, node) in chain.into_iter().enumerate() {
+                    let parent = previous_new_id
+                        .clone()
+                        .unwrap_or_else(|| node.parent.clone());
+                    let kind = if index == 0 {
+                        let Kind::Anchor(anchor) = &node.kind else {
+                            unreachable!("session chain should start with anchor");
+                        };
+                        Kind::Anchor(Anchor::session(
+                            anchor.merge_parents().to_vec(),
+                            rebased_session_anchor.clone(),
+                        ))
+                    } else {
+                        node.kind.clone()
+                    };
+                    let new_node =
+                        Node::new(parent, node.role, node.metadata, kind, node.created_at);
+                    upsert_node_without_transaction(connection, path, &new_node)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
+                    previous_new_id = Some(new_node.id.clone());
+                    new_head = new_node.id.clone();
+                    nodes.push(new_node);
+                }
+
+                update_branch_head_after_session_write(
+                    connection,
+                    path,
+                    branch,
+                    &expected_old_head,
+                    &new_head,
+                )
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+                Ok((new_head, nodes))
+            },
+        )
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn handoff_session_in_sqlite(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    patch: &SessionAnchorPatch,
+    prompt: &str,
+) -> Result<(String, Node)> {
+    let prompt = prompt.trim().to_owned();
+    ensure!(!prompt.is_empty(), InvalidSessionHandoffPromptSnafu);
+    connection
+        .immediate_transaction::<(String, Node), SqliteTransactionError, _>(async |connection| {
+            let expected_old_head = load_branch_head(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            let chain = load_session_chain(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            let session_node = chain
+                .last()
+                .expect("session chain should not be empty");
+            let session_anchor = session_anchor_from_node(path, session_node)
+                .map_err(SqliteTransactionError::Operation)?;
+            let mut handoff_session_anchor = session_anchor.apply_patch(patch);
+            handoff_session_anchor.prompt = prompt;
+
+            let node = Node::new(
+                expected_old_head.clone(),
+                Role::System,
+                None,
+                Kind::Anchor(Anchor::session(vec![], handoff_session_anchor)),
+                jiff::Timestamp::now(),
+            );
+            validate_new_node(connection, path, &node)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            persist_node_without_transaction(connection, path, &node)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            update_branch_head_after_session_write(
+                connection,
+                path,
+                branch,
+                &expected_old_head,
+                &node.id,
+            )
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
+            Ok((node.id.clone(), node))
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn load_session_chain(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+) -> Result<Vec<Node>> {
+    let ancestry = load_ancestry_nodes(connection, path, branch).await?;
+    let mut chain = Vec::new();
+    for node in ancestry {
+        let is_session_anchor = matches!(
+            node.kind,
+            Kind::Anchor(Anchor {
+                payload: AnchorPayload::Session(_),
+                ..
+            })
+        );
+        chain.push(node);
+        if is_session_anchor {
+            return Ok(chain);
+        }
+    }
+    MissingSessionAnchorSnafu {
+        branch: branch.to_owned(),
+    }
+    .fail()
+}
+
+fn session_anchor_from_node(path: &Path, node: &Node) -> Result<crate::SessionAnchor> {
+    match &node.kind {
+        Kind::Anchor(anchor) => anchor
+            .as_session()
+            .cloned()
+            .context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: "session chain should end with session anchor".to_owned(),
+            }),
+        _ => CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "session chain should end with anchor".to_owned(),
+        }
+        .fail(),
+    }
+}
+
+async fn update_branch_head_after_session_write(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    expected_old_head: &str,
+    new_head: &str,
+) -> Result<()> {
+    let updated = update_branch_head(connection, path, branch, expected_old_head, new_head).await?;
+    ensure!(
+        updated == 1,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("SQLite branch {branch:?} did not match expected head"),
+        }
+    );
+    Ok(())
+}
+
 fn validate_session_row_summary(row: &SessionRow, state: &SessionState, path: &Path) -> Result<()> {
     validate_text_summary(path, "sessions.state", &row.state, state.as_str())?;
     validate_optional_text_summary(
@@ -3540,25 +3723,16 @@ impl SessionStore for SqliteStore {
 
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let plan = state.plan_rebase_session(name, patch)?;
-        self.block_on(async {
+        let (new_head, nodes) = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_session_nodes_and_branch_head(
-                &mut connection,
-                &self.database_path,
-                &plan.branch,
-                &plan.expected_old_head,
-                &plan.new_head,
-                &plan.nodes,
-            )
-            .await
+            rebase_session_in_sqlite(&mut connection, &self.database_path, name, patch).await
         })?;
-        for node in plan.nodes {
+        let mut state = self.inner.write().expect("store lock poisoned");
+        for node in nodes {
             state.insert_existing_node(node)?;
         }
-        state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
-        Ok(plan.new_head)
+        state.branches.insert(name.to_owned(), new_head.clone());
+        Ok(new_head)
     }
 
     fn handoff_session(
@@ -3568,23 +3742,15 @@ impl SessionStore for SqliteStore {
         prompt: &str,
     ) -> Result<String> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let plan = state.plan_handoff_session(name, patch, prompt)?;
-        self.block_on(async {
+        let (new_head, node) = self.block_on(async {
             let mut connection = self.connect().await?;
-            persist_session_nodes_and_branch_head(
-                &mut connection,
-                &self.database_path,
-                &plan.branch,
-                &plan.expected_old_head,
-                &plan.new_head,
-                std::slice::from_ref(&plan.node),
-            )
-            .await
+            handoff_session_in_sqlite(&mut connection, &self.database_path, name, patch, prompt)
+                .await
         })?;
-        state.insert_existing_node(plan.node)?;
-        state.apply_set_branch_head(plan.branch, &plan.expected_old_head, plan.new_head.clone())?;
-        Ok(plan.new_head)
+        let mut state = self.inner.write().expect("store lock poisoned");
+        state.insert_existing_node(node)?;
+        state.branches.insert(name.to_owned(), new_head.clone());
+        Ok(new_head)
     }
 }
 
