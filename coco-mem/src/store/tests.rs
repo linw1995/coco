@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use super::memory::MemoryStore;
 use super::sqlite::SqliteStore;
 use crate::{
     Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueItem,
@@ -146,15 +145,6 @@ trait TestStoreFactory {
     fn create() -> Self::Backend;
 }
 
-struct MemoryFactory;
-
-impl TestStoreFactory for MemoryFactory {
-    type Backend = MemoryStore;
-
-    fn create() -> Self::Backend {
-        MemoryStore::new()
-    }
-}
 struct SqliteFactory;
 
 impl TestStoreFactory for SqliteFactory {
@@ -2495,5 +2485,4 @@ macro_rules! define_common_store_tests {
     };
 }
 
-define_common_store_tests!(memory_store, MemoryFactory);
 define_common_store_tests!(sqlite_store, SqliteFactory);

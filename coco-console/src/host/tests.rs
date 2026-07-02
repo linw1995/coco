@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use coco_mem::{
-    Anchor, BranchStore, Kind, MemoryStore, MergeParent, MessageQueueStore, NewNode, NodeStore,
-    PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
-    SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor, Tool, ToolResult, ToolUse,
+    Anchor, BranchStore, Kind, MergeParent, MessageQueueStore, NewNode, NodeStore, PromptAnchor,
+    Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillInvocationAnchor,
+    SkillInvocationMode, SkillResultAnchor, SqliteStore, Tool, ToolResult, ToolUse,
 };
 use serde_json::json;
 
@@ -24,6 +24,14 @@ use crate::render::{
     render_provider_context_fragment, render_snapshot_page,
 };
 use crate::{ConsolePublisher, ConsoleStore};
+
+fn test_store() -> SqliteStore {
+    let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).expect("SQLite store should open");
+    std::mem::forget(tempdir);
+    store
+}
 
 fn session_anchor() -> SessionAnchor {
     SessionAnchor {
@@ -192,7 +200,7 @@ fn apply_diff_node_keys(
 
 #[test]
 fn graph_snapshot_contains_primary_and_merge_edges() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let left = store
         .append(NewNode {
@@ -405,7 +413,7 @@ fn provider_context_fragment_renders_default_or_missing_selection() {
 
 #[test]
 fn graph_snapshot_contains_shadow_parent_edges() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -451,7 +459,7 @@ fn graph_snapshot_contains_shadow_parent_edges() {
 
 #[test]
 fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -566,7 +574,7 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
 
 #[test]
 fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -676,7 +684,7 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
 
 #[test]
 fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -740,7 +748,7 @@ fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
 
 #[test]
 fn node_details_include_nodes_from_same_provider_context() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let first_session = store
         .append(NewNode {
@@ -854,7 +862,7 @@ fn node_details_include_nodes_from_same_provider_context() {
 
 #[test]
 fn provider_context_list_uses_one_head_to_context_start_path() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -990,7 +998,7 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
 
 #[test]
 fn provider_context_id_stays_stable_when_branch_head_moves() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -1059,7 +1067,7 @@ fn provider_context_id_stays_stable_when_branch_head_moves() {
 
 #[test]
 fn provider_context_ids_preserve_unique_branch_names() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -1162,7 +1170,7 @@ fn provider_context_ids_preserve_unique_branch_names() {
 
 #[test]
 fn all_mode_provider_contexts_cover_older_visible_segments() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let first_session = store
         .append(NewNode {
@@ -1265,7 +1273,7 @@ fn snapshot_content<'a>(snapshot: &'a GraphSnapshot, node_id: &str) -> &'a str {
 
 #[test]
 fn graph_snapshot_renders_content_for_visible_node_kinds() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let mut empty_prompt_session_anchor = session_anchor();
     empty_prompt_session_anchor.prompt.clear();
@@ -2337,7 +2345,7 @@ fn streamed_graph_markup_escapes_dynamic_values() {
 #[test]
 fn console_store_notifies_after_successful_writes() {
     let publisher = ConsolePublisher::new();
-    let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+    let store = ConsoleStore::new(test_store(), publisher.clone());
     let root = store.root_id();
 
     store
@@ -2359,7 +2367,7 @@ fn console_store_notifies_after_successful_writes() {
 #[test]
 fn console_store_notifies_only_when_dequeue_removes_message() {
     let publisher = ConsolePublisher::new();
-    let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+    let store = ConsoleStore::new(test_store(), publisher.clone());
 
     assert_eq!(store.dequeue_message("system").unwrap(), None);
     assert_eq!(publisher.current_version(), 0);
@@ -2378,7 +2386,7 @@ fn console_store_notifies_only_when_dequeue_removes_message() {
 
 #[test]
 fn console_store_lists_message_queues() {
-    let store = ConsoleStore::new(MemoryStore::new(), ConsolePublisher::new());
+    let store = ConsoleStore::new(test_store(), ConsolePublisher::new());
 
     store
         .enqueue_message("system", json!({"ok": true}))

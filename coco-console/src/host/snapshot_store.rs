@@ -5961,7 +5961,15 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use coco_mem::{MemoryStore, NewNode, NodeStore, PersistentStore, Role};
+    use coco_mem::{NewNode, NodeStore, PersistentStore, Role, SqliteStore};
+
+    fn test_store() -> SqliteStore {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).expect("SQLite store should open");
+        std::mem::forget(tempdir);
+        store
+    }
 
     struct BranchAdvanceDuringWalkStore {
         root: Node,
@@ -5973,7 +5981,7 @@ mod tests {
 
     impl BranchAdvanceDuringWalkStore {
         fn new() -> Self {
-            let memory = MemoryStore::new();
+            let memory = test_store();
             let root = memory.get_node(&memory.root_id()).unwrap();
             let old_head = Node::new(
                 root.id.clone(),
@@ -6441,7 +6449,7 @@ mod tests {
 
     #[test]
     fn visible_skill_invocation_linear_subtrees_handles_deep_chain() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let source_id = store.root_id();
         let depth = 20_000;
         let mut node_ids = Vec::with_capacity(depth);

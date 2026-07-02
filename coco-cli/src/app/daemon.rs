@@ -2228,8 +2228,9 @@ mod tests {
         SessionConfig, StepContext,
     };
     use coco_mem::{
-        BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MemoryStore, MessageQueueStore,
-        NewNode, NodeStore, ProviderProfile, Role, SessionAnchorPatch, SessionRole, SessionStore,
+        BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MessageQueueStore, NewNode,
+        NodeStore, ProviderProfile, Role, SessionAnchorPatch, SessionRole, SessionStore,
+        SqliteStore,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -2249,6 +2250,14 @@ mod tests {
         encode_telegram_message, resolve_daemon_command_socket_path, resolve_daemon_socket_path,
         run_daemon_command, start_chatgpt_auth_check_task,
     };
+
+    fn test_store() -> SqliteStore {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).expect("SQLite store should open");
+        std::mem::forget(tempdir);
+        store
+    }
 
     fn daemon_command<I, T>(args: I) -> DaemonCommand
     where
@@ -2306,7 +2315,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_profile_graph_builds_snapshot_without_serving() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let root = store.root_id();
         store.fork("main", &root).unwrap();
         let node = store
@@ -2379,7 +2388,7 @@ mod tests {
         let socket_parent = temp_dir.path().join("not-a-directory");
         fs::write(&socket_parent, "").unwrap();
         let socket_path = socket_parent.join("coco.sock");
-        let store = MemoryStore::new();
+        let store = test_store();
         let llm = Arc::new(LlmService::new(
             store.clone(),
             BlockingOnceBackend::default(),
@@ -2413,7 +2422,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let socket_path = temp_dir.path().join("coco.sock");
         fs::write(&socket_path, "").unwrap();
-        let store = MemoryStore::new();
+        let store = test_store();
         let llm = Arc::new(LlmService::new(
             store.clone(),
             BlockingOnceBackend::default(),
@@ -2438,7 +2447,7 @@ mod tests {
     #[test]
     fn chatgpt_auth_check_task_skips_empty_config() {
         let llm = Arc::new(LlmService::new(
-            MemoryStore::new(),
+            test_store(),
             BlockingOnceBackend::default(),
         ));
 
@@ -2544,7 +2553,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_message_queue_publisher_persists_inbound_message() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let publisher = TelegramMessageQueuePublisher::new(store.clone(), Arc::new(Notify::new()));
         let message =
             InboundMessage::telegram_with_message_id("chat-1", "sender-1", "message-1", "hello");
@@ -2562,7 +2571,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_queue_worker_returns_after_message_processing_finishes() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2596,7 +2605,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_queue_worker_waits_for_active_target_branch_job() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2632,7 +2641,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_joins_inflight_active_branch_job() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2698,7 +2707,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_exits_after_draining_branch_queue() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2737,7 +2746,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_backs_off_when_active_job_waits_for_recovery() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = FailingBackend::default();
         let calls = backend.calls.clone();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -2792,7 +2801,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_does_not_start_idle_active_job() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = FailingBackend::default();
         let calls = backend.calls.clone();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -2852,7 +2861,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_processes_branch_queue_when_legacy_head_waits() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2926,7 +2935,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_processes_branch_queue_when_legacy_head_is_inflight() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -3003,7 +3012,7 @@ mod tests {
 
     #[test]
     fn active_job_waiting_for_recovery_detects_failure_child() {
-        let store = MemoryStore::new();
+        let store = test_store();
         store.fork("main", &store.root_id()).unwrap();
         let base = store.get_branch_head("main").unwrap();
         let active_job = store.submit_job("main", &base).unwrap();
@@ -3021,7 +3030,7 @@ mod tests {
 
     #[test]
     fn active_job_waiting_for_recovery_detects_terminal_failure() {
-        let store = MemoryStore::new();
+        let store = test_store();
         store.fork("main", &store.root_id()).unwrap();
         let base = store.get_branch_head("main").unwrap();
         let active_job = store.submit_job("main", &base).unwrap();
@@ -3040,7 +3049,7 @@ mod tests {
 
     #[test]
     fn active_job_waiting_for_recovery_ignores_clean_job() {
-        let store = MemoryStore::new();
+        let store = test_store();
         store.fork("main", &store.root_id()).unwrap();
         let base = store.get_branch_head("main").unwrap();
         let active_job = store.submit_job("main", &base).unwrap();
@@ -3050,7 +3059,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_discards_prompt_request_for_missing_branch() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -3086,7 +3095,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_discards_duplicate_prompt_request() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -3124,7 +3133,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_materializes_day_prompt_request() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3187,7 +3196,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_derives_missing_recovery_dedupe_key() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3232,7 +3241,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_skips_duplicate_recovery_prompt_request() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3283,7 +3292,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_queues_day_recovery_behind_blocked_main_queue() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("main")).await.unwrap();
@@ -3374,7 +3383,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_skips_recovery_prompt_when_job_exists() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3428,7 +3437,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_skips_recovery_prompt_when_legacy_job_exists() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3482,7 +3491,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_skips_recovery_prompt_when_legacy_request_exists() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3546,7 +3555,7 @@ mod tests {
 
     #[tokio::test]
     async fn derive_day_session_config_uses_latest_session_anchor() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let llm = Arc::new(LlmService::new(
             store.clone(),
             BlockingOnceBackend::default(),

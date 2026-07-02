@@ -1343,9 +1343,9 @@ mod tests {
     use crate::ConsoleStore;
     use crate::host::snapshot_store::ConsoleGraphSnapshotStore;
     use coco_mem::{
-        Anchor, BranchStore, JobStore, Kind, MemoryStore, MergeParent, NewNode, NodeStore,
-        PersistentStore, PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor,
-        SkillInvocationMode, SkillResultAnchor, Tool, ToolUse,
+        Anchor, BranchStore, JobStore, Kind, MergeParent, NewNode, NodeStore, PersistentStore,
+        PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor, SkillInvocationMode,
+        SkillResultAnchor, SqliteStore, Tool, ToolUse,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -1353,6 +1353,14 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{Duration, sleep};
+
+    fn test_store() -> SqliteStore {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).expect("SQLite store should open");
+        std::mem::forget(tempdir);
+        store
+    }
 
     fn session_anchor() -> SessionAnchor {
         SessionAnchor {
@@ -1371,8 +1379,8 @@ mod tests {
         }
     }
 
-    fn graph_store(publisher: ConsolePublisher) -> (ConsoleStore<MemoryStore>, String, String) {
-        let store = ConsoleStore::new(MemoryStore::new(), publisher);
+    fn graph_store(publisher: ConsolePublisher) -> (ConsoleStore<SqliteStore>, String, String) {
+        let store = ConsoleStore::new(test_store(), publisher);
         let root = store.root_id();
         let session = store
             .append(NewNode {
@@ -1412,7 +1420,7 @@ mod tests {
 
     #[test]
     fn materialized_shell_branches_use_branch_lane_keys() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let root = store.root_id();
         let session = store
             .append(NewNode {
@@ -1446,7 +1454,7 @@ mod tests {
 
     #[test]
     fn materialized_shell_branches_preserve_hidden_branches() {
-        let store = MemoryStore::new();
+        let store = test_store();
         let root = store.root_id();
         store.fork("hidden", &root).unwrap();
 
@@ -1604,7 +1612,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -1670,7 +1678,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -1709,7 +1717,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -1785,7 +1793,7 @@ mod tests {
         ));
         let reopened_publisher = ConsolePublisher::new();
         let reopened_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             reopened_publisher.clone(),
             path.clone(),
         )
@@ -1946,7 +1954,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -2074,7 +2082,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -2202,7 +2210,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -2327,7 +2335,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -2455,7 +2463,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -2580,7 +2588,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -2680,7 +2688,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -2840,7 +2848,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -2970,7 +2978,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -3090,7 +3098,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -3198,7 +3206,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -3366,7 +3374,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -3527,7 +3535,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -3619,7 +3627,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -3712,7 +3720,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -3794,7 +3802,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -3871,7 +3879,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -3944,7 +3952,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4059,7 +4067,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4165,7 +4173,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4293,7 +4301,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4381,7 +4389,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4434,7 +4442,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4519,7 +4527,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4644,7 +4652,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4763,7 +4771,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4821,7 +4829,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4880,7 +4888,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -4948,7 +4956,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -5015,7 +5023,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -5079,7 +5087,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -5147,7 +5155,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -5300,7 +5308,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -5423,7 +5431,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -5547,7 +5555,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -5644,7 +5652,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -5794,7 +5802,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -5911,7 +5919,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -6054,7 +6062,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -6224,7 +6232,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -6356,7 +6364,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -6467,7 +6475,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -6602,7 +6610,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -6727,7 +6735,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -6806,7 +6814,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -6891,7 +6899,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -6988,7 +6996,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -7084,7 +7092,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -7218,7 +7226,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -7342,7 +7350,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -7448,7 +7456,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -7535,7 +7543,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -7618,7 +7626,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -7791,7 +7799,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -7906,7 +7914,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -7981,7 +7989,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -8110,7 +8118,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -8216,7 +8224,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -8316,7 +8324,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -8419,7 +8427,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -8530,7 +8538,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -8625,7 +8633,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -8736,7 +8744,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -8843,7 +8851,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -8914,7 +8922,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -9003,7 +9011,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -9129,7 +9137,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -9207,7 +9215,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -9334,7 +9342,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
@@ -9841,7 +9849,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            MemoryStore::new(),
+            test_store(),
             publisher.clone(),
             path.clone(),
         )
