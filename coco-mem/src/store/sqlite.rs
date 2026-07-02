@@ -268,6 +268,7 @@ macro_rules! node_row_columns {
 #[derive(Queryable)]
 struct MessageQueueItemRow {
     row_id: i64,
+    created_at: String,
     item_json: String,
 }
 
@@ -3553,6 +3554,7 @@ async fn load_message_queue_items(
     let rows = message_queue_items_with_rowid::table
         .select((
             message_queue_items_with_rowid::rowid,
+            message_queue_items_with_rowid::created_at,
             message_queue_items_with_rowid::payload_json,
         ))
         .order(message_queue_items_with_rowid::rowid)
@@ -3588,6 +3590,78 @@ async fn load_message_queue_items(
     Ok(())
 }
 
+async fn load_queue_messages(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    queue: &str,
+) -> Result<Vec<MessageQueueItem>> {
+    let rows = message_queue_items_with_rowid::table
+        .filter(message_queue_items_with_rowid::queue.eq(queue))
+        .select((
+            message_queue_items_with_rowid::rowid,
+            message_queue_items_with_rowid::created_at,
+            message_queue_items_with_rowid::payload_json,
+        ))
+        .order(message_queue_items_with_rowid::rowid)
+        .load::<MessageQueueItemRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    message_queue_rows_into_sorted_items(path, rows)
+}
+
+async fn load_message_queue_names(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<Vec<String>> {
+    message_queue_items::table
+        .select(message_queue_items::queue)
+        .distinct()
+        .order(message_queue_items::queue)
+        .load::<String>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+fn message_queue_item_row_into_item(
+    path: &Path,
+    row: MessageQueueItemRow,
+) -> Result<MessageQueueItem> {
+    let item =
+        serde_json::from_str::<MessageQueueItem>(&row.item_json).context(ParseSqliteStoreValueSnafu {
+            path: path.to_owned(),
+            column: "message_queue_items.payload_json".to_owned(),
+        })?;
+    validate_text_summary(
+        path,
+        "message_queue_items.created_at",
+        &row.created_at,
+        &item.created_at.to_string(),
+    )?;
+    Ok(item)
+}
+
+fn message_queue_rows_into_sorted_items(
+    path: &Path,
+    rows: Vec<MessageQueueItemRow>,
+) -> Result<Vec<MessageQueueItem>> {
+    let mut items = Vec::new();
+    for row in rows {
+        let row_id = row.row_id;
+        let item = message_queue_item_row_into_item(path, row)?;
+        items.push((row_id, item));
+    }
+    items.sort_by(|(left_row_id, left), (right_row_id, right)| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left_row_id.cmp(right_row_id))
+    });
+    Ok(items.into_iter().map(|(_, item)| item).collect())
+}
+
 async fn persist_message_queue_item(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -3610,6 +3684,45 @@ async fn persist_message_queue_item(
             path: path.to_owned(),
         })?;
     Ok(())
+}
+
+async fn dequeue_message_queue_item(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    queue: &str,
+) -> Result<Option<MessageQueueItem>> {
+    connection
+        .immediate_transaction::<Option<MessageQueueItem>, SqliteTransactionError, _>(
+            async |connection| {
+                let rows = message_queue_items_with_rowid::table
+                    .filter(message_queue_items_with_rowid::queue.eq(queue))
+                    .select((
+                        message_queue_items_with_rowid::rowid,
+                        message_queue_items_with_rowid::created_at,
+                        message_queue_items_with_rowid::payload_json,
+                    ))
+                    .order(message_queue_items_with_rowid::rowid)
+                    .load::<MessageQueueItemRow>(connection)
+                    .await
+                    .context(QuerySqliteStoreSnafu {
+                        path: path.to_owned(),
+                    })
+                    .map_err(SqliteTransactionError::Operation)?;
+                let Some(item) = message_queue_rows_into_sorted_items(path, rows)
+                    .map_err(SqliteTransactionError::Operation)?
+                    .into_iter()
+                    .next()
+                else {
+                    return Ok(None);
+                };
+                delete_message_queue_item(connection, path, &item)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                Ok(Some(item))
+            },
+        )
+        .await
+        .map_err(|error| error.into_store_error(path))
 }
 
 async fn delete_message_queue_item(
@@ -4133,55 +4246,61 @@ impl JobStore for SqliteStore {
 impl MessageQueueStore for SqliteStore {
     fn enqueue_message(&self, queue: &str, payload: serde_json::Value) -> Result<MessageQueueItem> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let item = temp.enqueue_message(queue, payload);
+        let item = MessageQueueItem::new(queue, payload, jiff::Timestamp::now());
         self.block_on(async {
             let mut connection = self.connect().await?;
             persist_message_queue_item(&mut connection, &self.database_path, &item).await
         })?;
-        state.message_queues = temp.message_queues;
+        self.inner
+            .write()
+            .expect("store lock poisoned")
+            .message_queues
+            .entry(queue.to_owned())
+            .or_default()
+            .push(item.clone());
         Ok(item)
     }
 
     fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
         self.ensure_writable()?;
-        let mut state = self.inner.write().expect("store lock poisoned");
-        let mut temp = state.clone();
-        let item = temp.dequeue_message(queue);
-        let Some(item) = item else {
-            return Ok(None);
-        };
-        self.block_on(async {
+        let item = self.block_on(async {
             let mut connection = self.connect().await?;
-            delete_message_queue_item(&mut connection, &self.database_path, &item).await
+            dequeue_message_queue_item(&mut connection, &self.database_path, queue).await
         })?;
-        state.message_queues = temp.message_queues;
-        Ok(Some(item))
+        if let Some(item) = &item {
+            let mut state = self.inner.write().expect("store lock poisoned");
+            if let Some(messages) = state.message_queues.get_mut(queue) {
+                messages.retain(|message| message.message_id != item.message_id);
+                if messages.is_empty() {
+                    state.message_queues.remove(queue);
+                }
+            }
+        }
+        Ok(item)
     }
 
     fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .peek_message(queue))
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            Ok(load_queue_messages(&mut connection, &self.database_path, queue)
+                .await?
+                .into_iter()
+                .next())
+        })
     }
 
     fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .list_queue_messages(queue))
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_queue_messages(&mut connection, &self.database_path, queue).await
+        })
     }
 
     fn list_message_queues(&self) -> Result<Vec<String>> {
-        Ok(self
-            .inner
-            .read()
-            .expect("store lock poisoned")
-            .list_message_queues())
+        self.block_on(async {
+            let mut connection = self.connect().await?;
+            load_message_queue_names(&mut connection, &self.database_path).await
+        })
     }
 }
 
