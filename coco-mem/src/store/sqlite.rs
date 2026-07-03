@@ -717,6 +717,11 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         create_branch(&mut connection, &self.database_path, name, from_ref).await
     }
+
+    async fn get_branch_head_in_sqlite(&self, name: &str) -> Result<String> {
+        let mut connection = self.connect().await?;
+        load_branch_head(&mut connection, &self.database_path, name).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4120,10 +4125,7 @@ impl BranchStore for SqliteStore {
     }
 
     fn get_branch_head(&self, name: &str) -> Result<String> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            load_branch_head(&mut connection, &self.database_path, name).await
-        })
+        self.block_on(self.get_branch_head_in_sqlite(name))
     }
 
     fn delete_branch(&self, name: &str) -> Result<()> {
