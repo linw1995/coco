@@ -326,13 +326,6 @@ impl SqliteDatabase {
         )
     }
 
-    fn open_writable_file_path(path: impl AsRef<Path>) -> Result<Self> {
-        block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            Self::open(path.as_ref().to_owned(), true),
-        )
-    }
-
     async fn open(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let databases = SQLITE_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -492,7 +485,10 @@ impl SqliteStore {
         let path = path.as_ref();
         prepare_store_directory(path)?;
         block_on_sqlite_runtime_with(sqlite_runtime()?, reject_incomplete_legacy_json_store(path))?;
-        let store = Self::new(path, StoreAccess::ReadWrite)?;
+        let store = block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            Self::new(path, StoreAccess::ReadWrite),
+        )?;
         store.database.with_initialization_lock(|| {
             store.run_migrations()?;
             store.load_or_initialize_state()
@@ -512,7 +508,10 @@ impl SqliteStore {
         ensure_existing_store_directory(path)?;
         block_on_sqlite_runtime_with(sqlite_runtime()?, reject_incomplete_legacy_json_store(path))?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
-        let store = Self::new(path, StoreAccess::ReadOnly)?;
+        let store = block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            Self::new(path, StoreAccess::ReadOnly),
+        )?;
         store.database.with_initialization_lock(|| {
             store.ensure_current_schema()?;
             store.ensure_root_exists()
@@ -533,21 +532,18 @@ impl SqliteStore {
         existing_schema_version(&mut connection, &self.database_path).await
     }
 
-    fn new(path: &Path, access: StoreAccess) -> Result<Self> {
-        Self::new_with_database_path(path, path.join(SQLITE_DATABASE_FILE_NAME), access)
+    async fn new(path: &Path, access: StoreAccess) -> Result<Self> {
+        Self::new_with_database_path(path, path.join(SQLITE_DATABASE_FILE_NAME), access).await
     }
 
-    fn new_with_database_path(
+    async fn new_with_database_path(
         path: &Path,
         database_path: PathBuf,
         access: StoreAccess,
     ) -> Result<Self> {
         let database = match access {
-            StoreAccess::ReadWrite => SqliteDatabase::open_writable_file_path(&database_path)?,
-            StoreAccess::ReadOnly => block_on_sqlite_runtime_with(
-                sqlite_runtime()?,
-                SqliteDatabase::open(database_path.clone(), false),
-            )?,
+            StoreAccess::ReadWrite => SqliteDatabase::open(database_path.clone(), true).await?,
+            StoreAccess::ReadOnly => SqliteDatabase::open(database_path.clone(), false).await?,
         };
         let lock_file = if access == StoreAccess::ReadWrite {
             Some(super::lock::open_store_lock(path)?)
@@ -594,7 +590,10 @@ impl SqliteStore {
 
     fn sqlite_schema_requires_migration(path: &Path) -> Result<bool> {
         ensure_existing_store_directory(path)?;
-        let store = Self::new(path, StoreAccess::ReadOnly)?;
+        let store = block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            Self::new(path, StoreAccess::ReadOnly),
+        )?;
         ensure_existing_database_file(&store.database_path)?;
         let version = store.database.with_initialization_lock(|| {
             store.block_on(async {
@@ -1013,7 +1012,7 @@ async fn reject_incomplete_legacy_json_store(path: &Path) -> Result<()> {
 }
 
 async fn fs_migration_complete_marker_exists(path: &Path) -> Result<bool> {
-    let store = SqliteStore::new(path, StoreAccess::ReadOnly)?;
+    let store = SqliteStore::new(path, StoreAccess::ReadOnly).await?;
     let mut connection = store.connect().await?;
     load_store_meta_bool(
         &mut connection,
