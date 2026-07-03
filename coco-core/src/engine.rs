@@ -404,7 +404,7 @@ where
                 Err(error) => return Err(error.into()),
             }
         }
-        if let Some(active_job) = self.active_branch_prompt_job(branch)? {
+        if let Some(active_job) = self.active_branch_prompt_job(branch).await? {
             return Err(EngineError::EngineFailed {
                 message: format!(
                     "Branch {branch:?} already has an active prompt job {:?}",
@@ -438,21 +438,21 @@ where
         self.build_job_status_snapshot(&job)
     }
 
-    pub fn active_branch_prompt_job(
+    pub async fn active_branch_prompt_job(
         &self,
         branch: &str,
     ) -> std::result::Result<Option<Job>, EngineError> {
-        self.active_branch_prompt_job_excluding(branch, None)
+        self.active_branch_prompt_job_excluding(branch, None).await
     }
 
-    pub fn list_jobs(
+    pub async fn list_jobs(
         &self,
     ) -> std::result::Result<std::collections::HashMap<String, Job>, EngineError> {
-        Ok(self.service.store().list_jobs()?)
+        Ok(self.service.store().list_jobs().await?)
     }
 
     pub async fn resume_incomplete_jobs(&self) -> std::result::Result<(), EngineError> {
-        let jobs = self.list_jobs()?;
+        let jobs = self.list_jobs().await?;
         let incomplete_count = jobs
             .values()
             .filter(|job| !matches!(job.status, JobStatus::Finished))
@@ -572,7 +572,7 @@ where
         }
 
         if matches!(job.status, JobStatus::Running) {
-            self.ensure_job_has_exclusive_branch_access(&job)?;
+            self.ensure_job_has_exclusive_branch_access(&job).await?;
             match self.resume_or_run_job(&job, merge_parents).await {
                 Ok(JobRunOutcome::Completed) => {
                     job = match self.restore_root_branch_after_recovery(&job) {
@@ -832,12 +832,13 @@ where
             .map_or_else(|| Ok(job.base.clone()), |last_node| Ok(last_node.id))
     }
 
-    fn ensure_job_has_exclusive_branch_access(
+    async fn ensure_job_has_exclusive_branch_access(
         &self,
         job: &Job,
     ) -> std::result::Result<(), EngineError> {
-        if let Some(active_job) =
-            self.active_branch_prompt_job_excluding(&job.work_branch, Some(&job.job_id))?
+        if let Some(active_job) = self
+            .active_branch_prompt_job_excluding(&job.work_branch, Some(&job.job_id))
+            .await?
         {
             tracing::warn!(
                 branch = %job.branch,
@@ -856,7 +857,7 @@ where
         Ok(())
     }
 
-    fn active_branch_prompt_job_excluding(
+    async fn active_branch_prompt_job_excluding(
         &self,
         branch: &str,
         excluded_job_id: Option<&str>,
@@ -864,7 +865,8 @@ where
         Ok(self
             .service
             .store()
-            .list_jobs()?
+            .list_jobs()
+            .await?
             .into_values()
             .filter(|job| {
                 (job.branch == branch || job.work_branch == branch)

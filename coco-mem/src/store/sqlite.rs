@@ -4457,8 +4457,14 @@ impl JobStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn list_jobs(&self) -> Result<std::collections::HashMap<String, Job>> {
-        self.block_on(self.list_jobs_in_sqlite())
+    async fn list_jobs(&self) -> Result<std::collections::HashMap<String, Job>> {
+        let store = self.clone();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.list_jobs_in_sqlite().await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn set_job_status(&self, job_id: &str, expected: JobStatus, next: JobStatus) -> Result<Job> {

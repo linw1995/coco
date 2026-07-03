@@ -175,7 +175,7 @@ pub trait JobStore {
     -> impl Future<Output = StoreResult<Job>> + Send + 'a;
 
     /// Returns all persisted prompt jobs keyed by job id.
-    fn list_jobs(&self) -> StoreResult<HashMap<String, Job>>;
+    fn list_jobs(&self) -> impl Future<Output = StoreResult<HashMap<String, Job>>> + Send + '_;
 
     /// Updates a prompt job lifecycle state when the current state matches.
     fn set_job_status(
@@ -460,8 +460,10 @@ impl JobStore for PersistentStore {
         }
     }
 
-    fn list_jobs(&self) -> StoreResult<HashMap<String, Job>> {
-        delegate_persistent_store!(self, store, store.list_jobs())
+    async fn list_jobs(&self) -> StoreResult<HashMap<String, Job>> {
+        match self {
+            Self::Sqlite(store) => store.list_jobs().await,
+        }
     }
 
     fn set_job_status(

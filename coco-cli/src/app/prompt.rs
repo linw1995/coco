@@ -402,7 +402,12 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let mut jobs = Vec::new();
-    for job_id in engine.list_jobs().context(CoreEngineSnafu)?.into_keys() {
+    for job_id in engine
+        .list_jobs()
+        .await
+        .context(CoreEngineSnafu)?
+        .into_keys()
+    {
         let snapshot = engine.get_job(&job_id).await.context(CoreEngineSnafu)?;
         jobs.push(job_list_item_from_snapshot(snapshot));
     }

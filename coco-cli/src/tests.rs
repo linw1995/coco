@@ -1191,7 +1191,7 @@ async fn prompt_persists_single_job_even_without_async() {
 
     assert_eq!(output, "done");
 
-    let jobs = open_store(&store_path).unwrap().list_jobs().unwrap();
+    let jobs = open_store(&store_path).unwrap().list_jobs().await.unwrap();
     assert_eq!(jobs.len(), 1);
     let job_id = jobs.keys().next().unwrap().clone();
     let status_text_output = run_with_backend(

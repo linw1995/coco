@@ -1104,6 +1104,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         if let Some(active_job) = self
             .engine
             .active_branch_prompt_job(&request.branch)
+            .await
             .context(CoreEngineSnafu)?
         {
             return self
@@ -1142,6 +1143,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         if let Some(active_job) = self
             .engine
             .active_branch_prompt_job(&request.branch)
+            .await
             .context(CoreEngineSnafu)?
         {
             drop(guard);
@@ -1613,6 +1615,7 @@ where
     loop {
         let active_job = engine
             .active_branch_prompt_job(branch)
+            .await
             .context(CoreEngineSnafu)?;
         let Some(active_job) = active_job else {
             return Ok(());

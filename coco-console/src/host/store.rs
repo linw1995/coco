@@ -215,8 +215,8 @@ where
         self.inner.get_job(job_id).await
     }
 
-    fn list_jobs(&self) -> StoreResult<HashMap<String, Job>> {
-        self.inner.list_jobs()
+    async fn list_jobs(&self) -> StoreResult<HashMap<String, Job>> {
+        self.inner.list_jobs().await
     }
 
     fn set_job_status(

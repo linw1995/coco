@@ -532,7 +532,7 @@ async fn llm_engine_calls_prompt_and_returns_text() {
     let response = engine.reply("main", "hello").await.unwrap();
 
     assert_eq!(response, "hello from llm");
-    let jobs = store.list_jobs().unwrap();
+    let jobs = store.list_jobs().await.unwrap();
     assert_eq!(jobs.len(), 1);
     let job_id = jobs.keys().next().unwrap();
     let persisted_job = jobs.get(job_id).unwrap();
@@ -998,7 +998,13 @@ async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
         store.get_job(&job_id).await.unwrap().status,
         JobStatus::Finished
     );
-    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+    assert!(
+        engine
+            .active_branch_prompt_job("main")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1079,16 +1085,24 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
         store.get_node(&recovered.head).unwrap().kind,
         Kind::Text("recovered by c".to_owned())
     );
-    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+    assert!(
+        engine
+            .active_branch_prompt_job("main")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         engine
             .active_branch_prompt_job("recovery-b")
+            .await
             .unwrap()
             .is_none()
     );
     assert!(
         engine
             .active_branch_prompt_job("recovery-c")
+            .await
             .unwrap()
             .is_none()
     );
@@ -1132,10 +1146,17 @@ async fn llm_engine_finishes_job_when_recovery_restore_fails() {
     assert_eq!(recovered.status, JobStatus::Finished);
     assert_eq!(recovered.branch, "main");
     assert_eq!(recovered.work_branch, "recovery-b");
-    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+    assert!(
+        engine
+            .active_branch_prompt_job("main")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         engine
             .active_branch_prompt_job("recovery-b")
+            .await
             .unwrap()
             .is_none()
     );
@@ -1177,7 +1198,13 @@ async fn llm_engine_reply_surfaces_backend_failure_message() {
         events[0].payload["type"],
         "llm.backend_failure.recovery_requested"
     );
-    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+    assert!(
+        engine
+            .active_branch_prompt_job("main")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1263,7 +1290,7 @@ async fn core_service_handles_batch_prompt_across_multiple_branches() {
     assert_eq!(result.outcomes[1].branch, "draft");
     assert_eq!(result.outcomes[1].status(), BranchPromptStatus::Succeeded);
     assert_eq!(result.outcomes[1].text(), Some("draft done"));
-    let jobs = store.list_jobs().unwrap();
+    let jobs = store.list_jobs().await.unwrap();
     assert_eq!(jobs.len(), 2);
     assert!(jobs.values().all(|job| job.status == JobStatus::Finished));
 }
@@ -1356,20 +1383,19 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
         .unwrap();
     let original_head = store.get_branch_head("main").unwrap();
     submit_prompt_job(&store, "main", "keep going");
+    let job_id = store
+        .list_jobs()
+        .await
+        .unwrap()
+        .keys()
+        .next()
+        .expect("job should exist")
+        .clone();
     store
-        .set_job_status(
-            store
-                .list_jobs()
-                .unwrap()
-                .keys()
-                .next()
-                .expect("job should exist"),
-            JobStatus::Queued,
-            JobStatus::Running,
-        )
+        .set_job_status(&job_id, JobStatus::Queued, JobStatus::Running)
         .unwrap();
 
-    let job = store.list_jobs().unwrap();
+    let job = store.list_jobs().await.unwrap();
     let job = job.values().next().unwrap().clone();
     store
         .set_branch_head("main", &original_head, &job.base)
@@ -1494,7 +1520,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
         state_error,
         coco_llm::coco_mem::StoreError::BranchNotFound { name } if name == child_branch
     ));
-    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(store.list_jobs().await.unwrap().is_empty());
 
     let children = store.list_children(&invocation_id).unwrap();
     let child_session_anchor = children
@@ -1697,5 +1723,5 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
         branch_error,
         coco_llm::coco_mem::StoreError::BranchNotFound { name } if name == child_branch
     ));
-    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(store.list_jobs().await.unwrap().is_empty());
 }
