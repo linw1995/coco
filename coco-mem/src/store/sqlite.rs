@@ -853,14 +853,15 @@ impl SqliteGraphStore {
         .await
     }
 
-    fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
+    async fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
         let reference = reference.to_owned();
         let path = self.database_path.clone();
-        self.block_on(self.with_connection(move |connection| {
+        self.with_connection(move |connection| {
             Box::pin(
                 async move { load_node_by_prefix_or_branch(connection, &path, &reference).await },
             )
-        }))
+        })
+        .await
     }
 }
 
@@ -3934,7 +3935,7 @@ impl NodeStore for SqliteGraphStore {
     }
 
     fn get_node(&self, id: &str) -> Result<Node> {
-        self.get_node_by_prefix_or_branch(id)
+        self.block_on(self.get_node_by_prefix_or_branch(id))
     }
 
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
