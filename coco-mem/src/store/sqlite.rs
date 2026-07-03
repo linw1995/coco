@@ -521,9 +521,8 @@ impl SqliteStore {
         Ok(store)
     }
 
-    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        block_on_sqlite_runtime_with(sqlite_runtime()?, Self::open_read_only_in_sqlite(path))
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_in_sqlite(path.as_ref()).await
     }
 
     async fn open_read_only_in_sqlite(path: &Path) -> Result<Self> {
@@ -5080,15 +5079,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn reopened_sqlite_handles_share_database_instance() {
+    #[tokio::test]
+    async fn reopened_sqlite_handles_share_database_instance() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
 
         let store = SqliteStore::open(&path).unwrap();
-        let read_only = SqliteStore::open_read_only(&path).unwrap();
+        let read_only = SqliteStore::open_read_only(&path).await.unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
-        let lexical_read_only = SqliteStore::open_read_only(path.join(".")).unwrap();
+        let lexical_read_only = SqliteStore::open_read_only(path.join(".")).await.unwrap();
 
         assert!(std::ptr::eq(
             store.database.shared_pool(),
@@ -5146,8 +5145,8 @@ mod tests {
         assert_eq!(store.get_node(&written).unwrap().id, written);
     }
 
-    #[test]
-    fn sqlite_store_serializes_concurrent_writes_on_shared_database() {
+    #[tokio::test]
+    async fn sqlite_store_serializes_concurrent_writes_on_shared_database() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5185,7 +5184,7 @@ mod tests {
         children.sort();
 
         assert_eq!(children, node_ids);
-        let reopened = SqliteStore::open_read_only(&path).unwrap();
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
         assert_eq!(
             reopened.list_children(&reopened.root_id()).unwrap().len(),
             8
@@ -5198,7 +5197,7 @@ mod tests {
         let path = tempdir.path().join("store");
         SqliteStore::open(&path).unwrap();
 
-        let store = SqliteStore::open_read_only(&path).unwrap();
+        let store = SqliteStore::open_read_only(&path).await.unwrap();
 
         assert_eq!(store.schema_version().await.unwrap(), 6);
     }
@@ -5500,15 +5499,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn open_read_only_rejects_writes() {
+    #[tokio::test]
+    async fn open_read_only_rejects_writes() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let writable = SqliteStore::open(&path).unwrap();
         let root_id = writable.root_id();
         drop(writable);
 
-        let store = SqliteStore::open_read_only(&path).unwrap();
+        let store = SqliteStore::open_read_only(&path).await.unwrap();
         let err = store
             .append(NewNode {
                 parent: root_id.clone(),
@@ -5519,7 +5518,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, crate::StoreError::StoreReadOnly { .. }));
-        let reopened = SqliteStore::open_read_only(&path).unwrap();
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
         assert!(reopened.list_children(&root_id).unwrap().is_empty());
     }
 
@@ -5562,18 +5561,18 @@ mod tests {
         let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(result, 0);
 
-        let store = SqliteStore::open_read_only(&path).unwrap();
+        let store = SqliteStore::open_read_only(&path).await.unwrap();
 
         assert_eq!(store.schema_version().await.unwrap(), 6);
     }
 
-    #[test]
-    fn open_read_only_rejects_missing_schema() {
+    #[tokio::test]
+    async fn open_read_only_rejects_missing_schema() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
 
-        let err = SqliteStore::open_read_only(&path).unwrap_err();
+        let err = SqliteStore::open_read_only(&path).await.unwrap_err();
 
         assert!(err.to_string().contains("SQLite"));
         assert!(!super::sqlite_database_path(&path).exists());
@@ -5657,14 +5656,14 @@ mod tests {
         assert_eq!(reopened.schema_version().await.unwrap(), 6);
     }
 
-    #[test]
-    fn open_read_only_rejects_legacy_json_store() {
+    #[tokio::test]
+    async fn open_read_only_rejects_legacy_json_store() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("nodes.jsonl"), "").unwrap();
 
-        let err = SqliteStore::open_read_only(&path).unwrap_err();
+        let err = SqliteStore::open_read_only(&path).await.unwrap_err();
 
         assert!(
             matches!(err, crate::StoreError::LegacyJsonStore { path: legacy } if legacy == path)
