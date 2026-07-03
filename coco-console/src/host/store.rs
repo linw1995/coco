@@ -207,8 +207,13 @@ where
         self.notify_if_ok(self.inner.submit_job(branch, base).await)
     }
 
-    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
-        self.notify_if_ok(self.inner.submit_job_with_id(job_id, branch, base))
+    async fn submit_job_with_id<'a>(
+        &'a self,
+        job_id: &'a str,
+        branch: &'a str,
+        base: &'a str,
+    ) -> StoreResult<Job> {
+        self.notify_if_ok(self.inner.submit_job_with_id(job_id, branch, base).await)
     }
 
     async fn get_job<'a>(&'a self, job_id: &'a str) -> StoreResult<Job> {

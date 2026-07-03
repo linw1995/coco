@@ -3477,6 +3477,7 @@ mod tests {
                 "day",
                 &store.get_branch_head("day").unwrap(),
             )
+            .await
             .unwrap();
         store
             .enqueue_message(
@@ -3534,6 +3535,7 @@ mod tests {
                 "day",
                 &store.get_branch_head("day").unwrap(),
             )
+            .await
             .unwrap();
         store
             .enqueue_message(

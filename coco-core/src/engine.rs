@@ -371,10 +371,12 @@ where
             session_patch.as_ref(),
         )?;
         let job = match job_id {
-            Some(job_id) => self
-                .service
-                .store()
-                .submit_job_with_id(job_id, branch, &base)?,
+            Some(job_id) => {
+                self.service
+                    .store()
+                    .submit_job_with_id(job_id, branch, &base)
+                    .await?
+            }
             None => self.service.store().submit_job(branch, &base).await?,
         };
         tracing::info!(

@@ -172,7 +172,12 @@ pub trait JobStore {
     /// Creates a new single-task prompt job record with a caller-provided id.
     ///
     /// Rejects the request when the branch already has an unfinished prompt job.
-    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job>;
+    fn submit_job_with_id<'a>(
+        &'a self,
+        job_id: &'a str,
+        branch: &'a str,
+        base: &'a str,
+    ) -> impl Future<Output = StoreResult<Job>> + Send + 'a;
 
     /// Returns a persisted prompt job.
     fn get_job<'a>(&'a self, job_id: &'a str)
@@ -456,8 +461,15 @@ impl JobStore for PersistentStore {
         }
     }
 
-    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
-        delegate_persistent_store!(self, store, store.submit_job_with_id(job_id, branch, base))
+    async fn submit_job_with_id<'a>(
+        &'a self,
+        job_id: &'a str,
+        branch: &'a str,
+        base: &'a str,
+    ) -> StoreResult<Job> {
+        match self {
+            Self::Sqlite(store) => store.submit_job_with_id(job_id, branch, base).await,
+        }
     }
 
     async fn get_job<'a>(&'a self, job_id: &'a str) -> StoreResult<Job> {
