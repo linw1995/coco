@@ -752,6 +752,10 @@ impl SqliteGraphStore {
     }
 
     pub fn begin_read_transaction(&self) -> Result<()> {
+        self.block_on(self.begin_read_transaction_in_sqlite())
+    }
+
+    async fn begin_read_transaction_in_sqlite(&self) -> Result<()> {
         ensure!(
             self.read_transaction
                 .lock()
@@ -763,37 +767,39 @@ impl SqliteGraphStore {
             }
         );
 
-        self.block_on(async {
-            let mut connection = self.database.inner.pool.get_owned().await.context(
-                AcquireSqliteConnectionSnafu {
+        let mut connection =
+            self.database
+                .inner
+                .pool
+                .get_owned()
+                .await
+                .context(AcquireSqliteConnectionSnafu {
                     path: self.database_path.clone(),
-                },
-            )?;
-            begin_deferred_transaction(&mut connection, &self.database_path).await?;
-            let mut connection = Some(connection);
-            let transaction_already_active = {
-                let mut read_transaction = self
-                    .read_transaction
-                    .lock()
-                    .expect("graph store transaction lock poisoned");
-                if read_transaction.is_some() {
-                    true
-                } else {
-                    *read_transaction = connection.take();
-                    false
-                }
-            };
-            if transaction_already_active {
-                let mut connection = connection.expect("pending graph read connection is missing");
-                rollback_deferred_transaction(&mut connection, &self.database_path).await?;
-                return CorruptedStoreSnafu {
-                    path: self.database_path.clone(),
-                    message: "SQLite graph read transaction already active".to_owned(),
-                }
-                .fail();
+                })?;
+        begin_deferred_transaction(&mut connection, &self.database_path).await?;
+        let mut connection = Some(connection);
+        let transaction_already_active = {
+            let mut read_transaction = self
+                .read_transaction
+                .lock()
+                .expect("graph store transaction lock poisoned");
+            if read_transaction.is_some() {
+                true
+            } else {
+                *read_transaction = connection.take();
+                false
             }
-            Ok(())
-        })
+        };
+        if transaction_already_active {
+            let mut connection = connection.expect("pending graph read connection is missing");
+            rollback_deferred_transaction(&mut connection, &self.database_path).await?;
+            return CorruptedStoreSnafu {
+                path: self.database_path.clone(),
+                message: "SQLite graph read transaction already active".to_owned(),
+            }
+            .fail();
+        }
+        Ok(())
     }
 
     pub fn commit_read_transaction(&self) -> Result<()> {
