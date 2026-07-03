@@ -836,10 +836,10 @@ impl SqliteGraphStore {
         .fail()
     }
 
-    fn branch_head(&self, name: &str) -> Result<Option<String>> {
+    async fn branch_head(&self, name: &str) -> Result<Option<String>> {
         let name = name.to_owned();
         let path = self.database_path.clone();
-        self.block_on(self.with_connection(move |connection| {
+        self.with_connection(move |connection| {
             Box::pin(async move {
                 branches::table
                     .filter(branches::name.eq(name))
@@ -849,7 +849,8 @@ impl SqliteGraphStore {
                     .optional()
                     .context(QuerySqliteStoreSnafu { path })
             })
-        }))
+        })
+        .await
     }
 
     fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
@@ -3951,8 +3952,11 @@ impl BranchStore for SqliteGraphStore {
     }
 
     fn get_branch_head(&self, name: &str) -> Result<String> {
-        self.branch_head(name)?.context(BranchNotFoundSnafu {
-            name: name.to_owned(),
+        let name = name.to_owned();
+        self.block_on(async move {
+            self.branch_head(&name).await?.context(BranchNotFoundSnafu {
+                name: name.to_owned(),
+            })
         })
     }
 
