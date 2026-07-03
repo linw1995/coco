@@ -919,6 +919,12 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         rollback_preset_record(&mut connection, &self.database_path, name, target_version).await
     }
+
+    async fn delete_preset_in_sqlite(&self, name: &str) -> Result<()> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        delete_preset_record_checked(&mut connection, &self.database_path, name).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4441,12 +4447,7 @@ impl PresetStore for SqliteStore {
     }
 
     fn delete_preset(&self, name: &str) -> Result<()> {
-        self.ensure_writable()?;
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            delete_preset_record_checked(&mut connection, &self.database_path, name).await
-        })?;
-        Ok(())
+        self.block_on(self.delete_preset_in_sqlite(name))
     }
 }
 
