@@ -940,6 +940,17 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         load_skill_record(&mut connection, &self.database_path, role, name).await
     }
+
+    async fn add_skill_in_sqlite(
+        &self,
+        role: SessionRole,
+        name: &str,
+        spec: SkillVersionSpec,
+    ) -> Result<SkillRecord> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        add_skill_record(&mut connection, &self.database_path, role, name, spec).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4481,12 +4492,7 @@ impl SkillStore for SqliteStore {
         name: &str,
         spec: SkillVersionSpec,
     ) -> Result<SkillRecord> {
-        self.ensure_writable()?;
-        let created = self.block_on(async {
-            let mut connection = self.connect().await?;
-            add_skill_record(&mut connection, &self.database_path, role, name, spec).await
-        })?;
-        Ok(created)
+        self.block_on(self.add_skill_in_sqlite(role, name, spec))
     }
 
     fn update_skill(
