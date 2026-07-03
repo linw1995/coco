@@ -107,13 +107,13 @@ where
         self.inner.get_session_state(name)
     }
 
-    fn set_session_state(
-        &self,
-        name: &str,
-        expected: Option<&SessionState>,
+    async fn set_session_state<'a>(
+        &'a self,
+        name: &'a str,
+        expected: Option<&'a SessionState>,
         next: SessionState,
     ) -> StoreResult<SessionState> {
-        self.notify_if_ok(self.inner.set_session_state(name, expected, next))
+        self.notify_if_ok(self.inner.set_session_state(name, expected, next).await)
     }
 
     async fn rebase_session<'a>(

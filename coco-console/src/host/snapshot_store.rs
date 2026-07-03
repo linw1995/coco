@@ -234,13 +234,13 @@ impl SessionStore for MaterializationSourceSnapshot {
             })
     }
 
-    fn set_session_state(
-        &self,
-        _name: &str,
-        _expected: Option<&SessionState>,
+    fn set_session_state<'a>(
+        &'a self,
+        _name: &'a str,
+        _expected: Option<&'a SessionState>,
         _next: SessionState,
-    ) -> coco_mem::StoreResult<SessionState> {
-        Self::read_only_error()
+    ) -> impl Future<Output = coco_mem::StoreResult<SessionState>> + Send + 'a {
+        std::future::ready(Self::read_only_error())
     }
 
     fn rebase_session<'a>(
@@ -6098,15 +6098,15 @@ mod tests {
             })
         }
 
-        fn set_session_state(
-            &self,
-            _name: &str,
-            _expected: Option<&SessionState>,
+        fn set_session_state<'a>(
+            &'a self,
+            _name: &'a str,
+            _expected: Option<&'a SessionState>,
             _next: SessionState,
-        ) -> coco_mem::StoreResult<SessionState> {
-            Err(coco_mem::StoreError::StoreReadOnly {
+        ) -> impl Future<Output = coco_mem::StoreResult<SessionState>> + Send + 'a {
+            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            })
+            }))
         }
 
         fn rebase_session<'a>(

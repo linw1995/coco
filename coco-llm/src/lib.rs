@@ -1543,6 +1543,7 @@ where
                     base_head_id: base_head_id.clone(),
                 },
             )
+            .await
             .context(MemorySnafu)?;
 
         tracing::info!(
@@ -2236,6 +2237,7 @@ where
                     },
                 },
             )
+            .await
             .context(MemorySnafu)?;
 
         tracing::info!(
@@ -2301,6 +2303,7 @@ where
                     base_head_id: source_anchor_id.clone(),
                 },
             )
+            .await
             .context(MemorySnafu)?;
 
         tracing::info!(

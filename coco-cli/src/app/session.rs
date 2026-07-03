@@ -199,7 +199,7 @@ where
             run_session_handoff_command(command, store, llm, provider_profiles).await
         }
         SessionSubcommand::Reopen(command) => {
-            run_session_reopen_command(command.branch, command.json, store)
+            run_session_reopen_command(command.branch, command.json, store).await
         }
         SessionSubcommand::Pr(command) => {
             run_session_pr_command(
@@ -213,6 +213,7 @@ where
         }
         SessionSubcommand::Close(command) => {
             run_session_close_command(command.branch, command.target_branch, command.json, store)
+                .await
         }
         SessionSubcommand::Merge(command) => {
             run_session_merge_command(
@@ -404,7 +405,7 @@ where
     )))
 }
 
-fn run_session_reopen_command(
+async fn run_session_reopen_command(
     branch: String,
     json: bool,
     store: &impl SessionStore,
@@ -413,6 +414,7 @@ fn run_session_reopen_command(
         branch: branch.clone(),
         state: store
             .set_session_state(&branch, None, SessionState::Active)
+            .await
             .context(StoreSnafu)?,
     };
     Ok(Some(render_session_result(
@@ -445,7 +447,7 @@ where
     )))
 }
 
-fn run_session_close_command(
+async fn run_session_close_command(
     branch: String,
     target_branch: String,
     json: bool,
@@ -462,6 +464,7 @@ fn run_session_close_command(
                     reason: PauseReason::Closed,
                 },
             )
+            .await
             .context(StoreSnafu)?,
     };
     Ok(Some(render_session_result(

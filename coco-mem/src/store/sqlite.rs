@@ -4338,13 +4338,13 @@ impl SessionStore for SqliteGraphStore {
         self.block_on(self.get_session_state_in_sqlite(name))
     }
 
-    fn set_session_state(
-        &self,
-        _name: &str,
-        _expected: Option<&SessionState>,
+    fn set_session_state<'a>(
+        &'a self,
+        _name: &'a str,
+        _expected: Option<&'a SessionState>,
         _next: SessionState,
-    ) -> Result<SessionState> {
-        self.ensure_read_only()
+    ) -> impl Future<Output = Result<SessionState>> + Send + 'a {
+        std::future::ready(self.ensure_read_only())
     }
 
     fn rebase_session<'a>(
@@ -4418,13 +4418,25 @@ impl SessionStore for SqliteStore {
         self.block_on(self.get_session_state_in_sqlite(name))
     }
 
-    fn set_session_state(
-        &self,
-        name: &str,
-        expected: Option<&SessionState>,
+    async fn set_session_state<'a>(
+        &'a self,
+        name: &'a str,
+        expected: Option<&'a SessionState>,
         next: SessionState,
     ) -> Result<SessionState> {
-        self.block_on(self.set_session_state_in_sqlite(name, expected, next))
+        let store = self.clone();
+        let name = name.to_owned();
+        let expected = expected.cloned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move {
+                store
+                    .set_session_state_in_sqlite(&name, expected.as_ref(), next)
+                    .await
+            })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     async fn rebase_session<'a>(
@@ -5819,6 +5831,7 @@ mod tests {
                     reason: PauseReason::Closed,
                 },
             )
+            .await
             .unwrap();
         assert_eq!(
             session_summary(&store, "main").await,

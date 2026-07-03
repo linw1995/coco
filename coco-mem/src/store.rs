@@ -65,12 +65,12 @@ pub trait SessionStore {
     fn get_session_state(&self, name: &str) -> StoreResult<SessionState>;
 
     /// Updates the persisted session workflow state.
-    fn set_session_state(
-        &self,
-        name: &str,
-        expected: Option<&SessionState>,
+    fn set_session_state<'a>(
+        &'a self,
+        name: &'a str,
+        expected: Option<&'a SessionState>,
         next: SessionState,
-    ) -> StoreResult<SessionState>;
+    ) -> impl Future<Output = StoreResult<SessionState>> + Send + 'a;
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
     fn rebase_session<'a>(
@@ -352,13 +352,15 @@ impl SessionStore for PersistentStore {
         delegate_persistent_store!(self, store, store.get_session_state(name))
     }
 
-    fn set_session_state(
-        &self,
-        name: &str,
-        expected: Option<&SessionState>,
+    async fn set_session_state<'a>(
+        &'a self,
+        name: &'a str,
+        expected: Option<&'a SessionState>,
         next: SessionState,
     ) -> StoreResult<SessionState> {
-        delegate_persistent_store!(self, store, store.set_session_state(name, expected, next))
+        match self {
+            Self::Sqlite(store) => store.set_session_state(name, expected, next).await,
+        }
     }
 
     async fn rebase_session<'a>(

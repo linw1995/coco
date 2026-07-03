@@ -585,7 +585,7 @@ where
     assert!(matches!(err, Error::BranchNotFound { name } if name == "missing"));
 }
 
-fn assert_set_session_state_updates_value<F>()
+async fn assert_set_session_state_updates_value<F>()
 where
     F: TestStoreFactory,
 {
@@ -603,6 +603,7 @@ where
                 base_head_id: root_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -614,7 +615,7 @@ where
     );
 }
 
-fn assert_set_session_state_requires_matching_expected<F>()
+async fn assert_set_session_state_requires_matching_expected<F>()
 where
     F: TestStoreFactory,
 {
@@ -631,6 +632,7 @@ where
                 reason: PauseReason::Closed,
             },
         )
+        .await
         .unwrap();
 
     let err = store
@@ -642,6 +644,7 @@ where
                 base_head_id: root_id,
             },
         )
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -654,7 +657,7 @@ where
     ));
 }
 
-fn assert_set_branch_head_preserves_attached_state<F>()
+async fn assert_set_branch_head_preserves_attached_state<F>()
 where
     F: TestStoreFactory,
 {
@@ -673,6 +676,7 @@ where
                 base_head_id: base_anchor_id,
             },
         )
+        .await
         .unwrap();
 
     let feedback_id = store.append(make_text_node(&root_id, "feedback")).unwrap();
@@ -691,7 +695,7 @@ where
     );
 }
 
-fn assert_set_session_state_accepts_merged_anchor_on_target_branch<F>()
+async fn assert_set_session_state_accepts_merged_anchor_on_target_branch<F>()
 where
     F: TestStoreFactory,
 {
@@ -712,6 +716,7 @@ where
                 },
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -725,7 +730,7 @@ where
     );
 }
 
-fn assert_set_session_state_rejects_merged_anchor_outside_target_branch<F>()
+async fn assert_set_session_state_rejects_merged_anchor_outside_target_branch<F>()
 where
     F: TestStoreFactory,
 {
@@ -748,6 +753,7 @@ where
                 },
             },
         )
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -757,7 +763,7 @@ where
     ));
 }
 
-fn assert_set_session_state_rejects_non_anchor_merged_node<F>()
+async fn assert_set_session_state_rejects_non_anchor_merged_node<F>()
 where
     F: TestStoreFactory,
 {
@@ -778,12 +784,13 @@ where
                 },
             },
         )
+        .await
         .unwrap_err();
 
     assert!(matches!(err, Error::InvalidAnchor { id } if id == base_text_id));
 }
 
-fn assert_paused_merged_state_can_resume_as_attached<F>()
+async fn assert_paused_merged_state_can_resume_as_attached<F>()
 where
     F: TestStoreFactory,
 {
@@ -804,6 +811,7 @@ where
                 },
             },
         )
+        .await
         .unwrap();
 
     let next_base_anchor_id = store
@@ -826,6 +834,7 @@ where
                 base_head_id: next_base_anchor_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -837,7 +846,7 @@ where
     );
 }
 
-fn assert_paused_closed_state_can_resume_as_attached<F>()
+async fn assert_paused_closed_state_can_resume_as_attached<F>()
 where
     F: TestStoreFactory,
 {
@@ -856,6 +865,7 @@ where
                 reason: PauseReason::Closed,
             },
         )
+        .await
         .unwrap();
 
     let next_base_anchor_id = store
@@ -876,6 +886,7 @@ where
                 base_head_id: next_base_anchor_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -887,7 +898,7 @@ where
     );
 }
 
-fn assert_list_session_states_returns_branch_state_map<F>()
+async fn assert_list_session_states_returns_branch_state_map<F>()
 where
     F: TestStoreFactory,
 {
@@ -904,6 +915,7 @@ where
                 base_head_id: root_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     let states = store.list_session_states().unwrap();
@@ -2304,49 +2316,49 @@ macro_rules! define_common_store_tests {
                 assert_delete_branch_rejects_missing_branch::<$factory>();
             }
 
-            #[test]
-            fn set_session_state_updates_value() {
-                assert_set_session_state_updates_value::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_updates_value() {
+                assert_set_session_state_updates_value::<$factory>().await;
             }
 
-            #[test]
-            fn set_session_state_requires_matching_expected() {
-                assert_set_session_state_requires_matching_expected::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_requires_matching_expected() {
+                assert_set_session_state_requires_matching_expected::<$factory>().await;
             }
 
-            #[test]
-            fn set_branch_head_preserves_attached_state() {
-                assert_set_branch_head_preserves_attached_state::<$factory>();
+            #[tokio::test]
+            async fn set_branch_head_preserves_attached_state() {
+                assert_set_branch_head_preserves_attached_state::<$factory>().await;
             }
 
-            #[test]
-            fn set_session_state_accepts_merged_anchor_on_target_branch() {
-                assert_set_session_state_accepts_merged_anchor_on_target_branch::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_accepts_merged_anchor_on_target_branch() {
+                assert_set_session_state_accepts_merged_anchor_on_target_branch::<$factory>().await;
             }
 
-            #[test]
-            fn set_session_state_rejects_merged_anchor_outside_target_branch() {
-                assert_set_session_state_rejects_merged_anchor_outside_target_branch::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_rejects_merged_anchor_outside_target_branch() {
+                assert_set_session_state_rejects_merged_anchor_outside_target_branch::<$factory>().await;
             }
 
-            #[test]
-            fn set_session_state_rejects_non_anchor_merged_node() {
-                assert_set_session_state_rejects_non_anchor_merged_node::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_rejects_non_anchor_merged_node() {
+                assert_set_session_state_rejects_non_anchor_merged_node::<$factory>().await;
             }
 
-            #[test]
-            fn paused_merged_state_can_resume_as_attached() {
-                assert_paused_merged_state_can_resume_as_attached::<$factory>();
+            #[tokio::test]
+            async fn paused_merged_state_can_resume_as_attached() {
+                assert_paused_merged_state_can_resume_as_attached::<$factory>().await;
             }
 
-            #[test]
-            fn paused_closed_state_can_resume_as_attached() {
-                assert_paused_closed_state_can_resume_as_attached::<$factory>();
+            #[tokio::test]
+            async fn paused_closed_state_can_resume_as_attached() {
+                assert_paused_closed_state_can_resume_as_attached::<$factory>().await;
             }
 
-            #[test]
-            fn list_session_states_returns_branch_state_map() {
-                assert_list_session_states_returns_branch_state_map::<$factory>();
+            #[tokio::test]
+            async fn list_session_states_returns_branch_state_map() {
+                assert_list_session_states_returns_branch_state_map::<$factory>().await;
             }
 
             #[tokio::test]

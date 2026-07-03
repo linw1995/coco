@@ -2835,6 +2835,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
                 base_head_id: merged_anchor_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     let main_head_before_feedback = store.get_branch_head("main").unwrap();
@@ -2908,6 +2909,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
                 base_head_id: merged_feedback_source_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     let feedback_text_output = run_with_backend(
