@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use coco_mem::{
-    Anchor, BranchStore, Kind, MemoryStore, MergeParent, MessageQueueStore, NewNode, NodeStore,
+    Anchor, BranchStore, Kind, MergeParent, MessageQueueStore, NewNode, Node, NodeStore,
     PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
-    SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor, Tool, ToolResult, ToolUse,
+    SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor, SqliteStore, Tool, ToolResult,
+    ToolUse,
 };
 use serde_json::json;
 
@@ -24,6 +25,69 @@ use crate::render::{
     render_provider_context_fragment, render_snapshot_page,
 };
 use crate::{ConsolePublisher, ConsoleStore};
+
+fn test_store() -> SqliteStore {
+    SqliteStore::open_temporary().expect("temporary SQLite store should open")
+}
+
+#[derive(Default)]
+struct DeepChainStore {
+    nodes: HashMap<String, Node>,
+    children: HashMap<String, Vec<String>>,
+}
+
+impl DeepChainStore {
+    fn insert(&mut self, node: Node) {
+        if !node.parent.is_empty() {
+            self.children
+                .entry(node.parent.clone())
+                .or_default()
+                .push(node.id.clone());
+        }
+        self.nodes.insert(node.id.clone(), node);
+    }
+}
+
+impl NodeStore for DeepChainStore {
+    fn root_id(&self) -> String {
+        panic!("deep chain test does not read root id")
+    }
+
+    fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
+        panic!("deep chain test inserts nodes directly")
+    }
+
+    fn ancestry(&self, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        panic!("deep chain test does not read ancestry")
+    }
+
+    fn log(&self, _base_ref: &str, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        panic!("deep chain test does not read logs")
+    }
+
+    fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
+        Ok(self
+            .nodes
+            .get(id)
+            .unwrap_or_else(|| panic!("node {id:?} should exist"))
+            .clone())
+    }
+
+    fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        Ok(self
+            .children
+            .get(node_id)
+            .into_iter()
+            .flatten()
+            .map(|child_id| {
+                self.nodes
+                    .get(child_id)
+                    .unwrap_or_else(|| panic!("child node {child_id:?} should exist"))
+                    .clone()
+            })
+            .collect())
+    }
+}
 
 fn session_anchor() -> SessionAnchor {
     SessionAnchor {
@@ -192,7 +256,7 @@ fn apply_diff_node_keys(
 
 #[test]
 fn graph_snapshot_contains_primary_and_merge_edges() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let left = store
         .append(NewNode {
@@ -405,7 +469,7 @@ fn provider_context_fragment_renders_default_or_missing_selection() {
 
 #[test]
 fn graph_snapshot_contains_shadow_parent_edges() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -451,7 +515,7 @@ fn graph_snapshot_contains_shadow_parent_edges() {
 
 #[test]
 fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -566,7 +630,7 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
 
 #[test]
 fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -676,71 +740,75 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
 
 #[test]
 fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
-    let store = MemoryStore::new();
-    let root = store.root_id();
-    let session = store
-        .append(NewNode {
-            parent: root,
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
-        })
-        .unwrap();
-    let tool_use = store
-        .append(NewNode {
-            parent: session,
-            role: Role::LLM,
-            metadata: None,
-            kind: Kind::tool_use(ToolUse {
-                id: "tool-1".to_owned(),
-                name: "skill".to_owned(),
-                input: json!({}),
-            }),
-        })
-        .unwrap();
-    let invocation = store
-        .append(NewNode {
-            parent: tool_use.clone(),
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::skill_invocation(
-                Vec::new(),
-                SkillInvocationAnchor {
-                    skill_name: "fast-rust".to_owned(),
-                    mode: SkillInvocationMode::InheritContext,
-                },
-            )),
-        })
-        .unwrap();
+    let mut store = DeepChainStore::default();
+    let created_at = "1970-01-01T00:00:00Z".parse().unwrap();
+    let session = Node::new(
+        String::new(),
+        Role::System,
+        None,
+        Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+        created_at,
+    );
+    let tool_use = Node::new(
+        session.id.clone(),
+        Role::LLM,
+        None,
+        Kind::tool_use(ToolUse {
+            id: "tool-1".to_owned(),
+            name: "skill".to_owned(),
+            input: json!({}),
+        }),
+        created_at,
+    );
+    let invocation = Node::new(
+        tool_use.id.clone(),
+        Role::System,
+        None,
+        Kind::Anchor(Anchor::skill_invocation(
+            Vec::new(),
+            SkillInvocationAnchor {
+                skill_name: "fast-rust".to_owned(),
+                mode: SkillInvocationMode::InheritContext,
+            },
+        )),
+        created_at,
+    );
+    let tool_use_id = tool_use.id.clone();
+    let invocation_id = invocation.id.clone();
     let mut parent = invocation.clone();
+    store.insert(session);
+    store.insert(tool_use);
+    store.insert(invocation);
     let depth = 20_000;
     for index in 0..depth {
-        parent = store
-            .append(NewNode {
-                parent,
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text(format!("delegated context {index}")),
-            })
-            .unwrap();
+        let node = Node::new(
+            parent.id,
+            Role::User,
+            None,
+            Kind::Text(format!("delegated context {index}")),
+            created_at,
+        );
+        parent = node.clone();
+        store.insert(node);
     }
 
-    let nodes = visible_skill_invocation_subtree_nodes(&store, GraphMode::All, &tool_use).unwrap();
+    let nodes =
+        visible_skill_invocation_subtree_nodes(&store, GraphMode::All, &tool_use_id).unwrap();
 
     assert_eq!(nodes.len(), depth + 1);
     assert_eq!(
         nodes.first().map(|node| node.id.as_str()),
-        Some(invocation.as_str())
+        Some(invocation_id.as_str())
     );
     assert_eq!(
         nodes.last().map(|node| node.id.as_str()),
-        Some(parent.as_str())
+        Some(parent.id.as_str())
     );
 }
 
 #[test]
 fn node_details_include_nodes_from_same_provider_context() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let first_session = store
         .append(NewNode {
@@ -854,7 +922,7 @@ fn node_details_include_nodes_from_same_provider_context() {
 
 #[test]
 fn provider_context_list_uses_one_head_to_context_start_path() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -990,7 +1058,7 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
 
 #[test]
 fn provider_context_id_stays_stable_when_branch_head_moves() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -1059,7 +1127,7 @@ fn provider_context_id_stays_stable_when_branch_head_moves() {
 
 #[test]
 fn provider_context_ids_preserve_unique_branch_names() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -1162,7 +1230,7 @@ fn provider_context_ids_preserve_unique_branch_names() {
 
 #[test]
 fn all_mode_provider_contexts_cover_older_visible_segments() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let first_session = store
         .append(NewNode {
@@ -1265,7 +1333,7 @@ fn snapshot_content<'a>(snapshot: &'a GraphSnapshot, node_id: &str) -> &'a str {
 
 #[test]
 fn graph_snapshot_renders_content_for_visible_node_kinds() {
-    let store = MemoryStore::new();
+    let store = test_store();
     let root = store.root_id();
     let mut empty_prompt_session_anchor = session_anchor();
     empty_prompt_session_anchor.prompt.clear();
@@ -2337,7 +2405,7 @@ fn streamed_graph_markup_escapes_dynamic_values() {
 #[test]
 fn console_store_notifies_after_successful_writes() {
     let publisher = ConsolePublisher::new();
-    let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+    let store = ConsoleStore::new(test_store(), publisher.clone());
     let root = store.root_id();
 
     store
@@ -2359,7 +2427,7 @@ fn console_store_notifies_after_successful_writes() {
 #[test]
 fn console_store_notifies_only_when_dequeue_removes_message() {
     let publisher = ConsolePublisher::new();
-    let store = ConsoleStore::new(MemoryStore::new(), publisher.clone());
+    let store = ConsoleStore::new(test_store(), publisher.clone());
 
     assert_eq!(store.dequeue_message("system").unwrap(), None);
     assert_eq!(publisher.current_version(), 0);
@@ -2378,7 +2446,7 @@ fn console_store_notifies_only_when_dequeue_removes_message() {
 
 #[test]
 fn console_store_lists_message_queues() {
-    let store = ConsoleStore::new(MemoryStore::new(), ConsolePublisher::new());
+    let store = ConsoleStore::new(test_store(), ConsolePublisher::new());
 
     store
         .enqueue_message("system", json!({"ok": true}))

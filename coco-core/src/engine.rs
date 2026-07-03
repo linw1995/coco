@@ -1,8 +1,8 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
-    BranchStore, Job, JobStatus, JobStore, Kind, MemoryStore, MergeParent, MessageQueueStore, Node,
-    NodeStore, PromptAttachment, SessionStore, SkillStore,
+    BranchStore, Job, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, Node, NodeStore,
+    PromptAttachment, SessionStore, SkillStore, SqliteStore,
 };
 use coco_llm::{
     BackendError, BackendFailureContext, CompletionBackend, CompletionInput, CompletionOrigin,
@@ -45,7 +45,7 @@ struct PromptReply {
     text: String,
 }
 
-pub struct ConversationEngine<B = RigBackend, S = MemoryStore> {
+pub struct ConversationEngine<B = RigBackend, S = SqliteStore> {
     service: Arc<LlmService<B, S>>,
     inflight_jobs: InflightJobTable,
 }
@@ -87,8 +87,8 @@ impl<B, S> Clone for ConversationEngine<B, S> {
     }
 }
 
-impl ConversationEngine<RigBackend, MemoryStore> {
-    pub fn with_service(service: Arc<LlmService<RigBackend, MemoryStore>>) -> Self {
+impl ConversationEngine<RigBackend, SqliteStore> {
+    pub fn with_service(service: Arc<LlmService<RigBackend, SqliteStore>>) -> Self {
         Self::new(service)
     }
 }

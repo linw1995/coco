@@ -2,14 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 mod lock;
-mod memory;
 mod sqlite;
-mod state;
 
 #[cfg(test)]
 mod tests;
 
-pub use memory::MemoryStore;
 pub use sqlite::{SqliteDatabase, SqliteGraphStore, SqliteStore};
 
 use crate::{
