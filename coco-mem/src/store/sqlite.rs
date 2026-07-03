@@ -821,6 +821,10 @@ impl SqliteGraphStore {
     }
 
     pub fn rollback_read_transaction(&self) -> Result<()> {
+        self.block_on(self.rollback_read_transaction_in_sqlite())
+    }
+
+    async fn rollback_read_transaction_in_sqlite(&self) -> Result<()> {
         let Some(mut connection) = self
             .read_transaction
             .lock()
@@ -830,9 +834,7 @@ impl SqliteGraphStore {
             return Ok(());
         };
 
-        self.block_on(async {
-            rollback_deferred_transaction(&mut connection, &self.database_path).await
-        })
+        rollback_deferred_transaction(&mut connection, &self.database_path).await
     }
 
     fn ensure_read_only<T>(&self) -> Result<T> {
