@@ -240,7 +240,7 @@ where
 
 impl<S> MessageQueueStore for ConsoleStore<S>
 where
-    S: MessageQueueStore,
+    S: MessageQueueStore + Sync,
 {
     fn enqueue_message(
         &self,
@@ -266,8 +266,8 @@ where
         self.inner.list_queue_messages(queue)
     }
 
-    fn list_message_queues(&self) -> StoreResult<Vec<String>> {
-        self.inner.list_message_queues()
+    async fn list_message_queues(&self) -> StoreResult<Vec<String>> {
+        self.inner.list_message_queues().await
     }
 }
 

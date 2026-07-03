@@ -832,7 +832,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         {
             match decode_system_event_message(item.payload.clone()) {
                 Ok(event) => {
-                    if !self.queue_prompt_job_for_event(&item, event)? {
+                    if !self.queue_prompt_job_for_event(&item, event).await? {
                         return Ok(handled);
                     }
                     self.store
@@ -856,7 +856,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         Ok(handled)
     }
 
-    fn queue_prompt_job_for_event(
+    async fn queue_prompt_job_for_event(
         &self,
         item: &MessageQueueItem,
         event: SystemEvent,
@@ -881,7 +881,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
 
         let request = materialize_system_event_prompt_job(route, &event);
         let dedupe_job_ids = system_event_prompt_job_dedupe_ids(&event);
-        if self.prompt_job_request_exists(&dedupe_job_ids)? {
+        if self.prompt_job_request_exists(&dedupe_job_ids).await? {
             tracing::debug!(
                 message_id = %item.message_id,
                 queue = SYSTEM_EVENT_QUEUE,
@@ -902,7 +902,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         Ok(true)
     }
 
-    fn prompt_job_request_exists(&self, job_ids: &[String]) -> Result<bool>
+    async fn prompt_job_request_exists(&self, job_ids: &[String]) -> Result<bool>
     where
         S: Store,
     {
@@ -917,6 +917,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         for queue in self
             .store
             .list_message_queues()
+            .await
             .context(StoreSnafu)?
             .into_iter()
             .filter(|queue| is_prompt_job_queue(queue))
@@ -955,7 +956,7 @@ impl<B, S> PromptJobMessageQueueSupervisor<B, S> {
         let mut queues = HashSet::new();
         let mut workers = Vec::<(String, tokio::task::JoinHandle<Result<()>>)>::new();
         loop {
-            for queue in self.prompt_job_queues()? {
+            for queue in self.prompt_job_queues().await? {
                 if queues.insert(queue.clone()) {
                     let worker = PromptJobMessageQueueWorker::new(
                         queue.clone(),
@@ -981,13 +982,14 @@ impl<B, S> PromptJobMessageQueueSupervisor<B, S> {
         }
     }
 
-    fn prompt_job_queues(&self) -> Result<Vec<String>>
+    async fn prompt_job_queues(&self) -> Result<Vec<String>>
     where
         S: Store,
     {
         Ok(self
             .store
             .list_message_queues()
+            .await
             .context(StoreSnafu)?
             .into_iter()
             .filter(|queue| is_prompt_job_queue(queue))

@@ -1715,7 +1715,7 @@ where
     assert_eq!(second.status, JobStatus::Queued);
 }
 
-fn assert_message_queue_round_trip<F>()
+async fn assert_message_queue_round_trip<F>()
 where
     F: TestStoreFactory,
 {
@@ -1739,10 +1739,10 @@ where
     assert_eq!(store.dequeue_message("hooks").unwrap(), None);
     assert_eq!(store.peek_message("hooks").unwrap(), None);
     assert!(store.list_queue_messages("hooks").unwrap().is_empty());
-    assert!(store.list_message_queues().unwrap().is_empty());
+    assert!(store.list_message_queues().await.unwrap().is_empty());
 }
 
-fn assert_message_queue_isolates_named_queues<F>()
+async fn assert_message_queue_isolates_named_queues<F>()
 where
     F: TestStoreFactory,
 {
@@ -1763,7 +1763,7 @@ where
         vec![scheduler.clone()]
     );
     assert_eq!(
-        store.list_message_queues().unwrap(),
+        store.list_message_queues().await.unwrap(),
         vec!["hooks".to_owned(), "scheduler".to_owned()]
     );
     assert_eq!(store.dequeue_message("hooks").unwrap(), Some(hook));
@@ -2462,14 +2462,14 @@ macro_rules! define_common_store_tests {
                 assert_submit_job_allows_new_job_after_previous_job_finishes::<$factory>();
             }
 
-            #[test]
-            fn message_queue_round_trip() {
-                assert_message_queue_round_trip::<$factory>();
+            #[tokio::test]
+            async fn message_queue_round_trip() {
+                assert_message_queue_round_trip::<$factory>().await;
             }
 
-            #[test]
-            fn message_queue_isolates_named_queues() {
-                assert_message_queue_isolates_named_queues::<$factory>();
+            #[tokio::test]
+            async fn message_queue_isolates_named_queues() {
+                assert_message_queue_isolates_named_queues::<$factory>().await;
             }
 
             #[test]

@@ -2444,15 +2444,15 @@ fn console_store_notifies_only_when_dequeue_removes_message() {
     assert_eq!(publisher.current_version(), 2);
 }
 
-#[test]
-fn console_store_lists_message_queues() {
+#[tokio::test]
+async fn console_store_lists_message_queues() {
     let store = ConsoleStore::new(test_store(), ConsolePublisher::new());
 
     store
         .enqueue_message("system", json!({"ok": true}))
         .unwrap();
 
-    assert_eq!(store.list_message_queues().unwrap(), vec!["system"]);
+    assert_eq!(store.list_message_queues().await.unwrap(), vec!["system"]);
 }
 
 #[test]

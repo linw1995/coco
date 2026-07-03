@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 
 mod lock;
@@ -188,7 +189,7 @@ pub trait MessageQueueStore {
     fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;
 
     /// Returns all queue names that currently contain at least one message.
-    fn list_message_queues(&self) -> StoreResult<Vec<String>>;
+    fn list_message_queues(&self) -> impl Future<Output = StoreResult<Vec<String>>> + Send + '_;
 }
 
 /// Capability for stores with a process-shareable backing path.
@@ -452,8 +453,10 @@ impl MessageQueueStore for PersistentStore {
         delegate_persistent_store!(self, store, store.list_queue_messages(queue))
     }
 
-    fn list_message_queues(&self) -> StoreResult<Vec<String>> {
-        delegate_persistent_store!(self, store, store.list_message_queues())
+    async fn list_message_queues(&self) -> StoreResult<Vec<String>> {
+        match self {
+            PersistentStore::Sqlite(store) => store.list_message_queues().await,
+        }
     }
 }
 

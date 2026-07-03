@@ -4489,8 +4489,8 @@ impl MessageQueueStore for SqliteStore {
         self.block_on(self.list_queue_messages_in_sqlite(queue))
     }
 
-    fn list_message_queues(&self) -> Result<Vec<String>> {
-        self.block_on(self.list_message_queues_in_sqlite())
+    async fn list_message_queues(&self) -> Result<Vec<String>> {
+        self.list_message_queues_in_sqlite().await
     }
 }
 

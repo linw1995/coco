@@ -42,10 +42,11 @@ fn is_prompt_job_queue(queue: &str) -> bool {
     queue == PROMPT_JOB_QUEUE || queue.starts_with(PROMPT_JOB_BRANCH_QUEUE_PREFIX)
 }
 
-fn list_prompt_job_queue_messages(store: &impl Store) -> Result<Vec<MessageQueueItem>> {
+async fn list_prompt_job_queue_messages(store: &impl Store) -> Result<Vec<MessageQueueItem>> {
     let mut items = Vec::new();
     for queue in store
         .list_message_queues()
+        .await
         .context(StoreSnafu)?
         .into_iter()
         .filter(|queue| is_prompt_job_queue(queue))
@@ -362,7 +363,9 @@ where
     let snapshot = match engine.get_job(&command.job) {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            if let Some(view) = load_queued_prompt_request_status(shared_store, &command.job)? {
+            if let Some(view) =
+                load_queued_prompt_request_status(shared_store, &command.job).await?
+            {
                 return Ok(Some(if command.json {
                     render_json(view)
                 } else {
@@ -403,7 +406,7 @@ where
         })
         .collect::<Result<Vec<_>>>()?;
 
-    jobs.extend(load_queued_prompt_request_list(shared_store)?);
+    jobs.extend(load_queued_prompt_request_list(shared_store).await?);
     jobs.sort_by(|left, right| {
         right
             .created_at
@@ -618,11 +621,11 @@ fn render_job_status_snapshot_text(snapshot: &JobStatusSnapshot) -> String {
     )
 }
 
-fn load_queued_prompt_request_status(
+async fn load_queued_prompt_request_status(
     store: &impl Store,
     job_id: &str,
 ) -> Result<Option<QueuedPromptRequestStatusView>> {
-    let items = list_prompt_job_queue_messages(store)?;
+    let items = list_prompt_job_queue_messages(store).await?;
     let Some((item, request)) = items.into_iter().find_map(|item| {
         serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
             .ok()
@@ -652,8 +655,8 @@ fn load_queued_prompt_request_status(
     }))
 }
 
-fn load_queued_prompt_request_list(store: &impl Store) -> Result<Vec<JobListItemView>> {
-    let items = list_prompt_job_queue_messages(store)?;
+async fn load_queued_prompt_request_list(store: &impl Store) -> Result<Vec<JobListItemView>> {
+    let items = list_prompt_job_queue_messages(store).await?;
     let mut jobs = Vec::new();
     for item in items {
         let Ok(request) = serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
