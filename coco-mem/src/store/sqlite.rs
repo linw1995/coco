@@ -314,7 +314,10 @@ impl SqliteDatabase {
     }
 
     pub fn open_unshared_file_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_uncached(path.as_ref().to_owned(), true)
+        block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            Self::open_uncached(path.as_ref().to_owned(), true),
+        )
     }
 
     fn open_writable_file_path(path: impl AsRef<Path>) -> Result<Self> {
@@ -360,14 +363,11 @@ impl SqliteDatabase {
         Ok(database)
     }
 
-    fn open_uncached(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {
+    async fn open_uncached(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let runtime = sqlite_runtime()?;
         let ensure_wal_flag = Arc::new(AtomicBool::new(ensure_wal));
-        let pool = block_on_sqlite_runtime_with(
-            runtime,
-            build_sqlite_pool(&database_path, ensure_wal_flag.clone()),
-        )?;
+        let pool = build_sqlite_pool(&database_path, ensure_wal_flag.clone()).await?;
         let database = Self {
             inner: Arc::new(SqliteDatabaseInner {
                 database_path: database_path.clone(),
@@ -378,7 +378,7 @@ impl SqliteDatabase {
             }),
         };
         if ensure_wal {
-            database.block_on(database.request_wal_journal_mode())?;
+            database.request_wal_journal_mode().await?;
         }
         Ok(database)
     }
