@@ -112,7 +112,10 @@ pub trait PresetStore {
     ) -> impl Future<Output = StoreResult<PresetRecord>> + Send + 'a;
 
     /// Deletes one preset by preset name.
-    fn delete_preset(&self, name: &str) -> StoreResult<()>;
+    fn delete_preset<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Future<Output = StoreResult<()>> + Send + 'a;
 }
 
 /// Persisted skill storage API.
@@ -380,8 +383,10 @@ impl PresetStore for PersistentStore {
         }
     }
 
-    fn delete_preset(&self, name: &str) -> StoreResult<()> {
-        delegate_persistent_store!(self, store, store.delete_preset(name))
+    async fn delete_preset<'a>(&'a self, name: &'a str) -> StoreResult<()> {
+        match self {
+            Self::Sqlite(store) => store.delete_preset(name).await,
+        }
     }
 }
 

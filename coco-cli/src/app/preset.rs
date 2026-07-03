@@ -86,7 +86,7 @@ where
         }
         PresetSubcommand::Delete(command) => {
             let json = command.json;
-            let result = run_preset_delete(command, store)?;
+            let result = run_preset_delete(command, store).await?;
             Ok(Some(if json {
                 render_json(result)
             } else {
@@ -147,11 +147,14 @@ async fn run_preset_rollback(
     Ok(preset_summary_view(&record))
 }
 
-fn run_preset_delete(
+async fn run_preset_delete(
     command: PresetNameCommand,
     store: &impl PresetStore,
 ) -> Result<PresetDeleteResult> {
-    store.delete_preset(&command.name).context(StoreSnafu)?;
+    store
+        .delete_preset(&command.name)
+        .await
+        .context(StoreSnafu)?;
     Ok(PresetDeleteResult { name: command.name })
 }
 

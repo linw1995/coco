@@ -4580,8 +4580,15 @@ impl PresetStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn delete_preset(&self, name: &str) -> Result<()> {
-        self.block_on(self.delete_preset_in_sqlite(name))
+    async fn delete_preset<'a>(&'a self, name: &'a str) -> Result<()> {
+        let store = self.clone();
+        let name = name.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.delete_preset_in_sqlite(&name).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 }
 

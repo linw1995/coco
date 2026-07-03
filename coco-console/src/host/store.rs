@@ -154,8 +154,8 @@ where
         self.notify_if_ok(self.inner.rollback_preset(name, target_version).await)
     }
 
-    fn delete_preset(&self, name: &str) -> StoreResult<()> {
-        self.notify_if_ok(self.inner.delete_preset(name))
+    async fn delete_preset<'a>(&'a self, name: &'a str) -> StoreResult<()> {
+        self.notify_if_ok(self.inner.delete_preset(name).await)
     }
 }
 

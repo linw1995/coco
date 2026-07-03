@@ -1031,7 +1031,7 @@ where
         .await
         .unwrap();
 
-    store.delete_preset(preset_name).unwrap();
+    store.delete_preset(preset_name).await.unwrap();
 
     assert!(store.list_preset_records().await.unwrap().is_empty());
     assert!(matches!(
@@ -1075,13 +1075,13 @@ where
     ));
 }
 
-fn assert_delete_preset_rejects_missing_config<F>()
+async fn assert_delete_preset_rejects_missing_config<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
 
-    let err = store.delete_preset("missing-preset").unwrap_err();
+    let err = store.delete_preset("missing-preset").await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -2338,9 +2338,9 @@ macro_rules! define_common_store_tests {
                 assert_get_preset_rejects_missing_config::<$factory>().await;
             }
 
-            #[test]
-            fn delete_preset_rejects_missing_config() {
-                assert_delete_preset_rejects_missing_config::<$factory>();
+            #[tokio::test]
+            async fn delete_preset_rejects_missing_config() {
+                assert_delete_preset_rejects_missing_config::<$factory>().await;
             }
 
             #[test]
