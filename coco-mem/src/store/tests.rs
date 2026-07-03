@@ -114,7 +114,7 @@ fn make_prompt_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
     }
 }
 
-fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> crate::Job
+async fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> crate::Job
 where
     S: BranchStore + JobStore + NodeStore,
 {
@@ -133,7 +133,7 @@ where
             )),
         })
         .unwrap();
-    store.submit_job(branch, &prompt_anchor_id).unwrap()
+    store.submit_job(branch, &prompt_anchor_id).await.unwrap()
 }
 
 trait TestStoreFactory {
@@ -1553,12 +1553,12 @@ where
     let store = F::create();
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
     assert_eq!(store.get_job(&job.job_id).await.unwrap(), job);
 }
 
-fn assert_create_job_generates_unique_ids<F>()
+async fn assert_create_job_generates_unique_ids<F>()
 where
     F: TestStoreFactory,
 {
@@ -1566,8 +1566,8 @@ where
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
     store.fork("draft", &root_id).unwrap();
-    let first = submit_prompt_job(&store, "main", "hello");
-    let second = submit_prompt_job(&store, "draft", "world");
+    let first = submit_prompt_job(&store, "main", "hello").await;
+    let second = submit_prompt_job(&store, "draft", "world").await;
 
     assert!(!first.job_id.is_empty());
     assert!(!second.job_id.is_empty());
@@ -1581,7 +1581,7 @@ where
     let store = F::create();
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    let job = submit_prompt_job(&store, "main", "hello").await;
     let running = store
         .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
         .await
@@ -1604,7 +1604,7 @@ where
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
     store.fork("recovery", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
     assert_eq!(job.work_branch, "main");
     let updated = store
@@ -1628,7 +1628,7 @@ where
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
     store.fork("recovery", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
     let err = store
         .set_job_work_branch(&job.job_id, "stale", "recovery")
@@ -1650,13 +1650,13 @@ where
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
     store.fork("recovery", &root_id).unwrap();
-    let first = submit_prompt_job(&store, "main", "hello");
+    let first = submit_prompt_job(&store, "main", "hello").await;
     store
         .set_job_work_branch(&first.job_id, "main", "recovery")
         .await
         .unwrap();
 
-    let err = store.submit_job("recovery", &root_id).unwrap_err();
+    let err = store.submit_job("recovery", &root_id).await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -1672,7 +1672,7 @@ where
     let store = F::create();
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
     let err = store
         .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Finished)
@@ -1686,14 +1686,14 @@ where
     ));
 }
 
-fn assert_submit_job_rejects_second_active_job_on_same_branch<F>()
+async fn assert_submit_job_rejects_second_active_job_on_same_branch<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
-    let first = submit_prompt_job(&store, "main", "hello");
+    let first = submit_prompt_job(&store, "main", "hello").await;
 
     let second_parent = store.get_branch_head("main").unwrap();
     let second_anchor_id = store
@@ -1710,7 +1710,10 @@ where
             )),
         })
         .unwrap();
-    let err = store.submit_job("main", &second_anchor_id).unwrap_err();
+    let err = store
+        .submit_job("main", &second_anchor_id)
+        .await
+        .unwrap_err();
 
     assert!(matches!(
         err,
@@ -1726,7 +1729,7 @@ where
     let store = F::create();
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
-    let first = submit_prompt_job(&store, "main", "hello");
+    let first = submit_prompt_job(&store, "main", "hello").await;
     store
         .set_job_status(&first.job_id, JobStatus::Queued, JobStatus::Running)
         .await
@@ -1736,7 +1739,7 @@ where
         .await
         .unwrap();
 
-    let second = submit_prompt_job(&store, "main", "world");
+    let second = submit_prompt_job(&store, "main", "world").await;
 
     assert_ne!(first.job_id, second.job_id);
     assert_eq!(second.status, JobStatus::Queued);
@@ -2461,9 +2464,9 @@ macro_rules! define_common_store_tests {
                 assert_job_round_trip::<$factory>().await;
             }
 
-            #[test]
-            fn create_job_generates_unique_ids() {
-                assert_create_job_generates_unique_ids::<$factory>();
+            #[tokio::test]
+            async fn create_job_generates_unique_ids() {
+                assert_create_job_generates_unique_ids::<$factory>().await;
             }
 
             #[tokio::test]
@@ -2511,9 +2514,9 @@ macro_rules! define_common_store_tests {
                 assert_set_job_status_rejects_invalid_transition::<$factory>().await;
             }
 
-            #[test]
-            fn submit_job_rejects_second_active_job_on_same_branch() {
-                assert_submit_job_rejects_second_active_job_on_same_branch::<$factory>();
+            #[tokio::test]
+            async fn submit_job_rejects_second_active_job_on_same_branch() {
+                assert_submit_job_rejects_second_active_job_on_same_branch::<$factory>().await;
             }
 
             #[tokio::test]

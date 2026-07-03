@@ -2911,6 +2911,7 @@ mod tests {
         let engine = ConversationEngine::new(llm);
         let active_job = store
             .submit_job("main", &store.get_branch_head("main").unwrap())
+            .await
             .unwrap();
         store
             .set_job_status(&active_job.job_id, JobStatus::Queued, JobStatus::Running)
@@ -3065,12 +3066,12 @@ mod tests {
         legacy_task.await.unwrap().unwrap();
     }
 
-    #[test]
-    fn active_job_waiting_for_recovery_detects_failure_child() {
+    #[tokio::test]
+    async fn active_job_waiting_for_recovery_detects_failure_child() {
         let store = test_store();
         store.fork("main", &store.root_id()).unwrap();
         let base = store.get_branch_head("main").unwrap();
-        let active_job = store.submit_job("main", &base).unwrap();
+        let active_job = store.submit_job("main", &base).await.unwrap();
         store
             .append(NewNode {
                 parent: base,
@@ -3083,12 +3084,12 @@ mod tests {
         assert!(super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
     }
 
-    #[test]
-    fn active_job_waiting_for_recovery_detects_terminal_failure() {
+    #[tokio::test]
+    async fn active_job_waiting_for_recovery_detects_terminal_failure() {
         let store = test_store();
         store.fork("main", &store.root_id()).unwrap();
         let base = store.get_branch_head("main").unwrap();
-        let active_job = store.submit_job("main", &base).unwrap();
+        let active_job = store.submit_job("main", &base).await.unwrap();
         let failure = store
             .append(NewNode {
                 parent: base.clone(),
@@ -3102,12 +3103,12 @@ mod tests {
         assert!(super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
     }
 
-    #[test]
-    fn active_job_waiting_for_recovery_ignores_clean_job() {
+    #[tokio::test]
+    async fn active_job_waiting_for_recovery_ignores_clean_job() {
         let store = test_store();
         store.fork("main", &store.root_id()).unwrap();
         let base = store.get_branch_head("main").unwrap();
-        let active_job = store.submit_job("main", &base).unwrap();
+        let active_job = store.submit_job("main", &base).await.unwrap();
 
         assert!(!super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
     }

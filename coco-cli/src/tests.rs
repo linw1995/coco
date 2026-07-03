@@ -89,7 +89,7 @@ fn cli_help_uses_coco_command_name() {
     assert!(!help.contains("Usage: coco-cli"));
 }
 
-fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> coco_mem::Job
+async fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> coco_mem::Job
 where
     S: BranchStore + JobStore + NodeStore,
 {
@@ -108,7 +108,7 @@ where
             )),
         })
         .unwrap();
-    store.submit_job(branch, &prompt_anchor_id).unwrap()
+    store.submit_job(branch, &prompt_anchor_id).await.unwrap()
 }
 
 #[derive(Debug, Clone)]
@@ -1528,7 +1528,7 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
     .await;
 
     let store = open_store(&store_path).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
     run_with_backend(
         prompt_worker_cli(store_path.clone(), &job.job_id),
@@ -1591,7 +1591,7 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
             )),
         })
         .unwrap();
-    let job = store.submit_job("main", &prompt_anchor_id).unwrap();
+    let job = store.submit_job("main", &prompt_anchor_id).await.unwrap();
 
     let status_output = run_with_backend(
         prompt_status_cli(store_path, &job.job_id),
@@ -1627,7 +1627,7 @@ async fn prompt_status_reports_running_task_progress() {
     .await;
 
     let store = open_store(&store_path).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello progress");
+    let job = submit_prompt_job(&store, "main", "hello progress").await;
 
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
@@ -5865,7 +5865,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
     let session_head = store.get_branch_head("main").unwrap();
     let parent_tool_use =
         append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
-    let job = submit_prompt_job(&store, "main", "hello");
+    let job = submit_prompt_job(&store, "main", "hello").await;
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("done")])]),
@@ -6423,7 +6423,7 @@ async fn daemon_startup_resumes_incomplete_jobs() {
     .await;
 
     let store = open_store(&store_path).unwrap();
-    let job = submit_prompt_job(&store, "main", "resume me");
+    let job = submit_prompt_job(&store, "main", "resume me").await;
     store
         .set_job_status(
             &job.job_id,

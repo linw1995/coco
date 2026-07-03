@@ -4438,8 +4438,16 @@ impl SessionStore for SqliteStore {
 }
 
 impl JobStore for SqliteStore {
-    fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
-        self.block_on(self.submit_job_in_sqlite(branch, base))
+    async fn submit_job<'a>(&'a self, branch: &'a str, base: &'a str) -> Result<Job> {
+        let store = self.clone();
+        let branch = branch.to_owned();
+        let base = base.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.submit_job_in_sqlite(&branch, &base).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {

@@ -375,7 +375,7 @@ where
                 .service
                 .store()
                 .submit_job_with_id(job_id, branch, &base)?,
-            None => self.service.store().submit_job(branch, &base)?,
+            None => self.service.store().submit_job(branch, &base).await?,
         };
         tracing::info!(
             job_id = %job.job_id,

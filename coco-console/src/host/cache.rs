@@ -9467,8 +9467,8 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn snapshot_write_transaction_allows_store_write_after_short_lock() {
+    #[tokio::test]
+    async fn snapshot_write_transaction_allows_store_write_after_short_lock() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
         let root = writer.root_id();
@@ -9493,7 +9493,7 @@ mod tests {
         });
         started_rx.recv().unwrap();
 
-        writer.submit_job("main", &base).unwrap();
+        writer.submit_job("main", &base).await.unwrap();
         transaction.join().unwrap();
 
         drop(writer);

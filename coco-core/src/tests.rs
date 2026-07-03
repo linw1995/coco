@@ -272,7 +272,11 @@ fn session_config(branch: &str) -> SessionConfig {
     }
 }
 
-fn submit_prompt_job(store: &SqliteStore, branch: &str, prompt: &str) -> coco_llm::coco_mem::Job {
+async fn submit_prompt_job(
+    store: &SqliteStore,
+    branch: &str,
+    prompt: &str,
+) -> coco_llm::coco_mem::Job {
     let parent = store.get_branch_head(branch).unwrap();
     let prompt_anchor_id = store
         .append(NewNode {
@@ -288,7 +292,7 @@ fn submit_prompt_job(store: &SqliteStore, branch: &str, prompt: &str) -> coco_ll
             )),
         })
         .unwrap();
-    store.submit_job(branch, &prompt_anchor_id).unwrap()
+    store.submit_job(branch, &prompt_anchor_id).await.unwrap()
 }
 
 #[tokio::test]
@@ -1385,7 +1389,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
         .await
         .unwrap();
     let original_head = store.get_branch_head("main").unwrap();
-    submit_prompt_job(&store, "main", "keep going");
+    submit_prompt_job(&store, "main", "keep going").await;
     let job_id = store
         .list_jobs()
         .await
