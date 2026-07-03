@@ -1722,9 +1722,11 @@ where
     let store = F::create();
     let first = store
         .enqueue_message("hooks", json!({"text": "first"}))
+        .await
         .unwrap();
     let second = store
         .enqueue_message("hooks", json!({"text": "second"}))
+        .await
         .unwrap();
 
     assert_eq!(
@@ -1755,9 +1757,11 @@ where
     let store = F::create();
     let hook = store
         .enqueue_message("hooks", json!({"text": "hook"}))
+        .await
         .unwrap();
     let scheduler = store
         .enqueue_message("scheduler", json!({"text": "scheduler"}))
+        .await
         .unwrap();
 
     assert_eq!(
@@ -1779,16 +1783,18 @@ where
     );
 }
 
-fn assert_message_queue_ids_are_content_derived<F>()
+async fn assert_message_queue_ids_are_content_derived<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
     let first = store
         .enqueue_message("hooks", json!({"text": "same"}))
+        .await
         .unwrap();
     let second = store
         .enqueue_message("hooks", json!({"text": "same"}))
+        .await
         .unwrap();
 
     assert_ne!(first.message_id, second.message_id);
@@ -2481,9 +2487,9 @@ macro_rules! define_common_store_tests {
                 assert_message_queue_isolates_named_queues::<$factory>().await;
             }
 
-            #[test]
-            fn message_queue_ids_are_content_derived() {
-                assert_message_queue_ids_are_content_derived::<$factory>();
+            #[tokio::test]
+            async fn message_queue_ids_are_content_derived() {
+                assert_message_queue_ids_are_content_derived::<$factory>().await;
             }
 
         }

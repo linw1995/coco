@@ -895,7 +895,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
             return Ok(true);
         }
 
-        queue_prompt_job_request(&self.store, request)?;
+        queue_prompt_job_request(&self.store, request).await?;
         tracing::info!(
             message_id = %item.message_id,
             queue = SYSTEM_EVENT_QUEUE,
@@ -1453,6 +1453,7 @@ where
         let item = self
             .store
             .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
+            .await
             .map_err(ChannelError::handler)?;
         let conversation_id = message.conversation_id().to_owned();
         let sender_id = message.sender_id().to_owned();
@@ -2597,6 +2598,7 @@ mod tests {
         let message = InboundMessage::telegram("chat", "user", "first");
         store
             .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
+            .await
             .unwrap();
         let worker = TelegramMessageQueueWorker::new(
             "main",
@@ -2642,6 +2644,7 @@ mod tests {
         let message = InboundMessage::telegram("chat", "user", "next");
         store
             .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
+            .await
             .unwrap();
         let worker =
             TelegramMessageQueueWorker::new("main", store, engine, Arc::new(Notify::new()));
@@ -2687,6 +2690,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -2748,6 +2752,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(queue.clone(), store.clone(), engine.clone());
 
@@ -2793,6 +2798,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -2847,6 +2853,7 @@ mod tests {
         };
         store
             .enqueue_message(PROMPT_JOB_QUEUE, json!(request.clone()))
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -2916,6 +2923,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         super::queue_prompt_job_request(
             &store,
@@ -2927,6 +2935,7 @@ mod tests {
                 session_patch: None,
             },
         )
+        .await
         .unwrap();
         let legacy_worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -2997,6 +3006,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         super::queue_prompt_job_request(
             &store,
@@ -3008,6 +3018,7 @@ mod tests {
                 session_patch: None,
             },
         )
+        .await
         .unwrap();
         let legacy_worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -3114,6 +3125,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -3158,6 +3170,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker =
             PromptJobMessageQueueWorker::new(PROMPT_JOB_QUEUE.to_owned(), store.clone(), engine);
@@ -3200,6 +3213,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3265,6 +3279,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3310,8 +3325,12 @@ mod tests {
         });
         store
             .enqueue_message(SYSTEM_EVENT_QUEUE, payload.clone())
+            .await
             .unwrap();
-        store.enqueue_message(SYSTEM_EVENT_QUEUE, payload).unwrap();
+        store
+            .enqueue_message(SYSTEM_EVENT_QUEUE, payload)
+            .await
+            .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
         assert_eq!(worker.drain_once().await.unwrap(), 2);
@@ -3357,6 +3376,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         store
             .enqueue_message(
@@ -3378,6 +3398,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3470,6 +3491,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3526,6 +3548,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3565,6 +3588,7 @@ mod tests {
                 session_patch: None,
             },
         )
+        .await
         .unwrap();
         store
             .enqueue_message(
@@ -3586,6 +3610,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 

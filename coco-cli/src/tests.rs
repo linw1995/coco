@@ -1356,6 +1356,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
                 "session_patch": null,
             }),
         )
+        .await
         .unwrap();
 
     let pending_list_output = crate::app::runtime::run_with_services(

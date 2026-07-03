@@ -173,11 +173,11 @@ pub trait JobStore {
 /// Generic persistent message queue storage API.
 pub trait MessageQueueStore {
     /// Enqueues one message in a named queue.
-    fn enqueue_message(
-        &self,
-        queue: &str,
+    fn enqueue_message<'a>(
+        &'a self,
+        queue: &'a str,
         payload: serde_json::Value,
-    ) -> StoreResult<MessageQueueItem>;
+    ) -> impl Future<Output = StoreResult<MessageQueueItem>> + Send + 'a;
 
     /// Removes and returns the oldest message in a named queue.
     fn dequeue_message<'a>(
@@ -442,12 +442,14 @@ impl JobStore for PersistentStore {
 }
 
 impl MessageQueueStore for PersistentStore {
-    fn enqueue_message(
-        &self,
-        queue: &str,
+    async fn enqueue_message<'a>(
+        &'a self,
+        queue: &'a str,
         payload: serde_json::Value,
     ) -> StoreResult<MessageQueueItem> {
-        delegate_persistent_store!(self, store, store.enqueue_message(queue, payload))
+        match self {
+            PersistentStore::Sqlite(store) => store.enqueue_message(queue, payload).await,
+        }
     }
 
     async fn dequeue_message<'a>(

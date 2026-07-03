@@ -2434,6 +2434,7 @@ async fn console_store_notifies_only_when_dequeue_removes_message() {
 
     let item = store
         .enqueue_message("system", json!({"ok": true}))
+        .await
         .unwrap();
     assert_eq!(publisher.current_version(), 1);
 
@@ -2450,6 +2451,7 @@ async fn console_store_lists_message_queues() {
 
     store
         .enqueue_message("system", json!({"ok": true}))
+        .await
         .unwrap();
 
     assert_eq!(store.list_message_queues().await.unwrap(), vec!["system"]);

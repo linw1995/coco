@@ -242,12 +242,14 @@ impl<S> MessageQueueStore for ConsoleStore<S>
 where
     S: MessageQueueStore + Sync,
 {
-    fn enqueue_message(
-        &self,
-        queue: &str,
+    async fn enqueue_message<'a>(
+        &'a self,
+        queue: &'a str,
         payload: serde_json::Value,
     ) -> StoreResult<MessageQueueItem> {
-        self.notify_if_ok(self.inner.enqueue_message(queue, payload))
+        let item = self.inner.enqueue_message(queue, payload).await?;
+        self.publisher.mark_changed();
+        Ok(item)
     }
 
     async fn dequeue_message<'a>(

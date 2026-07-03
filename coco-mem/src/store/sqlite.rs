@@ -4473,8 +4473,19 @@ impl JobStore for SqliteStore {
 }
 
 impl MessageQueueStore for SqliteStore {
-    fn enqueue_message(&self, queue: &str, payload: serde_json::Value) -> Result<MessageQueueItem> {
-        self.block_on(self.enqueue_message_in_sqlite(queue, payload))
+    async fn enqueue_message<'a>(
+        &'a self,
+        queue: &'a str,
+        payload: serde_json::Value,
+    ) -> Result<MessageQueueItem> {
+        let store = self.clone();
+        let queue = queue.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.enqueue_message_in_sqlite(&queue, payload).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     async fn dequeue_message<'a>(&'a self, queue: &'a str) -> Result<Option<MessageQueueItem>> {
@@ -5717,9 +5728,11 @@ mod tests {
         let store = SqliteStore::open(&path).unwrap();
         let first = store
             .enqueue_message("runner", serde_json::json!({"index": 1}))
+            .await
             .unwrap();
         let second = store
             .enqueue_message("runner", serde_json::json!({"index": 2}))
+            .await
             .unwrap();
 
         let reopened = SqliteStore::open(&path).unwrap();

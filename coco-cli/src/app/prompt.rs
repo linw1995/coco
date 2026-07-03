@@ -250,7 +250,8 @@ where
                     merge_parents: command.merge_parents,
                     session_patch,
                 },
-            )?;
+            )
+            .await?;
             let view = JobQueuedView {
                 job_id,
                 status: JobStatus::Queued,
@@ -462,13 +463,14 @@ where
     });
 }
 
-pub fn queue_prompt_job_request(
+pub async fn queue_prompt_job_request(
     store: &impl Store,
     request: QueuedPromptRequest,
 ) -> Result<MessageQueueItem> {
     let queue = prompt_job_queue_for_branch(&request.branch);
     store
         .enqueue_message(&queue, json!(request))
+        .await
         .context(StoreSnafu)
 }
 

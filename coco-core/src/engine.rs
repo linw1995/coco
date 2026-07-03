@@ -690,11 +690,14 @@ where
 
         match self.service.run(request).await {
             Ok(_) => Ok(JobRunOutcome::Completed),
-            Err(source) => self.handle_completion_error(job, source, !is_retrying_failure),
+            Err(source) => {
+                self.handle_completion_error(job, source, !is_retrying_failure)
+                    .await
+            }
         }
     }
 
-    fn handle_completion_error(
+    async fn handle_completion_error(
         &self,
         job: &Job,
         source: LlmError,
@@ -706,7 +709,8 @@ where
         } = &source
         {
             if queue_recovery_event {
-                self.enqueue_backend_failure_recovery_event(job, backend_source, context)?;
+                self.enqueue_backend_failure_recovery_event(job, backend_source, context)
+                    .await?;
             } else {
                 tracing::warn!(
                     job_id = %job.job_id,
@@ -724,17 +728,21 @@ where
         Err(source.into())
     }
 
-    fn enqueue_backend_failure_recovery_event(
+    async fn enqueue_backend_failure_recovery_event(
         &self,
         job: &Job,
         source: &BackendError,
         context: &BackendFailureContext,
     ) -> std::result::Result<(), EngineError> {
         let event = backend_failure_recovery_event(job, source, context);
-        let item = self.service.store().enqueue_message(
-            SYSTEM_EVENT_QUEUE,
-            serde_json::to_value(&event).expect("system event payload should serialize"),
-        )?;
+        let item = self
+            .service
+            .store()
+            .enqueue_message(
+                SYSTEM_EVENT_QUEUE,
+                serde_json::to_value(&event).expect("system event payload should serialize"),
+            )
+            .await?;
         tracing::warn!(
             job_id = %job.job_id,
             branch = %job.branch,
