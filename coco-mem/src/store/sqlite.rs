@@ -5755,8 +5755,8 @@ mod tests {
         assert_eq!(messages[1].message_id, second.message_id);
     }
 
-    #[test]
-    fn message_queue_sorts_by_parsed_timestamp() {
+    #[tokio::test]
+    async fn message_queue_sorts_by_parsed_timestamp() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5772,15 +5772,13 @@ mod tests {
             created_at: "2026-01-01T00:00:00.001Z".parse().unwrap(),
             payload: serde_json::json!({"index": 2}),
         };
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            super::persist_message_queue_item(&mut connection, &store.database_path, &first)
-                .await
-                .unwrap();
-            super::persist_message_queue_item(&mut connection, &store.database_path, &second)
-                .await
-                .unwrap();
-        });
+        let mut connection = store.connect().await.unwrap();
+        super::persist_message_queue_item(&mut connection, &store.database_path, &first)
+            .await
+            .unwrap();
+        super::persist_message_queue_item(&mut connection, &store.database_path, &second)
+            .await
+            .unwrap();
 
         let reopened = SqliteStore::open(&path).unwrap();
         let messages = reopened.list_queue_messages("runner").unwrap();
