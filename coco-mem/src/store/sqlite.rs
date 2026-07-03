@@ -480,12 +480,8 @@ impl SqliteDatabase {
 }
 
 impl SqliteStore {
-    pub fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            Self::open_read_only_or_upgrade_schema_in_sqlite(path),
-        )
+    pub async fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_or_upgrade_schema_in_sqlite(path.as_ref()).await
     }
 
     async fn open_read_only_or_upgrade_schema_in_sqlite(path: &Path) -> Result<Self> {
@@ -5583,14 +5579,16 @@ mod tests {
         assert!(!super::sqlite_database_path(&path).exists());
     }
 
-    #[test]
-    fn open_read_only_or_upgrade_schema_rejects_old_diesel_schema_version() {
+    #[tokio::test]
+    async fn open_read_only_or_upgrade_schema_rejects_old_diesel_schema_version() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
         create_diesel_migration_metadata_for_test(&path, "00000000000005");
 
-        let err = SqliteStore::open_read_only_or_upgrade_schema(&path).unwrap_err();
+        let err = SqliteStore::open_read_only_or_upgrade_schema(&path)
+            .await
+            .unwrap_err();
 
         assert!(
             err.to_string()

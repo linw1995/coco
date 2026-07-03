@@ -277,8 +277,10 @@ impl PersistentStore {
         SqliteStore::open(path).map(Self::Sqlite)
     }
 
-    pub fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> StoreResult<Self> {
-        SqliteStore::open_read_only_or_upgrade_schema(path).map(Self::Sqlite)
+    pub async fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> StoreResult<Self> {
+        SqliteStore::open_read_only_or_upgrade_schema(path)
+            .await
+            .map(Self::Sqlite)
     }
 
     pub fn store_path(&self) -> &Path {

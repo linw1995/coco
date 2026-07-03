@@ -52,7 +52,7 @@ where
         store_path,
         command,
     } = cli;
-    let shared_store = open_store_for_command(&store_path, &command)?;
+    let shared_store = open_store_for_command(&store_path, &command).await?;
     let config = config::load_cwd_config()?;
     let provider_profiles = config.provider_profiles;
     let channel_configs = config.channels;

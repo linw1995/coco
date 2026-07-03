@@ -15,9 +15,11 @@ pub fn open_store(path: &Path) -> Result<PersistentStore> {
     PersistentStore::open(path).context(StoreSnafu)
 }
 
-pub fn open_store_for_command(path: &Path, command: &Command) -> Result<PersistentStore> {
+pub async fn open_store_for_command(path: &Path, command: &Command) -> Result<PersistentStore> {
     if command_is_read_only(command) && path.exists() {
-        return PersistentStore::open_read_only_or_upgrade_schema(path).context(StoreSnafu);
+        return PersistentStore::open_read_only_or_upgrade_schema(path)
+            .await
+            .context(StoreSnafu);
     }
 
     PersistentStore::open(path).context(StoreSnafu)
