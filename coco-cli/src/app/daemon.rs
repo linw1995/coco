@@ -82,9 +82,7 @@ pub struct CocoCliDaemonServerHandle<B, S> {
 
 pub struct DaemonServerOptions<'a> {
     pub channel_configs: &'a ChannelConfigs,
-    pub console_config: Option<ConsoleConfig>,
-    pub console_publisher: Option<ConsolePublisher>,
-    pub console_graph_store_path: PathBuf,
+    pub console: Option<ConsoleServerHandle>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +120,19 @@ where
     let console_config = daemon_console_config(&command, console_publisher.as_ref());
 
     ensure_initial_session(shared_store, llm, provider_profiles).await?;
+    let console = match console_config {
+        Some(config) => Some(
+            start_console_server_with_graph_store_path(
+                config,
+                shared_store.clone(),
+                console_publisher.expect("console publisher should exist when console is enabled"),
+                console_graph_store_path,
+            )
+            .await
+            .context(ConsoleSnafu)?,
+        ),
+        None => None,
+    };
     let server = start_daemon_server(
         &socket_path,
         shared_store,
@@ -130,9 +141,7 @@ where
         &shared_engine,
         DaemonServerOptions {
             channel_configs,
-            console_config,
-            console_publisher,
-            console_graph_store_path,
+            console,
         },
     )?;
     spawn_resume_incomplete_jobs(shared_engine);
@@ -540,20 +549,7 @@ where
     let llm = llm.clone();
     let provider_profiles = provider_profiles.clone();
     let shared_engine = shared_engine.clone();
-    let console = match options.console_config {
-        Some(config) => Some(
-            start_console_server_with_graph_store_path(
-                config,
-                shared_store.clone(),
-                options
-                    .console_publisher
-                    .expect("console publisher should exist when console is enabled"),
-                options.console_graph_store_path,
-            )
-            .context(ConsoleSnafu)?,
-        ),
-        None => None,
-    };
+    let console = options.console;
     if let Some(console) = &console {
         tracing::info!(addr = %console.addr(), "coco console listening");
     }

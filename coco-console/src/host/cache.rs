@@ -58,7 +58,7 @@ pub struct ConsoleGraphCache<S> {
 enum ConsoleGraphSource<S> {
     #[allow(dead_code)]
     Store(S),
-    PersistentStorePath(PathBuf),
+    PersistentStore(SqliteGraphStore),
 }
 
 #[derive(Default)]
@@ -142,12 +142,14 @@ where
         }
     }
 
-    pub fn new_with_persistent_store_path(
+    pub async fn new_with_persistent_store_path(
         _store: S,
         invalidations: ConsolePublisher,
         path: PathBuf,
     ) -> crate::Result<Self> {
-        SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
+        let store = SqliteGraphStore::open_read_only(&path)
+            .await
+            .context(crate::error::StoreSnafu)?;
         let snapshots = ConsoleGraphSnapshotStore::open(&path)?;
         let persisted_version = latest_persistent_materialization_version(&snapshots)?;
         let ready = ConsolePublisher::new();
@@ -160,7 +162,7 @@ where
                 .unwrap_or(1),
         );
         Ok(Self {
-            source: ConsoleGraphSource::PersistentStorePath(path),
+            source: ConsoleGraphSource::PersistentStore(store),
             invalidations,
             ready,
             progress: ConsolePublisher::new(),
@@ -1195,13 +1197,9 @@ where
             Self::Store(store) => {
                 build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
             }
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                run_sqlite_graph_read_transaction(&store, || {
-                    build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
-                })
-            }
+            Self::PersistentStore(store) => run_sqlite_graph_read_transaction(&store, || {
+                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
+            }),
         }
     }
 
@@ -1213,22 +1211,16 @@ where
     ) -> crate::Result<bool> {
         match self {
             Self::Store(store) => snapshots.try_append_linear_branch(source_version, mode, &store),
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                run_sqlite_graph_read_transaction(&store, || {
-                    snapshots.try_append_linear_branch(source_version, mode, &store)
-                })
-            }
+            Self::PersistentStore(store) => run_sqlite_graph_read_transaction(&store, || {
+                snapshots.try_append_linear_branch(source_version, mode, &store)
+            }),
         }
     }
 
     fn get_node(self, node_id: &str) -> crate::Result<coco_mem::Node> {
         match self {
             Self::Store(store) => store.get_node(node_id).context(crate::error::StoreSnafu),
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
+            Self::PersistentStore(store) => {
                 store.get_node(node_id).context(crate::error::StoreSnafu)
             }
         }
@@ -1241,9 +1233,7 @@ where
     ) -> crate::Result<Option<crate::graph::GraphProviderContextSelection>> {
         match self {
             Self::Store(store) => provider_context_for_node(&store, target_node_id, context),
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
+            Self::PersistentStore(store) => {
                 provider_context_for_node(&store, target_node_id, context)
             }
         }
@@ -1255,11 +1245,7 @@ where
     ) -> crate::Result<Vec<MaterializedGraphShellBranch>> {
         match self {
             Self::Store(store) => materialized_shell_branches(&store, lanes),
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                materialized_shell_branches(&store, lanes)
-            }
+            Self::PersistentStore(store) => materialized_shell_branches(&store, lanes),
         }
     }
 }
@@ -1612,6 +1598,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -1678,6 +1665,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -1717,6 +1705,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -1793,6 +1782,7 @@ mod tests {
             reopened_publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let reopened = reopened_cache.snapshot_current_ready(GraphMode::All);
         assert_eq!(reopened_cache.current_version(), target_version);
@@ -1954,6 +1944,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2082,6 +2073,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2210,6 +2202,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2335,6 +2328,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2463,6 +2457,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2588,6 +2583,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2688,6 +2684,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2848,6 +2845,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2978,6 +2976,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3098,6 +3097,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3206,6 +3206,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3374,6 +3375,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3535,6 +3537,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3627,6 +3630,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3720,6 +3724,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3802,6 +3807,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3879,6 +3885,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3952,6 +3959,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4067,6 +4075,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4173,6 +4182,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4301,6 +4311,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4389,6 +4400,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4442,6 +4454,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4527,6 +4540,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4652,6 +4666,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
@@ -4771,6 +4786,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
@@ -4829,6 +4845,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4888,6 +4905,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4956,6 +4974,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5023,6 +5042,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5087,6 +5107,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5155,6 +5176,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5308,6 +5330,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5431,6 +5454,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5555,6 +5579,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5652,6 +5677,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5802,6 +5828,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5919,6 +5946,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6062,6 +6090,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6232,6 +6261,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6364,6 +6394,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6475,6 +6506,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6610,6 +6642,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6735,6 +6768,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6814,6 +6848,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6899,6 +6934,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6996,6 +7032,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7092,6 +7129,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7226,6 +7264,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let old_session = writer
@@ -7350,6 +7389,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let old_session = writer
@@ -7456,6 +7496,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7543,6 +7584,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7626,6 +7668,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7799,6 +7842,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let old_session = writer
@@ -7914,6 +7958,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7989,6 +8034,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8118,6 +8164,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8224,6 +8271,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8324,6 +8372,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8427,6 +8476,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8538,6 +8588,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8633,6 +8684,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8744,6 +8796,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8851,6 +8904,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8922,6 +8976,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9011,6 +9066,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9137,6 +9193,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9215,6 +9272,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9342,6 +9400,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9849,6 +9908,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer

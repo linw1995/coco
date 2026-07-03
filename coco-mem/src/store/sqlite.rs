@@ -988,9 +988,9 @@ impl SqliteStore {
 }
 
 impl SqliteGraphStore {
-    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        block_on_sqlite_runtime_with(sqlite_runtime()?, Self::open_read_only_in_sqlite(path))
+        Self::open_read_only_in_sqlite(path).await
     }
 
     async fn open_read_only_in_sqlite(path: &Path) -> Result<Self> {
@@ -5086,7 +5086,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).unwrap();
         let read_only = SqliteStore::open_read_only(&path).await.unwrap();
-        let graph = SqliteGraphStore::open_read_only(&path).unwrap();
+        let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
         let lexical_read_only = SqliteStore::open_read_only(path.join(".")).await.unwrap();
 
         assert!(std::ptr::eq(
@@ -5108,7 +5108,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
-        let graph = SqliteGraphStore::open_read_only(&path).unwrap();
+        let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
         let graph_connection_database = graph.database.clone();
         let (graph_locked_tx, graph_locked_rx) = mpsc::channel();
         let (release_graph_tx, release_graph_rx) = oneshot::channel();
@@ -5452,8 +5452,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn graph_store_reads_children_from_node_relations() {
+    #[tokio::test]
+    async fn graph_store_reads_children_from_node_relations() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let writer = SqliteStore::open(&path).unwrap();
@@ -5469,7 +5469,7 @@ mod tests {
         writer.fork("graph-child", &child_id).unwrap();
         drop(writer);
 
-        let graph_store = SqliteGraphStore::open_read_only(&path).unwrap();
+        let graph_store = SqliteGraphStore::open_read_only(&path).await.unwrap();
 
         assert_eq!(graph_store.root_id(), root_id);
         assert_eq!(
@@ -5670,13 +5670,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn graph_open_read_only_rejects_missing_schema_without_creating_database() {
+    #[tokio::test]
+    async fn graph_open_read_only_rejects_missing_schema_without_creating_database() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
 
-        let err = SqliteGraphStore::open_read_only(&path).unwrap_err();
+        let err = SqliteGraphStore::open_read_only(&path).await.unwrap_err();
 
         assert!(err.to_string().contains("SQLite"));
         assert!(!super::sqlite_database_path(&path).exists());

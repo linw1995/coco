@@ -89,7 +89,7 @@ where
     start_console_server_with_cache(config, ConsoleGraphCache::new(store, publisher))
 }
 
-pub fn start_console_server_with_graph_store_path<S>(
+pub async fn start_console_server_with_graph_store_path<S>(
     config: ConsoleConfig,
     store: S,
     publisher: ConsolePublisher,
@@ -99,7 +99,8 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let cache =
-        ConsoleGraphCache::new_with_persistent_store_path(store, publisher, graph_store_path)?;
+        ConsoleGraphCache::new_with_persistent_store_path(store, publisher, graph_store_path)
+            .await?;
     start_console_server_with_cache(config, cache)
 }
 
@@ -1653,6 +1654,7 @@ mod tests {
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
 
@@ -1691,6 +1693,7 @@ mod tests {
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         state.cache.current_snapshot(GraphMode::All).await;
@@ -1730,6 +1733,7 @@ mod tests {
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         let all = state
@@ -1883,6 +1887,7 @@ mod tests {
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
 
@@ -1933,6 +1938,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         seed_cache.current_snapshot(GraphMode::Anchors).await;
         drop(seed_cache);
@@ -1943,6 +1949,7 @@ mod tests {
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
 
@@ -2007,6 +2014,7 @@ mod tests {
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         let query = format!("target={}&mode=all", node_target_id(&text));
@@ -2067,6 +2075,7 @@ mod tests {
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         state.cache.current_snapshot(GraphMode::Anchors).await;
@@ -2131,6 +2140,7 @@ mod tests {
                 publisher.clone(),
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         let initial = state.cache.current_snapshot(GraphMode::Anchors).await;
@@ -2188,6 +2198,7 @@ mod tests {
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
 
@@ -2249,6 +2260,7 @@ mod tests {
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         seed_cache.current_snapshot(GraphMode::Anchors).await;
         drop(seed_cache);
@@ -2259,6 +2271,7 @@ mod tests {
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         let visible_query = format!("mode=anchors&target={}", node_target_id(&prompt));
