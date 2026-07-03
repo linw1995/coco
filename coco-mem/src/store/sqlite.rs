@@ -146,7 +146,7 @@ pub struct SqliteGraphStore {
     database_path: PathBuf,
     database: SqliteDatabase,
     root_id: String,
-    read_transaction: Arc<Mutex<Option<AsyncSqliteConnectionGuard<'static>>>>,
+    read_transaction: Arc<tokio::sync::Mutex<Option<AsyncSqliteConnectionGuard<'static>>>>,
 }
 
 impl std::fmt::Debug for SqliteGraphStore {
@@ -699,7 +699,7 @@ impl SqliteGraphStore {
             database_path,
             database,
             root_id: String::new(),
-            read_transaction: Arc::new(Mutex::new(None)),
+            read_transaction: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -730,25 +730,20 @@ impl SqliteGraphStore {
         self.database.connection().await
     }
 
-    fn with_connection<T, F>(&self, operation: F) -> Result<T>
+    async fn with_connection<T, F>(&self, operation: F) -> Result<T>
     where
         T: Send,
         F: for<'a> FnOnce(&'a mut AsyncSqliteConnection) -> SqliteGraphConnectionFuture<'a, T>
             + Send,
     {
-        let mut read_transaction = self
-            .read_transaction
-            .lock()
-            .expect("graph store transaction lock poisoned");
+        let mut read_transaction = self.read_transaction.lock().await;
         if let Some(connection) = read_transaction.as_mut() {
-            return self.block_on(operation(&mut *connection));
+            return operation(&mut *connection).await;
         }
         drop(read_transaction);
 
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            operation(&mut connection).await
-        })
+        let mut connection = self.connect().await?;
+        operation(&mut connection).await
     }
 
     pub fn begin_read_transaction(&self) -> Result<()> {
@@ -756,11 +751,9 @@ impl SqliteGraphStore {
     }
 
     async fn begin_read_transaction_in_sqlite(&self) -> Result<()> {
+        let transaction_is_inactive = self.read_transaction.lock().await.is_none();
         ensure!(
-            self.read_transaction
-                .lock()
-                .expect("graph store transaction lock poisoned")
-                .is_none(),
+            transaction_is_inactive,
             CorruptedStoreSnafu {
                 path: self.database_path.clone(),
                 message: "SQLite graph read transaction already active".to_owned(),
@@ -779,10 +772,7 @@ impl SqliteGraphStore {
         begin_deferred_transaction(&mut connection, &self.database_path).await?;
         let mut connection = Some(connection);
         let transaction_already_active = {
-            let mut read_transaction = self
-                .read_transaction
-                .lock()
-                .expect("graph store transaction lock poisoned");
+            let mut read_transaction = self.read_transaction.lock().await;
             if read_transaction.is_some() {
                 true
             } else {
@@ -807,15 +797,15 @@ impl SqliteGraphStore {
     }
 
     async fn commit_read_transaction_in_sqlite(&self) -> Result<()> {
-        let mut connection = self
-            .read_transaction
-            .lock()
-            .expect("graph store transaction lock poisoned")
-            .take()
-            .context(CorruptedStoreSnafu {
-                path: self.database_path.clone(),
-                message: "SQLite graph read transaction is not active".to_owned(),
-            })?;
+        let mut connection =
+            self.read_transaction
+                .lock()
+                .await
+                .take()
+                .context(CorruptedStoreSnafu {
+                    path: self.database_path.clone(),
+                    message: "SQLite graph read transaction is not active".to_owned(),
+                })?;
 
         commit_deferred_transaction(&mut connection, &self.database_path).await
     }
@@ -825,12 +815,7 @@ impl SqliteGraphStore {
     }
 
     async fn rollback_read_transaction_in_sqlite(&self) -> Result<()> {
-        let Some(mut connection) = self
-            .read_transaction
-            .lock()
-            .expect("graph store transaction lock poisoned")
-            .take()
-        else {
+        let Some(mut connection) = self.read_transaction.lock().await.take() else {
             return Ok(());
         };
 
@@ -847,7 +832,7 @@ impl SqliteGraphStore {
     fn branch_head(&self, name: &str) -> Result<Option<String>> {
         let name = name.to_owned();
         let path = self.database_path.clone();
-        self.with_connection(move |connection| {
+        self.block_on(self.with_connection(move |connection| {
             Box::pin(async move {
                 branches::table
                     .filter(branches::name.eq(name))
@@ -857,17 +842,17 @@ impl SqliteGraphStore {
                     .optional()
                     .context(QuerySqliteStoreSnafu { path })
             })
-        })
+        }))
     }
 
     fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
         let reference = reference.to_owned();
         let path = self.database_path.clone();
-        self.with_connection(move |connection| {
+        self.block_on(self.with_connection(move |connection| {
             Box::pin(
                 async move { load_node_by_prefix_or_branch(connection, &path, &reference).await },
             )
-        })
+        }))
     }
 }
 
@@ -3926,18 +3911,18 @@ impl NodeStore for SqliteGraphStore {
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
         let head_ref = head_ref.to_owned();
         let path = self.database_path.clone();
-        self.with_connection(move |connection| {
+        self.block_on(self.with_connection(move |connection| {
             Box::pin(async move { load_ancestry_nodes(connection, &path, &head_ref).await })
-        })
+        }))
     }
 
     fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
         let base_ref = base_ref.to_owned();
         let head_ref = head_ref.to_owned();
         let path = self.database_path.clone();
-        self.with_connection(move |connection| {
+        self.block_on(self.with_connection(move |connection| {
             Box::pin(async move { load_log_nodes(connection, &path, &base_ref, &head_ref).await })
-        })
+        }))
     }
 
     fn get_node(&self, id: &str) -> Result<Node> {
@@ -3947,9 +3932,9 @@ impl NodeStore for SqliteGraphStore {
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
         let node_id = node_id.to_owned();
         let path = self.database_path.clone();
-        self.with_connection(move |connection| {
+        self.block_on(self.with_connection(move |connection| {
             Box::pin(async move { load_child_nodes(connection, &path, &node_id).await })
-        })
+        }))
     }
 }
 
@@ -3981,17 +3966,17 @@ impl BranchStore for SqliteGraphStore {
 impl SessionStore for SqliteGraphStore {
     fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
         let path = self.database_path.clone();
-        self.with_connection(move |connection| {
+        self.block_on(self.with_connection(move |connection| {
             Box::pin(async move { load_session_states(connection, &path).await })
-        })
+        }))
     }
 
     fn get_session_state(&self, name: &str) -> Result<SessionState> {
         let name = name.to_owned();
         let path = self.database_path.clone();
-        self.with_connection(move |connection| {
+        self.block_on(self.with_connection(move |connection| {
             Box::pin(async move { load_session_state(connection, &path, &name).await })
-        })
+        }))
     }
 
     fn set_session_state(
