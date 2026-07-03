@@ -180,13 +180,13 @@ where
         self.notify_if_ok(self.inner.add_skill(role, name, spec).await)
     }
 
-    fn update_skill(
-        &self,
+    async fn update_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
-        patch: &SkillUpdatePatch,
+        name: &'a str,
+        patch: &'a SkillUpdatePatch,
     ) -> StoreResult<SkillRecord> {
-        self.notify_if_ok(self.inner.update_skill(role, name, patch))
+        self.notify_if_ok(self.inner.update_skill(role, name, patch).await)
     }
 
     fn rollback_skill(

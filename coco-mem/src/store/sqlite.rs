@@ -4624,13 +4624,21 @@ impl SkillStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn update_skill(
-        &self,
+    async fn update_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
-        patch: &SkillUpdatePatch,
+        name: &'a str,
+        patch: &'a SkillUpdatePatch,
     ) -> Result<SkillRecord> {
-        self.block_on(self.update_skill_in_sqlite(role, name, patch))
+        let store = self.clone();
+        let name = name.to_owned();
+        let patch = patch.clone();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.update_skill_in_sqlite(role, &name, &patch).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn rollback_skill(
@@ -5935,6 +5943,7 @@ mod tests {
                     ..SkillUpdatePatch::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(updated.current_version, 2);
         let rolled_back = store

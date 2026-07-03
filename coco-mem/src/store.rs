@@ -139,12 +139,12 @@ pub trait SkillStore {
     ) -> impl Future<Output = StoreResult<SkillRecord>> + Send + 'a;
 
     /// Creates a new version for an existing skill by patching the current version.
-    fn update_skill(
-        &self,
+    fn update_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
-        patch: &SkillUpdatePatch,
-    ) -> StoreResult<SkillRecord>;
+        name: &'a str,
+        patch: &'a SkillUpdatePatch,
+    ) -> impl Future<Output = StoreResult<SkillRecord>> + Send + 'a;
 
     /// Creates a new version cloned from a previous version and makes it current.
     fn rollback_skill(
@@ -416,13 +416,15 @@ impl SkillStore for PersistentStore {
         }
     }
 
-    fn update_skill(
-        &self,
+    async fn update_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
-        patch: &SkillUpdatePatch,
+        name: &'a str,
+        patch: &'a SkillUpdatePatch,
     ) -> StoreResult<SkillRecord> {
-        delegate_persistent_store!(self, store, store.update_skill(role, name, patch))
+        match self {
+            Self::Sqlite(store) => store.update_skill(role, name, patch).await,
+        }
     }
 
     fn rollback_skill(

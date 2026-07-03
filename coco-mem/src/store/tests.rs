@@ -1897,6 +1897,7 @@ where
                 enable_coco_shim: Some(true),
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(updated.current_version, 2);
@@ -1952,6 +1953,7 @@ where
                 enable_coco_shim: Some(true),
             },
         )
+        .await
         .unwrap();
 
     let rolled_back = store

@@ -88,7 +88,7 @@ where
         }
         SkillSubcommand::Update(command) => {
             let json = command.json;
-            let skill = run_skill_update(command, store)?;
+            let skill = run_skill_update(command, store).await?;
             Ok(Some(if json {
                 render_json(skill)
             } else {
@@ -156,7 +156,7 @@ async fn run_skill_add(
     Ok(skill_summary_view(command.role.into(), &record))
 }
 
-fn run_skill_update(
+async fn run_skill_update(
     command: SkillUpdateCommand,
     store: &impl SkillStore,
 ) -> Result<SkillSummaryView> {
@@ -185,6 +185,7 @@ fn run_skill_update(
     };
     let record = store
         .update_skill(command.role.into(), &command.name, &patch)
+        .await
         .context(StoreSnafu)?;
     Ok(skill_summary_view(command.role.into(), &record))
 }
