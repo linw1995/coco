@@ -4684,22 +4684,20 @@ mod tests {
             .unwrap()
     }
 
-    fn node_metadata_rows(store: &SqliteStore, node_id: &str) -> Vec<NodeMetadataRow> {
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            node_metadata::table
-                .filter(node_metadata::node_id.eq(node_id))
-                .select((
-                    node_metadata::node_id,
-                    node_metadata::ordinal,
-                    node_metadata::execution_id,
-                    node_metadata::call_id,
-                ))
-                .order(node_metadata::ordinal)
-                .load::<NodeMetadataRow>(&mut connection)
-                .await
-                .unwrap()
-        })
+    async fn node_metadata_rows(store: &SqliteStore, node_id: &str) -> Vec<NodeMetadataRow> {
+        let mut connection = store.connect().await.unwrap();
+        node_metadata::table
+            .filter(node_metadata::node_id.eq(node_id))
+            .select((
+                node_metadata::node_id,
+                node_metadata::ordinal,
+                node_metadata::execution_id,
+                node_metadata::call_id,
+            ))
+            .order(node_metadata::ordinal)
+            .load::<NodeMetadataRow>(&mut connection)
+            .await
+            .unwrap()
     }
 
     fn node_kinds(store: &SqliteStore, node_id: &str) -> (String, Option<String>) {
@@ -5073,8 +5071,8 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn append_persists_node_metadata_rows() {
+    #[tokio::test]
+    async fn append_persists_node_metadata_rows() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5110,7 +5108,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            node_metadata_rows(&store, &single),
+            node_metadata_rows(&store, &single).await,
             vec![NodeMetadataRow {
                 node_id: single,
                 ordinal: 0,
@@ -5119,7 +5117,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            node_metadata_rows(&store, &many),
+            node_metadata_rows(&store, &many).await,
             vec![
                 NodeMetadataRow {
                     node_id: many.clone(),
