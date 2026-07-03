@@ -4756,23 +4756,21 @@ mod tests {
             .unwrap()
     }
 
-    fn job_summary(store: &SqliteStore, job_id: &str) -> JobSummaryRow {
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            jobs::table
-                .filter(jobs::job_id.eq(job_id))
-                .select((
-                    jobs::created_at,
-                    jobs::finished_at,
-                    jobs::branch,
-                    jobs::work_branch,
-                    jobs::base,
-                    jobs::status,
-                ))
-                .get_result::<JobSummaryRow>(&mut connection)
-                .await
-                .unwrap()
-        })
+    async fn job_summary(store: &SqliteStore, job_id: &str) -> JobSummaryRow {
+        let mut connection = store.connect().await.unwrap();
+        jobs::table
+            .filter(jobs::job_id.eq(job_id))
+            .select((
+                jobs::created_at,
+                jobs::finished_at,
+                jobs::branch,
+                jobs::work_branch,
+                jobs::base,
+                jobs::status,
+            ))
+            .get_result::<JobSummaryRow>(&mut connection)
+            .await
+            .unwrap()
     }
 
     fn persist_store_meta_bool_for_test(store: &SqliteStore, key: &str, value: bool) {
@@ -5660,8 +5658,8 @@ mod tests {
         assert!(reopened.get_node(&handoff).is_ok());
     }
 
-    #[test]
-    fn job_operations_persist_across_reopen() {
+    #[tokio::test]
+    async fn job_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5678,7 +5676,7 @@ mod tests {
             .unwrap();
         assert_eq!(job.status, JobStatus::Running);
         assert_eq!(
-            job_summary(&store, "job-test"),
+            job_summary(&store, "job-test").await,
             JobSummaryRow {
                 created_at: job.created_at.to_string(),
                 finished_at: None,
