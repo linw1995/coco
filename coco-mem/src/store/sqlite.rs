@@ -962,6 +962,24 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         update_skill_record(&mut connection, &self.database_path, role, name, patch).await
     }
+
+    async fn rollback_skill_in_sqlite(
+        &self,
+        role: SessionRole,
+        name: &str,
+        target_version: u64,
+    ) -> Result<SkillRecord> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        rollback_skill_record(
+            &mut connection,
+            &self.database_path,
+            role,
+            name,
+            target_version,
+        )
+        .await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4521,19 +4539,7 @@ impl SkillStore for SqliteStore {
         name: &str,
         target_version: u64,
     ) -> Result<SkillRecord> {
-        self.ensure_writable()?;
-        let updated = self.block_on(async {
-            let mut connection = self.connect().await?;
-            rollback_skill_record(
-                &mut connection,
-                &self.database_path,
-                role,
-                name,
-                target_version,
-            )
-            .await
-        })?;
-        Ok(updated)
+        self.block_on(self.rollback_skill_in_sqlite(role, name, target_version))
     }
 }
 
