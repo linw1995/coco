@@ -701,6 +701,11 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         load_log_nodes(&mut connection, &self.database_path, base_ref, head_ref).await
     }
+
+    async fn get_node_in_sqlite(&self, id: &str) -> Result<Node> {
+        let mut connection = self.connect().await?;
+        load_node_by_prefix_or_branch(&mut connection, &self.database_path, id).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4090,10 +4095,7 @@ impl NodeStore for SqliteStore {
     }
 
     fn get_node(&self, id: &str) -> Result<Node> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            load_node_by_prefix_or_branch(&mut connection, &self.database_path, id).await
-        })
+        self.block_on(self.get_node_in_sqlite(id))
     }
 
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
