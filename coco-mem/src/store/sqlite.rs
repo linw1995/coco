@@ -5551,8 +5551,8 @@ mod tests {
         assert!(reopened.get_branch_head("main").is_err());
     }
 
-    #[test]
-    fn persist_session_nodes_rolls_back_node_when_branch_head_mismatch() {
+    #[tokio::test]
+    async fn persist_session_nodes_rolls_back_node_when_branch_head_mismatch() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5567,28 +5567,26 @@ mod tests {
         );
         let node_id = node.id.clone();
 
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            let err = super::persist_session_nodes_and_branch_head(
-                &mut connection,
-                &store.database_path,
-                "main",
-                "stale-head",
-                &node_id,
-                std::slice::from_ref(&node),
-            )
+        let mut connection = store.connect().await.unwrap();
+        let err = super::persist_session_nodes_and_branch_head(
+            &mut connection,
+            &store.database_path,
+            "main",
+            "stale-head",
+            &node_id,
+            std::slice::from_ref(&node),
+        )
+        .await
+        .unwrap_err();
+        let count = nodes::table
+            .filter(nodes::id.eq(node_id))
+            .count()
+            .get_result::<i64>(&mut connection)
             .await
-            .unwrap_err();
-            let count = nodes::table
-                .filter(nodes::id.eq(node_id))
-                .count()
-                .get_result::<i64>(&mut connection)
-                .await
-                .unwrap();
+            .unwrap();
 
-            assert!(err.to_string().contains("did not match expected head"));
-            assert_eq!(count, 0);
-        });
+        assert!(err.to_string().contains("did not match expected head"));
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
