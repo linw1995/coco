@@ -746,6 +746,13 @@ impl SqliteStore {
         )
         .await
     }
+
+    async fn list_session_states_in_sqlite(
+        &self,
+    ) -> Result<std::collections::HashMap<String, SessionState>> {
+        let mut connection = self.connect().await?;
+        load_session_states(&mut connection, &self.database_path).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4163,10 +4170,7 @@ impl BranchStore for SqliteStore {
 
 impl SessionStore for SqliteStore {
     fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            load_session_states(&mut connection, &self.database_path).await
-        })
+        self.block_on(self.list_session_states_in_sqlite())
     }
 
     fn get_session_state(&self, name: &str) -> Result<SessionState> {
