@@ -4487,17 +4487,30 @@ impl JobStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn set_job_work_branch(
-        &self,
-        job_id: &str,
-        expected_work_branch: &str,
-        next_work_branch: &str,
+    async fn set_job_work_branch<'a>(
+        &'a self,
+        job_id: &'a str,
+        expected_work_branch: &'a str,
+        next_work_branch: &'a str,
     ) -> Result<Job> {
-        self.block_on(self.set_job_work_branch_in_sqlite(
-            job_id,
-            expected_work_branch,
-            next_work_branch,
-        ))
+        let store = self.clone();
+        let job_id = job_id.to_owned();
+        let expected_work_branch = expected_work_branch.to_owned();
+        let next_work_branch = next_work_branch.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move {
+                store
+                    .set_job_work_branch_in_sqlite(
+                        &job_id,
+                        &expected_work_branch,
+                        &next_work_branch,
+                    )
+                    .await
+            })
+            .await
+            .expect("SQLite store task should not panic")
     }
 }
 

@@ -1609,6 +1609,7 @@ where
     assert_eq!(job.work_branch, "main");
     let updated = store
         .set_job_work_branch(&job.job_id, "main", "recovery")
+        .await
         .unwrap();
 
     assert_eq!(updated.branch, "main");
@@ -1619,7 +1620,7 @@ where
     );
 }
 
-fn assert_set_job_work_branch_rejects_stale_expected_branch<F>()
+async fn assert_set_job_work_branch_rejects_stale_expected_branch<F>()
 where
     F: TestStoreFactory,
 {
@@ -1631,6 +1632,7 @@ where
 
     let err = store
         .set_job_work_branch(&job.job_id, "stale", "recovery")
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -1640,7 +1642,7 @@ where
     ));
 }
 
-fn assert_submit_job_rejects_active_work_branch<F>()
+async fn assert_submit_job_rejects_active_work_branch<F>()
 where
     F: TestStoreFactory,
 {
@@ -1651,6 +1653,7 @@ where
     let first = submit_prompt_job(&store, "main", "hello");
     store
         .set_job_work_branch(&first.job_id, "main", "recovery")
+        .await
         .unwrap();
 
     let err = store.submit_job("recovery", &root_id).unwrap_err();
@@ -2493,14 +2496,14 @@ macro_rules! define_common_store_tests {
                 assert_job_work_branch_round_trip::<$factory>().await;
             }
 
-            #[test]
-            fn set_job_work_branch_rejects_stale_expected_branch() {
-                assert_set_job_work_branch_rejects_stale_expected_branch::<$factory>();
+            #[tokio::test]
+            async fn set_job_work_branch_rejects_stale_expected_branch() {
+                assert_set_job_work_branch_rejects_stale_expected_branch::<$factory>().await;
             }
 
-            #[test]
-            fn submit_job_rejects_active_work_branch() {
-                assert_submit_job_rejects_active_work_branch::<$factory>();
+            #[tokio::test]
+            async fn submit_job_rejects_active_work_branch() {
+                assert_submit_job_rejects_active_work_branch::<$factory>().await;
             }
 
             #[tokio::test]

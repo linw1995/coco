@@ -186,12 +186,12 @@ pub trait JobStore {
     ) -> impl Future<Output = StoreResult<Job>> + Send + 'a;
 
     /// Moves the current work branch for an unfinished prompt job.
-    fn set_job_work_branch(
-        &self,
-        job_id: &str,
-        expected_work_branch: &str,
-        next_work_branch: &str,
-    ) -> StoreResult<Job>;
+    fn set_job_work_branch<'a>(
+        &'a self,
+        job_id: &'a str,
+        expected_work_branch: &'a str,
+        next_work_branch: &'a str,
+    ) -> impl Future<Output = StoreResult<Job>> + Send + 'a;
 }
 
 /// Generic persistent message queue storage API.
@@ -477,17 +477,19 @@ impl JobStore for PersistentStore {
         }
     }
 
-    fn set_job_work_branch(
-        &self,
-        job_id: &str,
-        expected_work_branch: &str,
-        next_work_branch: &str,
+    async fn set_job_work_branch<'a>(
+        &'a self,
+        job_id: &'a str,
+        expected_work_branch: &'a str,
+        next_work_branch: &'a str,
     ) -> StoreResult<Job> {
-        delegate_persistent_store!(
-            self,
-            store,
-            store.set_job_work_branch(job_id, expected_work_branch, next_work_branch)
-        )
+        match self {
+            Self::Sqlite(store) => {
+                store
+                    .set_job_work_branch(job_id, expected_work_branch, next_work_branch)
+                    .await
+            }
+        }
     }
 }
 

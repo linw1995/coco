@@ -423,17 +423,17 @@ where
         self.build_job_status_snapshot(&job)
     }
 
-    pub fn set_job_work_branch(
+    pub async fn set_job_work_branch(
         &self,
         job_id: &str,
         expected_work_branch: &str,
         next_work_branch: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let job = self.service.store().set_job_work_branch(
-            job_id,
-            expected_work_branch,
-            next_work_branch,
-        )?;
+        let job = self
+            .service
+            .store()
+            .set_job_work_branch(job_id, expected_work_branch, next_work_branch)
+            .await?;
         self.service.notify_job_status_changed(job_id);
         self.build_job_status_snapshot(&job)
     }
@@ -575,7 +575,7 @@ where
             self.ensure_job_has_exclusive_branch_access(&job).await?;
             match self.resume_or_run_job(&job, merge_parents).await {
                 Ok(JobRunOutcome::Completed) => {
-                    job = match self.restore_root_branch_after_recovery(&job) {
+                    job = match self.restore_root_branch_after_recovery(&job).await {
                         Ok(job) => job,
                         Err(error) => {
                             self.finish_job(&job).await?;
@@ -762,7 +762,7 @@ where
         Ok(())
     }
 
-    fn restore_root_branch_after_recovery(
+    async fn restore_root_branch_after_recovery(
         &self,
         job: &Job,
     ) -> std::result::Result<Job, EngineError> {
@@ -776,10 +776,11 @@ where
         self.service
             .store()
             .set_branch_head(&job.branch, &root_head, &response_head)?;
-        let job =
-            self.service
-                .store()
-                .set_job_work_branch(&job.job_id, &job.work_branch, &job.branch)?;
+        let job = self
+            .service
+            .store()
+            .set_job_work_branch(&job.job_id, &job.work_branch, &job.branch)
+            .await?;
         self.service.notify_job_status_changed(&job.job_id);
         tracing::info!(
             job_id = %job.job_id,

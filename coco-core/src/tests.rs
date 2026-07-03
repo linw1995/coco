@@ -1048,6 +1048,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
     engine.service().fork("recovery-b", &retry_from_a).unwrap();
     let on_b = engine
         .set_job_work_branch(&job.job_id, "main", "recovery-b")
+        .await
         .unwrap();
     assert_eq!(on_b.status, JobStatus::Running);
     assert_eq!(on_b.branch, "main");
@@ -1071,6 +1072,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
     engine.service().fork("recovery-c", &retry_from_b).unwrap();
     let on_c = engine
         .set_job_work_branch(&job.job_id, "recovery-b", "recovery-c")
+        .await
         .unwrap();
     assert_eq!(on_c.status, JobStatus::Running);
     assert_eq!(on_c.work_branch, "recovery-c");
@@ -1138,6 +1140,7 @@ async fn llm_engine_finishes_job_when_recovery_restore_fails() {
     engine.service().fork("recovery-b", retry_from).unwrap();
     engine
         .set_job_work_branch(&job.job_id, &failed.work_branch, "recovery-b")
+        .await
         .unwrap();
     store.delete_branch("main").unwrap();
 
