@@ -514,7 +514,7 @@ impl SqliteStore {
         )?;
         store.database.with_initialization_lock(|| {
             store.block_on(store.ensure_current_schema())?;
-            store.ensure_root_exists()
+            store.block_on(store.ensure_root_exists())
         })?;
         Ok(store)
     }
@@ -651,13 +651,11 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn ensure_root_exists(&self) -> Result<()> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            let root_id = load_root_id(&mut connection, &self.database_path).await?;
-            load_node_by_exact_id(&mut connection, &self.database_path, &root_id).await?;
-            Ok(())
-        })
+    async fn ensure_root_exists(&self) -> Result<()> {
+        let mut connection = self.connect().await?;
+        let root_id = load_root_id(&mut connection, &self.database_path).await?;
+        load_node_by_exact_id(&mut connection, &self.database_path, &root_id).await?;
+        Ok(())
     }
 
     async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
