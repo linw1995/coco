@@ -803,6 +803,10 @@ impl SqliteGraphStore {
     }
 
     pub fn commit_read_transaction(&self) -> Result<()> {
+        self.block_on(self.commit_read_transaction_in_sqlite())
+    }
+
+    async fn commit_read_transaction_in_sqlite(&self) -> Result<()> {
         let mut connection = self
             .read_transaction
             .lock()
@@ -813,9 +817,7 @@ impl SqliteGraphStore {
                 message: "SQLite graph read transaction is not active".to_owned(),
             })?;
 
-        self.block_on(async {
-            commit_deferred_transaction(&mut connection, &self.database_path).await
-        })
+        commit_deferred_transaction(&mut connection, &self.database_path).await
     }
 
     pub fn rollback_read_transaction(&self) -> Result<()> {
