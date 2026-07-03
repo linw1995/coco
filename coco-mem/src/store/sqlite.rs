@@ -853,6 +853,18 @@ impl SqliteStore {
         )
         .await
     }
+
+    async fn enqueue_message_in_sqlite(
+        &self,
+        queue: &str,
+        payload: serde_json::Value,
+    ) -> Result<MessageQueueItem> {
+        self.ensure_writable()?;
+        let item = MessageQueueItem::new(queue, payload, jiff::Timestamp::now());
+        let mut connection = self.connect().await?;
+        persist_message_queue_item(&mut connection, &self.database_path, &item).await?;
+        Ok(item)
+    }
 }
 
 impl SqliteGraphStore {
@@ -4337,13 +4349,7 @@ impl JobStore for SqliteStore {
 
 impl MessageQueueStore for SqliteStore {
     fn enqueue_message(&self, queue: &str, payload: serde_json::Value) -> Result<MessageQueueItem> {
-        self.ensure_writable()?;
-        let item = MessageQueueItem::new(queue, payload, jiff::Timestamp::now());
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            persist_message_queue_item(&mut connection, &self.database_path, &item).await
-        })?;
-        Ok(item)
+        self.block_on(self.enqueue_message_in_sqlite(queue, payload))
     }
 
     fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
