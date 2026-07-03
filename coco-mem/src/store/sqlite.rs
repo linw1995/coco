@@ -728,6 +728,24 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         delete_branch_checked(&mut connection, &self.database_path, name).await
     }
+
+    async fn set_branch_head_in_sqlite(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        new_head: &str,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        update_branch_head_checked(
+            &mut connection,
+            &self.database_path,
+            name,
+            expected_old_head,
+            new_head,
+        )
+        .await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4139,19 +4157,7 @@ impl BranchStore for SqliteStore {
     }
 
     fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {
-        self.ensure_writable()?;
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            update_branch_head_checked(
-                &mut connection,
-                &self.database_path,
-                name,
-                expected_old_head,
-                new_head,
-            )
-            .await
-        })?;
-        Ok(())
+        self.block_on(self.set_branch_head_in_sqlite(name, expected_old_head, new_head))
     }
 }
 
