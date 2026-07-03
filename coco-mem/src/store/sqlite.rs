@@ -491,7 +491,7 @@ impl SqliteStore {
         )?;
         store.database.with_initialization_lock(|| {
             store.block_on(store.run_migrations())?;
-            store.load_or_initialize_state()
+            store.block_on(store.load_or_initialize_state())
         })?;
         Ok(store)
     }
@@ -630,29 +630,27 @@ impl SqliteStore {
         self.database.block_on(future)
     }
 
-    fn load_or_initialize_state(&self) -> Result<()> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            if node_count(&mut connection, &self.database_path).await? == 0 {
-                self.ensure_writable()?;
-                let root = initial_root_node();
-                let root_id = root.id.clone();
-                connection
-                    .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
-                        persist_root_metadata(connection, &self.database_path, &root_id)
-                            .await
-                            .map_err(SqliteTransactionError::Operation)?;
-                        persist_node_without_transaction(connection, &self.database_path, &root)
-                            .await
-                            .map_err(SqliteTransactionError::Operation)
-                    })
-                    .await
-                    .map_err(|error| error.into_store_error(&self.database_path))?;
-                return Ok(());
-            }
-            load_root_id(&mut connection, &self.database_path).await?;
-            Ok(())
-        })
+    async fn load_or_initialize_state(&self) -> Result<()> {
+        let mut connection = self.connect().await?;
+        if node_count(&mut connection, &self.database_path).await? == 0 {
+            self.ensure_writable()?;
+            let root = initial_root_node();
+            let root_id = root.id.clone();
+            connection
+                .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+                    persist_root_metadata(connection, &self.database_path, &root_id)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
+                    persist_node_without_transaction(connection, &self.database_path, &root)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)
+                })
+                .await
+                .map_err(|error| error.into_store_error(&self.database_path))?;
+            return Ok(());
+        }
+        load_root_id(&mut connection, &self.database_path).await?;
+        Ok(())
     }
 
     fn ensure_root_exists(&self) -> Result<()> {
