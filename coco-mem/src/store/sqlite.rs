@@ -891,6 +891,16 @@ impl SqliteGraphStore {
         })
         .await
     }
+
+    async fn list_session_states_in_sqlite(
+        &self,
+    ) -> Result<std::collections::HashMap<String, SessionState>> {
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_session_states(connection, &path).await })
+        })
+        .await
+    }
 }
 
 fn sqlite_database_path(path: &Path) -> PathBuf {
@@ -3992,10 +4002,7 @@ impl BranchStore for SqliteGraphStore {
 
 impl SessionStore for SqliteGraphStore {
     fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
-        let path = self.database_path.clone();
-        self.block_on(self.with_connection(move |connection| {
-            Box::pin(async move { load_session_states(connection, &path).await })
-        }))
+        self.block_on(self.list_session_states_in_sqlite())
     }
 
     fn get_session_state(&self, name: &str) -> Result<SessionState> {
