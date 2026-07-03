@@ -901,6 +901,15 @@ impl SqliteGraphStore {
         })
         .await
     }
+
+    async fn get_session_state_in_sqlite(&self, name: &str) -> Result<SessionState> {
+        let name = name.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_session_state(connection, &path, &name).await })
+        })
+        .await
+    }
 }
 
 fn sqlite_database_path(path: &Path) -> PathBuf {
@@ -4006,11 +4015,7 @@ impl SessionStore for SqliteGraphStore {
     }
 
     fn get_session_state(&self, name: &str) -> Result<SessionState> {
-        let name = name.to_owned();
-        let path = self.database_path.clone();
-        self.block_on(self.with_connection(move |connection| {
-            Box::pin(async move { load_session_state(connection, &path, &name).await })
-        }))
+        self.block_on(self.get_session_state_in_sqlite(name))
     }
 
     fn set_session_state(
