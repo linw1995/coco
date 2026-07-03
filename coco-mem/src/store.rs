@@ -92,7 +92,10 @@ pub trait PresetStore {
     ) -> impl Future<Output = StoreResult<HashMap<String, PresetRecord>>> + Send + '_;
 
     /// Returns one preset record by preset name.
-    fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord>;
+    fn get_preset_record<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Future<Output = StoreResult<PresetRecord>> + Send + 'a;
 
     /// Creates a new version for a preset under a preset name.
     fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord>;
@@ -347,8 +350,10 @@ impl PresetStore for PersistentStore {
         }
     }
 
-    fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord> {
-        delegate_persistent_store!(self, store, store.get_preset_record(name))
+    async fn get_preset_record<'a>(&'a self, name: &'a str) -> StoreResult<PresetRecord> {
+        match self {
+            Self::Sqlite(store) => store.get_preset_record(name).await,
+        }
     }
 
     fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord> {

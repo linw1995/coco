@@ -58,8 +58,11 @@ fn make_preset(model: &str, role: SessionRole) -> Preset {
     }
 }
 
-fn current_preset(store: &impl PresetStore, name: &str) -> std::result::Result<Preset, Error> {
-    let record = store.get_preset_record(name)?;
+async fn current_preset(
+    store: &impl PresetStore,
+    name: &str,
+) -> std::result::Result<Preset, Error> {
+    let record = store.get_preset_record(name).await?;
     record
         .current_preset()
         .ok_or_else(|| Error::PresetVersionNotFound {
@@ -928,10 +931,11 @@ where
     assert_eq!(stored.current_version, 1);
     assert_eq!(stored.current_preset(), Some(config.clone()));
     assert_eq!(stored.versions.keys().copied().collect::<Vec<_>>(), vec![1]);
-    assert_eq!(current_preset(&store, preset_name).unwrap(), config);
+    assert_eq!(current_preset(&store, preset_name).await.unwrap(), config);
     assert_eq!(
         store
             .get_preset_record(preset_name)
+            .await
             .unwrap()
             .current_version,
         1
@@ -948,7 +952,7 @@ where
     );
 }
 
-fn assert_preset_replaces_existing_value<F>()
+async fn assert_preset_replaces_existing_value<F>()
 where
     F: TestStoreFactory,
 {
@@ -975,10 +979,10 @@ where
         make_preset("gpt-5.4", SessionRole::Orchestrator)
     );
     assert_eq!(stored.versions.get(&2).unwrap().to_preset(), updated);
-    assert_eq!(current_preset(&store, preset_name).unwrap(), updated);
+    assert_eq!(current_preset(&store, preset_name).await.unwrap(), updated);
 }
 
-fn assert_rollback_preset_creates_new_current_version<F>()
+async fn assert_rollback_preset_creates_new_current_version<F>()
 where
     F: TestStoreFactory,
 {
@@ -998,7 +1002,7 @@ where
     );
     assert_eq!(rolled_back.current_preset(), Some(original.clone()));
     assert_eq!(rolled_back.versions.get(&2).unwrap().to_preset(), updated);
-    assert_eq!(current_preset(&store, preset_name).unwrap(), original);
+    assert_eq!(current_preset(&store, preset_name).await.unwrap(), original);
 }
 
 async fn assert_delete_preset_removes_only_config<F>()
@@ -1020,13 +1024,13 @@ where
 
     assert!(store.list_preset_records().await.unwrap().is_empty());
     assert!(matches!(
-        store.get_preset_record(preset_name),
+        store.get_preset_record(preset_name).await,
         Err(Error::PresetNotFound { name }) if name == preset_name
     ));
     assert_eq!(store.get_branch_head("main").unwrap(), root_id);
 }
 
-fn assert_delete_branch_preserves_preset<F>()
+async fn assert_delete_branch_preserves_preset<F>()
 where
     F: TestStoreFactory,
 {
@@ -1043,16 +1047,16 @@ where
         store.get_branch_head("main"),
         Err(Error::BranchNotFound { name }) if name == "main"
     ));
-    assert_eq!(current_preset(&store, preset_name).unwrap(), config);
+    assert_eq!(current_preset(&store, preset_name).await.unwrap(), config);
 }
 
-fn assert_get_preset_rejects_missing_config<F>()
+async fn assert_get_preset_rejects_missing_config<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
 
-    let err = store.get_preset_record("missing-preset").unwrap_err();
+    let err = store.get_preset_record("missing-preset").await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -2298,14 +2302,14 @@ macro_rules! define_common_store_tests {
                 assert_preset_round_trip::<$factory>().await;
             }
 
-            #[test]
-            fn preset_replaces_existing_value() {
-                assert_preset_replaces_existing_value::<$factory>();
+            #[tokio::test]
+            async fn preset_replaces_existing_value() {
+                assert_preset_replaces_existing_value::<$factory>().await;
             }
 
-            #[test]
-            fn rollback_preset_creates_new_current_version() {
-                assert_rollback_preset_creates_new_current_version::<$factory>();
+            #[tokio::test]
+            async fn rollback_preset_creates_new_current_version() {
+                assert_rollback_preset_creates_new_current_version::<$factory>().await;
             }
 
             #[tokio::test]
@@ -2313,14 +2317,14 @@ macro_rules! define_common_store_tests {
                 assert_delete_preset_removes_only_config::<$factory>().await;
             }
 
-            #[test]
-            fn delete_branch_preserves_preset() {
-                assert_delete_branch_preserves_preset::<$factory>();
+            #[tokio::test]
+            async fn delete_branch_preserves_preset() {
+                assert_delete_branch_preserves_preset::<$factory>().await;
             }
 
-            #[test]
-            fn get_preset_rejects_missing_config() {
-                assert_get_preset_rejects_missing_config::<$factory>();
+            #[tokio::test]
+            async fn get_preset_rejects_missing_config() {
+                assert_get_preset_rejects_missing_config::<$factory>().await;
             }
 
             #[test]

@@ -4543,8 +4543,15 @@ impl PresetStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
-        self.block_on(self.get_preset_record_in_sqlite(name))
+    async fn get_preset_record<'a>(&'a self, name: &'a str) -> Result<PresetRecord> {
+        let store = self.clone();
+        let name = name.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.get_preset_record_in_sqlite(&name).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
@@ -5828,8 +5835,8 @@ mod tests {
         assert_eq!(messages[1].message_id, second.message_id);
     }
 
-    #[test]
-    fn preset_operations_persist_across_reopen() {
+    #[tokio::test]
+    async fn preset_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5842,7 +5849,7 @@ mod tests {
         assert_eq!(rolled_back.current_version, 3);
 
         let reopened = SqliteStore::open(&path).unwrap();
-        let record = reopened.get_preset_record("default").unwrap();
+        let record = reopened.get_preset_record("default").await.unwrap();
 
         assert_eq!(record.current_version, 3);
         assert_eq!(record.current_preset().unwrap().model, "gpt-5.4");

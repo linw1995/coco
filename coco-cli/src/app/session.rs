@@ -7,7 +7,7 @@ use coco_llm::{
 };
 use coco_mem::{
     AnchorPayload, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, PresetStore,
-    SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
+    SessionAnchor, SessionAnchorPatch, SessionState, SessionStore, Store, StoreError, Tool,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -356,7 +356,7 @@ where
 {
     let branch = command.branch.clone();
     let json = command.json;
-    let rebase = resolve_session_rebase(command, store, provider_profiles)?;
+    let rebase = resolve_session_rebase(command, store, provider_profiles).await?;
     let head_id = llm
         .rebase_session(&branch, rebase.patch)
         .await
@@ -388,7 +388,7 @@ where
     let json = rebase_command.json;
     let prompt = prompt.trim().to_owned();
     ensure!(!prompt.is_empty(), EmptyPromptSnafu);
-    let handoff = resolve_session_rebase(rebase_command, store, provider_profiles)?;
+    let handoff = resolve_session_rebase(rebase_command, store, provider_profiles).await?;
     let head = if refresh_tools {
         llm.handoff_session_refreshing_tools(&branch, handoff.patch, &prompt)
             .await
@@ -1848,27 +1848,24 @@ fn resolve_visible_session_anchor(
     })
 }
 
-fn resolve_session_rebase(
+async fn resolve_session_rebase(
     command: SessionRebaseCommand,
     store: &impl PresetStore,
     provider_profiles: &impl ProviderProfileLookup,
 ) -> Result<ResolvedSessionRebase> {
-    let mut patch = command
-        .preset
-        .as_deref()
-        .map(|name| {
-            let record = store.get_preset_record(name).context(StoreSnafu)?;
-            let config = record
-                .current_preset()
-                .ok_or_else(|| StoreError::PresetVersionNotFound {
-                    name: name.to_owned(),
-                    version: record.current_version,
-                })
-                .context(StoreSnafu)?;
-            preset_to_session_anchor_patch(&config, provider_profiles)
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let mut patch = if let Some(name) = command.preset.as_deref() {
+        let record = store.get_preset_record(name).await.context(StoreSnafu)?;
+        let config = record
+            .current_preset()
+            .ok_or_else(|| StoreError::PresetVersionNotFound {
+                name: name.to_owned(),
+                version: record.current_version,
+            })
+            .context(StoreSnafu)?;
+        preset_to_session_anchor_patch(&config, provider_profiles)?
+    } else {
+        SessionAnchorPatch::default()
+    };
 
     if let Some(role) = command.role {
         patch.role = Some(role.into());

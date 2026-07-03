@@ -138,8 +138,8 @@ where
         self.inner.list_preset_records().await
     }
 
-    fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord> {
-        self.inner.get_preset_record(name)
+    async fn get_preset_record<'a>(&'a self, name: &'a str) -> StoreResult<PresetRecord> {
+        self.inner.get_preset_record(name).await
     }
 
     fn set_preset(&self, name: &str, config: Preset) -> StoreResult<PresetRecord> {

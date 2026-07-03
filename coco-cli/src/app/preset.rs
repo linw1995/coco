@@ -68,7 +68,7 @@ where
         }
         PresetSubcommand::Show(command) => {
             let json = command.json;
-            let preset = run_preset_show(command, store)?;
+            let preset = run_preset_show(command, store).await?;
             Ok(Some(if json {
                 render_json(preset)
             } else {
@@ -121,8 +121,14 @@ async fn run_preset_list(store: &impl PresetStore) -> Result<Vec<PresetSummaryVi
     Ok(records.iter().map(preset_summary_view).collect())
 }
 
-fn run_preset_show(command: PresetNameCommand, store: &impl PresetStore) -> Result<PresetShowView> {
-    let record = store.get_preset_record(&command.name).context(StoreSnafu)?;
+async fn run_preset_show(
+    command: PresetNameCommand,
+    store: &impl PresetStore,
+) -> Result<PresetShowView> {
+    let record = store
+        .get_preset_record(&command.name)
+        .await
+        .context(StoreSnafu)?;
     Ok(PresetShowView {
         name: record.name,
         current_version: record.current_version,

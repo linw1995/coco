@@ -5060,6 +5060,7 @@ async fn preset_commands_manage_versions_in_store() {
     let persisted = open_store(&store_path)
         .unwrap()
         .get_preset_record(preset_name)
+        .await
         .unwrap()
         .current_preset()
         .unwrap();
