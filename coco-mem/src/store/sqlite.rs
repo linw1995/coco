@@ -706,6 +706,11 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         load_node_by_prefix_or_branch(&mut connection, &self.database_path, id).await
     }
+
+    async fn list_children_in_sqlite(&self, node_id: &str) -> Result<Vec<Node>> {
+        let mut connection = self.connect().await?;
+        load_child_nodes(&mut connection, &self.database_path, node_id).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4099,10 +4104,7 @@ impl NodeStore for SqliteStore {
     }
 
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            load_child_nodes(&mut connection, &self.database_path, node_id).await
-        })
+        self.block_on(self.list_children_in_sqlite(node_id))
     }
 }
 
