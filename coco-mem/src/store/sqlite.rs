@@ -4773,22 +4773,20 @@ mod tests {
             .unwrap()
     }
 
-    fn persist_store_meta_bool_for_test(store: &SqliteStore, key: &str, value: bool) {
+    async fn persist_store_meta_bool_for_test(store: &SqliteStore, key: &str, value: bool) {
         let value_json = serde_json::to_string(&value).unwrap();
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            diesel::insert_into(store_meta::table)
-                .values((
-                    store_meta::key.eq(key),
-                    store_meta::value_json.eq(value_json),
-                ))
-                .on_conflict(store_meta::key)
-                .do_update()
-                .set(store_meta::value_json.eq(diesel::upsert::excluded(store_meta::value_json)))
-                .execute(&mut connection)
-                .await
-                .unwrap();
-        });
+        let mut connection = store.connect().await.unwrap();
+        diesel::insert_into(store_meta::table)
+            .values((
+                store_meta::key.eq(key),
+                store_meta::value_json.eq(value_json),
+            ))
+            .on_conflict(store_meta::key)
+            .do_update()
+            .set(store_meta::value_json.eq(diesel::upsert::excluded(store_meta::value_json)))
+            .execute(&mut connection)
+            .await
+            .unwrap();
     }
 
     fn create_diesel_migration_metadata_for_test(path: &std::path::Path, version: &str) {
@@ -5414,7 +5412,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
-        persist_store_meta_bool_for_test(&store, super::FS_MIGRATION_COMPLETE_META_KEY, true);
+        persist_store_meta_bool_for_test(&store, super::FS_MIGRATION_COMPLETE_META_KEY, true).await;
         drop(store);
         std::fs::write(path.join("meta.json"), "{}").unwrap();
         std::fs::write(path.join("nodes.jsonl"), "").unwrap();
