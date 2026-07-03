@@ -341,7 +341,10 @@ impl SqliteDatabase {
 
         let runtime = sqlite_runtime()?;
         let ensure_wal_flag = Arc::new(AtomicBool::new(ensure_wal));
-        let pool = build_sqlite_pool(runtime, &database_path, ensure_wal_flag.clone())?;
+        let pool = block_on_sqlite_runtime_with(
+            runtime,
+            build_sqlite_pool(&database_path, ensure_wal_flag.clone()),
+        )?;
         let inner = Arc::new(SqliteDatabaseInner {
             database_path: database_path.clone(),
             runtime,
@@ -361,7 +364,10 @@ impl SqliteDatabase {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let runtime = sqlite_runtime()?;
         let ensure_wal_flag = Arc::new(AtomicBool::new(ensure_wal));
-        let pool = build_sqlite_pool(runtime, &database_path, ensure_wal_flag.clone())?;
+        let pool = block_on_sqlite_runtime_with(
+            runtime,
+            build_sqlite_pool(&database_path, ensure_wal_flag.clone()),
+        )?;
         let database = Self {
             inner: Arc::new(SqliteDatabaseInner {
                 database_path: database_path.clone(),
@@ -994,8 +1000,7 @@ fn fs_migration_complete_marker_exists(path: &Path) -> Result<bool> {
     })
 }
 
-fn build_sqlite_pool(
-    runtime: &'static Runtime,
+async fn build_sqlite_pool(
     database_path: &Path,
     ensure_wal: Arc<AtomicBool>,
 ) -> Result<AsyncSqlitePool<AsyncSqliteConnection>> {
@@ -1003,15 +1008,13 @@ fn build_sqlite_pool(
         database_path.to_string_lossy().into_owned(),
         sqlite_pool_manager_config(database_path.to_owned(), ensure_wal),
     );
-    block_on_sqlite_runtime_with(runtime, async {
-        AsyncSqlitePool::builder()
-            .max_size(SQLITE_POOL_MAX_SIZE)
-            .build(manager)
-            .await
-            .context(CreateSqlitePoolSnafu {
-                path: database_path.to_owned(),
-            })
-    })
+    AsyncSqlitePool::builder()
+        .max_size(SQLITE_POOL_MAX_SIZE)
+        .build(manager)
+        .await
+        .context(CreateSqlitePoolSnafu {
+            path: database_path.to_owned(),
+        })
 }
 
 fn sqlite_pool_manager_config(
