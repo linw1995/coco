@@ -711,6 +711,12 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         load_child_nodes(&mut connection, &self.database_path, node_id).await
     }
+
+    async fn fork_in_sqlite(&self, name: &str, from_ref: &str) -> Result<String> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        create_branch(&mut connection, &self.database_path, name, from_ref).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4110,12 +4116,7 @@ impl NodeStore for SqliteStore {
 
 impl BranchStore for SqliteStore {
     fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
-        self.ensure_writable()?;
-        let head_id = self.block_on(async {
-            let mut connection = self.connect().await?;
-            create_branch(&mut connection, &self.database_path, name, from_ref).await
-        })?;
-        Ok(head_id)
+        self.block_on(self.fork_in_sqlite(name, from_ref))
     }
 
     fn get_branch_head(&self, name: &str) -> Result<String> {
