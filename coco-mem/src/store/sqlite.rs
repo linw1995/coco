@@ -4315,8 +4315,8 @@ impl BranchStore for SqliteGraphStore {
         self.block_on(self.get_branch_head_in_sqlite(name))
     }
 
-    fn delete_branch(&self, _name: &str) -> Result<()> {
-        self.ensure_read_only()
+    fn delete_branch<'a>(&'a self, _name: &'a str) -> impl Future<Output = Result<()>> + Send + 'a {
+        std::future::ready(self.ensure_read_only())
     }
 
     fn set_branch_head(
@@ -4407,8 +4407,15 @@ impl BranchStore for SqliteStore {
         self.block_on(self.get_branch_head_in_sqlite(name))
     }
 
-    fn delete_branch(&self, name: &str) -> Result<()> {
-        self.block_on(self.delete_branch_in_sqlite(name))
+    async fn delete_branch<'a>(&'a self, name: &'a str) -> Result<()> {
+        let store = self.clone();
+        let name = name.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.delete_branch_in_sqlite(&name).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {
@@ -5746,8 +5753,8 @@ mod tests {
         assert_eq!(reopened.get_node(&second[..12]).unwrap().id, second);
     }
 
-    #[test]
-    fn branch_operations_persist_across_reopen() {
+    #[tokio::test]
+    async fn branch_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5776,7 +5783,7 @@ mod tests {
         let reopened = SqliteStore::open(&path).unwrap();
         assert_eq!(reopened.get_branch_head("main").unwrap(), second);
 
-        reopened.delete_branch("main").unwrap();
+        reopened.delete_branch("main").await.unwrap();
         let reopened = SqliteStore::open(&path).unwrap();
         assert!(reopened.get_branch_head("main").is_err());
     }

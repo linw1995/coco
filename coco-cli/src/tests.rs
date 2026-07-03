@@ -6332,7 +6332,7 @@ async fn daemon_startup_replaces_invalid_builtin_day_branch() {
         .await
         .unwrap();
     let main_head = store.get_branch_head("main").unwrap();
-    store.delete_branch("day").unwrap();
+    store.delete_branch("day").await.unwrap();
     store.fork("day", &main_head).unwrap();
     assert_eq!(store.get_branch_head("day").unwrap(), main_head);
 

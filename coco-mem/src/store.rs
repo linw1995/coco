@@ -45,7 +45,10 @@ pub trait BranchStore {
     fn get_branch_head(&self, name: &str) -> StoreResult<String>;
 
     /// Deletes a branch head and its session state.
-    fn delete_branch(&self, name: &str) -> StoreResult<()>;
+    fn delete_branch<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Future<Output = StoreResult<()>> + Send + 'a;
 
     /// Moves a branch head when the expected current head matches.
     fn set_branch_head(
@@ -328,8 +331,10 @@ impl BranchStore for PersistentStore {
         delegate_persistent_store!(self, store, store.get_branch_head(name))
     }
 
-    fn delete_branch(&self, name: &str) -> StoreResult<()> {
-        delegate_persistent_store!(self, store, store.delete_branch(name))
+    async fn delete_branch<'a>(&'a self, name: &'a str) -> StoreResult<()> {
+        match self {
+            Self::Sqlite(store) => store.delete_branch(name).await,
+        }
     }
 
     fn set_branch_head(

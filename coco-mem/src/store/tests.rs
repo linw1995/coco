@@ -565,7 +565,7 @@ where
     let root_id = store.root_id();
     let branch_head = store.fork("main", &root_id).unwrap();
 
-    store.delete_branch("main").unwrap();
+    store.delete_branch("main").await.unwrap();
 
     let err = store.get_branch_head("main").unwrap_err();
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
@@ -574,13 +574,13 @@ where
     assert_eq!(store.get_node(&branch_head).unwrap().id, branch_head);
 }
 
-fn assert_delete_branch_rejects_missing_branch<F>()
+async fn assert_delete_branch_rejects_missing_branch<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
 
-    let err = store.delete_branch("missing").unwrap_err();
+    let err = store.delete_branch("missing").await.unwrap_err();
 
     assert!(matches!(err, Error::BranchNotFound { name } if name == "missing"));
 }
@@ -1064,7 +1064,7 @@ where
     store.fork("main", &root_id).unwrap();
     store.set_preset(preset_name, config.clone()).await.unwrap();
 
-    store.delete_branch("main").unwrap();
+    store.delete_branch("main").await.unwrap();
 
     assert!(matches!(
         store.get_branch_head("main"),
@@ -1114,7 +1114,7 @@ where
     assert_eq!(node.id, branch_head);
 }
 
-fn assert_get_node_supports_prefix_after_branch_delete<F>()
+async fn assert_get_node_supports_prefix_after_branch_delete<F>()
 where
     F: TestStoreFactory,
 {
@@ -1127,7 +1127,7 @@ where
     store
         .set_branch_head("draft", &root_id, &draft_node)
         .unwrap();
-    store.delete_branch("draft").unwrap();
+    store.delete_branch("draft").await.unwrap();
 
     let prefix = &draft_node[..8];
     let node = store.get_node(prefix).unwrap();
@@ -2311,9 +2311,9 @@ macro_rules! define_common_store_tests {
                 assert_delete_branch_removes_branch_and_session_state::<$factory>().await;
             }
 
-            #[test]
-            fn delete_branch_rejects_missing_branch() {
-                assert_delete_branch_rejects_missing_branch::<$factory>();
+            #[tokio::test]
+            async fn delete_branch_rejects_missing_branch() {
+                assert_delete_branch_rejects_missing_branch::<$factory>().await;
             }
 
             #[tokio::test]
@@ -2401,9 +2401,9 @@ macro_rules! define_common_store_tests {
                 assert_get_node_supports_branch_name::<$factory>();
             }
 
-            #[test]
-            fn get_node_supports_prefix_after_branch_delete() {
-                assert_get_node_supports_prefix_after_branch_delete::<$factory>();
+            #[tokio::test]
+            async fn get_node_supports_prefix_after_branch_delete() {
+                assert_get_node_supports_prefix_after_branch_delete::<$factory>().await;
             }
 
             #[test]

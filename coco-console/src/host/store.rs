@@ -68,7 +68,7 @@ where
 
 impl<S> BranchStore for ConsoleStore<S>
 where
-    S: BranchStore,
+    S: BranchStore + Sync,
 {
     fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
         self.notify_if_ok(self.inner.fork(name, from_ref))
@@ -78,8 +78,8 @@ where
         self.inner.get_branch_head(name)
     }
 
-    fn delete_branch(&self, name: &str) -> StoreResult<()> {
-        self.notify_if_ok(self.inner.delete_branch(name))
+    async fn delete_branch<'a>(&'a self, name: &'a str) -> StoreResult<()> {
+        self.notify_if_ok(self.inner.delete_branch(name).await)
     }
 
     fn set_branch_head(

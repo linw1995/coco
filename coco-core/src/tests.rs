@@ -994,7 +994,7 @@ async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
     let job_id = job.job_id.clone();
 
-    store.delete_branch("main").unwrap();
+    store.delete_branch("main").await.unwrap();
     let error = engine.drive_job(&job_id).await.unwrap_err();
 
     assert!(matches!(error, EngineError::SessionMissing { branch } if branch == "main"));
@@ -1146,7 +1146,7 @@ async fn llm_engine_finishes_job_when_recovery_restore_fails() {
         .set_job_work_branch(&job.job_id, &failed.work_branch, "recovery-b")
         .await
         .unwrap();
-    store.delete_branch("main").unwrap();
+    store.delete_branch("main").await.unwrap();
 
     let recovered = engine.drive_job(&job.job_id).await.unwrap();
 

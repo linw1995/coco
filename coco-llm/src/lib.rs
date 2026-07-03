@@ -1508,7 +1508,10 @@ where
 {
     pub async fn delete_session_branch(&self, branch: &str) -> Result<()> {
         let _guard = self.lock_branch(branch).await;
-        self.store.delete_branch(branch).context(MemorySnafu)?;
+        self.store
+            .delete_branch(branch)
+            .await
+            .context(MemorySnafu)?;
         let cleaned_session_count = self
             .runtime
             .unified_exec_sessions

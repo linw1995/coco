@@ -4739,7 +4739,7 @@ mod tests {
                 .unwrap()
         );
 
-        writer.delete_branch("main").unwrap();
+        writer.delete_branch("main").await.unwrap();
         publisher.mark_changed();
         let empty_again_version = publisher.current_version();
         let empty_again = cache
@@ -7047,7 +7047,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("draft").unwrap();
+        writer.delete_branch("draft").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8182,7 +8182,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("draft").unwrap();
+        writer.delete_branch("draft").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -9176,7 +9176,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("draft").unwrap();
+        writer.delete_branch("draft").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -9265,7 +9265,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("main").unwrap();
+        writer.delete_branch("main").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -9393,7 +9393,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("beta").unwrap();
+        writer.delete_branch("beta").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 

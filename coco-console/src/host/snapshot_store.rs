@@ -206,8 +206,11 @@ impl BranchStore for MaterializationSourceSnapshot {
             })
     }
 
-    fn delete_branch(&self, _name: &str) -> coco_mem::StoreResult<()> {
-        Self::read_only_error()
+    fn delete_branch<'a>(
+        &'a self,
+        _name: &'a str,
+    ) -> impl Future<Output = coco_mem::StoreResult<()>> + Send + 'a {
+        std::future::ready(Self::read_only_error())
     }
 
     fn set_branch_head(
@@ -6066,10 +6069,13 @@ mod tests {
             })
         }
 
-        fn delete_branch(&self, _name: &str) -> coco_mem::StoreResult<()> {
-            Err(coco_mem::StoreError::StoreReadOnly {
+        fn delete_branch<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> impl Future<Output = coco_mem::StoreResult<()>> + Send + 'a {
+            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            })
+            }))
         }
 
         fn set_branch_head(

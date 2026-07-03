@@ -282,6 +282,7 @@ where
             );
             shared_store
                 .delete_branch(BUILTIN_DAY_BRANCH)
+                .await
                 .context(StoreSnafu)?;
         }
         Err(StoreError::BranchNotFound { .. }) => {}
