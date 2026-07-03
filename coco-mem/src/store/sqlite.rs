@@ -813,6 +813,11 @@ impl SqliteStore {
         submit_job_with_id_in_sqlite(&mut connection, &self.database_path, job_id, branch, base)
             .await
     }
+
+    async fn get_job_in_sqlite(&self, job_id: &str) -> Result<Job> {
+        let mut connection = self.connect().await?;
+        load_job(&mut connection, &self.database_path, job_id).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4270,10 +4275,7 @@ impl JobStore for SqliteStore {
     }
 
     fn get_job(&self, job_id: &str) -> Result<Job> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            load_job(&mut connection, &self.database_path, job_id).await
-        })
+        self.block_on(self.get_job_in_sqlite(job_id))
     }
 
     fn list_jobs(&self) -> Result<std::collections::HashMap<String, Job>> {
