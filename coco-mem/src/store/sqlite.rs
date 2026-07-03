@@ -891,6 +891,13 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         load_message_queue_names(&mut connection, &self.database_path).await
     }
+
+    async fn list_preset_records_in_sqlite(
+        &self,
+    ) -> Result<std::collections::HashMap<String, PresetRecord>> {
+        let mut connection = self.connect().await?;
+        load_preset_records(&mut connection, &self.database_path).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4397,10 +4404,7 @@ impl MessageQueueStore for SqliteStore {
 
 impl PresetStore for SqliteStore {
     fn list_preset_records(&self) -> Result<std::collections::HashMap<String, PresetRecord>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            load_preset_records(&mut connection, &self.database_path).await
-        })
+        self.block_on(self.list_preset_records_in_sqlite())
     }
 
     fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
