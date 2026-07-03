@@ -1958,6 +1958,7 @@ where
 
     let rolled_back = store
         .rollback_skill(SessionRole::Orchestrator, "custom-orchestrator", 1)
+        .await
         .unwrap();
 
     assert_eq!(rolled_back.current_version, 3);

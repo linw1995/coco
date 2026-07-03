@@ -147,12 +147,12 @@ pub trait SkillStore {
     ) -> impl Future<Output = StoreResult<SkillRecord>> + Send + 'a;
 
     /// Creates a new version cloned from a previous version and makes it current.
-    fn rollback_skill(
-        &self,
+    fn rollback_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
+        name: &'a str,
         target_version: u64,
-    ) -> StoreResult<SkillRecord>;
+    ) -> impl Future<Output = StoreResult<SkillRecord>> + Send + 'a;
 }
 
 /// Prompt job storage API.
@@ -427,17 +427,15 @@ impl SkillStore for PersistentStore {
         }
     }
 
-    fn rollback_skill(
-        &self,
+    async fn rollback_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
+        name: &'a str,
         target_version: u64,
     ) -> StoreResult<SkillRecord> {
-        delegate_persistent_store!(
-            self,
-            store,
-            store.rollback_skill(role, name, target_version)
-        )
+        match self {
+            Self::Sqlite(store) => store.rollback_skill(role, name, target_version).await,
+        }
     }
 }
 

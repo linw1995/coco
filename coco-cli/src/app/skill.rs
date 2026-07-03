@@ -97,7 +97,7 @@ where
         }
         SkillSubcommand::Rollback(command) => {
             let json = command.json;
-            let skill = run_skill_rollback(command, store)?;
+            let skill = run_skill_rollback(command, store).await?;
             Ok(Some(if json {
                 render_json(skill)
             } else {
@@ -190,12 +190,13 @@ async fn run_skill_update(
     Ok(skill_summary_view(command.role.into(), &record))
 }
 
-fn run_skill_rollback(
+async fn run_skill_rollback(
     command: SkillRollbackCommand,
     store: &impl SkillStore,
 ) -> Result<SkillSummaryView> {
     let record = store
         .rollback_skill(command.role.into(), &command.name, command.to_version)
+        .await
         .context(StoreSnafu)?;
     Ok(skill_summary_view(command.role.into(), &record))
 }

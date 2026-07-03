@@ -189,13 +189,13 @@ where
         self.notify_if_ok(self.inner.update_skill(role, name, patch).await)
     }
 
-    fn rollback_skill(
-        &self,
+    async fn rollback_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
+        name: &'a str,
         target_version: u64,
     ) -> StoreResult<SkillRecord> {
-        self.notify_if_ok(self.inner.rollback_skill(role, name, target_version))
+        self.notify_if_ok(self.inner.rollback_skill(role, name, target_version).await)
     }
 }
 
