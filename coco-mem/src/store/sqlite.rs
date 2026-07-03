@@ -306,11 +306,8 @@ impl std::fmt::Debug for SqliteDatabase {
 }
 
 impl SqliteDatabase {
-    pub fn open_store_path(path: impl AsRef<Path>) -> Result<Self> {
-        block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            Self::open(sqlite_database_path(path.as_ref()), false),
-        )
+    pub async fn open_store_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(sqlite_database_path(path.as_ref()), false).await
     }
 
     pub fn open_writable_store_path(path: impl AsRef<Path>) -> Result<Self> {
