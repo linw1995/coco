@@ -262,8 +262,11 @@ where
         self.inner.peek_message(queue)
     }
 
-    fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>> {
-        self.inner.list_queue_messages(queue)
+    async fn list_queue_messages<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> StoreResult<Vec<MessageQueueItem>> {
+        self.inner.list_queue_messages(queue).await
     }
 
     async fn list_message_queues(&self) -> StoreResult<Vec<String>> {

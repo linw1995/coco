@@ -1728,7 +1728,7 @@ where
         .unwrap();
 
     assert_eq!(
-        store.list_queue_messages("hooks").unwrap(),
+        store.list_queue_messages("hooks").await.unwrap(),
         vec![first.clone(), second.clone(),]
     );
     assert_eq!(store.peek_message("hooks").unwrap(), Some(first.clone()));
@@ -1738,7 +1738,7 @@ where
     assert_eq!(store.dequeue_message("hooks").unwrap(), Some(second));
     assert_eq!(store.dequeue_message("hooks").unwrap(), None);
     assert_eq!(store.peek_message("hooks").unwrap(), None);
-    assert!(store.list_queue_messages("hooks").unwrap().is_empty());
+    assert!(store.list_queue_messages("hooks").await.unwrap().is_empty());
     assert!(store.list_message_queues().await.unwrap().is_empty());
 }
 
@@ -1755,11 +1755,11 @@ where
         .unwrap();
 
     assert_eq!(
-        store.list_queue_messages("hooks").unwrap(),
+        store.list_queue_messages("hooks").await.unwrap(),
         vec![hook.clone()]
     );
     assert_eq!(
-        store.list_queue_messages("scheduler").unwrap(),
+        store.list_queue_messages("scheduler").await.unwrap(),
         vec![scheduler.clone()]
     );
     assert_eq!(

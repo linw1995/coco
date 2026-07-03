@@ -854,7 +854,7 @@ async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
     assert_eq!(snapshot.status, JobStatus::Running);
     assert_eq!(snapshot.branch, "main");
     assert_eq!(snapshot.work_branch, "main");
-    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).unwrap();
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].queue, SYSTEM_EVENT_QUEUE);
     let payload = &events[0].payload;
@@ -974,6 +974,7 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
     assert!(
         store
             .list_queue_messages(SYSTEM_EVENT_QUEUE)
+            .await
             .unwrap()
             .is_empty()
     );
@@ -1026,6 +1027,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
     assert_eq!(failed_a.work_branch, "main");
     let first_event = store
         .list_queue_messages(SYSTEM_EVENT_QUEUE)
+        .await
         .unwrap()
         .pop()
         .expect("first recovery event should exist");
@@ -1045,7 +1047,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
     let failed_b = engine.drive_job(&job.job_id).await.unwrap();
     assert_eq!(failed_b.status, JobStatus::Running);
     assert_eq!(failed_b.work_branch, "recovery-b");
-    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).unwrap();
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).await.unwrap();
     assert_eq!(events.len(), 2);
     let second_event = events.last().unwrap();
     assert_eq!(second_event.payload["data"]["root_branch"], "main");
@@ -1108,6 +1110,7 @@ async fn llm_engine_finishes_job_when_recovery_restore_fails() {
     let failed = engine.drive_job(&job.job_id).await.unwrap();
     let event = store
         .list_queue_messages(SYSTEM_EVENT_QUEUE)
+        .await
         .unwrap()
         .pop()
         .expect("recovery event should exist");
@@ -1165,7 +1168,7 @@ async fn llm_engine_reply_surfaces_backend_failure_message() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).unwrap();
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].payload["type"],

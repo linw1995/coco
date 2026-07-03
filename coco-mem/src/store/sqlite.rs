@@ -4485,8 +4485,8 @@ impl MessageQueueStore for SqliteStore {
         self.block_on(self.peek_message_in_sqlite(queue))
     }
 
-    fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
-        self.block_on(self.list_queue_messages_in_sqlite(queue))
+    async fn list_queue_messages<'a>(&'a self, queue: &'a str) -> Result<Vec<MessageQueueItem>> {
+        self.list_queue_messages_in_sqlite(queue).await
     }
 
     async fn list_message_queues(&self) -> Result<Vec<String>> {
@@ -5683,8 +5683,8 @@ mod tests {
         assert_eq!(job.base, session);
     }
 
-    #[test]
-    fn message_queue_operations_persist_across_reopen() {
+    #[tokio::test]
+    async fn message_queue_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5696,7 +5696,7 @@ mod tests {
             .unwrap();
 
         let reopened = SqliteStore::open(&path).unwrap();
-        let messages = reopened.list_queue_messages("runner").unwrap();
+        let messages = reopened.list_queue_messages("runner").await.unwrap();
         assert_eq!(messages[0].message_id, first.message_id);
         assert_eq!(messages[1].message_id, second.message_id);
         assert_eq!(
@@ -5707,7 +5707,7 @@ mod tests {
         let dequeued = reopened.dequeue_message("runner").unwrap().unwrap();
         assert_eq!(dequeued.message_id, first.message_id);
         let reopened = SqliteStore::open(&path).unwrap();
-        let messages = reopened.list_queue_messages("runner").unwrap();
+        let messages = reopened.list_queue_messages("runner").await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, second.message_id);
     }
@@ -5739,7 +5739,7 @@ mod tests {
             .unwrap();
 
         let reopened = SqliteStore::open(&path).unwrap();
-        let messages = reopened.list_queue_messages("runner").unwrap();
+        let messages = reopened.list_queue_messages("runner").await.unwrap();
 
         assert_eq!(messages[0].message_id, first.message_id);
         assert_eq!(messages[1].message_id, second.message_id);
@@ -5771,7 +5771,7 @@ mod tests {
             .unwrap();
 
         let reopened = SqliteStore::open(&path).unwrap();
-        let messages = reopened.list_queue_messages("runner").unwrap();
+        let messages = reopened.list_queue_messages("runner").await.unwrap();
 
         assert_eq!(messages[0].message_id, first.message_id);
         assert_eq!(messages[1].message_id, second.message_id);

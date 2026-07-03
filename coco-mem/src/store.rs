@@ -186,7 +186,10 @@ pub trait MessageQueueStore {
     fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
 
     /// Returns all persisted messages for a named queue in dequeue order.
-    fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;
+    fn list_queue_messages<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> impl Future<Output = StoreResult<Vec<MessageQueueItem>>> + Send + 'a;
 
     /// Returns all queue names that currently contain at least one message.
     fn list_message_queues(&self) -> impl Future<Output = StoreResult<Vec<String>>> + Send + '_;
@@ -449,8 +452,13 @@ impl MessageQueueStore for PersistentStore {
         delegate_persistent_store!(self, store, store.peek_message(queue))
     }
 
-    fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>> {
-        delegate_persistent_store!(self, store, store.list_queue_messages(queue))
+    async fn list_queue_messages<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> StoreResult<Vec<MessageQueueItem>> {
+        match self {
+            PersistentStore::Sqlite(store) => store.list_queue_messages(queue).await,
+        }
     }
 
     async fn list_message_queues(&self) -> StoreResult<Vec<String>> {

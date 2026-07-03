@@ -1309,6 +1309,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert!(text_output.contains("branch: main"));
     let queued_messages = store
         .list_queue_messages(&prompt_job_queue_for_branch("main"))
+        .await
         .unwrap();
     assert_eq!(queued_messages.len(), 1);
     let text_job_id = queued_messages[0].payload["job_id"].as_str().unwrap();
@@ -1411,6 +1412,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(
         store
             .list_queue_messages(&prompt_job_queue_for_branch("main"))
+            .await
             .unwrap()
             .len(),
         1
@@ -1418,11 +1420,18 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(
         store
             .list_queue_messages(&prompt_job_queue_for_branch("json"))
+            .await
             .unwrap()
             .len(),
         1
     );
-    assert!(store.list_queue_messages("prompt.job").unwrap().is_empty());
+    assert!(
+        store
+            .list_queue_messages("prompt.job")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1479,6 +1488,7 @@ async fn forwarded_runtime_async_prompt_without_daemon_worker_drives_in_process(
     assert!(
         store
             .list_queue_messages(&prompt_job_queue_for_branch("main"))
+            .await
             .unwrap()
             .is_empty()
     );

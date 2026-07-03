@@ -51,7 +51,12 @@ async fn list_prompt_job_queue_messages(store: &impl Store) -> Result<Vec<Messag
         .into_iter()
         .filter(|queue| is_prompt_job_queue(queue))
     {
-        items.extend(store.list_queue_messages(&queue).context(StoreSnafu)?);
+        items.extend(
+            store
+                .list_queue_messages(&queue)
+                .await
+                .context(StoreSnafu)?,
+        );
     }
     items.sort_by_key(|item| item.created_at);
     Ok(items)

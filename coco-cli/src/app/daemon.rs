@@ -925,6 +925,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
             if self
                 .store
                 .list_queue_messages(&queue)
+                .await
                 .context(StoreSnafu)?
                 .into_iter()
                 .filter_map(|item| decode_prompt_job_message(item.payload).ok())
@@ -2559,7 +2560,10 @@ mod tests {
         let response = publisher.handle(message.clone()).await.unwrap();
 
         assert_eq!(response.text, "queued telegram inbound message");
-        let items = store.list_queue_messages(TELEGRAM_INBOUND_QUEUE).unwrap();
+        let items = store
+            .list_queue_messages(TELEGRAM_INBOUND_QUEUE)
+            .await
+            .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(
             decode_telegram_message(items[0].payload.clone()).unwrap(),
@@ -2596,6 +2600,7 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(TELEGRAM_INBOUND_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -2686,7 +2691,11 @@ mod tests {
         assert!(engine.get_job("job-request").is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
 
@@ -2735,7 +2744,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(store.list_queue_messages(&queue).unwrap().is_empty());
+        assert!(store.list_queue_messages(&queue).await.unwrap().is_empty());
         assert_eq!(
             engine.join_job("job-day-queued").await.unwrap().status,
             JobStatus::Finished
@@ -2785,7 +2794,11 @@ mod tests {
             JobStatus::Running
         );
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         let failure_count = store
@@ -2852,7 +2865,11 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -2911,7 +2928,11 @@ mod tests {
         let day_task = tokio::spawn(async move { day_worker.drain_once().await });
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
@@ -2991,7 +3012,11 @@ mod tests {
 
         assert!(engine.get_job("job-main-queued").is_err());
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
@@ -3085,7 +3110,11 @@ mod tests {
 
         assert!(engine.get_job("job-missing-branch").is_err());
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             0
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -3123,6 +3152,7 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -3163,17 +3193,20 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
         let request: QueuedPromptRequest =
@@ -3226,6 +3259,7 @@ mod tests {
             super::backend_failure_recovery_dedupe_key("job-failed", "main", "retry-node");
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
         let request: QueuedPromptRequest =
@@ -3270,11 +3304,13 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
         let request: QueuedPromptRequest =
@@ -3333,11 +3369,16 @@ mod tests {
         assert_eq!(worker.drain_once().await.unwrap(), 1);
 
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
     }
@@ -3422,12 +3463,14 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -3476,12 +3519,14 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -3534,11 +3579,13 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
         let request: QueuedPromptRequest =
