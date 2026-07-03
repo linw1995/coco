@@ -473,7 +473,10 @@ impl SqliteStore {
     pub fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if sqlite_database_path(path).is_file() {
-            if Self::sqlite_schema_requires_migration(path)? {
+            if block_on_sqlite_runtime_with(
+                sqlite_runtime()?,
+                Self::sqlite_schema_requires_migration(path),
+            )? {
                 drop(Self::open(path)?);
             }
             return Self::open_read_only(path);
@@ -584,12 +587,9 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn sqlite_schema_requires_migration(path: &Path) -> Result<bool> {
+    async fn sqlite_schema_requires_migration(path: &Path) -> Result<bool> {
         ensure_existing_store_directory(path)?;
-        let store = block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            Self::new(path, StoreAccess::ReadOnly),
-        )?;
+        let store = Self::new(path, StoreAccess::ReadOnly).await?;
         ensure_existing_database_file(&store.database_path)?;
         let version = store.database.with_initialization_lock(|| {
             store.block_on(async {
