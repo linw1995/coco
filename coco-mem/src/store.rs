@@ -121,7 +121,10 @@ pub trait PresetStore {
 /// Persisted skill storage API.
 pub trait SkillStore {
     /// Returns all persisted skills for the given role.
-    fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>>;
+    fn list_skills(
+        &self,
+        role: SessionRole,
+    ) -> impl Future<Output = StoreResult<Vec<SkillRecord>>> + Send + '_;
 
     /// Returns one persisted skill for the given role and name.
     fn get_skill<'a>(
@@ -395,8 +398,10 @@ impl PresetStore for PersistentStore {
 }
 
 impl SkillStore for PersistentStore {
-    fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>> {
-        delegate_persistent_store!(self, store, store.list_skills(role))
+    async fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>> {
+        match self {
+            Self::Sqlite(store) => store.list_skills(role).await,
+        }
     }
 
     async fn get_skill<'a>(&'a self, role: SessionRole, name: &'a str) -> StoreResult<SkillRecord> {

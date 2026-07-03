@@ -1603,7 +1603,7 @@ where
     }
 
     async fn run_locked(&self, request: CompletionRequest) -> Result<CompletionResult> {
-        let prepared = self.prepare_completion_run(request)?;
+        let prepared = self.prepare_completion_run(request).await?;
         let completed = self
             .backend
             .complete(prepared.session.clone(), prepared.resolved.clone())
@@ -1611,7 +1611,10 @@ where
         self.finish_completion_run(prepared, completed)
     }
 
-    fn prepare_completion_run(&self, request: CompletionRequest) -> Result<PreparedCompletionRun> {
+    async fn prepare_completion_run(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<PreparedCompletionRun> {
         let branch = request.branch.clone();
         let origin_kind = completion_origin_kind(&request.origin);
         let input_kind = completion_input_kind(&request.input);
@@ -1644,14 +1647,17 @@ where
             )?,
         };
         let mut session = match &request.origin {
-            CompletionOrigin::ReferenceWithBranchSession(_) => self
-                .resolve_session_from_reference_with_branch_session(
+            CompletionOrigin::ReferenceWithBranchSession(_) => {
+                self.resolve_session_from_reference_with_branch_session(
                     &request.branch,
                     &retry_from_node_id,
                     &original_head,
-                )?,
+                )
+                .await?
+            }
             CompletionOrigin::BranchHead | CompletionOrigin::Reference(_) => {
-                self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?
+                self.resolve_session_from_reference(&request.branch, &retry_from_node_id)
+                    .await?
             }
         };
         if request.active_skill_runtime.is_some() {
@@ -1930,18 +1936,18 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + SkillStore,
+    S: NodeStore + SkillStore + Sync,
 {
-    fn resolve_session_from_reference(
+    async fn resolve_session_from_reference(
         &self,
         branch: &str,
         reference: &str,
     ) -> Result<ResolvedSession> {
         let context = self.resolve_context(reference)?;
-        self.session_from_context(branch, context)
+        self.session_from_context(branch, context).await
     }
 
-    fn resolve_session_from_reference_with_branch_session(
+    async fn resolve_session_from_reference_with_branch_session(
         &self,
         branch: &str,
         reference: &str,
@@ -1951,7 +1957,7 @@ where
         let branch_context = self.resolve_context(branch_head)?;
         context.active_anchor_id = branch_context.active_anchor_id;
         context.session_anchor = branch_context.session_anchor;
-        self.session_from_context(branch, context)
+        self.session_from_context(branch, context).await
     }
 }
 
@@ -2313,12 +2319,12 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + SkillStore,
+    S: NodeStore + SkillStore + Sync,
 {
     #[cfg(test)]
-    fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
+    async fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
         let context = self.resolve_context(branch)?;
-        self.session_from_context(branch, context)
+        self.session_from_context(branch, context).await
     }
 }
 
@@ -2360,14 +2366,14 @@ fn skill_summaries_from_records(records: &[SkillRecord]) -> Vec<SessionSkillSumm
         .collect()
 }
 
-fn session_skill_summaries(
-    store: &impl SkillStore,
+async fn session_skill_summaries(
+    store: &(impl SkillStore + Sync),
     session_role: SessionRole,
 ) -> Result<Vec<SessionSkillSummary>> {
     let mut seen_names = HashSet::new();
     let mut skills = Vec::new();
     for role in accessible_skill_roles(session_role) {
-        let records = store.list_skills(*role).context(MemorySnafu)?;
+        let records = store.list_skills(*role).await.context(MemorySnafu)?;
         for skill in skill_summaries_from_records(&records) {
             if seen_names.insert(skill.name.clone()) {
                 skills.push(skill);
@@ -2403,9 +2409,9 @@ fn append_skills_to_system_prompt(system_prompt: &str, skills: &[SessionSkillSum
 
 impl<B, S> LlmService<B, S>
 where
-    S: SkillStore,
+    S: SkillStore + Sync,
 {
-    fn session_from_context(
+    async fn session_from_context(
         &self,
         branch: &str,
         context: ResolvedContext,
@@ -2433,7 +2439,8 @@ where
         let profile_additional_params =
             provider_config.and_then(|config| config.additional_params.clone());
 
-        let available_skills = session_skill_summaries(self.store(), context.session_anchor.role)?;
+        let available_skills =
+            session_skill_summaries(self.store(), context.session_anchor.role).await?;
 
         Ok(ResolvedSession {
             branch: branch.to_owned(),
@@ -5163,7 +5170,7 @@ mod tests {
             .await
             .unwrap();
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
 
         assert!(session.config.system_prompt.starts_with("You are helpful."));
         assert!(session.config.system_prompt.contains("## Available Skills"));
@@ -5310,7 +5317,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&store_path).unwrap();
         let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         let tool_result_message = session
             .provider_history
             .iter()
@@ -5417,7 +5424,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&store_path).unwrap();
         let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         let tool_result_message = session
             .provider_history
             .iter()
@@ -6483,7 +6490,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "second");
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -6520,7 +6527,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "second");
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_ne!(session.anchor_id, anchor_id);
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
@@ -6548,7 +6555,7 @@ mod tests {
         let result = service.run(request("main")).await.unwrap();
 
         assert_eq!(result.text, "continued");
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -6685,7 +6692,7 @@ mod tests {
     #[tokio::test]
     async fn context_reconstruction_orders_skill_prompt_after_inherited_history() {
         let (service, child_prompt) = skill_child_context_fixture(None).await;
-        let session = service.resolve_session("child").unwrap();
+        let session = service.resolve_session("child").await.unwrap();
 
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
@@ -6700,7 +6707,7 @@ mod tests {
     #[tokio::test]
     async fn context_reconstruction_skips_tool_use_that_created_skill_invocation() {
         let (service, _) = skill_child_context_fixture(None).await;
-        let session = service.resolve_session("child").unwrap();
+        let session = service.resolve_session("child").await.unwrap();
 
         assert_eq!(
             session
@@ -6725,7 +6732,7 @@ mod tests {
     async fn context_reconstruction_can_hide_parent_history_for_handoff_skill_child() {
         let (service, child_prompt) =
             skill_child_context_fixture(Some("Review the bounded diff.".to_owned())).await;
-        let session = service.resolve_session("child").unwrap();
+        let session = service.resolve_session("child").await.unwrap();
 
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
@@ -6769,7 +6776,7 @@ mod tests {
         assert_eq!(node_execution_id(&failure), Some(execution_id.as_str()));
         assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -6814,7 +6821,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(result.text, "merge answer");
         assert_eq!(session.config.model, "gpt-4.1-mini");
         assert!(session.config.system_prompt.starts_with("You are helpful."));
@@ -6978,7 +6985,7 @@ mod tests {
         ));
         assert_ne!(ancestry[1].role, Role::User);
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -7025,7 +7032,7 @@ mod tests {
         let prompt_anchor_id = retry_from_node_id.clone();
         assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -7451,7 +7458,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "updated");
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(session.config.provider, Provider::Anthropic);
         assert_eq!(session.config.model, "claude-sonnet-4-20250514");
         assert!(session.config.system_prompt.starts_with("You are helpful."));
@@ -7936,7 +7943,7 @@ mod tests {
             .await
             .unwrap();
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -8757,7 +8764,7 @@ mod tests {
         assert_eq!(node_execution_id(tool_use), Some("execution-step-1"));
         assert_eq!(result.execution_id, "execution-step-2");
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(session.provider_history.len(), 5);
         assert!(matches!(
             &session.provider_history[2],
@@ -8868,7 +8875,7 @@ mod tests {
         ));
         assert_eq!(tool_use.parent, context.retry_from_node_id);
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![

@@ -4593,8 +4593,14 @@ impl PresetStore for SqliteStore {
 }
 
 impl SkillStore for SqliteStore {
-    fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
-        self.block_on(self.list_skills_in_sqlite(role))
+    async fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
+        let store = self.clone();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.list_skills_in_sqlite(role).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     async fn get_skill<'a>(&'a self, role: SessionRole, name: &'a str) -> Result<SkillRecord> {

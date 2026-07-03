@@ -163,8 +163,8 @@ impl<S> SkillStore for ConsoleStore<S>
 where
     S: SkillStore + Sync,
 {
-    fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>> {
-        self.inner.list_skills(role)
+    async fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>> {
+        self.inner.list_skills(role).await
     }
 
     async fn get_skill<'a>(&'a self, role: SessionRole, name: &'a str) -> StoreResult<SkillRecord> {

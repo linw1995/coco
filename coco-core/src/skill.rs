@@ -133,12 +133,15 @@ where
         &self,
         request: SkillSearchRequest,
     ) -> std::result::Result<String, ExecutorError> {
-        let result = self.upgrade_engine()?.search_skills(
-            &request.workspace_root,
-            request.session_role,
-            &request.query,
-            request.limit,
-        )?;
+        let result = self
+            .upgrade_engine()?
+            .search_skills(
+                &request.workspace_root,
+                request.session_role,
+                &request.query,
+                request.limit,
+            )
+            .await?;
 
         let output = serde_json::to_string_pretty(&result).context(SerializeOutputSnafu)?;
         Ok(output)
@@ -285,7 +288,7 @@ where
     B: CompletionBackend + 'static,
     S: NodeStore + BranchStore + SessionStore + SkillStore + Clone + Send + Sync + 'static,
 {
-    pub fn search_skills(
+    pub async fn search_skills(
         &self,
         workspace_root: &Path,
         session_role: SessionRole,
@@ -298,7 +301,8 @@ where
             session_role,
             query,
             limit,
-        )?;
+        )
+        .await?;
         Ok(result)
     }
 
@@ -316,7 +320,8 @@ where
             self.service().store(),
             session_role,
             skill_name,
-        )?;
+        )
+        .await?;
         let request = SkillInvocationRequest {
             workspace_root: workspace_root.to_path_buf(),
             base_branch: base_branch.to_owned(),
@@ -640,17 +645,17 @@ fn synthetic_skill_path(role: SessionRole, name: &str, version: u64) -> PathBuf 
     ))
 }
 
-fn collect_store_skills<S>(
+async fn collect_store_skills<S>(
     store: &S,
     session_role: SessionRole,
 ) -> std::result::Result<Vec<SkillEntry>, SkillError>
 where
-    S: SkillStore,
+    S: SkillStore + Sync,
 {
     let mut seen_names = HashSet::new();
     let mut skills = Vec::new();
     for role in accessible_skill_roles(session_role) {
-        let records = store.list_skills(role).context(LoadSkillsSnafu)?;
+        let records = store.list_skills(role).await.context(LoadSkillsSnafu)?;
         for skill in skill_entries_from_store_records(role, &records) {
             if seen_names.insert(skill.name.clone()) {
                 skills.push(skill);
@@ -688,15 +693,15 @@ fn skill_entries_from_store_records(role: SessionRole, records: &[SkillRecord]) 
         .collect()
 }
 
-fn collect_skills<S>(
+async fn collect_skills<S>(
     _workspace_root: &Path,
     store: &S,
     session_role: SessionRole,
 ) -> std::result::Result<Vec<SkillEntry>, SkillError>
 where
-    S: SkillStore,
+    S: SkillStore + Sync,
 {
-    let mut skills = collect_store_skills(store, session_role)?;
+    let mut skills = collect_store_skills(store, session_role).await?;
     skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
     Ok(skills)
 }
@@ -733,14 +738,15 @@ fn score_skill(skill: &SkillEntry, query: &str) -> usize {
     score
 }
 
-fn search_skills(
+async fn search_skills(
     workspace_root: &Path,
-    store: &impl SkillStore,
+    store: &(impl SkillStore + Sync),
     session_role: SessionRole,
     query: &str,
     limit: usize,
 ) -> std::result::Result<SkillSearchResult, SkillError> {
-    let mut matches = collect_skills(workspace_root, store, session_role)?
+    let mut matches = collect_skills(workspace_root, store, session_role)
+        .await?
         .into_iter()
         .filter_map(|skill| {
             let score = score_skill(&skill, query);
@@ -768,13 +774,14 @@ fn search_skills(
     })
 }
 
-fn resolve_skill(
+async fn resolve_skill(
     workspace_root: &Path,
-    store: &impl SkillStore,
+    store: &(impl SkillStore + Sync),
     session_role: SessionRole,
     name: &str,
 ) -> std::result::Result<SkillEntry, SkillError> {
-    let matches = collect_skills(workspace_root, store, session_role)?
+    let matches = collect_skills(workspace_root, store, session_role)
+        .await?
         .into_iter()
         .filter(|skill| skill.name == name)
         .collect::<Vec<_>>();
@@ -901,14 +908,15 @@ mod tests {
             "openai docs",
             1,
         )
+        .await
         .unwrap();
 
         assert_eq!(result.skills.len(), 1);
         assert_eq!(result.skills[0].name, "openai-docs");
     }
 
-    #[test]
-    fn search_skills_ignores_external_skill_roots() {
+    #[tokio::test]
+    async fn search_skills_ignores_external_skill_roots() {
         let root = tempfile::tempdir().unwrap();
         let skill_dir = root.path().join("external-skill");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -932,17 +940,22 @@ description: "External skill."
             "external-skill",
             10,
         )
+        .await
         .unwrap();
 
         assert!(result.skills.is_empty());
     }
 
-    #[test]
-    fn collect_store_skills_respects_role_hierarchy() {
+    #[tokio::test]
+    async fn collect_store_skills_respects_role_hierarchy() {
         let store = test_store();
 
-        let runner = collect_store_skills(&store, SessionRole::Runner).unwrap();
-        let orchestrator = collect_store_skills(&store, SessionRole::Orchestrator).unwrap();
+        let runner = collect_store_skills(&store, SessionRole::Runner)
+            .await
+            .unwrap();
+        let orchestrator = collect_store_skills(&store, SessionRole::Orchestrator)
+            .await
+            .unwrap();
 
         assert_eq!(
             runner
@@ -993,6 +1006,7 @@ description: "External skill."
             SessionRole::Orchestrator,
             "shared-skill",
         )
+        .await
         .unwrap();
 
         assert_eq!(skill.session_role, SessionRole::Orchestrator);

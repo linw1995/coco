@@ -106,7 +106,7 @@ where
         }
         SkillSubcommand::List(command) => {
             let json = command.json;
-            let skills = run_skill_list(command, store)?;
+            let skills = run_skill_list(command, store).await?;
             Ok(Some(if json {
                 render_json(skills)
             } else {
@@ -201,7 +201,7 @@ async fn run_skill_rollback(
     Ok(skill_summary_view(command.role.into(), &record))
 }
 
-fn run_skill_list(
+async fn run_skill_list(
     command: SkillListCommand,
     store: &impl SkillStore,
 ) -> Result<Vec<SkillSummaryView>> {
@@ -212,7 +212,7 @@ fn run_skill_list(
         .unwrap_or_else(|| vec![SessionRole::Orchestrator, SessionRole::Runner]);
     let mut skills = Vec::new();
     for role in roles {
-        let mut records = store.list_skills(role).context(StoreSnafu)?;
+        let mut records = store.list_skills(role).await.context(StoreSnafu)?;
         records.sort_by(|left, right| left.name.cmp(&right.name));
         skills.extend(
             records
