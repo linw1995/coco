@@ -150,7 +150,7 @@ where
         let store = SqliteGraphStore::open_read_only(&path)
             .await
             .context(crate::error::StoreSnafu)?;
-        let snapshots = ConsoleGraphSnapshotStore::open(&path)?;
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).await?;
         let persisted_version = latest_persistent_materialization_version(&snapshots)?;
         let ready = ConsolePublisher::new();
         if let Some(version) = persisted_version {
@@ -1740,6 +1740,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -1757,25 +1758,28 @@ mod tests {
         let materialized = materialized.expect("materialized viewport should be stored");
         let database_path = crate::host::snapshot_store::database_path(&path);
         assert_eq!(
-            sqlite_table_row_count(&database_path, "console_graph_materializations"),
+            sqlite_table_row_count(&database_path, "console_graph_materializations").await,
             1
         );
-        assert!(sqlite_table_row_count(&database_path, "console_graph_node_locations") > 0);
-        assert!(sqlite_table_row_count(&database_path, "console_graph_edge_routes") > 0);
-        assert!(!sqlite_table_has_column(
-            &database_path,
-            "console_graph_node_locations",
-            "source_version",
-        ));
-        assert!(!sqlite_table_has_column(
-            &database_path,
-            "console_graph_edge_routes",
-            "source_version",
-        ));
-        assert!(!sqlite_table_exists(
-            &database_path,
-            "console_graph_snapshots"
-        ));
+        assert!(sqlite_table_row_count(&database_path, "console_graph_node_locations").await > 0);
+        assert!(sqlite_table_row_count(&database_path, "console_graph_edge_routes").await > 0);
+        assert!(
+            !sqlite_table_has_column(
+                &database_path,
+                "console_graph_node_locations",
+                "source_version",
+            )
+            .await
+        );
+        assert!(
+            !sqlite_table_has_column(
+                &database_path,
+                "console_graph_edge_routes",
+                "source_version",
+            )
+            .await
+        );
+        assert!(!sqlite_table_exists(&database_path, "console_graph_snapshots").await);
         let reopened_publisher = ConsolePublisher::new();
         let reopened_cache = ConsoleGraphCache::new_with_persistent_store_path(
             test_store(),
@@ -1823,13 +1827,17 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn graph_materialization_preflight_read_does_not_block_store_writes() {
+    #[tokio::test]
+    async fn graph_materialization_preflight_read_does_not_block_store_writes() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
-        ConsoleGraphSnapshotStore::open(&path).unwrap();
+        ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        let graph_database =
+            coco_mem::SqliteDatabase::open_unshared_file_path(&graph_database_path)
+                .await
+                .unwrap();
         let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
         let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
@@ -1837,7 +1845,7 @@ mod tests {
             use diesel::Connection;
             use diesel::prelude::*;
 
-            with_sqlite_test_connection(&graph_database_path, move |connection| {
+            with_sqlite_test_connection(graph_database, move |connection| {
                 connection
                     .transaction::<(), diesel::result::Error, _>(|connection| {
                         assert_eq!(
@@ -1883,17 +1891,21 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn graph_materialization_write_does_not_block_store_writes() {
+    #[tokio::test]
+    async fn graph_materialization_write_does_not_block_store_writes() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
-        ConsoleGraphSnapshotStore::open(&path).unwrap();
+        ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        let graph_database =
+            coco_mem::SqliteDatabase::open_unshared_file_path(&graph_database_path)
+                .await
+                .unwrap();
         let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
         let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
-            with_sqlite_test_connection(&graph_database_path, move |connection| {
+            with_sqlite_test_connection(graph_database, move |connection| {
                 connection
                     .immediate_transaction::<(), diesel::result::Error, _>(|_| {
                         transaction_started_tx.send(()).unwrap();
@@ -2011,6 +2023,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -3749,7 +3762,7 @@ mod tests {
 
         cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let next = writer
             .append(NewNode {
                 parent: text.clone(),
@@ -3765,6 +3778,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -3788,10 +3802,10 @@ mod tests {
         assert_eq!(materialized.version, target_version);
         assert!(materialized.nodes.iter().any(|node| node.id == next));
 
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -3832,7 +3846,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let second = writer
             .append(NewNode {
                 parent: first.clone(),
@@ -3861,10 +3875,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
         assert!(cache.rebuild_statuses().iter().any(|status| {
             status.mode == GraphMode::All
                 && status.source_version == target_version
@@ -3920,6 +3934,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -4025,10 +4040,12 @@ mod tests {
         let branch_labels = visible_full_layout_branch_labels(&snapshot);
         let viewport = materialize_graph_viewport(&snapshot);
         ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .replace_materialization_from_viewport(GraphMode::All, viewport, branch_labels)
             .unwrap();
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,
@@ -4131,6 +4148,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -4254,6 +4272,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -4360,6 +4379,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::Anchors,
@@ -4684,6 +4704,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -4706,6 +4727,7 @@ mod tests {
         assert!(materialized.lanes.is_empty());
         assert!(
             !ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .has_non_empty_materialization(GraphMode::All)
                 .unwrap()
@@ -4749,6 +4771,7 @@ mod tests {
         assert!(non_empty.lanes.iter().any(|lane| lane.label == "main"));
         assert!(
             ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .has_non_empty_materialization(GraphMode::All)
                 .unwrap()
@@ -5229,6 +5252,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,
@@ -5383,7 +5407,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let merge_anchor = writer
             .append(NewNode {
                 parent: main_hidden.clone(),
@@ -5435,10 +5459,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -5504,7 +5528,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let merge_anchor = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -5560,10 +5584,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -5606,7 +5630,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let orphan_parent = writer
             .append(NewNode {
                 parent: root,
@@ -5658,10 +5682,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -6793,7 +6817,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let second = writer
             .append(NewNode {
                 parent: first.clone(),
@@ -6829,10 +6853,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -6864,7 +6888,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let prompt = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6915,10 +6939,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -6984,7 +7008,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer
             .set_branch_head("main", &second_prompt, &first_prompt)
             .unwrap();
@@ -7013,10 +7037,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7083,7 +7107,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.delete_branch("draft").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7110,10 +7134,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7179,7 +7203,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.fork("draft", &session).unwrap();
         let draft_anchor = writer
             .append(NewNode {
@@ -7245,10 +7269,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7325,7 +7349,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.fork("draft", &current_session).unwrap();
         let draft_anchor = writer
             .append(NewNode {
@@ -7371,8 +7395,8 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
 
         drop(cache);
         drop(writer);
@@ -7422,7 +7446,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let current_session = writer
             .append(NewNode {
                 parent: old_prompt.clone(),
@@ -7478,8 +7502,8 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 2);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 2);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
 
         drop(cache);
         drop(writer);
@@ -7617,7 +7641,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.fork("draft", &main_anchor).unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7649,10 +7673,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7752,7 +7776,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let merge_anchor = writer
             .append(NewNode {
                 parent: main_hidden.clone(),
@@ -7823,10 +7847,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7992,7 +8016,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.set_branch_head("main", &second, &first).unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8015,10 +8039,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8084,7 +8108,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer
             .set_branch_head("main", &main_second, &main_first)
             .unwrap();
@@ -8108,6 +8132,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,
@@ -8125,10 +8150,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
         let viewport_error = tokio::time::timeout(
             Duration::from_millis(200),
             cache.viewport_after(
@@ -8228,7 +8253,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.delete_branch("draft").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8253,8 +8278,8 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert!(audit.row_count(&database_path, "node_delete") >= 3);
-        assert!(audit.row_count(&database_path, "edge_delete") >= 3);
+        assert!(audit.row_count(&database_path, "node_delete").await >= 3);
+        assert!(audit.row_count(&database_path, "edge_delete").await >= 3);
 
         drop(cache);
         drop(writer);
@@ -8310,7 +8335,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let main_second = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8353,10 +8378,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 2);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 2);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8410,7 +8435,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.fork("draft", &main_first).unwrap();
         let draft_first = writer
             .append(NewNode {
@@ -8457,10 +8482,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8722,7 +8747,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.fork("draft", &main_first).unwrap();
         let draft_merge = writer
             .append(NewNode {
@@ -8777,10 +8802,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8823,7 +8848,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.fork("draft", &main_first).unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8863,10 +8888,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         publisher.mark_changed();
         let refresh_version = publisher.current_version();
@@ -8888,7 +8913,7 @@ mod tests {
 
         assert_eq!(refreshed.version, refresh_version);
         assert_eq!(refreshed_alias_nodes, 2);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8920,7 +8945,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.fork("draft", &session).unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8941,6 +8966,7 @@ mod tests {
             })
             .count();
         let reference = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .materialized_node_reference(GraphMode::All, &crate::graph::node_target_id(&session))
             .unwrap()
@@ -8957,10 +8983,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9002,7 +9028,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let main_next = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -9047,10 +9073,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 2);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 2);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9105,7 +9131,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.fork("beta", &main_first).unwrap();
         let beta_first = writer
             .append(NewNode {
@@ -9174,10 +9200,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9232,7 +9258,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.delete_branch("draft").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -9253,10 +9279,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9322,7 +9348,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.delete_branch("main").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -9344,6 +9370,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,
@@ -9361,10 +9388,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
         let viewport_error = tokio::time::timeout(
             Duration::from_millis(200),
             cache.viewport_after(
@@ -9451,7 +9478,7 @@ mod tests {
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer.delete_branch("beta").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -9491,23 +9518,23 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 2);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 2);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 2);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 2);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn cache_uses_snapshot_materialization_database() {
+    #[tokio::test]
+    async fn cache_uses_snapshot_materialization_database() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).unwrap();
         let main_database_path = path.join("store.sqlite3");
         let graph_database_path = path.join("console-graph.sqlite3");
 
-        ConsoleGraphSnapshotStore::open(&path).unwrap();
+        ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         assert_eq!(
             crate::host::snapshot_store::database_path(&path),
@@ -9518,8 +9545,8 @@ mod tests {
             "console_graph_node_locations",
             "console_graph_edge_routes",
         ] {
-            assert!(sqlite_table_exists(&graph_database_path, table));
-            assert!(!sqlite_table_exists(&main_database_path, table));
+            assert!(sqlite_table_exists(&graph_database_path, table).await);
+            assert!(!sqlite_table_exists(&main_database_path, table).await);
         }
 
         drop(writer);
@@ -9532,7 +9559,7 @@ mod tests {
         let writer = PersistentStore::open(&path).unwrap();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
-        let snapshot = ConsoleGraphSnapshotStore::open(&path).unwrap();
+        let snapshot = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
         let base = root.clone();
 
         let (started_tx, started_rx) = mpsc::channel();
@@ -9567,13 +9594,12 @@ mod tests {
         }
     }
 
-    fn with_sqlite_test_connection<T, F>(database_path: &std::path::Path, operation: F) -> T
+    fn with_sqlite_test_connection<T, F>(database: coco_mem::SqliteDatabase, operation: F) -> T
     where
         T: Send + 'static,
         F: FnOnce(&mut diesel::sqlite::SqliteConnection) -> T + Send + 'static,
     {
-        coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
-            .unwrap()
+        database
             .with_sync_connection(
                 |connection| Ok(operation(connection)),
                 |source| panic!("{source}"),
@@ -9624,11 +9650,14 @@ mod tests {
     }
 
     impl GraphFactAuditSnapshot {
-        fn capture(database_path: &std::path::Path) -> Self {
+        async fn capture(database_path: &std::path::Path) -> Self {
             use crate::schema::{console_graph_edge_routes, console_graph_node_locations};
             use diesel::prelude::*;
 
-            with_sqlite_test_connection(database_path, |connection| {
+            let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
+                .await
+                .unwrap();
+            with_sqlite_test_connection(database, |connection| {
                 let nodes = console_graph_node_locations::table
                     .select((
                         console_graph_node_locations::mode,
@@ -9793,8 +9822,8 @@ mod tests {
             })
         }
 
-        fn row_count(&self, database_path: &std::path::Path, kind: &str) -> i64 {
-            let next = Self::capture(database_path);
+        async fn row_count(&self, database_path: &std::path::Path, kind: &str) -> i64 {
+            let next = Self::capture(database_path).await;
             match kind {
                 "node_delete" => deleted_count(&self.nodes, &next.nodes),
                 "edge_delete" => deleted_count(&self.edges, &next.edges),
@@ -9825,11 +9854,14 @@ mod tests {
             .count() as i64
     }
 
-    fn sqlite_table_exists(database_path: &std::path::Path, table: &str) -> bool {
+    async fn sqlite_table_exists(database_path: &std::path::Path, table: &str) -> bool {
         use diesel::prelude::*;
 
         let table = table.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| {
+        let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
+            .await
+            .unwrap();
+        with_sqlite_test_connection(database, move |connection| {
             sqlite_master::table
                 .filter(sqlite_master::object_type.eq("table"))
                 .filter(sqlite_master::name.eq(table))
@@ -9840,7 +9872,11 @@ mod tests {
         })
     }
 
-    fn sqlite_table_has_column(database_path: &std::path::Path, table: &str, column: &str) -> bool {
+    async fn sqlite_table_has_column(
+        database_path: &std::path::Path,
+        table: &str,
+        column: &str,
+    ) -> bool {
         use crate::schema::{
             console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
         };
@@ -9848,7 +9884,10 @@ mod tests {
 
         let table = table.to_owned();
         let column = column.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| {
+        let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
+            .await
+            .unwrap();
+        with_sqlite_test_connection(database, move |connection| {
             match (table.as_str(), column.as_str()) {
                 ("console_graph_materializations", "source_version") => {
                     console_graph_materializations::table
@@ -9874,14 +9913,17 @@ mod tests {
         })
     }
 
-    fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
+    async fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
         use crate::schema::{
             console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
         };
         use diesel::prelude::*;
 
         let table = table.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| match table.as_str() {
+        let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
+            .await
+            .unwrap();
+        with_sqlite_test_connection(database, move |connection| match table.as_str() {
             "console_graph_materializations" => console_graph_materializations::table
                 .count()
                 .get_result(connection)
@@ -9933,6 +9975,7 @@ mod tests {
         let mut first_materialized = None;
         for _ in 0..50 {
             first_materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -9963,6 +10006,7 @@ mod tests {
 
         let snapshot = cache.snapshot_current(GraphMode::All).await.unwrap();
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,

@@ -314,11 +314,8 @@ impl SqliteDatabase {
         Self::open(sqlite_database_path(path.as_ref()), true).await
     }
 
-    pub fn open_unshared_file_path(path: impl AsRef<Path>) -> Result<Self> {
-        block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            Self::open_uncached(path.as_ref().to_owned(), true),
-        )
+    pub async fn open_unshared_file_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_uncached(path.as_ref().to_owned(), true).await
     }
 
     async fn open(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {

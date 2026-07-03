@@ -501,11 +501,12 @@ impl From<diesel::result::Error> for SnapshotTransactionError {
 }
 
 impl ConsoleGraphSnapshotStore {
-    pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
+    pub async fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
         let dir = dir.as_ref();
         let path = database_path(dir);
-        let database =
-            SqliteDatabase::open_unshared_file_path(&path).context(crate::error::StoreSnafu)?;
+        let database = SqliteDatabase::open_unshared_file_path(&path)
+            .await
+            .context(crate::error::StoreSnafu)?;
         let store = Self {
             path: Arc::new(path),
             database,
@@ -6172,11 +6173,11 @@ mod tests {
         assert_eq!(snapshot.ancestry("main").unwrap()[0].id, store.old_head.id);
     }
 
-    #[test]
-    fn failed_batch_seed_clears_committed_facts_and_restores_empty_meta() {
+    #[tokio::test]
+    async fn failed_batch_seed_clears_committed_facts_and_restores_empty_meta() {
         let path = temp_store_path();
         let _writer = PersistentStore::open(&path).unwrap();
-        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let store = snapshots.clone();
         let (restored_version, row_count) = snapshots
@@ -6236,11 +6237,11 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn direct_materialized_node_lookups_ignore_rows_without_meta() {
+    #[tokio::test]
+    async fn direct_materialized_node_lookups_ignore_rows_without_meta() {
         let path = temp_store_path();
         let _writer = PersistentStore::open(&path).unwrap();
-        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let store = snapshots.clone();
         snapshots
@@ -6289,11 +6290,11 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn latest_viewport_reads_meta_and_rows_from_one_snapshot() {
+    #[tokio::test]
+    async fn latest_viewport_reads_meta_and_rows_from_one_snapshot() {
         let path = temp_store_path();
         let _writer = PersistentStore::open(&path).unwrap();
-        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let store = snapshots.clone();
         snapshots
@@ -6369,11 +6370,11 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn meta_gated_materialized_node_lookups_read_from_one_snapshot() {
+    #[tokio::test]
+    async fn meta_gated_materialized_node_lookups_read_from_one_snapshot() {
         let path = temp_store_path();
         let _writer = PersistentStore::open(&path).unwrap();
-        let snapshots = ConsoleGraphSnapshotStore::open(&path).unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let store = snapshots.clone();
         snapshots
