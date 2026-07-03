@@ -127,7 +127,7 @@ struct SqliteDatabaseInner {
     runtime: &'static Runtime,
     pool: AsyncSqlitePool<AsyncSqliteConnection>,
     ensure_wal: Arc<AtomicBool>,
-    initialization: Mutex<()>,
+    initialization: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -353,7 +353,7 @@ impl SqliteDatabase {
             runtime,
             pool,
             ensure_wal: ensure_wal_flag,
-            initialization: Mutex::new(()),
+            initialization: tokio::sync::Mutex::new(()),
         });
         let database = {
             let mut databases = databases
@@ -386,7 +386,7 @@ impl SqliteDatabase {
                 runtime,
                 pool,
                 ensure_wal: ensure_wal_flag,
-                initialization: Mutex::new(()),
+                initialization: tokio::sync::Mutex::new(()),
             }),
         };
         if ensure_wal {
@@ -456,16 +456,13 @@ impl SqliteDatabase {
         ensure_wal_journal_mode(&mut connection, &self.inner.database_path).await
     }
 
-    fn with_initialization_lock<T, F>(&self, operation: F) -> Result<T>
+    async fn with_initialization_lock<T, F, Fut>(&self, operation: F) -> Result<T>
     where
-        F: FnOnce() -> Result<T>,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>>,
     {
-        let _guard = self
-            .inner
-            .initialization
-            .lock()
-            .expect("SQLite database initialization lock poisoned");
-        operation()
+        let _guard = self.inner.initialization.lock().await;
+        operation().await
     }
 }
 
@@ -492,10 +489,13 @@ impl SqliteStore {
             sqlite_runtime()?,
             Self::new(path, StoreAccess::ReadWrite),
         )?;
-        store.database.with_initialization_lock(|| {
-            store.block_on(store.run_migrations())?;
-            store.block_on(store.load_or_initialize_state())
-        })?;
+        block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            store.database.with_initialization_lock(|| async {
+                store.run_migrations().await?;
+                store.load_or_initialize_state().await
+            }),
+        )?;
         Ok(store)
     }
 
@@ -515,10 +515,13 @@ impl SqliteStore {
             sqlite_runtime()?,
             Self::new(path, StoreAccess::ReadOnly),
         )?;
-        store.database.with_initialization_lock(|| {
-            store.block_on(store.ensure_current_schema())?;
-            store.block_on(store.ensure_root_exists())
-        })?;
+        block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            store.database.with_initialization_lock(|| async {
+                store.ensure_current_schema().await?;
+                store.ensure_root_exists().await
+            }),
+        )?;
         Ok(store)
     }
 
@@ -591,12 +594,13 @@ impl SqliteStore {
         ensure_existing_store_directory(path)?;
         let store = Self::new(path, StoreAccess::ReadOnly).await?;
         ensure_existing_database_file(&store.database_path)?;
-        let version = store.database.with_initialization_lock(|| {
-            store.block_on(async {
+        let version = store
+            .database
+            .with_initialization_lock(|| async {
                 let mut connection = store.connect().await?;
                 existing_schema_version(&mut connection, &store.database_path).await
             })
-        })?;
+            .await?;
         ensure!(
             version == SQLITE_SCHEMA_VERSION,
             CorruptedStoreSnafu {
@@ -669,13 +673,14 @@ impl SqliteGraphStore {
         ensure_existing_store_directory(path)?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path)?;
-        let root_id = store.database.with_initialization_lock(|| {
-            store.ensure_current_schema()?;
-            store.block_on(async {
+        let root_id = block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            store.database.with_initialization_lock(|| async {
+                store.ensure_current_schema()?;
                 let mut connection = store.connect().await?;
                 load_root_id(&mut connection, &store.database_path).await
-            })
-        })?;
+            }),
+        )?;
         Ok(Self { root_id, ..store })
     }
 
