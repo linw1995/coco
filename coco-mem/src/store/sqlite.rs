@@ -418,22 +418,40 @@ impl SqliteDatabase {
         P: FnOnce(StoreError) -> E + Send,
         M: FnOnce(diesel::result::Error) -> E + Send,
     {
-        let result = self.block_on(async {
-            let mut connection = match self.connection().await {
-                Ok(connection) => connection,
-                Err(error) => return Err(map_pool_error(error)),
-            };
-            match connection
-                .spawn_blocking(move |connection| Ok(operation(connection)))
-                .await
-            {
-                Ok(result) => Ok(result),
-                Err(error) => Err(map_connection_error(error)),
-            }
-        });
+        let result = self.block_on(self.with_sync_connection_in_sqlite(
+            operation,
+            map_pool_error,
+            map_connection_error,
+        ));
         match result {
             Ok(result) => result,
             Err(error) => Err(error),
+        }
+    }
+
+    async fn with_sync_connection_in_sqlite<T, E, F, P, M>(
+        &self,
+        operation: F,
+        map_pool_error: P,
+        map_connection_error: M,
+    ) -> std::result::Result<std::result::Result<T, E>, E>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(&mut SqliteConnection) -> std::result::Result<T, E> + Send + 'static,
+        P: FnOnce(StoreError) -> E + Send,
+        M: FnOnce(diesel::result::Error) -> E + Send,
+    {
+        let mut connection = match self.connection().await {
+            Ok(connection) => connection,
+            Err(error) => return Err(map_pool_error(error)),
+        };
+        match connection
+            .spawn_blocking(move |connection| Ok(operation(connection)))
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) => Err(map_connection_error(error)),
         }
     }
 
