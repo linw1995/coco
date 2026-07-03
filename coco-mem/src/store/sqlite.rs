@@ -977,7 +977,12 @@ fn reject_incomplete_legacy_json_store(path: &Path) -> Result<()> {
     }
 
     let database_path = sqlite_database_path(path);
-    if database_path.is_file() && fs_migration_complete_marker_exists(path)? {
+    if database_path.is_file()
+        && block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            fs_migration_complete_marker_exists(path),
+        )?
+    {
         return Ok(());
     }
 
@@ -987,17 +992,15 @@ fn reject_incomplete_legacy_json_store(path: &Path) -> Result<()> {
     .fail()
 }
 
-fn fs_migration_complete_marker_exists(path: &Path) -> Result<bool> {
+async fn fs_migration_complete_marker_exists(path: &Path) -> Result<bool> {
     let store = SqliteStore::new(path, StoreAccess::ReadOnly)?;
-    store.block_on(async {
-        let mut connection = store.connect().await?;
-        load_store_meta_bool(
-            &mut connection,
-            &store.database_path,
-            FS_MIGRATION_COMPLETE_META_KEY,
-        )
-        .await
-    })
+    let mut connection = store.connect().await?;
+    load_store_meta_bool(
+        &mut connection,
+        &store.database_path,
+        FS_MIGRATION_COMPLETE_META_KEY,
+    )
+    .await
 }
 
 async fn build_sqlite_pool(
