@@ -116,8 +116,12 @@ where
         self.notify_if_ok(self.inner.set_session_state(name, expected, next))
     }
 
-    fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
-        self.notify_if_ok(self.inner.rebase_session(name, patch))
+    async fn rebase_session<'a>(
+        &'a self,
+        name: &'a str,
+        patch: &'a SessionAnchorPatch,
+    ) -> StoreResult<String> {
+        self.notify_if_ok(self.inner.rebase_session(name, patch).await)
     }
 
     async fn handoff_session<'a>(

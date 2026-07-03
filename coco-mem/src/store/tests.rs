@@ -1241,7 +1241,7 @@ where
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
 }
 
-fn assert_rebase_session_rewrites_branch_chain_with_updated_config<F>()
+async fn assert_rebase_session_rewrites_branch_chain_with_updated_config<F>()
 where
     F: TestStoreFactory,
 {
@@ -1263,6 +1263,7 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     assert_ne!(new_head, child_id);
@@ -1291,7 +1292,7 @@ where
     );
 }
 
-fn assert_rebase_session_patch_system_prompt_rebuilds_branch_chain<F>()
+async fn assert_rebase_session_patch_system_prompt_rebuilds_branch_chain<F>()
 where
     F: TestStoreFactory,
 {
@@ -1311,6 +1312,7 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     let ancestry = store.ancestry("main").unwrap();
@@ -1329,7 +1331,7 @@ where
     assert_eq!(old_anchor.as_session().unwrap().system_prompt, "system");
 }
 
-fn assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes<F>()
+async fn assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes<F>()
 where
     F: TestStoreFactory,
 {
@@ -1352,6 +1354,7 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     let ancestry = store.ancestry("main").unwrap();
@@ -1366,7 +1369,7 @@ where
     assert_eq!(anchor.merge_parent_node_ids(), [session_id.as_str()]);
 }
 
-fn assert_rebase_session_keeps_other_branches_on_old_chain<F>()
+async fn assert_rebase_session_keeps_other_branches_on_old_chain<F>()
 where
     F: TestStoreFactory,
 {
@@ -1385,6 +1388,7 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(store.get_branch_head("draft").unwrap(), child_id);
@@ -1400,7 +1404,7 @@ where
     assert_eq!(draft_ancestry[1].id, session_id);
 }
 
-fn assert_rebase_session_requires_visible_session_anchor<F>()
+async fn assert_rebase_session_requires_visible_session_anchor<F>()
 where
     F: TestStoreFactory,
 {
@@ -1410,6 +1414,7 @@ where
 
     let err = store
         .rebase_session("main", &SessionAnchorPatch::default())
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -1418,7 +1423,7 @@ where
     ));
 }
 
-fn assert_rebase_session_preserves_created_at_across_rewritten_chain<F>()
+async fn assert_rebase_session_preserves_created_at_across_rewritten_chain<F>()
 where
     F: TestStoreFactory,
 {
@@ -1438,6 +1443,7 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     let ancestry = store.ancestry("main").unwrap();
@@ -2413,34 +2419,34 @@ macro_rules! define_common_store_tests {
                 assert_log_returns_branch_not_found_when_branch_is_missing::<$factory>();
             }
 
-            #[test]
-            fn rebase_session_rewrites_branch_chain_with_updated_config() {
-                assert_rebase_session_rewrites_branch_chain_with_updated_config::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_rewrites_branch_chain_with_updated_config() {
+                assert_rebase_session_rewrites_branch_chain_with_updated_config::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_patch_system_prompt_rebuilds_branch_chain() {
-                assert_rebase_session_patch_system_prompt_rebuilds_branch_chain::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_patch_system_prompt_rebuilds_branch_chain() {
+                assert_rebase_session_patch_system_prompt_rebuilds_branch_chain::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_keeps_merge_parents_pointing_to_original_nodes() {
-                assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_keeps_merge_parents_pointing_to_original_nodes() {
+                assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_keeps_other_branches_on_old_chain() {
-                assert_rebase_session_keeps_other_branches_on_old_chain::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_keeps_other_branches_on_old_chain() {
+                assert_rebase_session_keeps_other_branches_on_old_chain::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_requires_visible_session_anchor() {
-                assert_rebase_session_requires_visible_session_anchor::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_requires_visible_session_anchor() {
+                assert_rebase_session_requires_visible_session_anchor::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_preserves_created_at_across_rewritten_chain() {
-                assert_rebase_session_preserves_created_at_across_rewritten_chain::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_preserves_created_at_across_rewritten_chain() {
+                assert_rebase_session_preserves_created_at_across_rewritten_chain::<$factory>().await;
             }
 
             #[tokio::test]

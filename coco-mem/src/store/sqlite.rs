@@ -4347,8 +4347,12 @@ impl SessionStore for SqliteGraphStore {
         self.ensure_read_only()
     }
 
-    fn rebase_session(&self, _name: &str, _patch: &SessionAnchorPatch) -> Result<String> {
-        self.ensure_read_only()
+    fn rebase_session<'a>(
+        &'a self,
+        _name: &'a str,
+        _patch: &'a SessionAnchorPatch,
+    ) -> impl Future<Output = Result<String>> + Send + 'a {
+        std::future::ready(self.ensure_read_only())
     }
 
     async fn handoff_session<'a>(
@@ -4423,8 +4427,20 @@ impl SessionStore for SqliteStore {
         self.block_on(self.set_session_state_in_sqlite(name, expected, next))
     }
 
-    fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
-        self.block_on(self.rebase_session_in_sqlite(name, patch))
+    async fn rebase_session<'a>(
+        &'a self,
+        name: &'a str,
+        patch: &'a SessionAnchorPatch,
+    ) -> Result<String> {
+        let store = self.clone();
+        let name = name.to_owned();
+        let patch = patch.clone();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.rebase_session_in_sqlite(&name, &patch).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     async fn handoff_session<'a>(
@@ -5823,6 +5839,7 @@ mod tests {
                     ..SessionAnchorPatch::default()
                 },
             )
+            .await
             .unwrap();
         let handoff = store
             .handoff_session("main", &SessionAnchorPatch::default(), "next prompt")

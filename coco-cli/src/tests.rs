@@ -2442,6 +2442,7 @@ async fn session_handoff_refreshes_inherited_builtin_tool_definitions_by_default
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     run_with_backend(
@@ -2500,6 +2501,7 @@ async fn session_handoff_can_preserve_inherited_tool_definitions() {
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     run_with_backend(

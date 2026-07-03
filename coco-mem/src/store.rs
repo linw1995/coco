@@ -73,7 +73,11 @@ pub trait SessionStore {
     ) -> StoreResult<SessionState>;
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
-    fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+    fn rebase_session<'a>(
+        &'a self,
+        name: &'a str,
+        patch: &'a SessionAnchorPatch,
+    ) -> impl Future<Output = StoreResult<String>> + Send + 'a;
 
     /// Appends a new full session anchor to reset provider context for a branch.
     fn handoff_session<'a>(
@@ -357,8 +361,14 @@ impl SessionStore for PersistentStore {
         delegate_persistent_store!(self, store, store.set_session_state(name, expected, next))
     }
 
-    fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.rebase_session(name, patch))
+    async fn rebase_session<'a>(
+        &'a self,
+        name: &'a str,
+        patch: &'a SessionAnchorPatch,
+    ) -> StoreResult<String> {
+        match self {
+            Self::Sqlite(store) => store.rebase_session(name, patch).await,
+        }
     }
 
     async fn handoff_session<'a>(

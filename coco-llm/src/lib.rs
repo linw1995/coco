@@ -1335,6 +1335,7 @@ where
         let anchor_id = self
             .store
             .rebase_session(branch, &patch)
+            .await
             .context(MemorySnafu)?;
         tracing::info!(
             branch = %branch,
