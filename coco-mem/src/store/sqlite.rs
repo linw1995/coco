@@ -334,7 +334,7 @@ impl SqliteDatabase {
             let database = Self { inner };
             drop(databases);
             if ensure_wal {
-                database.request_wal_journal_mode()?;
+                database.block_on(database.request_wal_journal_mode())?;
             }
             return Ok(database);
         }
@@ -352,7 +352,7 @@ impl SqliteDatabase {
         databases.insert(database_path, Arc::downgrade(&inner));
         let database = Self { inner };
         if ensure_wal {
-            database.request_wal_journal_mode()?;
+            database.block_on(database.request_wal_journal_mode())?;
         }
         Ok(database)
     }
@@ -372,7 +372,7 @@ impl SqliteDatabase {
             }),
         };
         if ensure_wal {
-            database.request_wal_journal_mode()?;
+            database.block_on(database.request_wal_journal_mode())?;
         }
         Ok(database)
     }
@@ -432,12 +432,10 @@ impl SqliteDatabase {
         block_on_sqlite_runtime_with(self.inner.runtime, future)
     }
 
-    fn request_wal_journal_mode(&self) -> Result<()> {
+    async fn request_wal_journal_mode(&self) -> Result<()> {
         self.inner.ensure_wal.store(true, Ordering::SeqCst);
-        self.block_on(async {
-            let mut connection = self.connection().await?;
-            ensure_wal_journal_mode(&mut connection, &self.inner.database_path).await
-        })
+        let mut connection = self.connection().await?;
+        ensure_wal_journal_mode(&mut connection, &self.inner.database_path).await
     }
 
     fn with_initialization_lock<T, F>(&self, operation: F) -> Result<T>
