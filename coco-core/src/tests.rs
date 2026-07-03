@@ -1393,6 +1393,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
         .clone();
     store
         .set_job_status(&job_id, JobStatus::Queued, JobStatus::Running)
+        .await
         .unwrap();
 
     let job = store.list_jobs().await.unwrap();

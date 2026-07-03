@@ -6430,6 +6430,7 @@ async fn daemon_startup_resumes_incomplete_jobs() {
             coco_mem::JobStatus::Queued,
             coco_mem::JobStatus::Running,
         )
+        .await
         .unwrap();
 
     let llm = llm_with_test_provider_config(

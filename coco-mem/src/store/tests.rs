@@ -1584,10 +1584,12 @@ where
     let job = submit_prompt_job(&store, "main", "hello");
     let running = store
         .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .await
         .unwrap();
     assert!(running.finished_at.is_none());
     let finished = store
         .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+        .await
         .unwrap();
 
     assert!(finished.finished_at.is_some());
@@ -1660,7 +1662,7 @@ where
     ));
 }
 
-fn assert_set_job_status_rejects_invalid_transition<F>()
+async fn assert_set_job_status_rejects_invalid_transition<F>()
 where
     F: TestStoreFactory,
 {
@@ -1671,6 +1673,7 @@ where
 
     let err = store
         .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Finished)
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -1713,7 +1716,7 @@ where
     ));
 }
 
-fn assert_submit_job_allows_new_job_after_previous_job_finishes<F>()
+async fn assert_submit_job_allows_new_job_after_previous_job_finishes<F>()
 where
     F: TestStoreFactory,
 {
@@ -1723,9 +1726,11 @@ where
     let first = submit_prompt_job(&store, "main", "hello");
     store
         .set_job_status(&first.job_id, JobStatus::Queued, JobStatus::Running)
+        .await
         .unwrap();
     store
         .set_job_status(&first.job_id, JobStatus::Running, JobStatus::Finished)
+        .await
         .unwrap();
 
     let second = submit_prompt_job(&store, "main", "world");
@@ -2498,9 +2503,9 @@ macro_rules! define_common_store_tests {
                 assert_submit_job_rejects_active_work_branch::<$factory>();
             }
 
-            #[test]
-            fn set_job_status_rejects_invalid_transition() {
-                assert_set_job_status_rejects_invalid_transition::<$factory>();
+            #[tokio::test]
+            async fn set_job_status_rejects_invalid_transition() {
+                assert_set_job_status_rejects_invalid_transition::<$factory>().await;
             }
 
             #[test]
@@ -2508,9 +2513,9 @@ macro_rules! define_common_store_tests {
                 assert_submit_job_rejects_second_active_job_on_same_branch::<$factory>();
             }
 
-            #[test]
-            fn submit_job_allows_new_job_after_previous_job_finishes() {
-                assert_submit_job_allows_new_job_after_previous_job_finishes::<$factory>();
+            #[tokio::test]
+            async fn submit_job_allows_new_job_after_previous_job_finishes() {
+                assert_submit_job_allows_new_job_after_previous_job_finishes::<$factory>().await;
             }
 
             #[tokio::test]

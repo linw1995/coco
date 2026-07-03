@@ -557,11 +557,11 @@ where
         );
 
         if matches!(job.status, JobStatus::Queued) {
-            job = self.service.store().set_job_status(
-                job_id,
-                JobStatus::Queued,
-                JobStatus::Running,
-            )?;
+            job = self
+                .service
+                .store()
+                .set_job_status(job_id, JobStatus::Queued, JobStatus::Running)
+                .await?;
             self.service.notify_job_status_changed(job_id);
             tracing::info!(
                 job_id = %job.job_id,
@@ -795,11 +795,10 @@ where
         if matches!(job.status, JobStatus::Finished) {
             return Ok(());
         }
-        self.service.store().set_job_status(
-            &job.job_id,
-            JobStatus::Running,
-            JobStatus::Finished,
-        )?;
+        self.service
+            .store()
+            .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+            .await?;
         self.service.notify_job_status_changed(&job.job_id);
         tracing::info!(
             job_id = %job.job_id,

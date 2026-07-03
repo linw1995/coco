@@ -178,12 +178,12 @@ pub trait JobStore {
     fn list_jobs(&self) -> impl Future<Output = StoreResult<HashMap<String, Job>>> + Send + '_;
 
     /// Updates a prompt job lifecycle state when the current state matches.
-    fn set_job_status(
-        &self,
-        job_id: &str,
+    fn set_job_status<'a>(
+        &'a self,
+        job_id: &'a str,
         expected: JobStatus,
         next: JobStatus,
-    ) -> StoreResult<Job>;
+    ) -> impl Future<Output = StoreResult<Job>> + Send + 'a;
 
     /// Moves the current work branch for an unfinished prompt job.
     fn set_job_work_branch(
@@ -466,13 +466,15 @@ impl JobStore for PersistentStore {
         }
     }
 
-    fn set_job_status(
-        &self,
-        job_id: &str,
+    async fn set_job_status<'a>(
+        &'a self,
+        job_id: &'a str,
         expected: JobStatus,
         next: JobStatus,
     ) -> StoreResult<Job> {
-        delegate_persistent_store!(self, store, store.set_job_status(job_id, expected, next))
+        match self {
+            Self::Sqlite(store) => store.set_job_status(job_id, expected, next).await,
+        }
     }
 
     fn set_job_work_branch(

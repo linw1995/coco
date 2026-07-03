@@ -2914,6 +2914,7 @@ mod tests {
             .unwrap();
         store
             .set_job_status(&active_job.job_id, JobStatus::Queued, JobStatus::Running)
+            .await
             .unwrap();
         store
             .enqueue_message(

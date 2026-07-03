@@ -219,13 +219,13 @@ where
         self.inner.list_jobs().await
     }
 
-    fn set_job_status(
-        &self,
-        job_id: &str,
+    async fn set_job_status<'a>(
+        &'a self,
+        job_id: &'a str,
         expected: JobStatus,
         next: JobStatus,
     ) -> StoreResult<Job> {
-        self.notify_if_ok(self.inner.set_job_status(job_id, expected, next))
+        self.notify_if_ok(self.inner.set_job_status(job_id, expected, next).await)
     }
 
     fn set_job_work_branch(

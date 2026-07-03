@@ -4467,8 +4467,24 @@ impl JobStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn set_job_status(&self, job_id: &str, expected: JobStatus, next: JobStatus) -> Result<Job> {
-        self.block_on(self.set_job_status_in_sqlite(job_id, expected, next))
+    async fn set_job_status<'a>(
+        &'a self,
+        job_id: &'a str,
+        expected: JobStatus,
+        next: JobStatus,
+    ) -> Result<Job> {
+        let store = self.clone();
+        let job_id = job_id.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move {
+                store
+                    .set_job_status_in_sqlite(&job_id, expected, next)
+                    .await
+            })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn set_job_work_branch(
@@ -5789,6 +5805,7 @@ mod tests {
         assert_eq!(job.status, JobStatus::Queued);
         let job = store
             .set_job_status("job-test", JobStatus::Queued, JobStatus::Running)
+            .await
             .unwrap();
         assert_eq!(job.status, JobStatus::Running);
         assert_eq!(
