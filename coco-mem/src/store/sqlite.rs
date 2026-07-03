@@ -469,16 +469,20 @@ impl SqliteDatabase {
 impl SqliteStore {
     pub fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            Self::open_read_only_or_upgrade_schema_in_sqlite(path),
+        )
+    }
+
+    async fn open_read_only_or_upgrade_schema_in_sqlite(path: &Path) -> Result<Self> {
         if sqlite_database_path(path).is_file() {
-            if block_on_sqlite_runtime_with(
-                sqlite_runtime()?,
-                Self::sqlite_schema_requires_migration(path),
-            )? {
-                drop(Self::open(path)?);
+            if Self::sqlite_schema_requires_migration(path).await? {
+                drop(Self::open_in_sqlite(path).await?);
             }
-            return Self::open_read_only(path);
+            return Self::open_read_only_in_sqlite(path).await;
         }
-        Self::open_read_only(path)
+        Self::open_read_only_in_sqlite(path).await
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
