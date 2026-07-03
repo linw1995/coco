@@ -509,20 +509,21 @@ impl SqliteStore {
 
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        block_on_sqlite_runtime_with(sqlite_runtime()?, Self::open_read_only_in_sqlite(path))
+    }
+
+    async fn open_read_only_in_sqlite(path: &Path) -> Result<Self> {
         ensure_existing_store_directory(path)?;
-        block_on_sqlite_runtime_with(sqlite_runtime()?, reject_incomplete_legacy_json_store(path))?;
+        reject_incomplete_legacy_json_store(path).await?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
-        let store = block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            Self::new(path, StoreAccess::ReadOnly),
-        )?;
-        block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            store.database.with_initialization_lock(|| async {
+        let store = Self::new(path, StoreAccess::ReadOnly).await?;
+        store
+            .database
+            .with_initialization_lock(|| async {
                 store.ensure_current_schema().await?;
                 store.ensure_root_exists().await
-            }),
-        )?;
+            })
+            .await?;
         Ok(store)
     }
 
