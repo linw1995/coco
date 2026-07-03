@@ -505,11 +505,9 @@ impl SqliteStore {
         &self.database_path
     }
 
-    pub fn schema_version(&self) -> Result<i32> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            existing_schema_version(&mut connection, &self.database_path).await
-        })
+    pub async fn schema_version(&self) -> Result<i32> {
+        let mut connection = self.connect().await?;
+        existing_schema_version(&mut connection, &self.database_path).await
     }
 
     fn new(path: &Path, access: StoreAccess) -> Result<Self> {
@@ -4639,15 +4637,15 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn open_creates_sqlite_database_and_schema() {
+    #[tokio::test]
+    async fn open_creates_sqlite_database_and_schema() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
 
         let store = SqliteStore::open(&path).unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().await.unwrap(), 6);
     }
 
     #[test]
@@ -4792,15 +4790,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_read_only_accepts_current_schema() {
+    #[tokio::test]
+    async fn open_read_only_accepts_current_schema() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         SqliteStore::open(&path).unwrap();
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().await.unwrap(), 6);
     }
 
     #[test]
@@ -5145,8 +5143,8 @@ mod tests {
         assert!(matches!(err, crate::StoreError::StoreLocked { path: locked } if locked == path));
     }
 
-    #[test]
-    fn open_read_only_allows_store_locked_by_another_owner() {
+    #[tokio::test]
+    async fn open_read_only_allows_store_locked_by_another_owner() {
         use std::os::fd::AsRawFd;
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -5164,7 +5162,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().await.unwrap(), 6);
     }
 
     #[test]
@@ -5240,8 +5238,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_accepts_legacy_json_store_after_completed_sqlite_migration() {
+    #[tokio::test]
+    async fn open_accepts_legacy_json_store_after_completed_sqlite_migration() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5252,7 +5250,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(reopened.schema_version().unwrap(), 6);
+        assert_eq!(reopened.schema_version().await.unwrap(), 6);
     }
 
     #[test]
