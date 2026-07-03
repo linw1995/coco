@@ -4740,22 +4740,20 @@ mod tests {
             .unwrap()
     }
 
-    fn session_summary(store: &SqliteStore, branch: &str) -> SessionSummaryRow {
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            sessions::table
-                .filter(sessions::branch_name.eq(branch))
-                .select((
-                    sessions::state,
-                    sessions::target_branch,
-                    sessions::base_head_id,
-                    sessions::pause_reason,
-                    sessions::merged_anchor_id,
-                ))
-                .get_result::<SessionSummaryRow>(&mut connection)
-                .await
-                .unwrap()
-        })
+    async fn session_summary(store: &SqliteStore, branch: &str) -> SessionSummaryRow {
+        let mut connection = store.connect().await.unwrap();
+        sessions::table
+            .filter(sessions::branch_name.eq(branch))
+            .select((
+                sessions::state,
+                sessions::target_branch,
+                sessions::base_head_id,
+                sessions::pause_reason,
+                sessions::merged_anchor_id,
+            ))
+            .get_result::<SessionSummaryRow>(&mut connection)
+            .await
+            .unwrap()
     }
 
     fn job_summary(store: &SqliteStore, job_id: &str) -> JobSummaryRow {
@@ -5597,8 +5595,8 @@ mod tests {
         });
     }
 
-    #[test]
-    fn session_operations_persist_across_reopen() {
+    #[tokio::test]
+    async fn session_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5625,7 +5623,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            session_summary(&store, "main"),
+            session_summary(&store, "main").await,
             SessionSummaryRow {
                 state: "paused".to_owned(),
                 target_branch: Some(String::new()),
