@@ -306,11 +306,17 @@ impl std::fmt::Debug for SqliteDatabase {
 
 impl SqliteDatabase {
     pub fn open_store_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(sqlite_database_path(path.as_ref()), false)
+        block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            Self::open(sqlite_database_path(path.as_ref()), false),
+        )
     }
 
     pub fn open_writable_store_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(sqlite_database_path(path.as_ref()), true)
+        block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            Self::open(sqlite_database_path(path.as_ref()), true),
+        )
     }
 
     pub fn open_unshared_file_path(path: impl AsRef<Path>) -> Result<Self> {
@@ -321,33 +327,34 @@ impl SqliteDatabase {
     }
 
     fn open_writable_file_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(path.as_ref().to_owned(), true)
+        block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            Self::open(path.as_ref().to_owned(), true),
+        )
     }
 
-    fn open(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {
+    async fn open(database_path: PathBuf, ensure_wal: bool) -> Result<Self> {
         let database_path = sqlite_database_registry_path(&database_path)?;
         let databases = SQLITE_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut databases = databases
-            .lock()
-            .expect("SQLite database registry lock poisoned");
-        if let Some(inner) = databases
-            .get(&database_path)
-            .and_then(std::sync::Weak::upgrade)
-        {
-            let database = Self { inner };
-            drop(databases);
+        let existing = {
+            let databases = databases
+                .lock()
+                .expect("SQLite database registry lock poisoned");
+            databases
+                .get(&database_path)
+                .and_then(std::sync::Weak::upgrade)
+                .map(|inner| Self { inner })
+        };
+        if let Some(database) = existing {
             if ensure_wal {
-                database.block_on(database.request_wal_journal_mode())?;
+                database.request_wal_journal_mode().await?;
             }
             return Ok(database);
         }
 
         let runtime = sqlite_runtime()?;
         let ensure_wal_flag = Arc::new(AtomicBool::new(ensure_wal));
-        let pool = block_on_sqlite_runtime_with(
-            runtime,
-            build_sqlite_pool(&database_path, ensure_wal_flag.clone()),
-        )?;
+        let pool = build_sqlite_pool(&database_path, ensure_wal_flag.clone()).await?;
         let inner = Arc::new(SqliteDatabaseInner {
             database_path: database_path.clone(),
             runtime,
@@ -355,10 +362,22 @@ impl SqliteDatabase {
             ensure_wal: ensure_wal_flag,
             initialization: Mutex::new(()),
         });
-        databases.insert(database_path, Arc::downgrade(&inner));
-        let database = Self { inner };
+        let database = {
+            let mut databases = databases
+                .lock()
+                .expect("SQLite database registry lock poisoned");
+            if let Some(inner) = databases
+                .get(&database_path)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                Self { inner }
+            } else {
+                databases.insert(database_path, Arc::downgrade(&inner));
+                Self { inner }
+            }
+        };
         if ensure_wal {
-            database.block_on(database.request_wal_journal_mode())?;
+            database.request_wal_journal_mode().await?;
         }
         Ok(database)
     }
@@ -525,7 +544,10 @@ impl SqliteStore {
     ) -> Result<Self> {
         let database = match access {
             StoreAccess::ReadWrite => SqliteDatabase::open_writable_file_path(&database_path)?,
-            StoreAccess::ReadOnly => SqliteDatabase::open(database_path.clone(), false)?,
+            StoreAccess::ReadOnly => block_on_sqlite_runtime_with(
+                sqlite_runtime()?,
+                SqliteDatabase::open(database_path.clone(), false),
+            )?,
         };
         let lock_file = if access == StoreAccess::ReadWrite {
             Some(super::lock::open_store_lock(path)?)
@@ -672,7 +694,10 @@ impl SqliteGraphStore {
 
     fn new(path: &Path) -> Result<Self> {
         let database_path = sqlite_database_path(path);
-        let database = SqliteDatabase::open(database_path.clone(), false)?;
+        let database = block_on_sqlite_runtime_with(
+            sqlite_runtime()?,
+            SqliteDatabase::open(database_path.clone(), false),
+        )?;
         Ok(Self {
             dir: path.to_owned(),
             database_path,
