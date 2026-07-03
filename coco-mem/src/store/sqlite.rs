@@ -4711,17 +4711,15 @@ mod tests {
         (row.kind, row.anchor_kind)
     }
 
-    fn node_kind_json(store: &SqliteStore, node_id: &str) -> serde_json::Value {
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            let kind_json = nodes::table
-                .filter(nodes::id.eq(node_id))
-                .select(nodes::kind_json)
-                .get_result::<String>(&mut connection)
-                .await
-                .unwrap();
-            serde_json::from_str(&kind_json).unwrap()
-        })
+    async fn node_kind_json(store: &SqliteStore, node_id: &str) -> serde_json::Value {
+        let mut connection = store.connect().await.unwrap();
+        let kind_json = nodes::table
+            .filter(nodes::id.eq(node_id))
+            .select(nodes::kind_json)
+            .get_result::<String>(&mut connection)
+            .await
+            .unwrap();
+        serde_json::from_str(&kind_json).unwrap()
     }
 
     fn node_anchor_summary(store: &SqliteStore, node_id: &str) -> NodeAnchorSummaryRow {
@@ -5133,8 +5131,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn append_persists_node_anchor_summary() {
+    #[tokio::test]
+    async fn append_persists_node_anchor_summary() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5190,7 +5188,7 @@ mod tests {
                 anchor_skill_invocation_mode: None,
             }
         );
-        let session_kind_json = node_kind_json(&store, &session);
+        let session_kind_json = node_kind_json(&store, &session).await;
         assert_eq!(
             session_kind_json.pointer("/Anchor/payload/Session/role"),
             None
@@ -5223,7 +5221,7 @@ mod tests {
                 anchor_skill_invocation_mode: None,
             }
         );
-        let prompt_kind_json = node_kind_json(&store, &prompt);
+        let prompt_kind_json = node_kind_json(&store, &prompt).await;
         assert_eq!(
             prompt_kind_json.pointer("/Anchor/payload/Prompt/prompt"),
             None
