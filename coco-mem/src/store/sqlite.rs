@@ -490,7 +490,7 @@ impl SqliteStore {
             Self::new(path, StoreAccess::ReadWrite),
         )?;
         store.database.with_initialization_lock(|| {
-            store.run_migrations()?;
+            store.block_on(store.run_migrations())?;
             store.load_or_initialize_state()
         })?;
         Ok(store)
@@ -560,15 +560,13 @@ impl SqliteStore {
         })
     }
 
-    fn run_migrations(&self) -> Result<()> {
+    async fn run_migrations(&self) -> Result<()> {
         self.ensure_writable()?;
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            configure_writable_connection(&mut connection, &self.database_path).await?;
-            reject_unsupported_schema_version(&mut connection, &self.database_path).await?;
-            run_embedded_migrations(&mut connection, &self.database_path).await?;
-            Ok(())
-        })
+        let mut connection = self.connect().await?;
+        configure_writable_connection(&mut connection, &self.database_path).await?;
+        reject_unsupported_schema_version(&mut connection, &self.database_path).await?;
+        run_embedded_migrations(&mut connection, &self.database_path).await?;
+        Ok(())
     }
 
     fn ensure_current_schema(&self) -> Result<()> {
