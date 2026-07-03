@@ -4722,24 +4722,22 @@ mod tests {
         serde_json::from_str(&kind_json).unwrap()
     }
 
-    fn node_anchor_summary(store: &SqliteStore, node_id: &str) -> NodeAnchorSummaryRow {
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            nodes::table
-                .filter(nodes::id.eq(node_id))
-                .select((
-                    nodes::anchor_session_role,
-                    nodes::anchor_provider_profile,
-                    nodes::anchor_provider,
-                    nodes::anchor_model,
-                    nodes::anchor_prompt,
-                    nodes::anchor_skill_name,
-                    nodes::anchor_skill_invocation_mode,
-                ))
-                .get_result::<NodeAnchorSummaryRow>(&mut connection)
-                .await
-                .unwrap()
-        })
+    async fn node_anchor_summary(store: &SqliteStore, node_id: &str) -> NodeAnchorSummaryRow {
+        let mut connection = store.connect().await.unwrap();
+        nodes::table
+            .filter(nodes::id.eq(node_id))
+            .select((
+                nodes::anchor_session_role,
+                nodes::anchor_provider_profile,
+                nodes::anchor_provider,
+                nodes::anchor_model,
+                nodes::anchor_prompt,
+                nodes::anchor_skill_name,
+                nodes::anchor_skill_invocation_mode,
+            ))
+            .get_result::<NodeAnchorSummaryRow>(&mut connection)
+            .await
+            .unwrap()
     }
 
     fn session_summary(store: &SqliteStore, branch: &str) -> SessionSummaryRow {
@@ -5177,7 +5175,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            node_anchor_summary(&store, &session),
+            node_anchor_summary(&store, &session).await,
             NodeAnchorSummaryRow {
                 anchor_session_role: Some("runner".to_owned()),
                 anchor_provider_profile: Some("runner-profile".to_owned()),
@@ -5210,7 +5208,7 @@ mod tests {
             None
         );
         assert_eq!(
-            node_anchor_summary(&store, &prompt),
+            node_anchor_summary(&store, &prompt).await,
             NodeAnchorSummaryRow {
                 anchor_session_role: None,
                 anchor_provider_profile: None,
