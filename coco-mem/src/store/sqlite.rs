@@ -1162,6 +1162,12 @@ impl SqliteGraphStore {
         .await
     }
 
+    async fn get_branch_head_in_sqlite(&self, name: &str) -> Result<String> {
+        self.branch_head(name).await?.context(BranchNotFoundSnafu {
+            name: name.to_owned(),
+        })
+    }
+
     async fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
         let reference = reference.to_owned();
         let path = self.database_path.clone();
@@ -4296,12 +4302,7 @@ impl BranchStore for SqliteGraphStore {
     }
 
     fn get_branch_head(&self, name: &str) -> Result<String> {
-        let name = name.to_owned();
-        self.block_on(async move {
-            self.branch_head(&name).await?.context(BranchNotFoundSnafu {
-                name: name.to_owned(),
-            })
-        })
+        self.block_on(self.get_branch_head_in_sqlite(name))
     }
 
     fn delete_branch(&self, _name: &str) -> Result<()> {
