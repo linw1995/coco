@@ -925,6 +925,16 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         delete_preset_record_checked(&mut connection, &self.database_path, name).await
     }
+
+    async fn list_skills_in_sqlite(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
+        let mut connection = self.connect().await?;
+        Ok(load_skill_groups(&mut connection, &self.database_path)
+            .await?
+            .for_role(role)
+            .values()
+            .cloned()
+            .collect())
+    }
 }
 
 impl SqliteGraphStore {
@@ -4453,15 +4463,7 @@ impl PresetStore for SqliteStore {
 
 impl SkillStore for SqliteStore {
     fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            Ok(load_skill_groups(&mut connection, &self.database_path)
-                .await?
-                .for_role(role)
-                .values()
-                .cloned()
-                .collect())
-        })
+        self.block_on(self.list_skills_in_sqlite(role))
     }
 
     fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
