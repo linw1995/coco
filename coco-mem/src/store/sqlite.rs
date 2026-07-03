@@ -671,6 +671,11 @@ impl SqliteStore {
     async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
         self.database.connection().await
     }
+
+    async fn root_id_in_sqlite(&self) -> Result<String> {
+        let mut connection = self.connect().await?;
+        load_root_id(&mut connection, &self.database_path).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4043,12 +4048,8 @@ impl SessionStore for SqliteGraphStore {
 
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
-        self.block_on(async {
-            let mut connection = self.connect().await.expect("SQLite connection should open");
-            load_root_id(&mut connection, &self.database_path)
-                .await
-                .expect("SQLite root metadata should exist")
-        })
+        self.block_on(self.root_id_in_sqlite())
+            .expect("SQLite root metadata should exist")
     }
 
     fn append(&self, node: NewNode) -> Result<String> {
