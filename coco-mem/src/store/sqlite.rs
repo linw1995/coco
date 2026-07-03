@@ -4700,17 +4700,15 @@ mod tests {
             .unwrap()
     }
 
-    fn node_kinds(store: &SqliteStore, node_id: &str) -> (String, Option<String>) {
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            let row = nodes::table
-                .filter(nodes::id.eq(node_id))
-                .select((nodes::kind, nodes::anchor_kind))
-                .get_result::<NodeKindRow>(&mut connection)
-                .await
-                .unwrap();
-            (row.kind, row.anchor_kind)
-        })
+    async fn node_kinds(store: &SqliteStore, node_id: &str) -> (String, Option<String>) {
+        let mut connection = store.connect().await.unwrap();
+        let row = nodes::table
+            .filter(nodes::id.eq(node_id))
+            .select((nodes::kind, nodes::anchor_kind))
+            .get_result::<NodeKindRow>(&mut connection)
+            .await
+            .unwrap();
+        (row.kind, row.anchor_kind)
     }
 
     fn node_kind_json(store: &SqliteStore, node_id: &str) -> serde_json::Value {
@@ -5049,7 +5047,7 @@ mod tests {
 
         let relations = node_relation_rows(&store, &child).await;
 
-        assert_eq!(node_kinds(&store, &child), expected_node_kinds);
+        assert_eq!(node_kinds(&store, &child).await, expected_node_kinds);
         assert_eq!(relations.len(), 3);
         assert!(relations.contains(&NodeRelationRow {
             child_node_id: child.clone(),
