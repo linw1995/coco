@@ -98,7 +98,11 @@ pub trait PresetStore {
     ) -> impl Future<Output = StoreResult<PresetRecord>> + Send + 'a;
 
     /// Creates a new version for a preset under a preset name.
-    fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord>;
+    fn set_preset<'a>(
+        &'a self,
+        name: &'a str,
+        preset: Preset,
+    ) -> impl Future<Output = StoreResult<PresetRecord>> + Send + 'a;
 
     /// Creates a new version cloned from a previous preset version.
     fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord>;
@@ -356,8 +360,10 @@ impl PresetStore for PersistentStore {
         }
     }
 
-    fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord> {
-        delegate_persistent_store!(self, store, store.set_preset(name, preset))
+    async fn set_preset<'a>(&'a self, name: &'a str, preset: Preset) -> StoreResult<PresetRecord> {
+        match self {
+            Self::Sqlite(store) => store.set_preset(name, preset).await,
+        }
     }
 
     fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord> {

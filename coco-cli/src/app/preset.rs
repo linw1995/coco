@@ -51,7 +51,7 @@ where
     match command.command {
         PresetSubcommand::Set(command) => {
             let json = command.json;
-            let preset = run_preset_set(command, store, provider_profiles)?;
+            let preset = run_preset_set(command, store, provider_profiles).await?;
             Ok(Some(if json {
                 render_json(preset)
             } else {
@@ -96,7 +96,7 @@ where
     }
 }
 
-fn run_preset_set<S>(
+async fn run_preset_set<S>(
     command: PresetSetCommand,
     store: &S,
     provider_profiles: &ProviderProfiles,
@@ -106,7 +106,7 @@ where
 {
     let name = command.name.clone();
     let config = resolve_preset(command, provider_profiles)?;
-    let record = store.set_preset(&name, config).context(StoreSnafu)?;
+    let record = store.set_preset(&name, config).await.context(StoreSnafu)?;
     Ok(preset_summary_view(&record))
 }
 

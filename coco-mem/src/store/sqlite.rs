@@ -4554,8 +4554,15 @@ impl PresetStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
-        self.block_on(self.set_preset_in_sqlite(name, config))
+    async fn set_preset<'a>(&'a self, name: &'a str, config: Preset) -> Result<PresetRecord> {
+        let store = self.clone();
+        let name = name.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.set_preset_in_sqlite(&name, config).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
@@ -5841,9 +5848,15 @@ mod tests {
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
 
-        let first = store.set_preset("default", preset("gpt-5.4")).unwrap();
+        let first = store
+            .set_preset("default", preset("gpt-5.4"))
+            .await
+            .unwrap();
         assert_eq!(first.current_version, 1);
-        let second = store.set_preset("default", preset("gpt-5.5")).unwrap();
+        let second = store
+            .set_preset("default", preset("gpt-5.5"))
+            .await
+            .unwrap();
         assert_eq!(second.current_version, 2);
         let rolled_back = store.rollback_preset("default", 1).unwrap();
         assert_eq!(rolled_back.current_version, 3);

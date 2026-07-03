@@ -926,7 +926,7 @@ where
     let preset_name = "coding";
     let config = make_preset("gpt-5.4", SessionRole::Orchestrator);
 
-    let stored = store.set_preset(preset_name, config.clone()).unwrap();
+    let stored = store.set_preset(preset_name, config.clone()).await.unwrap();
 
     assert_eq!(stored.current_version, 1);
     assert_eq!(stored.current_preset(), Some(config.clone()));
@@ -963,10 +963,14 @@ where
             preset_name,
             make_preset("gpt-5.4", SessionRole::Orchestrator),
         )
+        .await
         .unwrap();
     let updated = make_preset("claude-sonnet-4-20250514", SessionRole::Runner);
 
-    let stored = store.set_preset(preset_name, updated.clone()).unwrap();
+    let stored = store
+        .set_preset(preset_name, updated.clone())
+        .await
+        .unwrap();
 
     assert_eq!(stored.current_version, 2);
     assert_eq!(stored.current_preset(), Some(updated.clone()));
@@ -990,8 +994,14 @@ where
     let preset_name = "coding";
     let original = make_preset("gpt-5.4", SessionRole::Orchestrator);
     let updated = make_preset("claude-sonnet-4-20250514", SessionRole::Runner);
-    store.set_preset(preset_name, original.clone()).unwrap();
-    store.set_preset(preset_name, updated.clone()).unwrap();
+    store
+        .set_preset(preset_name, original.clone())
+        .await
+        .unwrap();
+    store
+        .set_preset(preset_name, updated.clone())
+        .await
+        .unwrap();
 
     let rolled_back = store.rollback_preset(preset_name, 1).unwrap();
 
@@ -1018,6 +1028,7 @@ where
             preset_name,
             make_preset("gpt-5.4", SessionRole::Orchestrator),
         )
+        .await
         .unwrap();
 
     store.delete_preset(preset_name).unwrap();
@@ -1039,7 +1050,7 @@ where
     let preset_name = "coding";
     let config = make_preset("gpt-5.4", SessionRole::Orchestrator);
     store.fork("main", &root_id).unwrap();
-    store.set_preset(preset_name, config.clone()).unwrap();
+    store.set_preset(preset_name, config.clone()).await.unwrap();
 
     store.delete_branch("main").unwrap();
 

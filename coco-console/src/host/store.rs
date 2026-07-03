@@ -142,8 +142,8 @@ where
         self.inner.get_preset_record(name).await
     }
 
-    fn set_preset(&self, name: &str, config: Preset) -> StoreResult<PresetRecord> {
-        self.notify_if_ok(self.inner.set_preset(name, config))
+    async fn set_preset<'a>(&'a self, name: &'a str, config: Preset) -> StoreResult<PresetRecord> {
+        self.notify_if_ok(self.inner.set_preset(name, config).await)
     }
 
     fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord> {
