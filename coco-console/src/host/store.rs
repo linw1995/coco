@@ -97,7 +97,7 @@ where
 
 impl<S> SessionStore for ConsoleStore<S>
 where
-    S: SessionStore,
+    S: SessionStore + Sync,
 {
     fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>> {
         self.inner.list_session_states()
@@ -120,13 +120,13 @@ where
         self.notify_if_ok(self.inner.rebase_session(name, patch))
     }
 
-    fn handoff_session(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        prompt: &str,
+    async fn handoff_session<'a>(
+        &'a self,
+        name: &'a str,
+        patch: &'a SessionAnchorPatch,
+        prompt: &'a str,
     ) -> StoreResult<String> {
-        self.notify_if_ok(self.inner.handoff_session(name, patch, prompt))
+        self.notify_if_ok(self.inner.handoff_session(name, patch, prompt).await)
     }
 }
 

@@ -4351,11 +4351,11 @@ impl SessionStore for SqliteGraphStore {
         self.ensure_read_only()
     }
 
-    fn handoff_session(
-        &self,
-        _name: &str,
-        _patch: &SessionAnchorPatch,
-        _prompt: &str,
+    async fn handoff_session<'a>(
+        &'a self,
+        _name: &'a str,
+        _patch: &'a SessionAnchorPatch,
+        _prompt: &'a str,
     ) -> Result<String> {
         self.ensure_read_only()
     }
@@ -4427,13 +4427,26 @@ impl SessionStore for SqliteStore {
         self.block_on(self.rebase_session_in_sqlite(name, patch))
     }
 
-    fn handoff_session(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        prompt: &str,
+    async fn handoff_session<'a>(
+        &'a self,
+        name: &'a str,
+        patch: &'a SessionAnchorPatch,
+        prompt: &'a str,
     ) -> Result<String> {
-        self.block_on(self.handoff_session_in_sqlite(name, patch, prompt))
+        let store = self.clone();
+        let name = name.to_owned();
+        let patch = patch.clone();
+        let prompt = prompt.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move {
+                store
+                    .handoff_session_in_sqlite(&name, &patch, &prompt)
+                    .await
+            })
+            .await
+            .expect("SQLite store task should not panic")
     }
 }
 
@@ -5813,6 +5826,7 @@ mod tests {
             .unwrap();
         let handoff = store
             .handoff_session("main", &SessionAnchorPatch::default(), "next prompt")
+            .await
             .unwrap();
 
         let reopened = SqliteStore::open(&path).unwrap();

@@ -251,11 +251,11 @@ impl SessionStore for MaterializationSourceSnapshot {
         Self::read_only_error()
     }
 
-    fn handoff_session(
-        &self,
-        _name: &str,
-        _patch: &SessionAnchorPatch,
-        _prompt: &str,
+    async fn handoff_session<'a>(
+        &'a self,
+        _name: &'a str,
+        _patch: &'a SessionAnchorPatch,
+        _prompt: &'a str,
     ) -> coco_mem::StoreResult<String> {
         Self::read_only_error()
     }
@@ -6119,15 +6119,15 @@ mod tests {
             })
         }
 
-        fn handoff_session(
-            &self,
-            _name: &str,
-            _patch: &SessionAnchorPatch,
-            _prompt: &str,
-        ) -> coco_mem::StoreResult<String> {
-            Err(coco_mem::StoreError::StoreReadOnly {
+        fn handoff_session<'a>(
+            &'a self,
+            _name: &'a str,
+            _patch: &'a SessionAnchorPatch,
+            _prompt: &'a str,
+        ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
+            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            })
+            }))
         }
     }
 

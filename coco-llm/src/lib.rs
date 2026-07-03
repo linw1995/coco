@@ -1358,6 +1358,7 @@ where
         let anchor_id = self
             .store
             .handoff_session(branch, &patch, prompt)
+            .await
             .context(MemorySnafu)?;
         tracing::info!(
             branch = %branch,
@@ -1390,6 +1391,7 @@ where
         let anchor_id = self
             .store
             .handoff_session(branch, &patch, prompt)
+            .await
             .context(MemorySnafu)?;
         tracing::info!(
             branch = %branch,

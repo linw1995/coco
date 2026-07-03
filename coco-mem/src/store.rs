@@ -76,12 +76,12 @@ pub trait SessionStore {
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
 
     /// Appends a new full session anchor to reset provider context for a branch.
-    fn handoff_session(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        prompt: &str,
-    ) -> StoreResult<String>;
+    fn handoff_session<'a>(
+        &'a self,
+        name: &'a str,
+        patch: &'a SessionAnchorPatch,
+        prompt: &'a str,
+    ) -> impl Future<Output = StoreResult<String>> + Send + 'a;
 }
 
 /// Preset storage API.
@@ -361,13 +361,15 @@ impl SessionStore for PersistentStore {
         delegate_persistent_store!(self, store, store.rebase_session(name, patch))
     }
 
-    fn handoff_session(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        prompt: &str,
+    async fn handoff_session<'a>(
+        &'a self,
+        name: &'a str,
+        patch: &'a SessionAnchorPatch,
+        prompt: &'a str,
     ) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.handoff_session(name, patch, prompt))
+        match self {
+            Self::Sqlite(store) => store.handoff_session(name, patch, prompt).await,
+        }
     }
 }
 

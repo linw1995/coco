@@ -3667,6 +3667,7 @@ mod tests {
                 },
                 "day handoff",
             )
+            .await
             .unwrap();
 
         let config = super::derive_day_session_config(&store)

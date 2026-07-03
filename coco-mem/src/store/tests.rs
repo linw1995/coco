@@ -1446,7 +1446,7 @@ where
     assert_eq!(ancestry[2].id, root_id);
 }
 
-fn assert_handoff_session_appends_session_anchor_after_current_head<F>()
+async fn assert_handoff_session_appends_session_anchor_after_current_head<F>()
 where
     F: TestStoreFactory,
 {
@@ -1458,6 +1458,7 @@ where
 
     let new_head = store
         .handoff_session("main", &SessionAnchorPatch::default(), "handoff prompt")
+        .await
         .unwrap();
 
     assert_ne!(new_head, child_id);
@@ -1477,7 +1478,7 @@ where
     assert_eq!(ancestry[3].id, root_id);
 }
 
-fn assert_handoff_session_requires_visible_session_anchor<F>()
+async fn assert_handoff_session_requires_visible_session_anchor<F>()
 where
     F: TestStoreFactory,
 {
@@ -1487,6 +1488,7 @@ where
 
     let err = store
         .handoff_session("main", &SessionAnchorPatch::default(), "handoff prompt")
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -1495,7 +1497,7 @@ where
     ));
 }
 
-fn assert_handoff_session_rejects_empty_prompt<F>()
+async fn assert_handoff_session_rejects_empty_prompt<F>()
 where
     F: TestStoreFactory,
 {
@@ -1506,13 +1508,14 @@ where
 
     let err = store
         .handoff_session("main", &SessionAnchorPatch::default(), "  ")
+        .await
         .unwrap_err();
 
     assert!(matches!(err, Error::InvalidSessionHandoffPrompt));
     assert_eq!(store.get_branch_head("main").unwrap(), session_id);
 }
 
-fn assert_handoff_session_applies_session_patch<F>()
+async fn assert_handoff_session_applies_session_patch<F>()
 where
     F: TestStoreFactory,
 {
@@ -1532,6 +1535,7 @@ where
             },
             "handoff prompt",
         )
+        .await
         .unwrap();
 
     let node = store.get_node(&new_head).unwrap();
@@ -2439,24 +2443,24 @@ macro_rules! define_common_store_tests {
                 assert_rebase_session_preserves_created_at_across_rewritten_chain::<$factory>();
             }
 
-            #[test]
-            fn handoff_session_appends_session_anchor_after_current_head() {
-                assert_handoff_session_appends_session_anchor_after_current_head::<$factory>();
+            #[tokio::test]
+            async fn handoff_session_appends_session_anchor_after_current_head() {
+                assert_handoff_session_appends_session_anchor_after_current_head::<$factory>().await;
             }
 
-            #[test]
-            fn handoff_session_requires_visible_session_anchor() {
-                assert_handoff_session_requires_visible_session_anchor::<$factory>();
+            #[tokio::test]
+            async fn handoff_session_requires_visible_session_anchor() {
+                assert_handoff_session_requires_visible_session_anchor::<$factory>().await;
             }
 
-            #[test]
-            fn handoff_session_rejects_empty_prompt() {
-                assert_handoff_session_rejects_empty_prompt::<$factory>();
+            #[tokio::test]
+            async fn handoff_session_rejects_empty_prompt() {
+                assert_handoff_session_rejects_empty_prompt::<$factory>().await;
             }
 
-            #[test]
-            fn handoff_session_applies_session_patch() {
-                assert_handoff_session_applies_session_patch::<$factory>();
+            #[tokio::test]
+            async fn handoff_session_applies_session_patch() {
+                assert_handoff_session_applies_session_patch::<$factory>().await;
             }
 
             #[tokio::test]
