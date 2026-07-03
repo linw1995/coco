@@ -472,7 +472,7 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         prepare_store_directory(path)?;
-        reject_incomplete_legacy_json_store(path)?;
+        block_on_sqlite_runtime_with(sqlite_runtime()?, reject_incomplete_legacy_json_store(path))?;
         let store = Self::new(path, StoreAccess::ReadWrite)?;
         store.database.with_initialization_lock(|| {
             store.run_migrations()?;
@@ -491,7 +491,7 @@ impl SqliteStore {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         ensure_existing_store_directory(path)?;
-        reject_incomplete_legacy_json_store(path)?;
+        block_on_sqlite_runtime_with(sqlite_runtime()?, reject_incomplete_legacy_json_store(path))?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path, StoreAccess::ReadOnly)?;
         store.database.with_initialization_lock(|| {
@@ -968,7 +968,7 @@ fn ensure_existing_database_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn reject_incomplete_legacy_json_store(path: &Path) -> Result<()> {
+async fn reject_incomplete_legacy_json_store(path: &Path) -> Result<()> {
     let has_legacy_marker = LEGACY_JSON_STORE_MARKERS
         .iter()
         .any(|file_name| path.join(file_name).exists());
@@ -977,12 +977,7 @@ fn reject_incomplete_legacy_json_store(path: &Path) -> Result<()> {
     }
 
     let database_path = sqlite_database_path(path);
-    if database_path.is_file()
-        && block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            fs_migration_complete_marker_exists(path),
-        )?
-    {
+    if database_path.is_file() && fs_migration_complete_marker_exists(path).await? {
         return Ok(());
     }
 
