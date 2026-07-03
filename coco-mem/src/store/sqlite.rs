@@ -882,6 +882,15 @@ impl SqliteGraphStore {
         })
         .await
     }
+
+    async fn list_children_in_sqlite(&self, node_id: &str) -> Result<Vec<Node>> {
+        let node_id = node_id.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_child_nodes(connection, &path, &node_id).await })
+        })
+        .await
+    }
 }
 
 fn sqlite_database_path(path: &Path) -> PathBuf {
@@ -3949,11 +3958,7 @@ impl NodeStore for SqliteGraphStore {
     }
 
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
-        let node_id = node_id.to_owned();
-        let path = self.database_path.clone();
-        self.block_on(self.with_connection(move |connection| {
-            Box::pin(async move { load_child_nodes(connection, &path, &node_id).await })
-        }))
+        self.block_on(self.list_children_in_sqlite(node_id))
     }
 }
 
