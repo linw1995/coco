@@ -135,6 +135,7 @@ pub struct SqliteStore {
     dir: PathBuf,
     database_path: PathBuf,
     database: SqliteDatabase,
+    root_id: String,
     access: StoreAccess,
     _lock_file: Option<Arc<std::fs::File>>,
     _owned_directory: Option<Arc<OwnedStoreDirectory>>,
@@ -511,14 +512,15 @@ impl SqliteStore {
     async fn open_in_sqlite(path: &Path) -> Result<Self> {
         prepare_store_directory(path)?;
         reject_incomplete_legacy_json_store(path).await?;
-        let store = Self::new(path, StoreAccess::ReadWrite).await?;
-        store
+        let mut store = Self::new(path, StoreAccess::ReadWrite).await?;
+        let root_id = store
             .database
             .with_initialization_lock(|| async {
                 store.run_migrations().await?;
                 store.load_or_initialize_state().await
             })
             .await?;
+        store.root_id = root_id;
         Ok(store)
     }
 
@@ -538,14 +540,15 @@ impl SqliteStore {
         ensure_existing_store_directory(path)?;
         reject_incomplete_legacy_json_store(path).await?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
-        let store = Self::new(path, StoreAccess::ReadOnly).await?;
-        store
+        let mut store = Self::new(path, StoreAccess::ReadOnly).await?;
+        let root_id = store
             .database
             .with_initialization_lock(|| async {
                 store.ensure_current_schema().await?;
                 store.ensure_root_exists().await
             })
             .await?;
+        store.root_id = root_id;
         Ok(store)
     }
 
@@ -584,6 +587,7 @@ impl SqliteStore {
             dir: path.to_owned(),
             database_path: database_path.clone(),
             database,
+            root_id: String::new(),
             access,
             _lock_file: lock_file,
             _owned_directory: None,
@@ -656,7 +660,7 @@ impl SqliteStore {
         self.database.block_on(future)
     }
 
-    async fn load_or_initialize_state(&self) -> Result<()> {
+    async fn load_or_initialize_state(&self) -> Result<String> {
         let mut connection = self.connect().await?;
         if node_count(&mut connection, &self.database_path).await? == 0 {
             self.ensure_writable()?;
@@ -673,26 +677,20 @@ impl SqliteStore {
                 })
                 .await
                 .map_err(|error| error.into_store_error(&self.database_path))?;
-            return Ok(());
+            return Ok(root_id);
         }
-        load_root_id(&mut connection, &self.database_path).await?;
-        Ok(())
+        load_root_id(&mut connection, &self.database_path).await
     }
 
-    async fn ensure_root_exists(&self) -> Result<()> {
+    async fn ensure_root_exists(&self) -> Result<String> {
         let mut connection = self.connect().await?;
         let root_id = load_root_id(&mut connection, &self.database_path).await?;
         load_node_by_exact_id(&mut connection, &self.database_path, &root_id).await?;
-        Ok(())
+        Ok(root_id)
     }
 
     async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
         self.database.connection().await
-    }
-
-    async fn root_id_in_sqlite(&self) -> Result<String> {
-        let mut connection = self.connect().await?;
-        load_root_id(&mut connection, &self.database_path).await
     }
 
     async fn append_in_sqlite(&self, node: NewNode) -> Result<String> {
@@ -4371,8 +4369,7 @@ impl SessionStore for SqliteGraphStore {
 
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
-        self.block_on(self.root_id_in_sqlite())
-            .expect("SQLite root metadata should exist")
+        self.root_id.clone()
     }
 
     fn append(&self, node: NewNode) -> Result<String> {
