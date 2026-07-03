@@ -871,6 +871,16 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         dequeue_message_queue_item(&mut connection, &self.database_path, queue).await
     }
+
+    async fn peek_message_in_sqlite(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        let mut connection = self.connect().await?;
+        Ok(
+            load_queue_messages(&mut connection, &self.database_path, queue)
+                .await?
+                .into_iter()
+                .next(),
+        )
+    }
 }
 
 impl SqliteGraphStore {
@@ -4363,15 +4373,7 @@ impl MessageQueueStore for SqliteStore {
     }
 
     fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            Ok(
-                load_queue_messages(&mut connection, &self.database_path, queue)
-                    .await?
-                    .into_iter()
-                    .next(),
-            )
-        })
+        self.block_on(self.peek_message_in_sqlite(queue))
     }
 
     fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
