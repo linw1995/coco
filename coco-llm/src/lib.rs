@@ -4395,8 +4395,10 @@ mod tests {
     type FakeRunQueue =
         Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendRun, BackendError>>>>>;
 
-    fn test_store() -> SqliteStore {
-        SqliteStore::open_temporary().expect("temporary SQLite store should open")
+    async fn test_store() -> SqliteStore {
+        SqliteStore::open_temporary()
+            .await
+            .expect("temporary SQLite store should open")
     }
 
     #[derive(Clone)]
@@ -5185,7 +5187,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_session_appends_available_skills_to_system_prompt() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store, FakeBackend::with_responses(&[]));
         service
             .create_session(session_config("main"))
@@ -5234,7 +5236,7 @@ mod tests {
             "main",
             vec![Ok(turn), Ok(BackendTurn::finished("done"))],
         )]);
-        let store = test_store();
+        let store = test_store().await;
         let first_done = Arc::new(Notify::new());
         let release_second = Arc::new(Notify::new());
         let service = LlmService::builder(store.clone(), backend)
@@ -5312,7 +5314,7 @@ mod tests {
                 "main",
                 vec![Ok(turn), Ok(BackendTurn::finished("done"))],
             )]);
-            let store = SqliteStore::open(&store_path).unwrap();
+            let store = SqliteStore::open(&store_path).await.unwrap();
             let first_done = Arc::new(Notify::new());
             let release_second = Arc::new(Notify::new());
             let service = LlmService::builder(store, backend)
@@ -5337,7 +5339,7 @@ mod tests {
             assert_eq!(prompt.await.unwrap().unwrap().text, "done");
         }
 
-        let reopened = SqliteStore::open(&store_path).unwrap();
+        let reopened = SqliteStore::open(&store_path).await.unwrap();
         let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
         let session = service.resolve_session("main").await.unwrap();
         let tool_result_message = session
@@ -5390,7 +5392,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let store_path = temp_dir.path().join("store");
         {
-            let store = SqliteStore::open(&store_path).unwrap();
+            let store = SqliteStore::open(&store_path).await.unwrap();
             let service = LlmService::new(store.clone(), FakeBackend::with_turns(vec![]));
             service
                 .create_session(SessionConfig {
@@ -5444,7 +5446,7 @@ mod tests {
                 .unwrap();
         }
 
-        let reopened = SqliteStore::open(&store_path).unwrap();
+        let reopened = SqliteStore::open(&store_path).await.unwrap();
         let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
         let session = service.resolve_session("main").await.unwrap();
         let tool_result_message = session
@@ -5504,16 +5506,19 @@ mod tests {
     }
 
     fn context_node(role: Role, metadata: Option<NodeMetadata>, kind: Kind) -> coco_mem::Node {
-        let store = test_store();
-        let id = store
-            .append(NewNode {
-                parent: store.root_id(),
-                role,
-                metadata,
-                kind,
-            })
-            .expect("test node should be appended");
-        store.get_node(&id).expect("test node should exist")
+        static NODE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = format!(
+            "test-node-{}",
+            NODE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        coco_mem::Node {
+            id,
+            parent: "test-root".to_owned(),
+            created_at: "1970-01-01T00:00:00Z".parse().unwrap(),
+            role,
+            metadata,
+            kind,
+        }
     }
 
     fn node_execution_id(node: &coco_mem::Node) -> Option<&str> {
@@ -5588,18 +5593,18 @@ mod tests {
         assert_eq!(Provider::ChatGpt.as_str(), "chatgpt");
     }
 
-    #[test]
-    fn provider_auth_checks_are_enabled_only_for_rig_backend_by_default() {
-        let fake = LlmService::new(test_store(), FakeBackend::with_responses(&[]));
-        let rig = LlmService::new(test_store(), RigBackend::default());
+    #[tokio::test]
+    async fn provider_auth_checks_are_enabled_only_for_rig_backend_by_default() {
+        let fake = LlmService::new(test_store().await, FakeBackend::with_responses(&[]));
+        let rig = LlmService::new(test_store().await, RigBackend::default());
 
         assert!(!fake.enables_provider_auth_checks());
         assert!(rig.enables_provider_auth_checks());
     }
 
-    #[test]
-    fn chatgpt_auth_check_configs_include_only_chatgpt_profiles() {
-        let service = LlmService::builder(test_store(), FakeBackend::with_responses(&[]))
+    #[tokio::test]
+    async fn chatgpt_auth_check_configs_include_only_chatgpt_profiles() {
+        let service = LlmService::builder(test_store().await, FakeBackend::with_responses(&[]))
             .with_provider_configs(HashMap::from([
                 (
                     "openai".to_owned(),
@@ -6229,7 +6234,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_persists_execution_metadata_on_assistant_node() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -6260,7 +6265,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_profile_additional_params_apply_at_runtime() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello")])]);
         let calls = backend.calls.clone();
         let service = LlmService::builder(store, backend)
@@ -6386,7 +6391,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_profile_additional_params_do_not_leak_to_provider_override() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello")])]);
         let calls = backend.calls.clone();
         let service = LlmService::builder(store, backend)
@@ -6431,7 +6436,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_resolves_session_anchor_merge_parents() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let main_session = service
@@ -6472,7 +6477,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_with_provider_profile_persists_only_profile_name() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let mut config = session_config("main");
@@ -6494,7 +6499,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_turn_uses_previous_assistant_text_in_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("first"), Ok("second")])]);
         let service = LlmService::new(store, backend);
         service
@@ -6527,7 +6532,7 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_session_resets_provider_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("first"), Ok("second")])]);
         let service = LlmService::new(store, backend);
         service
@@ -6563,7 +6568,7 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_session_prompt_seeds_empty_context() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("continued")])]);
         let service = LlmService::new(store, backend);
         let mut config = session_config("main");
@@ -6589,7 +6594,7 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_session_refreshing_tools_refreshes_inherited_builtin_definitions() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let mut config = session_config("main");
@@ -6631,7 +6636,7 @@ mod tests {
     async fn skill_child_context_fixture(
         handoff: Option<String>,
     ) -> (LlmService<FakeBackend, SqliteStore>, String) {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
         let base_session = service
             .create_session(session_config("main"))
@@ -6764,7 +6769,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_completion_persists_failure_kind_but_not_prompt_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::failed("rate limited", vec![]))],
@@ -6810,7 +6815,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_keeps_session_config_without_importing_merge_parent_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[
             ("main", &[Ok("main answer"), Ok("merge answer")]),
             ("draft", &[Ok("draft answer")]),
@@ -6874,7 +6879,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_with_session_patch_appends_patch_anchor_without_truncating_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[
             ("main", &[Ok("main answer")]),
             ("runner", &[Ok("runner answer")]),
@@ -6952,7 +6957,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_advances_branch_head_to_completion_node() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("prompted")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -6982,7 +6987,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_uses_prompt_anchor_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("prompted")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -7020,7 +7025,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_can_retry_after_prompt_failure() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[
@@ -7072,7 +7077,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_can_continue_from_historical_reference() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("first"), Ok("resumed")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -7104,7 +7109,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_can_retry_reference_with_latest_branch_session() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[(
             "main",
             &[Err(BackendError::failed("rate limited")), Ok("recovered")],
@@ -7166,7 +7171,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_can_start_from_historical_reference_with_prompt() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("old head"), Ok("new head")])]);
         let service = LlmService::new(store.clone(), backend);
         let session = service
@@ -7212,7 +7217,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_branches_can_complete_concurrently() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_barrier(
             &[("main", "main"), ("draft", "draft")],
             Arc::new(Barrier::new(2)),
@@ -7242,7 +7247,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_pull_request_uses_target_head_as_base() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let base_session = service
@@ -7286,7 +7291,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_session_appends_target_prompt_anchor_and_pauses_source() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -7335,7 +7340,7 @@ mod tests {
 
     #[tokio::test]
     async fn feedback_appends_session_prompt_anchor_and_advances_base_head() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let base_session = service
@@ -7397,7 +7402,7 @@ mod tests {
 
     #[tokio::test]
     async fn feedback_rejects_source_behind_attached_base_head() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let base_session = service
@@ -7446,7 +7451,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebase_session_changes_defaults_for_future_turns() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello"), Ok("updated")])]);
         let calls = backend.calls.clone();
         let service = LlmService::new(store, backend);
@@ -7507,7 +7512,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebase_session_patch_system_prompt_rebuilds_session_anchor() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("updated")])]);
         let calls = backend.calls.clone();
         let service = LlmService::new(store.clone(), backend);
@@ -7551,7 +7556,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebase_session_keeps_sibling_branch_defaults_unchanged() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[
             ("main", &[Ok("main"), Ok("main updated")]),
             ("draft", &[Ok("draft")]),
@@ -7599,7 +7604,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_persists_tool_trace_before_final_assistant_text() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::succeeded_with_steps(
@@ -7678,7 +7683,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_persists_sibling_tool_calls_as_single_nodes() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::succeeded_with_steps(
@@ -7799,7 +7804,7 @@ mod tests {
                 .expect("assistant choice should be non-empty"),
         );
         let backend = FakeBackend::with_turns(vec![("main", vec![Ok(turn)])]);
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::builder(store.clone(), backend)
             .with_skill_search_executor(Arc::new(FakeSkillExecutor))
             .build();
@@ -7851,7 +7856,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_rejects_streamed_trace_head_without_terminal_text() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), StreamingInvalidTerminalTextBackend);
         service
             .create_session(session_config("main"))
@@ -7873,7 +7878,7 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_tool_trace_preserves_event_timestamps() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), StreamingBackend::new());
         service
             .create_session(session_config("main"))
@@ -7901,7 +7906,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_exposes_load_image_tool_definition_to_backend() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = ToolDefinitionRecorder::default();
         let calls = backend.calls.clone();
         let service = LlmService::new(store.clone(), backend);
@@ -7920,7 +7925,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_session_keeps_tool_entries_but_text_history_stays_text_only() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::succeeded_with_steps(
@@ -8421,7 +8426,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_exec_tool_result_appends_skill_result_fan_in() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
         let session = service
             .create_session(session_config("main"))
@@ -8477,7 +8482,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_write_stdin_tool_result_fans_in_original_exec_skill() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
         let session = service
             .create_session(session_config("main"))
@@ -8730,7 +8735,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_step_completion_uses_distinct_execution_ids_per_completion_call() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::succeeded_with_steps(
@@ -8818,7 +8823,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_completion_persists_partial_trace_as_orphan_chain() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::failed_with_steps(
@@ -8909,7 +8914,7 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_failure_keeps_branch_head_at_retry_point() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), StreamingFailBackend);
         service
             .create_session(session_config("main"))

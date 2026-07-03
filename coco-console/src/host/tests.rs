@@ -26,8 +26,10 @@ use crate::render::{
 };
 use crate::{ConsolePublisher, ConsoleStore};
 
-fn test_store() -> SqliteStore {
-    SqliteStore::open_temporary().expect("temporary SQLite store should open")
+async fn test_store() -> SqliteStore {
+    SqliteStore::open_temporary()
+        .await
+        .expect("temporary SQLite store should open")
 }
 
 #[derive(Default)]
@@ -254,9 +256,9 @@ fn apply_diff_node_keys(
     rendered
 }
 
-#[test]
-fn graph_snapshot_contains_primary_and_merge_edges() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_contains_primary_and_merge_edges() {
+    let store = test_store().await;
     let root = store.root_id();
     let left = store
         .append(NewNode {
@@ -467,9 +469,9 @@ fn provider_context_fragment_renders_default_or_missing_selection() {
     assert!(missing_context.contains("detail-missing"));
 }
 
-#[test]
-fn graph_snapshot_contains_shadow_parent_edges() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_contains_shadow_parent_edges() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -513,9 +515,9 @@ fn graph_snapshot_contains_shadow_parent_edges() {
     }));
 }
 
-#[test]
-fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -628,9 +630,9 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
     );
 }
 
-#[test]
-fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -806,9 +808,9 @@ fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
     );
 }
 
-#[test]
-fn node_details_include_nodes_from_same_provider_context() {
-    let store = test_store();
+#[tokio::test]
+async fn node_details_include_nodes_from_same_provider_context() {
+    let store = test_store().await;
     let root = store.root_id();
     let first_session = store
         .append(NewNode {
@@ -920,9 +922,9 @@ fn node_details_include_nodes_from_same_provider_context() {
     assert!(hidden_context.contains("class=\"provider-context-node selected\""));
 }
 
-#[test]
-fn provider_context_list_uses_one_head_to_context_start_path() {
-    let store = test_store();
+#[tokio::test]
+async fn provider_context_list_uses_one_head_to_context_start_path() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -1056,9 +1058,9 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
     assert!(!shared_hidden_context_from_review.contains("main hidden context"));
 }
 
-#[test]
-fn provider_context_id_stays_stable_when_branch_head_moves() {
-    let store = test_store();
+#[tokio::test]
+async fn provider_context_id_stays_stable_when_branch_head_moves() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -1125,9 +1127,9 @@ fn provider_context_id_stays_stable_when_branch_head_moves() {
     assert!(next_context.nodes.iter().any(|node| node.id == next_prompt));
 }
 
-#[test]
-fn provider_context_ids_preserve_unique_branch_names() {
-    let store = test_store();
+#[tokio::test]
+async fn provider_context_ids_preserve_unique_branch_names() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -1228,9 +1230,9 @@ fn provider_context_ids_preserve_unique_branch_names() {
     );
 }
 
-#[test]
-fn all_mode_provider_contexts_cover_older_visible_segments() {
-    let store = test_store();
+#[tokio::test]
+async fn all_mode_provider_contexts_cover_older_visible_segments() {
+    let store = test_store().await;
     let root = store.root_id();
     let first_session = store
         .append(NewNode {
@@ -1331,9 +1333,9 @@ fn snapshot_content<'a>(snapshot: &'a GraphSnapshot, node_id: &str) -> &'a str {
         .expect("node should be visible")
 }
 
-#[test]
-fn graph_snapshot_renders_content_for_visible_node_kinds() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_renders_content_for_visible_node_kinds() {
+    let store = test_store().await;
     let root = store.root_id();
     let mut empty_prompt_session_anchor = session_anchor();
     empty_prompt_session_anchor.prompt.clear();
@@ -2402,10 +2404,10 @@ fn streamed_graph_markup_escapes_dynamic_values() {
     assert!(!html.contains("<img src=x onerror=alert(1)>"));
 }
 
-#[test]
-fn console_store_notifies_after_successful_writes() {
+#[tokio::test]
+async fn console_store_notifies_after_successful_writes() {
     let publisher = ConsolePublisher::new();
-    let store = ConsoleStore::new(test_store(), publisher.clone());
+    let store = ConsoleStore::new(test_store().await, publisher.clone());
     let root = store.root_id();
 
     store
@@ -2427,7 +2429,7 @@ fn console_store_notifies_after_successful_writes() {
 #[tokio::test]
 async fn console_store_notifies_only_when_dequeue_removes_message() {
     let publisher = ConsolePublisher::new();
-    let store = ConsoleStore::new(test_store(), publisher.clone());
+    let store = ConsoleStore::new(test_store().await, publisher.clone());
 
     assert_eq!(store.dequeue_message("system").await.unwrap(), None);
     assert_eq!(publisher.current_version(), 0);
@@ -2447,7 +2449,7 @@ async fn console_store_notifies_only_when_dequeue_removes_message() {
 
 #[tokio::test]
 async fn console_store_lists_message_queues() {
-    let store = ConsoleStore::new(test_store(), ConsolePublisher::new());
+    let store = ConsoleStore::new(test_store().await, ConsolePublisher::new());
 
     store
         .enqueue_message("system", json!({"ok": true}))

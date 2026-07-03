@@ -491,9 +491,9 @@ impl SqliteStore {
         Self::open_read_only_in_sqlite(path).await
     }
 
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        block_on_sqlite_runtime_with(sqlite_runtime()?, Self::open_in_sqlite(path))
+        Self::open_in_sqlite(path).await
     }
 
     async fn open_in_sqlite(path: &Path) -> Result<Self> {
@@ -511,9 +511,9 @@ impl SqliteStore {
         Ok(store)
     }
 
-    pub fn open_temporary() -> Result<Self> {
+    pub async fn open_temporary() -> Result<Self> {
         let directory = Arc::new(create_temporary_store_directory());
-        let mut store = Self::open(&directory.path)?;
+        let mut store = Self::open(&directory.path).await?;
         store._owned_directory = Some(directory);
         Ok(store)
     }
@@ -5043,15 +5043,15 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
 
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
         assert_eq!(store.schema_version().await.unwrap(), 6);
     }
 
-    #[test]
-    fn open_temporary_removes_directory_after_last_store_drop() {
-        let store = SqliteStore::open_temporary().unwrap();
+    #[tokio::test]
+    async fn open_temporary_removes_directory_after_last_store_drop() {
+        let store = SqliteStore::open_temporary().await.unwrap();
         let path = store.store_path().to_owned();
         let clone = store.clone();
 
@@ -5062,12 +5062,12 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[test]
-    fn cloned_sqlite_store_shares_database_instance() {
+    #[tokio::test]
+    async fn cloned_sqlite_store_shares_database_instance() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
 
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let cloned = store.clone();
 
         assert!(std::ptr::eq(
@@ -5081,7 +5081,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
 
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let read_only = SqliteStore::open_read_only(&path).await.unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
         let lexical_read_only = SqliteStore::open_read_only(path.join(".")).await.unwrap();
@@ -5104,7 +5104,7 @@ mod tests {
     async fn graph_store_connection_contention_does_not_block_writer() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
         let graph_connection_database = graph.database.clone();
         let (graph_locked_tx, graph_locked_rx) = mpsc::channel();
@@ -5146,7 +5146,7 @@ mod tests {
     async fn sqlite_store_serializes_concurrent_writes_on_shared_database() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
 
         let handles = (0..8)
@@ -5192,7 +5192,7 @@ mod tests {
     async fn open_read_only_accepts_current_schema() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        SqliteStore::open(&path).unwrap();
+        SqliteStore::open(&path).await.unwrap();
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
@@ -5203,7 +5203,7 @@ mod tests {
     async fn append_persists_node_relations() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let primary_parent = store
             .append(NewNode {
@@ -5292,7 +5292,7 @@ mod tests {
     async fn append_persists_node_metadata_rows() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let single_metadata = BackendMetadata {
             execution_id: Some("execution-single".to_owned()),
@@ -5356,7 +5356,7 @@ mod tests {
     async fn append_persists_node_anchor_summary() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let session = store
             .append(NewNode {
@@ -5453,7 +5453,7 @@ mod tests {
     async fn graph_store_reads_children_from_node_relations() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let writer = SqliteStore::open(&path).unwrap();
+        let writer = SqliteStore::open(&path).await.unwrap();
         let root_id = writer.root_id();
         let child_id = writer
             .append(NewNode {
@@ -5500,7 +5500,7 @@ mod tests {
     async fn open_read_only_rejects_writes() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let writable = SqliteStore::open(&path).unwrap();
+        let writable = SqliteStore::open(&path).await.unwrap();
         let root_id = writable.root_id();
         drop(writable);
 
@@ -5519,8 +5519,8 @@ mod tests {
         assert!(reopened.list_children(&root_id).unwrap().is_empty());
     }
 
-    #[test]
-    fn open_rejects_store_locked_by_another_owner() {
+    #[tokio::test]
+    async fn open_rejects_store_locked_by_another_owner() {
         use std::os::fd::AsRawFd;
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -5536,7 +5536,7 @@ mod tests {
         let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(result, 0);
 
-        let err = SqliteStore::open(&path).unwrap_err();
+        let err = SqliteStore::open(&path).await.unwrap_err();
 
         assert!(matches!(err, crate::StoreError::StoreLocked { path: locked } if locked == path));
     }
@@ -5547,7 +5547,7 @@ mod tests {
 
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        SqliteStore::open(&path).unwrap();
+        SqliteStore::open(&path).await.unwrap();
         let lock_path = path.join("store.lock");
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
@@ -5592,14 +5592,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_rejects_old_diesel_schema_version() {
+    #[tokio::test]
+    async fn open_rejects_old_diesel_schema_version() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
         create_diesel_migration_metadata_for_test(&path, "00000000000005");
 
-        let err = SqliteStore::open(&path).unwrap_err();
+        let err = SqliteStore::open(&path).await.unwrap_err();
 
         assert!(
             err.to_string()
@@ -5607,15 +5607,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_rejects_legacy_json_store_without_creating_database() {
+    #[tokio::test]
+    async fn open_rejects_legacy_json_store_without_creating_database() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("meta.json"), "{}").unwrap();
         std::fs::write(path.join("nodes.jsonl"), "").unwrap();
 
-        let err = SqliteStore::open(&path).unwrap_err();
+        let err = SqliteStore::open(&path).await.unwrap_err();
 
         assert!(
             matches!(err, crate::StoreError::LegacyJsonStore { path: legacy } if legacy == path)
@@ -5623,15 +5623,15 @@ mod tests {
         assert!(!super::sqlite_database_path(&path).exists());
     }
 
-    #[test]
-    fn open_rejects_legacy_json_store_with_unmarked_sqlite_database() {
+    #[tokio::test]
+    async fn open_rejects_legacy_json_store_with_unmarked_sqlite_database() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        SqliteStore::open(&path).unwrap();
+        SqliteStore::open(&path).await.unwrap();
         std::fs::write(path.join("meta.json"), "{}").unwrap();
         std::fs::write(path.join("nodes.jsonl"), "").unwrap();
 
-        let err = SqliteStore::open(&path).unwrap_err();
+        let err = SqliteStore::open(&path).await.unwrap_err();
 
         assert!(
             matches!(err, crate::StoreError::LegacyJsonStore { path: legacy } if legacy == path)
@@ -5642,13 +5642,13 @@ mod tests {
     async fn open_accepts_legacy_json_store_after_completed_sqlite_migration() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         persist_store_meta_bool_for_test(&store, super::FS_MIGRATION_COMPLETE_META_KEY, true).await;
         drop(store);
         std::fs::write(path.join("meta.json"), "{}").unwrap();
         std::fs::write(path.join("nodes.jsonl"), "").unwrap();
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
 
         assert_eq!(reopened.schema_version().await.unwrap(), 6);
     }
@@ -5679,11 +5679,11 @@ mod tests {
         assert!(!super::sqlite_database_path(&path).exists());
     }
 
-    #[test]
-    fn append_persists_node_across_reopen() {
+    #[tokio::test]
+    async fn append_persists_node_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let child_id = store
             .append(NewNode {
@@ -5695,18 +5695,18 @@ mod tests {
             .unwrap();
         assert_eq!(store.list_children(&root_id).unwrap()[0].id, child_id);
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         let child = reopened.get_node(&child_id).unwrap();
 
         assert_eq!(child.parent, root_id);
         assert_eq!(reopened.list_children(&root_id).unwrap()[0].id, child_id);
     }
 
-    #[test]
-    fn reopened_store_supports_node_traversal() {
+    #[tokio::test]
+    async fn reopened_store_supports_node_traversal() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let first = store
             .append(NewNode {
@@ -5725,7 +5725,7 @@ mod tests {
             })
             .unwrap();
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
 
         let ancestry = reopened
             .ancestry(&second)
@@ -5751,7 +5751,7 @@ mod tests {
     async fn branch_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let first = store
             .append(NewNode {
@@ -5774,11 +5774,11 @@ mod tests {
         store.set_branch_head("main", &first, &second).unwrap();
         assert_eq!(store.get_branch_head("main").unwrap(), second);
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         assert_eq!(reopened.get_branch_head("main").unwrap(), second);
 
         reopened.delete_branch("main").await.unwrap();
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         assert!(reopened.get_branch_head("main").is_err());
     }
 
@@ -5786,7 +5786,7 @@ mod tests {
     async fn persist_session_nodes_rolls_back_node_when_branch_head_mismatch() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         store.fork("main", &root_id).unwrap();
         let node = Node::new(
@@ -5824,7 +5824,7 @@ mod tests {
     async fn session_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let session = store.append(session_anchor_node(&root_id)).unwrap();
         store.fork("main", &session).unwrap();
@@ -5874,7 +5874,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
 
         assert_eq!(reopened.get_branch_head("main").unwrap(), handoff);
         assert_eq!(
@@ -5892,7 +5892,7 @@ mod tests {
     async fn job_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let session = store.append(session_anchor_node(&root_id)).unwrap();
         store.fork("main", &session).unwrap();
@@ -5919,7 +5919,7 @@ mod tests {
             }
         );
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         let job = reopened.get_job("job-test").await.unwrap();
 
         assert_eq!(job.status, JobStatus::Running);
@@ -5931,7 +5931,7 @@ mod tests {
     async fn message_queue_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let first = store
             .enqueue_message("runner", serde_json::json!({"index": 1}))
             .await
@@ -5941,7 +5941,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         let messages = reopened.list_queue_messages("runner").await.unwrap();
         assert_eq!(messages[0].message_id, first.message_id);
         assert_eq!(messages[1].message_id, second.message_id);
@@ -5957,7 +5957,7 @@ mod tests {
 
         let dequeued = reopened.dequeue_message("runner").await.unwrap().unwrap();
         assert_eq!(dequeued.message_id, first.message_id);
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         let messages = reopened.list_queue_messages("runner").await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, second.message_id);
@@ -5967,7 +5967,7 @@ mod tests {
     async fn message_queue_preserves_insert_order_for_equal_timestamps() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let created_at = "2026-01-01T00:00:00Z".parse().unwrap();
         let first = MessageQueueItem {
             message_id: "z-first".to_owned(),
@@ -5989,7 +5989,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         let messages = reopened.list_queue_messages("runner").await.unwrap();
 
         assert_eq!(messages[0].message_id, first.message_id);
@@ -6000,7 +6000,7 @@ mod tests {
     async fn message_queue_sorts_by_parsed_timestamp() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         let first = MessageQueueItem {
             message_id: "first".to_owned(),
             queue: "runner".to_owned(),
@@ -6021,7 +6021,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         let messages = reopened.list_queue_messages("runner").await.unwrap();
 
         assert_eq!(messages[0].message_id, first.message_id);
@@ -6032,7 +6032,7 @@ mod tests {
     async fn preset_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
 
         let first = store
             .set_preset("default", preset("gpt-5.4"))
@@ -6047,7 +6047,7 @@ mod tests {
         let rolled_back = store.rollback_preset("default", 1).await.unwrap();
         assert_eq!(rolled_back.current_version, 3);
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         let record = reopened.get_preset_record("default").await.unwrap();
 
         assert_eq!(record.current_version, 3);
@@ -6058,7 +6058,7 @@ mod tests {
     async fn skill_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        let store = SqliteStore::open(&path).unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
         assert!(
             store
                 .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
@@ -6098,7 +6098,7 @@ mod tests {
             .unwrap();
         assert_eq!(rolled_back.current_version, 3);
 
-        let reopened = SqliteStore::open(&path).unwrap();
+        let reopened = SqliteStore::open(&path).await.unwrap();
         let record = reopened
             .get_skill(SessionRole::Runner, "custom-runner")
             .await

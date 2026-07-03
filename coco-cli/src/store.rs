@@ -11,8 +11,8 @@ use crate::{
 use coco_mem::PersistentStore;
 
 #[cfg(test)]
-pub fn open_store(path: &Path) -> Result<PersistentStore> {
-    PersistentStore::open(path).context(StoreSnafu)
+pub async fn open_store(path: &Path) -> Result<PersistentStore> {
+    PersistentStore::open(path).await.context(StoreSnafu)
 }
 
 pub async fn open_store_for_command(path: &Path, command: &Command) -> Result<PersistentStore> {
@@ -22,7 +22,7 @@ pub async fn open_store_for_command(path: &Path, command: &Command) -> Result<Pe
             .context(StoreSnafu);
     }
 
-    PersistentStore::open(path).context(StoreSnafu)
+    PersistentStore::open(path).await.context(StoreSnafu)
 }
 
 fn command_is_read_only(command: &Command) -> bool {

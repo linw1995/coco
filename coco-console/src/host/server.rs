@@ -1037,8 +1037,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
 
-    fn test_store() -> SqliteStore {
-        SqliteStore::open_temporary().expect("temporary SQLite store should open")
+    async fn test_store() -> SqliteStore {
+        SqliteStore::open_temporary()
+            .await
+            .expect("temporary SQLite store should open")
     }
 
     fn test_config() -> ConsoleConfig {
@@ -1129,9 +1131,12 @@ mod tests {
     }
 
     async fn response_bytes_from(bytes: &[u8]) -> Vec<u8> {
-        let handle =
-            start_console_server(test_config(), test_store(), crate::ConsolePublisher::new())
-                .unwrap();
+        let handle = start_console_server(
+            test_config(),
+            test_store().await,
+            crate::ConsolePublisher::new(),
+        )
+        .unwrap();
         let mut client = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         client.write_all(bytes).await.unwrap();
         let mut response = Vec::new();
@@ -1148,9 +1153,12 @@ mod tests {
 
     #[tokio::test]
     async fn start_console_server_accepts_requests() {
-        let handle =
-            start_console_server(test_config(), test_store(), crate::ConsolePublisher::new())
-                .unwrap();
+        let handle = start_console_server(
+            test_config(),
+            test_store().await,
+            crate::ConsolePublisher::new(),
+        )
+        .unwrap();
         let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         stream
             .write_all(get_request("/style.css").as_bytes())
@@ -1185,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn write_event_stream_writes_initial_and_changed_events() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let handle = start_console_server(test_config(), store.clone(), publisher.clone()).unwrap();
         let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         stream
@@ -1236,7 +1244,7 @@ mod tests {
     #[tokio::test]
     async fn versioned_viewport_items_diff_waits_past_empty_known_diff() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let root = store.root_id();
         store.fork("main", &root).unwrap();
         let first = store
@@ -1286,7 +1294,7 @@ mod tests {
     #[tokio::test]
     async fn versioned_viewport_items_diff_returns_known_payload_changes() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let root = store.root_id();
         let first = store
             .append(NewNode {
@@ -1329,7 +1337,7 @@ mod tests {
     #[tokio::test]
     async fn versioned_viewport_items_diff_waits_for_newer_version() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let viewport = GraphViewportRequest::default();
         let state = app_state(store, publisher.clone());
         let snapshot = state.cache.current_snapshot(GraphMode::All).await;
@@ -1363,7 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn viewport_diff_returns_immediate_patch_even_with_version_query() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let root = store.root_id();
         store.fork("main", &root).unwrap();
         let version = publisher.current_version();
@@ -1467,7 +1475,8 @@ mod tests {
     #[tokio::test]
     async fn versioned_fragment_waits_for_newer_version() {
         let publisher = ConsolePublisher::new();
-        let handle = start_console_server(test_config(), test_store(), publisher.clone()).unwrap();
+        let handle =
+            start_console_server(test_config(), test_store().await, publisher.clone()).unwrap();
         let mut initial = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         initial
             .write_all(b"GET /fragment HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
@@ -1644,13 +1653,13 @@ mod tests {
     #[tokio::test]
     async fn graph_json_schedules_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         writer.fork("main", &writer.root_id()).unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
@@ -1673,7 +1682,7 @@ mod tests {
     #[tokio::test]
     async fn graph_json_ignores_cached_full_snapshot_in_materialized_mode() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
@@ -1689,7 +1698,7 @@ mod tests {
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
@@ -1713,7 +1722,7 @@ mod tests {
     #[tokio::test]
     async fn index_page_uses_mode_specific_loading_version() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
@@ -1729,7 +1738,7 @@ mod tests {
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
@@ -1877,13 +1886,13 @@ mod tests {
     #[tokio::test]
     async fn fragment_schedules_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         writer.fork("main", &writer.root_id()).unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
@@ -1905,7 +1914,7 @@ mod tests {
     #[tokio::test]
     async fn fragment_uses_materialized_shell_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -1934,7 +1943,7 @@ mod tests {
         writer.set_branch_head("main", &session, &prompt).unwrap();
         publisher.mark_changed();
         let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
@@ -1945,7 +1954,7 @@ mod tests {
 
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
@@ -1994,7 +2003,7 @@ mod tests {
     #[tokio::test]
     async fn node_detail_uses_materialized_facts_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         writer.fork("main", &root).unwrap();
@@ -2010,7 +2019,7 @@ mod tests {
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
@@ -2033,7 +2042,7 @@ mod tests {
     #[tokio::test]
     async fn node_detail_reads_hidden_context_node_incrementally() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -2071,7 +2080,7 @@ mod tests {
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
@@ -2098,7 +2107,7 @@ mod tests {
     #[tokio::test]
     async fn node_detail_ignores_hidden_node_outside_current_materialized_context() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -2136,7 +2145,7 @@ mod tests {
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher.clone(),
                 path.clone(),
             )
@@ -2188,13 +2197,13 @@ mod tests {
     #[tokio::test]
     async fn provider_context_default_avoids_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         writer.fork("main", &writer.root_id()).unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
@@ -2219,7 +2228,7 @@ mod tests {
     #[tokio::test]
     async fn provider_context_uses_materialized_facts_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -2256,7 +2265,7 @@ mod tests {
         writer.set_branch_head("main", &session, &prompt).unwrap();
         publisher.mark_changed();
         let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
@@ -2267,7 +2276,7 @@ mod tests {
 
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )

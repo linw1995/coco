@@ -5967,8 +5967,10 @@ mod tests {
 
     use coco_mem::{NewNode, NodeStore, PersistentStore, Role, SqliteStore};
 
-    fn test_store() -> SqliteStore {
-        SqliteStore::open_temporary().expect("temporary SQLite store should open")
+    async fn test_store() -> SqliteStore {
+        SqliteStore::open_temporary()
+            .await
+            .expect("temporary SQLite store should open")
     }
 
     struct BranchAdvanceDuringWalkStore {
@@ -5980,8 +5982,8 @@ mod tests {
     }
 
     impl BranchAdvanceDuringWalkStore {
-        fn new() -> Self {
-            let memory = test_store();
+        async fn new() -> Self {
+            let memory = test_store().await;
             let root = memory.get_node(&memory.root_id()).unwrap();
             let old_head = Node::new(
                 root.id.clone(),
@@ -6158,9 +6160,9 @@ mod tests {
         path
     }
 
-    #[test]
-    fn materialization_source_snapshot_captures_branch_heads_before_node_walk() {
-        let store = BranchAdvanceDuringWalkStore::new();
+    #[tokio::test]
+    async fn materialization_source_snapshot_captures_branch_heads_before_node_walk() {
+        let store = BranchAdvanceDuringWalkStore::new().await;
 
         let snapshot = MaterializationSourceSnapshot::from_store(
             &store,
@@ -6176,7 +6178,7 @@ mod tests {
     #[tokio::test]
     async fn failed_batch_seed_clears_committed_facts_and_restores_empty_meta() {
         let path = temp_store_path();
-        let _writer = PersistentStore::open(&path).unwrap();
+        let _writer = PersistentStore::open(&path).await.unwrap();
         let snapshots = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let store = snapshots.clone();
@@ -6240,7 +6242,7 @@ mod tests {
     #[tokio::test]
     async fn direct_materialized_node_lookups_ignore_rows_without_meta() {
         let path = temp_store_path();
-        let _writer = PersistentStore::open(&path).unwrap();
+        let _writer = PersistentStore::open(&path).await.unwrap();
         let snapshots = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let store = snapshots.clone();
@@ -6293,7 +6295,7 @@ mod tests {
     #[tokio::test]
     async fn latest_viewport_reads_meta_and_rows_from_one_snapshot() {
         let path = temp_store_path();
-        let _writer = PersistentStore::open(&path).unwrap();
+        let _writer = PersistentStore::open(&path).await.unwrap();
         let snapshots = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let store = snapshots.clone();
@@ -6373,7 +6375,7 @@ mod tests {
     #[tokio::test]
     async fn meta_gated_materialized_node_lookups_read_from_one_snapshot() {
         let path = temp_store_path();
-        let _writer = PersistentStore::open(&path).unwrap();
+        let _writer = PersistentStore::open(&path).await.unwrap();
         let snapshots = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let store = snapshots.clone();
@@ -6455,9 +6457,9 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn visible_skill_invocation_linear_subtrees_handles_deep_chain() {
-        let store = test_store();
+    #[tokio::test]
+    async fn visible_skill_invocation_linear_subtrees_handles_deep_chain() {
+        let store = test_store().await;
         let source_id = store.root_id();
         let depth = 20_000;
         let mut node_ids = Vec::with_capacity(depth);

@@ -809,8 +809,9 @@ mod tests {
 
     use super::*;
 
-    fn test_store() -> coco_llm::coco_mem::SqliteStore {
+    async fn test_store() -> coco_llm::coco_mem::SqliteStore {
         coco_llm::coco_mem::SqliteStore::open_temporary()
+            .await
             .expect("temporary SQLite store should open")
     }
 
@@ -886,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_skills_finds_store_matches_by_name_and_description() {
-        let store = test_store();
+        let store = test_store().await;
         store
             .add_skill(
                 SessionRole::Orchestrator,
@@ -931,7 +932,7 @@ description: "External skill."
 "#,
         )
         .unwrap();
-        let store = test_store();
+        let store = test_store().await;
 
         let result = search_skills(
             root.path(),
@@ -948,7 +949,7 @@ description: "External skill."
 
     #[tokio::test]
     async fn collect_store_skills_respects_role_hierarchy() {
-        let store = test_store();
+        let store = test_store().await;
 
         let runner = collect_store_skills(&store, SessionRole::Runner)
             .await
@@ -983,7 +984,7 @@ description: "External skill."
 
     #[tokio::test]
     async fn collect_store_skills_prefers_current_role_on_name_conflict() {
-        let store = test_store();
+        let store = test_store().await;
         for role in [SessionRole::Orchestrator, SessionRole::Runner] {
             store
                 .add_skill(

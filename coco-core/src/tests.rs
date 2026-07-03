@@ -29,8 +29,10 @@ use crate::{
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
-fn test_store() -> SqliteStore {
-    SqliteStore::open_temporary().expect("temporary SQLite store should open")
+async fn test_store() -> SqliteStore {
+    SqliteStore::open_temporary()
+        .await
+        .expect("temporary SQLite store should open")
 }
 
 fn append_skill_invocation_node<S>(store: &S, parent: &str, skill_name: &str) -> String
@@ -297,7 +299,7 @@ async fn submit_prompt_job(
 
 #[tokio::test]
 async fn core_service_routes_message_to_engine() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("hello from llm")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -316,7 +318,7 @@ async fn core_service_routes_message_to_engine() {
 
 #[tokio::test]
 async fn core_service_telegram_prompt_requires_completing_request_before_reply() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -356,7 +358,7 @@ async fn core_service_telegram_prompt_requires_completing_request_before_reply()
 
 #[tokio::test]
 async fn core_service_telegram_prompt_includes_image_attachments() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let mut config = session_config("main");
@@ -409,7 +411,7 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
 
 #[tokio::test]
 async fn core_service_telegram_prompt_omits_load_image_when_tool_is_unavailable() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -443,7 +445,7 @@ async fn core_service_telegram_prompt_omits_load_image_when_tool_is_unavailable(
 
 #[tokio::test]
 async fn core_service_telegram_prompt_includes_voice_attachments() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -487,7 +489,7 @@ async fn core_service_telegram_prompt_includes_voice_attachments() {
 
 #[tokio::test]
 async fn core_service_returns_missing_session() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let service = CoreService::new(
@@ -505,7 +507,7 @@ async fn core_service_returns_missing_session() {
 
 #[tokio::test]
 async fn core_service_returns_branch_resolution_error_context() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let service = CoreService::new(FailingResolver, ConversationEngine::new(llm));
@@ -527,7 +529,7 @@ async fn core_service_returns_branch_resolution_error_context() {
 
 #[tokio::test]
 async fn llm_engine_calls_prompt_and_returns_text() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("hello from llm")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -548,7 +550,7 @@ async fn llm_engine_calls_prompt_and_returns_text() {
 
 #[tokio::test]
 async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("runner", &[Ok("runner done")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let main_session = llm.create_session(session_config("main")).await.unwrap();
@@ -590,7 +592,7 @@ async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
 
 #[tokio::test]
 async fn llm_engine_rejects_second_active_job_on_same_branch() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -611,7 +613,7 @@ async fn llm_engine_rejects_second_active_job_on_same_branch() {
 
 #[tokio::test]
 async fn llm_engine_branch_lock_uses_service_lock() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let engine = ConversationEngine::new(llm.clone());
@@ -646,7 +648,7 @@ async fn llm_engine_branch_lock_uses_service_lock() {
 
 #[tokio::test]
 async fn llm_engine_coalesces_duplicate_drive_job_calls() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -689,7 +691,7 @@ async fn llm_engine_coalesces_duplicate_drive_job_calls() {
 
 #[tokio::test]
 async fn llm_engine_join_job_waits_for_idle_job_without_starting_it() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -714,7 +716,7 @@ async fn llm_engine_join_job_waits_for_idle_job_without_starting_it() {
 
 #[tokio::test]
 async fn llm_engine_join_job_waits_for_later_driver_notification() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -755,7 +757,7 @@ async fn llm_engine_join_job_waits_for_later_driver_notification() {
 
 #[tokio::test]
 async fn llm_engine_join_job_observes_driver_from_another_engine_instance() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -799,7 +801,7 @@ async fn llm_engine_join_job_observes_driver_from_another_engine_instance() {
 
 #[tokio::test]
 async fn llm_engine_join_job_waits_for_inflight_job() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -841,7 +843,7 @@ async fn llm_engine_join_job_waits_for_inflight_job() {
 
 #[tokio::test]
 async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[(
         "main",
         &[Err(BackendError::Failed {
@@ -878,7 +880,7 @@ async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
 
 #[tokio::test]
 async fn llm_engine_retries_job_from_before_failure_node() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("recovered")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -909,7 +911,7 @@ async fn llm_engine_retries_job_from_before_failure_node() {
 
 #[tokio::test]
 async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = ModelGateBackend::new("good-model");
     let calls = backend.calls.clone();
     let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -948,7 +950,7 @@ async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session(
 
 #[tokio::test]
 async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_event() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[(
         "main",
         &[Err(BackendError::Failed {
@@ -986,7 +988,7 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
 
 #[tokio::test]
 async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -1013,7 +1015,7 @@ async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
 
 #[tokio::test]
 async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root_branch() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[
         (
             "main",
@@ -1116,7 +1118,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
 
 #[tokio::test]
 async fn llm_engine_finishes_job_when_recovery_restore_fails() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[
         (
             "main",
@@ -1171,7 +1173,7 @@ async fn llm_engine_finishes_job_when_recovery_restore_fails() {
 
 #[tokio::test]
 async fn llm_engine_maps_missing_session_error() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let engine = ConversationEngine::new(llm);
@@ -1183,7 +1185,7 @@ async fn llm_engine_maps_missing_session_error() {
 
 #[tokio::test]
 async fn llm_engine_reply_surfaces_backend_failure_message() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = AlwaysFailBackend::new();
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -1216,7 +1218,7 @@ async fn llm_engine_reply_surfaces_backend_failure_message() {
 
 #[tokio::test]
 async fn llm_engine_reply_rejects_intermediate_text_without_terminal_response() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = MissingFinalTextBackend::new();
     let llm = Arc::new(LlmService::new(store, backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -1236,7 +1238,7 @@ async fn llm_engine_reply_rejects_intermediate_text_without_terminal_response() 
 
 #[tokio::test]
 async fn core_service_rejects_empty_message_content() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let service = CoreService::new(
@@ -1256,7 +1258,7 @@ async fn core_service_rejects_empty_message_content() {
 
 #[tokio::test]
 async fn core_service_handles_batch_prompt_across_multiple_branches() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[
         ("main", &[Ok("main done")]),
         ("draft", &[Ok("draft done")]),
@@ -1304,7 +1306,7 @@ async fn core_service_handles_batch_prompt_across_multiple_branches() {
 
 #[tokio::test]
 async fn core_service_batch_prompt_reports_per_branch_failures() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("main done")])]);
     let llm = Arc::new(LlmService::new(store, backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -1345,7 +1347,7 @@ async fn core_service_batch_prompt_reports_per_branch_failures() {
 
 #[tokio::test]
 async fn core_service_batch_prompt_rejects_duplicate_branch() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let service = CoreService::new(
@@ -1381,7 +1383,7 @@ async fn core_service_batch_prompt_rejects_duplicate_branch() {
 
 #[tokio::test]
 async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
-    let store = test_store();
+    let store = test_store().await;
     let setup_backend = FakeBackend::with_responses(&[]);
     let setup_llm = Arc::new(LlmService::new(store.clone(), setup_backend));
     setup_llm
@@ -1457,7 +1459,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
 
 #[tokio::test]
 async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = AnyBranchBackend::new("child result");
     let calls = backend.calls.clone();
     let provider_contexts = backend.provider_contexts.clone();
@@ -1567,7 +1569,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
 
 #[tokio::test]
 async fn llm_engine_materializes_store_skill_scripts() {
-    let store = test_store();
+    let store = test_store().await;
     store
         .add_skill(
             SessionRole::Orchestrator,
@@ -1644,7 +1646,7 @@ async fn llm_engine_materializes_store_skill_scripts() {
 async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
     let runtime_root = std::env::temp_dir().join("coco").join("skill-sessions");
     let body = format!("# Bad Scripted Skill {}", nanoid::nanoid!());
-    let store = test_store();
+    let store = test_store().await;
     store
         .add_skill(
             SessionRole::Orchestrator,
@@ -1687,7 +1689,7 @@ async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
 
 #[tokio::test]
 async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = AlwaysFailBackend::new();
     let calls = backend.calls.clone();
     let llm = Arc::new(LlmService::new(store.clone(), backend));

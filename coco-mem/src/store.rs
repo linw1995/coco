@@ -273,8 +273,8 @@ pub enum PersistentStore {
 }
 
 impl PersistentStore {
-    pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
-        SqliteStore::open(path).map(Self::Sqlite)
+    pub async fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        SqliteStore::open(path).await.map(Self::Sqlite)
     }
 
     pub async fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> StoreResult<Self> {
