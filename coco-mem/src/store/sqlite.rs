@@ -676,6 +676,21 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         load_root_id(&mut connection, &self.database_path).await
     }
+
+    async fn append_in_sqlite(&self, node: NewNode) -> Result<String> {
+        self.ensure_writable()?;
+        let node = Node::new(
+            node.parent,
+            node.role,
+            node.metadata,
+            node.kind,
+            jiff::Timestamp::now(),
+        );
+        let mut connection = self.connect().await?;
+        validate_new_node(&mut connection, &self.database_path, &node).await?;
+        persist_node(&mut connection, &self.database_path, &node).await?;
+        Ok(node.id)
+    }
 }
 
 impl SqliteGraphStore {
@@ -4053,20 +4068,7 @@ impl NodeStore for SqliteStore {
     }
 
     fn append(&self, node: NewNode) -> Result<String> {
-        self.ensure_writable()?;
-        let node = Node::new(
-            node.parent,
-            node.role,
-            node.metadata,
-            node.kind,
-            jiff::Timestamp::now(),
-        );
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            validate_new_node(&mut connection, &self.database_path, &node).await?;
-            persist_node(&mut connection, &self.database_path, &node).await
-        })?;
-        Ok(node.id)
+        self.block_on(self.append_in_sqlite(node))
     }
 
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
