@@ -881,6 +881,11 @@ impl SqliteStore {
                 .next(),
         )
     }
+
+    async fn list_queue_messages_in_sqlite(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
+        let mut connection = self.connect().await?;
+        load_queue_messages(&mut connection, &self.database_path, queue).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4377,10 +4382,7 @@ impl MessageQueueStore for SqliteStore {
     }
 
     fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            load_queue_messages(&mut connection, &self.database_path, queue).await
-        })
+        self.block_on(self.list_queue_messages_in_sqlite(queue))
     }
 
     fn list_message_queues(&self) -> Result<Vec<String>> {
