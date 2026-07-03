@@ -5722,8 +5722,8 @@ mod tests {
         assert_eq!(messages[0].message_id, second.message_id);
     }
 
-    #[test]
-    fn message_queue_preserves_insert_order_for_equal_timestamps() {
+    #[tokio::test]
+    async fn message_queue_preserves_insert_order_for_equal_timestamps() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5740,15 +5740,13 @@ mod tests {
             created_at,
             payload: serde_json::json!({"index": 2}),
         };
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            super::persist_message_queue_item(&mut connection, &store.database_path, &first)
-                .await
-                .unwrap();
-            super::persist_message_queue_item(&mut connection, &store.database_path, &second)
-                .await
-                .unwrap();
-        });
+        let mut connection = store.connect().await.unwrap();
+        super::persist_message_queue_item(&mut connection, &store.database_path, &first)
+            .await
+            .unwrap();
+        super::persist_message_queue_item(&mut connection, &store.database_path, &second)
+            .await
+            .unwrap();
 
         let reopened = SqliteStore::open(&path).unwrap();
         let messages = reopened.list_queue_messages("runner").unwrap();
