@@ -483,19 +483,20 @@ impl SqliteStore {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        block_on_sqlite_runtime_with(sqlite_runtime()?, Self::open_in_sqlite(path))
+    }
+
+    async fn open_in_sqlite(path: &Path) -> Result<Self> {
         prepare_store_directory(path)?;
-        block_on_sqlite_runtime_with(sqlite_runtime()?, reject_incomplete_legacy_json_store(path))?;
-        let store = block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            Self::new(path, StoreAccess::ReadWrite),
-        )?;
-        block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            store.database.with_initialization_lock(|| async {
+        reject_incomplete_legacy_json_store(path).await?;
+        let store = Self::new(path, StoreAccess::ReadWrite).await?;
+        store
+            .database
+            .with_initialization_lock(|| async {
                 store.run_migrations().await?;
                 store.load_or_initialize_state().await
-            }),
-        )?;
+            })
+            .await?;
         Ok(store)
     }
 
