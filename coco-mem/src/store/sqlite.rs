@@ -823,6 +823,18 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         load_job_map(&mut connection, &self.database_path).await
     }
+
+    async fn set_job_status_in_sqlite(
+        &self,
+        job_id: &str,
+        expected: JobStatus,
+        next: JobStatus,
+    ) -> Result<Job> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        update_job_status_in_sqlite(&mut connection, &self.database_path, job_id, expected, next)
+            .await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4288,19 +4300,7 @@ impl JobStore for SqliteStore {
     }
 
     fn set_job_status(&self, job_id: &str, expected: JobStatus, next: JobStatus) -> Result<Job> {
-        self.ensure_writable()?;
-        let updated = self.block_on(async {
-            let mut connection = self.connect().await?;
-            update_job_status_in_sqlite(
-                &mut connection,
-                &self.database_path,
-                job_id,
-                expected,
-                next,
-            )
-            .await
-        })?;
-        Ok(updated)
+        self.block_on(self.set_job_status_in_sqlite(job_id, expected, next))
     }
 
     fn set_job_work_branch(
