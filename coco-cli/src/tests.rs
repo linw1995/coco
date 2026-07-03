@@ -5227,6 +5227,7 @@ async fn preset_commands_manage_versions_in_store() {
         open_store(&store_path)
             .unwrap()
             .list_preset_records()
+            .await
             .unwrap()
             .is_empty()
     );

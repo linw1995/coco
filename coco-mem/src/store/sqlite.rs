@@ -4533,8 +4533,14 @@ impl MessageQueueStore for SqliteStore {
 }
 
 impl PresetStore for SqliteStore {
-    fn list_preset_records(&self) -> Result<std::collections::HashMap<String, PresetRecord>> {
-        self.block_on(self.list_preset_records_in_sqlite())
+    async fn list_preset_records(&self) -> Result<std::collections::HashMap<String, PresetRecord>> {
+        let store = self.clone();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.list_preset_records_in_sqlite().await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {

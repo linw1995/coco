@@ -132,10 +132,10 @@ where
 
 impl<S> PresetStore for ConsoleStore<S>
 where
-    S: PresetStore,
+    S: PresetStore + Sync,
 {
-    fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>> {
-        self.inner.list_preset_records()
+    async fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>> {
+        self.inner.list_preset_records().await
     }
 
     fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord> {

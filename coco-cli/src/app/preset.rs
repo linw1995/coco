@@ -59,7 +59,7 @@ where
             }))
         }
         PresetSubcommand::List(command) => {
-            let presets = run_preset_list(store)?;
+            let presets = run_preset_list(store).await?;
             Ok(Some(if command.json {
                 render_json(presets)
             } else {
@@ -110,9 +110,10 @@ where
     Ok(preset_summary_view(&record))
 }
 
-fn run_preset_list(store: &impl PresetStore) -> Result<Vec<PresetSummaryView>> {
+async fn run_preset_list(store: &impl PresetStore) -> Result<Vec<PresetSummaryView>> {
     let mut records = store
         .list_preset_records()
+        .await
         .context(StoreSnafu)?
         .into_values()
         .collect::<Vec<_>>();

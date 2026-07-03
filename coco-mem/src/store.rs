@@ -87,7 +87,9 @@ pub trait SessionStore {
 /// Preset storage API.
 pub trait PresetStore {
     /// Returns all persisted preset records keyed by preset name.
-    fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>>;
+    fn list_preset_records(
+        &self,
+    ) -> impl Future<Output = StoreResult<HashMap<String, PresetRecord>>> + Send + '_;
 
     /// Returns one preset record by preset name.
     fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord>;
@@ -339,8 +341,10 @@ impl SessionStore for PersistentStore {
 }
 
 impl PresetStore for PersistentStore {
-    fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>> {
-        delegate_persistent_store!(self, store, store.list_preset_records())
+    async fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>> {
+        match self {
+            Self::Sqlite(store) => store.list_preset_records().await,
+        }
     }
 
     fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord> {

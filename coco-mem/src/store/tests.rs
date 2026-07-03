@@ -915,7 +915,7 @@ where
     );
 }
 
-fn assert_preset_round_trip<F>()
+async fn assert_preset_round_trip<F>()
 where
     F: TestStoreFactory,
 {
@@ -939,6 +939,7 @@ where
     assert_eq!(
         store
             .list_preset_records()
+            .await
             .unwrap()
             .get(preset_name)
             .unwrap()
@@ -1000,7 +1001,7 @@ where
     assert_eq!(current_preset(&store, preset_name).unwrap(), original);
 }
 
-fn assert_delete_preset_removes_only_config<F>()
+async fn assert_delete_preset_removes_only_config<F>()
 where
     F: TestStoreFactory,
 {
@@ -1017,7 +1018,7 @@ where
 
     store.delete_preset(preset_name).unwrap();
 
-    assert!(store.list_preset_records().unwrap().is_empty());
+    assert!(store.list_preset_records().await.unwrap().is_empty());
     assert!(matches!(
         store.get_preset_record(preset_name),
         Err(Error::PresetNotFound { name }) if name == preset_name
@@ -2292,9 +2293,9 @@ macro_rules! define_common_store_tests {
                 assert_list_session_states_returns_branch_state_map::<$factory>();
             }
 
-            #[test]
-            fn preset_round_trip() {
-                assert_preset_round_trip::<$factory>();
+            #[tokio::test]
+            async fn preset_round_trip() {
+                assert_preset_round_trip::<$factory>().await;
             }
 
             #[test]
@@ -2307,9 +2308,9 @@ macro_rules! define_common_store_tests {
                 assert_rollback_preset_creates_new_current_version::<$factory>();
             }
 
-            #[test]
-            fn delete_preset_removes_only_config() {
-                assert_delete_preset_removes_only_config::<$factory>();
+            #[tokio::test]
+            async fn delete_preset_removes_only_config() {
+                assert_delete_preset_removes_only_config::<$factory>().await;
             }
 
             #[test]
