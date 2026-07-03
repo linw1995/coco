@@ -903,6 +903,12 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         load_preset_record(&mut connection, &self.database_path, name).await
     }
+
+    async fn set_preset_in_sqlite(&self, name: &str, config: Preset) -> Result<PresetRecord> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        set_preset_record(&mut connection, &self.database_path, name, config).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4417,12 +4423,7 @@ impl PresetStore for SqliteStore {
     }
 
     fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
-        self.ensure_writable()?;
-        let updated = self.block_on(async {
-            let mut connection = self.connect().await?;
-            set_preset_record(&mut connection, &self.database_path, name, config).await
-        })?;
-        Ok(updated)
+        self.block_on(self.set_preset_in_sqlite(name, config))
     }
 
     fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
