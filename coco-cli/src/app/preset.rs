@@ -77,7 +77,7 @@ where
         }
         PresetSubcommand::Rollback(command) => {
             let json = command.json;
-            let preset = run_preset_rollback(command, store)?;
+            let preset = run_preset_rollback(command, store).await?;
             Ok(Some(if json {
                 render_json(preset)
             } else {
@@ -136,12 +136,13 @@ async fn run_preset_show(
     })
 }
 
-fn run_preset_rollback(
+async fn run_preset_rollback(
     command: PresetRollbackCommand,
     store: &impl PresetStore,
 ) -> Result<PresetSummaryView> {
     let record = store
         .rollback_preset(&command.name, command.to_version)
+        .await
         .context(StoreSnafu)?;
     Ok(preset_summary_view(&record))
 }

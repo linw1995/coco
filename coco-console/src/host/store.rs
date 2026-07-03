@@ -146,8 +146,12 @@ where
         self.notify_if_ok(self.inner.set_preset(name, config).await)
     }
 
-    fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord> {
-        self.notify_if_ok(self.inner.rollback_preset(name, target_version))
+    async fn rollback_preset<'a>(
+        &'a self,
+        name: &'a str,
+        target_version: u64,
+    ) -> StoreResult<PresetRecord> {
+        self.notify_if_ok(self.inner.rollback_preset(name, target_version).await)
     }
 
     fn delete_preset(&self, name: &str) -> StoreResult<()> {

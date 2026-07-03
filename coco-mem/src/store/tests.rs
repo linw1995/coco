@@ -1003,7 +1003,7 @@ where
         .await
         .unwrap();
 
-    let rolled_back = store.rollback_preset(preset_name, 1).unwrap();
+    let rolled_back = store.rollback_preset(preset_name, 1).await.unwrap();
 
     assert_eq!(rolled_back.current_version, 3);
     assert_eq!(

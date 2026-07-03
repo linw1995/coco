@@ -4565,8 +4565,19 @@ impl PresetStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
-        self.block_on(self.rollback_preset_in_sqlite(name, target_version))
+    async fn rollback_preset<'a>(
+        &'a self,
+        name: &'a str,
+        target_version: u64,
+    ) -> Result<PresetRecord> {
+        let store = self.clone();
+        let name = name.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.rollback_preset_in_sqlite(&name, target_version).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn delete_preset(&self, name: &str) -> Result<()> {
@@ -5858,7 +5869,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.current_version, 2);
-        let rolled_back = store.rollback_preset("default", 1).unwrap();
+        let rolled_back = store.rollback_preset("default", 1).await.unwrap();
         assert_eq!(rolled_back.current_version, 3);
 
         let reopened = SqliteStore::open(&path).unwrap();
