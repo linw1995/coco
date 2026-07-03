@@ -795,6 +795,12 @@ impl SqliteStore {
                 .await?;
         Ok(new_head)
     }
+
+    async fn submit_job_in_sqlite(&self, branch: &str, base: &str) -> Result<Job> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        submit_job_in_sqlite(&mut connection, &self.database_path, branch, base).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4244,12 +4250,7 @@ impl SessionStore for SqliteStore {
 
 impl JobStore for SqliteStore {
     fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
-        self.ensure_writable()?;
-        let created = self.block_on(async {
-            let mut connection = self.connect().await?;
-            submit_job_in_sqlite(&mut connection, &self.database_path, branch, base).await
-        })?;
-        Ok(created)
+        self.block_on(self.submit_job_in_sqlite(branch, base))
     }
 
     fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
