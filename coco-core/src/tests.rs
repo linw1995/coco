@@ -536,7 +536,7 @@ async fn llm_engine_calls_prompt_and_returns_text() {
     assert_eq!(jobs.len(), 1);
     let job_id = jobs.keys().next().unwrap();
     let persisted_job = jobs.get(job_id).unwrap();
-    let job = engine.get_job(job_id).unwrap();
+    let job = engine.get_job(job_id).await.unwrap();
     assert_eq!(job.status, JobStatus::Finished);
     assert_eq!(job.finished_at, persisted_job.finished_at);
     assert!(job.finished_at.is_some());
@@ -703,7 +703,7 @@ async fn llm_engine_join_job_waits_for_idle_job_without_starting_it() {
     assert!(result.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        store.get_job(&job.job_id).unwrap().status,
+        store.get_job(&job.job_id).await.unwrap().status,
         JobStatus::Queued
     );
 }
@@ -994,7 +994,10 @@ async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
     let error = engine.drive_job(&job_id).await.unwrap_err();
 
     assert!(matches!(error, EngineError::SessionMissing { branch } if branch == "main"));
-    assert_eq!(store.get_job(&job_id).unwrap().status, JobStatus::Finished);
+    assert_eq!(
+        store.get_job(&job_id).await.unwrap().status,
+        JobStatus::Finished
+    );
     assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
 }
 
@@ -1413,7 +1416,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
 
     resumed_engine.resume_incomplete_jobs().await.unwrap();
 
-    let stored_job = resumed_engine.get_job(&job.job_id).unwrap();
+    let stored_job = resumed_engine.get_job(&job.job_id).await.unwrap();
     assert_eq!(stored_job.status, JobStatus::Finished);
     assert_eq!(store.get_branch_head("main").unwrap(), stored_job.head);
 }

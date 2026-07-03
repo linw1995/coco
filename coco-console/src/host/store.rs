@@ -201,7 +201,7 @@ where
 
 impl<S> JobStore for ConsoleStore<S>
 where
-    S: JobStore,
+    S: JobStore + Sync,
 {
     fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job> {
         self.notify_if_ok(self.inner.submit_job(branch, base))
@@ -211,8 +211,8 @@ where
         self.notify_if_ok(self.inner.submit_job_with_id(job_id, branch, base))
     }
 
-    fn get_job(&self, job_id: &str) -> StoreResult<Job> {
-        self.inner.get_job(job_id)
+    async fn get_job<'a>(&'a self, job_id: &'a str) -> StoreResult<Job> {
+        self.inner.get_job(job_id).await
     }
 
     fn list_jobs(&self) -> StoreResult<HashMap<String, Job>> {

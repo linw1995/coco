@@ -1313,7 +1313,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
         .unwrap();
     assert_eq!(queued_messages.len(), 1);
     let text_job_id = queued_messages[0].payload["job_id"].as_str().unwrap();
-    assert!(store.get_job(text_job_id).is_err());
+    assert!(store.get_job(text_job_id).await.is_err());
     assert_eq!(queued_messages[0].payload["branch"], "main");
     assert_eq!(queued_messages[0].payload["prompt"], "hello");
 
@@ -1498,6 +1498,7 @@ async fn forwarded_runtime_async_prompt_without_daemon_worker_drives_in_process(
         loop {
             if store
                 .get_job(job_id)
+                .await
                 .is_ok_and(|job| job.status == coco_mem::JobStatus::Finished)
             {
                 break;
@@ -6439,7 +6440,7 @@ async fn daemon_startup_resumes_incomplete_jobs() {
 
     resume_incomplete_jobs(&engine).await.unwrap();
 
-    let resumed_job = store.get_job(&job.job_id).unwrap();
+    let resumed_job = store.get_job(&job.job_id).await.unwrap();
     assert_eq!(resumed_job.status, coco_mem::JobStatus::Finished);
     let head = store.get_branch_head("main").unwrap();
     let node = store.get_node(&head).unwrap();

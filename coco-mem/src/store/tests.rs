@@ -1546,7 +1546,7 @@ where
     assert_eq!(session.max_tokens, Some(256));
 }
 
-fn assert_job_round_trip<F>()
+async fn assert_job_round_trip<F>()
 where
     F: TestStoreFactory,
 {
@@ -1555,7 +1555,7 @@ where
     store.fork("main", &root_id).unwrap();
     let job = submit_prompt_job(&store, "main", "hello");
 
-    assert_eq!(store.get_job(&job.job_id).unwrap(), job);
+    assert_eq!(store.get_job(&job.job_id).await.unwrap(), job);
 }
 
 fn assert_create_job_generates_unique_ids<F>()
@@ -1574,7 +1574,7 @@ where
     assert_ne!(first.job_id, second.job_id);
 }
 
-fn assert_finished_job_round_trip<F>()
+async fn assert_finished_job_round_trip<F>()
 where
     F: TestStoreFactory,
 {
@@ -1591,10 +1591,10 @@ where
         .unwrap();
 
     assert!(finished.finished_at.is_some());
-    assert_eq!(store.get_job(&job.job_id).unwrap(), finished);
+    assert_eq!(store.get_job(&job.job_id).await.unwrap(), finished);
 }
 
-fn assert_job_work_branch_round_trip<F>()
+async fn assert_job_work_branch_round_trip<F>()
 where
     F: TestStoreFactory,
 {
@@ -1611,7 +1611,10 @@ where
 
     assert_eq!(updated.branch, "main");
     assert_eq!(updated.work_branch, "recovery");
-    assert_eq!(store.get_job(&job.job_id).unwrap().work_branch, "recovery");
+    assert_eq!(
+        store.get_job(&job.job_id).await.unwrap().work_branch,
+        "recovery"
+    );
 }
 
 fn assert_set_job_work_branch_rejects_stale_expected_branch<F>()
@@ -2445,9 +2448,9 @@ macro_rules! define_common_store_tests {
                 assert_handoff_session_applies_session_patch::<$factory>();
             }
 
-            #[test]
-            fn job_round_trip() {
-                assert_job_round_trip::<$factory>();
+            #[tokio::test]
+            async fn job_round_trip() {
+                assert_job_round_trip::<$factory>().await;
             }
 
             #[test]
@@ -2475,14 +2478,14 @@ macro_rules! define_common_store_tests {
                 assert_rollback_skill_creates_new_current_version::<$factory>().await;
             }
 
-            #[test]
-            fn finished_job_round_trip() {
-                assert_finished_job_round_trip::<$factory>();
+            #[tokio::test]
+            async fn finished_job_round_trip() {
+                assert_finished_job_round_trip::<$factory>().await;
             }
 
-            #[test]
-            fn job_work_branch_round_trip() {
-                assert_job_work_branch_round_trip::<$factory>();
+            #[tokio::test]
+            async fn job_work_branch_round_trip() {
+                assert_job_work_branch_round_trip::<$factory>().await;
             }
 
             #[test]

@@ -366,7 +366,7 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let snapshot = match engine.get_job(&command.job) {
+    let snapshot = match engine.get_job(&command.job).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
             if let Some(view) =
@@ -381,8 +381,9 @@ where
             return Err(error).context(CoreEngineSnafu);
         }
     };
-    let prompt_details =
-        load_prompt_anchor_details(shared_store, &command.job).context(CoreEngineSnafu)?;
+    let prompt_details = load_prompt_anchor_details(shared_store, &command.job)
+        .await
+        .context(CoreEngineSnafu)?;
     let view = build_job_status_view(snapshot, prompt_details);
     Ok(Some(if command.json {
         render_json(view)
@@ -400,17 +401,11 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let mut jobs = engine
-        .list_jobs()
-        .context(CoreEngineSnafu)?
-        .into_keys()
-        .map(|job_id| {
-            engine
-                .get_job(&job_id)
-                .map(job_list_item_from_snapshot)
-                .context(CoreEngineSnafu)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut jobs = Vec::new();
+    for job_id in engine.list_jobs().context(CoreEngineSnafu)?.into_keys() {
+        let snapshot = engine.get_job(&job_id).await.context(CoreEngineSnafu)?;
+        jobs.push(job_list_item_from_snapshot(snapshot));
+    }
 
     jobs.extend(load_queued_prompt_request_list(shared_store).await?);
     jobs.sort_by(|left, right| {
@@ -509,11 +504,11 @@ fn build_job_status_view(
     }
 }
 
-fn load_prompt_anchor_details(
+async fn load_prompt_anchor_details(
     store: &(impl JobStore + NodeStore),
     job_id: &str,
 ) -> std::result::Result<PromptAnchorDetails, EngineError> {
-    let job = store.get_job(job_id)?;
+    let job = store.get_job(job_id).await?;
     let node = store.get_node(&job.base)?;
     match node.kind {
         Kind::Anchor(anchor) => match &anchor.payload {

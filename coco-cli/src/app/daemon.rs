@@ -910,7 +910,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         S: Store,
     {
         for job_id in job_ids {
-            match self.store.get_job(job_id) {
+            match self.store.get_job(job_id).await {
                 Ok(_) => return Ok(true),
                 Err(StoreError::PromptJobNotFound { .. }) => {}
                 Err(source) => return Err(source).context(StoreSnafu),
@@ -1179,7 +1179,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             Err(error) => return Err(error).context(StoreSnafu),
         }
 
-        match self.store.get_job(&request.job_id) {
+        match self.store.get_job(&request.job_id).await {
             Ok(_) => {
                 self.discard_duplicate_prompt_request(item, request).await?;
                 return Ok(PromptQueueHeadReadiness::Continue);
@@ -2707,7 +2707,7 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!join_task.is_finished());
-        assert!(engine.get_job("job-request").is_err());
+        assert!(engine.get_job("job-request").await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store
@@ -2726,7 +2726,7 @@ mod tests {
             super::PromptQueueHeadResult::Continue
         ));
         assert_eq!(
-            engine.get_job(&active_job_id).unwrap().status,
+            engine.get_job(&active_job_id).await.unwrap().status,
             JobStatus::Finished
         );
     }
@@ -2811,7 +2811,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            engine.get_job(&active_job_id).unwrap().status,
+            engine.get_job(&active_job_id).await.unwrap().status,
             JobStatus::Running
         );
         assert_eq!(
@@ -2872,7 +2872,7 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            engine.get_job(&active_job_id).unwrap().status,
+            engine.get_job(&active_job_id).await.unwrap().status,
             JobStatus::Queued
         );
 
@@ -2960,7 +2960,7 @@ mod tests {
             1
         );
         assert_eq!(
-            engine.get_job("job-day-queued").unwrap().status,
+            engine.get_job("job-day-queued").await.unwrap().status,
             JobStatus::Running
         );
 
@@ -2968,9 +2968,10 @@ mod tests {
         day_task.await.unwrap().unwrap();
         assert!(!legacy_task.is_finished());
         legacy_task.abort();
-        wait_until(Duration::from_secs(1), || {
+        wait_until_async(Duration::from_secs(1), || async {
             engine
                 .get_job("job-day-queued")
+                .await
                 .is_ok_and(|job| job.status == JobStatus::Finished)
         })
         .await;
@@ -3036,7 +3037,7 @@ mod tests {
         assert!(!legacy_task.is_finished());
         day_worker.drain_once().await.unwrap();
 
-        assert!(engine.get_job("job-main-queued").is_err());
+        assert!(engine.get_job("job-main-queued").await.is_err());
         assert_eq!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
@@ -3046,9 +3047,10 @@ mod tests {
             1
         );
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
-        wait_until(Duration::from_secs(1), || {
+        wait_until_async(Duration::from_secs(1), || async {
             engine
                 .get_job("job-day-queued")
+                .await
                 .is_ok_and(|job| job.status == JobStatus::Finished)
         })
         .await;
@@ -3135,7 +3137,7 @@ mod tests {
 
         worker.drain_once().await.unwrap();
 
-        assert!(engine.get_job("job-missing-branch").is_err());
+        assert!(engine.get_job("job-missing-branch").await.is_err());
         assert_eq!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
@@ -3735,6 +3737,22 @@ mod tests {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("condition was not met before timeout");
+    }
+
+    async fn wait_until_async<F, Fut>(timeout: Duration, mut condition: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition().await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

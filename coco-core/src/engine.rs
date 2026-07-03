@@ -275,7 +275,7 @@ where
             )
             .await?;
         let snapshot = self.drive_job_for_prompt(&job.job_id).await?;
-        let job = self.service.store().get_job(&job.job_id)?;
+        let job = self.service.store().get_job(&job.job_id).await?;
         if !matches!(snapshot.status, JobStatus::Finished) {
             self.finish_job(&job).await?;
             return Err(EngineError::EngineFailed {
@@ -360,7 +360,7 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<Job, EngineError> {
-        self.ensure_prompt_job_can_submit(job_id, branch)?;
+        self.ensure_prompt_job_can_submit(job_id, branch).await?;
         let merge_parent_count = merge_parents.len();
         let has_session_patch = session_patch.is_some();
         let base = self.service.append_prompt_job_base(
@@ -388,13 +388,13 @@ where
         Ok(job)
     }
 
-    fn ensure_prompt_job_can_submit(
+    async fn ensure_prompt_job_can_submit(
         &self,
         job_id: Option<&str>,
         branch: &str,
     ) -> std::result::Result<(), EngineError> {
         if let Some(job_id) = job_id {
-            match self.service.store().get_job(job_id) {
+            match self.service.store().get_job(job_id).await {
                 Ok(_) => {
                     return Err(EngineError::EngineFailed {
                         message: format!("Prompt job {job_id:?} already exists"),
@@ -415,8 +415,11 @@ where
         Ok(())
     }
 
-    pub fn get_job(&self, job_id: &str) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let job = self.service.store().get_job(job_id)?;
+    pub async fn get_job(
+        &self,
+        job_id: &str,
+    ) -> std::result::Result<JobStatusSnapshot, EngineError> {
+        let job = self.service.store().get_job(job_id).await?;
         self.build_job_status_snapshot(&job)
     }
 
@@ -469,7 +472,7 @@ where
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         let _ = self.drive_job_singleflight(job_id, vec![]).await;
-        self.get_job(job_id)
+        self.get_job(job_id).await
     }
 
     pub async fn join_job(
@@ -478,7 +481,7 @@ where
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         let mut job_status = self.service.subscribe_job_status(job_id);
         loop {
-            let snapshot = self.get_job(job_id)?;
+            let snapshot = self.get_job(job_id).await?;
             if matches!(snapshot.status, JobStatus::Finished) {
                 self.service.clear_job_status_watch(job_id);
                 return Ok(snapshot);
@@ -490,7 +493,7 @@ where
                 "waiting for prompt job status notification"
             );
             if job_status.changed().await.is_err() {
-                return self.get_job(job_id);
+                return self.get_job(job_id).await;
             }
         }
     }
@@ -505,7 +508,7 @@ where
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         let _ = self.drive_job_singleflight(job_id, merge_parents).await;
-        self.get_job(job_id)
+        self.get_job(job_id).await
     }
 
     async fn drive_job_for_prompt(
@@ -513,7 +516,7 @@ where
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         self.drive_job_singleflight(job_id, vec![]).await?;
-        self.get_job(job_id)
+        self.get_job(job_id).await
     }
 
     async fn drive_job_singleflight(
@@ -542,7 +545,7 @@ where
         job_id: &str,
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<String, EngineError> {
-        let mut job = self.service.store().get_job(job_id)?;
+        let mut job = self.service.store().get_job(job_id).await?;
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,

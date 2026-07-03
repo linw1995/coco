@@ -171,7 +171,8 @@ pub trait JobStore {
     fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job>;
 
     /// Returns a persisted prompt job.
-    fn get_job(&self, job_id: &str) -> StoreResult<Job>;
+    fn get_job<'a>(&'a self, job_id: &'a str)
+    -> impl Future<Output = StoreResult<Job>> + Send + 'a;
 
     /// Returns all persisted prompt jobs keyed by job id.
     fn list_jobs(&self) -> StoreResult<HashMap<String, Job>>;
@@ -453,8 +454,10 @@ impl JobStore for PersistentStore {
         delegate_persistent_store!(self, store, store.submit_job_with_id(job_id, branch, base))
     }
 
-    fn get_job(&self, job_id: &str) -> StoreResult<Job> {
-        delegate_persistent_store!(self, store, store.get_job(job_id))
+    async fn get_job<'a>(&'a self, job_id: &'a str) -> StoreResult<Job> {
+        match self {
+            Self::Sqlite(store) => store.get_job(job_id).await,
+        }
     }
 
     fn list_jobs(&self) -> StoreResult<HashMap<String, Job>> {

@@ -4446,8 +4446,15 @@ impl JobStore for SqliteStore {
         self.block_on(self.submit_job_with_id_in_sqlite(job_id, branch, base))
     }
 
-    fn get_job(&self, job_id: &str) -> Result<Job> {
-        self.block_on(self.get_job_in_sqlite(job_id))
+    async fn get_job<'a>(&'a self, job_id: &'a str) -> Result<Job> {
+        let store = self.clone();
+        let job_id = job_id.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.get_job_in_sqlite(&job_id).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn list_jobs(&self) -> Result<std::collections::HashMap<String, Job>> {
@@ -5791,7 +5798,7 @@ mod tests {
         );
 
         let reopened = SqliteStore::open(&path).unwrap();
-        let job = reopened.get_job("job-test").unwrap();
+        let job = reopened.get_job("job-test").await.unwrap();
 
         assert_eq!(job.status, JobStatus::Running);
         assert_eq!(job.branch, "main");
