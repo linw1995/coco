@@ -513,7 +513,7 @@ impl SqliteStore {
             Self::new(path, StoreAccess::ReadOnly),
         )?;
         store.database.with_initialization_lock(|| {
-            store.ensure_current_schema()?;
+            store.block_on(store.ensure_current_schema())?;
             store.ensure_root_exists()
         })?;
         Ok(store)
@@ -569,21 +569,19 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn ensure_current_schema(&self) -> Result<()> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            let version = existing_schema_version(&mut connection, &self.database_path).await?;
-            ensure!(
-                version == SQLITE_SCHEMA_VERSION,
-                CorruptedStoreSnafu {
-                    path: self.database_path.clone(),
-                    message: format!(
-                        "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
-                    ),
-                }
-            );
-            Ok(())
-        })
+    async fn ensure_current_schema(&self) -> Result<()> {
+        let mut connection = self.connect().await?;
+        let version = existing_schema_version(&mut connection, &self.database_path).await?;
+        ensure!(
+            version == SQLITE_SCHEMA_VERSION,
+            CorruptedStoreSnafu {
+                path: self.database_path.clone(),
+                message: format!(
+                    "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
+                ),
+            }
+        );
+        Ok(())
     }
 
     fn sqlite_schema_requires_migration(path: &Path) -> Result<bool> {
