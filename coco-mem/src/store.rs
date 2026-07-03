@@ -131,12 +131,12 @@ pub trait SkillStore {
     ) -> impl Future<Output = StoreResult<SkillRecord>> + Send + 'a;
 
     /// Creates a new persisted skill for the given role.
-    fn add_skill(
-        &self,
+    fn add_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
+        name: &'a str,
         spec: SkillVersionSpec,
-    ) -> StoreResult<SkillRecord>;
+    ) -> impl Future<Output = StoreResult<SkillRecord>> + Send + 'a;
 
     /// Creates a new version for an existing skill by patching the current version.
     fn update_skill(
@@ -405,13 +405,15 @@ impl SkillStore for PersistentStore {
         }
     }
 
-    fn add_skill(
-        &self,
+    async fn add_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
+        name: &'a str,
         spec: SkillVersionSpec,
     ) -> StoreResult<SkillRecord> {
-        delegate_persistent_store!(self, store, store.add_skill(role, name, spec))
+        match self {
+            Self::Sqlite(store) => store.add_skill(role, name, spec).await,
+        }
     }
 
     fn update_skill(

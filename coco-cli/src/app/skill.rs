@@ -79,7 +79,7 @@ where
     match command.command {
         SkillSubcommand::Add(command) => {
             let json = command.json;
-            let skill = run_skill_add(command, store)?;
+            let skill = run_skill_add(command, store).await?;
             Ok(Some(if json {
                 render_json(skill)
             } else {
@@ -134,7 +134,10 @@ where
     }
 }
 
-fn run_skill_add(command: SkillAddCommand, store: &impl SkillStore) -> Result<SkillSummaryView> {
+async fn run_skill_add(
+    command: SkillAddCommand,
+    store: &impl SkillStore,
+) -> Result<SkillSummaryView> {
     let body = read_skill_body(&command.file)?;
     let scripts = read_skill_scripts(command.scripts, command.script_dir)?;
     let record = store
@@ -148,6 +151,7 @@ fn run_skill_add(command: SkillAddCommand, store: &impl SkillStore) -> Result<Sk
                 enable_coco_shim: command.enable_coco_shim,
             },
         )
+        .await
         .context(StoreSnafu)?;
     Ok(skill_summary_view(command.role.into(), &record))
 }

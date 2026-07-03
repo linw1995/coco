@@ -4608,13 +4608,20 @@ impl SkillStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn add_skill(
-        &self,
+    async fn add_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
+        name: &'a str,
         spec: SkillVersionSpec,
     ) -> Result<SkillRecord> {
-        self.block_on(self.add_skill_in_sqlite(role, name, spec))
+        let store = self.clone();
+        let name = name.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.add_skill_in_sqlite(role, &name, spec).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn update_skill(
@@ -5916,6 +5923,7 @@ mod tests {
                     enable_coco_shim: false,
                 },
             )
+            .await
             .unwrap();
         assert_eq!(created.current_version, 1);
         let updated = store

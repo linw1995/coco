@@ -171,13 +171,13 @@ where
         self.inner.get_skill(role, name).await
     }
 
-    fn add_skill(
-        &self,
+    async fn add_skill<'a>(
+        &'a self,
         role: SessionRole,
-        name: &str,
+        name: &'a str,
         spec: SkillVersionSpec,
     ) -> StoreResult<SkillRecord> {
-        self.notify_if_ok(self.inner.add_skill(role, name, spec))
+        self.notify_if_ok(self.inner.add_skill(role, name, spec).await)
     }
 
     fn update_skill(

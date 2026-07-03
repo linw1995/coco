@@ -1835,7 +1835,7 @@ where
     assert_ne!(different_payload.message_id, first.message_id);
 }
 
-fn assert_add_skill_starts_at_version_one<F>()
+async fn assert_add_skill_starts_at_version_one<F>()
 where
     F: TestStoreFactory,
 {
@@ -1851,6 +1851,7 @@ where
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(record.current_version, 1);
@@ -1858,7 +1859,7 @@ where
     assert_eq!(record.current().unwrap().description, "first");
 }
 
-fn assert_update_skill_creates_new_version<F>()
+async fn assert_update_skill_creates_new_version<F>()
 where
     F: TestStoreFactory,
 {
@@ -1882,6 +1883,7 @@ where
                 enable_coco_shim: false,
             },
         )
+        .await
         .unwrap();
 
     let updated = store
@@ -1914,7 +1916,7 @@ where
     assert!(current.enable_coco_shim);
 }
 
-fn assert_rollback_skill_creates_new_current_version<F>()
+async fn assert_rollback_skill_creates_new_current_version<F>()
 where
     F: TestStoreFactory,
 {
@@ -1934,6 +1936,7 @@ where
                 enable_coco_shim: false,
             },
         )
+        .await
         .unwrap();
     store
         .update_skill(
@@ -2449,9 +2452,9 @@ macro_rules! define_common_store_tests {
                 assert_create_job_generates_unique_ids::<$factory>();
             }
 
-            #[test]
-            fn add_skill_starts_at_version_one() {
-                assert_add_skill_starts_at_version_one::<$factory>();
+            #[tokio::test]
+            async fn add_skill_starts_at_version_one() {
+                assert_add_skill_starts_at_version_one::<$factory>().await;
             }
 
             #[tokio::test]
@@ -2459,14 +2462,14 @@ macro_rules! define_common_store_tests {
                 assert_new_store_seeds_default_skills::<$factory>().await;
             }
 
-            #[test]
-            fn update_skill_creates_new_version() {
-                assert_update_skill_creates_new_version::<$factory>();
+            #[tokio::test]
+            async fn update_skill_creates_new_version() {
+                assert_update_skill_creates_new_version::<$factory>().await;
             }
 
-            #[test]
-            fn rollback_skill_creates_new_current_version() {
-                assert_rollback_skill_creates_new_current_version::<$factory>();
+            #[tokio::test]
+            async fn rollback_skill_creates_new_current_version() {
+                assert_rollback_skill_creates_new_current_version::<$factory>().await;
             }
 
             #[test]

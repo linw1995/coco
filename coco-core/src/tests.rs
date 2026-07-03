@@ -1438,6 +1438,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
     let caller_task = "Review the inherited task from the parent prompt.";
     let caller_prompt_id = store
@@ -1544,6 +1545,7 @@ async fn llm_engine_materializes_store_skill_scripts() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
 
     let backend = AnyBranchBackend::new("script result");
@@ -1620,6 +1622,7 @@ async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
 
     let backend = AnyBranchBackend::new("should not run");
@@ -1664,6 +1667,7 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
                 enable_coco_shim: false,
             },
         )
+        .await
         .unwrap();
     let invocation_id = append_skill_invocation_node(&store, &base_session.anchor_id, "fast-rust");
 

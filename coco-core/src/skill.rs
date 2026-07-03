@@ -877,8 +877,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn search_skills_finds_store_matches_by_name_and_description() {
+    #[tokio::test]
+    async fn search_skills_finds_store_matches_by_name_and_description() {
         let store = test_store();
         store
             .add_skill(
@@ -891,6 +891,7 @@ mod tests {
                     enable_coco_shim: false,
                 },
             )
+            .await
             .unwrap();
 
         let result = search_skills(
@@ -967,8 +968,8 @@ description: "External skill."
         );
     }
 
-    #[test]
-    fn collect_store_skills_prefers_current_role_on_name_conflict() {
+    #[tokio::test]
+    async fn collect_store_skills_prefers_current_role_on_name_conflict() {
         let store = test_store();
         for role in [SessionRole::Orchestrator, SessionRole::Runner] {
             store
@@ -982,6 +983,7 @@ description: "External skill."
                         enable_coco_shim: false,
                     },
                 )
+                .await
                 .unwrap();
         }
 

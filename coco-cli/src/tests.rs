@@ -5587,6 +5587,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
     let session_head = store.get_branch_head("main").unwrap();
     let parent_tool_use =
@@ -5709,6 +5710,7 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
     store
         .add_skill(
@@ -5721,6 +5723,7 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
 
     let session_head = store.get_branch_head("main").unwrap();
