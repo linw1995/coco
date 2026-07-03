@@ -1967,7 +1967,7 @@ where
     assert!(!current.enable_coco_shim);
 }
 
-fn assert_new_store_seeds_default_skills<F>()
+async fn assert_new_store_seeds_default_skills<F>()
 where
     F: TestStoreFactory,
 {
@@ -1975,21 +1975,32 @@ where
 
     let orchestrator = store
         .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+        .await
         .unwrap();
     let new_skill = store
         .get_skill(SessionRole::Orchestrator, "new-skill")
+        .await
         .unwrap();
     let cronjob = store
         .get_skill(SessionRole::Orchestrator, "cronjob")
+        .await
         .unwrap();
     let recovery = store
         .get_skill(SessionRole::Orchestrator, "recovery")
+        .await
         .unwrap();
     let compact = store
         .get_skill(SessionRole::Orchestrator, "compact")
+        .await
         .unwrap();
-    let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
-    let telegram = store.get_skill(SessionRole::Runner, "telegram").unwrap();
+    let runner = store
+        .get_skill(SessionRole::Runner, "coco-runner")
+        .await
+        .unwrap();
+    let telegram = store
+        .get_skill(SessionRole::Runner, "telegram")
+        .await
+        .unwrap();
 
     assert_eq!(orchestrator.current_version, 1);
     assert_eq!(new_skill.current_version, 1);
@@ -2443,9 +2454,9 @@ macro_rules! define_common_store_tests {
                 assert_add_skill_starts_at_version_one::<$factory>();
             }
 
-            #[test]
-            fn new_store_seeds_default_skills() {
-                assert_new_store_seeds_default_skills::<$factory>();
+            #[tokio::test]
+            async fn new_store_seeds_default_skills() {
+                assert_new_store_seeds_default_skills::<$factory>().await;
             }
 
             #[test]

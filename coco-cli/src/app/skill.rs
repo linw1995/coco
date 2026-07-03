@@ -115,7 +115,7 @@ where
         }
         SkillSubcommand::Show(command) => {
             let json = command.json;
-            let skill = run_skill_show(command, store)?;
+            let skill = run_skill_show(command, store).await?;
             Ok(Some(if json {
                 render_json(skill)
             } else {
@@ -217,9 +217,15 @@ fn run_skill_list(
     Ok(skills)
 }
 
-fn run_skill_show(command: SkillShowCommand, store: &impl SkillStore) -> Result<SkillShowView> {
+async fn run_skill_show(
+    command: SkillShowCommand,
+    store: &impl SkillStore,
+) -> Result<SkillShowView> {
     let role: SessionRole = command.role.into();
-    let record = store.get_skill(role, &command.name).context(StoreSnafu)?;
+    let record = store
+        .get_skill(role, &command.name)
+        .await
+        .context(StoreSnafu)?;
     let versions = record
         .versions
         .values()

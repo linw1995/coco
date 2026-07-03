@@ -161,14 +161,14 @@ where
 
 impl<S> SkillStore for ConsoleStore<S>
 where
-    S: SkillStore,
+    S: SkillStore + Sync,
 {
     fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>> {
         self.inner.list_skills(role)
     }
 
-    fn get_skill(&self, role: SessionRole, name: &str) -> StoreResult<SkillRecord> {
-        self.inner.get_skill(role, name)
+    async fn get_skill<'a>(&'a self, role: SessionRole, name: &'a str) -> StoreResult<SkillRecord> {
+        self.inner.get_skill(role, name).await
     }
 
     fn add_skill(

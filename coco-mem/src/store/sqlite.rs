@@ -4597,8 +4597,15 @@ impl SkillStore for SqliteStore {
         self.block_on(self.list_skills_in_sqlite(role))
     }
 
-    fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
-        self.block_on(self.get_skill_in_sqlite(role, name))
+    async fn get_skill<'a>(&'a self, role: SessionRole, name: &'a str) -> Result<SkillRecord> {
+        let store = self.clone();
+        let name = name.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.get_skill_in_sqlite(role, &name).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn add_skill(
@@ -5886,14 +5893,15 @@ mod tests {
         assert_eq!(record.current_preset().unwrap().model, "gpt-5.4");
     }
 
-    #[test]
-    fn skill_operations_persist_across_reopen() {
+    #[tokio::test]
+    async fn skill_operations_persist_across_reopen() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
         assert!(
             store
                 .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+                .await
                 .is_ok()
         );
 
@@ -5929,6 +5937,7 @@ mod tests {
         let reopened = SqliteStore::open(&path).unwrap();
         let record = reopened
             .get_skill(SessionRole::Runner, "custom-runner")
+            .await
             .unwrap();
 
         assert_eq!(record.current_version, 3);
