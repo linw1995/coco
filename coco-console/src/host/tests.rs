@@ -2424,12 +2424,12 @@ fn console_store_notifies_after_successful_writes() {
     assert_eq!(publisher.current_version(), 1);
 }
 
-#[test]
-fn console_store_notifies_only_when_dequeue_removes_message() {
+#[tokio::test]
+async fn console_store_notifies_only_when_dequeue_removes_message() {
     let publisher = ConsolePublisher::new();
     let store = ConsoleStore::new(test_store(), publisher.clone());
 
-    assert_eq!(store.dequeue_message("system").unwrap(), None);
+    assert_eq!(store.dequeue_message("system").await.unwrap(), None);
     assert_eq!(publisher.current_version(), 0);
 
     let item = store
@@ -2437,10 +2437,10 @@ fn console_store_notifies_only_when_dequeue_removes_message() {
         .unwrap();
     assert_eq!(publisher.current_version(), 1);
 
-    assert_eq!(store.dequeue_message("system").unwrap(), Some(item));
+    assert_eq!(store.dequeue_message("system").await.unwrap(), Some(item));
     assert_eq!(publisher.current_version(), 2);
 
-    assert_eq!(store.dequeue_message("system").unwrap(), None);
+    assert_eq!(store.dequeue_message("system").await.unwrap(), None);
     assert_eq!(publisher.current_version(), 2);
 }
 

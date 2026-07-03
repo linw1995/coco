@@ -180,10 +180,16 @@ pub trait MessageQueueStore {
     ) -> StoreResult<MessageQueueItem>;
 
     /// Removes and returns the oldest message in a named queue.
-    fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
+    fn dequeue_message<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> impl Future<Output = StoreResult<Option<MessageQueueItem>>> + Send + 'a;
 
     /// Returns the oldest message in a named queue without removing it.
-    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
+    fn peek_message<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> impl Future<Output = StoreResult<Option<MessageQueueItem>>> + Send + 'a;
 
     /// Returns all persisted messages for a named queue in dequeue order.
     fn list_queue_messages<'a>(
@@ -444,12 +450,19 @@ impl MessageQueueStore for PersistentStore {
         delegate_persistent_store!(self, store, store.enqueue_message(queue, payload))
     }
 
-    fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
-        delegate_persistent_store!(self, store, store.dequeue_message(queue))
+    async fn dequeue_message<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> StoreResult<Option<MessageQueueItem>> {
+        match self {
+            PersistentStore::Sqlite(store) => store.dequeue_message(queue).await,
+        }
     }
 
-    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
-        delegate_persistent_store!(self, store, store.peek_message(queue))
+    async fn peek_message<'a>(&'a self, queue: &'a str) -> StoreResult<Option<MessageQueueItem>> {
+        match self {
+            PersistentStore::Sqlite(store) => store.peek_message(queue).await,
+        }
     }
 
     async fn list_queue_messages<'a>(

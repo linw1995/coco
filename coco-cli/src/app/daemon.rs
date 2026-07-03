@@ -828,6 +828,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         while let Some(item) = self
             .store
             .peek_message(SYSTEM_EVENT_QUEUE)
+            .await
             .context(StoreSnafu)?
         {
             match decode_system_event_message(item.payload.clone()) {
@@ -837,11 +838,13 @@ impl<S> SystemEventMessageQueueWorker<S> {
                     }
                     self.store
                         .dequeue_message(SYSTEM_EVENT_QUEUE)
+                        .await
                         .context(StoreSnafu)?;
                 }
                 Err(error) => {
                     self.store
                         .dequeue_message(SYSTEM_EVENT_QUEUE)
+                        .await
                         .context(StoreSnafu)?;
                     tracing::error!(
                         message_id = %item.message_id,
@@ -1020,7 +1023,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
     {
         loop {
             self.drain_once().await?;
-            if self.peek_prompt_queue_head()?.is_none() {
+            if self.peek_prompt_queue_head().await?.is_none() {
                 return Ok(());
             }
         }
@@ -1034,7 +1037,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         let mut progressed = false;
         let mut saw_item = false;
         let mut wait_duration = None;
-        while let Some(item) = self.peek_prompt_queue_head()? {
+        while let Some(item) = self.peek_prompt_queue_head().await? {
             saw_item = true;
             match decode_prompt_job_message(item.payload.clone()) {
                 Ok(request) => {
@@ -1055,6 +1058,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     let Some(item) = self
                         .store
                         .dequeue_message(&self.queue)
+                        .await
                         .context(StoreSnafu)?
                     else {
                         continue;
@@ -1070,11 +1074,14 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         Ok(())
     }
 
-    fn peek_prompt_queue_head(&self) -> Result<Option<MessageQueueItem>>
+    async fn peek_prompt_queue_head(&self) -> Result<Option<MessageQueueItem>>
     where
         S: Store,
     {
-        self.store.peek_message(&self.queue).context(StoreSnafu)
+        self.store
+            .peek_message(&self.queue)
+            .await
+            .context(StoreSnafu)
     }
 
     async fn handle_prompt_request_queue_head(
@@ -1087,7 +1094,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         S: Store + Clone + Send + Sync + 'static,
     {
         if matches!(
-            self.ensure_prompt_request_queue_head_ready(item, request)?,
+            self.ensure_prompt_request_queue_head_ready(item, request)
+                .await?,
             PromptQueueHeadReadiness::Continue
         ) {
             return Ok(PromptQueueHeadResult::Continue);
@@ -1104,7 +1112,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         }
 
         let guard = self.engine.lock_branch(&request.branch).await;
-        let Some(item) = self.peek_prompt_queue_head()? else {
+        let Some(item) = self.peek_prompt_queue_head().await? else {
             return Ok(PromptQueueHeadResult::Continue);
         };
         let request = match decode_prompt_job_message(item.payload.clone()) {
@@ -1113,6 +1121,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 let Some(item) = self
                     .store
                     .dequeue_message(&self.queue)
+                    .await
                     .context(StoreSnafu)?
                 else {
                     return Ok(PromptQueueHeadResult::Continue);
@@ -1123,7 +1132,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         };
 
         if matches!(
-            self.ensure_prompt_request_queue_head_ready(&item, &request)?,
+            self.ensure_prompt_request_queue_head_ready(&item, &request)
+                .await?,
             PromptQueueHeadReadiness::Continue
         ) {
             return Ok(PromptQueueHeadResult::Continue);
@@ -1142,6 +1152,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         let Some(item) = self
             .store
             .dequeue_message(&self.queue)
+            .await
             .context(StoreSnafu)?
         else {
             return Ok(PromptQueueHeadResult::Continue);
@@ -1150,7 +1161,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         Ok(PromptQueueHeadResult::Continue)
     }
 
-    fn ensure_prompt_request_queue_head_ready(
+    async fn ensure_prompt_request_queue_head_ready(
         &self,
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
@@ -1161,7 +1172,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         match self.store.get_branch_head(&request.branch) {
             Ok(_) => {}
             Err(coco_mem::StoreError::BranchNotFound { .. }) => {
-                self.discard_prompt_request_for_missing_branch(item, request)?;
+                self.discard_prompt_request_for_missing_branch(item, request)
+                    .await?;
                 return Ok(PromptQueueHeadReadiness::Continue);
             }
             Err(error) => return Err(error).context(StoreSnafu),
@@ -1169,7 +1181,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
 
         match self.store.get_job(&request.job_id) {
             Ok(_) => {
-                self.discard_duplicate_prompt_request(item, request)?;
+                self.discard_duplicate_prompt_request(item, request).await?;
                 return Ok(PromptQueueHeadReadiness::Continue);
             }
             Err(coco_mem::StoreError::PromptJobNotFound { .. }) => {}
@@ -1179,7 +1191,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         Ok(PromptQueueHeadReadiness::Ready)
     }
 
-    fn discard_prompt_request_for_missing_branch(
+    async fn discard_prompt_request_for_missing_branch(
         &self,
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
@@ -1190,6 +1202,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         if self
             .store
             .dequeue_message(&self.queue)
+            .await
             .context(StoreSnafu)?
             .is_some()
         {
@@ -1204,7 +1217,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         Ok(())
     }
 
-    fn discard_duplicate_prompt_request(
+    async fn discard_duplicate_prompt_request(
         &self,
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
@@ -1215,6 +1228,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         if self
             .store
             .dequeue_message(&self.queue)
+            .await
             .context(StoreSnafu)?
             .is_some()
         {
@@ -1506,6 +1520,7 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
         while let Some(item) = self
             .store
             .dequeue_message(TELEGRAM_INBOUND_QUEUE)
+            .await
             .context(StoreSnafu)?
         {
             handled += 1;
@@ -2678,7 +2693,7 @@ mod tests {
             store.clone(),
             engine.clone(),
         );
-        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        let item = store.peek_message(PROMPT_JOB_QUEUE).await.unwrap().unwrap();
         let request = super::decode_prompt_job_message(item.payload.clone()).unwrap();
 
         let join_task = tokio::spawn(async move {
@@ -2839,7 +2854,7 @@ mod tests {
             engine.clone(),
         );
 
-        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        let item = store.peek_message(PROMPT_JOB_QUEUE).await.unwrap().unwrap();
         assert!(matches!(
             worker
                 .handle_prompt_request_queue_head(&item, &request)
@@ -2854,7 +2869,7 @@ mod tests {
             JobStatus::Queued
         );
 
-        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        let item = store.peek_message(PROMPT_JOB_QUEUE).await.unwrap().unwrap();
         assert!(matches!(
             worker
                 .handle_prompt_request_queue_head(&item, &request)

@@ -1731,13 +1731,19 @@ where
         store.list_queue_messages("hooks").await.unwrap(),
         vec![first.clone(), second.clone(),]
     );
-    assert_eq!(store.peek_message("hooks").unwrap(), Some(first.clone()));
-    assert_eq!(store.peek_message("missing").unwrap(), None);
-    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(first));
-    assert_eq!(store.peek_message("hooks").unwrap(), Some(second.clone()));
-    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(second));
-    assert_eq!(store.dequeue_message("hooks").unwrap(), None);
-    assert_eq!(store.peek_message("hooks").unwrap(), None);
+    assert_eq!(
+        store.peek_message("hooks").await.unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(store.peek_message("missing").await.unwrap(), None);
+    assert_eq!(store.dequeue_message("hooks").await.unwrap(), Some(first));
+    assert_eq!(
+        store.peek_message("hooks").await.unwrap(),
+        Some(second.clone())
+    );
+    assert_eq!(store.dequeue_message("hooks").await.unwrap(), Some(second));
+    assert_eq!(store.dequeue_message("hooks").await.unwrap(), None);
+    assert_eq!(store.peek_message("hooks").await.unwrap(), None);
     assert!(store.list_queue_messages("hooks").await.unwrap().is_empty());
     assert!(store.list_message_queues().await.unwrap().is_empty());
 }
@@ -1766,8 +1772,11 @@ where
         store.list_message_queues().await.unwrap(),
         vec!["hooks".to_owned(), "scheduler".to_owned()]
     );
-    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(hook));
-    assert_eq!(store.dequeue_message("scheduler").unwrap(), Some(scheduler));
+    assert_eq!(store.dequeue_message("hooks").await.unwrap(), Some(hook));
+    assert_eq!(
+        store.dequeue_message("scheduler").await.unwrap(),
+        Some(scheduler)
+    );
 }
 
 fn assert_message_queue_ids_are_content_derived<F>()

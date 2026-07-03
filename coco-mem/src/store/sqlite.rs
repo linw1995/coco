@@ -4477,20 +4477,47 @@ impl MessageQueueStore for SqliteStore {
         self.block_on(self.enqueue_message_in_sqlite(queue, payload))
     }
 
-    fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
-        self.block_on(self.dequeue_message_in_sqlite(queue))
+    async fn dequeue_message<'a>(&'a self, queue: &'a str) -> Result<Option<MessageQueueItem>> {
+        let store = self.clone();
+        let queue = queue.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.dequeue_message_in_sqlite(&queue).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
-    fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
-        self.block_on(self.peek_message_in_sqlite(queue))
+    async fn peek_message<'a>(&'a self, queue: &'a str) -> Result<Option<MessageQueueItem>> {
+        let store = self.clone();
+        let queue = queue.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.peek_message_in_sqlite(&queue).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     async fn list_queue_messages<'a>(&'a self, queue: &'a str) -> Result<Vec<MessageQueueItem>> {
-        self.list_queue_messages_in_sqlite(queue).await
+        let store = self.clone();
+        let queue = queue.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.list_queue_messages_in_sqlite(&queue).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     async fn list_message_queues(&self) -> Result<Vec<String>> {
-        self.list_message_queues_in_sqlite().await
+        let store = self.clone();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.list_message_queues_in_sqlite().await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 }
 
@@ -5700,11 +5727,16 @@ mod tests {
         assert_eq!(messages[0].message_id, first.message_id);
         assert_eq!(messages[1].message_id, second.message_id);
         assert_eq!(
-            reopened.peek_message("runner").unwrap().unwrap().payload["index"],
+            reopened
+                .peek_message("runner")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload["index"],
             1
         );
 
-        let dequeued = reopened.dequeue_message("runner").unwrap().unwrap();
+        let dequeued = reopened.dequeue_message("runner").await.unwrap().unwrap();
         assert_eq!(dequeued.message_id, first.message_id);
         let reopened = SqliteStore::open(&path).unwrap();
         let messages = reopened.list_queue_messages("runner").await.unwrap();

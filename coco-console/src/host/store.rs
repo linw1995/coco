@@ -250,16 +250,19 @@ where
         self.notify_if_ok(self.inner.enqueue_message(queue, payload))
     }
 
-    fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
-        let item = self.inner.dequeue_message(queue)?;
+    async fn dequeue_message<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> StoreResult<Option<MessageQueueItem>> {
+        let item = self.inner.dequeue_message(queue).await?;
         if item.is_some() {
             self.publisher.mark_changed();
         }
         Ok(item)
     }
 
-    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
-        self.inner.peek_message(queue)
+    async fn peek_message<'a>(&'a self, queue: &'a str) -> StoreResult<Option<MessageQueueItem>> {
+        self.inner.peek_message(queue).await
     }
 
     async fn list_queue_messages<'a>(
