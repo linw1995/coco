@@ -691,6 +691,11 @@ impl SqliteStore {
         persist_node(&mut connection, &self.database_path, &node).await?;
         Ok(node.id)
     }
+
+    async fn ancestry_in_sqlite(&self, head_ref: &str) -> Result<Vec<Node>> {
+        let mut connection = self.connect().await?;
+        load_ancestry_nodes(&mut connection, &self.database_path, head_ref).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4072,10 +4077,7 @@ impl NodeStore for SqliteStore {
     }
 
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            load_ancestry_nodes(&mut connection, &self.database_path, head_ref).await
-        })
+        self.block_on(self.ancestry_in_sqlite(head_ref))
     }
 
     fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
