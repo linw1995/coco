@@ -4664,26 +4664,24 @@ mod tests {
         }
     }
 
-    fn node_relation_rows(store: &SqliteStore, child_node_id: &str) -> Vec<NodeRelationRow> {
-        store.block_on(async {
-            let mut connection = store.connect().await.unwrap();
-            node_relations::table
-                .filter(node_relations::child_node_id.eq(child_node_id))
-                .select((
-                    node_relations::child_node_id,
-                    node_relations::parent_node_id,
-                    node_relations::kind,
-                    node_relations::ordinal,
-                ))
-                .order((
-                    node_relations::kind,
-                    node_relations::ordinal,
-                    node_relations::parent_node_id,
-                ))
-                .load::<NodeRelationRow>(&mut connection)
-                .await
-                .unwrap()
-        })
+    async fn node_relation_rows(store: &SqliteStore, child_node_id: &str) -> Vec<NodeRelationRow> {
+        let mut connection = store.connect().await.unwrap();
+        node_relations::table
+            .filter(node_relations::child_node_id.eq(child_node_id))
+            .select((
+                node_relations::child_node_id,
+                node_relations::parent_node_id,
+                node_relations::kind,
+                node_relations::ordinal,
+            ))
+            .order((
+                node_relations::kind,
+                node_relations::ordinal,
+                node_relations::parent_node_id,
+            ))
+            .load::<NodeRelationRow>(&mut connection)
+            .await
+            .unwrap()
     }
 
     fn node_metadata_rows(store: &SqliteStore, node_id: &str) -> Vec<NodeMetadataRow> {
@@ -4986,8 +4984,8 @@ mod tests {
         assert_eq!(store.schema_version().await.unwrap(), 6);
     }
 
-    #[test]
-    fn append_persists_node_relations() {
+    #[tokio::test]
+    async fn append_persists_node_relations() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
@@ -5051,7 +5049,7 @@ mod tests {
             })
             .unwrap();
 
-        let relations = node_relation_rows(&store, &child);
+        let relations = node_relation_rows(&store, &child).await;
 
         assert_eq!(node_kinds(&store, &child), expected_node_kinds);
         assert_eq!(relations.len(), 3);
