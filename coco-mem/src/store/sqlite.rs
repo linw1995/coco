@@ -935,6 +935,11 @@ impl SqliteStore {
             .cloned()
             .collect())
     }
+
+    async fn get_skill_in_sqlite(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
+        let mut connection = self.connect().await?;
+        load_skill_record(&mut connection, &self.database_path, role, name).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4467,10 +4472,7 @@ impl SkillStore for SqliteStore {
     }
 
     fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            load_skill_record(&mut connection, &self.database_path, role, name).await
-        })
+        self.block_on(self.get_skill_in_sqlite(role, name))
     }
 
     fn add_skill(
