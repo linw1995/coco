@@ -863,6 +863,15 @@ impl SqliteGraphStore {
         })
         .await
     }
+
+    async fn ancestry_in_sqlite(&self, head_ref: &str) -> Result<Vec<Node>> {
+        let head_ref = head_ref.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_ancestry_nodes(connection, &path, &head_ref).await })
+        })
+        .await
+    }
 }
 
 fn sqlite_database_path(path: &Path) -> PathBuf {
@@ -3918,11 +3927,7 @@ impl NodeStore for SqliteGraphStore {
     }
 
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        let head_ref = head_ref.to_owned();
-        let path = self.database_path.clone();
-        self.block_on(self.with_connection(move |connection| {
-            Box::pin(async move { load_ancestry_nodes(connection, &path, &head_ref).await })
-        }))
+        self.block_on(self.ancestry_in_sqlite(head_ref))
     }
 
     fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
