@@ -2215,7 +2215,7 @@ where
     ) -> Result<SessionMerge> {
         let _workflow = self.lock_workflow().await;
         let _branch_guard = self.lock_branch(branch).await;
-        let resolved_target_branch = self.resolve_target_branch(branch, target_branch)?;
+        let resolved_target_branch = self.resolve_target_branch(branch, target_branch).await?;
         let _target_guard = if resolved_target_branch == branch {
             None
         } else {
@@ -2263,7 +2263,7 @@ where
     ) -> Result<SessionFeedback> {
         let _workflow = self.lock_workflow().await;
         let _branch_guard = self.lock_branch(branch).await;
-        let (target_branch, base_head_id) = self.attached_state(branch)?;
+        let (target_branch, base_head_id) = self.attached_state(branch).await?;
         let _target_guard = if target_branch == branch {
             None
         } else {
@@ -2723,8 +2723,16 @@ impl<B, S> LlmService<B, S>
 where
     S: SessionStore,
 {
-    fn resolve_target_branch(&self, branch: &str, explicit_target: Option<&str>) -> Result<String> {
-        let state = self.store.get_session_state(branch).context(MemorySnafu)?;
+    async fn resolve_target_branch(
+        &self,
+        branch: &str,
+        explicit_target: Option<&str>,
+    ) -> Result<String> {
+        let state = self
+            .store
+            .get_session_state(branch)
+            .await
+            .context(MemorySnafu)?;
 
         if let Some(target_branch) = explicit_target {
             match state {
@@ -2763,8 +2771,13 @@ where
         }
     }
 
-    fn attached_state(&self, branch: &str) -> Result<(String, String)> {
-        match self.store.get_session_state(branch).context(MemorySnafu)? {
+    async fn attached_state(&self, branch: &str) -> Result<(String, String)> {
+        match self
+            .store
+            .get_session_state(branch)
+            .await
+            .context(MemorySnafu)?
+        {
             SessionState::Attached {
                 target_branch,
                 base_head_id,
@@ -7260,7 +7273,7 @@ mod tests {
         assert_eq!(pr.target_branch, "base");
         assert_eq!(pr.base_head_id, review_anchor_id);
         assert_eq!(
-            store.get_session_state("main").unwrap(),
+            store.get_session_state("main").await.unwrap(),
             SessionState::Attached {
                 target_branch: "base".to_owned(),
                 base_head_id: pr.base_head_id,
@@ -7307,7 +7320,7 @@ mod tests {
             merged.merged_anchor_id
         );
         assert_eq!(
-            store.get_session_state("main").unwrap(),
+            store.get_session_state("main").await.unwrap(),
             SessionState::Paused {
                 target_branch: "base".to_owned(),
                 reason: PauseReason::Merged {
@@ -7371,7 +7384,7 @@ mod tests {
             feedback.feedback_anchor_id
         );
         assert_eq!(
-            store.get_session_state("main").unwrap(),
+            store.get_session_state("main").await.unwrap(),
             SessionState::Attached {
                 target_branch: "base".to_owned(),
                 base_head_id: base_feedback_id,

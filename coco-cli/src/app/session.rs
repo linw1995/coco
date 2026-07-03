@@ -178,10 +178,11 @@ where
         }
         SessionSubcommand::Fork(command) => {
             run_session_fork_command(command.branch, command.from_ref, command.json, store, llm)
+                .await
         }
         SessionSubcommand::List(command) => run_session_list_command(command.json, store),
         SessionSubcommand::Get(command) => {
-            run_session_get_command(command.branch, command.json, store)
+            run_session_get_command(command.branch, command.json, store).await
         }
         SessionSubcommand::Graph(command) => {
             run_session_graph_command(command.json, command.all, store)
@@ -254,7 +255,7 @@ where
     Ok(None)
 }
 
-fn run_session_fork_command<B, S>(
+async fn run_session_fork_command<B, S>(
     branch: String,
     from_ref: String,
     json: bool,
@@ -268,7 +269,7 @@ where
     let head_id = llm.fork(branch.clone(), &from_ref).context(LlmSnafu)?;
     let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
     let result = SessionForkResult {
-        state: store.get_session_state(&branch).context(StoreSnafu)?,
+        state: store.get_session_state(&branch).await.context(StoreSnafu)?,
         role: anchor.role,
         branch,
         head_id,
@@ -290,12 +291,12 @@ fn run_session_list_command(
     })))
 }
 
-fn run_session_get_command(
+async fn run_session_get_command(
     branch: String,
     json: bool,
     store: &(impl BranchStore + NodeStore + SessionStore),
 ) -> Result<Option<String>> {
-    let details = read_session_details(store, &branch)?;
+    let details = read_session_details(store, &branch).await?;
     Ok(Some(render_session_result(
         details,
         json,
@@ -439,7 +440,7 @@ where
         .open_pull_request(&branch, &target_branch)
         .await
         .context(LlmSnafu)?;
-    let result = build_pull_request_result(store, pr)?;
+    let result = build_pull_request_result(store, pr).await?;
     Ok(Some(render_session_result(
         result,
         json,
@@ -490,7 +491,7 @@ where
         .merge_session(&branch, target_branch.as_deref(), &prompt)
         .await
         .context(LlmSnafu)?;
-    let result = build_session_merge_result(store, merged)?;
+    let result = build_session_merge_result(store, merged).await?;
     Ok(Some(render_session_result(
         result,
         json,
@@ -514,7 +515,7 @@ where
         .apply_feedback(&branch, &prompt, from_ref.as_deref())
         .await
         .context(LlmSnafu)?;
-    let result = build_session_feedback_result(store, feedback)?;
+    let result = build_session_feedback_result(store, feedback).await?;
     Ok(Some(render_session_result(
         result,
         json,
@@ -616,12 +617,12 @@ fn list_sessions(
         .collect()
 }
 
-fn read_session_details(
+async fn read_session_details(
     store: &(impl BranchStore + NodeStore + SessionStore),
     branch: &str,
 ) -> Result<SessionDetails> {
     let head_id = store.get_branch_head(branch).context(StoreSnafu)?;
-    let state = store.get_session_state(branch).context(StoreSnafu)?;
+    let state = store.get_session_state(branch).await.context(StoreSnafu)?;
     let (anchor_id, anchor) = resolve_visible_session_anchor(store, branch)?;
 
     Ok(SessionDetails {
@@ -1784,7 +1785,7 @@ fn shorten_id(node_id: &str) -> &str {
     &node_id[..node_id.len().min(8)]
 }
 
-fn build_pull_request_result(
+async fn build_pull_request_result(
     store: &impl SessionStore,
     pr: coco_llm::PullRequest,
 ) -> Result<PullRequestResult> {
@@ -1792,11 +1793,14 @@ fn build_pull_request_result(
         branch: pr.branch.clone(),
         target_branch: pr.target_branch,
         base_head_id: pr.base_head_id,
-        state: store.get_session_state(&pr.branch).context(StoreSnafu)?,
+        state: store
+            .get_session_state(&pr.branch)
+            .await
+            .context(StoreSnafu)?,
     })
 }
 
-fn build_session_merge_result(
+async fn build_session_merge_result(
     store: &impl SessionStore,
     merged: SessionMerge,
 ) -> Result<SessionMergeResult> {
@@ -1807,11 +1811,12 @@ fn build_session_merge_result(
         merged_anchor_id: merged.merged_anchor_id,
         state: store
             .get_session_state(&merged.branch)
+            .await
             .context(StoreSnafu)?,
     })
 }
 
-fn build_session_feedback_result(
+async fn build_session_feedback_result(
     store: &impl SessionStore,
     feedback: SessionFeedback,
 ) -> Result<SessionFeedbackResult> {
@@ -1823,6 +1828,7 @@ fn build_session_feedback_result(
         feedback_anchor_id: feedback.feedback_anchor_id,
         state: store
             .get_session_state(&feedback.branch)
+            .await
             .context(StoreSnafu)?,
     })
 }

@@ -103,8 +103,8 @@ where
         self.inner.list_session_states()
     }
 
-    fn get_session_state(&self, name: &str) -> StoreResult<SessionState> {
-        self.inner.get_session_state(name)
+    async fn get_session_state<'a>(&'a self, name: &'a str) -> StoreResult<SessionState> {
+        self.inner.get_session_state(name).await
     }
 
     async fn set_session_state<'a>(

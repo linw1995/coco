@@ -4334,8 +4334,15 @@ impl SessionStore for SqliteGraphStore {
         self.block_on(self.list_session_states_in_sqlite())
     }
 
-    fn get_session_state(&self, name: &str) -> Result<SessionState> {
-        self.block_on(self.get_session_state_in_sqlite(name))
+    async fn get_session_state<'a>(&'a self, name: &'a str) -> Result<SessionState> {
+        let store = self.clone();
+        let name = name.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.get_session_state_in_sqlite(&name).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     fn set_session_state<'a>(
@@ -4414,8 +4421,15 @@ impl SessionStore for SqliteStore {
         self.block_on(self.list_session_states_in_sqlite())
     }
 
-    fn get_session_state(&self, name: &str) -> Result<SessionState> {
-        self.block_on(self.get_session_state_in_sqlite(name))
+    async fn get_session_state<'a>(&'a self, name: &'a str) -> Result<SessionState> {
+        let store = self.clone();
+        let name = name.to_owned();
+        self.database
+            .inner
+            .runtime
+            .spawn(async move { store.get_session_state_in_sqlite(&name).await })
+            .await
+            .expect("SQLite store task should not panic")
     }
 
     async fn set_session_state<'a>(
@@ -5863,7 +5877,7 @@ mod tests {
 
         assert_eq!(reopened.get_branch_head("main").unwrap(), handoff);
         assert_eq!(
-            reopened.get_session_state("main").unwrap(),
+            reopened.get_session_state("main").await.unwrap(),
             SessionState::Paused {
                 target_branch: String::new(),
                 reason: PauseReason::Closed,

@@ -1523,7 +1523,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
         branch_error,
         coco_llm::coco_mem::StoreError::BranchNotFound { name } if name == child_branch
     ));
-    let state_error = store.get_session_state(&child_branch).unwrap_err();
+    let state_error = store.get_session_state(&child_branch).await.unwrap_err();
     assert!(matches!(
         state_error,
         coco_llm::coco_mem::StoreError::BranchNotFound { name } if name == child_branch

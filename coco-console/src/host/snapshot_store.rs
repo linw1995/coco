@@ -225,7 +225,7 @@ impl SessionStore for MaterializationSourceSnapshot {
         Ok(self.sessions.clone())
     }
 
-    fn get_session_state(&self, name: &str) -> coco_mem::StoreResult<SessionState> {
+    async fn get_session_state<'a>(&'a self, name: &'a str) -> coco_mem::StoreResult<SessionState> {
         self.sessions
             .get(name)
             .cloned()
@@ -6089,13 +6089,18 @@ mod tests {
             Ok(HashMap::from([("main".to_owned(), SessionState::Active)]))
         }
 
-        fn get_session_state(&self, name: &str) -> coco_mem::StoreResult<SessionState> {
-            if name == "main" {
-                return Ok(SessionState::Active);
-            }
-            Err(coco_mem::StoreError::BranchNotFound {
-                name: name.to_owned(),
-            })
+        fn get_session_state<'a>(
+            &'a self,
+            name: &'a str,
+        ) -> impl Future<Output = coco_mem::StoreResult<SessionState>> + Send + 'a {
+            let result = if name == "main" {
+                Ok(SessionState::Active)
+            } else {
+                Err(coco_mem::StoreError::BranchNotFound {
+                    name: name.to_owned(),
+                })
+            };
+            std::future::ready(result)
         }
 
         fn set_session_state<'a>(

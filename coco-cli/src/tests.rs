@@ -1782,7 +1782,7 @@ async fn session_fork_creates_active_branch_from_reference() {
     assert_eq!(store.get_branch_head("draft").unwrap(), source_head_id);
     assert_eq!(store.get_branch_head("json-draft").unwrap(), source_head_id);
     assert_eq!(
-        store.get_session_state("draft").unwrap(),
+        store.get_session_state("draft").await.unwrap(),
         SessionState::Active
     );
 }
@@ -2209,7 +2209,7 @@ async fn session_delete_removes_branch_and_session_state() {
     let store = open_store(&store_path).unwrap();
     let err = store.get_branch_head("draft").unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
-    let err = store.get_session_state("draft").unwrap_err();
+    let err = store.get_session_state("draft").await.unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
     let err = store.get_branch_head("json-draft").unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "json-draft"));
@@ -2638,6 +2638,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
         open_store(&store_path)
             .unwrap()
             .get_session_state("main")
+            .await
             .unwrap(),
         SessionState::Active
     );

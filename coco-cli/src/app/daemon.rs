@@ -270,7 +270,7 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    if builtin_day_session_is_valid(shared_store)? {
+    if builtin_day_session_is_valid(shared_store).await? {
         return Ok(());
     }
 
@@ -307,13 +307,13 @@ where
     Ok(())
 }
 
-fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
+async fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
     let head = match store.get_branch_head(BUILTIN_DAY_BRANCH) {
         Ok(head) => head,
         Err(StoreError::BranchNotFound { .. }) => return Ok(false),
         Err(source) => return Err(source).context(StoreSnafu),
     };
-    match store.get_session_state(BUILTIN_DAY_BRANCH) {
+    match store.get_session_state(BUILTIN_DAY_BRANCH).await {
         Ok(_) => {}
         Err(StoreError::BranchNotFound { .. }) => return Ok(false),
         Err(source) => return Err(source).context(StoreSnafu),
@@ -2432,7 +2432,12 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, crate::Error::BindDaemonSocket { .. }));
-        assert!(store.get_session_state(DEFAULT_SESSION_BRANCH).is_ok());
+        assert!(
+            store
+                .get_session_state(DEFAULT_SESSION_BRANCH)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

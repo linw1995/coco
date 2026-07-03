@@ -528,19 +528,19 @@ where
     assert!(matches!(err, Error::BranchExists { name } if name == "main"));
 }
 
-fn assert_fork_initializes_session_state<F>()
+async fn assert_fork_initializes_session_state<F>()
 where
     F: TestStoreFactory,
 {
     let store = F::create();
     let root_id = store.root_id();
     store.fork("main", &root_id).unwrap();
-    let state = store.get_session_state("main").unwrap();
+    let state = store.get_session_state("main").await.unwrap();
 
     assert_eq!(state, SessionState::Active);
 }
 
-fn assert_set_branch_head_keeps_session_state_untouched<F>()
+async fn assert_set_branch_head_keeps_session_state_untouched<F>()
 where
     F: TestStoreFactory,
 {
@@ -551,13 +551,13 @@ where
     store.fork("main", &child_id).unwrap();
 
     store.set_branch_head("main", &child_id, &next_id).unwrap();
-    let state = store.get_session_state("main").unwrap();
+    let state = store.get_session_state("main").await.unwrap();
 
     assert_eq!(store.get_branch_head("main").unwrap(), next_id);
     assert_eq!(state, SessionState::Active);
 }
 
-fn assert_delete_branch_removes_branch_and_session_state<F>()
+async fn assert_delete_branch_removes_branch_and_session_state<F>()
 where
     F: TestStoreFactory,
 {
@@ -569,7 +569,7 @@ where
 
     let err = store.get_branch_head("main").unwrap_err();
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
-    let err = store.get_session_state("main").unwrap_err();
+    let err = store.get_session_state("main").await.unwrap_err();
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
     assert_eq!(store.get_node(&branch_head).unwrap().id, branch_head);
 }
@@ -684,7 +684,7 @@ where
         .set_branch_head("main", &root_id, &feedback_id)
         .unwrap();
 
-    let state = store.get_session_state("main").unwrap();
+    let state = store.get_session_state("main").await.unwrap();
     assert_eq!(store.get_branch_head("main").unwrap(), feedback_id);
     assert_eq!(
         state,
@@ -2291,9 +2291,9 @@ macro_rules! define_common_store_tests {
                 assert_fork_rejects_duplicates::<$factory>();
             }
 
-            #[test]
-            fn fork_initializes_session_state() {
-                assert_fork_initializes_session_state::<$factory>();
+            #[tokio::test]
+            async fn fork_initializes_session_state() {
+                assert_fork_initializes_session_state::<$factory>().await;
             }
 
             #[test]
@@ -2301,14 +2301,14 @@ macro_rules! define_common_store_tests {
                 assert_set_branch_head_requires_matching_expected_head::<$factory>();
             }
 
-            #[test]
-            fn set_branch_head_keeps_session_state_untouched() {
-                assert_set_branch_head_keeps_session_state_untouched::<$factory>();
+            #[tokio::test]
+            async fn set_branch_head_keeps_session_state_untouched() {
+                assert_set_branch_head_keeps_session_state_untouched::<$factory>().await;
             }
 
-            #[test]
-            fn delete_branch_removes_branch_and_session_state() {
-                assert_delete_branch_removes_branch_and_session_state::<$factory>();
+            #[tokio::test]
+            async fn delete_branch_removes_branch_and_session_state() {
+                assert_delete_branch_removes_branch_and_session_state::<$factory>().await;
             }
 
             #[test]
