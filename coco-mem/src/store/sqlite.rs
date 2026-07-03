@@ -865,6 +865,12 @@ impl SqliteStore {
         persist_message_queue_item(&mut connection, &self.database_path, &item).await?;
         Ok(item)
     }
+
+    async fn dequeue_message_in_sqlite(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        dequeue_message_queue_item(&mut connection, &self.database_path, queue).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4353,12 +4359,7 @@ impl MessageQueueStore for SqliteStore {
     }
 
     fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
-        self.ensure_writable()?;
-        let item = self.block_on(async {
-            let mut connection = self.connect().await?;
-            dequeue_message_queue_item(&mut connection, &self.database_path, queue).await
-        })?;
-        Ok(item)
+        self.block_on(self.dequeue_message_in_sqlite(queue))
     }
 
     fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
