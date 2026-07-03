@@ -290,6 +290,7 @@ where
                 },
             )),
         })
+        .await
         .context(StoreSnafu)?;
     let workspace_root = std::env::current_dir().context(ResolveCurrentDirSnafu)?;
     let result = ConversationEngine::new(llm.clone())

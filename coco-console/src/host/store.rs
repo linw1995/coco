@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 use coco_mem::{
     BranchStore, Job, JobStatus, JobStore, MessageQueueItem, MessageQueueStore, NewNode, Node,
@@ -39,14 +41,20 @@ impl<S> ConsoleStore<S> {
 
 impl<S> NodeStore for ConsoleStore<S>
 where
-    S: NodeStore,
+    S: NodeStore + Sync,
 {
     fn root_id(&self) -> String {
         self.inner.root_id()
     }
 
-    fn append(&self, node: NewNode) -> StoreResult<String> {
-        self.notify_if_ok(self.inner.append(node))
+    fn append<'a>(
+        &'a self,
+        node: NewNode,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let result = self.inner.append(node).await;
+            self.notify_if_ok(result)
+        })
     }
 
     fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {

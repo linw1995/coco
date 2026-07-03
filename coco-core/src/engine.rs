@@ -363,13 +363,16 @@ where
         self.ensure_prompt_job_can_submit(job_id, branch).await?;
         let merge_parent_count = merge_parents.len();
         let has_session_patch = session_patch.is_some();
-        let base = self.service.append_prompt_job_base(
-            branch,
-            prompt,
-            &attachments,
-            &merge_parents,
-            session_patch.as_ref(),
-        )?;
+        let base = self
+            .service
+            .append_prompt_job_base(
+                branch,
+                prompt,
+                &attachments,
+                &merge_parents,
+                session_patch.as_ref(),
+            )
+            .await?;
         let job = match job_id {
             Some(job_id) => {
                 self.service

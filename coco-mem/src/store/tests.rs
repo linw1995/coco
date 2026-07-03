@@ -132,6 +132,7 @@ where
                 },
             )),
         })
+        .await
         .unwrap();
     store.submit_job(branch, &prompt_anchor_id).await.unwrap()
 }
@@ -180,9 +181,15 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
 
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
 
     let stored = store.get_node(&child_id).unwrap();
     assert_eq!(stored.parent, session_id);
@@ -197,6 +204,7 @@ where
     let store = F::create().await;
     let err = store
         .append(make_text_node("missing", "child"))
+        .await
         .unwrap_err();
 
     assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
@@ -208,13 +216,18 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let merge_parent_id = store
         .append(make_text_node(&session_id, "merge-parent"))
+        .await
         .unwrap();
 
     let anchor_id = store
         .append(make_prompt_anchor_node(&session_id, &[&merge_parent_id]))
+        .await
         .unwrap();
 
     assert!(
@@ -241,6 +254,7 @@ where
     let root_id = store.root_id();
     let merge_parent_id = store
         .append(make_text_node(&root_id, "merge-parent"))
+        .await
         .unwrap();
 
     let anchor_id = store
@@ -248,6 +262,7 @@ where
             &root_id,
             &merge_parent_id,
         ))
+        .await
         .unwrap();
 
     assert!(
@@ -265,9 +280,13 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let err = store
         .append(make_prompt_anchor_node(&session_id, &["missing"]))
+        .await
         .unwrap_err();
 
     assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
@@ -279,15 +298,20 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let merge_parent_id = store
         .append(make_text_node(&session_id, "merge-parent"))
+        .await
         .unwrap();
     let err = store
         .append(make_prompt_anchor_node(
             &session_id,
             &[&merge_parent_id, &merge_parent_id],
         ))
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -302,12 +326,17 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let left_shadow = store
         .append(make_text_node(&session_id, "left-shadow"))
+        .await
         .unwrap();
     let right_shadow = store
         .append(make_text_node(&session_id, "right-shadow"))
+        .await
         .unwrap();
     let err = store
         .append(NewNode {
@@ -325,6 +354,7 @@ where
                 },
             )),
         })
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -340,9 +370,13 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let err = store
         .append(make_prompt_anchor_node(&session_id, &[&session_id]))
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -357,13 +391,26 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let left_root = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let right_root = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let left_leaf = store.append(make_text_node(&left_root, "left")).unwrap();
-    let right_leaf = store.append(make_text_node(&right_root, "right")).unwrap();
+    let left_root = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let right_root = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let left_leaf = store
+        .append(make_text_node(&left_root, "left"))
+        .await
+        .unwrap();
+    let right_leaf = store
+        .append(make_text_node(&right_root, "right"))
+        .await
+        .unwrap();
 
     let merge_id = store
         .append(make_prompt_anchor_node(&left_leaf, &[&right_leaf]))
+        .await
         .unwrap();
 
     assert!(
@@ -381,9 +428,15 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let a_id = store.append(make_text_node(&session_id, "a")).unwrap();
-    let b_id = store.append(make_text_node(&a_id, "b")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let a_id = store
+        .append(make_text_node(&session_id, "a"))
+        .await
+        .unwrap();
+    let b_id = store.append(make_text_node(&a_id, "b")).await.unwrap();
 
     let ancestry = store.ancestry(&b_id).unwrap();
     let ids: Vec<_> = ancestry.into_iter().map(|node| node.id).collect();
@@ -397,10 +450,17 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let left_id = store.append(make_text_node(&session_id, "left")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let left_id = store
+        .append(make_text_node(&session_id, "left"))
+        .await
+        .unwrap();
     let right_id = store
         .append(make_prompt_anchor_node(&left_id, &[&session_id]))
+        .await
         .unwrap();
 
     let nodes = store.list_children(&session_id).unwrap();
@@ -415,8 +475,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let leaf_id = store.append(make_text_node(&session_id, "leaf")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let leaf_id = store
+        .append(make_text_node(&session_id, "leaf"))
+        .await
+        .unwrap();
 
     let children = store.list_children(&leaf_id).unwrap();
 
@@ -441,10 +507,16 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let a_id = store.append(make_text_node(&session_id, "a")).unwrap();
-    let b_id = store.append(make_text_node(&a_id, "b")).unwrap();
-    let c_id = store.append(make_text_node(&b_id, "c")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let a_id = store
+        .append(make_text_node(&session_id, "a"))
+        .await
+        .unwrap();
+    let b_id = store.append(make_text_node(&a_id, "b")).await.unwrap();
+    let c_id = store.append(make_text_node(&b_id, "c")).await.unwrap();
 
     let log = store.log(&a_id, &c_id).unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
@@ -484,12 +556,17 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let merge_parent_id = store
         .append(make_text_node(&session_id, "merge-parent"))
+        .await
         .unwrap();
     let anchor_id = store
         .append(make_prompt_anchor_node(&session_id, &[&merge_parent_id]))
+        .await
         .unwrap();
 
     let err = store.log(&merge_parent_id, &anchor_id).unwrap_err();
@@ -548,8 +625,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
-    let next_id = store.append(make_text_node(&child_id, "next")).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
+    let next_id = store
+        .append(make_text_node(&child_id, "next"))
+        .await
+        .unwrap();
     store.fork("main", &child_id).unwrap();
 
     store.set_branch_head("main", &child_id, &next_id).unwrap();
@@ -665,7 +748,10 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     store.fork("base", &base_anchor_id).unwrap();
     store.fork("main", &root_id).unwrap();
 
@@ -681,7 +767,10 @@ where
         .await
         .unwrap();
 
-    let feedback_id = store.append(make_text_node(&root_id, "feedback")).unwrap();
+    let feedback_id = store
+        .append(make_text_node(&root_id, "feedback"))
+        .await
+        .unwrap();
     store
         .set_branch_head("main", &root_id, &feedback_id)
         .unwrap();
@@ -703,7 +792,10 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     store.fork("base", &base_anchor_id).unwrap();
     store.fork("main", &root_id).unwrap();
 
@@ -738,8 +830,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let other_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let other_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     store.fork("base", &base_anchor_id).unwrap();
     store.fork("other", &other_anchor_id).unwrap();
     store.fork("main", &root_id).unwrap();
@@ -771,7 +869,10 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let base_text_id = store.append(make_text_node(&root_id, "base text")).unwrap();
+    let base_text_id = store
+        .append(make_text_node(&root_id, "base text"))
+        .await
+        .unwrap();
     store.fork("base", &base_text_id).unwrap();
     store.fork("main", &root_id).unwrap();
 
@@ -798,7 +899,10 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     store.fork("base", &base_anchor_id).unwrap();
     store.fork("main", &root_id).unwrap();
 
@@ -818,6 +922,7 @@ where
 
     let next_base_anchor_id = store
         .append(make_prompt_anchor_node(&base_anchor_id, &[]))
+        .await
         .unwrap();
     store
         .set_branch_head("base", &base_anchor_id, &next_base_anchor_id)
@@ -854,7 +959,10 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     store.fork("base", &base_anchor_id).unwrap();
     store.fork("main", &root_id).unwrap();
 
@@ -872,6 +980,7 @@ where
 
     let next_base_anchor_id = store
         .append(make_prompt_anchor_node(&base_anchor_id, &[]))
+        .await
         .unwrap();
     store
         .set_branch_head("base", &base_anchor_id, &next_base_anchor_id)
@@ -1125,6 +1234,7 @@ where
     store.fork("draft", &root_id).unwrap();
     let draft_node = store
         .append(make_text_node(&root_id, "draft only"))
+        .await
         .unwrap();
     store
         .set_branch_head("draft", &root_id, &draft_node)
@@ -1148,6 +1258,7 @@ where
         ids.push(
             store
                 .append(make_text_node(&root_id, &format!("node-{index}")))
+                .await
                 .unwrap(),
         );
     }
@@ -1177,8 +1288,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
-    let next_id = store.append(make_text_node(&child_id, "next")).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
+    let next_id = store
+        .append(make_text_node(&child_id, "next"))
+        .await
+        .unwrap();
     store.fork("main", &child_id).unwrap();
 
     let err = store
@@ -1201,7 +1318,10 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
     store.fork("main", &child_id).unwrap();
 
     let log = store.log(&root_id, "main").unwrap();
@@ -1216,8 +1336,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
-    let leaf_id = store.append(make_text_node(&child_id, "leaf")).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
+    let leaf_id = store
+        .append(make_text_node(&child_id, "leaf"))
+        .await
+        .unwrap();
     store.fork("base", &child_id).unwrap();
 
     let log = store.log("base", &leaf_id).unwrap();
@@ -1232,8 +1358,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
-    let leaf_id = store.append(make_text_node(&child_id, "leaf")).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
+    let leaf_id = store
+        .append(make_text_node(&child_id, "leaf"))
+        .await
+        .unwrap();
     store.fork("base", &child_id).unwrap();
     store.fork("main", &leaf_id).unwrap();
 
@@ -1261,8 +1393,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
     let old_child = store.get_node(&child_id).unwrap();
     let old_session = store.get_node(&session_id).unwrap();
     store.fork("main", &child_id).unwrap();
@@ -1312,8 +1450,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
     let old_session = store.get_node(&session_id).unwrap();
     store.fork("main", &child_id).unwrap();
 
@@ -1351,12 +1495,17 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let merge_source_id = store
         .append(make_text_node(&session_id, "merge-source"))
+        .await
         .unwrap();
     let anchor_id = store
         .append(make_prompt_anchor_node(&merge_source_id, &[&session_id]))
+        .await
         .unwrap();
     store.fork("main", &anchor_id).unwrap();
 
@@ -1389,8 +1538,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
     store.fork("main", &child_id).unwrap();
     store.fork("draft", &child_id).unwrap();
 
@@ -1443,8 +1598,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
     let session_created_at = store.get_node(&session_id).unwrap().created_at;
     let child_created_at = store.get_node(&child_id).unwrap().created_at;
     store.fork("main", &child_id).unwrap();
@@ -1472,8 +1633,14 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
     store.fork("main", &child_id).unwrap();
 
     let new_head = store
@@ -1523,7 +1690,10 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     store.fork("main", &session_id).unwrap();
 
     let err = store
@@ -1541,7 +1711,10 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     store.fork("main", &session_id).unwrap();
 
     let new_head = store
@@ -1733,6 +1906,7 @@ where
                 },
             )),
         })
+        .await
         .unwrap();
     let err = store
         .submit_job("main", &second_anchor_id)

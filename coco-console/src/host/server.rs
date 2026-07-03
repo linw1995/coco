@@ -1033,6 +1033,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
@@ -1103,12 +1104,15 @@ mod tests {
     }
 
     fn temp_store_path() -> PathBuf {
+        static NEXT_TEMP_STORE: AtomicU64 = AtomicU64::new(0);
+
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "coco-console-server-test-{}-{nanos}",
+            "coco-console-server-test-{}-{nanos}-{sequence}",
             std::process::id()
         ))
     }
@@ -1229,6 +1233,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("changed".to_owned()),
             })
+            .await
             .unwrap();
 
         let mut invalidated = Vec::new();
@@ -1254,6 +1259,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible".to_owned()),
             })
+            .await
             .unwrap();
         store.set_branch_head("main", &root, &first).unwrap();
         let viewport = GraphViewportRequest::default();
@@ -1281,6 +1287,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("next visible".to_owned()),
             })
+            .await
             .unwrap();
         store.set_branch_head("main", &first, &next).unwrap();
 
@@ -1303,6 +1310,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first".to_owned()),
             })
+            .await
             .unwrap();
         let second = store
             .append(NewNode {
@@ -1311,6 +1319,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second".to_owned()),
             })
+            .await
             .unwrap();
         store.fork("main", &first).unwrap();
         store.fork("draft", &second).unwrap();
@@ -1693,6 +1702,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("cached full snapshot node".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &root, &text).unwrap();
         publisher.mark_changed();
@@ -1733,6 +1743,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("all mode only".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &root, &text).unwrap();
         publisher.mark_changed();
@@ -1924,6 +1935,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let prompt = writer
@@ -1939,6 +1951,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &prompt).unwrap();
         publisher.mark_changed();
@@ -2014,6 +2027,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("single node detail".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &root, &text).unwrap();
         publisher.mark_changed();
@@ -2052,6 +2066,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let hidden_text = writer
@@ -2061,6 +2076,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("hidden targeted materialized detail".to_owned()),
             })
+            .await
             .unwrap();
         let prompt = writer
             .append(NewNode {
@@ -2075,6 +2091,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &prompt).unwrap();
         publisher.mark_changed();
@@ -2117,6 +2134,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let hidden_text = writer
@@ -2126,6 +2144,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("stale hidden materialized detail".to_owned()),
             })
+            .await
             .unwrap();
         let prompt = writer
             .append(NewNode {
@@ -2140,6 +2159,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &prompt).unwrap();
         publisher.mark_changed();
@@ -2238,6 +2258,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let hidden_text = writer
@@ -2247,6 +2268,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("hidden context item".to_owned()),
             })
+            .await
             .unwrap();
         let prompt = writer
             .append(NewNode {
@@ -2261,6 +2283,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &prompt).unwrap();
         publisher.mark_changed();

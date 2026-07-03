@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -128,6 +129,7 @@ struct SqliteDatabaseInner {
     pool: AsyncSqlitePool<AsyncSqliteConnection>,
     ensure_wal: Arc<AtomicBool>,
     initialization: tokio::sync::Mutex<()>,
+    write: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -346,6 +348,7 @@ impl SqliteDatabase {
             pool,
             ensure_wal: ensure_wal_flag,
             initialization: tokio::sync::Mutex::new(()),
+            write: tokio::sync::Mutex::new(()),
         });
         let database = {
             let mut databases = databases
@@ -379,6 +382,7 @@ impl SqliteDatabase {
                 pool,
                 ensure_wal: ensure_wal_flag,
                 initialization: tokio::sync::Mutex::new(()),
+                write: tokio::sync::Mutex::new(()),
             }),
         };
         if ensure_wal {
@@ -688,6 +692,7 @@ impl SqliteStore {
             node.kind,
             jiff::Timestamp::now(),
         );
+        let _write = self.database.inner.write.lock().await;
         let mut connection = self.connect().await?;
         validate_new_node(&mut connection, &self.database_path, &node).await?;
         persist_node(&mut connection, &self.database_path, &node).await?;
@@ -4277,8 +4282,11 @@ impl NodeStore for SqliteGraphStore {
         self.root_id.clone()
     }
 
-    fn append(&self, _node: NewNode) -> Result<String> {
-        self.ensure_read_only()
+    fn append<'a>(
+        &'a self,
+        _node: NewNode,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move { self.ensure_read_only() })
     }
 
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
@@ -4369,8 +4377,11 @@ impl NodeStore for SqliteStore {
         self.root_id.clone()
     }
 
-    fn append(&self, node: NewNode) -> Result<String> {
-        self.block_on(self.append_in_sqlite(node))
+    fn append<'a>(
+        &'a self,
+        node: NewNode,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move { self.append_in_sqlite(node).await })
     }
 
     fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
@@ -5120,8 +5131,8 @@ mod tests {
 
         let writer = store.clone();
         let root = store.root_id();
-        let (write_tx, write_rx) = mpsc::channel();
-        let write = std::thread::spawn(move || {
+        let (write_tx, write_rx) = oneshot::channel();
+        let write = tokio::spawn(async move {
             let node = writer
                 .append(NewNode {
                     parent: root,
@@ -5129,16 +5140,18 @@ mod tests {
                     metadata: None,
                     kind: Kind::Text("write while graph rebuild holds its connection".to_owned()),
                 })
+                .await
                 .unwrap();
             write_tx.send(node).unwrap();
         });
 
-        let written = write_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("writer should not wait for graph connection release");
+        let written = tokio::time::timeout(Duration::from_secs(1), write_rx)
+            .await
+            .expect("writer should not wait for graph connection release")
+            .unwrap();
         release_graph_tx.send(()).unwrap();
         graph_lock.await.unwrap();
-        write.join().unwrap();
+        write.await.unwrap();
         assert_eq!(store.get_node(&written).unwrap().id, written);
     }
 
@@ -5153,7 +5166,7 @@ mod tests {
             .map(|index| {
                 let store = store.clone();
                 let root_id = root_id.clone();
-                std::thread::spawn(move || {
+                tokio::spawn(async move {
                     store
                         .append(NewNode {
                             parent: root_id,
@@ -5161,15 +5174,16 @@ mod tests {
                             metadata: None,
                             kind: Kind::Text(format!("child-{index}")),
                         })
+                        .await
                         .unwrap()
                 })
             })
             .collect::<Vec<_>>();
 
-        let mut node_ids = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect::<Vec<_>>();
+        let mut node_ids = Vec::new();
+        for handle in handles {
+            node_ids.push(handle.await.unwrap());
+        }
         node_ids.sort();
 
         let mut children = store
@@ -5212,6 +5226,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("primary parent".to_owned()),
             })
+            .await
             .unwrap();
         let merge_parent = store
             .append(NewNode {
@@ -5220,6 +5235,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("merge parent".to_owned()),
             })
+            .await
             .unwrap();
         let shadow_parent = store
             .append(NewNode {
@@ -5228,6 +5244,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("shadow parent".to_owned()),
             })
+            .await
             .unwrap();
         let child_kind = Kind::Anchor(Anchor::session(
             vec![
@@ -5262,6 +5279,7 @@ mod tests {
                 metadata: None,
                 kind: child_kind,
             })
+            .await
             .unwrap();
 
         let relations = node_relation_rows(&store, &child).await;
@@ -5305,6 +5323,7 @@ mod tests {
                 metadata: Some(NodeMetadata::one(single_metadata)),
                 kind: Kind::Text("single metadata".to_owned()),
             })
+            .await
             .unwrap();
         let many = store
             .append(NewNode {
@@ -5322,6 +5341,7 @@ mod tests {
                 ])),
                 kind: Kind::Text("many metadata".to_owned()),
             })
+            .await
             .unwrap();
 
         assert_eq!(
@@ -5381,6 +5401,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let prompt = store
             .append(NewNode {
@@ -5395,6 +5416,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
 
         assert_eq!(
@@ -5462,6 +5484,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("graph child".to_owned()),
             })
+            .await
             .unwrap();
         writer.fork("graph-child", &child_id).unwrap();
         drop(writer);
@@ -5491,6 +5514,7 @@ mod tests {
                     metadata: None,
                     kind: Kind::Text("blocked".to_owned()),
                 })
+                .await
                 .unwrap_err(),
             crate::StoreError::StoreReadOnly { .. }
         ));
@@ -5512,6 +5536,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("child".to_owned()),
             })
+            .await
             .unwrap_err();
 
         assert!(matches!(err, crate::StoreError::StoreReadOnly { .. }));
@@ -5692,6 +5717,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("child".to_owned()),
             })
+            .await
             .unwrap();
         assert_eq!(store.list_children(&root_id).unwrap()[0].id, child_id);
 
@@ -5715,6 +5741,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first".to_owned()),
             })
+            .await
             .unwrap();
         let second = store
             .append(NewNode {
@@ -5723,6 +5750,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second".to_owned()),
             })
+            .await
             .unwrap();
 
         let reopened = SqliteStore::open(&path).await.unwrap();
@@ -5760,6 +5788,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first".to_owned()),
             })
+            .await
             .unwrap();
         let second = store
             .append(NewNode {
@@ -5768,6 +5797,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second".to_owned()),
             })
+            .await
             .unwrap();
 
         assert_eq!(store.fork("main", &first).unwrap(), first);
@@ -5826,7 +5856,7 @@ mod tests {
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
-        let session = store.append(session_anchor_node(&root_id)).unwrap();
+        let session = store.append(session_anchor_node(&root_id)).await.unwrap();
         store.fork("main", &session).unwrap();
         let text = store
             .append(NewNode {
@@ -5835,6 +5865,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("text".to_owned()),
             })
+            .await
             .unwrap();
         store.set_branch_head("main", &session, &text).unwrap();
         store
@@ -5894,7 +5925,7 @@ mod tests {
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
-        let session = store.append(session_anchor_node(&root_id)).unwrap();
+        let session = store.append(session_anchor_node(&root_id)).await.unwrap();
         store.fork("main", &session).unwrap();
 
         let job = store

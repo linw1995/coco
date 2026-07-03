@@ -55,8 +55,13 @@ impl NodeStore for DeepChainStore {
         panic!("deep chain test does not read root id")
     }
 
-    fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
-        panic!("deep chain test inserts nodes directly")
+    fn append<'a>(
+        &'a self,
+        _node: NewNode,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = coco_mem::StoreResult<String>> + Send + 'a>,
+    > {
+        Box::pin(async move { panic!("deep chain test inserts nodes directly") })
     }
 
     fn ancestry(&self, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
@@ -267,6 +272,7 @@ async fn graph_snapshot_contains_primary_and_merge_edges() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     store.fork("main", &left).unwrap();
     let right = store
@@ -276,6 +282,7 @@ async fn graph_snapshot_contains_primary_and_merge_edges() {
             metadata: None,
             kind: Kind::Text("feedback".to_owned()),
         })
+        .await
         .unwrap();
     let merged = store
         .append(NewNode {
@@ -287,6 +294,7 @@ async fn graph_snapshot_contains_primary_and_merge_edges() {
                 session_anchor(),
             )),
         })
+        .await
         .unwrap();
     store.set_branch_head("main", &left, &merged).unwrap();
     store.fork("draft", &left).unwrap();
@@ -297,6 +305,7 @@ async fn graph_snapshot_contains_primary_and_merge_edges() {
             metadata: None,
             kind: Kind::Text("draft work".to_owned()),
         })
+        .await
         .unwrap();
     store.set_branch_head("draft", &left, &draft).unwrap();
 
@@ -480,6 +489,7 @@ async fn graph_snapshot_contains_shadow_parent_edges() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     store.fork("main", &session).unwrap();
     let shadow_parent = store
@@ -489,6 +499,7 @@ async fn graph_snapshot_contains_shadow_parent_edges() {
             metadata: None,
             kind: Kind::Text("shadow".to_owned()),
         })
+        .await
         .unwrap();
     let prompt = store
         .append(NewNode {
@@ -503,6 +514,7 @@ async fn graph_snapshot_contains_shadow_parent_edges() {
                 },
             )),
         })
+        .await
         .unwrap();
     store.set_branch_head("main", &session, &prompt).unwrap();
 
@@ -526,6 +538,7 @@ async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     store.fork("main", &session).unwrap();
     store.fork("draft", &session).unwrap();
@@ -543,6 +556,7 @@ async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
                 },
             )),
         })
+        .await
         .unwrap();
     let main_hidden = store
         .append(NewNode {
@@ -551,6 +565,7 @@ async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
             metadata: None,
             kind: Kind::Text("main hidden".to_owned()),
         })
+        .await
         .unwrap();
     let draft_anchor = store
         .append(NewNode {
@@ -565,6 +580,7 @@ async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
                 },
             )),
         })
+        .await
         .unwrap();
     let draft_hidden = store
         .append(NewNode {
@@ -573,6 +589,7 @@ async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
             metadata: None,
             kind: Kind::Text("draft hidden".to_owned()),
         })
+        .await
         .unwrap();
     let merge_anchor = store
         .append(NewNode {
@@ -587,6 +604,7 @@ async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &session, &merge_anchor)
@@ -641,6 +659,7 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     store.fork("main", &session).unwrap();
     let tool_use = store
@@ -654,6 +673,7 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
                 input: json!({}),
             }),
         })
+        .await
         .unwrap();
     store.set_branch_head("main", &session, &tool_use).unwrap();
     let ignored_child = store
@@ -663,6 +683,7 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
             metadata: None,
             kind: Kind::Text("not a skill subtree".to_owned()),
         })
+        .await
         .unwrap();
     let invocation = store
         .append(NewNode {
@@ -677,6 +698,7 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
                 },
             )),
         })
+        .await
         .unwrap();
     let invocation_child = store
         .append(NewNode {
@@ -685,6 +707,7 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
             metadata: None,
             kind: Kind::Text("delegated context".to_owned()),
         })
+        .await
         .unwrap();
 
     let snapshot = build_graph_snapshot(&store, 9).unwrap();
@@ -819,6 +842,7 @@ async fn node_details_include_nodes_from_same_provider_context() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     store.fork("main", &first_session).unwrap();
     let previous_text = store
@@ -828,6 +852,7 @@ async fn node_details_include_nodes_from_same_provider_context() {
             metadata: None,
             kind: Kind::Text("previous provider context".to_owned()),
         })
+        .await
         .unwrap();
     let next_session = store
         .append(NewNode {
@@ -836,6 +861,7 @@ async fn node_details_include_nodes_from_same_provider_context() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     let hidden_text = store
         .append(NewNode {
@@ -844,6 +870,7 @@ async fn node_details_include_nodes_from_same_provider_context() {
             metadata: None,
             kind: Kind::Text("hidden node inside current provider context".to_owned()),
         })
+        .await
         .unwrap();
     let prompt = store
         .append(NewNode {
@@ -858,6 +885,7 @@ async fn node_details_include_nodes_from_same_provider_context() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &first_session, &prompt)
@@ -933,6 +961,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     store.fork("main", &session).unwrap();
     let shared_hidden = store
@@ -942,6 +971,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
             metadata: None,
             kind: Kind::Text("shared hidden context".to_owned()),
         })
+        .await
         .unwrap();
     let shared_prompt = store
         .append(NewNode {
@@ -956,6 +986,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
                 },
             )),
         })
+        .await
         .unwrap();
     let main_hidden = store
         .append(NewNode {
@@ -964,6 +995,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
             metadata: None,
             kind: Kind::Text("main hidden context".to_owned()),
         })
+        .await
         .unwrap();
     let main_prompt = store
         .append(NewNode {
@@ -978,6 +1010,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &session, &main_prompt)
@@ -991,6 +1024,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
             metadata: None,
             kind: Kind::Text("review hidden context".to_owned()),
         })
+        .await
         .unwrap();
     let review_prompt = store
         .append(NewNode {
@@ -1005,6 +1039,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("review", &shared_prompt, &review_prompt)
@@ -1069,6 +1104,7 @@ async fn provider_context_id_stays_stable_when_branch_head_moves() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     store.fork("main", &session).unwrap();
     let first_prompt = store
@@ -1084,6 +1120,7 @@ async fn provider_context_id_stays_stable_when_branch_head_moves() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &session, &first_prompt)
@@ -1110,6 +1147,7 @@ async fn provider_context_id_stays_stable_when_branch_head_moves() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &first_prompt, &next_prompt)
@@ -1138,6 +1176,7 @@ async fn provider_context_ids_preserve_unique_branch_names() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
 
     store.fork("draft/review", &session).unwrap();
@@ -1148,6 +1187,7 @@ async fn provider_context_ids_preserve_unique_branch_names() {
             metadata: None,
             kind: Kind::Text("slash branch context".to_owned()),
         })
+        .await
         .unwrap();
     let slash_prompt = store
         .append(NewNode {
@@ -1162,6 +1202,7 @@ async fn provider_context_ids_preserve_unique_branch_names() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("draft/review", &session, &slash_prompt)
@@ -1175,6 +1216,7 @@ async fn provider_context_ids_preserve_unique_branch_names() {
             metadata: None,
             kind: Kind::Text("dash branch context".to_owned()),
         })
+        .await
         .unwrap();
     let dash_prompt = store
         .append(NewNode {
@@ -1189,6 +1231,7 @@ async fn provider_context_ids_preserve_unique_branch_names() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("draft-review", &session, &dash_prompt)
@@ -1241,6 +1284,7 @@ async fn all_mode_provider_contexts_cover_older_visible_segments() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     store.fork("main", &first_session).unwrap();
     let old_hidden = store
@@ -1250,6 +1294,7 @@ async fn all_mode_provider_contexts_cover_older_visible_segments() {
             metadata: None,
             kind: Kind::Text("old hidden context".to_owned()),
         })
+        .await
         .unwrap();
     let old_prompt = store
         .append(NewNode {
@@ -1264,6 +1309,7 @@ async fn all_mode_provider_contexts_cover_older_visible_segments() {
                 },
             )),
         })
+        .await
         .unwrap();
     let next_session = store
         .append(NewNode {
@@ -1272,6 +1318,7 @@ async fn all_mode_provider_contexts_cover_older_visible_segments() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     let new_prompt = store
         .append(NewNode {
@@ -1286,6 +1333,7 @@ async fn all_mode_provider_contexts_cover_older_visible_segments() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &first_session, &new_prompt)
@@ -1347,6 +1395,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), empty_prompt_session_anchor)),
         })
+        .await
         .unwrap();
     store.fork("main", &empty_prompt_session).unwrap();
 
@@ -1359,6 +1408,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), prompted_session_anchor)),
         })
+        .await
         .unwrap();
 
     let session_patch = SessionAnchorPatch {
@@ -1372,6 +1422,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session_patch(Vec::new(), session_patch.clone())),
         })
+        .await
         .unwrap();
     let prompt = store
         .append(NewNode {
@@ -1386,6 +1437,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 },
             )),
         })
+        .await
         .unwrap();
     let invocation = store
         .append(NewNode {
@@ -1400,6 +1452,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 },
             )),
         })
+        .await
         .unwrap();
     let skill_result = store
         .append(NewNode {
@@ -1414,6 +1467,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 },
             )),
         })
+        .await
         .unwrap();
     let tool_use = store
         .append(NewNode {
@@ -1426,6 +1480,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 input: json!({"cmd": "cargo test"}),
             }),
         })
+        .await
         .unwrap();
     let empty_tool_use = store
         .append(NewNode {
@@ -1434,6 +1489,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::tool_use_items(Vec::new()),
         })
+        .await
         .unwrap();
     let tool_result = store
         .append(NewNode {
@@ -1445,6 +1501,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 output: "tool output".to_owned(),
             }),
         })
+        .await
         .unwrap();
     let empty_tool_result = store
         .append(NewNode {
@@ -1453,6 +1510,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::tool_result_items(Vec::new()),
         })
+        .await
         .unwrap();
     let text = store
         .append(NewNode {
@@ -1461,6 +1519,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Text("plain text".to_owned()),
         })
+        .await
         .unwrap();
     let failure = store
         .append(NewNode {
@@ -1469,6 +1528,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Failure("failure message".to_owned()),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &empty_prompt_session, &failure)
@@ -2421,6 +2481,7 @@ async fn console_store_notifies_after_successful_writes() {
                 input: json!({}),
             }),
         })
+        .await
         .unwrap();
 
     assert_eq!(publisher.current_version(), 1);

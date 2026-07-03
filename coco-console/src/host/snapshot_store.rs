@@ -136,8 +136,13 @@ impl NodeStore for MaterializationSourceSnapshot {
         self.root_id.clone()
     }
 
-    fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
-        Self::read_only_error()
+    fn append<'a>(
+        &'a self,
+        _node: NewNode,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = coco_mem::StoreResult<String>> + Send + 'a>,
+    > {
+        Box::pin(async move { Self::read_only_error() })
     }
 
     fn ancestry(&self, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
@@ -6014,9 +6019,16 @@ mod tests {
             self.root.id.clone()
         }
 
-        fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
-            Err(coco_mem::StoreError::StoreReadOnly {
-                path: PathBuf::from("branch advance test store"),
+        fn append<'a>(
+            &'a self,
+            _node: NewNode,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = coco_mem::StoreResult<String>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                Err(coco_mem::StoreError::StoreReadOnly {
+                    path: PathBuf::from("branch advance test store"),
+                })
             })
         }
 
@@ -6472,6 +6484,7 @@ mod tests {
                     metadata: None,
                     kind: Kind::Text(format!("node {index}")),
                 })
+                .await
                 .unwrap();
             node_ids.push(parent.clone());
         }

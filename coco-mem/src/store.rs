@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 mod lock;
 mod sqlite;
@@ -21,7 +22,10 @@ pub trait NodeStore {
     fn root_id(&self) -> String;
 
     /// Appends a new node and returns the persisted node identifier.
-    fn append(&self, node: NewNode) -> StoreResult<String>;
+    fn append<'a>(
+        &'a self,
+        node: NewNode,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<String>> + Send + 'a>>;
 
     /// Returns the chain from a node id or branch reference back to the root.
     fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>>;
@@ -303,8 +307,15 @@ impl NodeStore for PersistentStore {
         delegate_persistent_store!(self, store, store.root_id())
     }
 
-    fn append(&self, node: NewNode) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.append(node))
+    fn append<'a>(
+        &'a self,
+        node: NewNode,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<String>> + Send + 'a>> {
+        Box::pin(async move {
+            match self {
+                Self::Sqlite(store) => store.append(node).await,
+            }
+        })
     }
 
     fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {

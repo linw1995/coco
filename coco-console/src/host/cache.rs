@@ -1338,6 +1338,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::oneshot;
     use tokio::time::{Duration, sleep};
 
     async fn test_store() -> SqliteStore {
@@ -1375,6 +1376,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         store.fork("main", &session).unwrap();
         let text = store
@@ -1384,6 +1386,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible only in all mode".to_owned()),
             })
+            .await
             .unwrap();
         store.set_branch_head("main", &session, &text).unwrap();
 
@@ -1415,6 +1418,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         let branch = "orphan abc123";
         store.fork(branch, &session).unwrap();
@@ -1541,6 +1545,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("new all-mode node".to_owned()),
             })
+            .await
             .unwrap();
         store.set_branch_head("main", &text, &next_text).unwrap();
 
@@ -1568,6 +1573,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("new version".to_owned()),
             })
+            .await
             .unwrap();
         store.set_branch_head("main", &text, &next_text).unwrap();
         let third = cache.current_snapshot(GraphMode::All).await;
@@ -1612,6 +1618,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         publisher.mark_changed();
@@ -1679,6 +1686,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let text = writer
@@ -1688,6 +1696,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
@@ -1719,6 +1728,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let text = writer
@@ -1728,6 +1738,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
@@ -1871,8 +1882,8 @@ mod tests {
 
         let writer_for_thread = writer.clone();
         let root = writer.root_id();
-        let (write_tx, write_rx) = mpsc::channel();
-        let write = std::thread::spawn(move || {
+        let (write_tx, write_rx) = oneshot::channel();
+        let write = tokio::spawn(async move {
             let node = writer_for_thread
                 .append(NewNode {
                     parent: root,
@@ -1880,15 +1891,18 @@ mod tests {
                     metadata: None,
                     kind: Kind::Text("store write while graph db is locked".to_owned()),
                 })
+                .await
                 .unwrap();
             write_tx.send(node).unwrap();
         });
 
-        let written = write_rx.recv_timeout(Duration::from_secs(1));
+        let written = tokio::time::timeout(Duration::from_secs(1), write_rx).await;
         release_transaction_tx.send(()).unwrap();
         transaction.join().unwrap();
-        write.join().unwrap();
-        let written = written.expect("store write should not wait for graph transaction release");
+        write.await.unwrap();
+        let written = written
+            .expect("store write should not wait for graph transaction release")
+            .unwrap();
         assert_eq!(writer.get_node(&written).unwrap().id, written);
 
         drop(writer);
@@ -1925,8 +1939,8 @@ mod tests {
 
         let writer_for_thread = writer.clone();
         let root = writer.root_id();
-        let (write_tx, write_rx) = mpsc::channel();
-        let write = std::thread::spawn(move || {
+        let (write_tx, write_rx) = oneshot::channel();
+        let write = tokio::spawn(async move {
             let node = writer_for_thread
                 .append(NewNode {
                     parent: root,
@@ -1934,16 +1948,18 @@ mod tests {
                     metadata: None,
                     kind: Kind::Text("store write while graph db is locked".to_owned()),
                 })
+                .await
                 .unwrap();
             write_tx.send(node).unwrap();
         });
 
-        let written = write_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("store write should not wait for graph transaction release");
+        let written = tokio::time::timeout(Duration::from_secs(1), write_rx)
+            .await
+            .expect("store write should not wait for graph transaction release")
+            .unwrap();
         release_transaction_tx.send(()).unwrap();
         transaction.join().unwrap();
-        write.join().unwrap();
+        write.await.unwrap();
         assert_eq!(writer.get_node(&written).unwrap().id, written);
 
         drop(writer);
@@ -1970,6 +1986,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -1983,6 +2000,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         let invocation = writer
@@ -1998,6 +2016,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2012,6 +2031,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2100,6 +2120,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -2113,6 +2134,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         publisher.mark_changed();
@@ -2140,6 +2162,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2154,6 +2177,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2229,6 +2253,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         publisher.mark_changed();
@@ -2251,6 +2276,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         let invocation = writer
@@ -2266,6 +2292,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2280,6 +2307,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2355,6 +2383,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -2368,6 +2397,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         let invocation = writer
@@ -2383,6 +2413,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2397,6 +2428,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -2484,6 +2516,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -2497,6 +2530,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         let invocation = writer
@@ -2512,6 +2546,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.fork("draft", &invocation).unwrap();
         publisher.mark_changed();
@@ -2537,6 +2572,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2610,6 +2646,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -2623,6 +2660,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         let invocation = writer
@@ -2638,6 +2676,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2652,6 +2691,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -2711,6 +2751,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -2724,6 +2765,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         let first_invocation = writer
@@ -2739,6 +2781,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let first_result = writer
             .append(NewNode {
@@ -2753,6 +2796,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let second_invocation = writer
             .append(NewNode {
@@ -2767,6 +2811,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let second_result = writer
             .append(NewNode {
@@ -2781,6 +2826,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2872,6 +2918,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -2885,6 +2932,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         let invocation = writer
@@ -2900,6 +2948,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let first_result = writer
             .append(NewNode {
@@ -2914,6 +2963,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let second_result = writer
             .append(NewNode {
@@ -2928,6 +2978,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -3003,6 +3054,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -3016,6 +3068,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         let child = writer
             .append(NewNode {
@@ -3030,6 +3083,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &child).unwrap();
         let invocation = writer
@@ -3045,6 +3099,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -3059,6 +3114,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -3124,6 +3180,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -3137,6 +3194,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         publisher.mark_changed();
@@ -3161,6 +3219,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let next = writer
             .append(NewNode {
@@ -3169,6 +3228,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("branch continued after tool use".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &tool_use, &next).unwrap();
         publisher.mark_changed();
@@ -3233,6 +3293,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_tool_use = writer
@@ -3246,6 +3307,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_tool_use)
@@ -3263,6 +3325,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let main_result = writer
             .append(NewNode {
@@ -3277,6 +3340,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let draft_tool_use = writer
             .append(NewNode {
@@ -3289,6 +3353,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.fork("draft", &draft_tool_use).unwrap();
         let draft_invocation = writer
@@ -3304,6 +3369,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let draft_result = writer
             .append(NewNode {
@@ -3318,6 +3384,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -3402,6 +3469,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let tool_use = writer
@@ -3415,6 +3483,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &tool_use).unwrap();
         let invocation = writer
@@ -3430,6 +3499,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result_first = writer
             .append(NewNode {
@@ -3444,6 +3514,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result_second = writer
             .append(NewNode {
@@ -3458,6 +3529,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -3564,6 +3636,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         publisher.mark_changed();
@@ -3588,6 +3661,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.fork("draft", &session).unwrap();
         let draft_merge = writer
@@ -3603,6 +3677,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_merge)
@@ -3657,6 +3732,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let orphan_parent = writer
@@ -3672,6 +3748,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -3686,6 +3763,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &merge_anchor)
@@ -3751,6 +3829,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let text = writer
@@ -3760,6 +3839,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
@@ -3774,6 +3854,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("next visible child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &text, &next).unwrap();
         publisher.mark_changed();
@@ -3835,6 +3916,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let first = writer
@@ -3844,6 +3926,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &first).unwrap();
         publisher.mark_changed();
@@ -3858,6 +3941,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &first, &second).unwrap();
         publisher.mark_changed();
@@ -3913,6 +3997,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let text = writer
@@ -3922,6 +4007,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("initial materialized seed".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
@@ -3988,6 +4074,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let text = writer
@@ -3997,6 +4084,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("full materialization fallback".to_owned()),
             })
+            .await
             .unwrap();
         let orphan = writer
             .append(NewNode {
@@ -4005,6 +4093,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("full materialization orphan".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan));
         writer.fork(&orphan_lane, &root).unwrap();
@@ -4021,6 +4110,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &merge_anchor)
@@ -4033,6 +4123,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("reserved label branch".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("orphan branch", &session, &reserved_label_branch_head)
@@ -4106,6 +4197,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let shared = writer
@@ -4115,6 +4207,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("initial shared node".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &shared).unwrap();
         writer.fork("feature", &shared).unwrap();
@@ -4125,6 +4218,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("initial main head".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &shared, &main_head).unwrap();
         let feature_head = writer
@@ -4134,6 +4228,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("initial feature head".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("feature", &shared, &feature_head)
@@ -4214,6 +4309,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let shared = writer
@@ -4223,6 +4319,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("shared".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &shared).unwrap();
         let orphan_parent = writer
@@ -4232,6 +4329,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan parent".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -4246,6 +4344,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &shared, &merge_anchor)
@@ -4258,6 +4357,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("beta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("beta", &shared, &beta_first)
@@ -4344,6 +4444,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let hidden = writer
@@ -4353,6 +4454,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("hidden anchor seed context".to_owned()),
             })
+            .await
             .unwrap();
         let prompt = writer
             .append(NewNode {
@@ -4367,6 +4469,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &prompt).unwrap();
         publisher.mark_changed();
@@ -4434,6 +4537,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         writer.fork("draft", &session).unwrap();
@@ -4488,6 +4592,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("skill research", &session).unwrap();
         writer.fork("orphan fix", &session).unwrap();
@@ -4516,6 +4621,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("next".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("skill research", &session, &next)
@@ -4574,6 +4680,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -4583,6 +4690,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -4597,6 +4705,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan tail".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -4611,6 +4720,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
@@ -4647,6 +4757,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("branch next".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head(&orphan_lane, &session, &branch_next)
@@ -4748,6 +4859,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         let text = writer
             .append(NewNode {
@@ -4756,6 +4868,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first non-empty node".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &root, &text).unwrap();
         publisher.mark_changed();
@@ -4824,6 +4937,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         let text = writer
             .append(NewNode {
@@ -4832,6 +4946,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft history".to_owned()),
             })
+            .await
             .unwrap();
         writer.fork("draft", &text).unwrap();
         publisher.mark_changed();
@@ -4882,6 +4997,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let text = writer
@@ -4891,6 +5007,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main history".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         writer.fork("empty", &root).unwrap();
@@ -4942,6 +5059,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let text = writer
@@ -4951,6 +5069,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main history".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
@@ -5011,6 +5130,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let text = writer
@@ -5020,6 +5140,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main history".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
@@ -5079,6 +5200,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         publisher.mark_changed();
@@ -5105,6 +5227,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("pending viewport update".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
@@ -5144,6 +5267,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         publisher.mark_changed();
@@ -5174,6 +5298,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("pending viewport diff update".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();
@@ -5213,6 +5338,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let first = writer
@@ -5222,6 +5348,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first materialized head".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &first).unwrap();
         publisher.mark_changed();
@@ -5234,6 +5361,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("sibling head cannot append incrementally".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &first, &sibling).unwrap();
         publisher.mark_changed();
@@ -5368,6 +5496,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_anchor = writer
@@ -5383,6 +5512,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let main_hidden = writer
             .append(NewNode {
@@ -5391,6 +5521,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main hidden".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_hidden)
@@ -5403,6 +5534,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft hidden".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_hidden)
@@ -5425,6 +5557,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_hidden, &merge_anchor)
@@ -5492,6 +5625,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -5501,6 +5635,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -5513,6 +5648,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_first)
@@ -5524,6 +5660,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &draft_first, &draft_second)
@@ -5546,6 +5683,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
@@ -5617,6 +5755,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -5626,6 +5765,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -5642,6 +5782,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan feedback".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -5656,6 +5797,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
@@ -5715,6 +5857,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -5724,6 +5867,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -5742,6 +5886,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         let invocation = writer
             .append(NewNode {
@@ -5756,6 +5901,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -5770,6 +5916,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -5784,6 +5931,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
@@ -5866,6 +6014,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -5875,6 +6024,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -5889,6 +6039,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan feedback".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -5903,6 +6054,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
@@ -5984,6 +6136,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let shared = writer
@@ -5993,6 +6146,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("shared".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &shared).unwrap();
         publisher.mark_changed();
@@ -6005,6 +6159,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_tail = writer
             .append(NewNode {
@@ -6013,6 +6168,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan tail".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6027,6 +6183,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &shared, &merge_anchor)
@@ -6128,6 +6285,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -6137,6 +6295,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -6151,6 +6310,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_middle = writer
             .append(NewNode {
@@ -6159,6 +6319,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan middle".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_tail = writer
             .append(NewNode {
@@ -6167,6 +6328,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan tail".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6181,6 +6343,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
@@ -6299,6 +6462,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -6308,6 +6472,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -6322,6 +6487,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_tail = writer
             .append(NewNode {
@@ -6330,6 +6496,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan tail".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6344,6 +6511,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
@@ -6432,6 +6600,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -6441,6 +6610,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -6455,6 +6625,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan feedback".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6469,6 +6640,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
@@ -6544,6 +6716,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -6553,6 +6726,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_first = writer
             .append(NewNode {
@@ -6561,6 +6735,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_second = writer
             .append(NewNode {
@@ -6569,6 +6744,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan second".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_third = writer
             .append(NewNode {
@@ -6577,6 +6753,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan third".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_parent = writer
             .append(NewNode {
@@ -6585,6 +6762,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan parent".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6599,6 +6777,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &merge_anchor)
@@ -6680,6 +6859,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -6689,6 +6869,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -6697,6 +6878,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_second)
@@ -6711,6 +6893,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan base".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_parent = writer
             .append(NewNode {
@@ -6725,6 +6908,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6739,6 +6923,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_second, &merge_anchor)
@@ -6806,6 +6991,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let first = writer
@@ -6815,6 +7001,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &first).unwrap();
         publisher.mark_changed();
@@ -6829,6 +7016,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &first, &second).unwrap();
         publisher.mark_changed();
@@ -6886,6 +7074,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         publisher.mark_changed();
@@ -6906,6 +7095,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &prompt).unwrap();
         publisher.mark_changed();
@@ -6972,6 +7162,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let first_prompt = writer
@@ -6987,6 +7178,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &first_prompt)
@@ -7004,6 +7196,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &first_prompt, &second_prompt)
@@ -7070,6 +7263,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_anchor = writer
@@ -7085,6 +7279,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
@@ -7103,6 +7298,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_anchor)
@@ -7167,6 +7363,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_anchor = writer
@@ -7182,6 +7379,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
@@ -7199,6 +7397,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_anchor, &main_followup)
@@ -7222,6 +7421,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_anchor)
@@ -7302,6 +7502,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &old_session).unwrap();
         let old_prompt = writer
@@ -7317,6 +7518,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &old_session, &old_prompt)
@@ -7328,6 +7530,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &old_prompt, &current_session)
@@ -7345,6 +7548,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &current_session, &main_anchor)
@@ -7368,6 +7572,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &current_session, &draft_anchor)
@@ -7427,6 +7632,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &old_session).unwrap();
         let old_prompt = writer
@@ -7442,6 +7648,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &old_session, &old_prompt)
@@ -7458,6 +7665,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &old_prompt, &current_session)
@@ -7475,6 +7683,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &current_session, &current_prompt)
@@ -7534,6 +7743,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_anchor = writer
@@ -7549,6 +7759,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
@@ -7564,6 +7775,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("hidden branch text".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("hidden", &root, &hidden_text)
@@ -7622,6 +7834,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_anchor = writer
@@ -7637,6 +7850,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
@@ -7706,6 +7920,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_anchor = writer
@@ -7721,6 +7936,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let main_hidden = writer
             .append(NewNode {
@@ -7729,6 +7945,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main hidden".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_hidden)
@@ -7747,6 +7964,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let draft_hidden = writer
             .append(NewNode {
@@ -7755,6 +7973,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft hidden".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_hidden)
@@ -7772,6 +7991,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &draft_hidden, &draft_second)
@@ -7794,6 +8014,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_hidden, &merge_anchor)
@@ -7880,6 +8101,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         let old_prompt = writer
             .append(NewNode {
@@ -7894,6 +8116,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let current_session = writer
             .append(NewNode {
@@ -7902,6 +8125,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &current_session).unwrap();
         let current_prompt = writer
@@ -7917,6 +8141,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &current_session, &current_prompt)
@@ -7936,6 +8161,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &current_prompt, &merge_anchor)
@@ -7996,6 +8222,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let first = writer
@@ -8005,6 +8232,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &first).unwrap();
         let second = writer
@@ -8014,6 +8242,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second child".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &first, &second).unwrap();
         publisher.mark_changed();
@@ -8072,6 +8301,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -8081,6 +8311,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -8092,6 +8323,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
@@ -8104,6 +8336,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_second, &draft_first)
@@ -8203,6 +8436,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -8212,6 +8446,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -8224,6 +8459,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
@@ -8235,6 +8471,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan parent".to_owned()),
             })
+            .await
             .unwrap();
         let draft_merge = writer
             .append(NewNode {
@@ -8249,6 +8486,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &draft_first, &draft_merge)
@@ -8310,6 +8548,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -8319,6 +8558,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -8331,6 +8571,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
@@ -8347,6 +8588,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
@@ -8358,6 +8600,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &draft_first, &draft_second)
@@ -8411,6 +8654,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -8420,6 +8664,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -8431,6 +8676,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
@@ -8448,6 +8694,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
@@ -8515,6 +8762,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("zeta", &session).unwrap();
         let shared = writer
@@ -8524,6 +8772,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("shared".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("zeta", &session, &shared).unwrap();
         publisher.mark_changed();
@@ -8627,6 +8876,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("zeta", &session).unwrap();
         let prompt = writer
@@ -8642,6 +8892,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer.set_branch_head("zeta", &session, &prompt).unwrap();
         publisher.mark_changed();
@@ -8723,6 +8974,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -8732,6 +8984,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -8743,6 +8996,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
@@ -8766,6 +9020,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_merge)
@@ -8835,6 +9090,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -8844,6 +9100,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -8943,6 +9200,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         publisher.mark_changed();
@@ -9016,6 +9274,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let shared = writer
@@ -9025,6 +9284,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("shared tail".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &shared).unwrap();
         writer.fork("draft", &shared).unwrap();
@@ -9040,6 +9300,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main next".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &shared, &main_next).unwrap();
         publisher.mark_changed();
@@ -9106,6 +9367,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -9115,6 +9377,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -9127,6 +9390,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("zeta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("zeta", &main_first, &zeta_first)
@@ -9144,6 +9408,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("beta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("beta", &main_first, &beta_first)
@@ -9233,6 +9498,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -9242,6 +9508,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -9254,6 +9521,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
@@ -9312,6 +9580,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -9321,6 +9590,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -9332,6 +9602,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
@@ -9344,6 +9615,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_second, &draft_first)
@@ -9441,6 +9713,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         let main_first = writer
@@ -9450,6 +9723,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
@@ -9462,6 +9736,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("beta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("beta", &main_first, &beta_first)
@@ -9474,6 +9749,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("zeta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("zeta", &main_first, &zeta_first)
@@ -9964,6 +10240,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer.fork("main", &session).unwrap();
         publisher.mark_changed();
@@ -10003,6 +10280,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("new node should roll back".to_owned()),
             })
+            .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
         publisher.mark_changed();

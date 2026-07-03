@@ -2342,6 +2342,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("profile graph".to_owned()),
             })
+            .await
             .unwrap();
         store.set_branch_head("main", &root, &node).unwrap();
         let llm = Arc::new(LlmService::new(
@@ -3083,6 +3084,7 @@ mod tests {
                 metadata: BackendMetadata::builder().build(),
                 kind: Kind::Failure("backend failed".to_owned()),
             })
+            .await
             .unwrap();
 
         assert!(super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
@@ -3101,6 +3103,7 @@ mod tests {
                 metadata: BackendMetadata::builder().build(),
                 kind: Kind::Failure("backend failed".to_owned()),
             })
+            .await
             .unwrap();
         store.set_branch_head("main", &base, &failure).unwrap();
 

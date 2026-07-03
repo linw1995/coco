@@ -107,6 +107,7 @@ where
                 },
             )),
         })
+        .await
         .unwrap();
     store.submit_job(branch, &prompt_anchor_id).await.unwrap()
 }
@@ -719,7 +720,7 @@ where
     .await
 }
 
-fn append_prompt_anchor(
+async fn append_prompt_anchor(
     store: &impl NodeStore,
     parent: &str,
     prompt: &str,
@@ -741,10 +742,11 @@ fn append_prompt_anchor(
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
-fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> String {
+async fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -768,10 +770,16 @@ fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> 
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
-fn append_tool_use_node(store: &impl NodeStore, parent: &str, id: &str, name: &str) -> String {
+async fn append_tool_use_node(
+    store: &impl NodeStore,
+    parent: &str,
+    id: &str,
+    name: &str,
+) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -787,10 +795,16 @@ fn append_tool_use_node(store: &impl NodeStore, parent: &str, id: &str, name: &s
                 }),
             }),
         })
+        .await
         .unwrap()
 }
 
-fn append_tool_result_node(store: &impl NodeStore, parent: &str, id: &str, output: &str) -> String {
+async fn append_tool_result_node(
+    store: &impl NodeStore,
+    parent: &str,
+    id: &str,
+    output: &str,
+) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -803,10 +817,11 @@ fn append_tool_result_node(store: &impl NodeStore, parent: &str, id: &str, outpu
                 output: output.to_owned(),
             }),
         })
+        .await
         .unwrap()
 }
 
-fn append_text_node(store: &impl NodeStore, parent: &str, text: &str) -> String {
+async fn append_text_node(store: &impl NodeStore, parent: &str, text: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -814,10 +829,11 @@ fn append_text_node(store: &impl NodeStore, parent: &str, text: &str) -> String 
             metadata: None,
             kind: Kind::Text(text.to_owned()),
         })
+        .await
         .unwrap()
 }
 
-fn append_failure_node(store: &impl NodeStore, parent: &str, message: &str) -> String {
+async fn append_failure_node(store: &impl NodeStore, parent: &str, message: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -825,10 +841,11 @@ fn append_failure_node(store: &impl NodeStore, parent: &str, message: &str) -> S
             metadata: None,
             kind: Kind::Failure(message.to_owned()),
         })
+        .await
         .unwrap()
 }
 
-fn append_skill_result_anchor(
+async fn append_skill_result_anchor(
     store: &impl NodeStore,
     parent: &str,
     merge_parent: &str,
@@ -848,10 +865,11 @@ fn append_skill_result_anchor(
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
-fn append_skill_invocation_anchor(
+async fn append_skill_invocation_anchor(
     store: &impl NodeStore,
     parent: &str,
     skill_name: &str,
@@ -869,6 +887,7 @@ fn append_skill_invocation_anchor(
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
@@ -1582,7 +1601,8 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
 
     let store = open_store(&store_path).await.unwrap();
     let session_head = store.get_branch_head("main").unwrap();
-    let shadow_parent = append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
+    let shadow_parent =
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let prompt_anchor_id = store
         .append(NewNode {
             parent: session_head,
@@ -1596,6 +1616,7 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
                 },
             )),
         })
+        .await
         .unwrap();
     let job = store.submit_job("main", &prompt_anchor_id).await.unwrap();
 
@@ -2836,7 +2857,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     );
 
     let merged_feedback_source_id =
-        append_prompt_anchor(&store, &merged_anchor_id, "review note", &[]);
+        append_prompt_anchor(&store, &merged_anchor_id, "review note", &[]).await;
     store
         .set_branch_head("base", &merged_anchor_id, &merged_feedback_source_id)
         .unwrap();
@@ -2906,7 +2927,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     );
 
     let second_feedback_source_id =
-        append_prompt_anchor(&store, &merged_feedback_source_id, "second review", &[]);
+        append_prompt_anchor(&store, &merged_feedback_source_id, "second review", &[]).await;
     store
         .set_branch_head(
             "base",
@@ -3046,7 +3067,8 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
         &store.get_branch_head("draft").unwrap(),
         "draft merge parent",
         &[],
-    );
+    )
+    .await;
     store
         .set_branch_head(
             "draft",
@@ -3066,7 +3088,7 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
     let store = open_store(&store_path).await.unwrap();
     let main_head = store.get_branch_head("main").unwrap();
     let merged_head =
-        append_prompt_anchor(&store, &main_head, "merge after delete", &[&draft_head]);
+        append_prompt_anchor(&store, &main_head, "merge after delete", &[&draft_head]).await;
     store
         .set_branch_head("main", &main_head, &merged_head)
         .unwrap();
@@ -3104,15 +3126,15 @@ async fn session_graph_shows_tool_and_failure_nodes() {
 
     let store = open_store(&store_path).await.unwrap();
     let session_head = store.get_branch_head("main").unwrap();
-    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command");
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &tool_use_id)
         .unwrap();
-    let tool_result_id = append_tool_result_node(&store, &tool_use_id, "tool-1", "hello");
+    let tool_result_id = append_tool_result_node(&store, &tool_use_id, "tool-1", "hello").await;
     store
         .set_branch_head("main", &tool_use_id, &tool_result_id)
         .unwrap();
-    let failure_id = append_failure_node(&store, &tool_result_id, "command failed");
+    let failure_id = append_failure_node(&store, &tool_result_id, "command failed").await;
     store
         .set_branch_head("main", &tool_result_id, &failure_id)
         .unwrap();
@@ -3206,12 +3228,12 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
 
     let store = open_store(&store_path).await.unwrap();
     let original_session_id = store.get_branch_head("main").unwrap();
-    let old_prompt_id = append_prompt_anchor(&store, &original_session_id, "old prompt", &[]);
-    let old_text_id = append_text_node(&store, &old_prompt_id, "old text");
+    let old_prompt_id = append_prompt_anchor(&store, &original_session_id, "old prompt", &[]).await;
+    let old_text_id = append_text_node(&store, &old_prompt_id, "old text").await;
     let new_session_id =
-        append_session_anchor(&store, &old_text_id, "You are executing the skill `docs`.");
-    let new_prompt_id = append_prompt_anchor(&store, &new_session_id, "new prompt", &[]);
-    let new_text_id = append_text_node(&store, &new_prompt_id, "new text");
+        append_session_anchor(&store, &old_text_id, "You are executing the skill `docs`.").await;
+    let new_prompt_id = append_prompt_anchor(&store, &new_session_id, "new prompt", &[]).await;
+    let new_text_id = append_text_node(&store, &new_prompt_id, "new text").await;
     store
         .set_branch_head("main", &original_session_id, &new_text_id)
         .unwrap();
@@ -3331,18 +3353,18 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
 
     let store = open_store(&store_path).await.unwrap();
     let session_id = store.get_branch_head("main").unwrap();
-    let main_anchor_id = append_prompt_anchor(&store, &session_id, "main anchor", &[]);
-    let main_hidden_id = append_text_node(&store, &main_anchor_id, "main hidden text");
+    let main_anchor_id = append_prompt_anchor(&store, &session_id, "main anchor", &[]).await;
+    let main_hidden_id = append_text_node(&store, &main_anchor_id, "main hidden text").await;
     store
         .set_branch_head("main", &session_id, &main_hidden_id)
         .unwrap();
-    let draft_anchor_id = append_prompt_anchor(&store, &session_id, "draft anchor", &[]);
-    let draft_hidden_id = append_text_node(&store, &draft_anchor_id, "draft hidden text");
+    let draft_anchor_id = append_prompt_anchor(&store, &session_id, "draft anchor", &[]).await;
+    let draft_hidden_id = append_text_node(&store, &draft_anchor_id, "draft hidden text").await;
     store
         .set_branch_head("draft", &session_id, &draft_hidden_id)
         .unwrap();
     let merge_anchor_id =
-        append_prompt_anchor(&store, &main_hidden_id, "merge anchor", &[&draft_hidden_id]);
+        append_prompt_anchor(&store, &main_hidden_id, "merge anchor", &[&draft_hidden_id]).await;
     store
         .set_branch_head("main", &main_hidden_id, &merge_anchor_id)
         .unwrap();
@@ -3433,23 +3455,25 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
 
     let store = open_store(&store_path).await.unwrap();
     let session_id = store.get_branch_head("main").unwrap();
-    let shared_anchor_id = append_prompt_anchor(&store, &session_id, "shared anchor", &[]);
-    let shared_hidden_id = append_text_node(&store, &shared_anchor_id, "shared hidden text");
+    let shared_anchor_id = append_prompt_anchor(&store, &session_id, "shared anchor", &[]).await;
+    let shared_hidden_id = append_text_node(&store, &shared_anchor_id, "shared hidden text").await;
 
-    let alpha_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "alpha anchor", &[]);
-    let alpha_hidden_id = append_text_node(&store, &alpha_anchor_id, "alpha hidden text");
+    let alpha_anchor_id =
+        append_prompt_anchor(&store, &shared_hidden_id, "alpha anchor", &[]).await;
+    let alpha_hidden_id = append_text_node(&store, &alpha_anchor_id, "alpha hidden text").await;
     store
         .set_branch_head("alpha", &session_id, &alpha_hidden_id)
         .unwrap();
 
-    let beta_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "beta anchor", &[]);
-    let beta_hidden_id = append_text_node(&store, &beta_anchor_id, "beta hidden text");
+    let beta_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "beta anchor", &[]).await;
+    let beta_hidden_id = append_text_node(&store, &beta_anchor_id, "beta hidden text").await;
     store
         .set_branch_head("beta", &session_id, &beta_hidden_id)
         .unwrap();
 
-    let gamma_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "gamma anchor", &[]);
-    let gamma_hidden_id = append_text_node(&store, &gamma_anchor_id, "gamma hidden text");
+    let gamma_anchor_id =
+        append_prompt_anchor(&store, &shared_hidden_id, "gamma anchor", &[]).await;
+    let gamma_hidden_id = append_text_node(&store, &gamma_anchor_id, "gamma hidden text").await;
     store
         .set_branch_head("gamma", &session_id, &gamma_hidden_id)
         .unwrap();
@@ -3459,7 +3483,8 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
         &alpha_hidden_id,
         "merge fanin anchor",
         &[&beta_hidden_id, &gamma_hidden_id],
-    );
+    )
+    .await;
     store
         .set_branch_head("main", &session_id, &merge_anchor_id)
         .unwrap();
@@ -3558,7 +3583,7 @@ async fn session_graph_and_show_render_skill_result_anchor() {
 
     let store = open_store(&store_path).await.unwrap();
     let session_head = store.get_branch_head("main").unwrap();
-    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command");
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &tool_use_id)
         .unwrap();
@@ -3568,7 +3593,8 @@ async fn session_graph_and_show_render_skill_result_anchor() {
         &session_head,
         "find-skills",
         "Delegated result",
-    );
+    )
+    .await;
     store
         .set_branch_head("main", &tool_use_id, &skill_result_id)
         .unwrap();
@@ -3625,26 +3651,28 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
 
     let store = open_store(&store_path).await.unwrap();
     let session_head = store.get_branch_head("main").unwrap();
-    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command");
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &tool_use_id)
         .unwrap();
-    let invocation_id = append_skill_invocation_anchor(&store, &tool_use_id, "fast-rust");
+    let invocation_id = append_skill_invocation_anchor(&store, &tool_use_id, "fast-rust").await;
     let child_session_id = append_session_anchor(
         &store,
         &invocation_id,
         "You are executing the skill `fast-rust` on an isolated branch.",
-    );
-    let child_output_id = append_text_node(&store, &child_session_id, "Delegated result");
+    )
+    .await;
+    let child_output_id = append_text_node(&store, &child_session_id, "Delegated result").await;
     let tool_result_id =
-        append_tool_result_node(&store, &tool_use_id, "tool-1", "Delegated result");
+        append_tool_result_node(&store, &tool_use_id, "tool-1", "Delegated result").await;
     let skill_result_id = append_skill_result_anchor(
         &store,
         &tool_result_id,
         &child_output_id,
         "fast-rust",
         "Delegated result",
-    );
+    )
+    .await;
     store
         .set_branch_head("main", &tool_use_id, &skill_result_id)
         .unwrap();
@@ -3775,9 +3803,9 @@ async fn session_show_outputs_children_ids_for_primary_and_merge_edges() {
 
     let store = open_store(&store_path).await.unwrap();
     let session_id = store.get_branch_head("main").unwrap();
-    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]);
+    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]).await;
     let merge_child_id =
-        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]);
+        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]).await;
 
     let output = run_with_backend(
         session_show_cli(store_path, &session_id, false),
@@ -3810,9 +3838,9 @@ async fn session_show_json_includes_children_ids() {
 
     let store = open_store(&store_path).await.unwrap();
     let session_id = store.get_branch_head("main").unwrap();
-    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]);
+    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]).await;
     let merge_child_id =
-        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]);
+        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]).await;
 
     let output = run_with_backend(
         session_show_cli(store_path, &session_id[..12], true),
@@ -3846,7 +3874,8 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
 
     let store = open_store(&store_path).await.unwrap();
     let session_id = store.get_branch_head("main").unwrap();
-    let shadow_parent = append_tool_use_node(&store, &session_id, "tool-call-1", "exec_command");
+    let shadow_parent =
+        append_tool_use_node(&store, &session_id, "tool-call-1", "exec_command").await;
     let shadow_anchor_id = store
         .append(NewNode {
             parent: session_id.clone(),
@@ -3860,6 +3889,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &session_id, &shadow_anchor_id)
@@ -3973,7 +4003,7 @@ async fn session_show_resolves_short_node_prefix_after_source_branch_delete() {
 
     let store = open_store(&store_path).await.unwrap();
     let draft_head = store.get_branch_head("draft").unwrap();
-    let draft_node_id = append_prompt_anchor(&store, &draft_head, "deleted branch node", &[]);
+    let draft_node_id = append_prompt_anchor(&store, &draft_head, "deleted branch node", &[]).await;
     store
         .set_branch_head("draft", &draft_head, &draft_node_id)
         .unwrap();
@@ -4038,12 +4068,15 @@ async fn session_show_reports_ambiguous_short_node_prefix() {
     let session_id = store.get_branch_head("main").unwrap();
     let mut ids = vec![root_id, session_id];
     for index in 0..32 {
-        ids.push(append_prompt_anchor(
-            &store,
-            &store.get_branch_head("main").unwrap(),
-            &format!("node-{index}"),
-            &[],
-        ));
+        ids.push(
+            append_prompt_anchor(
+                &store,
+                &store.get_branch_head("main").unwrap(),
+                &format!("node-{index}"),
+                &[],
+            )
+            .await,
+        );
     }
     let (prefix, matches) = ids
         .into_iter()
@@ -5533,7 +5566,7 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
     let store = open_store(&store_path).await.unwrap();
     let session_head = store.get_branch_head("draft").unwrap();
     let parent_tool_use =
-        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("draft", &[Ok("world")])]),
@@ -5614,7 +5647,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
         .unwrap();
     let session_head = store.get_branch_head("main").unwrap();
     let parent_tool_use =
-        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let llm = llm_with_test_provider_config(store.clone(), SkillRunBackend);
 
     let response = run_forwarded_with_services(
@@ -5763,8 +5796,10 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
                 },
             )),
         })
+        .await
         .unwrap();
-    let parent_tool_use = append_tool_use_node(&store, &patch_id, "tool-call-1", "exec_command");
+    let parent_tool_use =
+        append_tool_use_node(&store, &patch_id, "tool-call-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &patch_id)
         .unwrap();
@@ -5886,7 +5921,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
     let store = open_store(&store_path).await.unwrap();
     let session_head = store.get_branch_head("main").unwrap();
     let parent_tool_use =
-        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let job = submit_prompt_job(&store, "main", "hello").await;
     let llm = llm_with_test_provider_config(
         store.clone(),

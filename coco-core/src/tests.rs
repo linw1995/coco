@@ -35,7 +35,7 @@ async fn test_store() -> SqliteStore {
         .expect("temporary SQLite store should open")
 }
 
-fn append_skill_invocation_node<S>(store: &S, parent: &str, skill_name: &str) -> String
+async fn append_skill_invocation_node<S>(store: &S, parent: &str, skill_name: &str) -> String
 where
     S: NodeStore,
 {
@@ -52,6 +52,7 @@ where
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
@@ -293,6 +294,7 @@ async fn submit_prompt_job(
                 },
             )),
         })
+        .await
         .unwrap();
     store.submit_job(branch, &prompt_anchor_id).await.unwrap()
 }
@@ -894,6 +896,7 @@ async fn llm_engine_retries_job_from_before_failure_node() {
             metadata: BackendMetadata::builder().build(),
             kind: Kind::Failure("transient backend outage".to_owned()),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &current_head, &failure_id)
@@ -969,6 +972,7 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
             metadata: BackendMetadata::builder().build(),
             kind: Kind::Failure("transient backend outage".to_owned()),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &current_head, &failure_id)
@@ -1424,6 +1428,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
                 input: serde_json::json!({"cmd": "printf 'hello' > trace.txt"}),
             }),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &job.base, &tool_use_id)
@@ -1441,6 +1446,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
                 output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
             }),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &tool_use_id, &tool_result_id)
@@ -1493,8 +1499,9 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
                 },
             )),
         })
+        .await
         .unwrap();
-    let invocation_id = append_skill_invocation_node(&store, &caller_prompt_id, "fast-rust");
+    let invocation_id = append_skill_invocation_node(&store, &caller_prompt_id, "fast-rust").await;
 
     let result = engine
         .execute_skill_invocation(
@@ -1592,7 +1599,7 @@ async fn llm_engine_materializes_store_skill_scripts() {
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let invocation_id =
-        append_skill_invocation_node(&store, &base_session.anchor_id, "scripted-skill");
+        append_skill_invocation_node(&store, &base_session.anchor_id, "scripted-skill").await;
 
     engine
         .execute_skill_invocation(
@@ -1669,7 +1676,7 @@ async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let invocation_id =
-        append_skill_invocation_node(&store, &base_session.anchor_id, "bad-scripted-skill");
+        append_skill_invocation_node(&store, &base_session.anchor_id, "bad-scripted-skill").await;
 
     let error = engine
         .execute_skill_invocation(
@@ -1708,7 +1715,8 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
         )
         .await
         .unwrap();
-    let invocation_id = append_skill_invocation_node(&store, &base_session.anchor_id, "fast-rust");
+    let invocation_id =
+        append_skill_invocation_node(&store, &base_session.anchor_id, "fast-rust").await;
 
     let error = engine
         .execute_skill_invocation(

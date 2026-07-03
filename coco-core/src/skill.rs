@@ -350,7 +350,7 @@ where
         let store = service.store();
         let child_branch = temporary_skill_branch_name(&request.base_branch, &request.skill_name);
         ensure_skill_invocation_node(store, &request.parent_tool_use_id, &request.skill_name)?;
-        let child_session_anchor_id = append_skill_session_anchor(store, &request)?;
+        let child_session_anchor_id = append_skill_session_anchor(store, &request).await?;
 
         store
             .fork(&child_branch, &child_session_anchor_id)
@@ -414,7 +414,7 @@ where
     })
 }
 
-fn append_skill_session_anchor<S>(
+async fn append_skill_session_anchor<S>(
     store: &S,
     request: &SkillInvocationRequest,
 ) -> std::result::Result<String, LlmError>
@@ -448,6 +448,7 @@ where
                 },
             )),
         })
+        .await
         .map_err(|source| LlmError::Memory {
             source: Box::new(source),
         })
