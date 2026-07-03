@@ -4579,6 +4579,7 @@ mod tests {
     use diesel_async::RunQueryDsl;
     use std::sync::mpsc;
     use std::time::Duration;
+    use tokio::sync::oneshot;
 
     #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
     struct NodeRelationRow {
@@ -4868,22 +4869,19 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn graph_store_connection_contention_does_not_block_writer() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_store_connection_contention_does_not_block_writer() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).unwrap();
         let graph = SqliteGraphStore::open_read_only(&path).unwrap();
-        let graph_database = graph.database.clone();
-        let graph_connection_database = graph_database.clone();
+        let graph_connection_database = graph.database.clone();
         let (graph_locked_tx, graph_locked_rx) = mpsc::channel();
-        let (release_graph_tx, release_graph_rx) = mpsc::channel();
-        let graph_lock = std::thread::spawn(move || {
-            graph_database.block_on(async move {
-                let _connection = graph_connection_database.connection().await.unwrap();
-                graph_locked_tx.send(()).unwrap();
-                release_graph_rx.recv().unwrap();
-            });
+        let (release_graph_tx, release_graph_rx) = oneshot::channel();
+        let graph_lock = tokio::spawn(async move {
+            let _connection = graph_connection_database.connection().await.unwrap();
+            graph_locked_tx.send(()).unwrap();
+            release_graph_rx.await.unwrap();
         });
         graph_locked_rx
             .recv_timeout(Duration::from_secs(1))
@@ -4908,7 +4906,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("writer should not wait for graph connection release");
         release_graph_tx.send(()).unwrap();
-        graph_lock.join().unwrap();
+        graph_lock.await.unwrap();
         write.join().unwrap();
         assert_eq!(store.get_node(&written).unwrap().id, written);
     }
