@@ -758,6 +758,17 @@ impl SqliteStore {
         let mut connection = self.connect().await?;
         load_session_state(&mut connection, &self.database_path, name).await
     }
+
+    async fn set_session_state_in_sqlite(
+        &self,
+        name: &str,
+        expected: Option<&SessionState>,
+        next: SessionState,
+    ) -> Result<SessionState> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        update_session_state(&mut connection, &self.database_path, name, expected, next).await
+    }
 }
 
 impl SqliteGraphStore {
@@ -4188,12 +4199,7 @@ impl SessionStore for SqliteStore {
         expected: Option<&SessionState>,
         next: SessionState,
     ) -> Result<SessionState> {
-        self.ensure_writable()?;
-        let updated = self.block_on(async {
-            let mut connection = self.connect().await?;
-            update_session_state(&mut connection, &self.database_path, name, expected, next).await
-        })?;
-        Ok(updated)
+        self.block_on(self.set_session_state_in_sqlite(name, expected, next))
     }
 
     fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
