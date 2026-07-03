@@ -678,7 +678,7 @@ impl SqliteGraphStore {
         let path = path.as_ref();
         ensure_existing_store_directory(path)?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
-        let store = Self::new(path)?;
+        let store = block_on_sqlite_runtime_with(sqlite_runtime()?, Self::new(path))?;
         let root_id = block_on_sqlite_runtime_with(
             sqlite_runtime()?,
             store.database.with_initialization_lock(|| async {
@@ -694,12 +694,9 @@ impl SqliteGraphStore {
         &self.dir
     }
 
-    fn new(path: &Path) -> Result<Self> {
+    async fn new(path: &Path) -> Result<Self> {
         let database_path = sqlite_database_path(path);
-        let database = block_on_sqlite_runtime_with(
-            sqlite_runtime()?,
-            SqliteDatabase::open(database_path.clone(), false),
-        )?;
+        let database = SqliteDatabase::open(database_path.clone(), false).await?;
         Ok(Self {
             dir: path.to_owned(),
             database_path,
