@@ -676,7 +676,7 @@ impl SqliteGraphStore {
         let root_id = block_on_sqlite_runtime_with(
             sqlite_runtime()?,
             store.database.with_initialization_lock(|| async {
-                store.ensure_current_schema()?;
+                store.ensure_current_schema().await?;
                 let mut connection = store.connect().await?;
                 load_root_id(&mut connection, &store.database_path).await
             }),
@@ -703,21 +703,19 @@ impl SqliteGraphStore {
         })
     }
 
-    fn ensure_current_schema(&self) -> Result<()> {
-        self.block_on(async {
-            let mut connection = self.connect().await?;
-            let version = existing_schema_version(&mut connection, &self.database_path).await?;
-            ensure!(
-                version == SQLITE_SCHEMA_VERSION,
-                CorruptedStoreSnafu {
-                    path: self.database_path.clone(),
-                    message: format!(
-                        "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
-                    ),
-                }
-            );
-            Ok(())
-        })
+    async fn ensure_current_schema(&self) -> Result<()> {
+        let mut connection = self.connect().await?;
+        let version = existing_schema_version(&mut connection, &self.database_path).await?;
+        ensure!(
+            version == SQLITE_SCHEMA_VERSION,
+            CorruptedStoreSnafu {
+                path: self.database_path.clone(),
+                message: format!(
+                    "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
+                ),
+            }
+        );
+        Ok(())
     }
 
     fn block_on<F>(&self, future: F) -> F::Output
