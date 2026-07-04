@@ -1070,8 +1070,8 @@ impl SqliteGraphStore {
         operation(&mut connection).await
     }
 
-    pub fn begin_read_transaction(&self) -> Result<()> {
-        self.block_on(self.begin_read_transaction_in_sqlite())
+    pub async fn begin_read_transaction(&self) -> Result<()> {
+        self.begin_read_transaction_in_sqlite().await
     }
 
     async fn begin_read_transaction_in_sqlite(&self) -> Result<()> {
@@ -1116,8 +1116,8 @@ impl SqliteGraphStore {
         Ok(())
     }
 
-    pub fn commit_read_transaction(&self) -> Result<()> {
-        self.block_on(self.commit_read_transaction_in_sqlite())
+    pub async fn commit_read_transaction(&self) -> Result<()> {
+        self.commit_read_transaction_in_sqlite().await
     }
 
     async fn commit_read_transaction_in_sqlite(&self) -> Result<()> {
@@ -1134,8 +1134,8 @@ impl SqliteGraphStore {
         commit_deferred_transaction(&mut connection, &self.database_path).await
     }
 
-    pub fn rollback_read_transaction(&self) -> Result<()> {
-        self.block_on(self.rollback_read_transaction_in_sqlite())
+    pub async fn rollback_read_transaction(&self) -> Result<()> {
+        self.rollback_read_transaction_in_sqlite().await
     }
 
     async fn rollback_read_transaction_in_sqlite(&self) -> Result<()> {
