@@ -198,8 +198,12 @@ impl NodeStore for MaterializationSourceSnapshot {
 }
 
 impl BranchStore for MaterializationSourceSnapshot {
-    fn fork(&self, _name: &str, _from_ref: &str) -> coco_mem::StoreResult<String> {
-        Self::read_only_error()
+    fn fork<'a>(
+        &'a self,
+        _name: &'a str,
+        _from_ref: &'a str,
+    ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
+        std::future::ready(Self::read_only_error())
     }
 
     fn get_branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {
@@ -6069,10 +6073,14 @@ mod tests {
     }
 
     impl BranchStore for BranchAdvanceDuringWalkStore {
-        fn fork(&self, _name: &str, _from_ref: &str) -> coco_mem::StoreResult<String> {
-            Err(coco_mem::StoreError::StoreReadOnly {
+        fn fork<'a>(
+            &'a self,
+            _name: &'a str,
+            _from_ref: &'a str,
+        ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
+            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            })
+            }))
         }
 
         fn get_branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {

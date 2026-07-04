@@ -1475,6 +1475,7 @@ where
             .context(MemorySnafu)?;
         self.store
             .fork(&config.branch, &anchor_id)
+            .await
             .context(MemorySnafu)?;
 
         tracing::info!(
@@ -1494,9 +1495,13 @@ where
         })
     }
 
-    pub fn fork(&self, branch: impl Into<String>, from_ref: &str) -> Result<String> {
+    pub async fn fork(&self, branch: impl Into<String>, from_ref: &str) -> Result<String> {
         let branch = branch.into();
-        let anchor_id = self.store.fork(&branch, from_ref).context(MemorySnafu)?;
+        let anchor_id = self
+            .store
+            .fork(&branch, from_ref)
+            .await
+            .context(MemorySnafu)?;
         tracing::info!(
             branch = %branch,
             from_ref = %from_ref,
@@ -6772,7 +6777,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store.fork("child", &child_anchor_id).unwrap();
+        store.fork("child", &child_anchor_id).await.unwrap();
 
         (service, child_prompt.to_owned())
     }
@@ -6892,6 +6897,7 @@ mod tests {
             .unwrap();
         service
             .fork("draft", &main_result.response_node_id)
+            .await
             .unwrap();
         service
             .prompt(prompt_request("draft", "draft question"))
@@ -6962,7 +6968,7 @@ mod tests {
             .await
             .unwrap();
         let main_head = store.get_branch_head("main").unwrap();
-        service.fork("runner", &main_head).unwrap();
+        service.fork("runner", &main_head).await.unwrap();
         let exec_tool = builtin_tool_definition("exec_command").unwrap();
 
         let result = service
@@ -7288,7 +7294,10 @@ mod tests {
             .create_session(session_config("main"))
             .await
             .unwrap();
-        service.fork("draft", &main_session.anchor_id).unwrap();
+        service
+            .fork("draft", &main_session.anchor_id)
+            .await
+            .unwrap();
 
         let main_service = service.clone();
         let draft_service = service.clone();
@@ -7631,7 +7640,10 @@ mod tests {
             .create_session(session_config("main"))
             .await
             .unwrap();
-        service.fork("draft", &main_session.anchor_id).unwrap();
+        service
+            .fork("draft", &main_session.anchor_id)
+            .await
+            .unwrap();
         service
             .rebase_session(
                 "main",

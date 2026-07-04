@@ -354,6 +354,7 @@ where
 
         store
             .fork(&child_branch, &child_session_anchor_id)
+            .await
             .map_err(|source| LlmError::Memory {
                 source: Box::new(source),
             })?;

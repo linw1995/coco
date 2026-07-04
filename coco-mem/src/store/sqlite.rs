@@ -4307,8 +4307,12 @@ impl NodeStore for SqliteGraphStore {
 }
 
 impl BranchStore for SqliteGraphStore {
-    fn fork(&self, _name: &str, _from_ref: &str) -> Result<String> {
-        self.ensure_read_only()
+    fn fork<'a>(
+        &'a self,
+        _name: &'a str,
+        _from_ref: &'a str,
+    ) -> impl Future<Output = Result<String>> + Send + 'a {
+        std::future::ready(self.ensure_read_only())
     }
 
     fn get_branch_head(&self, name: &str) -> Result<String> {
@@ -4402,8 +4406,8 @@ impl NodeStore for SqliteStore {
 }
 
 impl BranchStore for SqliteStore {
-    fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
-        self.block_on(self.fork_in_sqlite(name, from_ref))
+    async fn fork<'a>(&'a self, name: &'a str, from_ref: &'a str) -> Result<String> {
+        self.fork_in_sqlite(name, from_ref).await
     }
 
     fn get_branch_head(&self, name: &str) -> Result<String> {
@@ -5486,7 +5490,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("graph-child", &child_id).unwrap();
+        writer.fork("graph-child", &child_id).await.unwrap();
         drop(writer);
 
         let graph_store = SqliteGraphStore::open_read_only(&path).await.unwrap();
@@ -5800,7 +5804,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.fork("main", &first).unwrap(), first);
+        assert_eq!(store.fork("main", &first).await.unwrap(), first);
         store.set_branch_head("main", &first, &second).unwrap();
         assert_eq!(store.get_branch_head("main").unwrap(), second);
 
@@ -5818,7 +5822,7 @@ mod tests {
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
-        store.fork("main", &root_id).unwrap();
+        store.fork("main", &root_id).await.unwrap();
         let node = Node::new(
             root_id.clone(),
             Role::User,
@@ -5857,7 +5861,7 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let session = store.append(session_anchor_node(&root_id)).await.unwrap();
-        store.fork("main", &session).unwrap();
+        store.fork("main", &session).await.unwrap();
         let text = store
             .append(NewNode {
                 parent: session.clone(),
@@ -5926,7 +5930,7 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
         let root_id = store.root_id();
         let session = store.append(session_anchor_node(&root_id)).await.unwrap();
-        store.fork("main", &session).unwrap();
+        store.fork("main", &session).await.unwrap();
 
         let job = store
             .submit_job_with_id("job-test", "main", &session)

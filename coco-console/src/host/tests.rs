@@ -274,7 +274,7 @@ async fn graph_snapshot_contains_primary_and_merge_edges() {
         })
         .await
         .unwrap();
-    store.fork("main", &left).unwrap();
+    store.fork("main", &left).await.unwrap();
     let right = store
         .append(NewNode {
             parent: root,
@@ -297,7 +297,7 @@ async fn graph_snapshot_contains_primary_and_merge_edges() {
         .await
         .unwrap();
     store.set_branch_head("main", &left, &merged).unwrap();
-    store.fork("draft", &left).unwrap();
+    store.fork("draft", &left).await.unwrap();
     let draft = store
         .append(NewNode {
             parent: left.clone(),
@@ -491,7 +491,7 @@ async fn graph_snapshot_contains_shadow_parent_edges() {
         })
         .await
         .unwrap();
-    store.fork("main", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
     let shadow_parent = store
         .append(NewNode {
             parent: root,
@@ -540,8 +540,8 @@ async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
         })
         .await
         .unwrap();
-    store.fork("main", &session).unwrap();
-    store.fork("draft", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
+    store.fork("draft", &session).await.unwrap();
 
     let main_anchor = store
         .append(NewNode {
@@ -661,7 +661,7 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
         })
         .await
         .unwrap();
-    store.fork("main", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
     let tool_use = store
         .append(NewNode {
             parent: session.clone(),
@@ -739,7 +739,7 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     assert!(invocation_context.contains("No provider context nodes."));
     assert!(!invocation_context.contains("The selected node is no longer available."));
 
-    store.fork("skill", &invocation_child).unwrap();
+    store.fork("skill", &invocation_child).await.unwrap();
     let skill_snapshot = build_graph_snapshot(&store, 10).unwrap();
     let skill_context = skill_snapshot
         .provider_contexts
@@ -844,7 +844,7 @@ async fn node_details_include_nodes_from_same_provider_context() {
         })
         .await
         .unwrap();
-    store.fork("main", &first_session).unwrap();
+    store.fork("main", &first_session).await.unwrap();
     let previous_text = store
         .append(NewNode {
             parent: first_session.clone(),
@@ -963,7 +963,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
         })
         .await
         .unwrap();
-    store.fork("main", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
     let shared_hidden = store
         .append(NewNode {
             parent: session.clone(),
@@ -1016,7 +1016,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
         .set_branch_head("main", &session, &main_prompt)
         .unwrap();
 
-    store.fork("review", &shared_prompt).unwrap();
+    store.fork("review", &shared_prompt).await.unwrap();
     let review_hidden = store
         .append(NewNode {
             parent: shared_prompt.clone(),
@@ -1106,7 +1106,7 @@ async fn provider_context_id_stays_stable_when_branch_head_moves() {
         })
         .await
         .unwrap();
-    store.fork("main", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
     let first_prompt = store
         .append(NewNode {
             parent: session.clone(),
@@ -1179,7 +1179,7 @@ async fn provider_context_ids_preserve_unique_branch_names() {
         .await
         .unwrap();
 
-    store.fork("draft/review", &session).unwrap();
+    store.fork("draft/review", &session).await.unwrap();
     let slash_hidden = store
         .append(NewNode {
             parent: session.clone(),
@@ -1208,7 +1208,7 @@ async fn provider_context_ids_preserve_unique_branch_names() {
         .set_branch_head("draft/review", &session, &slash_prompt)
         .unwrap();
 
-    store.fork("draft-review", &session).unwrap();
+    store.fork("draft-review", &session).await.unwrap();
     let dash_hidden = store
         .append(NewNode {
             parent: session.clone(),
@@ -1286,7 +1286,7 @@ async fn all_mode_provider_contexts_cover_older_visible_segments() {
         })
         .await
         .unwrap();
-    store.fork("main", &first_session).unwrap();
+    store.fork("main", &first_session).await.unwrap();
     let old_hidden = store
         .append(NewNode {
             parent: first_session.clone(),
@@ -1397,7 +1397,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
         })
         .await
         .unwrap();
-    store.fork("main", &empty_prompt_session).unwrap();
+    store.fork("main", &empty_prompt_session).await.unwrap();
 
     let mut prompted_session_anchor = session_anchor();
     prompted_session_anchor.prompt = "session prompt".to_owned();

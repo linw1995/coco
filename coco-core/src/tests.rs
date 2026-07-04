@@ -556,7 +556,7 @@ async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
     let backend = FakeBackend::with_responses(&[("runner", &[Ok("runner done")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let main_session = llm.create_session(session_config("main")).await.unwrap();
-    llm.fork("runner", &main_session.anchor_id).unwrap();
+    llm.fork("runner", &main_session.anchor_id).await.unwrap();
     let exec_tool = builtin_tool_definition("exec_command").unwrap();
     let engine = ConversationEngine::new(llm);
 
@@ -1055,7 +1055,11 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
         .expect("first event should include retry node")
         .to_owned();
 
-    engine.service().fork("recovery-b", &retry_from_a).unwrap();
+    engine
+        .service()
+        .fork("recovery-b", &retry_from_a)
+        .await
+        .unwrap();
     let on_b = engine
         .set_job_work_branch(&job.job_id, "main", "recovery-b")
         .await
@@ -1079,7 +1083,11 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
         .expect("second event should include retry node")
         .to_owned();
 
-    engine.service().fork("recovery-c", &retry_from_b).unwrap();
+    engine
+        .service()
+        .fork("recovery-c", &retry_from_b)
+        .await
+        .unwrap();
     let on_c = engine
         .set_job_work_branch(&job.job_id, "recovery-b", "recovery-c")
         .await
@@ -1147,7 +1155,11 @@ async fn llm_engine_finishes_job_when_recovery_restore_fails() {
         .as_str()
         .expect("event should include retry node");
 
-    engine.service().fork("recovery-b", retry_from).unwrap();
+    engine
+        .service()
+        .fork("recovery-b", retry_from)
+        .await
+        .unwrap();
     engine
         .set_job_work_branch(&job.job_id, &failed.work_branch, "recovery-b")
         .await

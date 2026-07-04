@@ -1251,7 +1251,7 @@ mod tests {
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(test_store().await, publisher.clone());
         let root = store.root_id();
-        store.fork("main", &root).unwrap();
+        store.fork("main", &root).await.unwrap();
         let first = store
             .append(NewNode {
                 parent: root.clone(),
@@ -1321,8 +1321,8 @@ mod tests {
             })
             .await
             .unwrap();
-        store.fork("main", &first).unwrap();
-        store.fork("draft", &second).unwrap();
+        store.fork("main", &first).await.unwrap();
+        store.fork("draft", &second).await.unwrap();
         let viewport = GraphViewportRequest::default();
         let state = app_state(store.clone(), publisher.clone());
         let snapshot = state.cache.current_snapshot(GraphMode::All).await;
@@ -1382,7 +1382,7 @@ mod tests {
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(test_store().await, publisher.clone());
         let root = store.root_id();
-        store.fork("main", &root).unwrap();
+        store.fork("main", &root).await.unwrap();
         let version = publisher.current_version();
         let viewport = GraphViewportRequest::default();
         let snapshot = build_graph_snapshot(&store, version).unwrap();
@@ -1664,7 +1664,7 @@ mod tests {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
-        writer.fork("main", &writer.root_id()).unwrap();
+        writer.fork("main", &writer.root_id()).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
@@ -1694,7 +1694,7 @@ mod tests {
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: root.clone(),
@@ -1735,7 +1735,7 @@ mod tests {
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: root.clone(),
@@ -1899,7 +1899,7 @@ mod tests {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
-        writer.fork("main", &writer.root_id()).unwrap();
+        writer.fork("main", &writer.root_id()).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
@@ -1937,7 +1937,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let prompt = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2019,7 +2019,7 @@ mod tests {
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: root.clone(),
@@ -2068,7 +2068,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let hidden_text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2136,7 +2136,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let hidden_text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2219,7 +2219,7 @@ mod tests {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
-        writer.fork("main", &writer.root_id()).unwrap();
+        writer.fork("main", &writer.root_id()).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
@@ -2260,7 +2260,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let hidden_text = writer
             .append(NewNode {
                 parent: session.clone(),

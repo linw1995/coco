@@ -43,7 +43,11 @@ pub trait NodeStore {
 /// Branch reference storage API.
 pub trait BranchStore {
     /// Creates a branch from a node id or branch reference and returns its head id.
-    fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String>;
+    fn fork<'a>(
+        &'a self,
+        name: &'a str,
+        from_ref: &'a str,
+    ) -> impl Future<Output = StoreResult<String>> + Send + 'a;
 
     /// Returns the current head node identifier for a branch.
     fn get_branch_head(&self, name: &str) -> StoreResult<String>;
@@ -336,8 +340,10 @@ impl NodeStore for PersistentStore {
 }
 
 impl BranchStore for PersistentStore {
-    fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.fork(name, from_ref))
+    async fn fork<'a>(&'a self, name: &'a str, from_ref: &'a str) -> StoreResult<String> {
+        match self {
+            Self::Sqlite(store) => store.fork(name, from_ref).await,
+        }
     }
 
     fn get_branch_head(&self, name: &str) -> StoreResult<String> {

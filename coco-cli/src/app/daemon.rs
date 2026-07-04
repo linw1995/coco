@@ -2334,7 +2334,7 @@ mod tests {
     async fn daemon_profile_graph_builds_snapshot_without_serving() {
         let store = test_store().await;
         let root = store.root_id();
-        store.fork("main", &root).unwrap();
+        store.fork("main", &root).await.unwrap();
         let node = store
             .append(NewNode {
                 parent: root.clone(),
@@ -3074,7 +3074,7 @@ mod tests {
     #[tokio::test]
     async fn active_job_waiting_for_recovery_detects_failure_child() {
         let store = test_store().await;
-        store.fork("main", &store.root_id()).unwrap();
+        store.fork("main", &store.root_id()).await.unwrap();
         let base = store.get_branch_head("main").unwrap();
         let active_job = store.submit_job("main", &base).await.unwrap();
         store
@@ -3093,7 +3093,7 @@ mod tests {
     #[tokio::test]
     async fn active_job_waiting_for_recovery_detects_terminal_failure() {
         let store = test_store().await;
-        store.fork("main", &store.root_id()).unwrap();
+        store.fork("main", &store.root_id()).await.unwrap();
         let base = store.get_branch_head("main").unwrap();
         let active_job = store.submit_job("main", &base).await.unwrap();
         let failure = store
@@ -3113,7 +3113,7 @@ mod tests {
     #[tokio::test]
     async fn active_job_waiting_for_recovery_ignores_clean_job() {
         let store = test_store().await;
-        store.fork("main", &store.root_id()).unwrap();
+        store.fork("main", &store.root_id()).await.unwrap();
         let base = store.get_branch_head("main").unwrap();
         let active_job = store.submit_job("main", &base).await.unwrap();
 

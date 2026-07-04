@@ -78,8 +78,8 @@ impl<S> BranchStore for ConsoleStore<S>
 where
     S: BranchStore + Sync,
 {
-    fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
-        self.notify_if_ok(self.inner.fork(name, from_ref))
+    async fn fork<'a>(&'a self, name: &'a str, from_ref: &'a str) -> StoreResult<String> {
+        self.notify_if_ok(self.inner.fork(name, from_ref).await)
     }
 
     fn get_branch_head(&self, name: &str) -> StoreResult<String> {

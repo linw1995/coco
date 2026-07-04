@@ -1378,7 +1378,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store.fork("main", &session).unwrap();
+        store.fork("main", &session).await.unwrap();
         let text = store
             .append(NewNode {
                 parent: session.clone(),
@@ -1421,7 +1421,7 @@ mod tests {
             .await
             .unwrap();
         let branch = "orphan abc123";
-        store.fork(branch, &session).unwrap();
+        store.fork(branch, &session).await.unwrap();
         let branch_lane = crate::api::GraphViewportLane {
             key: lane_key(branch),
             label: branch.to_owned(),
@@ -1446,7 +1446,7 @@ mod tests {
     async fn materialized_shell_branches_preserve_hidden_branches() {
         let store = test_store().await;
         let root = store.root_id();
-        store.fork("hidden", &root).unwrap();
+        store.fork("hidden", &root).await.unwrap();
 
         let branches = materialized_shell_branches(&store, &[]).unwrap();
 
@@ -1620,7 +1620,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -1688,7 +1688,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -1730,7 +1730,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -1988,7 +1988,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2122,7 +2122,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2255,7 +2255,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -2385,7 +2385,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2442,7 +2442,7 @@ mod tests {
         let skill_lane = format!("skill {}", crate::graph::shorten_id(&result));
         assert!(initial.lanes.iter().any(|lane| lane.label == skill_lane));
 
-        writer.fork("draft", &result).unwrap();
+        writer.fork("draft", &result).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -2518,7 +2518,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2548,7 +2548,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("draft", &invocation).unwrap();
+        writer.fork("draft", &invocation).await.unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -2648,7 +2648,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2753,7 +2753,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2920,7 +2920,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3056,7 +3056,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3182,7 +3182,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3295,7 +3295,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3355,7 +3355,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("draft", &draft_tool_use).unwrap();
+        writer.fork("draft", &draft_tool_use).await.unwrap();
         let draft_invocation = writer
             .append(NewNode {
                 parent: draft_tool_use.clone(),
@@ -3471,7 +3471,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3543,7 +3543,7 @@ mod tests {
         let skill_lane = format!("skill {}", crate::graph::shorten_id(&result_second));
         assert!(initial.lanes.iter().any(|lane| lane.label == skill_lane));
 
-        writer.fork("draft", &result_first).unwrap();
+        writer.fork("draft", &result_first).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -3638,7 +3638,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -3663,7 +3663,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_merge = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3734,7 +3734,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let orphan_parent = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3831,7 +3831,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3918,7 +3918,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3999,7 +3999,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4076,7 +4076,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4096,7 +4096,7 @@ mod tests {
             .await
             .unwrap();
         let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan));
-        writer.fork(&orphan_lane, &root).unwrap();
+        writer.fork(&orphan_lane, &root).await.unwrap();
         let merge_anchor = writer
             .append(NewNode {
                 parent: text.clone(),
@@ -4115,7 +4115,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &merge_anchor)
             .unwrap();
-        writer.fork("orphan branch", &session).unwrap();
+        writer.fork("orphan branch", &session).await.unwrap();
         let reserved_label_branch_head = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4199,7 +4199,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4210,7 +4210,7 @@ mod tests {
             .await
             .unwrap();
         writer.set_branch_head("main", &session, &shared).unwrap();
-        writer.fork("feature", &shared).unwrap();
+        writer.fork("feature", &shared).await.unwrap();
         let main_head = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -4311,7 +4311,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4349,7 +4349,7 @@ mod tests {
         writer
             .set_branch_head("main", &shared, &merge_anchor)
             .unwrap();
-        writer.fork("beta", &shared).unwrap();
+        writer.fork("beta", &shared).await.unwrap();
         let beta_first = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -4446,7 +4446,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let hidden = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4539,8 +4539,8 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
+        writer.fork("draft", &session).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4594,8 +4594,8 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("skill research", &session).unwrap();
-        writer.fork("orphan fix", &session).unwrap();
+        writer.fork("skill research", &session).await.unwrap();
+        writer.fork("orphan fix", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache
@@ -4682,7 +4682,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4737,7 +4737,7 @@ mod tests {
         let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan_tail));
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork(&orphan_lane, &session).unwrap();
+        writer.fork(&orphan_lane, &session).await.unwrap();
         publisher.mark_changed();
         let branch_created_version = publisher.current_version();
         let branch_created = cache
@@ -4804,7 +4804,7 @@ mod tests {
         .await
         .unwrap();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4929,7 +4929,7 @@ mod tests {
         .await
         .unwrap();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         let session = writer
             .append(NewNode {
                 parent: root,
@@ -4948,7 +4948,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("draft", &text).unwrap();
+        writer.fork("draft", &text).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4999,7 +4999,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5010,7 +5010,7 @@ mod tests {
             .await
             .unwrap();
         writer.set_branch_head("main", &session, &text).unwrap();
-        writer.fork("empty", &root).unwrap();
+        writer.fork("empty", &root).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -5061,7 +5061,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5082,7 +5082,7 @@ mod tests {
             .await
             .unwrap();
 
-        writer.fork("empty", &root).unwrap();
+        writer.fork("empty", &root).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -5132,7 +5132,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5202,7 +5202,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -5269,7 +5269,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -5340,7 +5340,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5498,7 +5498,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5526,7 +5526,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_hidden)
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_hidden = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5627,7 +5627,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5640,7 +5640,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_first)
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5757,7 +5757,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5859,7 +5859,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6016,7 +6016,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6074,7 +6074,7 @@ mod tests {
         assert_eq!(merged.version, merge_version);
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork("draft", &orphan_parent).unwrap();
+        writer.fork("draft", &orphan_parent).await.unwrap();
         publisher.mark_changed();
         let adopt_version = publisher.current_version();
         let adopted = cache
@@ -6138,7 +6138,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6203,7 +6203,7 @@ mod tests {
         assert_eq!(merged.version, merge_version);
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork("draft", &orphan_tail).unwrap();
+        writer.fork("draft", &orphan_tail).await.unwrap();
         publisher.mark_changed();
         let adopt_version = publisher.current_version();
         let adopted = cache
@@ -6287,7 +6287,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6363,7 +6363,7 @@ mod tests {
         assert_eq!(merged.version, merge_version);
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork("draft", &orphan_middle).unwrap();
+        writer.fork("draft", &orphan_middle).await.unwrap();
         publisher.mark_changed();
         let adopt_version = publisher.current_version();
         let adopted = cache
@@ -6464,7 +6464,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6531,7 +6531,7 @@ mod tests {
         assert_eq!(merged.version, merge_version);
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork("draft", &orphan_tail).unwrap();
+        writer.fork("draft", &orphan_tail).await.unwrap();
         publisher.mark_changed();
         let adopt_version = publisher.current_version();
         let adopted = cache
@@ -6602,7 +6602,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6718,7 +6718,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6861,7 +6861,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6993,7 +6993,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7076,7 +7076,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
@@ -7164,7 +7164,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first_prompt = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7265,7 +7265,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7284,7 +7284,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_anchor)
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7365,7 +7365,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7407,7 +7407,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7504,7 +7504,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &old_session).unwrap();
+        writer.fork("main", &old_session).await.unwrap();
         let old_prompt = writer
             .append(NewNode {
                 parent: old_session.clone(),
@@ -7558,7 +7558,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
-        writer.fork("draft", &current_session).unwrap();
+        writer.fork("draft", &current_session).await.unwrap();
         let draft_anchor = writer
             .append(NewNode {
                 parent: current_session.clone(),
@@ -7634,7 +7634,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &old_session).unwrap();
+        writer.fork("main", &old_session).await.unwrap();
         let old_prompt = writer
             .append(NewNode {
                 parent: old_session.clone(),
@@ -7745,7 +7745,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7767,7 +7767,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        writer.fork("hidden", &root).unwrap();
+        writer.fork("hidden", &root).await.unwrap();
         let hidden_text = writer
             .append(NewNode {
                 parent: root.clone(),
@@ -7836,7 +7836,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7860,7 +7860,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
-        writer.fork("draft", &main_anchor).unwrap();
+        writer.fork("draft", &main_anchor).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -7922,7 +7922,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7950,7 +7950,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_hidden)
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8127,7 +8127,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &current_session).unwrap();
+        writer.fork("main", &current_session).await.unwrap();
         let current_prompt = writer
             .append(NewNode {
                 parent: current_session.clone(),
@@ -8224,7 +8224,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8303,7 +8303,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8328,7 +8328,7 @@ mod tests {
         writer
             .set_branch_head("main", &main_first, &main_second)
             .unwrap();
-        writer.fork("draft", &main_second).unwrap();
+        writer.fork("draft", &main_second).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_second.clone(),
@@ -8438,7 +8438,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8451,7 +8451,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_first)
             .unwrap();
-        writer.fork("draft", &main_first).unwrap();
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8550,7 +8550,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8563,7 +8563,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_first)
             .unwrap();
-        writer.fork("draft", &main_first).unwrap();
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8656,7 +8656,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8686,7 +8686,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
-        writer.fork("draft", &main_first).unwrap();
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8764,7 +8764,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("zeta", &session).unwrap();
+        writer.fork("zeta", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8778,7 +8778,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        writer.fork("alpha", &shared).unwrap();
+        writer.fork("alpha", &shared).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8878,7 +8878,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("zeta", &session).unwrap();
+        writer.fork("zeta", &session).await.unwrap();
         let prompt = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8898,7 +8898,7 @@ mod tests {
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        writer.fork("alpha", &prompt).unwrap();
+        writer.fork("alpha", &prompt).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8976,7 +8976,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9006,7 +9006,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
-        writer.fork("draft", &main_first).unwrap();
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_merge = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9092,7 +9092,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9110,7 +9110,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
-        writer.fork("draft", &main_first).unwrap();
+        writer.fork("draft", &main_first).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -9202,13 +9202,13 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -9276,7 +9276,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9287,7 +9287,7 @@ mod tests {
             .await
             .unwrap();
         writer.set_branch_head("main", &session, &shared).unwrap();
-        writer.fork("draft", &shared).unwrap();
+        writer.fork("draft", &shared).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -9369,7 +9369,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9382,7 +9382,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_first)
             .unwrap();
-        writer.fork("zeta", &main_first).unwrap();
+        writer.fork("zeta", &main_first).await.unwrap();
         let zeta_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9400,7 +9400,7 @@ mod tests {
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
-        writer.fork("beta", &main_first).unwrap();
+        writer.fork("beta", &main_first).await.unwrap();
         let beta_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9500,7 +9500,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9513,7 +9513,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_first)
             .unwrap();
-        writer.fork("draft", &main_first).unwrap();
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9582,7 +9582,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9607,7 +9607,7 @@ mod tests {
         writer
             .set_branch_head("main", &main_first, &main_second)
             .unwrap();
-        writer.fork("draft", &main_second).unwrap();
+        writer.fork("draft", &main_second).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_second.clone(),
@@ -9715,7 +9715,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9728,7 +9728,7 @@ mod tests {
         writer
             .set_branch_head("main", &session, &main_first)
             .unwrap();
-        writer.fork("beta", &main_first).unwrap();
+        writer.fork("beta", &main_first).await.unwrap();
         let beta_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9741,7 +9741,7 @@ mod tests {
         writer
             .set_branch_head("beta", &main_first, &beta_first)
             .unwrap();
-        writer.fork("zeta", &main_first).unwrap();
+        writer.fork("zeta", &main_first).await.unwrap();
         let zeta_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9838,7 +9838,7 @@ mod tests {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).await.unwrap();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         let snapshot = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
         let base = root.clone();
 
@@ -10242,7 +10242,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
         let first_version = publisher.current_version();
         assert!(

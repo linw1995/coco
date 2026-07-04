@@ -266,7 +266,10 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let head_id = llm.fork(branch.clone(), &from_ref).context(LlmSnafu)?;
+    let head_id = llm
+        .fork(branch.clone(), &from_ref)
+        .await
+        .context(LlmSnafu)?;
     let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
     let result = SessionForkResult {
         state: store.get_session_state(&branch).await.context(StoreSnafu)?,

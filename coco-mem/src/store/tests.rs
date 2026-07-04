@@ -587,7 +587,7 @@ where
     let store = F::create().await;
     let root_id = store.root_id();
 
-    let head_id = store.fork("main", &root_id).unwrap();
+    let head_id = store.fork("main", &root_id).await.unwrap();
 
     assert_eq!(head_id, root_id);
     assert_eq!(store.get_branch_head("main").unwrap(), root_id);
@@ -599,10 +599,10 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("base", &root_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &root_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
-    let err = store.fork("main", &root_id).unwrap_err();
+    let err = store.fork("main", &root_id).await.unwrap_err();
 
     assert!(matches!(err, Error::BranchExists { name } if name == "main"));
 }
@@ -613,7 +613,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
     let state = store.get_session_state("main").await.unwrap();
 
     assert_eq!(state, SessionState::Active);
@@ -633,7 +633,7 @@ where
         .append(make_text_node(&child_id, "next"))
         .await
         .unwrap();
-    store.fork("main", &child_id).unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     store.set_branch_head("main", &child_id, &next_id).unwrap();
     let state = store.get_session_state("main").await.unwrap();
@@ -648,7 +648,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let branch_head = store.fork("main", &root_id).unwrap();
+    let branch_head = store.fork("main", &root_id).await.unwrap();
 
     store.delete_branch("main").await.unwrap();
 
@@ -676,8 +676,8 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("base", &root_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &root_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let state = store
         .set_session_state(
@@ -706,8 +706,8 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("base", &root_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &root_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
     store
         .set_session_state(
             "main",
@@ -752,8 +752,8 @@ where
         .append(make_session_anchor_node(&root_id))
         .await
         .unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     store
         .set_session_state(
@@ -796,8 +796,8 @@ where
         .append(make_session_anchor_node(&root_id))
         .await
         .unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let state = store
         .set_session_state(
@@ -838,9 +838,9 @@ where
         .append(make_session_anchor_node(&root_id))
         .await
         .unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("other", &other_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("other", &other_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let err = store
         .set_session_state(
@@ -873,8 +873,8 @@ where
         .append(make_text_node(&root_id, "base text"))
         .await
         .unwrap();
-    store.fork("base", &base_text_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &base_text_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let err = store
         .set_session_state(
@@ -903,8 +903,8 @@ where
         .append(make_session_anchor_node(&root_id))
         .await
         .unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     store
         .set_session_state(
@@ -963,8 +963,8 @@ where
         .append(make_session_anchor_node(&root_id))
         .await
         .unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     store
         .set_session_state(
@@ -1015,8 +1015,8 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("base", &root_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &root_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
     store
         .set_session_state(
             "main",
@@ -1145,7 +1145,7 @@ where
     let store = F::create().await;
     let root_id = store.root_id();
     let preset_name = "coding";
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
     store
         .set_preset(
             preset_name,
@@ -1172,7 +1172,7 @@ where
     let root_id = store.root_id();
     let preset_name = "coding";
     let config = make_preset("gpt-5.4", SessionRole::Orchestrator);
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
     store.set_preset(preset_name, config.clone()).await.unwrap();
 
     store.delete_branch("main").await.unwrap();
@@ -1218,7 +1218,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    let branch_head = store.fork("draft", &root_id).unwrap();
+    let branch_head = store.fork("draft", &root_id).await.unwrap();
 
     let node = store.get_node("draft").unwrap();
 
@@ -1231,7 +1231,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("draft", &root_id).unwrap();
+    store.fork("draft", &root_id).await.unwrap();
     let draft_node = store
         .append(make_text_node(&root_id, "draft only"))
         .await
@@ -1296,7 +1296,7 @@ where
         .append(make_text_node(&child_id, "next"))
         .await
         .unwrap();
-    store.fork("main", &child_id).unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     let err = store
         .set_branch_head("main", &root_id, &next_id)
@@ -1322,7 +1322,7 @@ where
         .append(make_text_node(&root_id, "child"))
         .await
         .unwrap();
-    store.fork("main", &child_id).unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     let log = store.log(&root_id, "main").unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
@@ -1344,7 +1344,7 @@ where
         .append(make_text_node(&child_id, "leaf"))
         .await
         .unwrap();
-    store.fork("base", &child_id).unwrap();
+    store.fork("base", &child_id).await.unwrap();
 
     let log = store.log("base", &leaf_id).unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
@@ -1366,8 +1366,8 @@ where
         .append(make_text_node(&child_id, "leaf"))
         .await
         .unwrap();
-    store.fork("base", &child_id).unwrap();
-    store.fork("main", &leaf_id).unwrap();
+    store.fork("base", &child_id).await.unwrap();
+    store.fork("main", &leaf_id).await.unwrap();
 
     let log = store.log("base", "main").unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
@@ -1403,7 +1403,7 @@ where
         .unwrap();
     let old_child = store.get_node(&child_id).unwrap();
     let old_session = store.get_node(&session_id).unwrap();
-    store.fork("main", &child_id).unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     let new_head = store
         .rebase_session(
@@ -1459,7 +1459,7 @@ where
         .await
         .unwrap();
     let old_session = store.get_node(&session_id).unwrap();
-    store.fork("main", &child_id).unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     let new_head = store
         .rebase_session(
@@ -1507,7 +1507,7 @@ where
         .append(make_prompt_anchor_node(&merge_source_id, &[&session_id]))
         .await
         .unwrap();
-    store.fork("main", &anchor_id).unwrap();
+    store.fork("main", &anchor_id).await.unwrap();
 
     store
         .rebase_session(
@@ -1546,8 +1546,8 @@ where
         .append(make_text_node(&session_id, "child"))
         .await
         .unwrap();
-    store.fork("main", &child_id).unwrap();
-    store.fork("draft", &child_id).unwrap();
+    store.fork("main", &child_id).await.unwrap();
+    store.fork("draft", &child_id).await.unwrap();
 
     let new_head = store
         .rebase_session(
@@ -1579,7 +1579,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let err = store
         .rebase_session("main", &SessionAnchorPatch::default())
@@ -1608,7 +1608,7 @@ where
         .unwrap();
     let session_created_at = store.get_node(&session_id).unwrap().created_at;
     let child_created_at = store.get_node(&child_id).unwrap().created_at;
-    store.fork("main", &child_id).unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     store
         .rebase_session(
@@ -1641,7 +1641,7 @@ where
         .append(make_text_node(&session_id, "child"))
         .await
         .unwrap();
-    store.fork("main", &child_id).unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     let new_head = store
         .handoff_session("main", &SessionAnchorPatch::default(), "handoff prompt")
@@ -1671,7 +1671,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let err = store
         .handoff_session("main", &SessionAnchorPatch::default(), "handoff prompt")
@@ -1694,7 +1694,7 @@ where
         .append(make_session_anchor_node(&root_id))
         .await
         .unwrap();
-    store.fork("main", &session_id).unwrap();
+    store.fork("main", &session_id).await.unwrap();
 
     let err = store
         .handoff_session("main", &SessionAnchorPatch::default(), "  ")
@@ -1715,7 +1715,7 @@ where
         .append(make_session_anchor_node(&root_id))
         .await
         .unwrap();
-    store.fork("main", &session_id).unwrap();
+    store.fork("main", &session_id).await.unwrap();
 
     let new_head = store
         .handoff_session(
@@ -1749,7 +1749,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
     let job = submit_prompt_job(&store, "main", "hello").await;
 
     assert_eq!(store.get_job(&job.job_id).await.unwrap(), job);
@@ -1761,8 +1761,8 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    store.fork("draft", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
+    store.fork("draft", &root_id).await.unwrap();
     let first = submit_prompt_job(&store, "main", "hello").await;
     let second = submit_prompt_job(&store, "draft", "world").await;
 
@@ -1777,7 +1777,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
     let job = submit_prompt_job(&store, "main", "hello").await;
     let running = store
         .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
@@ -1799,8 +1799,8 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    store.fork("recovery", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
+    store.fork("recovery", &root_id).await.unwrap();
     let job = submit_prompt_job(&store, "main", "hello").await;
 
     assert_eq!(job.work_branch, "main");
@@ -1823,8 +1823,8 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    store.fork("recovery", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
+    store.fork("recovery", &root_id).await.unwrap();
     let job = submit_prompt_job(&store, "main", "hello").await;
 
     let err = store
@@ -1845,8 +1845,8 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    store.fork("recovery", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
+    store.fork("recovery", &root_id).await.unwrap();
     let first = submit_prompt_job(&store, "main", "hello").await;
     store
         .set_job_work_branch(&first.job_id, "main", "recovery")
@@ -1868,7 +1868,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
     let job = submit_prompt_job(&store, "main", "hello").await;
 
     let err = store
@@ -1889,7 +1889,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
     let first = submit_prompt_job(&store, "main", "hello").await;
 
     let second_parent = store.get_branch_head("main").unwrap();
@@ -1926,7 +1926,7 @@ where
 {
     let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
     let first = submit_prompt_job(&store, "main", "hello").await;
     store
         .set_job_status(&first.job_id, JobStatus::Queued, JobStatus::Running)
