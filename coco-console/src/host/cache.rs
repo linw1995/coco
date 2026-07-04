@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::snapshot_store::ConsoleGraphSnapshotStore;
@@ -61,7 +61,7 @@ pub struct ConsoleGraphCache<S> {
 enum ConsoleGraphSource<S> {
     #[allow(dead_code)]
     Store(S),
-    PersistentStore(SqliteGraphStore),
+    PersistentStore(PathBuf),
 }
 
 #[derive(Default)]
@@ -151,7 +151,7 @@ where
         invalidations: ConsolePublisher,
         path: PathBuf,
     ) -> crate::Result<Self> {
-        let store = SqliteGraphStore::open_read_only(&path)
+        SqliteGraphStore::open_read_only(&path)
             .await
             .context(crate::error::StoreSnafu)?;
         let snapshots = ConsoleGraphSnapshotStore::open(&path).await?;
@@ -166,7 +166,7 @@ where
                 .unwrap_or(1),
         );
         Ok(Self {
-            source: ConsoleGraphSource::PersistentStore(store),
+            source: ConsoleGraphSource::PersistentStore(path),
             invalidations,
             ready,
             progress: ConsolePublisher::new(),
@@ -1159,6 +1159,12 @@ fn node_id_from_graph_target(target: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+async fn open_persistent_graph_store(path: &Path) -> crate::Result<SqliteGraphStore> {
+    SqliteGraphStore::open_read_only(path)
+        .await
+        .context(crate::error::StoreSnafu)
+}
+
 async fn run_sqlite_graph_read_transaction<T, Fut>(
     store: &SqliteGraphStore,
     operation: Fut,
@@ -1209,7 +1215,8 @@ where
             Self::Store(store) => {
                 build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress).await
             }
-            Self::PersistentStore(store) => {
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
                 run_sqlite_graph_read_transaction(
                     &store,
                     build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress),
@@ -1231,7 +1238,8 @@ where
                     .try_append_linear_branch(source_version, mode, &store)
                     .await
             }
-            Self::PersistentStore(store) => {
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
                 run_sqlite_graph_read_transaction(
                     &store,
                     snapshots.try_append_linear_branch(source_version, mode, &store),
@@ -1241,16 +1249,39 @@ where
         }
     }
 
+    #[cfg(test)]
+    async fn hold_persistent_read_transaction_until(
+        self,
+        started: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> crate::Result<()> {
+        let Self::PersistentStore(path) = self else {
+            let _ = started.send(());
+            let _ = release.await;
+            return Ok(());
+        };
+        let store = open_persistent_graph_store(&path).await?;
+        run_sqlite_graph_read_transaction(&store, async move {
+            let _ = started.send(());
+            let _ = release.await;
+            Ok(())
+        })
+        .await
+    }
+
     async fn get_node(self, node_id: &str) -> crate::Result<coco_mem::Node> {
         match self {
             Self::Store(store) => store
                 .get_node(node_id)
                 .await
                 .context(crate::error::StoreSnafu),
-            Self::PersistentStore(store) => store
-                .get_node(node_id)
-                .await
-                .context(crate::error::StoreSnafu),
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
+                store
+                    .get_node(node_id)
+                    .await
+                    .context(crate::error::StoreSnafu)
+            }
         }
     }
 
@@ -1261,7 +1292,8 @@ where
     ) -> crate::Result<Option<crate::graph::GraphProviderContextSelection>> {
         match self {
             Self::Store(store) => provider_context_for_node(&store, target_node_id, context).await,
-            Self::PersistentStore(store) => {
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
                 provider_context_for_node(&store, target_node_id, context).await
             }
         }
@@ -1273,7 +1305,10 @@ where
     ) -> crate::Result<Vec<MaterializedGraphShellBranch>> {
         match self {
             Self::Store(store) => materialized_shell_branches(&store, lanes).await,
-            Self::PersistentStore(store) => materialized_shell_branches(&store, lanes).await,
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
+                materialized_shell_branches(&store, lanes).await
+            }
         }
     }
 }
@@ -1724,6 +1759,66 @@ mod tests {
         let snapshot = cache.current_snapshot(GraphMode::All).await;
 
         assert!(snapshot.nodes.iter().any(|node| node.id == session));
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_graph_source_uses_independent_read_transactions() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).await.unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .await
+            .unwrap();
+        writer.fork("main", &session).await.unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("concurrent reader".to_owned()),
+            })
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
+
+        let source = ConsoleGraphSource::<ConsoleStore<SqliteStore>>::PersistentStore(path.clone());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let held_read = tokio::spawn(
+            source
+                .clone()
+                .hold_persistent_read_transaction_until(started_tx, release_rx),
+        );
+        started_rx
+            .await
+            .expect("held read transaction should start");
+
+        let concurrent_snapshot = source
+            .build_snapshot_with_progress(GraphMode::All, 1, |_| {})
+            .await;
+        release_tx
+            .send(())
+            .expect("held read transaction should be releasable");
+        held_read
+            .await
+            .expect("held read task should finish")
+            .expect("held read transaction should succeed");
+        let concurrent_snapshot =
+            concurrent_snapshot.expect("concurrent graph snapshot should build");
+
+        assert!(concurrent_snapshot.nodes.iter().any(|node| node.id == text));
+
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
