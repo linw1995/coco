@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, Node, NodeStore,
-    PromptAttachment, SessionStore, SkillStore, SqliteStore,
+    PromptAnchor, PromptAttachment, SessionStore, SkillStore, SqliteStore,
 };
 use coco_llm::{
     BackendError, BackendFailureContext, CompletionBackend, CompletionInput, CompletionOrigin,
@@ -363,24 +363,34 @@ where
         self.ensure_prompt_job_can_submit(job_id, branch).await?;
         let merge_parent_count = merge_parents.len();
         let has_session_patch = session_patch.is_some();
-        let base = self
-            .service
-            .append_prompt_job_base(
-                branch,
-                prompt,
-                &attachments,
-                &merge_parents,
-                session_patch.as_ref(),
-            )
-            .await?;
+        let prompt_anchor = PromptAnchor {
+            prompt: prompt.to_owned(),
+            attachments,
+        };
         let job = match job_id {
             Some(job_id) => {
                 self.service
                     .store()
-                    .submit_job_with_id(job_id, branch, &base)
+                    .submit_job_with_id_and_prompt_base(
+                        job_id,
+                        branch,
+                        prompt_anchor,
+                        merge_parents,
+                        session_patch,
+                    )
                     .await?
             }
-            None => self.service.store().submit_job(branch, &base).await?,
+            None => {
+                self.service
+                    .store()
+                    .submit_job_with_prompt_base(
+                        branch,
+                        prompt_anchor,
+                        merge_parents,
+                        session_patch,
+                    )
+                    .await?
+            }
         };
         tracing::info!(
             job_id = %job.job_id,

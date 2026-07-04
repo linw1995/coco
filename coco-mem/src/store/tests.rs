@@ -118,23 +118,18 @@ async fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> crate::J
 where
     S: BranchStore + JobStore + NodeStore,
 {
-    let parent = store.get_branch_head(branch).await.unwrap();
-    let prompt_anchor_id = store
-        .append(NewNode {
-            parent,
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::prompt(
-                vec![],
-                PromptAnchor {
-                    prompt: prompt.to_owned(),
-                    attachments: vec![],
-                },
-            )),
-        })
+    store
+        .submit_job_with_prompt_base(
+            branch,
+            PromptAnchor {
+                prompt: prompt.to_owned(),
+                attachments: vec![],
+            },
+            vec![],
+            None,
+        )
         .await
-        .unwrap();
-    store.submit_job(branch, &prompt_anchor_id).await.unwrap()
+        .unwrap()
 }
 
 trait TestStoreFactory {
@@ -1932,6 +1927,36 @@ where
     ));
 }
 
+async fn assert_submit_job_with_prompt_base_rolls_back_nodes_on_failure<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create().await;
+    let root_id = store.root_id();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
+
+    let err = store
+        .submit_job_with_prompt_base(
+            "main",
+            PromptAnchor {
+                prompt: "hello".to_owned(),
+                attachments: vec![],
+            },
+            vec![MergeParent::merge("missing")],
+            Some(SessionAnchorPatch::default()),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
+    assert!(store.list_jobs().await.unwrap().is_empty());
+    assert!(store.list_children(&session_id).await.unwrap().is_empty());
+}
+
 async fn assert_submit_job_allows_new_job_after_previous_job_finishes<F>()
 where
     F: TestStoreFactory,
@@ -2727,6 +2752,11 @@ macro_rules! define_common_store_tests {
             #[tokio::test]
             async fn submit_job_rejects_second_active_job_on_same_branch() {
                 assert_submit_job_rejects_second_active_job_on_same_branch::<$factory>().await;
+            }
+
+            #[tokio::test]
+            async fn submit_job_with_prompt_base_rolls_back_nodes_on_failure() {
+                assert_submit_job_with_prompt_base_rolls_back_nodes_on_failure::<$factory>().await;
             }
 
             #[tokio::test]

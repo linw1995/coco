@@ -45,8 +45,8 @@ use crate::schema::{
 };
 use crate::{
     Anchor, AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node,
-    NodeMetadata, PauseReason, Preset, PresetRecord, Role, SessionAnchorPatch, SessionRole,
-    SessionState, SkillGroups, SkillInvocationMode, SkillRecord, SkillUpdatePatch,
+    NodeMetadata, PauseReason, Preset, PresetRecord, PromptAnchor, Role, SessionAnchorPatch,
+    SessionRole, SessionState, SkillGroups, SkillInvocationMode, SkillRecord, SkillUpdatePatch,
     SkillVersionSpec, default_skill_groups,
 };
 
@@ -2968,6 +2968,73 @@ async fn submit_job_with_id_in_transaction(
     Ok(job)
 }
 
+async fn append_prompt_job_base_in_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    prompt: PromptAnchor,
+    merge_parents: Vec<MergeParent>,
+    session_patch: Option<SessionAnchorPatch>,
+) -> std::result::Result<String, SqliteTransactionError> {
+    let parent_id = load_branch_head(connection, path, branch)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    let prompt_parent_id = if let Some(patch) = session_patch {
+        load_session_chain(connection, path, &parent_id)
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
+        let node = Node::new(
+            parent_id,
+            Role::System,
+            None,
+            Kind::Anchor(Anchor::session_patch(vec![], patch)),
+            jiff::Timestamp::now(),
+        );
+        validate_new_node(connection, path, &node)
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
+        persist_node_without_transaction(connection, path, &node)
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
+        node.id
+    } else {
+        parent_id
+    };
+    let normalized_parents = normalize_prompt_merge_parents(&prompt_parent_id, merge_parents);
+    let node = Node::new(
+        prompt_parent_id,
+        Role::System,
+        None,
+        Kind::Anchor(Anchor::prompt(normalized_parents, prompt)),
+        jiff::Timestamp::now(),
+    );
+    validate_new_node(connection, path, &node)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    persist_node_without_transaction(connection, path, &node)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    Ok(node.id)
+}
+
+fn normalize_prompt_merge_parents(
+    parent_id: &str,
+    merge_parents: Vec<MergeParent>,
+) -> Vec<MergeParent> {
+    let mut normalized_parents = Vec::new();
+    for merge_parent in merge_parents {
+        let node_id = merge_parent.node_id();
+        if node_id != parent_id
+            && !normalized_parents
+                .iter()
+                .any(|parent: &MergeParent| parent.node_id() == node_id)
+        {
+            normalized_parents.push(merge_parent);
+        }
+    }
+    normalized_parents
+}
+
 fn job_uses_active_branch(job: &Job, branch: &str) -> bool {
     if matches!(job.status, JobStatus::Finished) {
         return false;
@@ -3949,6 +4016,55 @@ impl JobStore for SqliteStore {
             .map_err(|error| error.into_store_error(&self.database_path))
     }
 
+    async fn submit_job_with_prompt_base(
+        &self,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> Result<Job> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        connection
+            .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+                let job_id = loop {
+                    let job_id = format!("job-{}", nanoid::nanoid!());
+                    if jobs::table
+                        .filter(jobs::job_id.eq(&job_id))
+                        .count()
+                        .get_result::<i64>(connection)
+                        .await
+                        .context(QuerySqliteStoreSnafu {
+                            path: self.database_path.clone(),
+                        })
+                        .map_err(SqliteTransactionError::Operation)?
+                        == 0
+                    {
+                        break job_id;
+                    }
+                };
+                let base = append_prompt_job_base_in_transaction(
+                    connection,
+                    &self.database_path,
+                    branch,
+                    prompt,
+                    merge_parents,
+                    session_patch,
+                )
+                .await?;
+                submit_job_with_id_in_transaction(
+                    connection,
+                    &self.database_path,
+                    &job_id,
+                    branch,
+                    &base,
+                )
+                .await
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))
+    }
+
     async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
@@ -3960,6 +4076,40 @@ impl JobStore for SqliteStore {
                     job_id,
                     branch,
                     base,
+                )
+                .await
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))
+    }
+
+    async fn submit_job_with_id_and_prompt_base(
+        &self,
+        job_id: &str,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> Result<Job> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        connection
+            .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+                let base = append_prompt_job_base_in_transaction(
+                    connection,
+                    &self.database_path,
+                    branch,
+                    prompt,
+                    merge_parents,
+                    session_patch,
+                )
+                .await?;
+                submit_job_with_id_in_transaction(
+                    connection,
+                    &self.database_path,
+                    job_id,
+                    branch,
+                    &base,
                 )
                 .await
             })

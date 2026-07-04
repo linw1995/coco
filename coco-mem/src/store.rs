@@ -12,8 +12,9 @@ mod tests;
 pub use sqlite::{SqliteDatabase, SqliteGraphStore, SqliteStore};
 
 use crate::{
-    Job, JobStatus, MessageQueueItem, NewNode, Node, Preset, PresetRecord, SessionAnchorPatch,
-    SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    Job, JobStatus, MergeParent, MessageQueueItem, NewNode, Node, Preset, PresetRecord,
+    PromptAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch,
+    SkillVersionSpec, StoreResult,
 };
 
 /// Node graph storage API used by CoCo services.
@@ -149,10 +150,33 @@ pub trait JobStore {
     /// Rejects the request when the branch already has an unfinished prompt job.
     async fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job>;
 
+    /// Appends the prompt job base and creates a prompt job record atomically.
+    ///
+    /// Rejects the request when the branch already has an unfinished prompt job.
+    async fn submit_job_with_prompt_base(
+        &self,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<Job>;
+
     /// Creates a new single-task prompt job record with a caller-provided id.
     ///
     /// Rejects the request when the branch already has an unfinished prompt job.
     async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job>;
+
+    /// Appends the prompt job base and creates a prompt job record with a caller-provided id atomically.
+    ///
+    /// Rejects the request when the branch already has an unfinished prompt job.
+    async fn submit_job_with_id_and_prompt_base(
+        &self,
+        job_id: &str,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<Job>;
 
     /// Returns a persisted prompt job.
     async fn get_job(&self, job_id: &str) -> StoreResult<Job>;
@@ -459,9 +483,48 @@ impl JobStore for PersistentStore {
         }
     }
 
+    async fn submit_job_with_prompt_base(
+        &self,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<Job> {
+        match self {
+            Self::Sqlite(store) => {
+                store
+                    .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
+                    .await
+            }
+        }
+    }
+
     async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
         match self {
             Self::Sqlite(store) => store.submit_job_with_id(job_id, branch, base).await,
+        }
+    }
+
+    async fn submit_job_with_id_and_prompt_base(
+        &self,
+        job_id: &str,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<Job> {
+        match self {
+            Self::Sqlite(store) => {
+                store
+                    .submit_job_with_id_and_prompt_base(
+                        job_id,
+                        branch,
+                        prompt,
+                        merge_parents,
+                        session_patch,
+                    )
+                    .await
+            }
         }
     }
 

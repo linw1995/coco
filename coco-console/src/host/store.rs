@@ -3,10 +3,10 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use coco_mem::{
-    BranchStore, Job, JobStatus, JobStore, MessageQueueItem, MessageQueueStore, NewNode, Node,
-    NodeStore, Preset, PresetRecord, PresetStore, ProcessShareableStore, SessionAnchorPatch,
-    SessionRole, SessionState, SessionStore, SkillRecord, SkillStore, SkillUpdatePatch,
-    SkillVersionSpec, StoreResult,
+    BranchStore, Job, JobStatus, JobStore, MergeParent, MessageQueueItem, MessageQueueStore,
+    NewNode, Node, NodeStore, Preset, PresetRecord, PresetStore, ProcessShareableStore,
+    PromptAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillRecord,
+    SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 use crate::ConsolePublisher;
@@ -212,8 +212,43 @@ where
         self.notify_if_ok(self.inner.submit_job(branch, base).await)
     }
 
+    async fn submit_job_with_prompt_base(
+        &self,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<Job> {
+        self.notify_if_ok(
+            self.inner
+                .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
+                .await,
+        )
+    }
+
     async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
         self.notify_if_ok(self.inner.submit_job_with_id(job_id, branch, base).await)
+    }
+
+    async fn submit_job_with_id_and_prompt_base(
+        &self,
+        job_id: &str,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<Job> {
+        self.notify_if_ok(
+            self.inner
+                .submit_job_with_id_and_prompt_base(
+                    job_id,
+                    branch,
+                    prompt,
+                    merge_parents,
+                    session_patch,
+                )
+                .await,
+        )
     }
 
     async fn get_job(&self, job_id: &str) -> StoreResult<Job> {
