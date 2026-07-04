@@ -1244,6 +1244,7 @@ async fn materialized_shell_branches(
         .collect::<BTreeMap<_, _>>();
     let mut states = store
         .list_session_states()
+        .await
         .context(crate::error::StoreSnafu)?
         .into_iter()
         .collect::<Vec<(String, SessionState)>>();

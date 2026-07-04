@@ -241,8 +241,11 @@ impl BranchStore for MaterializationSourceSnapshot {
 }
 
 impl SessionStore for MaterializationSourceSnapshot {
-    fn list_session_states(&self) -> coco_mem::StoreResult<HashMap<String, SessionState>> {
-        Ok(self.sessions.clone())
+    fn list_session_states(
+        &self,
+    ) -> impl Future<Output = coco_mem::StoreResult<HashMap<String, SessionState>>> + Send + '_
+    {
+        std::future::ready(Ok(self.sessions.clone()))
     }
 
     async fn get_session_state<'a>(&'a self, name: &'a str) -> coco_mem::StoreResult<SessionState> {
@@ -667,6 +670,7 @@ impl ConsoleGraphSnapshotStore {
     ) -> crate::Result<bool> {
         let mut session_states = store
             .list_session_states()
+            .await
             .context(crate::error::StoreSnafu)?
             .into_iter()
             .collect::<Vec<_>>();
@@ -6126,8 +6130,14 @@ mod tests {
     }
 
     impl SessionStore for BranchAdvanceDuringWalkStore {
-        fn list_session_states(&self) -> coco_mem::StoreResult<HashMap<String, SessionState>> {
-            Ok(HashMap::from([("main".to_owned(), SessionState::Active)]))
+        fn list_session_states(
+            &self,
+        ) -> impl Future<Output = coco_mem::StoreResult<HashMap<String, SessionState>>> + Send + '_
+        {
+            std::future::ready(Ok(HashMap::from([(
+                "main".to_owned(),
+                SessionState::Active,
+            )])))
         }
 
         fn get_session_state<'a>(

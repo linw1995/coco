@@ -229,7 +229,7 @@ where
     F: FnMut(GraphBuildProgress),
 {
     let mut state = GraphBuildState::new(mode);
-    let session_states = sorted_session_states(store)?;
+    let session_states = sorted_session_states(store).await?;
     let total = session_states.len();
     (*progress)(GraphBuildProgress {
         phase: GraphBuildPhase::Branches,
@@ -673,9 +673,10 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
     }
 }
 
-fn sorted_session_states(store: &impl SessionStore) -> Result<Vec<(String, SessionState)>> {
+async fn sorted_session_states(store: &impl SessionStore) -> Result<Vec<(String, SessionState)>> {
     let mut branches = store
         .list_session_states()
+        .await
         .context(StoreSnafu)?
         .into_iter()
         .collect::<Vec<_>>();
@@ -689,7 +690,7 @@ pub(crate) async fn provider_context_for_node(
     context_id: Option<&str>,
 ) -> Result<Option<GraphProviderContextSelection>> {
     let mut contexts = HashMap::<String, GraphProviderContext>::new();
-    for (branch_name, _) in sorted_session_states(store)? {
+    for (branch_name, _) in sorted_session_states(store).await? {
         let head_id = store
             .get_branch_head(&branch_name)
             .await

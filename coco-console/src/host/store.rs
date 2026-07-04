@@ -108,8 +108,8 @@ impl<S> SessionStore for ConsoleStore<S>
 where
     S: SessionStore + Sync,
 {
-    fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>> {
-        self.inner.list_session_states()
+    async fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>> {
+        self.inner.list_session_states().await
     }
 
     async fn get_session_state<'a>(&'a self, name: &'a str) -> StoreResult<SessionState> {

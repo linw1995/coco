@@ -73,7 +73,9 @@ pub trait BranchStore {
 /// Branch workflow session state storage API.
 pub trait SessionStore {
     /// Returns all persisted branch workflow states keyed by branch.
-    fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>>;
+    fn list_session_states(
+        &self,
+    ) -> impl Future<Output = StoreResult<HashMap<String, SessionState>>> + Send + '_;
 
     /// Returns the workflow state for a branch.
     fn get_session_state<'a>(
@@ -378,8 +380,10 @@ impl BranchStore for PersistentStore {
 }
 
 impl SessionStore for PersistentStore {
-    fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>> {
-        delegate_persistent_store!(self, store, store.list_session_states())
+    async fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>> {
+        match self {
+            Self::Sqlite(store) => store.list_session_states().await,
+        }
     }
 
     async fn get_session_state<'a>(&'a self, name: &'a str) -> StoreResult<SessionState> {

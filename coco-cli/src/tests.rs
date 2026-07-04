@@ -6346,7 +6346,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
         .await
         .unwrap();
 
-    let states = store.list_session_states().unwrap();
+    let states = store.list_session_states().await.unwrap();
     assert_eq!(states.get("main"), Some(&SessionState::Active));
     assert_eq!(states.get("day"), Some(&SessionState::Active));
 

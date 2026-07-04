@@ -602,7 +602,7 @@ fn resolve_create_provider_profile(
 async fn list_sessions(
     store: &(impl BranchStore + NodeStore + SessionStore),
 ) -> Result<Vec<SessionSummary>> {
-    let states = store.list_session_states().context(StoreSnafu)?;
+    let states = store.list_session_states().await.context(StoreSnafu)?;
     let mut branches = states.into_iter().collect::<Vec<_>>();
     branches.sort_by(|(left, _), (right, _)| left.cmp(right));
 
@@ -757,7 +757,7 @@ async fn build_session_graph_entries(
     store: &(impl BranchStore + NodeStore + SessionStore),
     mode: SessionGraphMode,
 ) -> Result<Vec<GraphNodeEntry>> {
-    let states = store.list_session_states().context(StoreSnafu)?;
+    let states = store.list_session_states().await.context(StoreSnafu)?;
     if states.is_empty() {
         return Ok(vec![]);
     }

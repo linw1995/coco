@@ -4335,8 +4335,8 @@ impl BranchStore for SqliteGraphStore {
 }
 
 impl SessionStore for SqliteGraphStore {
-    fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
-        self.block_on(self.list_session_states_in_sqlite())
+    async fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
+        self.list_session_states_in_sqlite().await
     }
 
     async fn get_session_state<'a>(&'a self, name: &'a str) -> Result<SessionState> {
@@ -4438,8 +4438,8 @@ impl BranchStore for SqliteStore {
 }
 
 impl SessionStore for SqliteStore {
-    fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
-        self.block_on(self.list_session_states_in_sqlite())
+    async fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
+        self.list_session_states_in_sqlite().await
     }
 
     async fn get_session_state<'a>(&'a self, name: &'a str) -> Result<SessionState> {

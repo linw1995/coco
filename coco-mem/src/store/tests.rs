@@ -1035,7 +1035,7 @@ where
         .await
         .unwrap();
 
-    let states = store.list_session_states().unwrap();
+    let states = store.list_session_states().await.unwrap();
 
     assert_eq!(states.get("base"), Some(&SessionState::Active));
     assert_eq!(

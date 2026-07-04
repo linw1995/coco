@@ -255,6 +255,7 @@ where
 {
     if shared_store
         .list_session_states()
+        .await
         .context(StoreSnafu)?
         .is_empty()
     {
@@ -363,6 +364,7 @@ async fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
 async fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
     let mut branches = store
         .list_session_states()
+        .await
         .context(StoreSnafu)?
         .into_keys()
         .filter(|branch| branch != BUILTIN_DAY_BRANCH)
