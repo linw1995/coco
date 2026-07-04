@@ -2338,9 +2338,10 @@ where
         let source_anchor_id = self
             .resolve_reference_id(from_ref.unwrap_or(&target_branch))
             .await?;
-        self.ensure_ref_visible_on_branch(&target_branch, &source_anchor_id)?;
+        self.ensure_ref_visible_on_branch(&target_branch, &source_anchor_id)
+            .await?;
         if source_anchor_id != base_head_id {
-            match self.store.log(&base_head_id, &source_anchor_id) {
+            match self.store.log(&base_head_id, &source_anchor_id).await {
                 Ok(_) => {}
                 Err(StoreError::RefsNotConnected { .. }) => {
                     return FeedbackSourceNotAheadSnafu {
@@ -2876,9 +2877,10 @@ where
             })
     }
 
-    fn ensure_ref_visible_on_branch(&self, branch: &str, node_id: &str) -> Result<()> {
+    async fn ensure_ref_visible_on_branch(&self, branch: &str, node_id: &str) -> Result<()> {
         self.store
             .log(node_id, branch)
+            .await
             .context(MemorySnafu)
             .map(|_| ())
     }

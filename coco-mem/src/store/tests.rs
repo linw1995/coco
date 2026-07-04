@@ -522,7 +522,7 @@ where
     let b_id = store.append(make_text_node(&a_id, "b")).await.unwrap();
     let c_id = store.append(make_text_node(&b_id, "c")).await.unwrap();
 
-    let log = store.log(&a_id, &c_id).unwrap();
+    let log = store.log(&a_id, &c_id).await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![c_id, b_id, a_id]);
@@ -535,7 +535,7 @@ where
     let store = F::create().await;
     let root_id = store.root_id();
 
-    let log = store.log(&root_id, &root_id).unwrap();
+    let log = store.log(&root_id, &root_id).await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![root_id]);
@@ -549,7 +549,7 @@ where
     let root_id = store.root_id();
     let missing_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    let err = store.log(&root_id, missing_id).unwrap_err();
+    let err = store.log(&root_id, missing_id).await.unwrap_err();
 
     assert!(matches!(err, Error::NotFound { id } if id == missing_id));
 }
@@ -573,7 +573,7 @@ where
         .await
         .unwrap();
 
-    let err = store.log(&merge_parent_id, &anchor_id).unwrap_err();
+    let err = store.log(&merge_parent_id, &anchor_id).await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -1336,7 +1336,7 @@ where
         .unwrap();
     store.fork("main", &child_id).await.unwrap();
 
-    let log = store.log(&root_id, "main").unwrap();
+    let log = store.log(&root_id, "main").await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![child_id, root_id]);
@@ -1358,7 +1358,7 @@ where
         .unwrap();
     store.fork("base", &child_id).await.unwrap();
 
-    let log = store.log("base", &leaf_id).unwrap();
+    let log = store.log("base", &leaf_id).await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![leaf_id, child_id]);
@@ -1381,7 +1381,7 @@ where
     store.fork("base", &child_id).await.unwrap();
     store.fork("main", &leaf_id).await.unwrap();
 
-    let log = store.log("base", "main").unwrap();
+    let log = store.log("base", "main").await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![leaf_id, child_id]);
@@ -1394,7 +1394,7 @@ where
     let store = F::create().await;
     let root_id = store.root_id();
 
-    let err = store.log(&root_id, "main").unwrap_err();
+    let err = store.log(&root_id, "main").await.unwrap_err();
 
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
 }

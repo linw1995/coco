@@ -425,7 +425,7 @@ where
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         let job = self.service.store().get_job(job_id).await?;
-        self.build_job_status_snapshot(&job)
+        self.build_job_status_snapshot(&job).await
     }
 
     pub async fn set_job_work_branch(
@@ -440,7 +440,7 @@ where
             .set_job_work_branch(job_id, expected_work_branch, next_work_branch)
             .await?;
         self.service.notify_job_status_changed(job_id);
-        self.build_job_status_snapshot(&job)
+        self.build_job_status_snapshot(&job).await
     }
 
     pub async fn active_branch_prompt_job(
@@ -604,7 +604,7 @@ where
             }
         }
 
-        let head = self.job_head(&job)?;
+        let head = self.job_head(&job).await?;
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
@@ -621,7 +621,7 @@ where
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<JobRunOutcome, EngineError> {
         let store = self.service.store();
-        let last_node = find_job_last_node(store, job)?;
+        let last_node = find_job_last_node(store, job).await?;
 
         let retry_from_failure = if let Some(last_node) = last_node.as_ref() {
             match &last_node.kind {
@@ -776,7 +776,7 @@ where
         }
 
         let restored_from_work_branch = job.work_branch.clone();
-        let response_head = self.job_head(job)?;
+        let response_head = self.job_head(job).await?;
         let root_head = self.service.store().get_branch_head(&job.branch).await?;
         self.service
             .store()
@@ -815,11 +815,11 @@ where
         Ok(())
     }
 
-    fn build_job_status_snapshot(
+    async fn build_job_status_snapshot(
         &self,
         job: &Job,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let head = self.job_head(job)?;
+        let head = self.job_head(job).await?;
 
         Ok(JobStatusSnapshot {
             job_id: job.job_id.clone(),
@@ -833,8 +833,9 @@ where
         })
     }
 
-    fn job_head(&self, job: &Job) -> std::result::Result<String, EngineError> {
-        find_job_last_node(self.service.store(), job)?
+    async fn job_head(&self, job: &Job) -> std::result::Result<String, EngineError> {
+        find_job_last_node(self.service.store(), job)
+            .await?
             .map_or_else(|| Ok(job.base.clone()), |last_node| Ok(last_node.id))
     }
 
@@ -940,11 +941,14 @@ fn backend_failure_recovery_event(
     }
 }
 
-fn find_job_last_node<S>(store: &S, job: &Job) -> std::result::Result<Option<Node>, EngineError>
+async fn find_job_last_node<S>(
+    store: &S,
+    job: &Job,
+) -> std::result::Result<Option<Node>, EngineError>
 where
     S: NodeStore,
 {
-    let path = match store.log(&job.base, &job.work_branch) {
+    let path = match store.log(&job.base, &job.work_branch).await {
         Ok(path) => path,
         Err(coco_llm::coco_mem::StoreError::RefsNotConnected { .. }) => return Ok(None),
         Err(source) => return Err(source.into()),

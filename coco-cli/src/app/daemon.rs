@@ -1676,7 +1676,7 @@ async fn active_job_is_waiting_for_recovery(
     store: &impl Store,
     active_job: &coco_mem::Job,
 ) -> std::result::Result<bool, StoreError> {
-    let path = match store.log(&active_job.base, &active_job.work_branch) {
+    let path = match store.log(&active_job.base, &active_job.work_branch).await {
         Ok(path) => path,
         Err(StoreError::RefsNotConnected { .. }) => return Ok(false),
         Err(error) => return Err(error),

@@ -642,14 +642,6 @@ impl SqliteStore {
         .fail()
     }
 
-    fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: std::future::Future + Send,
-        F::Output: Send,
-    {
-        self.database.block_on(future)
-    }
-
     async fn load_or_initialize_state(&self) -> Result<String> {
         let mut connection = self.connect().await?;
         if node_count(&mut connection, &self.database_path).await? == 0 {
@@ -1040,14 +1032,6 @@ impl SqliteGraphStore {
             }
         );
         Ok(())
-    }
-
-    fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: std::future::Future + Send,
-        F::Output: Send,
-    {
-        self.database.block_on(future)
     }
 
     async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
@@ -4297,8 +4281,12 @@ impl NodeStore for SqliteGraphStore {
         Box::pin(async move { self.ancestry_in_sqlite(head_ref).await })
     }
 
-    fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        self.block_on(self.log_in_sqlite(base_ref, head_ref))
+    fn log<'a>(
+        &'a self,
+        base_ref: &'a str,
+        head_ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.log_in_sqlite(base_ref, head_ref).await })
     }
 
     fn get_node<'a>(
@@ -4405,8 +4393,12 @@ impl NodeStore for SqliteStore {
         Box::pin(async move { self.ancestry_in_sqlite(head_ref).await })
     }
 
-    fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        self.block_on(self.log_in_sqlite(base_ref, head_ref))
+    fn log<'a>(
+        &'a self,
+        base_ref: &'a str,
+        head_ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.log_in_sqlite(base_ref, head_ref).await })
     }
 
     fn get_node<'a>(
@@ -5808,6 +5800,7 @@ mod tests {
         );
         let log = reopened
             .log(&root_id, &second)
+            .await
             .unwrap()
             .into_iter()
             .map(|node| node.id)

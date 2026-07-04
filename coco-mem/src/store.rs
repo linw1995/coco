@@ -34,7 +34,11 @@ pub trait NodeStore {
     ) -> Pin<Box<dyn Future<Output = StoreResult<Vec<Node>>> + Send + 'a>>;
 
     /// Returns the main-parent chain from `head_ref` back to `base_ref`, inclusive.
-    fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>>;
+    fn log<'a>(
+        &'a self,
+        base_ref: &'a str,
+        head_ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<Vec<Node>>> + Send + 'a>>;
 
     /// Returns a single node by branch name, full node ID, or node ID prefix.
     fn get_node<'a>(
@@ -347,8 +351,16 @@ impl NodeStore for PersistentStore {
         })
     }
 
-    fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>> {
-        delegate_persistent_store!(self, store, store.log(base_ref, head_ref))
+    fn log<'a>(
+        &'a self,
+        base_ref: &'a str,
+        head_ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move {
+            match self {
+                Self::Sqlite(store) => store.log(base_ref, head_ref).await,
+            }
+        })
     }
 
     fn get_node<'a>(

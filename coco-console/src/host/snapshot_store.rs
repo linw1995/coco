@@ -136,6 +136,19 @@ impl MaterializationSourceSnapshot {
         }
     }
 
+    fn log_nodes(&self, base_ref: &str, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        let base_id = self.resolve_ref_id(base_ref)?;
+        let mut nodes = self.ancestry_nodes(head_ref)?;
+        let Some(index) = nodes.iter().position(|node| node.id == base_id) else {
+            return Err(coco_mem::StoreError::RefsNotConnected {
+                base_ref: base_ref.to_owned(),
+                head_ref: head_ref.to_owned(),
+            });
+        };
+        nodes.truncate(index + 1);
+        Ok(nodes)
+    }
+
     fn node(&self, id: &str) -> coco_mem::StoreResult<Node> {
         let id = self.resolve_ref_id(id)?;
         self.nodes
@@ -206,17 +219,12 @@ impl NodeStore for MaterializationSourceSnapshot {
         Box::pin(async move { self.ancestry_nodes(head_ref) })
     }
 
-    fn log(&self, base_ref: &str, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
-        let base_id = self.resolve_ref_id(base_ref)?;
-        let mut nodes = self.ancestry_nodes(head_ref)?;
-        let Some(index) = nodes.iter().position(|node| node.id == base_id) else {
-            return Err(coco_mem::StoreError::RefsNotConnected {
-                base_ref: base_ref.to_owned(),
-                head_ref: head_ref.to_owned(),
-            });
-        };
-        nodes.truncate(index + 1);
-        Ok(nodes)
+    fn log<'a>(
+        &'a self,
+        base_ref: &'a str,
+        head_ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.log_nodes(base_ref, head_ref) })
     }
 
     fn get_node<'a>(
@@ -1266,7 +1274,7 @@ impl ConsoleGraphSnapshotStore {
         )? {
             return Ok(appended);
         }
-        let Ok(mut chain) = store.log(&tail.node_id, input.head_id) else {
+        let Ok(mut chain) = store.log_nodes(&tail.node_id, input.head_id) else {
             return Ok(false);
         };
         chain.reverse();
@@ -2016,7 +2024,7 @@ impl ConsoleGraphSnapshotStore {
             .ancestry_nodes(input.head_id)
             .context(crate::error::StoreSnafu)?;
         let context_start_id = merge_parent_context_start_id(input.mode, &ancestry);
-        let Ok(mut chain) = store.log(&tail.node_id, input.head_id) else {
+        let Ok(mut chain) = store.log_nodes(&tail.node_id, input.head_id) else {
             return Ok(false);
         };
         chain.reverse();
@@ -6094,12 +6102,17 @@ mod tests {
             Box::pin(std::future::ready(result))
         }
 
-        fn log(&self, _base_ref: &str, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
-            match head_ref {
+        fn log<'a>(
+            &'a self,
+            _base_ref: &'a str,
+            head_ref: &'a str,
+        ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
+            let result = match head_ref {
                 id if id == self.old_head.id => Ok(vec![self.old_head.clone(), self.root.clone()]),
                 id if id == self.root.id => Ok(vec![self.root.clone()]),
                 id => Err(coco_mem::StoreError::NotFound { id: id.to_owned() }),
-            }
+            };
+            Box::pin(std::future::ready(result))
         }
 
         fn get_node<'a>(
