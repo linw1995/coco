@@ -6753,32 +6753,29 @@ fn resolve_session_config_persists_only_explicit_additional_params() {
     );
 }
 
-#[test]
-fn resolve_session_config_rejects_non_object_additional_params() {
-    let error = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: Some("[1,2,3]".to_owned()),
-                    tools: vec![],
-                    enable_all_tools: false,
-                    enable_coco_shim: false,
-                    disable_coco_shim: false,
-                })
-                .unwrap_err()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_rejects_non_object_additional_params() {
+    let error = with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: Some("[1,2,3]".to_owned()),
+                tools: vec![],
+                enable_all_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
+            })
+            .unwrap_err()
+        },
+    )
+    .await;
 
     assert!(matches!(
         error,
