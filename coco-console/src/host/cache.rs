@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -1158,6 +1159,39 @@ fn node_id_from_graph_target(target: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+async fn run_sqlite_graph_read_transaction<T, Fut>(
+    store: &SqliteGraphStore,
+    operation: Fut,
+) -> crate::Result<T>
+where
+    Fut: Future<Output = crate::Result<T>>,
+{
+    store
+        .begin_read_transaction()
+        .await
+        .context(crate::error::StoreSnafu)?;
+
+    let result = operation.await;
+    match result {
+        Ok(value) => {
+            store
+                .commit_read_transaction()
+                .await
+                .context(crate::error::StoreSnafu)?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = store.rollback_read_transaction().await {
+                tracing::warn!(
+                    error = %rollback_error,
+                    "failed to roll back SQLite graph read transaction after console graph read error"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 impl<S> ConsoleGraphSource<S>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -1176,7 +1210,11 @@ where
                 build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress).await
             }
             Self::PersistentStore(store) => {
-                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress).await
+                run_sqlite_graph_read_transaction(
+                    &store,
+                    build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress),
+                )
+                .await
             }
         }
     }
@@ -1194,9 +1232,11 @@ where
                     .await
             }
             Self::PersistentStore(store) => {
-                snapshots
-                    .try_append_linear_branch(source_version, mode, &store)
-                    .await
+                run_sqlite_graph_read_transaction(
+                    &store,
+                    snapshots.try_append_linear_branch(source_version, mode, &store),
+                )
+                .await
             }
         }
     }
