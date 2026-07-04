@@ -8,9 +8,7 @@ mod unified_exec_tool;
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(test)]
 use std::ffi::OsStr;
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::str::FromStr;
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -451,19 +449,18 @@ struct TraceNodeAppenderHandle {
     inner: Arc<dyn TraceNodeAppender>,
 }
 
+#[async_trait]
 trait TraceNodeAppender: Send + Sync {
     /// Returns the current trace tail.
-    fn head_id(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, BackendError>> + Send + '_>>;
+    async fn head_id(&self) -> std::result::Result<String, BackendError>;
 
     /// Appends a store node to the current trace tail.
-    fn append(
+    async fn append(
         &self,
         role: Role,
         metadata: Option<NodeMetadata>,
         kind: Kind,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, BackendError>> + Send + '_>>;
+    ) -> std::result::Result<String, BackendError>;
 }
 
 impl TraceNodeAppenderHandle {
@@ -471,19 +468,17 @@ impl TraceNodeAppenderHandle {
         Self { inner }
     }
 
-    fn append(
+    async fn append(
         &self,
         role: Role,
         metadata: Option<NodeMetadata>,
         kind: Kind,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, BackendError>> + Send + '_>> {
-        self.inner.append(role, metadata, kind)
+    ) -> std::result::Result<String, BackendError> {
+        self.inner.append(role, metadata, kind).await
     }
 
-    fn head_id(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, BackendError>> + Send + '_>> {
-        self.inner.head_id()
+    async fn head_id(&self) -> std::result::Result<String, BackendError> {
+        self.inner.head_id().await
     }
 }
 
@@ -493,37 +488,34 @@ impl std::fmt::Debug for TraceNodeAppenderHandle {
     }
 }
 
+#[async_trait]
 impl<S> TraceNodeAppender for StoreNodeAppender<S>
 where
     S: NodeStore + Send + Sync,
 {
-    fn head_id(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, BackendError>> + Send + '_>> {
-        Box::pin(async move { Ok(self.head_id.lock().await.clone()) })
+    async fn head_id(&self) -> std::result::Result<String, BackendError> {
+        Ok(self.head_id.lock().await.clone())
     }
 
-    fn append(
+    async fn append(
         &self,
         role: Role,
         metadata: Option<NodeMetadata>,
         kind: Kind,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, BackendError>> + Send + '_>> {
-        Box::pin(async move {
-            let mut head_id = self.head_id.lock().await;
-            let node_id = self
-                .store
-                .append(NewNode {
-                    parent: head_id.clone(),
-                    role,
-                    metadata,
-                    kind,
-                })
-                .await
-                .map_err(|source| BackendError::failed(source.to_string()))?;
-            *head_id = node_id.clone();
-            Ok(node_id)
-        })
+    ) -> std::result::Result<String, BackendError> {
+        let mut head_id = self.head_id.lock().await;
+        let node_id = self
+            .store
+            .append(NewNode {
+                parent: head_id.clone(),
+                role,
+                metadata,
+                kind,
+            })
+            .await
+            .map_err(|source| BackendError::failed(source.to_string()))?;
+        *head_id = node_id.clone();
+        Ok(node_id)
     }
 }
 

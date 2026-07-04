@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
 use diesel::sql_types::{Nullable, Text};
@@ -4244,81 +4244,64 @@ fn parse_session_role(role: &str, path: &Path) -> Result<SessionRole> {
     }
 }
 
+#[async_trait]
 impl NodeStore for SqliteGraphStore {
     fn root_id(&self) -> String {
         self.root_id.clone()
     }
 
-    fn append<'a>(
-        &'a self,
-        _node: NewNode,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-        Box::pin(async move { self.ensure_read_only() })
+    async fn append(&self, _node: NewNode) -> Result<String> {
+        self.ensure_read_only()
     }
 
-    fn ancestry<'a>(
-        &'a self,
-        head_ref: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move { self.ancestry_in_sqlite(head_ref).await })
+    async fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
+        self.ancestry_in_sqlite(head_ref).await
     }
 
-    fn log<'a>(
-        &'a self,
-        base_ref: &'a str,
-        head_ref: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move { self.log_in_sqlite(base_ref, head_ref).await })
+    async fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
+        self.log_in_sqlite(base_ref, head_ref).await
     }
 
-    fn get_node<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Node>> + Send + 'a>> {
-        Box::pin(async move { self.get_node_by_prefix_or_branch(id).await })
+    async fn get_node(&self, id: &str) -> Result<Node> {
+        self.get_node_by_prefix_or_branch(id).await
     }
 
-    fn list_children<'a>(
-        &'a self,
-        node_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move { self.list_children_in_sqlite(node_id).await })
+    async fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
+        self.list_children_in_sqlite(node_id).await
     }
 }
 
+#[async_trait]
 impl BranchStore for SqliteGraphStore {
-    fn fork<'a>(
-        &'a self,
-        _name: &'a str,
-        _from_ref: &'a str,
-    ) -> impl Future<Output = Result<String>> + Send + 'a {
-        std::future::ready(self.ensure_read_only())
+    async fn fork(&self, _name: &str, _from_ref: &str) -> Result<String> {
+        self.ensure_read_only()
     }
 
-    async fn get_branch_head<'a>(&'a self, name: &'a str) -> Result<String> {
+    async fn get_branch_head(&self, name: &str) -> Result<String> {
         self.get_branch_head_in_sqlite(name).await
     }
 
-    fn delete_branch<'a>(&'a self, _name: &'a str) -> impl Future<Output = Result<()>> + Send + 'a {
-        std::future::ready(self.ensure_read_only())
+    async fn delete_branch(&self, _name: &str) -> Result<()> {
+        self.ensure_read_only()
     }
 
-    fn set_branch_head<'a>(
-        &'a self,
-        _name: &'a str,
-        _expected_old_head: &'a str,
-        _new_head: &'a str,
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
-        std::future::ready(self.ensure_read_only())
+    async fn set_branch_head(
+        &self,
+        _name: &str,
+        _expected_old_head: &str,
+        _new_head: &str,
+    ) -> Result<()> {
+        self.ensure_read_only()
     }
 }
 
+#[async_trait]
 impl SessionStore for SqliteGraphStore {
     async fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
         self.list_session_states_in_sqlite().await
     }
 
-    async fn get_session_state<'a>(&'a self, name: &'a str) -> Result<SessionState> {
+    async fn get_session_state(&self, name: &str) -> Result<SessionState> {
         let store = self.clone();
         let name = name.to_owned();
         self.database
@@ -4329,85 +4312,67 @@ impl SessionStore for SqliteGraphStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn set_session_state<'a>(
-        &'a self,
-        _name: &'a str,
-        _expected: Option<&'a SessionState>,
+    async fn set_session_state(
+        &self,
+        _name: &str,
+        _expected: Option<&SessionState>,
         _next: SessionState,
-    ) -> impl Future<Output = Result<SessionState>> + Send + 'a {
-        std::future::ready(self.ensure_read_only())
+    ) -> Result<SessionState> {
+        self.ensure_read_only()
     }
 
-    fn rebase_session<'a>(
-        &'a self,
-        _name: &'a str,
-        _patch: &'a SessionAnchorPatch,
-    ) -> impl Future<Output = Result<String>> + Send + 'a {
-        std::future::ready(self.ensure_read_only())
+    async fn rebase_session(&self, _name: &str, _patch: &SessionAnchorPatch) -> Result<String> {
+        self.ensure_read_only()
     }
 
-    async fn handoff_session<'a>(
-        &'a self,
-        _name: &'a str,
-        _patch: &'a SessionAnchorPatch,
-        _prompt: &'a str,
+    async fn handoff_session(
+        &self,
+        _name: &str,
+        _patch: &SessionAnchorPatch,
+        _prompt: &str,
     ) -> Result<String> {
         self.ensure_read_only()
     }
 }
 
+#[async_trait]
 impl NodeStore for SqliteStore {
     fn root_id(&self) -> String {
         self.root_id.clone()
     }
 
-    fn append<'a>(
-        &'a self,
-        node: NewNode,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-        Box::pin(async move { self.append_in_sqlite(node).await })
+    async fn append(&self, node: NewNode) -> Result<String> {
+        self.append_in_sqlite(node).await
     }
 
-    fn ancestry<'a>(
-        &'a self,
-        head_ref: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move { self.ancestry_in_sqlite(head_ref).await })
+    async fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
+        self.ancestry_in_sqlite(head_ref).await
     }
 
-    fn log<'a>(
-        &'a self,
-        base_ref: &'a str,
-        head_ref: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move { self.log_in_sqlite(base_ref, head_ref).await })
+    async fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
+        self.log_in_sqlite(base_ref, head_ref).await
     }
 
-    fn get_node<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Node>> + Send + 'a>> {
-        Box::pin(async move { self.get_node_in_sqlite(id).await })
+    async fn get_node(&self, id: &str) -> Result<Node> {
+        self.get_node_in_sqlite(id).await
     }
 
-    fn list_children<'a>(
-        &'a self,
-        node_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move { self.list_children_in_sqlite(node_id).await })
+    async fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
+        self.list_children_in_sqlite(node_id).await
     }
 }
 
+#[async_trait]
 impl BranchStore for SqliteStore {
-    async fn fork<'a>(&'a self, name: &'a str, from_ref: &'a str) -> Result<String> {
+    async fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
         self.fork_in_sqlite(name, from_ref).await
     }
 
-    async fn get_branch_head<'a>(&'a self, name: &'a str) -> Result<String> {
+    async fn get_branch_head(&self, name: &str) -> Result<String> {
         self.get_branch_head_in_sqlite(name).await
     }
 
-    async fn delete_branch<'a>(&'a self, name: &'a str) -> Result<()> {
+    async fn delete_branch(&self, name: &str) -> Result<()> {
         let store = self.clone();
         let name = name.to_owned();
         self.database
@@ -4418,23 +4383,24 @@ impl BranchStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn set_branch_head<'a>(
-        &'a self,
-        name: &'a str,
-        expected_old_head: &'a str,
-        new_head: &'a str,
+    async fn set_branch_head(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        new_head: &str,
     ) -> Result<()> {
         self.set_branch_head_in_sqlite(name, expected_old_head, new_head)
             .await
     }
 }
 
+#[async_trait]
 impl SessionStore for SqliteStore {
     async fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
         self.list_session_states_in_sqlite().await
     }
 
-    async fn get_session_state<'a>(&'a self, name: &'a str) -> Result<SessionState> {
+    async fn get_session_state(&self, name: &str) -> Result<SessionState> {
         let store = self.clone();
         let name = name.to_owned();
         self.database
@@ -4445,10 +4411,10 @@ impl SessionStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn set_session_state<'a>(
-        &'a self,
-        name: &'a str,
-        expected: Option<&'a SessionState>,
+    async fn set_session_state(
+        &self,
+        name: &str,
+        expected: Option<&SessionState>,
         next: SessionState,
     ) -> Result<SessionState> {
         let store = self.clone();
@@ -4466,11 +4432,7 @@ impl SessionStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn rebase_session<'a>(
-        &'a self,
-        name: &'a str,
-        patch: &'a SessionAnchorPatch,
-    ) -> Result<String> {
+    async fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
         let store = self.clone();
         let name = name.to_owned();
         let patch = patch.clone();
@@ -4482,11 +4444,11 @@ impl SessionStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn handoff_session<'a>(
-        &'a self,
-        name: &'a str,
-        patch: &'a SessionAnchorPatch,
-        prompt: &'a str,
+    async fn handoff_session(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        prompt: &str,
     ) -> Result<String> {
         let store = self.clone();
         let name = name.to_owned();
@@ -4505,8 +4467,9 @@ impl SessionStore for SqliteStore {
     }
 }
 
+#[async_trait]
 impl JobStore for SqliteStore {
-    async fn submit_job<'a>(&'a self, branch: &'a str, base: &'a str) -> Result<Job> {
+    async fn submit_job(&self, branch: &str, base: &str) -> Result<Job> {
         let store = self.clone();
         let branch = branch.to_owned();
         let base = base.to_owned();
@@ -4518,12 +4481,7 @@ impl JobStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn submit_job_with_id<'a>(
-        &'a self,
-        job_id: &'a str,
-        branch: &'a str,
-        base: &'a str,
-    ) -> Result<Job> {
+    async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
         let store = self.clone();
         let job_id = job_id.to_owned();
         let branch = branch.to_owned();
@@ -4540,7 +4498,7 @@ impl JobStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn get_job<'a>(&'a self, job_id: &'a str) -> Result<Job> {
+    async fn get_job(&self, job_id: &str) -> Result<Job> {
         let store = self.clone();
         let job_id = job_id.to_owned();
         self.database
@@ -4561,9 +4519,9 @@ impl JobStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn set_job_status<'a>(
-        &'a self,
-        job_id: &'a str,
+    async fn set_job_status(
+        &self,
+        job_id: &str,
         expected: JobStatus,
         next: JobStatus,
     ) -> Result<Job> {
@@ -4581,11 +4539,11 @@ impl JobStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn set_job_work_branch<'a>(
-        &'a self,
-        job_id: &'a str,
-        expected_work_branch: &'a str,
-        next_work_branch: &'a str,
+    async fn set_job_work_branch(
+        &self,
+        job_id: &str,
+        expected_work_branch: &str,
+        next_work_branch: &str,
     ) -> Result<Job> {
         let store = self.clone();
         let job_id = job_id.to_owned();
@@ -4608,10 +4566,11 @@ impl JobStore for SqliteStore {
     }
 }
 
+#[async_trait]
 impl MessageQueueStore for SqliteStore {
-    async fn enqueue_message<'a>(
-        &'a self,
-        queue: &'a str,
+    async fn enqueue_message(
+        &self,
+        queue: &str,
         payload: serde_json::Value,
     ) -> Result<MessageQueueItem> {
         let store = self.clone();
@@ -4624,7 +4583,7 @@ impl MessageQueueStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn dequeue_message<'a>(&'a self, queue: &'a str) -> Result<Option<MessageQueueItem>> {
+    async fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
         let store = self.clone();
         let queue = queue.to_owned();
         self.database
@@ -4635,7 +4594,7 @@ impl MessageQueueStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn peek_message<'a>(&'a self, queue: &'a str) -> Result<Option<MessageQueueItem>> {
+    async fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
         let store = self.clone();
         let queue = queue.to_owned();
         self.database
@@ -4646,7 +4605,7 @@ impl MessageQueueStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn list_queue_messages<'a>(&'a self, queue: &'a str) -> Result<Vec<MessageQueueItem>> {
+    async fn list_queue_messages(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
         let store = self.clone();
         let queue = queue.to_owned();
         self.database
@@ -4668,6 +4627,7 @@ impl MessageQueueStore for SqliteStore {
     }
 }
 
+#[async_trait]
 impl PresetStore for SqliteStore {
     async fn list_preset_records(&self) -> Result<std::collections::HashMap<String, PresetRecord>> {
         let store = self.clone();
@@ -4679,7 +4639,7 @@ impl PresetStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn get_preset_record<'a>(&'a self, name: &'a str) -> Result<PresetRecord> {
+    async fn get_preset_record(&self, name: &str) -> Result<PresetRecord> {
         let store = self.clone();
         let name = name.to_owned();
         self.database
@@ -4690,7 +4650,7 @@ impl PresetStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn set_preset<'a>(&'a self, name: &'a str, config: Preset) -> Result<PresetRecord> {
+    async fn set_preset(&self, name: &str, config: Preset) -> Result<PresetRecord> {
         let store = self.clone();
         let name = name.to_owned();
         self.database
@@ -4701,11 +4661,7 @@ impl PresetStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn rollback_preset<'a>(
-        &'a self,
-        name: &'a str,
-        target_version: u64,
-    ) -> Result<PresetRecord> {
+    async fn rollback_preset(&self, name: &str, target_version: u64) -> Result<PresetRecord> {
         let store = self.clone();
         let name = name.to_owned();
         self.database
@@ -4716,7 +4672,7 @@ impl PresetStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn delete_preset<'a>(&'a self, name: &'a str) -> Result<()> {
+    async fn delete_preset(&self, name: &str) -> Result<()> {
         let store = self.clone();
         let name = name.to_owned();
         self.database
@@ -4728,6 +4684,7 @@ impl PresetStore for SqliteStore {
     }
 }
 
+#[async_trait]
 impl SkillStore for SqliteStore {
     async fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
         let store = self.clone();
@@ -4739,7 +4696,7 @@ impl SkillStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn get_skill<'a>(&'a self, role: SessionRole, name: &'a str) -> Result<SkillRecord> {
+    async fn get_skill(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
         let store = self.clone();
         let name = name.to_owned();
         self.database
@@ -4750,10 +4707,10 @@ impl SkillStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn add_skill<'a>(
-        &'a self,
+    async fn add_skill(
+        &self,
         role: SessionRole,
-        name: &'a str,
+        name: &str,
         spec: SkillVersionSpec,
     ) -> Result<SkillRecord> {
         let store = self.clone();
@@ -4766,11 +4723,11 @@ impl SkillStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn update_skill<'a>(
-        &'a self,
+    async fn update_skill(
+        &self,
         role: SessionRole,
-        name: &'a str,
-        patch: &'a SkillUpdatePatch,
+        name: &str,
+        patch: &SkillUpdatePatch,
     ) -> Result<SkillRecord> {
         let store = self.clone();
         let name = name.to_owned();
@@ -4783,10 +4740,10 @@ impl SkillStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    async fn rollback_skill<'a>(
-        &'a self,
+    async fn rollback_skill(
+        &self,
         role: SessionRole,
-        name: &'a str,
+        name: &str,
         target_version: u64,
     ) -> Result<SkillRecord> {
         let store = self.clone();

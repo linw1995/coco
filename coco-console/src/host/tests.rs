@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
+use async_trait::async_trait;
 use coco_mem::{
     Anchor, BranchStore, Kind, MergeParent, MessageQueueStore, NewNode, Node, NodeStore,
     PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
@@ -50,73 +51,45 @@ impl DeepChainStore {
     }
 }
 
+#[async_trait]
 impl NodeStore for DeepChainStore {
     fn root_id(&self) -> String {
         panic!("deep chain test does not read root id")
     }
 
-    fn append<'a>(
-        &'a self,
-        _node: NewNode,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = coco_mem::StoreResult<String>> + Send + 'a>,
-    > {
-        Box::pin(async move { panic!("deep chain test inserts nodes directly") })
+    async fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
+        panic!("deep chain test inserts nodes directly")
     }
 
-    fn ancestry<'a>(
-        &'a self,
-        _head_ref: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>,
-    > {
-        Box::pin(async move { panic!("deep chain test does not read ancestry") })
+    async fn ancestry(&self, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        panic!("deep chain test does not read ancestry")
     }
 
-    fn log<'a>(
-        &'a self,
-        _base_ref: &'a str,
-        _head_ref: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>,
-    > {
-        Box::pin(async move { panic!("deep chain test does not read logs") })
+    async fn log(&self, _base_ref: &str, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        panic!("deep chain test does not read logs")
     }
 
-    fn get_node<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = coco_mem::StoreResult<Node>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            Ok(self
-                .nodes
-                .get(id)
-                .unwrap_or_else(|| panic!("node {id:?} should exist"))
-                .clone())
-        })
+    async fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
+        Ok(self
+            .nodes
+            .get(id)
+            .unwrap_or_else(|| panic!("node {id:?} should exist"))
+            .clone())
     }
 
-    fn list_children<'a>(
-        &'a self,
-        node_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            Ok(self
-                .children
-                .get(node_id)
-                .into_iter()
-                .flatten()
-                .map(|child_id| {
-                    self.nodes
-                        .get(child_id)
-                        .unwrap_or_else(|| panic!("child node {child_id:?} should exist"))
-                        .clone()
-                })
-                .collect())
-        })
+    async fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        Ok(self
+            .children
+            .get(node_id)
+            .into_iter()
+            .flatten()
+            .map(|child_id| {
+                self.nodes
+                    .get(child_id)
+                    .unwrap_or_else(|| panic!("child node {child_id:?} should exist"))
+                    .clone()
+            })
+            .collect())
     }
 }
 

@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Double, Integer, Text};
 use diesel::sqlite::SqliteConnection;
@@ -198,92 +197,64 @@ impl MaterializationSourceSnapshot {
     }
 }
 
+#[async_trait]
 impl NodeStore for MaterializationSourceSnapshot {
     fn root_id(&self) -> String {
         self.root_id.clone()
     }
 
-    fn append<'a>(
-        &'a self,
-        _node: NewNode,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = coco_mem::StoreResult<String>> + Send + 'a>,
-    > {
-        Box::pin(async move { Self::read_only_error() })
+    async fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
+        Self::read_only_error()
     }
 
-    fn ancestry<'a>(
-        &'a self,
-        head_ref: &'a str,
-    ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move { self.ancestry_nodes(head_ref) })
+    async fn ancestry(&self, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        self.ancestry_nodes(head_ref)
     }
 
-    fn log<'a>(
-        &'a self,
-        base_ref: &'a str,
-        head_ref: &'a str,
-    ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move { self.log_nodes(base_ref, head_ref) })
+    async fn log(&self, base_ref: &str, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        self.log_nodes(base_ref, head_ref)
     }
 
-    fn get_node<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Node>> + Send + 'a>> {
-        Box::pin(async move { self.node(id) })
+    async fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
+        self.node(id)
     }
 
-    fn list_children<'a>(
-        &'a self,
-        node_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move { self.children(node_id) })
+    async fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        self.children(node_id)
     }
 }
 
+#[async_trait]
 impl BranchStore for MaterializationSourceSnapshot {
-    fn fork<'a>(
-        &'a self,
-        _name: &'a str,
-        _from_ref: &'a str,
-    ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
-        std::future::ready(Self::read_only_error())
+    async fn fork(&self, _name: &str, _from_ref: &str) -> coco_mem::StoreResult<String> {
+        Self::read_only_error()
     }
 
-    fn get_branch_head<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
-        std::future::ready(self.branch_head(name))
+    async fn get_branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {
+        self.branch_head(name)
     }
 
-    fn delete_branch<'a>(
-        &'a self,
-        _name: &'a str,
-    ) -> impl Future<Output = coco_mem::StoreResult<()>> + Send + 'a {
-        std::future::ready(Self::read_only_error())
+    async fn delete_branch(&self, _name: &str) -> coco_mem::StoreResult<()> {
+        Self::read_only_error()
     }
 
-    fn set_branch_head<'a>(
-        &'a self,
-        _name: &'a str,
-        _expected_old_head: &'a str,
-        _new_head: &'a str,
-    ) -> impl Future<Output = coco_mem::StoreResult<()>> + Send + 'a {
-        std::future::ready(Self::read_only_error())
+    async fn set_branch_head(
+        &self,
+        _name: &str,
+        _expected_old_head: &str,
+        _new_head: &str,
+    ) -> coco_mem::StoreResult<()> {
+        Self::read_only_error()
     }
 }
 
+#[async_trait]
 impl SessionStore for MaterializationSourceSnapshot {
-    fn list_session_states(
-        &self,
-    ) -> impl Future<Output = coco_mem::StoreResult<HashMap<String, SessionState>>> + Send + '_
-    {
-        std::future::ready(Ok(self.sessions.clone()))
+    async fn list_session_states(&self) -> coco_mem::StoreResult<HashMap<String, SessionState>> {
+        Ok(self.sessions.clone())
     }
 
-    async fn get_session_state<'a>(&'a self, name: &'a str) -> coco_mem::StoreResult<SessionState> {
+    async fn get_session_state(&self, name: &str) -> coco_mem::StoreResult<SessionState> {
         self.sessions
             .get(name)
             .cloned()
@@ -292,28 +263,28 @@ impl SessionStore for MaterializationSourceSnapshot {
             })
     }
 
-    fn set_session_state<'a>(
-        &'a self,
-        _name: &'a str,
-        _expected: Option<&'a SessionState>,
+    async fn set_session_state(
+        &self,
+        _name: &str,
+        _expected: Option<&SessionState>,
         _next: SessionState,
-    ) -> impl Future<Output = coco_mem::StoreResult<SessionState>> + Send + 'a {
-        std::future::ready(Self::read_only_error())
+    ) -> coco_mem::StoreResult<SessionState> {
+        Self::read_only_error()
     }
 
-    fn rebase_session<'a>(
-        &'a self,
-        _name: &'a str,
-        _patch: &'a SessionAnchorPatch,
-    ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
-        std::future::ready(Self::read_only_error())
+    async fn rebase_session(
+        &self,
+        _name: &str,
+        _patch: &SessionAnchorPatch,
+    ) -> coco_mem::StoreResult<String> {
+        Self::read_only_error()
     }
 
-    async fn handoff_session<'a>(
-        &'a self,
-        _name: &'a str,
-        _patch: &'a SessionAnchorPatch,
-        _prompt: &'a str,
+    async fn handoff_session(
+        &self,
+        _name: &str,
+        _patch: &SessionAnchorPatch,
+        _prompt: &str,
     ) -> coco_mem::StoreResult<String> {
         Self::read_only_error()
     }
@@ -6024,8 +5995,8 @@ fn parse_edge_kind(value: &str) -> crate::Result<GraphViewportEdgeKind> {
 mod tests {
     use super::*;
 
-    use std::cell::{Cell, RefCell};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use coco_mem::{NewNode, NodeStore, PersistentStore, Role, SqliteStore};
@@ -6040,8 +6011,8 @@ mod tests {
         root: Node,
         old_head: Node,
         new_head_id: String,
-        branch_head: RefCell<String>,
-        advanced: Cell<bool>,
+        branch_head: Mutex<String>,
+        advanced: AtomicBool,
     }
 
     impl BranchAdvanceDuringWalkStore {
@@ -6064,76 +6035,54 @@ mod tests {
             );
             Self {
                 root,
-                branch_head: RefCell::new(old_head.id.clone()),
+                branch_head: Mutex::new(old_head.id.clone()),
                 old_head,
                 new_head_id: new_head.id,
-                advanced: Cell::new(false),
+                advanced: AtomicBool::new(false),
             }
         }
     }
 
+    #[async_trait]
     impl NodeStore for BranchAdvanceDuringWalkStore {
         fn root_id(&self) -> String {
             self.root.id.clone()
         }
 
-        fn append<'a>(
-            &'a self,
-            _node: NewNode,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = coco_mem::StoreResult<String>> + Send + 'a>,
-        > {
-            Box::pin(async move {
-                Err(coco_mem::StoreError::StoreReadOnly {
-                    path: PathBuf::from("branch advance test store"),
-                })
+        async fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
             })
         }
 
-        fn ancestry<'a>(
-            &'a self,
-            head_ref: &'a str,
-        ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
-            let result = match head_ref {
+        async fn ancestry(&self, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+            match head_ref {
                 id if id == self.old_head.id => Ok(vec![self.old_head.clone(), self.root.clone()]),
                 id if id == self.root.id => Ok(vec![self.root.clone()]),
                 id => Err(coco_mem::StoreError::NotFound { id: id.to_owned() }),
-            };
-            Box::pin(std::future::ready(result))
+            }
         }
 
-        fn log<'a>(
-            &'a self,
-            _base_ref: &'a str,
-            head_ref: &'a str,
-        ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
-            let result = match head_ref {
+        async fn log(&self, _base_ref: &str, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+            match head_ref {
                 id if id == self.old_head.id => Ok(vec![self.old_head.clone(), self.root.clone()]),
                 id if id == self.root.id => Ok(vec![self.root.clone()]),
                 id => Err(coco_mem::StoreError::NotFound { id: id.to_owned() }),
-            };
-            Box::pin(std::future::ready(result))
+            }
         }
 
-        fn get_node<'a>(
-            &'a self,
-            id: &'a str,
-        ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Node>> + Send + 'a>> {
-            let result = match id {
+        async fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
+            match id {
                 id if id == self.root.id => Ok(self.root.clone()),
                 id if id == self.old_head.id => Ok(self.old_head.clone()),
                 id => Err(coco_mem::StoreError::NotFound { id: id.to_owned() }),
-            };
-            Box::pin(std::future::ready(result))
+            }
         }
 
-        fn list_children<'a>(
-            &'a self,
-            node_id: &'a str,
-        ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
-            let result = if node_id == self.root.id {
-                if !self.advanced.replace(true) {
-                    *self.branch_head.borrow_mut() = self.new_head_id.clone();
+        async fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
+            if node_id == self.root.id {
+                if !self.advanced.swap(true, Ordering::SeqCst) {
+                    *self.branch_head.lock().unwrap() = self.new_head_id.clone();
                 }
                 Ok(vec![self.old_head.clone()])
             } else if node_id == self.old_head.id {
@@ -6142,111 +6091,94 @@ mod tests {
                 Err(coco_mem::StoreError::NotFound {
                     id: node_id.to_owned(),
                 })
-            };
-            Box::pin(std::future::ready(result))
+            }
         }
     }
 
+    #[async_trait]
     impl BranchStore for BranchAdvanceDuringWalkStore {
-        fn fork<'a>(
-            &'a self,
-            _name: &'a str,
-            _from_ref: &'a str,
-        ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
-            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
+        async fn fork(&self, _name: &str, _from_ref: &str) -> coco_mem::StoreResult<String> {
+            Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            }))
+            })
         }
 
-        fn get_branch_head<'a>(
-            &'a self,
-            name: &'a str,
-        ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
-            std::future::ready(if name == "main" {
-                Ok(self.branch_head.borrow().clone())
+        async fn get_branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {
+            if name == "main" {
+                Ok(self.branch_head.lock().unwrap().clone())
             } else {
                 Err(coco_mem::StoreError::BranchNotFound {
                     name: name.to_owned(),
                 })
+            }
+        }
+
+        async fn delete_branch(&self, _name: &str) -> coco_mem::StoreResult<()> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
             })
         }
 
-        fn delete_branch<'a>(
-            &'a self,
-            _name: &'a str,
-        ) -> impl Future<Output = coco_mem::StoreResult<()>> + Send + 'a {
-            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
+        async fn set_branch_head(
+            &self,
+            _name: &str,
+            _expected_old_head: &str,
+            _new_head: &str,
+        ) -> coco_mem::StoreResult<()> {
+            Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            }))
-        }
-
-        fn set_branch_head<'a>(
-            &'a self,
-            _name: &'a str,
-            _expected_old_head: &'a str,
-            _new_head: &'a str,
-        ) -> impl Future<Output = coco_mem::StoreResult<()>> + Send + 'a {
-            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
-                path: PathBuf::from("branch advance test store"),
-            }))
+            })
         }
     }
 
+    #[async_trait]
     impl SessionStore for BranchAdvanceDuringWalkStore {
-        fn list_session_states(
+        async fn list_session_states(
             &self,
-        ) -> impl Future<Output = coco_mem::StoreResult<HashMap<String, SessionState>>> + Send + '_
-        {
-            std::future::ready(Ok(HashMap::from([(
-                "main".to_owned(),
-                SessionState::Active,
-            )])))
+        ) -> coco_mem::StoreResult<HashMap<String, SessionState>> {
+            Ok(HashMap::from([("main".to_owned(), SessionState::Active)]))
         }
 
-        fn get_session_state<'a>(
-            &'a self,
-            name: &'a str,
-        ) -> impl Future<Output = coco_mem::StoreResult<SessionState>> + Send + 'a {
-            let result = if name == "main" {
+        async fn get_session_state(&self, name: &str) -> coco_mem::StoreResult<SessionState> {
+            if name == "main" {
                 Ok(SessionState::Active)
             } else {
                 Err(coco_mem::StoreError::BranchNotFound {
                     name: name.to_owned(),
                 })
-            };
-            std::future::ready(result)
+            }
         }
 
-        fn set_session_state<'a>(
-            &'a self,
-            _name: &'a str,
-            _expected: Option<&'a SessionState>,
+        async fn set_session_state(
+            &self,
+            _name: &str,
+            _expected: Option<&SessionState>,
             _next: SessionState,
-        ) -> impl Future<Output = coco_mem::StoreResult<SessionState>> + Send + 'a {
-            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
+        ) -> coco_mem::StoreResult<SessionState> {
+            Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            }))
+            })
         }
 
-        fn rebase_session<'a>(
-            &'a self,
-            _name: &'a str,
-            _patch: &'a SessionAnchorPatch,
-        ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
-            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
+        async fn rebase_session(
+            &self,
+            _name: &str,
+            _patch: &SessionAnchorPatch,
+        ) -> coco_mem::StoreResult<String> {
+            Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            }))
+            })
         }
 
-        fn handoff_session<'a>(
-            &'a self,
-            _name: &'a str,
-            _patch: &'a SessionAnchorPatch,
-            _prompt: &'a str,
-        ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
-            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
+        async fn handoff_session(
+            &self,
+            _name: &str,
+            _patch: &SessionAnchorPatch,
+            _prompt: &str,
+        ) -> coco_mem::StoreResult<String> {
+            Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            }))
+            })
         }
     }
 
