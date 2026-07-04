@@ -6648,36 +6648,33 @@ async fn resolve_session_config_reads_tools_from_env() {
     assert!(config.enable_coco_shim);
 }
 
-#[test]
-fn resolve_session_config_enable_all_tools_overrides_env_tools() {
-    let config = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[
-                ("COCO_PROVIDER", "openai"),
-                ("COCO_MODEL", "gpt-4.1-mini"),
-                ("COCO_TOOLS", "exec_command"),
-            ],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: None,
-                    tools: vec![],
-                    enable_all_tools: true,
-                    enable_coco_shim: false,
-                    disable_coco_shim: false,
-                })
-                .unwrap()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_enable_all_tools_overrides_env_tools() {
+    let config = with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "openai"),
+            ("COCO_MODEL", "gpt-4.1-mini"),
+            ("COCO_TOOLS", "exec_command"),
+        ],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: None,
+                tools: vec![],
+                enable_all_tools: true,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
+            })
+            .unwrap()
+        },
+    )
+    .await;
 
     assert_eq!(tool_names(&config.tools), all_builtin_tool_names());
 }
