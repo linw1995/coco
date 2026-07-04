@@ -417,9 +417,20 @@ impl SqliteDatabase {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let database = self.clone();
         self.inner.runtime.spawn(async move {
-            let result = database
-                .with_sync_connection_in_sqlite(operation, map_pool_error, map_connection_error)
-                .await;
+            let result = async {
+                let mut connection = match database.connection().await {
+                    Ok(connection) => connection,
+                    Err(error) => return Err(map_pool_error(error)),
+                };
+                match connection
+                    .spawn_blocking(move |connection| Ok(operation(connection)))
+                    .await
+                {
+                    Ok(result) => Ok(result),
+                    Err(error) => Err(map_connection_error(error)),
+                }
+            }
+            .await;
             let _ = sender.send(result);
         });
         let result = receiver
@@ -428,32 +439,6 @@ impl SqliteDatabase {
         match result {
             Ok(result) => result,
             Err(error) => Err(error),
-        }
-    }
-
-    async fn with_sync_connection_in_sqlite<T, E, F, P, M>(
-        &self,
-        operation: F,
-        map_pool_error: P,
-        map_connection_error: M,
-    ) -> std::result::Result<std::result::Result<T, E>, E>
-    where
-        T: Send + 'static,
-        E: Send + 'static,
-        F: FnOnce(&mut SqliteConnection) -> std::result::Result<T, E> + Send + 'static,
-        P: FnOnce(StoreError) -> E + Send,
-        M: FnOnce(diesel::result::Error) -> E + Send,
-    {
-        let mut connection = match self.connection().await {
-            Ok(connection) => connection,
-            Err(error) => return Err(map_pool_error(error)),
-        };
-        match connection
-            .spawn_blocking(move |connection| Ok(operation(connection)))
-            .await
-        {
-            Ok(result) => Ok(result),
-            Err(error) => Err(map_connection_error(error)),
         }
     }
 
@@ -480,25 +465,18 @@ impl SqliteDatabase {
 
 impl SqliteStore {
     pub async fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_read_only_or_upgrade_schema_in_sqlite(path.as_ref()).await
-    }
-
-    async fn open_read_only_or_upgrade_schema_in_sqlite(path: &Path) -> Result<Self> {
+        let path = path.as_ref();
         if sqlite_database_path(path).is_file() {
             if Self::sqlite_schema_requires_migration(path).await? {
-                drop(Self::open_in_sqlite(path).await?);
+                drop(Self::open(path).await?);
             }
-            return Self::open_read_only_in_sqlite(path).await;
+            return Self::open_read_only(path).await;
         }
-        Self::open_read_only_in_sqlite(path).await
+        Self::open_read_only(path).await
     }
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        Self::open_in_sqlite(path).await
-    }
-
-    async fn open_in_sqlite(path: &Path) -> Result<Self> {
         prepare_store_directory(path)?;
         reject_incomplete_legacy_json_store(path).await?;
         let mut store = Self::new(path, StoreAccess::ReadWrite).await?;
@@ -521,10 +499,7 @@ impl SqliteStore {
     }
 
     pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_read_only_in_sqlite(path.as_ref()).await
-    }
-
-    async fn open_read_only_in_sqlite(path: &Path) -> Result<Self> {
+        let path = path.as_ref();
         ensure_existing_store_directory(path)?;
         reject_incomplete_legacy_json_store(path).await?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
@@ -672,315 +647,11 @@ impl SqliteStore {
     async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
         self.database.connection().await
     }
-
-    async fn append_in_sqlite(&self, node: NewNode) -> Result<String> {
-        self.ensure_writable()?;
-        let node = Node::new(
-            node.parent,
-            node.role,
-            node.metadata,
-            node.kind,
-            jiff::Timestamp::now(),
-        );
-        let _write = self.database.inner.write.lock().await;
-        let mut connection = self.connect().await?;
-        validate_new_node(&mut connection, &self.database_path, &node).await?;
-        persist_node(&mut connection, &self.database_path, &node).await?;
-        Ok(node.id)
-    }
-
-    async fn ancestry_in_sqlite(&self, head_ref: &str) -> Result<Vec<Node>> {
-        let mut connection = self.connect().await?;
-        load_ancestry_nodes(&mut connection, &self.database_path, head_ref).await
-    }
-
-    async fn log_in_sqlite(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        let mut connection = self.connect().await?;
-        load_log_nodes(&mut connection, &self.database_path, base_ref, head_ref).await
-    }
-
-    async fn get_node_in_sqlite(&self, id: &str) -> Result<Node> {
-        let mut connection = self.connect().await?;
-        load_node_by_prefix_or_branch(&mut connection, &self.database_path, id).await
-    }
-
-    async fn list_children_in_sqlite(&self, node_id: &str) -> Result<Vec<Node>> {
-        let mut connection = self.connect().await?;
-        load_child_nodes(&mut connection, &self.database_path, node_id).await
-    }
-
-    async fn fork_in_sqlite(&self, name: &str, from_ref: &str) -> Result<String> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        create_branch(&mut connection, &self.database_path, name, from_ref).await
-    }
-
-    async fn get_branch_head_in_sqlite(&self, name: &str) -> Result<String> {
-        let mut connection = self.connect().await?;
-        load_branch_head(&mut connection, &self.database_path, name).await
-    }
-
-    async fn delete_branch_in_sqlite(&self, name: &str) -> Result<()> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        delete_branch_checked(&mut connection, &self.database_path, name).await
-    }
-
-    async fn set_branch_head_in_sqlite(
-        &self,
-        name: &str,
-        expected_old_head: &str,
-        new_head: &str,
-    ) -> Result<()> {
-        self.ensure_writable()?;
-        let _write = self.database.inner.write.lock().await;
-        let mut connection = self.connect().await?;
-        update_branch_head_checked(
-            &mut connection,
-            &self.database_path,
-            name,
-            expected_old_head,
-            new_head,
-        )
-        .await
-    }
-
-    async fn list_session_states_in_sqlite(
-        &self,
-    ) -> Result<std::collections::HashMap<String, SessionState>> {
-        let mut connection = self.connect().await?;
-        load_session_states(&mut connection, &self.database_path).await
-    }
-
-    async fn get_session_state_in_sqlite(&self, name: &str) -> Result<SessionState> {
-        let mut connection = self.connect().await?;
-        load_session_state(&mut connection, &self.database_path, name).await
-    }
-
-    async fn set_session_state_in_sqlite(
-        &self,
-        name: &str,
-        expected: Option<&SessionState>,
-        next: SessionState,
-    ) -> Result<SessionState> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        update_session_state(&mut connection, &self.database_path, name, expected, next).await
-    }
-
-    async fn rebase_session_in_sqlite(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-    ) -> Result<String> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        let (new_head, _) =
-            rebase_session_in_sqlite(&mut connection, &self.database_path, name, patch).await?;
-        Ok(new_head)
-    }
-
-    async fn handoff_session_in_sqlite(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        prompt: &str,
-    ) -> Result<String> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        let (new_head, _) =
-            handoff_session_in_sqlite(&mut connection, &self.database_path, name, patch, prompt)
-                .await?;
-        Ok(new_head)
-    }
-
-    async fn submit_job_in_sqlite(&self, branch: &str, base: &str) -> Result<Job> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        submit_job_in_sqlite(&mut connection, &self.database_path, branch, base).await
-    }
-
-    async fn submit_job_with_id_in_sqlite(
-        &self,
-        job_id: &str,
-        branch: &str,
-        base: &str,
-    ) -> Result<Job> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        submit_job_with_id_in_sqlite(&mut connection, &self.database_path, job_id, branch, base)
-            .await
-    }
-
-    async fn get_job_in_sqlite(&self, job_id: &str) -> Result<Job> {
-        let mut connection = self.connect().await?;
-        load_job(&mut connection, &self.database_path, job_id).await
-    }
-
-    async fn list_jobs_in_sqlite(&self) -> Result<std::collections::HashMap<String, Job>> {
-        let mut connection = self.connect().await?;
-        load_job_map(&mut connection, &self.database_path).await
-    }
-
-    async fn set_job_status_in_sqlite(
-        &self,
-        job_id: &str,
-        expected: JobStatus,
-        next: JobStatus,
-    ) -> Result<Job> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        update_job_status_in_sqlite(&mut connection, &self.database_path, job_id, expected, next)
-            .await
-    }
-
-    async fn set_job_work_branch_in_sqlite(
-        &self,
-        job_id: &str,
-        expected_work_branch: &str,
-        next_work_branch: &str,
-    ) -> Result<Job> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        update_job_work_branch_in_sqlite(
-            &mut connection,
-            &self.database_path,
-            job_id,
-            expected_work_branch,
-            next_work_branch,
-        )
-        .await
-    }
-
-    async fn enqueue_message_in_sqlite(
-        &self,
-        queue: &str,
-        payload: serde_json::Value,
-    ) -> Result<MessageQueueItem> {
-        self.ensure_writable()?;
-        let item = MessageQueueItem::new(queue, payload, jiff::Timestamp::now());
-        let mut connection = self.connect().await?;
-        persist_message_queue_item(&mut connection, &self.database_path, &item).await?;
-        Ok(item)
-    }
-
-    async fn peek_message_in_sqlite(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
-        let mut connection = self.connect().await?;
-        Ok(
-            load_queue_messages(&mut connection, &self.database_path, queue)
-                .await?
-                .into_iter()
-                .next(),
-        )
-    }
-
-    async fn list_queue_messages_in_sqlite(&self, queue: &str) -> Result<Vec<MessageQueueItem>> {
-        let mut connection = self.connect().await?;
-        load_queue_messages(&mut connection, &self.database_path, queue).await
-    }
-
-    async fn list_message_queues_in_sqlite(&self) -> Result<Vec<String>> {
-        let mut connection = self.connect().await?;
-        load_message_queue_names(&mut connection, &self.database_path).await
-    }
-
-    async fn list_preset_records_in_sqlite(
-        &self,
-    ) -> Result<std::collections::HashMap<String, PresetRecord>> {
-        let mut connection = self.connect().await?;
-        load_preset_records(&mut connection, &self.database_path).await
-    }
-
-    async fn get_preset_record_in_sqlite(&self, name: &str) -> Result<PresetRecord> {
-        let mut connection = self.connect().await?;
-        load_preset_record(&mut connection, &self.database_path, name).await
-    }
-
-    async fn set_preset_in_sqlite(&self, name: &str, config: Preset) -> Result<PresetRecord> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        set_preset_record(&mut connection, &self.database_path, name, config).await
-    }
-
-    async fn rollback_preset_in_sqlite(
-        &self,
-        name: &str,
-        target_version: u64,
-    ) -> Result<PresetRecord> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        rollback_preset_record(&mut connection, &self.database_path, name, target_version).await
-    }
-
-    async fn delete_preset_in_sqlite(&self, name: &str) -> Result<()> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        delete_preset_record_checked(&mut connection, &self.database_path, name).await
-    }
-
-    async fn list_skills_in_sqlite(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
-        let mut connection = self.connect().await?;
-        Ok(load_skill_groups(&mut connection, &self.database_path)
-            .await?
-            .for_role(role)
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    async fn get_skill_in_sqlite(&self, role: SessionRole, name: &str) -> Result<SkillRecord> {
-        let mut connection = self.connect().await?;
-        load_skill_record(&mut connection, &self.database_path, role, name).await
-    }
-
-    async fn add_skill_in_sqlite(
-        &self,
-        role: SessionRole,
-        name: &str,
-        spec: SkillVersionSpec,
-    ) -> Result<SkillRecord> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        add_skill_record(&mut connection, &self.database_path, role, name, spec).await
-    }
-
-    async fn update_skill_in_sqlite(
-        &self,
-        role: SessionRole,
-        name: &str,
-        patch: &SkillUpdatePatch,
-    ) -> Result<SkillRecord> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        update_skill_record(&mut connection, &self.database_path, role, name, patch).await
-    }
-
-    async fn rollback_skill_in_sqlite(
-        &self,
-        role: SessionRole,
-        name: &str,
-        target_version: u64,
-    ) -> Result<SkillRecord> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        rollback_skill_record(
-            &mut connection,
-            &self.database_path,
-            role,
-            name,
-            target_version,
-        )
-        .await
-    }
 }
 
 impl SqliteGraphStore {
     pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        Self::open_read_only_in_sqlite(path).await
-    }
-
-    async fn open_read_only_in_sqlite(path: &Path) -> Result<Self> {
         ensure_existing_store_directory(path)?;
         ensure_existing_database_file(&sqlite_database_path(path))?;
         let store = Self::new(path).await?;
@@ -1047,10 +718,6 @@ impl SqliteGraphStore {
     }
 
     pub async fn begin_read_transaction(&self) -> Result<()> {
-        self.begin_read_transaction_in_sqlite().await
-    }
-
-    async fn begin_read_transaction_in_sqlite(&self) -> Result<()> {
         let transaction_is_inactive = self.read_transaction.lock().await.is_none();
         ensure!(
             transaction_is_inactive,
@@ -1093,10 +760,6 @@ impl SqliteGraphStore {
     }
 
     pub async fn commit_read_transaction(&self) -> Result<()> {
-        self.commit_read_transaction_in_sqlite().await
-    }
-
-    async fn commit_read_transaction_in_sqlite(&self) -> Result<()> {
         let mut connection =
             self.read_transaction
                 .lock()
@@ -1111,10 +774,6 @@ impl SqliteGraphStore {
     }
 
     pub async fn rollback_read_transaction(&self) -> Result<()> {
-        self.rollback_read_transaction_in_sqlite().await
-    }
-
-    async fn rollback_read_transaction_in_sqlite(&self) -> Result<()> {
         let Some(mut connection) = self.read_transaction.lock().await.take() else {
             return Ok(());
         };
@@ -1146,12 +805,6 @@ impl SqliteGraphStore {
         .await
     }
 
-    async fn get_branch_head_in_sqlite(&self, name: &str) -> Result<String> {
-        self.branch_head(name).await?.context(BranchNotFoundSnafu {
-            name: name.to_owned(),
-        })
-    }
-
     async fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
         let reference = reference.to_owned();
         let path = self.database_path.clone();
@@ -1159,53 +812,6 @@ impl SqliteGraphStore {
             Box::pin(
                 async move { load_node_by_prefix_or_branch(connection, &path, &reference).await },
             )
-        })
-        .await
-    }
-
-    async fn ancestry_in_sqlite(&self, head_ref: &str) -> Result<Vec<Node>> {
-        let head_ref = head_ref.to_owned();
-        let path = self.database_path.clone();
-        self.with_connection(move |connection| {
-            Box::pin(async move { load_ancestry_nodes(connection, &path, &head_ref).await })
-        })
-        .await
-    }
-
-    async fn log_in_sqlite(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        let base_ref = base_ref.to_owned();
-        let head_ref = head_ref.to_owned();
-        let path = self.database_path.clone();
-        self.with_connection(move |connection| {
-            Box::pin(async move { load_log_nodes(connection, &path, &base_ref, &head_ref).await })
-        })
-        .await
-    }
-
-    async fn list_children_in_sqlite(&self, node_id: &str) -> Result<Vec<Node>> {
-        let node_id = node_id.to_owned();
-        let path = self.database_path.clone();
-        self.with_connection(move |connection| {
-            Box::pin(async move { load_child_nodes(connection, &path, &node_id).await })
-        })
-        .await
-    }
-
-    async fn list_session_states_in_sqlite(
-        &self,
-    ) -> Result<std::collections::HashMap<String, SessionState>> {
-        let path = self.database_path.clone();
-        self.with_connection(move |connection| {
-            Box::pin(async move { load_session_states(connection, &path).await })
-        })
-        .await
-    }
-
-    async fn get_session_state_in_sqlite(&self, name: &str) -> Result<SessionState> {
-        let name = name.to_owned();
-        let path = self.database_path.clone();
-        self.with_connection(move |connection| {
-            Box::pin(async move { load_session_state(connection, &path, &name).await })
         })
         .await
     }
@@ -2847,125 +2453,6 @@ async fn update_session_state(
         .map_err(|error| error.into_store_error(path))
 }
 
-async fn rebase_session_in_sqlite(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    branch: &str,
-    patch: &SessionAnchorPatch,
-) -> Result<(String, Vec<Node>)> {
-    connection
-        .immediate_transaction::<(String, Vec<Node>), SqliteTransactionError, _>(
-            async |connection| {
-                let expected_old_head = load_branch_head(connection, path, branch)
-                    .await
-                    .map_err(SqliteTransactionError::Operation)?;
-                let mut chain = load_session_chain(connection, path, branch)
-                    .await
-                    .map_err(SqliteTransactionError::Operation)?;
-                chain.reverse();
-                let session_node = chain
-                    .as_slice()
-                    .first()
-                    .expect("session chain should not be empty");
-                let session_anchor = session_anchor_from_node(path, session_node)
-                    .map_err(SqliteTransactionError::Operation)?;
-                let rebased_session_anchor = session_anchor.apply_patch(patch);
-
-                let mut previous_new_id = None;
-                let mut new_head = String::new();
-                let mut nodes = Vec::with_capacity(chain.len());
-                for (index, node) in chain.into_iter().enumerate() {
-                    let parent = previous_new_id
-                        .clone()
-                        .unwrap_or_else(|| node.parent.clone());
-                    let kind = if index == 0 {
-                        let Kind::Anchor(anchor) = &node.kind else {
-                            unreachable!("session chain should start with anchor");
-                        };
-                        Kind::Anchor(Anchor::session(
-                            anchor.merge_parents().to_vec(),
-                            rebased_session_anchor.clone(),
-                        ))
-                    } else {
-                        node.kind.clone()
-                    };
-                    let new_node =
-                        Node::new(parent, node.role, node.metadata, kind, node.created_at);
-                    upsert_node_without_transaction(connection, path, &new_node)
-                        .await
-                        .map_err(SqliteTransactionError::Operation)?;
-                    previous_new_id = Some(new_node.id.clone());
-                    new_head = new_node.id.clone();
-                    nodes.push(new_node);
-                }
-
-                update_branch_head_after_session_write(
-                    connection,
-                    path,
-                    branch,
-                    &expected_old_head,
-                    &new_head,
-                )
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-                Ok((new_head, nodes))
-            },
-        )
-        .await
-        .map_err(|error| error.into_store_error(path))
-}
-
-async fn handoff_session_in_sqlite(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    branch: &str,
-    patch: &SessionAnchorPatch,
-    prompt: &str,
-) -> Result<(String, Node)> {
-    let prompt = prompt.trim().to_owned();
-    ensure!(!prompt.is_empty(), InvalidSessionHandoffPromptSnafu);
-    connection
-        .immediate_transaction::<(String, Node), SqliteTransactionError, _>(async |connection| {
-            let expected_old_head = load_branch_head(connection, path, branch)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            let chain = load_session_chain(connection, path, branch)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            let session_node = chain.last().expect("session chain should not be empty");
-            let session_anchor = session_anchor_from_node(path, session_node)
-                .map_err(SqliteTransactionError::Operation)?;
-            let mut handoff_session_anchor = session_anchor.apply_patch(patch);
-            handoff_session_anchor.prompt = prompt;
-
-            let node = Node::new(
-                expected_old_head.clone(),
-                Role::System,
-                None,
-                Kind::Anchor(Anchor::session(vec![], handoff_session_anchor)),
-                jiff::Timestamp::now(),
-            );
-            validate_new_node(connection, path, &node)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            persist_node_without_transaction(connection, path, &node)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            update_branch_head_after_session_write(
-                connection,
-                path,
-                branch,
-                &expected_old_head,
-                &node.id,
-            )
-            .await
-            .map_err(SqliteTransactionError::Operation)?;
-            Ok((node.id.clone(), node))
-        })
-        .await
-        .map_err(|error| error.into_store_error(path))
-}
-
 async fn load_session_chain(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -3429,53 +2916,6 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
     Ok(())
 }
 
-async fn submit_job_in_sqlite(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    branch: &str,
-    base: &str,
-) -> Result<Job> {
-    connection
-        .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
-            loop {
-                let job_id = format!("job-{}", nanoid::nanoid!());
-                if jobs::table
-                    .filter(jobs::job_id.eq(&job_id))
-                    .count()
-                    .get_result::<i64>(connection)
-                    .await
-                    .context(QuerySqliteStoreSnafu {
-                        path: path.to_owned(),
-                    })
-                    .map_err(SqliteTransactionError::Operation)?
-                    == 0
-                {
-                    return submit_job_with_id_in_transaction(
-                        connection, path, &job_id, branch, base,
-                    )
-                    .await;
-                }
-            }
-        })
-        .await
-        .map_err(|error| error.into_store_error(path))
-}
-
-async fn submit_job_with_id_in_sqlite(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    job_id: &str,
-    branch: &str,
-    base: &str,
-) -> Result<Job> {
-    connection
-        .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
-            submit_job_with_id_in_transaction(connection, path, job_id, branch, base).await
-        })
-        .await
-        .map_err(|error| error.into_store_error(path))
-}
-
 async fn submit_job_with_id_in_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -3526,118 +2966,6 @@ async fn submit_job_with_id_in_transaction(
         .await
         .map_err(SqliteTransactionError::Operation)?;
     Ok(job)
-}
-
-async fn update_job_status_in_sqlite(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    job_id: &str,
-    expected: JobStatus,
-    next: JobStatus,
-) -> Result<Job> {
-    connection
-        .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
-            let mut job = load_job(connection, path, job_id)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            if job.status != expected {
-                return Err(SqliteTransactionError::Operation(
-                    PromptJobMovedSnafu {
-                        job_id: job_id.to_owned(),
-                        expected: format!("{expected:?}"),
-                        actual: format!("{:?}", job.status),
-                    }
-                    .build(),
-                ));
-            }
-            if !job.status.can_transition_to(next) {
-                return Err(SqliteTransactionError::Operation(
-                    PromptJobInvalidStatusTransitionSnafu {
-                        job_id: job_id.to_owned(),
-                        current: format!("{:?}", job.status),
-                        next: format!("{next:?}"),
-                    }
-                    .build(),
-                ));
-            }
-            job.status = next;
-            job.finished_at = match next {
-                JobStatus::Finished => Some(jiff::Timestamp::now()),
-                _ => None,
-            };
-            persist_job(connection, path, &job)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            Ok(job)
-        })
-        .await
-        .map_err(|error| error.into_store_error(path))
-}
-
-async fn update_job_work_branch_in_sqlite(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    job_id: &str,
-    expected_work_branch: &str,
-    next_work_branch: &str,
-) -> Result<Job> {
-    connection
-        .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
-            load_branch_head(connection, path, next_work_branch)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            let jobs = load_job_map(connection, path)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            if let Some(active_job) = jobs
-                .values()
-                .find(|job| job.job_id != job_id && job_uses_active_branch(job, next_work_branch))
-            {
-                return Err(SqliteTransactionError::Operation(
-                    PromptJobActiveOnBranchSnafu {
-                        branch: next_work_branch.to_owned(),
-                        job_id: active_job.job_id.clone(),
-                    }
-                    .build(),
-                ));
-            }
-            let mut job = jobs.get(job_id).cloned().ok_or_else(|| {
-                SqliteTransactionError::Operation(
-                    PromptJobNotFoundSnafu {
-                        job_id: job_id.to_owned(),
-                    }
-                    .build(),
-                )
-            })?;
-            job.normalize_work_branch();
-            if matches!(job.status, JobStatus::Finished) {
-                return Err(SqliteTransactionError::Operation(
-                    PromptJobInvalidStatusTransitionSnafu {
-                        job_id: job_id.to_owned(),
-                        current: format!("{:?}", job.status),
-                        next: "work_branch_changed".to_owned(),
-                    }
-                    .build(),
-                ));
-            }
-            if job.work_branch != expected_work_branch {
-                return Err(SqliteTransactionError::Operation(
-                    PromptJobMovedSnafu {
-                        job_id: job_id.to_owned(),
-                        expected: expected_work_branch.to_owned(),
-                        actual: job.work_branch.clone(),
-                    }
-                    .build(),
-                ));
-            }
-            job.work_branch = next_work_branch.to_owned();
-            persist_job(connection, path, &job)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            Ok(job)
-        })
-        .await
-        .map_err(|error| error.into_store_error(path))
 }
 
 fn job_uses_active_branch(job: &Job, branch: &str) -> bool {
@@ -4249,11 +3577,22 @@ impl NodeStore for SqliteGraphStore {
     }
 
     async fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        self.ancestry_in_sqlite(head_ref).await
+        let head_ref = head_ref.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_ancestry_nodes(connection, &path, &head_ref).await })
+        })
+        .await
     }
 
     async fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        self.log_in_sqlite(base_ref, head_ref).await
+        let base_ref = base_ref.to_owned();
+        let head_ref = head_ref.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_log_nodes(connection, &path, &base_ref, &head_ref).await })
+        })
+        .await
     }
 
     async fn get_node(&self, id: &str) -> Result<Node> {
@@ -4261,7 +3600,12 @@ impl NodeStore for SqliteGraphStore {
     }
 
     async fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
-        self.list_children_in_sqlite(node_id).await
+        let node_id = node_id.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_child_nodes(connection, &path, &node_id).await })
+        })
+        .await
     }
 }
 
@@ -4272,7 +3616,9 @@ impl BranchStore for SqliteGraphStore {
     }
 
     async fn get_branch_head(&self, name: &str) -> Result<String> {
-        self.get_branch_head_in_sqlite(name).await
+        self.branch_head(name).await?.context(BranchNotFoundSnafu {
+            name: name.to_owned(),
+        })
     }
 
     async fn delete_branch(&self, _name: &str) -> Result<()> {
@@ -4292,7 +3638,11 @@ impl BranchStore for SqliteGraphStore {
 #[async_trait]
 impl SessionStore for SqliteGraphStore {
     async fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
-        self.list_session_states_in_sqlite().await
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move { load_session_states(connection, &path).await })
+        })
+        .await
     }
 
     async fn get_session_state(&self, name: &str) -> Result<SessionState> {
@@ -4301,7 +3651,14 @@ impl SessionStore for SqliteGraphStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.get_session_state_in_sqlite(&name).await })
+            .spawn(async move {
+                let path = store.database_path.clone();
+                store
+                    .with_connection(move |connection| {
+                        Box::pin(async move { load_session_state(connection, &path, &name).await })
+                    })
+                    .await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4336,34 +3693,53 @@ impl NodeStore for SqliteStore {
     }
 
     async fn append(&self, node: NewNode) -> Result<String> {
-        self.append_in_sqlite(node).await
+        self.ensure_writable()?;
+        let node = Node::new(
+            node.parent,
+            node.role,
+            node.metadata,
+            node.kind,
+            jiff::Timestamp::now(),
+        );
+        let _write = self.database.inner.write.lock().await;
+        let mut connection = self.connect().await?;
+        validate_new_node(&mut connection, &self.database_path, &node).await?;
+        persist_node(&mut connection, &self.database_path, &node).await?;
+        Ok(node.id)
     }
 
     async fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        self.ancestry_in_sqlite(head_ref).await
+        let mut connection = self.connect().await?;
+        load_ancestry_nodes(&mut connection, &self.database_path, head_ref).await
     }
 
     async fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
-        self.log_in_sqlite(base_ref, head_ref).await
+        let mut connection = self.connect().await?;
+        load_log_nodes(&mut connection, &self.database_path, base_ref, head_ref).await
     }
 
     async fn get_node(&self, id: &str) -> Result<Node> {
-        self.get_node_in_sqlite(id).await
+        let mut connection = self.connect().await?;
+        load_node_by_prefix_or_branch(&mut connection, &self.database_path, id).await
     }
 
     async fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
-        self.list_children_in_sqlite(node_id).await
+        let mut connection = self.connect().await?;
+        load_child_nodes(&mut connection, &self.database_path, node_id).await
     }
 }
 
 #[async_trait]
 impl BranchStore for SqliteStore {
     async fn fork(&self, name: &str, from_ref: &str) -> Result<String> {
-        self.fork_in_sqlite(name, from_ref).await
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        create_branch(&mut connection, &self.database_path, name, from_ref).await
     }
 
     async fn get_branch_head(&self, name: &str) -> Result<String> {
-        self.get_branch_head_in_sqlite(name).await
+        let mut connection = self.connect().await?;
+        load_branch_head(&mut connection, &self.database_path, name).await
     }
 
     async fn delete_branch(&self, name: &str) -> Result<()> {
@@ -4372,7 +3748,11 @@ impl BranchStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.delete_branch_in_sqlite(&name).await })
+            .spawn(async move {
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                delete_branch_checked(&mut connection, &store.database_path, &name).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4383,15 +3763,25 @@ impl BranchStore for SqliteStore {
         expected_old_head: &str,
         new_head: &str,
     ) -> Result<()> {
-        self.set_branch_head_in_sqlite(name, expected_old_head, new_head)
-            .await
+        self.ensure_writable()?;
+        let _write = self.database.inner.write.lock().await;
+        let mut connection = self.connect().await?;
+        update_branch_head_checked(
+            &mut connection,
+            &self.database_path,
+            name,
+            expected_old_head,
+            new_head,
+        )
+        .await
     }
 }
 
 #[async_trait]
 impl SessionStore for SqliteStore {
     async fn list_session_states(&self) -> Result<std::collections::HashMap<String, SessionState>> {
-        self.list_session_states_in_sqlite().await
+        let mut connection = self.connect().await?;
+        load_session_states(&mut connection, &self.database_path).await
     }
 
     async fn get_session_state(&self, name: &str) -> Result<SessionState> {
@@ -4400,7 +3790,10 @@ impl SessionStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.get_session_state_in_sqlite(&name).await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                load_session_state(&mut connection, &store.database_path, &name).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4418,9 +3811,16 @@ impl SessionStore for SqliteStore {
             .inner
             .runtime
             .spawn(async move {
-                store
-                    .set_session_state_in_sqlite(&name, expected.as_ref(), next)
-                    .await
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                update_session_state(
+                    &mut connection,
+                    &store.database_path,
+                    &name,
+                    expected.as_ref(),
+                    next,
+                )
+                .await
             })
             .await
             .expect("SQLite store task should not panic")
@@ -4433,7 +3833,83 @@ impl SessionStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.rebase_session_in_sqlite(&name, &patch).await })
+            .spawn(async move {
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                let (new_head, _) = connection
+                    .immediate_transaction::<(String, Vec<Node>), SqliteTransactionError, _>(
+                        async |connection| {
+                            let expected_old_head =
+                                load_branch_head(connection, &store.database_path, &name)
+                                    .await
+                                    .map_err(SqliteTransactionError::Operation)?;
+                            let mut chain =
+                                load_session_chain(connection, &store.database_path, &name)
+                                    .await
+                                    .map_err(SqliteTransactionError::Operation)?;
+                            chain.reverse();
+                            let session_node = chain
+                                .as_slice()
+                                .first()
+                                .expect("session chain should not be empty");
+                            let session_anchor =
+                                session_anchor_from_node(&store.database_path, session_node)
+                                    .map_err(SqliteTransactionError::Operation)?;
+                            let rebased_session_anchor = session_anchor.apply_patch(&patch);
+
+                            let mut previous_new_id = None;
+                            let mut new_head = String::new();
+                            let mut nodes = Vec::with_capacity(chain.len());
+                            for (index, node) in chain.into_iter().enumerate() {
+                                let parent = previous_new_id
+                                    .clone()
+                                    .unwrap_or_else(|| node.parent.clone());
+                                let kind = if index == 0 {
+                                    let Kind::Anchor(anchor) = &node.kind else {
+                                        unreachable!("session chain should start with anchor");
+                                    };
+                                    Kind::Anchor(Anchor::session(
+                                        anchor.merge_parents().to_vec(),
+                                        rebased_session_anchor.clone(),
+                                    ))
+                                } else {
+                                    node.kind.clone()
+                                };
+                                let new_node = Node::new(
+                                    parent,
+                                    node.role,
+                                    node.metadata,
+                                    kind,
+                                    node.created_at,
+                                );
+                                upsert_node_without_transaction(
+                                    connection,
+                                    &store.database_path,
+                                    &new_node,
+                                )
+                                .await
+                                .map_err(SqliteTransactionError::Operation)?;
+                                previous_new_id = Some(new_node.id.clone());
+                                new_head = new_node.id.clone();
+                                nodes.push(new_node);
+                            }
+
+                            update_branch_head_after_session_write(
+                                connection,
+                                &store.database_path,
+                                &name,
+                                &expected_old_head,
+                                &new_head,
+                            )
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                            Ok((new_head, nodes))
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.into_store_error(&store.database_path))?;
+                Ok(new_head)
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4452,9 +3928,60 @@ impl SessionStore for SqliteStore {
             .inner
             .runtime
             .spawn(async move {
-                store
-                    .handoff_session_in_sqlite(&name, &patch, &prompt)
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                let prompt = prompt.trim().to_owned();
+                ensure!(!prompt.is_empty(), InvalidSessionHandoffPromptSnafu);
+                let (new_head, _) = connection
+                    .immediate_transaction::<(String, Node), SqliteTransactionError, _>(
+                        async |connection| {
+                            let expected_old_head =
+                                load_branch_head(connection, &store.database_path, &name)
+                                    .await
+                                    .map_err(SqliteTransactionError::Operation)?;
+                            let chain = load_session_chain(connection, &store.database_path, &name)
+                                .await
+                                .map_err(SqliteTransactionError::Operation)?;
+                            let session_node =
+                                chain.last().expect("session chain should not be empty");
+                            let session_anchor =
+                                session_anchor_from_node(&store.database_path, session_node)
+                                    .map_err(SqliteTransactionError::Operation)?;
+                            let mut handoff_session_anchor = session_anchor.apply_patch(&patch);
+                            handoff_session_anchor.prompt = prompt;
+
+                            let node = Node::new(
+                                expected_old_head.clone(),
+                                Role::System,
+                                None,
+                                Kind::Anchor(Anchor::session(vec![], handoff_session_anchor)),
+                                jiff::Timestamp::now(),
+                            );
+                            validate_new_node(connection, &store.database_path, &node)
+                                .await
+                                .map_err(SqliteTransactionError::Operation)?;
+                            persist_node_without_transaction(
+                                connection,
+                                &store.database_path,
+                                &node,
+                            )
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                            update_branch_head_after_session_write(
+                                connection,
+                                &store.database_path,
+                                &name,
+                                &expected_old_head,
+                                &node.id,
+                            )
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                            Ok((node.id.clone(), node))
+                        },
+                    )
                     .await
+                    .map_err(|error| error.into_store_error(&store.database_path))?;
+                Ok(new_head)
             })
             .await
             .expect("SQLite store task should not panic")
@@ -4470,7 +3997,38 @@ impl JobStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.submit_job_in_sqlite(&branch, &base).await })
+            .spawn(async move {
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                connection
+                    .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+                        loop {
+                            let job_id = format!("job-{}", nanoid::nanoid!());
+                            if jobs::table
+                                .filter(jobs::job_id.eq(&job_id))
+                                .count()
+                                .get_result::<i64>(connection)
+                                .await
+                                .context(QuerySqliteStoreSnafu {
+                                    path: store.database_path.clone(),
+                                })
+                                .map_err(SqliteTransactionError::Operation)?
+                                == 0
+                            {
+                                return submit_job_with_id_in_transaction(
+                                    connection,
+                                    &store.database_path,
+                                    &job_id,
+                                    &branch,
+                                    &base,
+                                )
+                                .await;
+                            }
+                        }
+                    })
+                    .await
+                    .map_err(|error| error.into_store_error(&store.database_path))
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4484,9 +4042,21 @@ impl JobStore for SqliteStore {
             .inner
             .runtime
             .spawn(async move {
-                store
-                    .submit_job_with_id_in_sqlite(&job_id, &branch, &base)
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                connection
+                    .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+                        submit_job_with_id_in_transaction(
+                            connection,
+                            &store.database_path,
+                            &job_id,
+                            &branch,
+                            &base,
+                        )
+                        .await
+                    })
                     .await
+                    .map_err(|error| error.into_store_error(&store.database_path))
             })
             .await
             .expect("SQLite store task should not panic")
@@ -4498,7 +4068,10 @@ impl JobStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.get_job_in_sqlite(&job_id).await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                load_job(&mut connection, &store.database_path, &job_id).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4508,7 +4081,10 @@ impl JobStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.list_jobs_in_sqlite().await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                load_job_map(&mut connection, &store.database_path).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4525,9 +4101,45 @@ impl JobStore for SqliteStore {
             .inner
             .runtime
             .spawn(async move {
-                store
-                    .set_job_status_in_sqlite(&job_id, expected, next)
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                connection
+                    .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+                        let mut job = load_job(connection, &store.database_path, &job_id)
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                        if job.status != expected {
+                            return Err(SqliteTransactionError::Operation(
+                                PromptJobMovedSnafu {
+                                    job_id: job_id.to_owned(),
+                                    expected: format!("{expected:?}"),
+                                    actual: format!("{:?}", job.status),
+                                }
+                                .build(),
+                            ));
+                        }
+                        if !job.status.can_transition_to(next) {
+                            return Err(SqliteTransactionError::Operation(
+                                PromptJobInvalidStatusTransitionSnafu {
+                                    job_id: job_id.to_owned(),
+                                    current: format!("{:?}", job.status),
+                                    next: format!("{next:?}"),
+                                }
+                                .build(),
+                            ));
+                        }
+                        job.status = next;
+                        job.finished_at = match next {
+                            JobStatus::Finished => Some(jiff::Timestamp::now()),
+                            _ => None,
+                        };
+                        persist_job(connection, &store.database_path, &job)
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                        Ok(job)
+                    })
                     .await
+                    .map_err(|error| error.into_store_error(&store.database_path))
             })
             .await
             .expect("SQLite store task should not panic")
@@ -4547,13 +4159,64 @@ impl JobStore for SqliteStore {
             .inner
             .runtime
             .spawn(async move {
-                store
-                    .set_job_work_branch_in_sqlite(
-                        &job_id,
-                        &expected_work_branch,
-                        &next_work_branch,
-                    )
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                connection
+                    .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
+                        load_branch_head(connection, &store.database_path, &next_work_branch)
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                        let jobs = load_job_map(connection, &store.database_path)
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                        if let Some(active_job) = jobs.values().find(|job| {
+                            job.job_id != job_id && job_uses_active_branch(job, &next_work_branch)
+                        }) {
+                            return Err(SqliteTransactionError::Operation(
+                                PromptJobActiveOnBranchSnafu {
+                                    branch: next_work_branch.to_owned(),
+                                    job_id: active_job.job_id.clone(),
+                                }
+                                .build(),
+                            ));
+                        }
+                        let mut job = jobs.get(&job_id).cloned().ok_or_else(|| {
+                            SqliteTransactionError::Operation(
+                                PromptJobNotFoundSnafu {
+                                    job_id: job_id.to_owned(),
+                                }
+                                .build(),
+                            )
+                        })?;
+                        job.normalize_work_branch();
+                        if matches!(job.status, JobStatus::Finished) {
+                            return Err(SqliteTransactionError::Operation(
+                                PromptJobInvalidStatusTransitionSnafu {
+                                    job_id: job_id.to_owned(),
+                                    current: format!("{:?}", job.status),
+                                    next: "work_branch_changed".to_owned(),
+                                }
+                                .build(),
+                            ));
+                        }
+                        if job.work_branch != expected_work_branch {
+                            return Err(SqliteTransactionError::Operation(
+                                PromptJobMovedSnafu {
+                                    job_id: job_id.to_owned(),
+                                    expected: expected_work_branch.to_owned(),
+                                    actual: job.work_branch.clone(),
+                                }
+                                .build(),
+                            ));
+                        }
+                        job.work_branch = next_work_branch.to_owned();
+                        persist_job(connection, &store.database_path, &job)
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                        Ok(job)
+                    })
                     .await
+                    .map_err(|error| error.into_store_error(&store.database_path))
             })
             .await
             .expect("SQLite store task should not panic")
@@ -4572,7 +4235,13 @@ impl MessageQueueStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.enqueue_message_in_sqlite(&queue, payload).await })
+            .spawn(async move {
+                store.ensure_writable()?;
+                let item = MessageQueueItem::new(&queue, payload, jiff::Timestamp::now());
+                let mut connection = store.connect().await?;
+                persist_message_queue_item(&mut connection, &store.database_path, &item).await?;
+                Ok(item)
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4589,7 +4258,15 @@ impl MessageQueueStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.peek_message_in_sqlite(&queue).await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                Ok(
+                    load_queue_messages(&mut connection, &store.database_path, &queue)
+                        .await?
+                        .into_iter()
+                        .next(),
+                )
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4600,7 +4277,10 @@ impl MessageQueueStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.list_queue_messages_in_sqlite(&queue).await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                load_queue_messages(&mut connection, &store.database_path, &queue).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4610,7 +4290,10 @@ impl MessageQueueStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.list_message_queues_in_sqlite().await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                load_message_queue_names(&mut connection, &store.database_path).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4623,7 +4306,10 @@ impl PresetStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.list_preset_records_in_sqlite().await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                load_preset_records(&mut connection, &store.database_path).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4634,7 +4320,10 @@ impl PresetStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.get_preset_record_in_sqlite(&name).await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                load_preset_record(&mut connection, &store.database_path, &name).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4645,7 +4334,11 @@ impl PresetStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.set_preset_in_sqlite(&name, config).await })
+            .spawn(async move {
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                set_preset_record(&mut connection, &store.database_path, &name, config).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4656,7 +4349,12 @@ impl PresetStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.rollback_preset_in_sqlite(&name, target_version).await })
+            .spawn(async move {
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                rollback_preset_record(&mut connection, &store.database_path, &name, target_version)
+                    .await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4667,7 +4365,11 @@ impl PresetStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.delete_preset_in_sqlite(&name).await })
+            .spawn(async move {
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                delete_preset_record_checked(&mut connection, &store.database_path, &name).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4680,7 +4382,15 @@ impl SkillStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.list_skills_in_sqlite(role).await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                Ok(load_skill_groups(&mut connection, &store.database_path)
+                    .await?
+                    .for_role(role)
+                    .values()
+                    .cloned()
+                    .collect())
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4691,7 +4401,10 @@ impl SkillStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.get_skill_in_sqlite(role, &name).await })
+            .spawn(async move {
+                let mut connection = store.connect().await?;
+                load_skill_record(&mut connection, &store.database_path, role, &name).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4707,7 +4420,11 @@ impl SkillStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.add_skill_in_sqlite(role, &name, spec).await })
+            .spawn(async move {
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                add_skill_record(&mut connection, &store.database_path, role, &name, spec).await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4724,7 +4441,12 @@ impl SkillStore for SqliteStore {
         self.database
             .inner
             .runtime
-            .spawn(async move { store.update_skill_in_sqlite(role, &name, &patch).await })
+            .spawn(async move {
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                update_skill_record(&mut connection, &store.database_path, role, &name, &patch)
+                    .await
+            })
             .await
             .expect("SQLite store task should not panic")
     }
@@ -4741,9 +4463,16 @@ impl SkillStore for SqliteStore {
             .inner
             .runtime
             .spawn(async move {
-                store
-                    .rollback_skill_in_sqlite(role, &name, target_version)
-                    .await
+                store.ensure_writable()?;
+                let mut connection = store.connect().await?;
+                rollback_skill_record(
+                    &mut connection,
+                    &store.database_path,
+                    role,
+                    &name,
+                    target_version,
+                )
+                .await
             })
             .await
             .expect("SQLite store task should not panic")
