@@ -1387,9 +1387,13 @@ where
         prompt: &str,
     ) -> Result<String> {
         let _guard = self.lock_branch(branch).await;
+        let inherited_tools = if patch.tools.is_none() {
+            Some(self.resolve_context(branch).await?.session_anchor.tools)
+        } else {
+            None
+        };
         refresh_handoff_tool_patch(&mut patch, || {
-            self.resolve_context(branch)
-                .map(|context| context.session_anchor.tools)
+            Ok(inherited_tools.expect("inherited tools should be preloaded when needed"))
         })?;
         let has_tool_patch = patch.tools.is_some();
         let has_model_patch = patch.model.is_some();
@@ -1647,7 +1651,7 @@ where
             CompletionOrigin::BranchHead => original_head.clone(),
             CompletionOrigin::Reference(reference)
             | CompletionOrigin::ReferenceWithBranchSession(reference) => {
-                self.resolve_reference_id(reference)?
+                self.resolve_reference_id(reference).await?
             }
         };
         let retry_from_node_id = match &request.input {
@@ -1981,7 +1985,7 @@ where
         branch: &str,
         reference: &str,
     ) -> Result<ResolvedSession> {
-        let context = self.resolve_context(reference)?;
+        let context = self.resolve_context(reference).await?;
         self.session_from_context(branch, context).await
     }
 
@@ -1991,8 +1995,8 @@ where
         reference: &str,
         branch_head: &str,
     ) -> Result<ResolvedSession> {
-        let mut context = self.resolve_context(reference)?;
-        let branch_context = self.resolve_context(branch_head)?;
+        let mut context = self.resolve_context(reference).await?;
+        let branch_context = self.resolve_context(branch_head).await?;
         context.active_anchor_id = branch_context.active_anchor_id;
         context.session_anchor = branch_context.session_anchor;
         self.session_from_context(branch, context).await
@@ -2095,7 +2099,7 @@ where
     ) -> Result<String> {
         let prompt_parent_id = match session_patch {
             Some(patch) => {
-                self.resolve_context(parent_id)?;
+                self.resolve_context(parent_id).await?;
                 self.store
                     .append(NewNode {
                         parent: parent_id.to_owned(),
@@ -2331,7 +2335,9 @@ where
             Some(self.lock_branch(&target_branch).await)
         };
 
-        let source_anchor_id = self.resolve_reference_id(from_ref.unwrap_or(&target_branch))?;
+        let source_anchor_id = self
+            .resolve_reference_id(from_ref.unwrap_or(&target_branch))
+            .await?;
         self.ensure_ref_visible_on_branch(&target_branch, &source_anchor_id)?;
         if source_anchor_id != base_head_id {
             match self.store.log(&base_head_id, &source_anchor_id) {
@@ -2391,7 +2397,7 @@ where
 {
     #[cfg(test)]
     async fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
-        let context = self.resolve_context(branch)?;
+        let context = self.resolve_context(branch).await?;
         self.session_from_context(branch, context).await
     }
 }
@@ -2550,12 +2556,12 @@ impl<B, S> LlmService<B, S>
 where
     S: NodeStore,
 {
-    pub fn session_supports_tool(
+    pub async fn session_supports_tool(
         &self,
         branch: &str,
         tool_name: &str,
     ) -> std::result::Result<bool, Error> {
-        let context = self.resolve_context(branch)?;
+        let context = self.resolve_context(branch).await?;
         Ok(context
             .session_anchor
             .tools
@@ -2563,9 +2569,9 @@ where
             .any(|tool| tool.name == tool_name))
     }
 
-    fn resolve_context(&self, reference: &str) -> Result<ResolvedContext> {
+    async fn resolve_context(&self, reference: &str) -> Result<ResolvedContext> {
         let mut ordered = Vec::new();
-        for node in self.store.ancestry(reference).context(MemorySnafu)? {
+        for node in self.store.ancestry(reference).await.context(MemorySnafu)? {
             let is_context_start = is_provider_context_start(&node);
             ordered.push(node);
             if is_context_start {
@@ -2856,9 +2862,10 @@ impl<B, S> LlmService<B, S>
 where
     S: NodeStore,
 {
-    fn resolve_reference_id(&self, reference: &str) -> Result<String> {
+    async fn resolve_reference_id(&self, reference: &str) -> Result<String> {
         self.store
             .ancestry(reference)
+            .await
             .context(MemorySnafu)
             .map(|nodes| {
                 nodes
@@ -3380,7 +3387,7 @@ async fn append_skill_results_after_tool_result(
     let Kind::ToolResult(tool_results) = &tool_result_node.kind else {
         return Ok(vec![]);
     };
-    let ancestry = trace_node_store.ancestry(tool_result_node_id)?;
+    let ancestry = trace_node_store.ancestry(tool_result_node_id).await?;
     let mut appended = Vec::new();
     let mut fanned_in = HashSet::new();
 
@@ -6338,7 +6345,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let prompt = &ancestry[1];
 
@@ -6964,7 +6971,7 @@ mod tests {
             ]
         );
 
-        let ancestry = service.store().ancestry("main").unwrap();
+        let ancestry = service.store().ancestry("main").await.unwrap();
         assert!(matches!(
             &ancestry[0].kind,
             Kind::Text(text) if text == "merge answer"
@@ -7034,7 +7041,7 @@ mod tests {
         );
         drop(calls);
 
-        let ancestry = store.ancestry("runner").unwrap();
+        let ancestry = store.ancestry("runner").await.unwrap();
         assert!(matches!(
             &ancestry[0].kind,
             Kind::Text(text) if text == "runner answer"
@@ -7075,7 +7082,7 @@ mod tests {
             result.response_node_id
         );
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         assert_eq!(ancestry[0].id, result.response_node_id);
         assert!(matches!(&ancestry[0].kind, Kind::Text(text) if text == "prompted"));
         assert_eq!(ancestry[1].id, result.anchor_id);
@@ -7104,7 +7111,7 @@ mod tests {
             prompt_result.response_node_id
         );
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         assert!(matches!(&ancestry[0].kind, Kind::Text(text) if text == "prompted"));
         assert!(matches!(
             &ancestry[1].kind,
@@ -7645,7 +7652,7 @@ mod tests {
             .unwrap();
 
         assert_ne!(new_head, session.anchor_id);
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let Kind::Anchor(anchor) = &ancestry[0].kind else {
             panic!("expected rebuilt session anchor");
         };
@@ -7765,7 +7772,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let tool_result = &ancestry[1];
         let tool_use = &ancestry[2];
@@ -7863,7 +7870,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let tool_result = &ancestry[1];
         let tool_use = &ancestry[2];
@@ -8005,7 +8012,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let tool_use = &ancestry[1];
 
@@ -8906,7 +8913,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let tool_result = &ancestry[1];
         let tool_use = &ancestry[2];

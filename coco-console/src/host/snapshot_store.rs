@@ -115,6 +115,27 @@ impl MaterializationSourceSnapshot {
             })
     }
 
+    fn ancestry_nodes(&self, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        let mut node_id = self.resolve_ref_id(head_ref)?;
+        let mut nodes = Vec::new();
+        loop {
+            let node = self.nodes.get(&node_id).cloned().ok_or_else(|| {
+                coco_mem::StoreError::NotFound {
+                    id: node_id.clone(),
+                }
+            })?;
+            let parent = node.parent.clone();
+            nodes.push(node);
+            if parent.is_empty() {
+                return Ok(nodes);
+            }
+            if !self.nodes.contains_key(&parent) {
+                return Err(coco_mem::StoreError::ParentNotFound { id: parent });
+            }
+            node_id = parent;
+        }
+    }
+
     fn node(&self, id: &str) -> coco_mem::StoreResult<Node> {
         let id = self.resolve_ref_id(id)?;
         self.nodes
@@ -178,30 +199,16 @@ impl NodeStore for MaterializationSourceSnapshot {
         Box::pin(async move { Self::read_only_error() })
     }
 
-    fn ancestry(&self, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
-        let mut node_id = self.resolve_ref_id(head_ref)?;
-        let mut nodes = Vec::new();
-        loop {
-            let node = self.nodes.get(&node_id).cloned().ok_or_else(|| {
-                coco_mem::StoreError::NotFound {
-                    id: node_id.clone(),
-                }
-            })?;
-            let parent = node.parent.clone();
-            nodes.push(node);
-            if parent.is_empty() {
-                return Ok(nodes);
-            }
-            if !self.nodes.contains_key(&parent) {
-                return Err(coco_mem::StoreError::ParentNotFound { id: parent });
-            }
-            node_id = parent;
-        }
+    fn ancestry<'a>(
+        &'a self,
+        head_ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.ancestry_nodes(head_ref) })
     }
 
     fn log(&self, base_ref: &str, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
         let base_id = self.resolve_ref_id(base_ref)?;
-        let mut nodes = self.ancestry(head_ref)?;
+        let mut nodes = self.ancestry_nodes(head_ref)?;
         let Some(index) = nodes.iter().position(|node| node.id == base_id) else {
             return Err(coco_mem::StoreError::RefsNotConnected {
                 base_ref: base_ref.to_owned(),
@@ -1040,7 +1047,9 @@ impl ConsoleGraphSnapshotStore {
         let head_id = store
             .branch_head(branch)
             .context(crate::error::StoreSnafu)?;
-        let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+        let ancestry = store
+            .ancestry_nodes(&head_id)
+            .context(crate::error::StoreSnafu)?;
         Ok(!initial_visible_graph_lane_nodes(store, mode, ancestry)?.is_empty())
     }
 
@@ -1055,7 +1064,9 @@ impl ConsoleGraphSnapshotStore {
         let head_id = store
             .branch_head(first_branch)
             .context(crate::error::StoreSnafu)?;
-        let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+        let ancestry = store
+            .ancestry_nodes(&head_id)
+            .context(crate::error::StoreSnafu)?;
         let context_start_id = merge_parent_context_start_id(mode, &ancestry);
         let nodes = initial_visible_graph_lane_nodes(store, mode, ancestry)?;
         if nodes.is_empty() || !initial_visible_lane_is_linear(mode, &nodes) {
@@ -1655,7 +1666,7 @@ impl ConsoleGraphSnapshotStore {
         input: AppendLinearBranchInput<'_>,
     ) -> crate::Result<bool> {
         let ancestry = store
-            .ancestry(input.head_id)
+            .ancestry_nodes(input.head_id)
             .context(crate::error::StoreSnafu)?;
         let scoped_ancestry = provider_context_ancestry_nodes(ancestry);
         let Some(tail) =
@@ -1762,7 +1773,9 @@ impl ConsoleGraphSnapshotStore {
             let head_id = store
                 .branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
-            let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
+            let ancestry = store
+                .ancestry_nodes(&head_id)
+                .context(crate::error::StoreSnafu)?;
             let Some(row) =
                 self.first_materialized_lane_ancestry_node(connection, mode, branch, &ancestry)?
             else {
@@ -1795,7 +1808,7 @@ impl ConsoleGraphSnapshotStore {
         lane_y: i32,
     ) -> crate::Result<bool> {
         let ancestry = store
-            .ancestry(input.head_id)
+            .ancestry_nodes(input.head_id)
             .context(crate::error::StoreSnafu)?;
         let scoped_ancestry = provider_context_ancestry_nodes(ancestry);
         let context_start_id = context_start_id_from_scoped_ancestry(&scoped_ancestry);
@@ -2000,7 +2013,7 @@ impl ConsoleGraphSnapshotStore {
             return Ok(true);
         }
         let ancestry = store
-            .ancestry(input.head_id)
+            .ancestry_nodes(input.head_id)
             .context(crate::error::StoreSnafu)?;
         let context_start_id = merge_parent_context_start_id(input.mode, &ancestry);
         let Ok(mut chain) = store.log(&tail.node_id, input.head_id) else {
@@ -2429,7 +2442,7 @@ impl ConsoleGraphSnapshotStore {
         context_start_id: Option<&str>,
     ) -> crate::Result<MergeParentPoint> {
         let ancestry = store
-            .ancestry(merge_parent.node_id())
+            .ancestry_nodes(merge_parent.node_id())
             .context(crate::error::StoreSnafu)?;
         let Some(source_index) =
             visible_scoped_merge_parent_source_index(mode, &ancestry, context_start_id)
@@ -2868,7 +2881,7 @@ impl ConsoleGraphSnapshotStore {
         lane_y: i32,
     ) -> crate::Result<bool> {
         let ancestry = store
-            .ancestry(input.head_id)
+            .ancestry_nodes(input.head_id)
             .context(crate::error::StoreSnafu)?;
         let (source, source_point, nodes): (Option<String>, Option<Point>, Vec<Node>) = match self
             .first_materialized_ancestry_point(
@@ -6069,16 +6082,24 @@ mod tests {
             })
         }
 
-        fn ancestry(&self, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        fn ancestry<'a>(
+            &'a self,
+            head_ref: &'a str,
+        ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
+            let result = match head_ref {
+                id if id == self.old_head.id => Ok(vec![self.old_head.clone(), self.root.clone()]),
+                id if id == self.root.id => Ok(vec![self.root.clone()]),
+                id => Err(coco_mem::StoreError::NotFound { id: id.to_owned() }),
+            };
+            Box::pin(std::future::ready(result))
+        }
+
+        fn log(&self, _base_ref: &str, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
             match head_ref {
                 id if id == self.old_head.id => Ok(vec![self.old_head.clone(), self.root.clone()]),
                 id if id == self.root.id => Ok(vec![self.root.clone()]),
                 id => Err(coco_mem::StoreError::NotFound { id: id.to_owned() }),
             }
-        }
-
-        fn log(&self, _base_ref: &str, head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
-            self.ancestry(head_ref)
         }
 
         fn get_node<'a>(
@@ -6250,7 +6271,10 @@ mod tests {
             snapshot.get_branch_head("main").await.unwrap(),
             store.old_head.id
         );
-        assert_eq!(snapshot.ancestry("main").unwrap()[0].id, store.old_head.id);
+        assert_eq!(
+            snapshot.ancestry("main").await.unwrap()[0].id,
+            store.old_head.id
+        );
     }
 
     #[tokio::test]

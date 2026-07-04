@@ -64,8 +64,13 @@ impl NodeStore for DeepChainStore {
         Box::pin(async move { panic!("deep chain test inserts nodes directly") })
     }
 
-    fn ancestry(&self, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
-        panic!("deep chain test does not read ancestry")
+    fn ancestry<'a>(
+        &'a self,
+        _head_ref: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>,
+    > {
+        Box::pin(async move { panic!("deep chain test does not read ancestry") })
     }
 
     fn log(&self, _base_ref: &str, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {

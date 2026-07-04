@@ -332,7 +332,7 @@ async fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
         Err(source) => return Err(source).context(StoreSnafu),
     }
 
-    let ancestry = store.ancestry(&head).context(StoreSnafu)?;
+    let ancestry = store.ancestry(&head).await.context(StoreSnafu)?;
     let Some(session) = ancestry.into_iter().find_map(|node| {
         let Kind::Anchor(Anchor {
             payload: AnchorPayload::Session(session),
@@ -379,7 +379,7 @@ async fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionC
 
     for branch in branches {
         let head = store.get_branch_head(&branch).await.context(StoreSnafu)?;
-        let ancestry = store.ancestry(&head).context(StoreSnafu)?;
+        let ancestry = store.ancestry(&head).await.context(StoreSnafu)?;
         let Some(session_anchor) = ancestry.into_iter().find_map(|node| {
             let Kind::Anchor(anchor) = &node.kind else {
                 return None;

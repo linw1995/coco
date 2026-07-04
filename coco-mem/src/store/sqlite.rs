@@ -4290,8 +4290,11 @@ impl NodeStore for SqliteGraphStore {
         Box::pin(async move { self.ensure_read_only() })
     }
 
-    fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        self.block_on(self.ancestry_in_sqlite(head_ref))
+    fn ancestry<'a>(
+        &'a self,
+        head_ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.ancestry_in_sqlite(head_ref).await })
     }
 
     fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
@@ -4395,8 +4398,11 @@ impl NodeStore for SqliteStore {
         Box::pin(async move { self.append_in_sqlite(node).await })
     }
 
-    fn ancestry(&self, head_ref: &str) -> Result<Vec<Node>> {
-        self.block_on(self.ancestry_in_sqlite(head_ref))
+    fn ancestry<'a>(
+        &'a self,
+        head_ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.ancestry_in_sqlite(head_ref).await })
     }
 
     fn log(&self, base_ref: &str, head_ref: &str) -> Result<Vec<Node>> {
@@ -5536,7 +5542,7 @@ mod tests {
             graph_store.list_children(&root_id).await.unwrap()[0].id,
             child_id
         );
-        assert_eq!(graph_store.ancestry(&child_id).unwrap().len(), 2);
+        assert_eq!(graph_store.ancestry(&child_id).await.unwrap().len(), 2);
         assert!(matches!(
             graph_store
                 .append(NewNode {
@@ -5791,6 +5797,7 @@ mod tests {
 
         let ancestry = reopened
             .ancestry(&second)
+            .await
             .unwrap()
             .into_iter()
             .map(|node| node.id)

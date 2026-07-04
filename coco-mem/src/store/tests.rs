@@ -442,7 +442,7 @@ where
         .unwrap();
     let b_id = store.append(make_text_node(&a_id, "b")).await.unwrap();
 
-    let ancestry = store.ancestry(&b_id).unwrap();
+    let ancestry = store.ancestry(&b_id).await.unwrap();
     let ids: Vec<_> = ancestry.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![b_id, a_id, session_id, root_id]);
@@ -1431,7 +1431,7 @@ where
         .unwrap();
 
     assert_ne!(new_head, child_id);
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].id, new_head);
     assert!(matches!(&ancestry[0].kind, Kind::Text(text) if text == "child"));
     assert_ne!(ancestry[0].id, child_id);
@@ -1485,7 +1485,7 @@ where
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].id, new_head);
     assert_ne!(ancestry[1].id, session_id);
     let Kind::Anchor(anchor) = &ancestry[1].kind else {
@@ -1532,7 +1532,7 @@ where
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let rebased_prompt = &ancestry[0];
     let rebased_merge_source = &ancestry[1];
     let rebased_session = &ancestry[2];
@@ -1574,7 +1574,7 @@ where
 
     assert_eq!(store.get_branch_head("draft").await.unwrap(), child_id);
     assert_eq!(store.get_branch_head("main").await.unwrap(), new_head);
-    let draft_ancestry = store.ancestry("draft").unwrap();
+    let draft_ancestry = store.ancestry("draft").await.unwrap();
     let Kind::Anchor(anchor) = &draft_ancestry[1].kind else {
         panic!("expected session anchor");
     };
@@ -1633,7 +1633,7 @@ where
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].created_at, child_created_at);
     assert_eq!(ancestry[1].created_at, session_created_at);
     assert_eq!(ancestry[2].id, root_id);
@@ -1661,7 +1661,7 @@ where
         .unwrap();
 
     assert_ne!(new_head, child_id);
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].id, new_head);
     assert_eq!(ancestry[0].parent, child_id);
     let Kind::Anchor(anchor) = &ancestry[0].kind else {

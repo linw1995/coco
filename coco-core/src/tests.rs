@@ -339,7 +339,7 @@ async fn core_service_telegram_prompt_requires_completing_request_before_reply()
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let prompt = match &ancestry[1].kind {
         Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
         _ => panic!("expected prompt anchor"),
@@ -388,7 +388,7 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let prompt = match &ancestry[1].kind {
         Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
         _ => panic!("expected prompt anchor"),
@@ -435,7 +435,7 @@ async fn core_service_telegram_prompt_omits_load_image_when_tool_is_unavailable(
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let prompt = match &ancestry[1].kind {
         Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
         _ => panic!("expected prompt anchor"),
@@ -474,7 +474,7 @@ async fn core_service_telegram_prompt_includes_voice_attachments() {
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let prompt = match &ancestry[1].kind {
         Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
         _ => panic!("expected prompt anchor"),
@@ -575,7 +575,7 @@ async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
         .unwrap();
 
     assert_eq!(response, "runner done");
-    let ancestry = store.ancestry("runner").unwrap();
+    let ancestry = store.ancestry("runner").await.unwrap();
     assert!(matches!(
         &ancestry[0].kind,
         Kind::Text(text) if text == "runner done"

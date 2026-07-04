@@ -270,7 +270,7 @@ where
         .fork(branch.clone(), &from_ref)
         .await
         .context(LlmSnafu)?;
-    let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
+    let (_, anchor) = resolve_visible_session_anchor(store, &branch).await?;
     let result = SessionForkResult {
         state: store.get_session_state(&branch).await.context(StoreSnafu)?,
         role: anchor.role,
@@ -608,7 +608,7 @@ async fn list_sessions(
 
     let mut summaries = Vec::new();
     for (branch, state) in branches {
-        let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
+        let (_, anchor) = resolve_visible_session_anchor(store, &branch).await?;
         summaries.push(SessionSummary {
             head_id: store.get_branch_head(&branch).await.context(StoreSnafu)?,
             role: anchor.role,
@@ -625,7 +625,7 @@ async fn read_session_details(
 ) -> Result<SessionDetails> {
     let head_id = store.get_branch_head(branch).await.context(StoreSnafu)?;
     let state = store.get_session_state(branch).await.context(StoreSnafu)?;
-    let (anchor_id, anchor) = resolve_visible_session_anchor(store, branch)?;
+    let (anchor_id, anchor) = resolve_visible_session_anchor(store, branch).await?;
 
     Ok(SessionDetails {
         branch: branch.to_owned(),
@@ -772,7 +772,7 @@ async fn build_session_graph_entries(
 
     for (branch, state) in branches {
         let head_id = store.get_branch_head(&branch).await.context(StoreSnafu)?;
-        let mut scope_node_ids = initial_graph_scope(store, &head_id, mode)?;
+        let mut scope_node_ids = initial_graph_scope(store, &head_id, mode).await?;
         let mut branch_visible_node_ids = BTreeSet::new();
         collect_visible_graph_nodes(
             store,
@@ -1010,13 +1010,13 @@ async fn collect_visible_graph_nodes(
     Ok(())
 }
 
-fn initial_graph_scope(
+async fn initial_graph_scope(
     store: &impl NodeStore,
     head_id: &str,
     mode: SessionGraphMode,
 ) -> Result<BTreeSet<String>> {
     match mode {
-        SessionGraphMode::Anchors => collect_provider_context_node_ids(store, head_id),
+        SessionGraphMode::Anchors => collect_provider_context_node_ids(store, head_id).await,
         SessionGraphMode::All => Ok(BTreeSet::from([head_id.to_owned()])),
     }
 }
@@ -1034,13 +1034,13 @@ fn push_scoped_graph_node(
     pending.push(node_id);
 }
 
-fn collect_provider_context_node_ids(
+async fn collect_provider_context_node_ids(
     store: &impl NodeStore,
     head_id: &str,
 ) -> Result<BTreeSet<String>> {
     let mut node_ids = BTreeSet::new();
 
-    for node in store.ancestry(head_id).context(StoreSnafu)? {
+    for node in store.ancestry(head_id).await.context(StoreSnafu)? {
         if node.is_root() {
             break;
         }
@@ -1839,11 +1839,11 @@ async fn build_session_feedback_result(
     })
 }
 
-fn resolve_visible_session_anchor(
+async fn resolve_visible_session_anchor(
     store: &impl NodeStore,
     branch: &str,
 ) -> Result<(String, SessionAnchor)> {
-    let ancestry = store.ancestry(branch).context(StoreSnafu)?;
+    let ancestry = store.ancestry(branch).await.context(StoreSnafu)?;
     for node in ancestry {
         let coco_mem::Kind::Anchor(anchor) = node.kind else {
             continue;

@@ -1066,7 +1066,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
 
     assert_eq!(output, Some("runner done".to_owned()));
     let store = open_store(&store_path).await.unwrap();
-    let ancestry = store.ancestry("runner").unwrap();
+    let ancestry = store.ancestry("runner").await.unwrap();
     assert!(matches!(
         &ancestry[0].kind,
         Kind::Text(text) if text == "runner done"
@@ -1130,7 +1130,7 @@ async fn prompt_enable_all_tools_appends_all_tool_patch() {
     .unwrap();
 
     let store = open_store(&store_path).await.unwrap();
-    let ancestry = store.ancestry("runner").unwrap();
+    let ancestry = store.ancestry("runner").await.unwrap();
     let Kind::Anchor(anchor) = &ancestry[2].kind else {
         panic!("expected session patch anchor");
     };
@@ -2444,7 +2444,7 @@ async fn session_handoff_appends_inherited_session_anchor() {
     assert_ne!(value["head"], json!(original_head));
 
     let store = open_store(&store_path).await.unwrap();
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].id, head);
     let Kind::Anchor(anchor) = &ancestry[0].kind else {
         panic!("expected session anchor");
@@ -2510,7 +2510,7 @@ async fn session_handoff_refreshes_inherited_builtin_tool_definitions_by_default
     .unwrap();
 
     let store = open_store(&store_path).await.unwrap();
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let Kind::Anchor(anchor) = &ancestry[0].kind else {
         panic!("expected session anchor");
     };
@@ -2571,7 +2571,7 @@ async fn session_handoff_can_preserve_inherited_tool_definitions() {
     .unwrap();
 
     let store = open_store(&store_path).await.unwrap();
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let Kind::Anchor(anchor) = &ancestry[0].kind else {
         panic!("expected session anchor");
     };
@@ -5629,7 +5629,7 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
     assert_eq!(response.stdout, "world\n");
     assert!(response.stderr.is_empty());
 
-    let ancestry = store.ancestry("draft").unwrap();
+    let ancestry = store.ancestry("draft").await.unwrap();
     let prompt_anchor = ancestry
         .iter()
         .find_map(|node| match &node.kind {
@@ -5992,7 +5992,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
     assert!(response.stdout.is_empty());
     assert!(response.stderr.is_empty());
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let shadow_anchor = ancestry
         .iter()
         .find_map(|node| match &node.kind {

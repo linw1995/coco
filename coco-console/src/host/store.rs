@@ -57,8 +57,11 @@ where
         })
     }
 
-    fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {
-        self.inner.ancestry(head_ref)
+    fn ancestry<'a>(
+        &'a self,
+        head_ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.inner.ancestry(head_ref).await })
     }
 
     fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>> {

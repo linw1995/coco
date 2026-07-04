@@ -118,12 +118,12 @@ impl<B, S> ConversationEngine<B, S>
 where
     S: NodeStore,
 {
-    pub fn session_supports_tool(
+    pub async fn session_supports_tool(
         &self,
         branch: &str,
         tool_name: &str,
     ) -> std::result::Result<bool, LlmError> {
-        self.service.session_supports_tool(branch, tool_name)
+        self.service.session_supports_tool(branch, tool_name).await
     }
 }
 
