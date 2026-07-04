@@ -280,7 +280,7 @@ async fn submit_prompt_job(
     branch: &str,
     prompt: &str,
 ) -> coco_llm::coco_mem::Job {
-    let parent = store.get_branch_head(branch).unwrap();
+    let parent = store.get_branch_head(branch).await.unwrap();
     let prompt_anchor_id = store
         .append(NewNode {
             parent,
@@ -888,7 +888,7 @@ async fn llm_engine_retries_job_from_before_failure_node() {
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
-    let current_head = store.get_branch_head("main").unwrap();
+    let current_head = store.get_branch_head("main").await.unwrap();
     let failure_id = store
         .append(NewNode {
             parent: job.base.clone(),
@@ -965,7 +965,7 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
-    let current_head = store.get_branch_head("main").unwrap();
+    let current_head = store.get_branch_head("main").await.unwrap();
     let failure_id = store
         .append(NewNode {
             parent: job.base.clone(),
@@ -1102,7 +1102,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
     assert_eq!(recovered.status, JobStatus::Finished);
     assert_eq!(recovered.branch, "main");
     assert_eq!(recovered.work_branch, "main");
-    assert_eq!(store.get_branch_head("main").unwrap(), recovered.head);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), recovered.head);
     assert_eq!(
         store.get_node(&recovered.head).unwrap().kind,
         Kind::Text("recovered by c".to_owned())
@@ -1408,7 +1408,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
         .create_session(session_config("main"))
         .await
         .unwrap();
-    let original_head = store.get_branch_head("main").unwrap();
+    let original_head = store.get_branch_head("main").await.unwrap();
     submit_prompt_job(&store, "main", "keep going").await;
     let job_id = store
         .list_jobs()
@@ -1477,7 +1477,10 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
 
     let stored_job = resumed_engine.get_job(&job.job_id).await.unwrap();
     assert_eq!(stored_job.status, JobStatus::Finished);
-    assert_eq!(store.get_branch_head("main").unwrap(), stored_job.head);
+    assert_eq!(
+        store.get_branch_head("main").await.unwrap(),
+        stored_job.head
+    );
 }
 
 #[tokio::test]
@@ -1544,7 +1547,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
     let child_branch = calls[0].clone();
     drop(calls);
 
-    let branch_error = store.get_branch_head(&child_branch).unwrap_err();
+    let branch_error = store.get_branch_head(&child_branch).await.unwrap_err();
     assert!(matches!(
         branch_error,
         coco_llm::coco_mem::StoreError::BranchNotFound { name } if name == child_branch
@@ -1753,7 +1756,7 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
     let child_branch = calls[0].clone();
     drop(calls);
 
-    let branch_error = store.get_branch_head(&child_branch).unwrap_err();
+    let branch_error = store.get_branch_head(&child_branch).await.unwrap_err();
     assert!(matches!(
         branch_error,
         coco_llm::coco_mem::StoreError::BranchNotFound { name } if name == child_branch

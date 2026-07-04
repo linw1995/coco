@@ -4316,8 +4316,8 @@ impl BranchStore for SqliteGraphStore {
         std::future::ready(self.ensure_read_only())
     }
 
-    fn get_branch_head(&self, name: &str) -> Result<String> {
-        self.block_on(self.get_branch_head_in_sqlite(name))
+    async fn get_branch_head<'a>(&'a self, name: &'a str) -> Result<String> {
+        self.get_branch_head_in_sqlite(name).await
     }
 
     fn delete_branch<'a>(&'a self, _name: &'a str) -> impl Future<Output = Result<()>> + Send + 'a {
@@ -4411,8 +4411,8 @@ impl BranchStore for SqliteStore {
         self.fork_in_sqlite(name, from_ref).await
     }
 
-    fn get_branch_head(&self, name: &str) -> Result<String> {
-        self.block_on(self.get_branch_head_in_sqlite(name))
+    async fn get_branch_head<'a>(&'a self, name: &'a str) -> Result<String> {
+        self.get_branch_head_in_sqlite(name).await
     }
 
     async fn delete_branch<'a>(&'a self, name: &'a str) -> Result<()> {
@@ -5816,14 +5816,14 @@ mod tests {
             .set_branch_head("main", &first, &second)
             .await
             .unwrap();
-        assert_eq!(store.get_branch_head("main").unwrap(), second);
+        assert_eq!(store.get_branch_head("main").await.unwrap(), second);
 
         let reopened = SqliteStore::open(&path).await.unwrap();
-        assert_eq!(reopened.get_branch_head("main").unwrap(), second);
+        assert_eq!(reopened.get_branch_head("main").await.unwrap(), second);
 
         reopened.delete_branch("main").await.unwrap();
         let reopened = SqliteStore::open(&path).await.unwrap();
-        assert!(reopened.get_branch_head("main").is_err());
+        assert!(reopened.get_branch_head("main").await.is_err());
     }
 
     #[tokio::test]
@@ -5924,7 +5924,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.get_branch_head("main").unwrap(), handoff);
+        assert_eq!(reopened.get_branch_head("main").await.unwrap(), handoff);
         assert_eq!(
             reopened.get_session_state("main").await.unwrap(),
             SessionState::Paused {

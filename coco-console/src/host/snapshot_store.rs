@@ -59,7 +59,7 @@ struct MaterializationSourceSnapshot {
 }
 
 impl MaterializationSourceSnapshot {
-    fn from_store(
+    async fn from_store(
         store: &(impl BranchStore + NodeStore + SessionStore),
         session_states: &[(String, SessionState)],
     ) -> crate::Result<Self> {
@@ -69,6 +69,7 @@ impl MaterializationSourceSnapshot {
                 branch.clone(),
                 store
                     .get_branch_head(branch)
+                    .await
                     .context(crate::error::StoreSnafu)?,
             );
         }
@@ -97,6 +98,15 @@ impl MaterializationSourceSnapshot {
             branches,
             sessions: session_states.iter().cloned().collect(),
         })
+    }
+
+    fn branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {
+        self.branches
+            .get(name)
+            .cloned()
+            .ok_or_else(|| coco_mem::StoreError::BranchNotFound {
+                name: name.to_owned(),
+            })
     }
 
     fn resolve_ref_id(&self, reference: &str) -> coco_mem::StoreResult<String> {
@@ -206,13 +216,11 @@ impl BranchStore for MaterializationSourceSnapshot {
         std::future::ready(Self::read_only_error())
     }
 
-    fn get_branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {
-        self.branches
-            .get(name)
-            .cloned()
-            .ok_or_else(|| coco_mem::StoreError::BranchNotFound {
-                name: name.to_owned(),
-            })
+    fn get_branch_head<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
+        std::future::ready(self.branch_head(name))
     }
 
     fn delete_branch<'a>(
@@ -651,7 +659,7 @@ impl ConsoleGraphSnapshotStore {
         })
     }
 
-    pub fn try_append_linear_branch(
+    pub async fn try_append_linear_branch(
         &self,
         source_version: u64,
         mode: GraphMode,
@@ -665,7 +673,7 @@ impl ConsoleGraphSnapshotStore {
         session_states.sort_by(|(left, _), (right, _)| {
             branch_lane_priority(left).cmp(&branch_lane_priority(right))
         });
-        let source = MaterializationSourceSnapshot::from_store(store, &session_states)?;
+        let source = MaterializationSourceSnapshot::from_store(store, &session_states).await?;
 
         if session_states.is_empty() {
             let this = self.clone();
@@ -757,7 +765,7 @@ impl ConsoleGraphSnapshotStore {
                         continue;
                     }
                     let head_id = source
-                        .get_branch_head(branch)
+                        .branch_head(branch)
                         .context(crate::error::StoreSnafu)?;
                     this.shift_lanes_for_insertion(connection, mode, next_lane_y)?;
                     let input = AppendLinearBranchInput {
@@ -987,7 +995,7 @@ impl ConsoleGraphSnapshotStore {
 
     fn first_visible_initial_branch_index(
         &self,
-        store: &(impl BranchStore + NodeStore),
+        store: &MaterializationSourceSnapshot,
         mode: GraphMode,
         session_states: &[(String, SessionState)],
     ) -> crate::Result<Option<usize>> {
@@ -1001,12 +1009,12 @@ impl ConsoleGraphSnapshotStore {
 
     fn branch_has_initial_visible_nodes(
         &self,
-        store: &(impl BranchStore + NodeStore),
+        store: &MaterializationSourceSnapshot,
         mode: GraphMode,
         branch: &str,
     ) -> crate::Result<bool> {
         let head_id = store
-            .get_branch_head(branch)
+            .branch_head(branch)
             .context(crate::error::StoreSnafu)?;
         let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
         Ok(!initial_visible_graph_lane_nodes(store, mode, ancestry)?.is_empty())
@@ -1015,13 +1023,13 @@ impl ConsoleGraphSnapshotStore {
     fn try_seed_first_branch_materialization_in_transaction(
         &self,
         connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
+        store: &MaterializationSourceSnapshot,
         mode: GraphMode,
         first_branch: &str,
         first_state: &SessionState,
     ) -> crate::Result<bool> {
         let head_id = store
-            .get_branch_head(first_branch)
+            .branch_head(first_branch)
             .context(crate::error::StoreSnafu)?;
         let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
         let context_start_id = merge_parent_context_start_id(mode, &ancestry);
@@ -1456,7 +1464,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_update_anchor_materialization_in_transaction(
         &self,
         connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
+        store: &MaterializationSourceSnapshot,
         source_version: u64,
         session_states: &[(String, SessionState)],
     ) -> crate::Result<bool> {
@@ -1555,7 +1563,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_update_anchor_branch_lanes(
         &self,
         connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
+        store: &MaterializationSourceSnapshot,
         session_states: &[(String, SessionState)],
         materialized_lane_labels: BTreeSet<String>,
     ) -> crate::Result<bool> {
@@ -1564,7 +1572,7 @@ impl ConsoleGraphSnapshotStore {
         let mut next_lane_y = crate::layout::GRAPH_TOP_Y;
         for (branch, state) in session_states {
             let head_id = store
-                .get_branch_head(branch)
+                .branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
             let has_visible_nodes = self.branch_has_initial_visible_nodes(store, mode, branch)?;
             let appended = if materialized_lane_labels.contains(branch) {
@@ -1718,7 +1726,7 @@ impl ConsoleGraphSnapshotStore {
     fn refresh_materialized_node_labels(
         &self,
         connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
+        store: &MaterializationSourceSnapshot,
         mode: GraphMode,
         session_states: &[(String, SessionState)],
     ) -> crate::Result<Option<Vec<MaterializedTailNodeRow>>> {
@@ -1728,7 +1736,7 @@ impl ConsoleGraphSnapshotStore {
                 continue;
             }
             let head_id = store
-                .get_branch_head(branch)
+                .branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
             let ancestry = store.ancestry(&head_id).context(crate::error::StoreSnafu)?;
             let Some(row) =
@@ -3133,7 +3141,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_append_linear_branches_in_transaction(
         &self,
         connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
+        store: &MaterializationSourceSnapshot,
         source_version: u64,
         mode: GraphMode,
         session_states: &[(String, SessionState)],
@@ -3218,7 +3226,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_update_all_branch_lanes(
         &self,
         connection: &mut SqliteConnection,
-        store: &(impl BranchStore + NodeStore),
+        store: &MaterializationSourceSnapshot,
         session_states: &[(String, SessionState)],
         materialized_lane_labels: BTreeSet<String>,
     ) -> crate::Result<bool> {
@@ -3227,7 +3235,7 @@ impl ConsoleGraphSnapshotStore {
         let mut next_lane_y = crate::layout::GRAPH_TOP_Y;
         for (branch, state) in session_states {
             let head_id = store
-                .get_branch_head(branch)
+                .branch_head(branch)
                 .context(crate::error::StoreSnafu)?;
             let has_visible_nodes = self.branch_has_initial_visible_nodes(store, mode, branch)?;
             let appended = if materialized_lane_labels.contains(branch) {
@@ -6083,12 +6091,16 @@ mod tests {
             }))
         }
 
-        fn get_branch_head(&self, name: &str) -> coco_mem::StoreResult<String> {
-            if name == "main" {
-                return Ok(self.branch_head.borrow().clone());
-            }
-            Err(coco_mem::StoreError::BranchNotFound {
-                name: name.to_owned(),
+        fn get_branch_head<'a>(
+            &'a self,
+            name: &'a str,
+        ) -> impl Future<Output = coco_mem::StoreResult<String>> + Send + 'a {
+            std::future::ready(if name == "main" {
+                Ok(self.branch_head.borrow().clone())
+            } else {
+                Err(coco_mem::StoreError::BranchNotFound {
+                    name: name.to_owned(),
+                })
             })
         }
 
@@ -6188,10 +6200,17 @@ mod tests {
             &store,
             &[("main".to_owned(), SessionState::Active)],
         )
+        .await
         .unwrap();
 
-        assert_eq!(store.get_branch_head("main").unwrap(), store.new_head_id);
-        assert_eq!(snapshot.get_branch_head("main").unwrap(), store.old_head.id);
+        assert_eq!(
+            store.get_branch_head("main").await.unwrap(),
+            store.new_head_id
+        );
+        assert_eq!(
+            snapshot.get_branch_head("main").await.unwrap(),
+            store.old_head.id
+        );
         assert_eq!(snapshot.ancestry("main").unwrap()[0].id, store.old_head.id);
     }
 

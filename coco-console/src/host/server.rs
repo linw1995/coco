@@ -498,6 +498,7 @@ where
         return match state
             .cache
             .materialized_fragment_current_ready_or_schedule(mode)
+            .await
         {
             Ok(Some(shell)) => html_response(render_materialized_fragment(&shell)),
             Ok(None) => html_response(render_loading_fragment(
@@ -560,6 +561,7 @@ where
         return match state
             .cache
             .node_detail_current_ready_or_schedule(mode, target)
+            .await
         {
             Ok(Some(node)) => html_response(render_graph_node_detail_fragment(&node)),
             Ok(None) => html_response(render_node_detail_fragment(
@@ -602,11 +604,11 @@ where
         let target = query
             .get("target")
             .expect("target was checked before materialized provider context lookup");
-        return match state.cache.provider_context_current_ready_or_schedule(
-            mode,
-            target,
-            query.get("context"),
-        ) {
+        return match state
+            .cache
+            .provider_context_current_ready_or_schedule(mode, target, query.get("context"))
+            .await
+        {
             Ok(Some(items)) => html_response(render_provider_context_items_fragment(items)),
             Ok(None) => html_response(render_provider_context_missing_fragment(target)),
             Err(error) => plain_error(error.to_string()),
@@ -1388,7 +1390,7 @@ mod tests {
         store.fork("main", &root).await.unwrap();
         let version = publisher.current_version();
         let viewport = GraphViewportRequest::default();
-        let snapshot = build_graph_snapshot(&store, version).unwrap();
+        let snapshot = build_graph_snapshot(&store, version).await.unwrap();
         let rendered = layout_graph_viewport(&snapshot, viewport);
         let query = known_viewport_query(version, viewport, &rendered);
         let state = app_state(store, publisher);
@@ -2206,6 +2208,7 @@ mod tests {
                 GraphMode::Anchors,
                 &node_target_id(&hidden_text),
             )
+            .await
             .unwrap();
 
         assert!(detail.is_none());

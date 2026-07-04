@@ -180,12 +180,12 @@ where
             run_session_fork_command(command.branch, command.from_ref, command.json, store, llm)
                 .await
         }
-        SessionSubcommand::List(command) => run_session_list_command(command.json, store),
+        SessionSubcommand::List(command) => run_session_list_command(command.json, store).await,
         SessionSubcommand::Get(command) => {
             run_session_get_command(command.branch, command.json, store).await
         }
         SessionSubcommand::Graph(command) => {
-            run_session_graph_command(command.json, command.all, store)
+            run_session_graph_command(command.json, command.all, store).await
         }
         SessionSubcommand::Show(command) => {
             run_session_show_command(command.reference, command.json, store)
@@ -284,11 +284,11 @@ where
     )))
 }
 
-fn run_session_list_command(
+async fn run_session_list_command(
     json: bool,
     store: &(impl BranchStore + NodeStore + SessionStore),
 ) -> Result<Option<String>> {
-    let sessions = list_sessions(store)?;
+    let sessions = list_sessions(store).await?;
     Ok(Some(render_session_result(sessions, json, |sessions| {
         render_session_list_text(sessions)
     })))
@@ -307,7 +307,7 @@ async fn run_session_get_command(
     )))
 }
 
-fn run_session_graph_command(
+async fn run_session_graph_command(
     json: bool,
     all: bool,
     store: &(impl BranchStore + NodeStore + SessionStore),
@@ -317,7 +317,7 @@ fn run_session_graph_command(
     } else {
         SessionGraphMode::Anchors
     };
-    let entries = build_session_graph_entries(store, mode)?;
+    let entries = build_session_graph_entries(store, mode).await?;
     Ok(Some(render_session_result(entries, json, |entries| {
         render_session_graph_text(entries)
     })))
@@ -599,32 +599,31 @@ fn resolve_create_provider_profile(
     Err(crate::Error::MissingProviderProfileSelection { available })
 }
 
-fn list_sessions(
+async fn list_sessions(
     store: &(impl BranchStore + NodeStore + SessionStore),
 ) -> Result<Vec<SessionSummary>> {
     let states = store.list_session_states().context(StoreSnafu)?;
     let mut branches = states.into_iter().collect::<Vec<_>>();
     branches.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-    branches
-        .into_iter()
-        .map(|(branch, state)| {
-            let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
-            Ok(SessionSummary {
-                head_id: store.get_branch_head(&branch).context(StoreSnafu)?,
-                role: anchor.role,
-                branch,
-                state,
-            })
-        })
-        .collect()
+    let mut summaries = Vec::new();
+    for (branch, state) in branches {
+        let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
+        summaries.push(SessionSummary {
+            head_id: store.get_branch_head(&branch).await.context(StoreSnafu)?,
+            role: anchor.role,
+            branch,
+            state,
+        });
+    }
+    Ok(summaries)
 }
 
 async fn read_session_details(
     store: &(impl BranchStore + NodeStore + SessionStore),
     branch: &str,
 ) -> Result<SessionDetails> {
-    let head_id = store.get_branch_head(branch).context(StoreSnafu)?;
+    let head_id = store.get_branch_head(branch).await.context(StoreSnafu)?;
     let state = store.get_session_state(branch).await.context(StoreSnafu)?;
     let (anchor_id, anchor) = resolve_visible_session_anchor(store, branch)?;
 
@@ -754,7 +753,7 @@ fn render_session_state_text(state: &SessionState) -> String {
     }
 }
 
-fn build_session_graph_entries(
+async fn build_session_graph_entries(
     store: &(impl BranchStore + NodeStore + SessionStore),
     mode: SessionGraphMode,
 ) -> Result<Vec<GraphNodeEntry>> {
@@ -772,7 +771,7 @@ fn build_session_graph_entries(
     let mut labels_by_node = HashMap::<String, Vec<GraphBranchLabel>>::new();
 
     for (branch, state) in branches {
-        let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
+        let head_id = store.get_branch_head(&branch).await.context(StoreSnafu)?;
         let mut scope_node_ids = initial_graph_scope(store, &head_id, mode)?;
         let mut branch_visible_node_ids = BTreeSet::new();
         collect_visible_graph_nodes(

@@ -20,6 +20,7 @@ use crate::publisher::ConsolePublisher;
 use coco_mem::{BranchStore, NodeStore, SessionState, SessionStore, SqliteGraphStore, Store};
 use serde::Serialize;
 use snafu::prelude::*;
+#[cfg(test)]
 use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -49,6 +50,7 @@ pub struct ConsoleGraphCache<S> {
     ready: ConsolePublisher,
     progress: ConsolePublisher,
     snapshots: Option<ConsoleGraphSnapshotStore>,
+    #[cfg(test)]
     compute_permits: Arc<Semaphore>,
     publish_lock: Arc<Mutex<()>>,
     state: Arc<Mutex<CacheState>>,
@@ -136,6 +138,7 @@ where
             ready: ConsolePublisher::new(),
             progress: ConsolePublisher::new(),
             snapshots: None,
+            #[cfg(test)]
             compute_permits: Arc::new(Semaphore::new(1)),
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
@@ -167,6 +170,7 @@ where
             ready,
             progress: ConsolePublisher::new(),
             snapshots: Some(snapshots),
+            #[cfg(test)]
             compute_permits: Arc::new(Semaphore::new(1)),
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
@@ -211,6 +215,7 @@ where
         self.invalidations.subscribe()
     }
 
+    #[cfg(test)]
     pub async fn run_blocking_graph_compute<T, F>(&self, compute: F) -> crate::Result<T>
     where
         T: Send + 'static,
@@ -220,6 +225,7 @@ where
             .await
     }
 
+    #[cfg(test)]
     pub async fn run_blocking_graph_compute_with<T, I, P, F>(
         &self,
         prepare: P,
@@ -274,24 +280,22 @@ where
             )
         );
         let progress_cache = self.clone();
-        let snapshot = self
-            .run_blocking_graph_compute(move || {
-                source.build_snapshot_with_progress(mode, graph_version, |progress| {
-                    set_rebuild_status!(
-                        progress_cache,
-                        rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Building,
-                            Some(progress.phase),
-                            progress.processed,
-                            progress.total,
-                            progress.phase.label(),
-                        )
-                    );
-                })
+        let snapshot = source
+            .build_snapshot_with_progress(mode, graph_version, |progress| {
+                set_rebuild_status!(
+                    progress_cache,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Building,
+                        Some(progress.phase),
+                        progress.processed,
+                        progress.total,
+                        progress.phase.label(),
+                    )
+                );
             })
-            .await??;
+            .await?;
         let snapshot = Arc::new(snapshot);
         self.store_cached_snapshot(mode, source_version, snapshot.clone());
         self.publish_ready_version(source_version);
@@ -331,7 +335,7 @@ where
         self.snapshots.is_some()
     }
 
-    pub fn node_detail_current_ready_or_schedule(
+    pub async fn node_detail_current_ready_or_schedule(
         &self,
         mode: GraphMode,
         target: &str,
@@ -367,7 +371,9 @@ where
                     return Ok(None);
                 };
                 if snapshots.has_materialization(mode)?
-                    && !self.node_is_in_materialized_provider_context(snapshots, mode, &node_id)?
+                    && !self
+                        .node_is_in_materialized_provider_context(snapshots, mode, &node_id)
+                        .await?
                 {
                     return Ok(None);
                 }
@@ -380,7 +386,7 @@ where
         }
     }
 
-    fn node_is_in_materialized_provider_context(
+    async fn node_is_in_materialized_provider_context(
         &self,
         snapshots: &ConsoleGraphSnapshotStore,
         mode: GraphMode,
@@ -389,7 +395,8 @@ where
         let Some(selection) = self
             .source
             .clone()
-            .provider_context_for_node(node_id, None)?
+            .provider_context_for_node(node_id, None)
+            .await?
         else {
             return Ok(false);
         };
@@ -404,7 +411,7 @@ where
             .is_empty())
     }
 
-    pub(crate) fn provider_context_current_ready_or_schedule(
+    pub(crate) async fn provider_context_current_ready_or_schedule(
         &self,
         mode: GraphMode,
         target: &str,
@@ -425,7 +432,8 @@ where
         let Some(selection) = self
             .source
             .clone()
-            .provider_context_for_node(&target_node_id, context)?
+            .provider_context_for_node(&target_node_id, context)
+            .await?
         else {
             return Ok(target_was_materialized.then(Vec::new));
         };
@@ -460,7 +468,7 @@ where
         Ok(Some(items))
     }
 
-    pub(crate) fn materialized_fragment_current_ready_or_schedule(
+    pub(crate) async fn materialized_fragment_current_ready_or_schedule(
         &self,
         mode: GraphMode,
     ) -> crate::Result<Option<MaterializedGraphShell>> {
@@ -474,7 +482,8 @@ where
         let branches = self
             .source
             .clone()
-            .materialized_shell_branches(&facts.lanes)?;
+            .materialized_shell_branches(&facts.lanes)
+            .await?;
         let mut time_ticks = Vec::with_capacity(facts.nodes.len());
         for node in &facts.nodes {
             let store_node = self.source.clone().get_node(&node.node_id)?;
@@ -793,13 +802,11 @@ where
         if let Some(snapshots) = self.snapshots.clone() {
             let has_non_empty_materialization = snapshots.has_non_empty_materialization(mode);
             let source = self.source.clone();
-            let incremental_result = self
-                .run_blocking_graph_compute(move || {
-                    source.try_append_linear_materialization(snapshots, mode, source_version)
-                })
+            let incremental_result = source
+                .try_append_linear_materialization(snapshots, mode, source_version)
                 .await;
             let fallback_message = match incremental_result {
-                Ok(Ok(true)) => {
+                Ok(true) => {
                     self.publish_ready_version(source_version);
                     set_rebuild_status!(
                         self,
@@ -815,7 +822,7 @@ where
                     );
                     return;
                 }
-                Ok(Ok(false)) => match has_non_empty_materialization {
+                Ok(false) => match has_non_empty_materialization {
                     Ok(true) => {
                         set_rebuild_status!(
                             self,
@@ -850,21 +857,6 @@ where
                         return;
                     }
                 },
-                Ok(Err(error)) => {
-                    set_rebuild_status!(
-                        self,
-                        rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Failed,
-                            None,
-                            0,
-                            0,
-                            error.to_string(),
-                        )
-                    );
-                    return;
-                }
                 Err(error) => {
                     set_rebuild_status!(
                         self,
@@ -897,36 +889,36 @@ where
         let source = self.source.clone();
         let progress_cache = self.clone();
         let snapshots = self.snapshots.clone();
-        let result = self
-            .run_blocking_graph_compute(move || {
-                let snapshot =
-                    source.build_snapshot_with_progress(mode, source_version, |progress| {
-                        set_rebuild_status!(
-                            progress_cache,
-                            rebuild_status(
-                                mode,
-                                source_version,
-                                ConsoleGraphRebuildState::Building,
-                                Some(progress.phase),
-                                progress.processed,
-                                progress.total,
-                                progress.phase.label(),
-                            )
-                        );
-                    })?;
-                if let Some(snapshots) = snapshots {
-                    let branch_labels = visible_full_layout_branch_labels(&snapshot);
-                    snapshots.replace_materialization_from_viewport(
-                        mode,
-                        materialize_graph_viewport(&snapshot),
-                        branch_labels,
-                    )?;
-                }
-                crate::Result::Ok(snapshot)
-            })
-            .await;
+        let result = async move {
+            let snapshot = source
+                .build_snapshot_with_progress(mode, source_version, |progress| {
+                    set_rebuild_status!(
+                        progress_cache,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Building,
+                            Some(progress.phase),
+                            progress.processed,
+                            progress.total,
+                            progress.phase.label(),
+                        )
+                    );
+                })
+                .await?;
+            if let Some(snapshots) = snapshots {
+                let branch_labels = visible_full_layout_branch_labels(&snapshot);
+                snapshots.replace_materialization_from_viewport(
+                    mode,
+                    materialize_graph_viewport(&snapshot),
+                    branch_labels,
+                )?;
+            }
+            crate::Result::Ok(snapshot)
+        }
+        .await;
         match result {
-            Ok(Ok(snapshot)) => {
+            Ok(snapshot) => {
                 self.store_cached_snapshot(mode, source_version, Arc::new(snapshot));
                 self.publish_ready_version(source_version);
                 set_rebuild_status!(
@@ -939,20 +931,6 @@ where
                         1,
                         1,
                         "Graph snapshot ready",
-                    )
-                );
-            }
-            Ok(Err(error)) => {
-                set_rebuild_status!(
-                    self,
-                    rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Failed,
-                        None,
-                        0,
-                        0,
-                        error.to_string(),
                     )
                 );
             }
@@ -1184,7 +1162,7 @@ impl<S> ConsoleGraphSource<S>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    fn build_snapshot_with_progress<F>(
+    async fn build_snapshot_with_progress<F>(
         self,
         mode: GraphMode,
         version: u64,
@@ -1195,25 +1173,31 @@ where
     {
         match self {
             Self::Store(store) => {
-                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
+                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress).await
             }
-            Self::PersistentStore(store) => run_sqlite_graph_read_transaction(&store, || {
-                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
-            }),
+            Self::PersistentStore(store) => {
+                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress).await
+            }
         }
     }
 
-    fn try_append_linear_materialization(
+    async fn try_append_linear_materialization(
         self,
         snapshots: ConsoleGraphSnapshotStore,
         mode: GraphMode,
         source_version: u64,
     ) -> crate::Result<bool> {
         match self {
-            Self::Store(store) => snapshots.try_append_linear_branch(source_version, mode, &store),
-            Self::PersistentStore(store) => run_sqlite_graph_read_transaction(&store, || {
-                snapshots.try_append_linear_branch(source_version, mode, &store)
-            }),
+            Self::Store(store) => {
+                snapshots
+                    .try_append_linear_branch(source_version, mode, &store)
+                    .await
+            }
+            Self::PersistentStore(store) => {
+                snapshots
+                    .try_append_linear_branch(source_version, mode, &store)
+                    .await
+            }
         }
     }
 
@@ -1226,53 +1210,31 @@ where
         }
     }
 
-    fn provider_context_for_node(
+    async fn provider_context_for_node(
         self,
         target_node_id: &str,
         context: Option<&str>,
     ) -> crate::Result<Option<crate::graph::GraphProviderContextSelection>> {
         match self {
-            Self::Store(store) => provider_context_for_node(&store, target_node_id, context),
+            Self::Store(store) => provider_context_for_node(&store, target_node_id, context).await,
             Self::PersistentStore(store) => {
-                provider_context_for_node(&store, target_node_id, context)
+                provider_context_for_node(&store, target_node_id, context).await
             }
         }
     }
 
-    fn materialized_shell_branches(
+    async fn materialized_shell_branches(
         self,
         lanes: &[crate::api::GraphViewportLane],
     ) -> crate::Result<Vec<MaterializedGraphShellBranch>> {
         match self {
-            Self::Store(store) => materialized_shell_branches(&store, lanes),
-            Self::PersistentStore(store) => materialized_shell_branches(&store, lanes),
+            Self::Store(store) => materialized_shell_branches(&store, lanes).await,
+            Self::PersistentStore(store) => materialized_shell_branches(&store, lanes).await,
         }
     }
 }
 
-fn run_sqlite_graph_read_transaction<T>(
-    store: &SqliteGraphStore,
-    operation: impl FnOnce() -> crate::Result<T>,
-) -> crate::Result<T> {
-    store
-        .begin_read_transaction()
-        .context(crate::error::StoreSnafu)?;
-    let result = operation();
-    match result {
-        Ok(value) => {
-            store
-                .commit_read_transaction()
-                .context(crate::error::StoreSnafu)?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = store.rollback_read_transaction();
-            Err(error)
-        }
-    }
-}
-
-fn materialized_shell_branches(
+async fn materialized_shell_branches(
     store: &(impl BranchStore + SessionStore),
     lanes: &[crate::api::GraphViewportLane],
 ) -> crate::Result<Vec<MaterializedGraphShellBranch>> {
@@ -1301,25 +1263,25 @@ fn materialized_shell_branches(
             .then_with(|| left_branch.cmp(right_branch))
     });
 
-    states
-        .into_iter()
-        .map(|(branch, state)| {
-            let branch_key = lane_key(&branch);
-            let lane = lane_by_key.get(branch_key.as_str());
-            let head_id = store
-                .get_branch_head(&branch)
-                .context(crate::error::StoreSnafu)?;
-            Ok(MaterializedGraphShellBranch {
-                name: branch,
-                key: lane
-                    .map(|lane| lane.key.clone())
-                    .unwrap_or_else(|| branch_key.clone()),
-                lane_y: lane.map(|lane| lane.y),
-                head_short_id: crate::graph::shorten_id(&head_id),
-                state,
-            })
-        })
-        .collect()
+    let mut branches = Vec::new();
+    for (branch, state) in states {
+        let branch_key = lane_key(&branch);
+        let lane = lane_by_key.get(branch_key.as_str());
+        let head_id = store
+            .get_branch_head(&branch)
+            .await
+            .context(crate::error::StoreSnafu)?;
+        branches.push(MaterializedGraphShellBranch {
+            name: branch,
+            key: lane
+                .map(|lane| lane.key.clone())
+                .unwrap_or_else(|| branch_key.clone()),
+            lane_y: lane.map(|lane| lane.y),
+            head_short_id: crate::graph::shorten_id(&head_id),
+            state,
+        });
+    }
+    Ok(branches)
 }
 
 #[cfg(test)]
@@ -1436,8 +1398,9 @@ mod tests {
             y: 20,
         };
 
-        let branches =
-            materialized_shell_branches(&store, &[branch_lane.clone(), derived_lane]).unwrap();
+        let branches = materialized_shell_branches(&store, &[branch_lane.clone(), derived_lane])
+            .await
+            .unwrap();
 
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].name, branch);
@@ -1451,7 +1414,7 @@ mod tests {
         let root = store.root_id();
         store.fork("hidden", &root).await.unwrap();
 
-        let branches = materialized_shell_branches(&store, &[]).unwrap();
+        let branches = materialized_shell_branches(&store, &[]).await.unwrap();
 
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].name, "hidden");
@@ -5824,6 +5787,7 @@ mod tests {
             .unwrap();
         let full_snapshot =
             crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .await
                 .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_merge = viewport
@@ -6936,6 +6900,7 @@ mod tests {
             .unwrap();
         let full_snapshot =
             crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .await
                 .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_merge = viewport
@@ -7084,6 +7049,7 @@ mod tests {
             .unwrap();
         let full_snapshot =
             crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .await
                 .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_orphan = viewport
@@ -7602,6 +7568,7 @@ mod tests {
             target_version,
             GraphMode::Anchors,
         )
+        .await
         .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_draft = viewport
@@ -8209,6 +8176,7 @@ mod tests {
             target_version,
             GraphMode::Anchors,
         )
+        .await
         .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_merge = viewport
@@ -8911,6 +8879,7 @@ mod tests {
             .unwrap();
         let full_snapshot =
             crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .await
                 .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_draft = viewport

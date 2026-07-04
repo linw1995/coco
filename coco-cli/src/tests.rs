@@ -93,7 +93,7 @@ async fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> coco_mem
 where
     S: BranchStore + JobStore + NodeStore,
 {
-    let parent = store.get_branch_head(branch).unwrap();
+    let parent = store.get_branch_head(branch).await.unwrap();
     let prompt_anchor_id = store
         .append(NewNode {
             parent,
@@ -1028,6 +1028,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
         .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
     run_with_backend(
         session_fork_cli(store_path.clone(), "runner", Some("main")),
@@ -1600,7 +1601,7 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let shadow_parent =
         append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let prompt_anchor_id = store
@@ -1727,7 +1728,7 @@ async fn session_create_persists_branch_for_future_prompt_calls() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    assert_eq!(store.get_branch_head("main").unwrap().len(), 64);
+    assert_eq!(store.get_branch_head("main").await.unwrap().len(), 64);
 
     let output = run_with_backend(
         prompt_cli(store_path, Some("main"), &["hello"]),
@@ -1761,6 +1762,7 @@ async fn session_fork_creates_active_branch_from_reference() {
         .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
 
     let text_output = run_with_backend(
@@ -1807,8 +1809,14 @@ async fn session_fork_creates_active_branch_from_reference() {
     );
 
     let store = open_store(&store_path).await.unwrap();
-    assert_eq!(store.get_branch_head("draft").unwrap(), source_head_id);
-    assert_eq!(store.get_branch_head("json-draft").unwrap(), source_head_id);
+    assert_eq!(
+        store.get_branch_head("draft").await.unwrap(),
+        source_head_id
+    );
+    assert_eq!(
+        store.get_branch_head("json-draft").await.unwrap(),
+        source_head_id
+    );
     assert_eq!(
         store.get_session_state("draft").await.unwrap(),
         SessionState::Active
@@ -1840,7 +1848,7 @@ async fn session_list_returns_sorted_branches_with_states() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let base_head_id = store.get_branch_head("main").unwrap();
+    let base_head_id = store.get_branch_head("main").await.unwrap();
 
     run_with_backend(
         session_pr_cli(store_path.clone(), Some("draft"), "main"),
@@ -1885,7 +1893,7 @@ async fn session_list_returns_sorted_branches_with_states() {
         json!([
             {
                 "branch": "draft",
-                "head_id": store.get_branch_head("draft").unwrap(),
+                "head_id": store.get_branch_head("draft").await.unwrap(),
                 "role": "orchestrator",
                 "state": {
                     "Attached": {
@@ -1896,7 +1904,7 @@ async fn session_list_returns_sorted_branches_with_states() {
             },
             {
                 "branch": "main",
-                "head_id": store.get_branch_head("main").unwrap(),
+                "head_id": store.get_branch_head("main").await.unwrap(),
                 "role": "orchestrator",
                 "state": "Active"
             }
@@ -1969,7 +1977,7 @@ async fn session_get_returns_state_and_visible_anchor() {
     let store = open_store(&store_path).await.unwrap();
     assert_eq!(
         value["head_id"],
-        json!(store.get_branch_head("main").unwrap())
+        json!(store.get_branch_head("main").await.unwrap())
     );
 }
 
@@ -2235,11 +2243,11 @@ async fn session_delete_removes_branch_and_session_state() {
     );
 
     let store = open_store(&store_path).await.unwrap();
-    let err = store.get_branch_head("draft").unwrap_err();
+    let err = store.get_branch_head("draft").await.unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
     let err = store.get_session_state("draft").await.unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
-    let err = store.get_branch_head("json-draft").unwrap_err();
+    let err = store.get_branch_head("json-draft").await.unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "json-draft"));
 }
 
@@ -2264,6 +2272,7 @@ async fn session_rebase_updates_visible_session_config() {
         .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
 
     let rebase_text_output = run_with_backend(
@@ -2392,6 +2401,7 @@ async fn session_handoff_appends_inherited_session_anchor() {
         .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
 
     let text_output = run_with_backend(
@@ -2615,7 +2625,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
     assert!(pr_text_output.contains("branch: main"));
     assert!(pr_text_output.contains("state: attached target=main"));
 
-    let json_base_head_id = store.get_branch_head("main").unwrap();
+    let json_base_head_id = store.get_branch_head("main").await.unwrap();
     let pr_output = run_with_backend(
         session_pr_cli(store_path.clone(), Some("json"), "main"),
         &mut Cursor::new(""),
@@ -2785,7 +2795,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     .unwrap();
 
     let store = open_store(&store_path).await.unwrap();
-    let source_head_id = store.get_branch_head("main").unwrap();
+    let source_head_id = store.get_branch_head("main").await.unwrap();
 
     let merge_text_output = run_with_backend(
         Cli::try_parse_from([
@@ -2815,6 +2825,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         .await
         .unwrap()
         .get_branch_head("base")
+        .await
         .unwrap();
 
     let merge_output = run_with_backend(
@@ -2874,7 +2885,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         .await
         .unwrap();
 
-    let main_head_before_feedback = store.get_branch_head("main").unwrap();
+    let main_head_before_feedback = store.get_branch_head("main").await.unwrap();
     let feedback_output = run_with_backend(
         session_feedback_cli(
             store_path.clone(),
@@ -3066,7 +3077,7 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
     let store = open_store(&store_path).await.unwrap();
     let draft_head = append_prompt_anchor(
         &store,
-        &store.get_branch_head("draft").unwrap(),
+        &store.get_branch_head("draft").await.unwrap(),
         "draft merge parent",
         &[],
     )
@@ -3074,7 +3085,7 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
     store
         .set_branch_head(
             "draft",
-            &store.get_branch_head("draft").unwrap(),
+            &store.get_branch_head("draft").await.unwrap(),
             &draft_head,
         )
         .await
@@ -3089,7 +3100,7 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
     .unwrap();
 
     let store = open_store(&store_path).await.unwrap();
-    let main_head = store.get_branch_head("main").unwrap();
+    let main_head = store.get_branch_head("main").await.unwrap();
     let merged_head =
         append_prompt_anchor(&store, &main_head, "merge after delete", &[&draft_head]).await;
     store
@@ -3129,7 +3140,7 @@ async fn session_graph_shows_tool_and_failure_nodes() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &tool_use_id)
@@ -3234,7 +3245,7 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let original_session_id = store.get_branch_head("main").unwrap();
+    let original_session_id = store.get_branch_head("main").await.unwrap();
     let old_prompt_id = append_prompt_anchor(&store, &original_session_id, "old prompt", &[]).await;
     let old_text_id = append_text_node(&store, &old_prompt_id, "old text").await;
     let new_session_id =
@@ -3360,7 +3371,7 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
     let main_anchor_id = append_prompt_anchor(&store, &session_id, "main anchor", &[]).await;
     let main_hidden_id = append_text_node(&store, &main_anchor_id, "main hidden text").await;
     store
@@ -3465,7 +3476,7 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
     let shared_anchor_id = append_prompt_anchor(&store, &session_id, "shared anchor", &[]).await;
     let shared_hidden_id = append_text_node(&store, &shared_anchor_id, "shared hidden text").await;
 
@@ -3597,7 +3608,7 @@ async fn session_graph_and_show_render_skill_result_anchor() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &tool_use_id)
@@ -3667,7 +3678,7 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &tool_use_id)
@@ -3746,6 +3757,7 @@ async fn session_show_resolves_branch_to_head_node_text_output() {
         .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
     let output = run_with_backend(
         session_show_cli(store_path, "main", false),
@@ -3784,6 +3796,7 @@ async fn session_show_outputs_json_for_node_id_reference() {
         .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
     let prefix = &head_id[..12];
     let output = run_with_backend(
@@ -3821,7 +3834,7 @@ async fn session_show_outputs_children_ids_for_primary_and_merge_edges() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
     let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]).await;
     let merge_child_id =
         append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]).await;
@@ -3856,7 +3869,7 @@ async fn session_show_json_includes_children_ids() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
     let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]).await;
     let merge_child_id =
         append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]).await;
@@ -3892,7 +3905,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
     let shadow_parent =
         append_tool_use_node(&store, &session_id, "tool-call-1", "exec_command").await;
     let shadow_anchor_id = store
@@ -4022,7 +4035,7 @@ async fn session_show_resolves_short_node_prefix_after_source_branch_delete() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let draft_head = store.get_branch_head("draft").unwrap();
+    let draft_head = store.get_branch_head("draft").await.unwrap();
     let draft_node_id = append_prompt_anchor(&store, &draft_head, "deleted branch node", &[]).await;
     store
         .set_branch_head("draft", &draft_head, &draft_node_id)
@@ -4086,13 +4099,13 @@ async fn session_show_reports_ambiguous_short_node_prefix() {
 
     let store = open_store(&store_path).await.unwrap();
     let root_id = store.root_id();
-    let session_id = store.get_branch_head("main").unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
     let mut ids = vec![root_id, session_id];
     for index in 0..32 {
         ids.push(
             append_prompt_anchor(
                 &store,
-                &store.get_branch_head("main").unwrap(),
+                &store.get_branch_head("main").await.unwrap(),
                 &format!("node-{index}"),
                 &[],
             )
@@ -5585,7 +5598,7 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_head = store.get_branch_head("draft").unwrap();
+    let session_head = store.get_branch_head("draft").await.unwrap();
     let parent_tool_use =
         append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let llm = llm_with_test_provider_config(
@@ -5666,7 +5679,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
         )
         .await
         .unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let parent_tool_use =
         append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let llm = llm_with_test_provider_config(store.clone(), SkillRunBackend);
@@ -5803,7 +5816,7 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
         .await
         .unwrap();
 
-    let session_head = store.get_branch_head("main").unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let patch_id = store
         .append(NewNode {
             parent: session_head.clone(),
@@ -5942,7 +5955,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
     .await;
 
     let store = open_store(&store_path).await.unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let parent_tool_use =
         append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let job = submit_prompt_job(&store, "main", "hello").await;
@@ -6337,7 +6350,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
     assert_eq!(states.get("main"), Some(&SessionState::Active));
     assert_eq!(states.get("day"), Some(&SessionState::Active));
 
-    let head = store.get_branch_head("main").unwrap();
+    let head = store.get_branch_head("main").await.unwrap();
     let node = store.get_node(&head).unwrap();
     let Kind::Anchor(anchor) = node.kind else {
         panic!("expected default session anchor");
@@ -6362,7 +6375,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
         vec!["exec_command", "write_stdin", "search_skill", "load_image"]
     );
 
-    let day_head = store.get_branch_head("day").unwrap();
+    let day_head = store.get_branch_head("day").await.unwrap();
     let day_node = store.get_node(&day_head).unwrap();
     let Kind::Anchor(day_anchor) = day_node.kind else {
         panic!("expected day session anchor");
@@ -6392,8 +6405,8 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
-    assert_eq!(store.get_branch_head("main").unwrap(), head);
-    assert_eq!(store.get_branch_head("day").unwrap(), day_head);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), head);
+    assert_eq!(store.get_branch_head("day").await.unwrap(), day_head);
 }
 
 #[tokio::test]
@@ -6404,16 +6417,16 @@ async fn daemon_startup_replaces_invalid_builtin_day_branch() {
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
-    let main_head = store.get_branch_head("main").unwrap();
+    let main_head = store.get_branch_head("main").await.unwrap();
     store.delete_branch("day").await.unwrap();
     store.fork("day", &main_head).await.unwrap();
-    assert_eq!(store.get_branch_head("day").unwrap(), main_head);
+    assert_eq!(store.get_branch_head("day").await.unwrap(), main_head);
 
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
 
-    let day_head = store.get_branch_head("day").unwrap();
+    let day_head = store.get_branch_head("day").await.unwrap();
     assert_ne!(day_head, main_head);
     let day_node = store.get_node(&day_head).unwrap();
     let Kind::Anchor(day_anchor) = day_node.kind else {
@@ -6521,7 +6534,7 @@ async fn daemon_startup_resumes_incomplete_jobs() {
 
     let resumed_job = store.get_job(&job.job_id).await.unwrap();
     assert_eq!(resumed_job.status, coco_mem::JobStatus::Finished);
-    let head = store.get_branch_head("main").unwrap();
+    let head = store.get_branch_head("main").await.unwrap();
     let node = store.get_node(&head).unwrap();
     match node.kind {
         Kind::Text(text) => assert_eq!(text, "recovered after daemon start"),

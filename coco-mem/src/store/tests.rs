@@ -118,7 +118,7 @@ async fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> crate::J
 where
     S: BranchStore + JobStore + NodeStore,
 {
-    let parent = store.get_branch_head(branch).unwrap();
+    let parent = store.get_branch_head(branch).await.unwrap();
     let prompt_anchor_id = store
         .append(NewNode {
             parent,
@@ -590,7 +590,7 @@ where
     let head_id = store.fork("main", &root_id).await.unwrap();
 
     assert_eq!(head_id, root_id);
-    assert_eq!(store.get_branch_head("main").unwrap(), root_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), root_id);
 }
 
 async fn assert_fork_rejects_duplicates<F>()
@@ -641,7 +641,7 @@ where
         .unwrap();
     let state = store.get_session_state("main").await.unwrap();
 
-    assert_eq!(store.get_branch_head("main").unwrap(), next_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), next_id);
     assert_eq!(state, SessionState::Active);
 }
 
@@ -655,7 +655,7 @@ where
 
     store.delete_branch("main").await.unwrap();
 
-    let err = store.get_branch_head("main").unwrap_err();
+    let err = store.get_branch_head("main").await.unwrap_err();
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
     let err = store.get_session_state("main").await.unwrap_err();
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
@@ -780,12 +780,12 @@ where
         .unwrap();
 
     let state = store.get_session_state("main").await.unwrap();
-    assert_eq!(store.get_branch_head("main").unwrap(), feedback_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), feedback_id);
     assert_eq!(
         state,
         SessionState::Attached {
             target_branch: "base".to_owned(),
-            base_head_id: store.get_branch_head("base").unwrap(),
+            base_head_id: store.get_branch_head("base").await.unwrap(),
         }
     );
 }
@@ -1167,7 +1167,7 @@ where
         store.get_preset_record(preset_name).await,
         Err(Error::PresetNotFound { name }) if name == preset_name
     ));
-    assert_eq!(store.get_branch_head("main").unwrap(), root_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), root_id);
 }
 
 async fn assert_delete_branch_preserves_preset<F>()
@@ -1184,7 +1184,7 @@ where
     store.delete_branch("main").await.unwrap();
 
     assert!(matches!(
-        store.get_branch_head("main"),
+        store.get_branch_head("main").await,
         Err(Error::BranchNotFound { name }) if name == "main"
     ));
     assert_eq!(current_preset(&store, preset_name).await.unwrap(), config);
@@ -1568,8 +1568,8 @@ where
         .await
         .unwrap();
 
-    assert_eq!(store.get_branch_head("draft").unwrap(), child_id);
-    assert_eq!(store.get_branch_head("main").unwrap(), new_head);
+    assert_eq!(store.get_branch_head("draft").await.unwrap(), child_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), new_head);
     let draft_ancestry = store.ancestry("draft").unwrap();
     let Kind::Anchor(anchor) = &draft_ancestry[1].kind else {
         panic!("expected session anchor");
@@ -1710,7 +1710,7 @@ where
         .unwrap_err();
 
     assert!(matches!(err, Error::InvalidSessionHandoffPrompt));
-    assert_eq!(store.get_branch_head("main").unwrap(), session_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), session_id);
 }
 
 async fn assert_handoff_session_applies_session_patch<F>()
@@ -1900,7 +1900,7 @@ where
     store.fork("main", &root_id).await.unwrap();
     let first = submit_prompt_job(&store, "main", "hello").await;
 
-    let second_parent = store.get_branch_head("main").unwrap();
+    let second_parent = store.get_branch_head("main").await.unwrap();
     let second_anchor_id = store
         .append(NewNode {
             parent: second_parent,

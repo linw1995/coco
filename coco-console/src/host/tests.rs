@@ -309,7 +309,7 @@ async fn graph_snapshot_contains_primary_and_merge_edges() {
         .unwrap();
     store.set_branch_head("draft", &left, &draft).await.unwrap();
 
-    let snapshot = build_graph_snapshot(&store, 7).unwrap();
+    let snapshot = build_graph_snapshot(&store, 7).await.unwrap();
 
     assert_eq!(snapshot.version, 7);
     assert_eq!(snapshot.nodes.len(), 4);
@@ -521,7 +521,7 @@ async fn graph_snapshot_contains_shadow_parent_edges() {
         .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot(&store, 8).unwrap();
+    let snapshot = build_graph_snapshot(&store, 8).await.unwrap();
 
     assert!(snapshot.edges.contains(&GraphEdge {
         source: shadow_parent,
@@ -618,7 +618,9 @@ async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
         .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 11, GraphMode::Anchors).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 11, GraphMode::Anchors)
+        .await
+        .unwrap();
     let node_ids = snapshot
         .nodes
         .iter()
@@ -718,7 +720,7 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
         .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot(&store, 9).unwrap();
+    let snapshot = build_graph_snapshot(&store, 9).await.unwrap();
     let node_ids = snapshot
         .nodes
         .iter()
@@ -748,7 +750,7 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     assert!(!invocation_context.contains("The selected node is no longer available."));
 
     store.fork("skill", &invocation_child).await.unwrap();
-    let skill_snapshot = build_graph_snapshot(&store, 10).unwrap();
+    let skill_snapshot = build_graph_snapshot(&store, 10).await.unwrap();
     let skill_context = skill_snapshot
         .provider_contexts
         .iter()
@@ -900,7 +902,9 @@ async fn node_details_include_nodes_from_same_provider_context() {
         .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 32, GraphMode::Anchors).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 32, GraphMode::Anchors)
+        .await
+        .unwrap();
     let context = snapshot
         .provider_contexts
         .iter()
@@ -1056,7 +1060,9 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
         .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 33, GraphMode::Anchors).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 33, GraphMode::Anchors)
+        .await
+        .unwrap();
     let review_context = snapshot
         .provider_contexts
         .iter()
@@ -1138,7 +1144,9 @@ async fn provider_context_id_stays_stable_when_branch_head_moves() {
         .await
         .unwrap();
 
-    let first_snapshot = build_graph_snapshot_with_mode(&store, 35, GraphMode::Anchors).unwrap();
+    let first_snapshot = build_graph_snapshot_with_mode(&store, 35, GraphMode::Anchors)
+        .await
+        .unwrap();
     let first_context = first_snapshot
         .provider_contexts
         .iter()
@@ -1166,7 +1174,9 @@ async fn provider_context_id_stays_stable_when_branch_head_moves() {
         .await
         .unwrap();
 
-    let next_snapshot = build_graph_snapshot_with_mode(&store, 36, GraphMode::Anchors).unwrap();
+    let next_snapshot = build_graph_snapshot_with_mode(&store, 36, GraphMode::Anchors)
+        .await
+        .unwrap();
     let next_context = next_snapshot
         .provider_contexts
         .iter()
@@ -1252,7 +1262,9 @@ async fn provider_context_ids_preserve_unique_branch_names() {
         .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 37, GraphMode::Anchors).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 37, GraphMode::Anchors)
+        .await
+        .unwrap();
     let slash_context_id = provider_context_target(&session, "draft/review");
     let dash_context_id = provider_context_target(&session, "draft-review");
     let slash_context = snapshot
@@ -1355,7 +1367,9 @@ async fn all_mode_provider_contexts_cover_older_visible_segments() {
         .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 34, GraphMode::All).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 34, GraphMode::All)
+        .await
+        .unwrap();
     let old_context = snapshot
         .provider_contexts
         .iter()
@@ -1551,7 +1565,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
         .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot(&store, 10).unwrap();
+    let snapshot = build_graph_snapshot(&store, 10).await.unwrap();
 
     assert_eq!(
         snapshot_content(&snapshot, &empty_prompt_session),

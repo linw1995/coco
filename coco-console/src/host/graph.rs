@@ -175,22 +175,22 @@ struct VisibleGraphCollector<'a, S: NodeStore> {
 }
 
 #[cfg(test)]
-pub fn build_graph_snapshot(
+pub async fn build_graph_snapshot(
     store: &(impl BranchStore + NodeStore + SessionStore),
     version: u64,
 ) -> Result<GraphSnapshot> {
-    build_graph_snapshot_with_mode(store, version, GraphMode::All)
+    build_graph_snapshot_with_mode(store, version, GraphMode::All).await
 }
 
-pub fn build_graph_snapshot_with_mode(
+pub async fn build_graph_snapshot_with_mode(
     store: &(impl BranchStore + NodeStore + SessionStore),
     version: u64,
     mode: GraphMode,
 ) -> Result<GraphSnapshot> {
-    build_graph_snapshot_with_mode_and_progress(store, version, mode, |_| {})
+    build_graph_snapshot_with_mode_and_progress(store, version, mode, |_| {}).await
 }
 
-pub fn build_graph_snapshot_with_mode_and_progress<F>(
+pub async fn build_graph_snapshot_with_mode_and_progress<F>(
     store: &(impl BranchStore + NodeStore + SessionStore),
     version: u64,
     mode: GraphMode,
@@ -199,7 +199,7 @@ pub fn build_graph_snapshot_with_mode_and_progress<F>(
 where
     F: FnMut(GraphBuildProgress),
 {
-    let mut state = collect_graph_state(store, mode, &mut progress)?;
+    let mut state = collect_graph_state(store, mode, &mut progress).await?;
     let contexts = state.provider_contexts(store, &mut progress)?;
     let entries = sorted_graph_entries(&mut state, store, &contexts, &mut progress)?;
     let (nodes, edges) = graph_items_from_entries(entries);
@@ -220,7 +220,7 @@ where
     })
 }
 
-fn collect_graph_state<F>(
+async fn collect_graph_state<F>(
     store: &(impl BranchStore + NodeStore + SessionStore),
     mode: GraphMode,
     progress: &mut F,
@@ -237,7 +237,7 @@ where
         total,
     });
     for (index, (branch, session_state)) in session_states.into_iter().enumerate() {
-        state.collect_branch(store, branch, session_state)?;
+        state.collect_branch(store, branch, session_state).await?;
         (*progress)(GraphBuildProgress {
             phase: GraphBuildPhase::Branches,
             processed: index + 1,
@@ -353,13 +353,13 @@ impl GraphBuildState {
         }
     }
 
-    fn collect_branch(
+    async fn collect_branch(
         &mut self,
         store: &(impl BranchStore + NodeStore),
         branch: String,
         state: SessionState,
     ) -> Result<()> {
-        let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
+        let head_id = store.get_branch_head(&branch).await.context(StoreSnafu)?;
         let scope = self.collect_branch_scope(store, &head_id)?;
         let visible_head_id = self.resolve_visible_parent(store, &scope.node_ids, &head_id)?;
         self.add_branch_label(&branch, &state, visible_head_id.as_deref());
@@ -683,14 +683,17 @@ fn sorted_session_states(store: &impl SessionStore) -> Result<Vec<(String, Sessi
     Ok(branches)
 }
 
-pub(crate) fn provider_context_for_node(
+pub(crate) async fn provider_context_for_node(
     store: &(impl BranchStore + NodeStore + SessionStore),
     target_node_id: &str,
     context_id: Option<&str>,
 ) -> Result<Option<GraphProviderContextSelection>> {
     let mut contexts = HashMap::<String, GraphProviderContext>::new();
     for (branch_name, _) in sorted_session_states(store)? {
-        let head_id = store.get_branch_head(&branch_name).context(StoreSnafu)?;
+        let head_id = store
+            .get_branch_head(&branch_name)
+            .await
+            .context(StoreSnafu)?;
         let ancestry = store.ancestry(&head_id).context(StoreSnafu)?;
         for context_nodes in provider_contexts_from_head(ancestry) {
             let Some(id) = provider_context_id(&branch_name, &context_nodes) else {

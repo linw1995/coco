@@ -777,7 +777,7 @@ where
 
         let restored_from_work_branch = job.work_branch.clone();
         let response_head = self.job_head(job)?;
-        let root_head = self.service.store().get_branch_head(&job.branch)?;
+        let root_head = self.service.store().get_branch_head(&job.branch).await?;
         self.service
             .store()
             .set_branch_head(&job.branch, &root_head, &response_head)

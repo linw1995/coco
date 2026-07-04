@@ -191,7 +191,9 @@ where
 {
     let mode = daemon_profile_graph_mode(command);
     let started_at = Instant::now();
-    let snapshot = build_graph_snapshot_with_mode(shared_store, 0, mode).context(ConsoleSnafu)?;
+    let snapshot = build_graph_snapshot_with_mode(shared_store, 0, mode)
+        .await
+        .context(ConsoleSnafu)?;
     let result = daemon_graph_profile_result(mode, &snapshot, started_at.elapsed());
 
     if command.json {
@@ -283,7 +285,7 @@ where
         return Ok(());
     }
 
-    match shared_store.get_branch_head(BUILTIN_DAY_BRANCH) {
+    match shared_store.get_branch_head(BUILTIN_DAY_BRANCH).await {
         Ok(_) => {
             tracing::warn!(
                 branch = BUILTIN_DAY_BRANCH,
@@ -301,7 +303,7 @@ where
     let config = match resolve_session_config(day_session_create_command(), provider_profiles) {
         Ok(config) => config,
         Err(error) => {
-            let Some(config) = derive_day_session_config(shared_store)? else {
+            let Some(config) = derive_day_session_config(shared_store).await? else {
                 return Err(error);
             };
             config
@@ -318,7 +320,7 @@ where
 }
 
 async fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
-    let head = match store.get_branch_head(BUILTIN_DAY_BRANCH) {
+    let head = match store.get_branch_head(BUILTIN_DAY_BRANCH).await {
         Ok(head) => head,
         Err(StoreError::BranchNotFound { .. }) => return Ok(false),
         Err(source) => return Err(source).context(StoreSnafu),
@@ -358,7 +360,7 @@ async fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
         && actual_tools == expected_tools)
 }
 
-fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
+async fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
     let mut branches = store
         .list_session_states()
         .context(StoreSnafu)?
@@ -374,7 +376,7 @@ fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>
     }
 
     for branch in branches {
-        let head = store.get_branch_head(&branch).context(StoreSnafu)?;
+        let head = store.get_branch_head(&branch).await.context(StoreSnafu)?;
         let ancestry = store.ancestry(&head).context(StoreSnafu)?;
         let Some(session_anchor) = ancestry.into_iter().find_map(|node| {
             let Kind::Anchor(anchor) = &node.kind else {
@@ -865,7 +867,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         S: Store,
     {
         let route = route_system_event(&event);
-        match self.store.get_branch_head(route.branch) {
+        match self.store.get_branch_head(route.branch).await {
             Ok(_) => {}
             Err(StoreError::BranchNotFound { .. }) => {
                 tracing::warn!(
@@ -1168,7 +1170,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
     where
         S: Store,
     {
-        match self.store.get_branch_head(&request.branch) {
+        match self.store.get_branch_head(&request.branch).await {
             Ok(_) => {}
             Err(coco_mem::StoreError::BranchNotFound { .. }) => {
                 self.discard_prompt_request_for_missing_branch(item, request)
@@ -2915,7 +2917,7 @@ mod tests {
         llm.create_session(session_config("day")).await.unwrap();
         let engine = ConversationEngine::new(llm);
         let active_job = store
-            .submit_job("main", &store.get_branch_head("main").unwrap())
+            .submit_job("main", &store.get_branch_head("main").await.unwrap())
             .await
             .unwrap();
         store
@@ -3075,7 +3077,7 @@ mod tests {
     async fn active_job_waiting_for_recovery_detects_failure_child() {
         let store = test_store().await;
         store.fork("main", &store.root_id()).await.unwrap();
-        let base = store.get_branch_head("main").unwrap();
+        let base = store.get_branch_head("main").await.unwrap();
         let active_job = store.submit_job("main", &base).await.unwrap();
         store
             .append(NewNode {
@@ -3094,7 +3096,7 @@ mod tests {
     async fn active_job_waiting_for_recovery_detects_terminal_failure() {
         let store = test_store().await;
         store.fork("main", &store.root_id()).await.unwrap();
-        let base = store.get_branch_head("main").unwrap();
+        let base = store.get_branch_head("main").await.unwrap();
         let active_job = store.submit_job("main", &base).await.unwrap();
         let failure = store
             .append(NewNode {
@@ -3117,7 +3119,7 @@ mod tests {
     async fn active_job_waiting_for_recovery_ignores_clean_job() {
         let store = test_store().await;
         store.fork("main", &store.root_id()).await.unwrap();
-        let base = store.get_branch_head("main").unwrap();
+        let base = store.get_branch_head("main").await.unwrap();
         let active_job = store.submit_job("main", &base).await.unwrap();
 
         assert!(!super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
@@ -3485,7 +3487,7 @@ mod tests {
                     "llm.backend_failure:job-failed:main:retry-node",
                 ),
                 "day",
-                &store.get_branch_head("day").unwrap(),
+                &store.get_branch_head("day").await.unwrap(),
             )
             .await
             .unwrap();
@@ -3543,7 +3545,7 @@ mod tests {
                     "llm.backend_failure:job-failed:main:retry-node",
                 ),
                 "day",
-                &store.get_branch_head("day").unwrap(),
+                &store.get_branch_head("day").await.unwrap(),
             )
             .await
             .unwrap();
@@ -3681,6 +3683,7 @@ mod tests {
             .unwrap();
 
         let config = super::derive_day_session_config(&store)
+            .await
             .unwrap()
             .expect("day config should be derived");
 

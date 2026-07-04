@@ -82,8 +82,8 @@ where
         self.notify_if_ok(self.inner.fork(name, from_ref).await)
     }
 
-    fn get_branch_head(&self, name: &str) -> StoreResult<String> {
-        self.inner.get_branch_head(name)
+    async fn get_branch_head<'a>(&'a self, name: &'a str) -> StoreResult<String> {
+        self.inner.get_branch_head(name).await
     }
 
     async fn delete_branch<'a>(&'a self, name: &'a str) -> StoreResult<()> {

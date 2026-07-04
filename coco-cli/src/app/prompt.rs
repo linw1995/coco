@@ -643,6 +643,7 @@ async fn load_queued_prompt_request_status(
     };
     let head = store
         .get_branch_head(&request.branch)
+        .await
         .context(StoreSnafu)?
         .to_owned();
     Ok(Some(QueuedPromptRequestStatusView {
@@ -670,7 +671,7 @@ async fn load_queued_prompt_request_list(store: &impl Store) -> Result<Vec<JobLi
         else {
             continue;
         };
-        let head = match store.get_branch_head(&request.branch) {
+        let head = match store.get_branch_head(&request.branch).await {
             Ok(head) => head.to_owned(),
             Err(StoreError::BranchNotFound { .. }) => continue,
             Err(error) => return Err(error).context(StoreSnafu),

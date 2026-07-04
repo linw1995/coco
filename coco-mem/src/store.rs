@@ -50,7 +50,10 @@ pub trait BranchStore {
     ) -> impl Future<Output = StoreResult<String>> + Send + 'a;
 
     /// Returns the current head node identifier for a branch.
-    fn get_branch_head(&self, name: &str) -> StoreResult<String>;
+    fn get_branch_head<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Future<Output = StoreResult<String>> + Send + 'a;
 
     /// Deletes a branch head and its session state.
     fn delete_branch<'a>(
@@ -346,8 +349,10 @@ impl BranchStore for PersistentStore {
         }
     }
 
-    fn get_branch_head(&self, name: &str) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.get_branch_head(name))
+    async fn get_branch_head<'a>(&'a self, name: &'a str) -> StoreResult<String> {
+        match self {
+            Self::Sqlite(store) => store.get_branch_head(name).await,
+        }
     }
 
     async fn delete_branch<'a>(&'a self, name: &'a str) -> StoreResult<()> {

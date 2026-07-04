@@ -1546,6 +1546,7 @@ where
         let base_head_id = self
             .store
             .get_branch_head(target_branch)
+            .await
             .context(MemorySnafu)?;
         self.store
             .set_session_state(
@@ -1640,6 +1641,7 @@ where
         let original_head = self
             .store
             .get_branch_head(&request.branch)
+            .await
             .context(MemorySnafu)?;
         let reference_id = match &request.origin {
             CompletionOrigin::BranchHead => original_head.clone(),
@@ -2036,7 +2038,11 @@ where
         merge_parents: &[MergeParent],
         session_patch: Option<&SessionConfigPatch>,
     ) -> Result<String> {
-        let parent_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let parent_id = self
+            .store
+            .get_branch_head(branch)
+            .await
+            .context(MemorySnafu)?;
         self.append_prompt_anchor_to_parent_with_session_patch(
             &parent_id,
             prompt,
@@ -2058,7 +2064,11 @@ where
         prompt: &str,
         merge_parents: &[MergeParent],
     ) -> Result<String> {
-        let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let original_head = self
+            .store
+            .get_branch_head(branch)
+            .await
+            .context(MemorySnafu)?;
         let anchor_id = self
             .append_prompt_anchor_to_parent(&original_head, prompt, &[], merge_parents)
             .await?;
@@ -2268,7 +2278,11 @@ where
             Some(self.lock_branch(&resolved_target_branch).await)
         };
 
-        let source_head_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let source_head_id = self
+            .store
+            .get_branch_head(branch)
+            .await
+            .context(MemorySnafu)?;
         let merge_parents = vec![MergeParent::merge(source_head_id.clone())];
         let merged_anchor_id = self
             .append_prompt_anchor_to_branch(&resolved_target_branch, prompt, &merge_parents)
@@ -5322,7 +5336,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let initial_head = store.get_branch_head("main").unwrap();
+        let initial_head = store.get_branch_head("main").await.unwrap();
 
         let prompt =
             tokio::spawn(
@@ -5471,7 +5485,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let session_head = store.get_branch_head("main").unwrap();
+            let session_head = store.get_branch_head("main").await.unwrap();
             let tool_use_id = store
                 .append(NewNode {
                     parent: session_head.clone(),
@@ -6516,7 +6530,7 @@ mod tests {
             .create_session(session_config("main"))
             .await
             .unwrap();
-        let main_head = store.get_branch_head("main").unwrap();
+        let main_head = store.get_branch_head("main").await.unwrap();
 
         let draft_session = service
             .create_session(SessionConfig {
@@ -6878,7 +6892,10 @@ mod tests {
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
         assert_eq!(node_execution_id(&failure), Some(execution_id.as_str()));
-        assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
+        assert_eq!(
+            store.get_branch_head("main").await.unwrap(),
+            retry_from_node_id
+        );
 
         let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
@@ -6914,7 +6931,7 @@ mod tests {
             .prompt(prompt_request("draft", "draft question"))
             .await
             .unwrap();
-        let draft_head = store.get_branch_head("draft").unwrap();
+        let draft_head = store.get_branch_head("draft").await.unwrap();
 
         let result = service
             .prompt(PromptRequest {
@@ -6978,7 +6995,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let main_head = store.get_branch_head("main").unwrap();
+        let main_head = store.get_branch_head("main").await.unwrap();
         service.fork("runner", &main_head).await.unwrap();
         let exec_tool = builtin_tool_definition("exec_command").unwrap();
 
@@ -7049,7 +7066,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             result.response_node_id
         );
 
@@ -7078,7 +7095,7 @@ mod tests {
             .unwrap();
         assert_eq!(prompt_result.text, "prompted");
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             prompt_result.response_node_id
         );
 
@@ -7135,7 +7152,10 @@ mod tests {
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
         let prompt_anchor_id = retry_from_node_id.clone();
-        assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
+        assert_eq!(
+            store.get_branch_head("main").await.unwrap(),
+            retry_from_node_id
+        );
 
         let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
@@ -7177,7 +7197,7 @@ mod tests {
 
         assert_eq!(resumed.text, "resumed");
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             resumed.response_node_id
         );
 
@@ -7276,7 +7296,7 @@ mod tests {
 
         assert_eq!(resumed.text, "new head");
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             resumed.response_node_id
         );
         assert_ne!(old_head.response_node_id, resumed.response_node_id);
@@ -7321,8 +7341,8 @@ mod tests {
         assert_eq!(main_result.text, "main");
         assert_eq!(draft_result.text, "draft");
         assert_ne!(
-            service.store().get_branch_head("main").unwrap(),
-            service.store().get_branch_head("draft").unwrap()
+            service.store().get_branch_head("main").await.unwrap(),
+            service.store().get_branch_head("draft").await.unwrap()
         );
     }
 
@@ -7386,7 +7406,7 @@ mod tests {
             .await
             .unwrap();
         let pr = service.open_pull_request("main", "base").await.unwrap();
-        let source_head_id = store.get_branch_head("main").unwrap();
+        let source_head_id = store.get_branch_head("main").await.unwrap();
 
         let merged = service
             .merge_session("main", None, "handoff to base")
@@ -7407,7 +7427,7 @@ mod tests {
         assert_eq!(prompt_anchor.prompt, "handoff to base");
         assert_eq!(anchor.merge_parent_node_ids(), [source_head_id.as_str()]);
         assert_eq!(
-            store.get_branch_head("base").unwrap(),
+            store.get_branch_head("base").await.unwrap(),
             merged.merged_anchor_id
         );
         assert_eq!(
@@ -7473,7 +7493,7 @@ mod tests {
         assert_eq!(prompt_anchor.prompt, "address review comments");
         assert_eq!(anchor.merge_parent_node_ids(), [base_feedback_id.as_str()]);
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             feedback.feedback_anchor_id
         );
         assert_eq!(
@@ -7916,7 +7936,7 @@ mod tests {
         };
 
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             context.retry_from_node_id
         );
         let failure = store.get_node(&context.error_node_id).unwrap();
@@ -7952,7 +7972,7 @@ mod tests {
             .create_session(session_config("main"))
             .await
             .unwrap();
-        let original_head = store.get_branch_head("main").unwrap();
+        let original_head = store.get_branch_head("main").await.unwrap();
 
         let error = service
             .prompt(prompt_request("main", "finish the streamed reply"))
@@ -7963,7 +7983,7 @@ mod tests {
                 .to_string()
                 .contains("without terminal assistant text")
         );
-        assert_eq!(store.get_branch_head("main").unwrap(), original_head);
+        assert_eq!(store.get_branch_head("main").await.unwrap(), original_head);
     }
 
     #[tokio::test]
@@ -8974,7 +8994,7 @@ mod tests {
         };
 
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             context.retry_from_node_id
         );
 
@@ -9031,7 +9051,7 @@ mod tests {
         };
 
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             context.retry_from_node_id
         );
 
