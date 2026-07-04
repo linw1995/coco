@@ -514,7 +514,7 @@ async fn load_prompt_anchor_details(
     job_id: &str,
 ) -> std::result::Result<PromptAnchorDetails, EngineError> {
     let job = store.get_job(job_id).await?;
-    let node = store.get_node(&job.base)?;
+    let node = store.get_node(&job.base).await?;
     match node.kind {
         Kind::Anchor(anchor) => match &anchor.payload {
             AnchorPayload::Prompt(prompt_anchor) => Ok(PromptAnchorDetails {

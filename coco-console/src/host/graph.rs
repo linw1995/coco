@@ -360,7 +360,7 @@ impl GraphBuildState {
         state: SessionState,
     ) -> Result<()> {
         let head_id = store.get_branch_head(&branch).await.context(StoreSnafu)?;
-        let scope = self.collect_branch_scope(store, &head_id)?;
+        let scope = self.collect_branch_scope(store, &head_id).await?;
         let visible_head_id = self.resolve_visible_parent(store, &scope.node_ids, &head_id)?;
         self.add_branch_label(&branch, &state, visible_head_id.as_deref());
         self.branches.push(GraphBranch {
@@ -372,7 +372,7 @@ impl GraphBuildState {
         Ok(())
     }
 
-    fn collect_branch_scope(
+    async fn collect_branch_scope(
         &mut self,
         store: &impl NodeStore,
         head_id: &str,
@@ -387,7 +387,8 @@ impl GraphBuildState {
             &mut self.visible_node_ids,
             &mut self.visible_nodes,
             &mut branch_visible_node_ids,
-        )?;
+        )
+        .await?;
         self.merge_visible_node_scopes(&scope_node_ids, &branch_visible_node_ids);
         Ok(BranchGraphScope {
             node_ids: scope_node_ids,
@@ -594,9 +595,9 @@ impl GraphBuildState {
 }
 
 impl<S: NodeStore> VisibleGraphCollector<'_, S> {
-    fn collect(&mut self) -> Result<()> {
+    async fn collect(&mut self) -> Result<()> {
         while let Some(node_id) = self.next_node_id() {
-            self.visit(node_id)?;
+            self.visit(node_id).await?;
         }
         Ok(())
     }
@@ -616,8 +617,8 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
             && self.visited.insert(node_id.to_owned())
     }
 
-    fn visit(&mut self, node_id: String) -> Result<()> {
-        let node = self.store.get_node(&node_id).context(StoreSnafu)?;
+    async fn visit(&mut self, node_id: String) -> Result<()> {
+        let node = self.store.get_node(&node_id).await.context(StoreSnafu)?;
         if node.is_root() {
             return Ok(());
         }
@@ -753,7 +754,7 @@ fn is_duplicate_visible_merge_parent(
             .any(|existing| existing.node_id() == parent_id)
 }
 
-fn collect_visible_graph_nodes<S: NodeStore>(
+async fn collect_visible_graph_nodes<S: NodeStore>(
     store: &S,
     head_id: &str,
     scope_node_ids: &mut BTreeSet<String>,
@@ -773,6 +774,7 @@ fn collect_visible_graph_nodes<S: NodeStore>(
         visited: BTreeSet::new(),
     }
     .collect()
+    .await
 }
 
 fn initial_graph_scope(
@@ -976,18 +978,45 @@ pub(crate) fn initial_visible_graph_lane_nodes(
     Ok(nodes)
 }
 
-pub(crate) fn visible_skill_invocation_subtree_nodes(
+#[cfg(test)]
+pub(crate) async fn visible_skill_invocation_subtree_nodes(
     store: &impl NodeStore,
     mode: GraphMode,
     parent_id: &str,
 ) -> Result<Vec<Node>> {
     let mut nodes = Vec::new();
     let mut seen = BTreeSet::new();
-    push_initial_skill_invocation_subtrees(store, mode, parent_id, &mut seen, &mut nodes)?;
+    push_initial_skill_invocation_subtrees(store, mode, parent_id, &mut seen, &mut nodes).await?;
     Ok(nodes)
 }
 
-fn push_initial_skill_invocation_subtrees(
+pub(crate) fn visible_skill_invocation_subtree_nodes_with_lookup(
+    store: &impl NodeStore,
+    mode: GraphMode,
+    parent_id: &str,
+    mut get_node: impl FnMut(&str) -> Result<Node>,
+) -> Result<Vec<Node>> {
+    let mut nodes = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = skill_invocation_children(store, parent_id)?;
+    pending.reverse();
+    let mut visited = BTreeSet::new();
+
+    while let Some(node_id) = pending.pop() {
+        if node_id.is_empty() || !visited.insert(node_id.clone()) {
+            continue;
+        }
+        let node = get_node(&node_id)?;
+        let mut children = child_ids(store, &node.id)?;
+        children.reverse();
+        pending.extend(children);
+        push_initial_lane_node(mode, node, &mut seen, &mut nodes);
+    }
+    Ok(nodes)
+}
+
+#[cfg(test)]
+async fn push_initial_skill_invocation_subtrees(
     store: &impl NodeStore,
     mode: GraphMode,
     parent_id: &str,
@@ -1002,7 +1031,7 @@ fn push_initial_skill_invocation_subtrees(
         if node_id.is_empty() || !visited.insert(node_id.clone()) {
             continue;
         }
-        let node = store.get_node(&node_id).context(StoreSnafu)?;
+        let node = store.get_node(&node_id).await.context(StoreSnafu)?;
         let mut children = child_ids(store, &node.id)?;
         children.reverse();
         pending.extend(children);

@@ -263,7 +263,10 @@ where
         .branch
         .or_else(|| std::env::var(coco_llm::COCO_SESSION_BRANCH_ENV).ok())
         .context(MissingSkillRunBranchSnafu)?;
-    let parent = store.get_node(&parent_tool_use_id).context(StoreSnafu)?;
+    let parent = store
+        .get_node(&parent_tool_use_id)
+        .await
+        .context(StoreSnafu)?;
     ensure!(
         parent.kind.as_tool_uses().is_some(),
         InvalidSkillInvocationParentSnafu {
@@ -276,7 +279,7 @@ where
     let handoff = Some(prompt.clone());
     let mode = SkillInvocationMode::Handoff { prompt };
     let skill_name = command.name;
-    let session_role = resolve_parent_session_role(store, &parent_tool_use_id)?;
+    let session_role = resolve_parent_session_role(store, &parent_tool_use_id).await?;
     let invocation_node_id = store
         .append(NewNode {
             parent: parent_tool_use_id.clone(),
@@ -315,8 +318,11 @@ where
     })
 }
 
-fn resolve_parent_session_role(store: &impl NodeStore, start_id: &str) -> Result<SessionRole> {
-    let mut node = store.get_node(start_id).context(StoreSnafu)?;
+async fn resolve_parent_session_role(
+    store: &impl NodeStore,
+    start_id: &str,
+) -> Result<SessionRole> {
+    let mut node = store.get_node(start_id).await.context(StoreSnafu)?;
     let mut patches = Vec::new();
     loop {
         if let Kind::Anchor(anchor) = &node.kind {
@@ -338,7 +344,7 @@ fn resolve_parent_session_role(store: &impl NodeStore, start_id: &str) -> Result
                 parent_tool_use_id: start_id.to_owned(),
             }
         );
-        node = store.get_node(&node.parent).context(StoreSnafu)?;
+        node = store.get_node(&node.parent).await.context(StoreSnafu)?;
     }
 }
 

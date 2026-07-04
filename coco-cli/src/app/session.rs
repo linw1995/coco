@@ -188,7 +188,7 @@ where
             run_session_graph_command(command.json, command.all, store).await
         }
         SessionSubcommand::Show(command) => {
-            run_session_show_command(command.reference, command.json, store)
+            run_session_show_command(command.reference, command.json, store).await
         }
         SessionSubcommand::Delete(command) => {
             run_session_delete_command(command.branch, command.json, llm).await
@@ -323,12 +323,12 @@ async fn run_session_graph_command(
     })))
 }
 
-fn run_session_show_command(
+async fn run_session_show_command(
     reference: String,
     json: bool,
     store: &(impl BranchStore + NodeStore),
 ) -> Result<Option<String>> {
-    Ok(Some(render_session_show(store, &reference, json)?))
+    Ok(Some(render_session_show(store, &reference, json).await?))
 }
 
 async fn run_session_delete_command<B, S>(
@@ -782,7 +782,8 @@ async fn build_session_graph_entries(
             &mut visible_node_ids,
             &mut visible_nodes,
             &mut branch_visible_node_ids,
-        )?;
+        )
+        .await?;
         for node_id in branch_visible_node_ids {
             visible_node_scopes
                 .entry(node_id)
@@ -791,7 +792,7 @@ async fn build_session_graph_entries(
         }
 
         if let Some(label_node_id) =
-            resolve_visible_parent(store, &visible_node_ids, &scope_node_ids, &head_id)?
+            resolve_visible_parent(store, &visible_node_ids, &scope_node_ids, &head_id).await?
         {
             labels_by_node
                 .entry(label_node_id)
@@ -800,51 +801,51 @@ async fn build_session_graph_entries(
         }
     }
 
-    let mut entries = visible_nodes
-        .into_values()
-        .map(|node| {
-            let scope_node_ids = visible_node_scopes.remove(&node.id).unwrap_or_default();
-            let primary_parent = resolve_visible_parent(
-                store,
-                &visible_node_ids,
-                &scope_node_ids,
-                node.parent.as_str(),
-            )?;
-            let merge_parents = match &node.kind {
-                Kind::Anchor(anchor) => {
-                    let mut parents = Vec::new();
-                    for merge_parent in anchor.merge_parents() {
-                        let Some(parent_id) = resolve_visible_parent(
-                            store,
-                            &visible_node_ids,
-                            &scope_node_ids,
-                            merge_parent.node_id(),
-                        )?
-                        else {
-                            continue;
-                        };
-                        if primary_parent.as_ref() == Some(&parent_id)
-                            || parents
-                                .iter()
-                                .any(|existing: &MergeParent| existing.node_id() == parent_id)
-                        {
-                            continue;
-                        }
-                        parents.push(visible_merge_parent(merge_parent, parent_id));
+    let mut entries = Vec::new();
+    for node in visible_nodes.into_values() {
+        let scope_node_ids = visible_node_scopes.remove(&node.id).unwrap_or_default();
+        let primary_parent = resolve_visible_parent(
+            store,
+            &visible_node_ids,
+            &scope_node_ids,
+            node.parent.as_str(),
+        )
+        .await?;
+        let merge_parents = match &node.kind {
+            Kind::Anchor(anchor) => {
+                let mut parents = Vec::new();
+                for merge_parent in anchor.merge_parents() {
+                    let Some(parent_id) = resolve_visible_parent(
+                        store,
+                        &visible_node_ids,
+                        &scope_node_ids,
+                        merge_parent.node_id(),
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    if primary_parent.as_ref() == Some(&parent_id)
+                        || parents
+                            .iter()
+                            .any(|existing: &MergeParent| existing.node_id() == parent_id)
+                    {
+                        continue;
                     }
-                    parents
+                    parents.push(visible_merge_parent(merge_parent, parent_id));
                 }
-                _ => vec![],
-            };
+                parents
+            }
+            _ => vec![],
+        };
 
-            Ok(GraphNodeEntry {
-                labels: labels_by_node.remove(&node.id).unwrap_or_default(),
-                node,
-                primary_parent,
-                merge_parents,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        entries.push(GraphNodeEntry {
+            labels: labels_by_node.remove(&node.id).unwrap_or_default(),
+            node,
+            primary_parent,
+            merge_parents,
+        });
+    }
 
     entries = topologically_sort_graph_entries(entries);
 
@@ -952,7 +953,7 @@ fn compare_graph_entries_desc(left: &GraphNodeEntry, right: &GraphNodeEntry) -> 
         .then_with(|| right.node.id.cmp(&left.node.id))
 }
 
-fn collect_visible_graph_nodes(
+async fn collect_visible_graph_nodes(
     store: &impl NodeStore,
     head_id: &str,
     scope_node_ids: &mut BTreeSet<String>,
@@ -972,7 +973,7 @@ fn collect_visible_graph_nodes(
             continue;
         }
 
-        let node = store.get_node(&node_id).context(StoreSnafu)?;
+        let node = store.get_node(&node_id).await.context(StoreSnafu)?;
         if node.is_root() {
             continue;
         }
@@ -1106,12 +1107,12 @@ fn collect_visible_skill_invocation_subtrees(
     Ok(())
 }
 
-fn render_session_show(
+async fn render_session_show(
     store: &impl NodeStore,
     reference: &str,
     json_output: bool,
 ) -> Result<String> {
-    let node = resolve_show_reference(store, reference)?;
+    let node = resolve_show_reference(store, reference).await?;
     let children = store
         .list_children(&node.id)
         .context(StoreSnafu)?
@@ -1132,8 +1133,8 @@ fn render_session_show(
     }
 }
 
-fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Node> {
-    match store.get_node(reference) {
+async fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Node> {
+    match store.get_node(reference).await {
         Ok(node) => Ok(node),
         Err(StoreError::NotFound { .. }) => UnknownShowReferenceSnafu {
             reference: reference.to_owned(),
@@ -1146,7 +1147,7 @@ fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Nod
     }
 }
 
-fn resolve_visible_parent(
+async fn resolve_visible_parent(
     store: &impl NodeStore,
     visible_node_ids: &BTreeSet<String>,
     scope_node_ids: &BTreeSet<String>,
@@ -1166,7 +1167,7 @@ fn resolve_visible_parent(
             return Ok(Some(current_id));
         }
 
-        let node = store.get_node(&current_id).context(StoreSnafu)?;
+        let node = store.get_node(&current_id).await.context(StoreSnafu)?;
         if node.is_root() {
             return Ok(None);
         }

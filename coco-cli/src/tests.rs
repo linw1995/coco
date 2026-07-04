@@ -51,6 +51,10 @@ use crate::{
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
+async fn node_created_at(store: &impl NodeStore, id: &str) -> String {
+    store.get_node(id).await.unwrap().created_at.to_string()
+}
+
 fn prompt_job_queue_for_branch(branch: &str) -> String {
     format!("prompt.job/{branch}")
 }
@@ -2856,7 +2860,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     );
 
     let store = open_store(&store_path).await.unwrap();
-    let merged_anchor = store.get_node(&merged_anchor_id).unwrap();
+    let merged_anchor = store.get_node(&merged_anchor_id).await.unwrap();
     let Kind::Anchor(anchor) = merged_anchor.kind else {
         panic!("expected merged prompt anchor");
     };
@@ -2924,7 +2928,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     );
 
     let store = open_store(&store_path).await.unwrap();
-    let feedback_anchor = store.get_node(&feedback_anchor_id).unwrap();
+    let feedback_anchor = store.get_node(&feedback_anchor_id).await.unwrap();
     let Kind::Anchor(anchor) = feedback_anchor.kind else {
         panic!("expected feedback prompt anchor");
     };
@@ -3267,16 +3271,15 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
     .unwrap();
 
     let short_id = |id: &str| id.chars().take(8).collect::<String>();
-    let created_at = |id: &str| store.get_node(id).unwrap().created_at.to_string();
     let expected_output = formatdoc!(
         "
         * {new_prompt_id} prompt {new_prompt_created_at} [main] new prompt
         * {new_session_id} session {new_session_created_at} You are executing the skill `docs`.
         ",
         new_prompt_id = short_id(&new_prompt_id),
-        new_prompt_created_at = created_at(&new_prompt_id),
+        new_prompt_created_at = node_created_at(&store, &new_prompt_id).await,
         new_session_id = short_id(&new_session_id),
-        new_session_created_at = created_at(&new_session_id),
+        new_session_created_at = node_created_at(&store, &new_session_id).await,
     )
     .strip_suffix('\n')
     .expect("formatdoc output should end with one newline")
@@ -3302,17 +3305,17 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
         * {original_session_id} session {original_session_created_at} You are helpful.
         ",
         new_text_id = short_id(&new_text_id),
-        new_text_created_at = created_at(&new_text_id),
+        new_text_created_at = node_created_at(&store, &new_text_id).await,
         new_prompt_id = short_id(&new_prompt_id),
-        new_prompt_created_at = created_at(&new_prompt_id),
+        new_prompt_created_at = node_created_at(&store, &new_prompt_id).await,
         new_session_id = short_id(&new_session_id),
-        new_session_created_at = created_at(&new_session_id),
+        new_session_created_at = node_created_at(&store, &new_session_id).await,
         old_text_id = short_id(&old_text_id),
-        old_text_created_at = created_at(&old_text_id),
+        old_text_created_at = node_created_at(&store, &old_text_id).await,
         old_prompt_id = short_id(&old_prompt_id),
-        old_prompt_created_at = created_at(&old_prompt_id),
+        old_prompt_created_at = node_created_at(&store, &old_prompt_id).await,
         original_session_id = short_id(&original_session_id),
-        original_session_created_at = created_at(&original_session_id),
+        original_session_created_at = node_created_at(&store, &original_session_id).await,
     )
     .strip_suffix('\n')
     .expect("formatdoc output should end with one newline")
@@ -3401,7 +3404,6 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
     .unwrap();
 
     let short_id = |id: &str| id.chars().take(8).collect::<String>();
-    let created_at = |id: &str| store.get_node(id).unwrap().created_at.to_string();
     let expected_output = formatdoc!(
         "
         * {merge_id} prompt {merge_created_at} [main] merge anchor merge=[{draft_id}]
@@ -3412,13 +3414,13 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
         * {session_id} session {session_created_at} You are helpful.
         ",
         merge_id = short_id(&merge_anchor_id),
-        merge_created_at = created_at(&merge_anchor_id),
+        merge_created_at = node_created_at(&store, &merge_anchor_id).await,
         draft_id = short_id(&draft_anchor_id),
-        draft_created_at = created_at(&draft_anchor_id),
+        draft_created_at = node_created_at(&store, &draft_anchor_id).await,
         main_id = short_id(&main_anchor_id),
-        main_created_at = created_at(&main_anchor_id),
+        main_created_at = node_created_at(&store, &main_anchor_id).await,
         session_id = short_id(&session_id),
-        session_created_at = created_at(&session_id),
+        session_created_at = node_created_at(&store, &session_id).await,
     )
     .strip_suffix('\n')
     .expect("formatdoc output should end with one newline")
@@ -3525,7 +3527,6 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
     .unwrap();
 
     let short_id = |id: &str| id.chars().take(8).collect::<String>();
-    let created_at = |id: &str| store.get_node(id).unwrap().created_at.to_string();
     let expected_output = formatdoc!(
         "
         * {merge_id} prompt {merge_created_at} [main] merge fanin anchor merge=[{beta_id},{gamma_id}]
@@ -3539,17 +3540,17 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
         * {session_id} session {session_created_at} You are helpful.
         ",
         merge_id = short_id(&merge_anchor_id),
-        merge_created_at = created_at(&merge_anchor_id),
+        merge_created_at = node_created_at(&store, &merge_anchor_id).await,
         beta_id = short_id(&beta_anchor_id),
-        beta_created_at = created_at(&beta_anchor_id),
+        beta_created_at = node_created_at(&store, &beta_anchor_id).await,
         gamma_id = short_id(&gamma_anchor_id),
-        gamma_created_at = created_at(&gamma_anchor_id),
+        gamma_created_at = node_created_at(&store, &gamma_anchor_id).await,
         alpha_id = short_id(&alpha_anchor_id),
-        alpha_created_at = created_at(&alpha_anchor_id),
+        alpha_created_at = node_created_at(&store, &alpha_anchor_id).await,
         shared_id = short_id(&shared_anchor_id),
-        shared_created_at = created_at(&shared_anchor_id),
+        shared_created_at = node_created_at(&store, &shared_anchor_id).await,
         session_id = short_id(&session_id),
-        session_created_at = created_at(&session_id),
+        session_created_at = node_created_at(&store, &session_id).await,
     )
     .strip_suffix('\n')
     .expect("formatdoc output should end with one newline")
@@ -6351,7 +6352,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
     assert_eq!(states.get("day"), Some(&SessionState::Active));
 
     let head = store.get_branch_head("main").await.unwrap();
-    let node = store.get_node(&head).unwrap();
+    let node = store.get_node(&head).await.unwrap();
     let Kind::Anchor(anchor) = node.kind else {
         panic!("expected default session anchor");
     };
@@ -6376,7 +6377,7 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
     );
 
     let day_head = store.get_branch_head("day").await.unwrap();
-    let day_node = store.get_node(&day_head).unwrap();
+    let day_node = store.get_node(&day_head).await.unwrap();
     let Kind::Anchor(day_anchor) = day_node.kind else {
         panic!("expected day session anchor");
     };
@@ -6428,7 +6429,7 @@ async fn daemon_startup_replaces_invalid_builtin_day_branch() {
 
     let day_head = store.get_branch_head("day").await.unwrap();
     assert_ne!(day_head, main_head);
-    let day_node = store.get_node(&day_head).unwrap();
+    let day_node = store.get_node(&day_head).await.unwrap();
     let Kind::Anchor(day_anchor) = day_node.kind else {
         panic!("expected day session anchor");
     };
@@ -6535,7 +6536,7 @@ async fn daemon_startup_resumes_incomplete_jobs() {
     let resumed_job = store.get_job(&job.job_id).await.unwrap();
     assert_eq!(resumed_job.status, coco_mem::JobStatus::Finished);
     let head = store.get_branch_head("main").await.unwrap();
-    let node = store.get_node(&head).unwrap();
+    let node = store.get_node(&head).await.unwrap();
     match node.kind {
         Kind::Text(text) => assert_eq!(text, "recovered after daemon start"),
         other => panic!("expected text node at branch head, got {other:?}"),

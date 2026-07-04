@@ -65,8 +65,11 @@ where
         self.inner.log(base_ref, head_ref)
     }
 
-    fn get_node(&self, id: &str) -> StoreResult<Node> {
-        self.inner.get_node(id)
+    fn get_node<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<Node>> + Send + 'a>> {
+        Box::pin(async move { self.inner.get_node(id).await })
     }
 
     fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>> {

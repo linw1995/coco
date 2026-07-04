@@ -282,7 +282,7 @@ where
                 message: format!("prompt job {:?} is waiting for recovery", job.job_id),
             });
         }
-        build_prompt_reply(self.service.store(), &job, &snapshot)
+        build_prompt_reply(self.service.store(), &job, &snapshot).await
     }
 
     pub async fn submit_job(
@@ -961,7 +961,7 @@ where
     Ok(Some(last_node))
 }
 
-fn build_prompt_reply<S>(
+async fn build_prompt_reply<S>(
     store: &S,
     job: &Job,
     snapshot: &JobStatusSnapshot,
@@ -975,7 +975,7 @@ where
         });
     }
 
-    let response_node = store.get_node(&snapshot.head)?;
+    let response_node = store.get_node(&snapshot.head).await?;
     let execution_id = response_node
         .metadata
         .as_ref()

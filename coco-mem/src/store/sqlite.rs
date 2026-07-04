@@ -4298,8 +4298,11 @@ impl NodeStore for SqliteGraphStore {
         self.block_on(self.log_in_sqlite(base_ref, head_ref))
     }
 
-    fn get_node(&self, id: &str) -> Result<Node> {
-        self.block_on(self.get_node_by_prefix_or_branch(id))
+    fn get_node<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Node>> + Send + 'a>> {
+        Box::pin(async move { self.get_node_by_prefix_or_branch(id).await })
     }
 
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
@@ -4397,8 +4400,11 @@ impl NodeStore for SqliteStore {
         self.block_on(self.log_in_sqlite(base_ref, head_ref))
     }
 
-    fn get_node(&self, id: &str) -> Result<Node> {
-        self.block_on(self.get_node_in_sqlite(id))
+    fn get_node<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Node>> + Send + 'a>> {
+        Box::pin(async move { self.get_node_in_sqlite(id).await })
     }
 
     fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
@@ -5163,7 +5169,7 @@ mod tests {
         release_graph_tx.send(()).unwrap();
         graph_lock.await.unwrap();
         write.await.unwrap();
-        assert_eq!(store.get_node(&written).unwrap().id, written);
+        assert_eq!(store.get_node(&written).await.unwrap().id, written);
     }
 
     #[tokio::test]
@@ -5504,15 +5510,15 @@ mod tests {
 
         assert_eq!(graph_store.root_id(), root_id);
         assert_eq!(
-            graph_store.get_node(&child_id).unwrap().id,
+            graph_store.get_node(&child_id).await.unwrap().id,
             child_id.clone()
         );
         assert_eq!(
-            graph_store.get_node(&child_id[..12]).unwrap().id,
+            graph_store.get_node(&child_id[..12]).await.unwrap().id,
             child_id.clone()
         );
         assert_eq!(
-            graph_store.get_node("graph-child").unwrap().id,
+            graph_store.get_node("graph-child").await.unwrap().id,
             child_id.clone()
         );
         assert_eq!(graph_store.list_children(&root_id).unwrap()[0].id, child_id);
@@ -5733,7 +5739,7 @@ mod tests {
         assert_eq!(store.list_children(&root_id).unwrap()[0].id, child_id);
 
         let reopened = SqliteStore::open(&path).await.unwrap();
-        let child = reopened.get_node(&child_id).unwrap();
+        let child = reopened.get_node(&child_id).await.unwrap();
 
         assert_eq!(child.parent, root_id);
         assert_eq!(reopened.list_children(&root_id).unwrap()[0].id, child_id);
@@ -5783,7 +5789,7 @@ mod tests {
             .map(|node| node.id)
             .collect::<Vec<_>>();
         assert_eq!(log, vec![second.clone(), first, root_id]);
-        assert_eq!(reopened.get_node(&second[..12]).unwrap().id, second);
+        assert_eq!(reopened.get_node(&second[..12]).await.unwrap().id, second);
     }
 
     #[tokio::test]
@@ -5932,8 +5938,8 @@ mod tests {
                 reason: PauseReason::Closed,
             }
         );
-        assert!(reopened.get_node(&rebased).is_ok());
-        assert!(reopened.get_node(&handoff).is_ok());
+        assert!(reopened.get_node(&rebased).await.is_ok());
+        assert!(reopened.get_node(&handoff).await.is_ok());
     }
 
     #[tokio::test]

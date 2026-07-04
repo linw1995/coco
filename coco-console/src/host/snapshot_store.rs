@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use diesel::prelude::*;
@@ -18,7 +20,7 @@ use crate::error::{
 use crate::graph::{
     GraphMode, graph_kind_name, initial_visible_graph_lane_nodes, node_target_id,
     provider_context_ancestry_nodes, shorten_id, summarize_node,
-    visible_skill_invocation_subtree_nodes,
+    visible_skill_invocation_subtree_nodes_with_lookup,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
@@ -82,7 +84,10 @@ impl MaterializationSourceSnapshot {
             if nodes.contains_key(&node_id) {
                 continue;
             }
-            let node = store.get_node(&node_id).context(crate::error::StoreSnafu)?;
+            let node = store
+                .get_node(&node_id)
+                .await
+                .context(crate::error::StoreSnafu)?;
             let node_children = store
                 .list_children(&node_id)
                 .context(crate::error::StoreSnafu)?;
@@ -107,6 +112,14 @@ impl MaterializationSourceSnapshot {
             .ok_or_else(|| coco_mem::StoreError::BranchNotFound {
                 name: name.to_owned(),
             })
+    }
+
+    fn node(&self, id: &str) -> coco_mem::StoreResult<Node> {
+        let id = self.resolve_ref_id(id)?;
+        self.nodes
+            .get(&id)
+            .cloned()
+            .ok_or(coco_mem::StoreError::NotFound { id })
     }
 
     fn resolve_ref_id(&self, reference: &str) -> coco_mem::StoreResult<String> {
@@ -189,12 +202,11 @@ impl NodeStore for MaterializationSourceSnapshot {
         Ok(nodes)
     }
 
-    fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
-        let id = self.resolve_ref_id(id)?;
-        self.nodes
-            .get(&id)
-            .cloned()
-            .ok_or(coco_mem::StoreError::NotFound { id })
+    fn get_node<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Node>> + Send + 'a>> {
+        Box::pin(async move { self.node(id) })
     }
 
     fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
@@ -1212,7 +1224,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_append_linear_branch_in_transaction(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: AppendLinearBranchInput<'_>,
     ) -> crate::Result<bool> {
         let Some(tail) =
@@ -1358,7 +1370,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_append_unchanged_head_skill_subtree_in_transaction(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: &AppendLinearBranchInput<'_>,
         tail: &MaterializedTailNodeRow,
     ) -> crate::Result<Option<bool>> {
@@ -1392,7 +1404,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_refresh_materialized_branch_head_in_transaction(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: &AppendLinearBranchInput<'_>,
         tail: &MaterializedTailNodeRow,
         branch_label: &str,
@@ -1631,7 +1643,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_update_existing_anchor_branch_lane(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: AppendLinearBranchInput<'_>,
     ) -> crate::Result<bool> {
         let ancestry = store
@@ -1680,7 +1692,7 @@ impl ConsoleGraphSnapshotStore {
     fn replace_anchor_branch_lane_for_context_shift(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: AppendLinearBranchInput<'_>,
         tail: MaterializedTailNodeRow,
         scoped_ancestry: Vec<Node>,
@@ -1770,7 +1782,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_append_new_anchor_branch_lane_in_transaction(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: AppendLinearBranchInput<'_>,
         lane_y: i32,
     ) -> crate::Result<bool> {
@@ -1842,7 +1854,7 @@ impl ConsoleGraphSnapshotStore {
     fn insert_anchor_branch_lane_nodes(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: &AppendLinearBranchInput<'_>,
         lane_insert: AnchorBranchLaneInsert,
     ) -> crate::Result<bool> {
@@ -1971,7 +1983,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_append_anchor_branch_after_row(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: AppendLinearBranchInput<'_>,
         tail: MaterializedTailNodeRow,
     ) -> crate::Result<bool> {
@@ -2291,7 +2303,7 @@ impl ConsoleGraphSnapshotStore {
     fn point_with_merge_parent_column_constraints(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: MergeColumnConstraintInput<'_>,
     ) -> crate::Result<Option<Point>> {
         let mut parent_ids = BTreeSet::from([input.primary_parent_id.to_owned()]);
@@ -2353,7 +2365,7 @@ impl ConsoleGraphSnapshotStore {
     fn insert_node_merge_edges(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: NodeMergeEdgesInput<'_>,
     ) -> crate::Result<bool> {
         let mut parent_ids = BTreeSet::from([input.primary_parent_id.to_owned()]);
@@ -2402,7 +2414,7 @@ impl ConsoleGraphSnapshotStore {
     fn ensure_visible_merge_parent_point(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         mode: GraphMode,
         merge_parent: &MergeParent,
         reserved_lane_y: Option<i32>,
@@ -2444,7 +2456,7 @@ impl ConsoleGraphSnapshotStore {
     fn insert_orphan_merge_parent_lane(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: OrphanMergeParentLaneInput<'_>,
     ) -> crate::Result<Option<VisibleMergeParentPoint>> {
         let Some(orphan) = self.orphan_merge_parent_lane(
@@ -2528,7 +2540,7 @@ impl ConsoleGraphSnapshotStore {
     fn insert_orphan_merge_parent_nodes(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         mode: GraphMode,
         orphan: &OrphanMergeParentLane,
     ) -> crate::Result<Option<Point>> {
@@ -2616,7 +2628,7 @@ impl ConsoleGraphSnapshotStore {
     fn insert_orphan_merge_parent_node_edges(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: OrphanMergeParentNodeEdgeInput<'_>,
     ) -> crate::Result<bool> {
         let Some((previous_id, previous_point)) = input.previous else {
@@ -2843,7 +2855,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_append_new_branch_lane_in_transaction(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         input: AppendLinearBranchInput<'_>,
         lane_y: i32,
     ) -> crate::Result<bool> {
@@ -3013,7 +3025,7 @@ impl ConsoleGraphSnapshotStore {
     fn try_append_skill_invocation_subtree_in_transaction(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         mode: GraphMode,
         source_id: &str,
         source_point: Point,
@@ -3022,15 +3034,15 @@ impl ConsoleGraphSnapshotStore {
         if mode != GraphMode::All {
             return Ok(SkillSubtreeAppend::Absent);
         }
-        let source = store
-            .get_node(source_id)
-            .context(crate::error::StoreSnafu)?;
+        let source = store.node(source_id).context(crate::error::StoreSnafu)?;
         if source.kind.as_tool_uses().is_none() {
             return Ok(SkillSubtreeAppend::Absent);
         }
         let subtrees = visible_skill_invocation_linear_subtrees(
             source_id,
-            visible_skill_invocation_subtree_nodes(store, mode, source_id)?,
+            visible_skill_invocation_subtree_nodes_with_lookup(store, mode, source_id, |id| {
+                store.node(id).context(crate::error::StoreSnafu)
+            })?,
         );
         let Some(subtrees) = subtrees else {
             return Ok(SkillSubtreeAppend::Unsupported);
@@ -5118,7 +5130,7 @@ impl ConsoleGraphSnapshotStore {
     fn event_order_by_materialized_and_new_nodes(
         &self,
         connection: &mut SqliteConnection,
-        store: &impl NodeStore,
+        store: &MaterializationSourceSnapshot,
         mode: GraphMode,
         new_nodes: &[Node],
     ) -> crate::Result<BTreeMap<String, usize>> {
@@ -5130,9 +5142,7 @@ impl ConsoleGraphSnapshotStore {
             if nodes_by_id.contains_key(&row.node_id) {
                 continue;
             }
-            let node = store
-                .get_node(&row.node_id)
-                .context(crate::error::StoreSnafu)?;
+            let node = store.node(&row.node_id).context(crate::error::StoreSnafu)?;
             nodes_by_id.insert(row.node_id, node);
         }
 
@@ -6005,7 +6015,7 @@ mod tests {
     impl BranchAdvanceDuringWalkStore {
         async fn new() -> Self {
             let memory = test_store().await;
-            let root = memory.get_node(&memory.root_id()).unwrap();
+            let root = memory.get_node(&memory.root_id()).await.unwrap();
             let old_head = Node::new(
                 root.id.clone(),
                 Role::User,
@@ -6060,12 +6070,16 @@ mod tests {
             self.ancestry(head_ref)
         }
 
-        fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
-            match id {
+        fn get_node<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Node>> + Send + 'a>> {
+            let result = match id {
                 id if id == self.root.id => Ok(self.root.clone()),
                 id if id == self.old_head.id => Ok(self.old_head.clone()),
                 id => Err(coco_mem::StoreError::NotFound { id: id.to_owned() }),
-            }
+            };
+            Box::pin(std::future::ready(result))
         }
 
         fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
@@ -6525,10 +6539,10 @@ mod tests {
                 .unwrap();
             node_ids.push(parent.clone());
         }
-        let nodes = node_ids
-            .iter()
-            .map(|node_id| store.get_node(node_id).unwrap())
-            .collect();
+        let mut nodes = Vec::new();
+        for node_id in &node_ids {
+            nodes.push(store.get_node(node_id).await.unwrap());
+        }
 
         let subtrees = visible_skill_invocation_linear_subtrees(&source_id, nodes).unwrap();
         let expected_last = node_ids.last().unwrap();

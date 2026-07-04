@@ -349,7 +349,8 @@ where
         let service = self.service();
         let store = service.store();
         let child_branch = temporary_skill_branch_name(&request.base_branch, &request.skill_name);
-        ensure_skill_invocation_node(store, &request.parent_tool_use_id, &request.skill_name)?;
+        ensure_skill_invocation_node(store, &request.parent_tool_use_id, &request.skill_name)
+            .await?;
         let child_session_anchor_id = append_skill_session_anchor(store, &request).await?;
 
         store
@@ -388,7 +389,7 @@ where
     }
 }
 
-fn ensure_skill_invocation_node<S>(
+async fn ensure_skill_invocation_node<S>(
     store: &S,
     reference: &str,
     skill_name: &str,
@@ -398,6 +399,7 @@ where
 {
     let node = store
         .get_node(reference)
+        .await
         .map_err(|source| LlmError::Memory {
             source: Box::new(source),
         })?;
@@ -422,7 +424,7 @@ async fn append_skill_session_anchor<S>(
 where
     S: NodeStore,
 {
-    let inherited = resolve_parent_session_anchor(store, &request.parent_tool_use_id)?;
+    let inherited = resolve_parent_session_anchor(store, &request.parent_tool_use_id).await?;
     store
         .append(NewNode {
             parent: request.parent_tool_use_id.clone(),
@@ -455,7 +457,7 @@ where
         })
 }
 
-fn resolve_parent_session_anchor<S>(
+async fn resolve_parent_session_anchor<S>(
     store: &S,
     start_id: &str,
 ) -> std::result::Result<SessionAnchor, LlmError>
@@ -464,6 +466,7 @@ where
 {
     let mut node = store
         .get_node(start_id)
+        .await
         .map_err(|source| LlmError::Memory {
             source: Box::new(source),
         })?;
@@ -483,6 +486,7 @@ where
 
         node = store
             .get_node(&node.parent)
+            .await
             .map_err(|source| LlmError::Memory {
                 source: Box::new(source),
             })?;

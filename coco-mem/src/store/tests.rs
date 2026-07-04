@@ -166,7 +166,7 @@ where
     F: TestStoreFactory,
 {
     let store = F::create().await;
-    let root = store.get_node(&store.root_id()).unwrap();
+    let root = store.get_node(&store.root_id()).await.unwrap();
 
     let Kind::Text(text) = &root.kind else {
         panic!("expected text root node");
@@ -191,7 +191,7 @@ where
         .await
         .unwrap();
 
-    let stored = store.get_node(&child_id).unwrap();
+    let stored = store.get_node(&child_id).await.unwrap();
     assert_eq!(stored.parent, session_id);
     let children = store.list_children(&stored.parent).unwrap();
     assert!(children.iter().any(|node| node.id == child_id));
@@ -659,7 +659,7 @@ where
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
     let err = store.get_session_state("main").await.unwrap_err();
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
-    assert_eq!(store.get_node(&branch_head).unwrap().id, branch_head);
+    assert_eq!(store.get_node(&branch_head).await.unwrap().id, branch_head);
 }
 
 async fn assert_delete_branch_rejects_missing_branch<F>()
@@ -1226,7 +1226,7 @@ where
     let root_id = store.root_id();
     let branch_head = store.fork("draft", &root_id).await.unwrap();
 
-    let node = store.get_node("draft").unwrap();
+    let node = store.get_node("draft").await.unwrap();
 
     assert_eq!(node.id, branch_head);
 }
@@ -1249,7 +1249,7 @@ where
     store.delete_branch("draft").await.unwrap();
 
     let prefix = &draft_node[..8];
-    let node = store.get_node(prefix).unwrap();
+    let node = store.get_node(prefix).await.unwrap();
 
     assert_eq!(node.id, draft_node);
 }
@@ -1280,7 +1280,7 @@ where
         .find_map(|(prefix, matches)| (matches.len() > 1).then_some((prefix, matches)))
         .expect("expected at least one ambiguous one-character prefix");
 
-    let err = store.get_node(&ambiguous.0).unwrap_err();
+    let err = store.get_node(&ambiguous.0).await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -1409,8 +1409,8 @@ where
         .append(make_text_node(&session_id, "child"))
         .await
         .unwrap();
-    let old_child = store.get_node(&child_id).unwrap();
-    let old_session = store.get_node(&session_id).unwrap();
+    let old_child = store.get_node(&child_id).await.unwrap();
+    let old_session = store.get_node(&session_id).await.unwrap();
     store.fork("main", &child_id).await.unwrap();
 
     let new_head = store
@@ -1466,7 +1466,7 @@ where
         .append(make_text_node(&session_id, "child"))
         .await
         .unwrap();
-    let old_session = store.get_node(&session_id).unwrap();
+    let old_session = store.get_node(&session_id).await.unwrap();
     store.fork("main", &child_id).await.unwrap();
 
     let new_head = store
@@ -1614,8 +1614,8 @@ where
         .append(make_text_node(&session_id, "child"))
         .await
         .unwrap();
-    let session_created_at = store.get_node(&session_id).unwrap().created_at;
-    let child_created_at = store.get_node(&child_id).unwrap().created_at;
+    let session_created_at = store.get_node(&session_id).await.unwrap().created_at;
+    let child_created_at = store.get_node(&child_id).await.unwrap().created_at;
     store.fork("main", &child_id).await.unwrap();
 
     store
@@ -1739,7 +1739,7 @@ where
         .await
         .unwrap();
 
-    let node = store.get_node(&new_head).unwrap();
+    let node = store.get_node(&new_head).await.unwrap();
     let Kind::Anchor(anchor) = &node.kind else {
         panic!("expected session anchor");
     };

@@ -908,7 +908,7 @@ async fn llm_engine_retries_job_from_before_failure_node() {
     assert_eq!(recovered.status, JobStatus::Finished);
     assert_eq!(recovered.work_branch, "main");
     assert_eq!(
-        store.get_node(&recovered.head).unwrap().kind,
+        store.get_node(&recovered.head).await.unwrap().kind,
         Kind::Text("recovered".to_owned())
     );
 }
@@ -943,7 +943,7 @@ async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session(
 
     assert_eq!(recovered.status, JobStatus::Finished);
     assert_eq!(
-        store.get_node(&recovered.head).unwrap().kind,
+        store.get_node(&recovered.head).await.unwrap().kind,
         Kind::Text("recovered".to_owned())
     );
     assert_eq!(
@@ -1104,7 +1104,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
     assert_eq!(recovered.work_branch, "main");
     assert_eq!(store.get_branch_head("main").await.unwrap(), recovered.head);
     assert_eq!(
-        store.get_node(&recovered.head).unwrap().kind,
+        store.get_node(&recovered.head).await.unwrap().kind,
         Kind::Text("recovered by c".to_owned())
     );
     assert!(
@@ -1536,7 +1536,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
         .unwrap();
 
     assert_eq!(result.text, "child result");
-    let response_node = store.get_node(&result.response_node_id).unwrap();
+    let response_node = store.get_node(&result.response_node_id).await.unwrap();
     assert!(matches!(
         response_node.kind,
         Kind::Text(ref text) if text == "child result"

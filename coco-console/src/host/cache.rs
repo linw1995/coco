@@ -380,7 +380,7 @@ where
                 (node_id, Vec::new())
             }
         };
-        match self.source.clone().get_node(&node_id) {
+        match self.source.clone().get_node(&node_id).await {
             Ok(node) => Ok(Some(graph_node_from_node(node, labels, Vec::new()))),
             Err(_) => Ok(None),
         }
@@ -486,7 +486,7 @@ where
             .await?;
         let mut time_ticks = Vec::with_capacity(facts.nodes.len());
         for node in &facts.nodes {
-            let store_node = self.source.clone().get_node(&node.node_id)?;
+            let store_node = self.source.clone().get_node(&node.node_id).await?;
             time_ticks.push(MaterializedGraphShellTick {
                 time_ns: store_node.created_at.as_nanosecond(),
                 label: store_node.created_at.to_string(),
@@ -1201,12 +1201,16 @@ where
         }
     }
 
-    fn get_node(self, node_id: &str) -> crate::Result<coco_mem::Node> {
+    async fn get_node(self, node_id: &str) -> crate::Result<coco_mem::Node> {
         match self {
-            Self::Store(store) => store.get_node(node_id).context(crate::error::StoreSnafu),
-            Self::PersistentStore(store) => {
-                store.get_node(node_id).context(crate::error::StoreSnafu)
-            }
+            Self::Store(store) => store
+                .get_node(node_id)
+                .await
+                .context(crate::error::StoreSnafu),
+            Self::PersistentStore(store) => store
+                .get_node(node_id)
+                .await
+                .context(crate::error::StoreSnafu),
         }
     }
 
@@ -1882,7 +1886,7 @@ mod tests {
         let written = written
             .expect("store write should not wait for graph transaction release")
             .unwrap();
-        assert_eq!(writer.get_node(&written).unwrap().id, written);
+        assert_eq!(writer.get_node(&written).await.unwrap().id, written);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -1939,7 +1943,7 @@ mod tests {
         release_transaction_tx.send(()).unwrap();
         transaction.join().unwrap();
         write.await.unwrap();
-        assert_eq!(writer.get_node(&written).unwrap().id, written);
+        assert_eq!(writer.get_node(&written).await.unwrap().id, written);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

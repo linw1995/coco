@@ -72,12 +72,18 @@ impl NodeStore for DeepChainStore {
         panic!("deep chain test does not read logs")
     }
 
-    fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
-        Ok(self
-            .nodes
-            .get(id)
-            .unwrap_or_else(|| panic!("node {id:?} should exist"))
-            .clone())
+    fn get_node<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = coco_mem::StoreResult<Node>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Ok(self
+                .nodes
+                .get(id)
+                .unwrap_or_else(|| panic!("node {id:?} should exist"))
+                .clone())
+        })
     }
 
     fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
@@ -773,8 +779,8 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     assert!(!skill_context.nodes.iter().any(|node| node.id == tool_use));
 }
 
-#[test]
-fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
+#[tokio::test]
+async fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
     let mut store = DeepChainStore::default();
     let created_at = "1970-01-01T00:00:00Z".parse().unwrap();
     let session = Node::new(
@@ -827,8 +833,9 @@ fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
         store.insert(node);
     }
 
-    let nodes =
-        visible_skill_invocation_subtree_nodes(&store, GraphMode::All, &tool_use_id).unwrap();
+    let nodes = visible_skill_invocation_subtree_nodes(&store, GraphMode::All, &tool_use_id)
+        .await
+        .unwrap();
 
     assert_eq!(nodes.len(), depth + 1);
     assert_eq!(

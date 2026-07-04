@@ -2219,7 +2219,7 @@ where
         head: &str,
         text: &str,
     ) -> Result<String> {
-        let node = self.store.get_node(head).context(MemorySnafu)?;
+        let node = self.store.get_node(head).await.context(MemorySnafu)?;
         if matches!(&node.kind, Kind::Text(last_text) if last_text == text) {
             return Ok(head.to_owned());
         }
@@ -3376,7 +3376,7 @@ async fn append_skill_results_after_tool_result(
     trace_node_store: &TraceNodeStore,
     tool_result_node_id: &str,
 ) -> std::result::Result<Vec<String>, BackendError> {
-    let tool_result_node = trace_node_store.get_node(tool_result_node_id)?;
+    let tool_result_node = trace_node_store.get_node(tool_result_node_id).await?;
     let Kind::ToolResult(tool_results) = &tool_result_node.kind else {
         return Ok(vec![]);
     };
@@ -3458,7 +3458,7 @@ async fn append_backend_event_nodes(
             )
             .await?
             {
-                let skill_result = trace_node_store.get_node(&skill_result_node_id)?;
+                let skill_result = trace_node_store.get_node(&skill_result_node_id).await?;
                 appended.push((skill_result_node_id, skill_result.kind));
             }
         }
@@ -6551,7 +6551,7 @@ mod tests {
             .await
             .unwrap();
 
-        let anchor = store.get_node(&draft_session.anchor_id).unwrap();
+        let anchor = store.get_node(&draft_session.anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = anchor.kind else {
             panic!("expected anchor node");
         };
@@ -6572,7 +6572,7 @@ mod tests {
 
         let session = service.create_session(config).await.unwrap();
 
-        let anchor = store.get_node(&session.anchor_id).unwrap();
+        let anchor = store.get_node(&session.anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = anchor.kind else {
             panic!("expected anchor node");
         };
@@ -6709,7 +6709,7 @@ mod tests {
             .await
             .unwrap();
 
-        let node = store.get_node(&anchor_id).unwrap();
+        let node = store.get_node(&anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = node.kind else {
             panic!("expected anchor node");
         };
@@ -6888,7 +6888,7 @@ mod tests {
             other => panic!("expected backend error, got {other:?}"),
         };
 
-        let failure = store.get_node(&error_node_id).unwrap();
+        let failure = store.get_node(&error_node_id).await.unwrap();
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
         assert_eq!(node_execution_id(&failure), Some(execution_id.as_str()));
@@ -7148,7 +7148,7 @@ mod tests {
             } => (context.error_node_id, context.retry_from_node_id),
             other => panic!("expected backend error, got {other:?}"),
         };
-        let failure = store.get_node(&error_node_id).unwrap();
+        let failure = store.get_node(&error_node_id).await.unwrap();
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
         let prompt_anchor_id = retry_from_node_id.clone();
@@ -7169,7 +7169,7 @@ mod tests {
         let recovered = service.run(request("main")).await.unwrap();
         assert_eq!(recovered.text, "recovered");
         assert_eq!(recovered.anchor_id, prompt_anchor_id);
-        let recovered_node = store.get_node(&recovered.response_node_id).unwrap();
+        let recovered_node = store.get_node(&recovered.response_node_id).await.unwrap();
         assert_eq!(recovered_node.parent, prompt_anchor_id);
     }
 
@@ -7201,7 +7201,7 @@ mod tests {
             resumed.response_node_id
         );
 
-        let resumed_node = store.get_node(&resumed.response_node_id).unwrap();
+        let resumed_node = store.get_node(&resumed.response_node_id).await.unwrap();
         assert_eq!(resumed_node.parent, first.response_node_id);
     }
 
@@ -7250,7 +7250,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(recovered.text, "recovered");
-        let recovered_node = store.get_node(&recovered.response_node_id).unwrap();
+        let recovered_node = store.get_node(&recovered.response_node_id).await.unwrap();
         assert_eq!(recovered_node.parent, retry_from_node_id);
 
         let calls = calls.lock().await;
@@ -7301,7 +7301,7 @@ mod tests {
         );
         assert_ne!(old_head.response_node_id, resumed.response_node_id);
 
-        let prompt_anchor = store.get_node(&resumed.anchor_id).unwrap();
+        let prompt_anchor = store.get_node(&resumed.anchor_id).await.unwrap();
         assert_eq!(prompt_anchor.parent, session.anchor_id);
         assert!(matches!(
             &prompt_anchor.kind,
@@ -7418,7 +7418,7 @@ mod tests {
         assert_eq!(merged.source_head_id, source_head_id);
         assert_ne!(merged.merged_anchor_id, pr.base_head_id);
 
-        let merged_anchor = store.get_node(&merged.merged_anchor_id).unwrap();
+        let merged_anchor = store.get_node(&merged.merged_anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = merged_anchor.kind else {
             panic!("expected anchor node");
         };
@@ -7484,7 +7484,7 @@ mod tests {
         assert_eq!(feedback.target_branch, "base");
         assert_eq!(feedback.base_head_id, base_feedback_id);
         assert_eq!(feedback.source_anchor_id, base_feedback_id);
-        let feedback_anchor = store.get_node(&feedback.feedback_anchor_id).unwrap();
+        let feedback_anchor = store.get_node(&feedback.feedback_anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = feedback_anchor.kind else {
             panic!("expected anchor node");
         };
@@ -7939,8 +7939,8 @@ mod tests {
             store.get_branch_head("main").await.unwrap(),
             context.retry_from_node_id
         );
-        let failure = store.get_node(&context.error_node_id).unwrap();
-        let tool_result = store.get_node(&failure.parent).unwrap();
+        let failure = store.get_node(&context.error_node_id).await.unwrap();
+        let tool_result = store.get_node(&failure.parent).await.unwrap();
         assert!(
             tool_result
                 .kind
@@ -7954,7 +7954,7 @@ mod tests {
                 })
         );
 
-        let tool_use = store.get_node(&tool_result.parent).unwrap();
+        let tool_use = store.get_node(&tool_result.parent).await.unwrap();
         assert!(tool_use.kind.as_tool_uses().is_some_and(|tool_uses| {
             let uses = tool_uses.iter().collect::<Vec<_>>();
             uses.len() == 2
@@ -8582,8 +8582,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(appended.len(), 2);
-        let tool_result = store.get_node(&appended[0].0).unwrap();
-        let skill_result = store.get_node(&appended[1].0).unwrap();
+        let tool_result = store.get_node(&appended[0].0).await.unwrap();
+        let skill_result = store.get_node(&appended[1].0).await.unwrap();
         assert!(matches!(tool_result.kind, Kind::ToolResult(_)));
         assert_eq!(skill_result.parent, tool_result.id);
         let Kind::Anchor(anchor) = &skill_result.kind else {
@@ -8671,8 +8671,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(appended.len(), 2);
-        let tool_result = store.get_node(&appended[0].0).unwrap();
-        let skill_result = store.get_node(&appended[1].0).unwrap();
+        let tool_result = store.get_node(&appended[0].0).await.unwrap();
+        let skill_result = store.get_node(&appended[1].0).await.unwrap();
         assert!(matches!(tool_result.kind, Kind::ToolResult(_)));
         assert_eq!(skill_result.parent, tool_result.id);
         let Kind::Anchor(anchor) = &skill_result.kind else {
@@ -8998,23 +8998,23 @@ mod tests {
             context.retry_from_node_id
         );
 
-        let failure = store.get_node(&context.error_node_id).unwrap();
+        let failure = store.get_node(&context.error_node_id).await.unwrap();
         assert!(matches!(
             &failure.kind,
             Kind::Failure(text) if text == "MaxTurnError: (reached max turn limit: 8)"
         ));
 
-        let assistant = store.get_node(&failure.parent).unwrap();
+        let assistant = store.get_node(&failure.parent).await.unwrap();
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "trying again"));
 
-        let tool_result = store.get_node(&assistant.parent).unwrap();
+        let tool_result = store.get_node(&assistant.parent).await.unwrap();
         assert!(kind_has_tool_result(
             &tool_result.kind,
             "tool-call-1",
             "exit_status: 0\nstdout:\n\nstderr:\n"
         ));
 
-        let tool_use = store.get_node(&tool_result.parent).unwrap();
+        let tool_use = store.get_node(&tool_result.parent).await.unwrap();
         assert!(kind_has_tool_use(
             &tool_use.kind,
             "tool-call-1",
@@ -9055,10 +9055,10 @@ mod tests {
             context.retry_from_node_id
         );
 
-        let failure = store.get_node(&context.error_node_id).unwrap();
-        let assistant = store.get_node(&failure.parent).unwrap();
-        let tool_result = store.get_node(&assistant.parent).unwrap();
-        let tool_use = store.get_node(&tool_result.parent).unwrap();
+        let failure = store.get_node(&context.error_node_id).await.unwrap();
+        let assistant = store.get_node(&failure.parent).await.unwrap();
+        let tool_result = store.get_node(&assistant.parent).await.unwrap();
+        let tool_use = store.get_node(&tool_result.parent).await.unwrap();
 
         assert!(tool_use.created_at < tool_result.created_at);
         assert!(tool_result.created_at < assistant.created_at);
