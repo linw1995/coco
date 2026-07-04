@@ -6543,35 +6543,32 @@ async fn daemon_startup_resumes_incomplete_jobs() {
     }
 }
 
-#[test]
-fn resolve_session_config_reads_coco_prefixed_env_only() {
-    let config = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[
-                ("COCO_PROVIDER", "anthropic"),
-                ("COCO_MODEL", "claude-sonnet-4-20250514"),
-            ],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: None,
-                    tools: vec![],
-                    enable_all_tools: false,
-                    enable_coco_shim: false,
-                    disable_coco_shim: false,
-                })
-                .unwrap()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_reads_coco_prefixed_env_only() {
+    let config = with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "anthropic"),
+            ("COCO_MODEL", "claude-sonnet-4-20250514"),
+        ],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: None,
+                tools: vec![],
+                enable_all_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
+            })
+            .unwrap()
+        },
+    )
+    .await;
 
     assert_eq!(config.provider, Provider::ChatGpt);
     assert_eq!(config.model, "gpt-5.4");
