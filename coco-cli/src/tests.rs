@@ -6679,34 +6679,31 @@ async fn resolve_session_config_enable_all_tools_overrides_env_tools() {
     assert_eq!(tool_names(&config.tools), all_builtin_tool_names());
 }
 
-#[test]
-fn resolve_session_config_parses_additional_params_json_object() {
-    let config = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: Some(
-                        "{\"service_tier\":\"priority\",\"reasoning_effort\":\"low\"}".to_owned(),
-                    ),
-                    tools: vec![],
-                    enable_all_tools: false,
-                    enable_coco_shim: false,
-                    disable_coco_shim: false,
-                })
-                .unwrap()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_parses_additional_params_json_object() {
+    let config = with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: Some(
+                    "{\"service_tier\":\"priority\",\"reasoning_effort\":\"low\"}".to_owned(),
+                ),
+                tools: vec![],
+                enable_all_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
+            })
+            .unwrap()
+        },
+    )
+    .await;
 
     assert_eq!(
         config.additional_params,
