@@ -222,13 +222,13 @@ impl BranchStore for MaterializationSourceSnapshot {
         std::future::ready(Self::read_only_error())
     }
 
-    fn set_branch_head(
-        &self,
-        _name: &str,
-        _expected_old_head: &str,
-        _new_head: &str,
-    ) -> coco_mem::StoreResult<()> {
-        Self::read_only_error()
+    fn set_branch_head<'a>(
+        &'a self,
+        _name: &'a str,
+        _expected_old_head: &'a str,
+        _new_head: &'a str,
+    ) -> impl Future<Output = coco_mem::StoreResult<()>> + Send + 'a {
+        std::future::ready(Self::read_only_error())
     }
 }
 
@@ -6101,15 +6101,15 @@ mod tests {
             }))
         }
 
-        fn set_branch_head(
-            &self,
-            _name: &str,
-            _expected_old_head: &str,
-            _new_head: &str,
-        ) -> coco_mem::StoreResult<()> {
-            Err(coco_mem::StoreError::StoreReadOnly {
+        fn set_branch_head<'a>(
+            &'a self,
+            _name: &'a str,
+            _expected_old_head: &'a str,
+            _new_head: &'a str,
+        ) -> impl Future<Output = coco_mem::StoreResult<()>> + Send + 'a {
+            std::future::ready(Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
-            })
+            }))
         }
     }
 

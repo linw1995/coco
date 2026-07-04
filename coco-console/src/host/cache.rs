@@ -1388,7 +1388,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_branch_head("main", &session, &text).unwrap();
+        store
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
 
         (store, session, text)
     }
@@ -1547,7 +1550,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_branch_head("main", &text, &next_text).unwrap();
+        store
+            .set_branch_head("main", &text, &next_text)
+            .await
+            .unwrap();
 
         let refreshed = cache.current_snapshot(GraphMode::All).await;
 
@@ -1575,7 +1581,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_branch_head("main", &text, &next_text).unwrap();
+        store
+            .set_branch_head("main", &text, &next_text)
+            .await
+            .unwrap();
         let third = cache.current_snapshot(GraphMode::All).await;
 
         assert!(!Arc::ptr_eq(&first, &third));
@@ -1698,7 +1707,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let snapshot = cache.current_snapshot(GraphMode::All).await;
@@ -1740,7 +1752,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -2002,7 +2017,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2136,7 +2154,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let initial_version = publisher.current_version();
         let initial = cache
@@ -2278,7 +2299,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2399,7 +2423,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2532,7 +2559,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2662,7 +2692,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2705,7 +2738,10 @@ mod tests {
         let skill_lane = format!("skill {}", crate::graph::shorten_id(&result));
         assert!(initial.lanes.iter().any(|lane| lane.label == skill_lane));
 
-        writer.set_branch_head("main", &tool_use, &session).unwrap();
+        writer
+            .set_branch_head("main", &tool_use, &session)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -2767,7 +2803,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let first_invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2934,7 +2973,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -3085,7 +3127,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &child).unwrap();
+        writer
+            .set_branch_head("main", &session, &child)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -3129,7 +3174,10 @@ mod tests {
         assert!(initial.nodes.iter().any(|node| node.id == invocation));
         assert!(initial.nodes.iter().any(|node| node.id == result));
 
-        writer.set_branch_head("main", &child, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &child, &tool_use)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -3196,7 +3244,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -3230,7 +3281,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &tool_use, &next).unwrap();
+        writer
+            .set_branch_head("main", &tool_use, &next)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -3311,6 +3365,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_tool_use)
+            .await
             .unwrap();
         let main_invocation = writer
             .append(NewNode {
@@ -3413,6 +3468,7 @@ mod tests {
 
         writer
             .set_branch_head("main", &main_tool_use, &session)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -3485,7 +3541,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -3681,6 +3740,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_merge)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -3767,6 +3827,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -3779,6 +3840,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &merge_anchor, &session)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -3841,7 +3903,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         cache.current_snapshot(GraphMode::All).await;
@@ -3856,7 +3921,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &text, &next).unwrap();
+        writer.set_branch_head("main", &text, &next).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -3928,7 +3993,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &first).unwrap();
+        writer
+            .set_branch_head("main", &session, &first)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -3943,7 +4011,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &first, &second).unwrap();
+        writer
+            .set_branch_head("main", &first, &second)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4009,7 +4080,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4114,6 +4188,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &merge_anchor)
+            .await
             .unwrap();
         writer.fork("orphan branch", &session).await.unwrap();
         let reserved_label_branch_head = writer
@@ -4127,6 +4202,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("orphan branch", &session, &reserved_label_branch_head)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4209,7 +4285,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &shared).unwrap();
+        writer
+            .set_branch_head("main", &session, &shared)
+            .await
+            .unwrap();
         writer.fork("feature", &shared).await.unwrap();
         let main_head = writer
             .append(NewNode {
@@ -4220,7 +4299,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &shared, &main_head).unwrap();
+        writer
+            .set_branch_head("main", &shared, &main_head)
+            .await
+            .unwrap();
         let feature_head = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -4232,6 +4314,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("feature", &shared, &feature_head)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4321,7 +4404,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &shared).unwrap();
+        writer
+            .set_branch_head("main", &session, &shared)
+            .await
+            .unwrap();
         let orphan_parent = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -4348,6 +4434,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &shared, &merge_anchor)
+            .await
             .unwrap();
         writer.fork("beta", &shared).await.unwrap();
         let beta_first = writer
@@ -4361,6 +4448,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("beta", &shared, &beta_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4471,7 +4559,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4625,6 +4716,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("skill research", &session, &next)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4694,6 +4786,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -4724,6 +4817,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merged = cache
@@ -4761,6 +4855,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head(&orphan_lane, &session, &branch_next)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4870,7 +4965,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &root, &text).unwrap();
+        writer.set_branch_head("main", &root, &text).await.unwrap();
         publisher.mark_changed();
         let non_empty_version = publisher.current_version();
         let non_empty = cache
@@ -5009,7 +5104,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         writer.fork("empty", &root).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -5071,7 +5169,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -5142,7 +5243,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -5153,7 +5257,7 @@ mod tests {
             .await
             .unwrap();
 
-        writer.set_branch_head("main", &text, &root).unwrap();
+        writer.set_branch_head("main", &text, &root).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -5229,7 +5333,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -5300,7 +5407,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -5350,7 +5460,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &first).unwrap();
+        writer
+            .set_branch_head("main", &session, &first)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -5363,7 +5476,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &first, &sibling).unwrap();
+        writer
+            .set_branch_head("main", &first, &sibling)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -5525,6 +5641,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_hidden)
+            .await
             .unwrap();
         writer.fork("draft", &session).await.unwrap();
         let draft_hidden = writer
@@ -5538,6 +5655,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_hidden)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -5561,6 +5679,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_hidden, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -5639,6 +5758,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         writer.fork("draft", &session).await.unwrap();
         let draft_first = writer
@@ -5652,6 +5772,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_first)
+            .await
             .unwrap();
         let draft_second = writer
             .append(NewNode {
@@ -5664,6 +5785,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &draft_first, &draft_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -5687,6 +5809,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -5769,6 +5892,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -5801,6 +5925,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -5871,6 +5996,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -5935,6 +6061,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -6028,6 +6155,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -6058,6 +6186,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -6148,7 +6277,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &shared).unwrap();
+        writer
+            .set_branch_head("main", &session, &shared)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -6187,6 +6319,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &shared, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -6299,6 +6432,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -6347,6 +6481,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -6476,6 +6611,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -6515,6 +6651,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -6614,6 +6751,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -6644,6 +6782,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -6664,6 +6803,7 @@ mod tests {
 
         writer
             .set_branch_head("main", &merge_anchor, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let rewind_version = publisher.current_version();
@@ -6781,6 +6921,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -6882,6 +7023,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -6927,6 +7069,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_second, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7003,7 +7146,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &first).unwrap();
+        writer
+            .set_branch_head("main", &session, &first)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
@@ -7018,7 +7164,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &first, &second).unwrap();
+        writer
+            .set_branch_head("main", &first, &second)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -7097,7 +7246,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -7182,6 +7334,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &first_prompt)
+            .await
             .unwrap();
         let second_prompt = writer
             .append(NewNode {
@@ -7200,6 +7353,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &first_prompt, &second_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -7208,6 +7362,7 @@ mod tests {
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer
             .set_branch_head("main", &second_prompt, &first_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7283,6 +7438,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
+            .await
             .unwrap();
         writer.fork("draft", &session).await.unwrap();
         let draft_anchor = writer
@@ -7302,6 +7458,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -7383,6 +7540,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
+            .await
             .unwrap();
         let main_followup = writer
             .append(NewNode {
@@ -7401,6 +7559,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_anchor, &main_followup)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -7425,6 +7584,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7522,6 +7682,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &old_session, &old_prompt)
+            .await
             .unwrap();
         let current_session = writer
             .append(NewNode {
@@ -7534,6 +7695,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &old_prompt, &current_session)
+            .await
             .unwrap();
         let main_anchor = writer
             .append(NewNode {
@@ -7552,6 +7714,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &current_session, &main_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -7576,6 +7739,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &current_session, &draft_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7652,6 +7816,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &old_session, &old_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -7669,6 +7834,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &old_prompt, &current_session)
+            .await
             .unwrap();
         let current_prompt = writer
             .append(NewNode {
@@ -7687,6 +7853,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &current_session, &current_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7763,6 +7930,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -7779,6 +7947,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("hidden", &root, &hidden_text)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7854,6 +8023,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -7949,6 +8119,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_hidden)
+            .await
             .unwrap();
         writer.fork("draft", &session).await.unwrap();
         let draft_anchor = writer
@@ -7977,6 +8148,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_hidden)
+            .await
             .unwrap();
         let draft_second = writer
             .append(NewNode {
@@ -7995,6 +8167,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &draft_hidden, &draft_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -8018,6 +8191,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_hidden, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8145,6 +8319,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &current_session, &current_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
@@ -8165,6 +8340,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &current_prompt, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8234,7 +8410,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &first).unwrap();
+        writer
+            .set_branch_head("main", &session, &first)
+            .await
+            .unwrap();
         let second = writer
             .append(NewNode {
                 parent: first.clone(),
@@ -8244,13 +8423,19 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &first, &second).unwrap();
+        writer
+            .set_branch_head("main", &first, &second)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
-        writer.set_branch_head("main", &second, &first).unwrap();
+        writer
+            .set_branch_head("main", &second, &first)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8315,6 +8500,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -8327,6 +8513,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
         writer.fork("draft", &main_second).await.unwrap();
         let draft_first = writer
@@ -8340,6 +8527,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &main_second, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -8348,6 +8536,7 @@ mod tests {
         let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer
             .set_branch_head("main", &main_second, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8450,6 +8639,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
@@ -8463,6 +8653,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
+            .await
             .unwrap();
         let orphan_parent = writer
             .append(NewNode {
@@ -8490,6 +8681,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &draft_first, &draft_merge)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -8562,6 +8754,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
@@ -8575,6 +8768,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -8592,6 +8786,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
         let draft_second = writer
             .append(NewNode {
@@ -8604,6 +8799,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &draft_first, &draft_second)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8668,6 +8864,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -8680,6 +8877,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -8698,6 +8896,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8774,7 +8973,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("zeta", &session, &shared).unwrap();
+        writer
+            .set_branch_head("zeta", &session, &shared)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -8894,7 +9096,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("zeta", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("zeta", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
@@ -8988,6 +9193,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -9000,6 +9206,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -9024,6 +9231,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_merge)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -9104,6 +9312,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -9286,7 +9495,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &shared).unwrap();
+        writer
+            .set_branch_head("main", &session, &shared)
+            .await
+            .unwrap();
         writer.fork("draft", &shared).await.unwrap();
         publisher.mark_changed();
 
@@ -9302,7 +9514,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &shared, &main_next).unwrap();
+        writer
+            .set_branch_head("main", &shared, &main_next)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -9381,6 +9596,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         writer.fork("zeta", &main_first).await.unwrap();
         let zeta_first = writer
@@ -9394,6 +9610,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("zeta", &main_first, &zeta_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -9412,6 +9629,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("beta", &main_first, &beta_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -9512,6 +9730,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
@@ -9525,6 +9744,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -9594,6 +9814,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -9606,6 +9827,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
         writer.fork("draft", &main_second).await.unwrap();
         let draft_first = writer
@@ -9619,6 +9841,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("draft", &main_second, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -9727,6 +9950,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         writer.fork("beta", &main_first).await.unwrap();
         let beta_first = writer
@@ -9740,6 +9964,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("beta", &main_first, &beta_first)
+            .await
             .unwrap();
         writer.fork("zeta", &main_first).await.unwrap();
         let zeta_first = writer
@@ -9753,6 +9978,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("zeta", &main_first, &zeta_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -10282,7 +10508,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 

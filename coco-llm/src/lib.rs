@@ -1776,7 +1776,8 @@ where
                 &steps,
             )
             .await?;
-        self.move_branch_head(&resolved.branch, &original_head, &response_node_id)?;
+        self.move_branch_head(&resolved.branch, &original_head, &response_node_id)
+            .await?;
 
         tracing::info!(
             branch = %resolved.branch,
@@ -1856,7 +1857,8 @@ where
                 &steps,
             )
             .await?;
-        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
+        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)
+            .await?;
         tracing::warn!(
             branch = %resolved.branch,
             execution_id = %execution_id,
@@ -1925,7 +1927,8 @@ where
         let error_node_id = self
             .persist_backend_error(&resolved, &retry_from_node_id, &execution_id, &source)
             .await?;
-        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
+        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)
+            .await?;
         tracing::error!(
             branch = %resolved.branch,
             execution_id = %execution_id,
@@ -2061,6 +2064,7 @@ where
             .await?;
         self.store
             .set_branch_head(branch, &original_head, &anchor_id)
+            .await
             .context(MemorySnafu)?;
 
         Ok(anchor_id)
@@ -2228,13 +2232,19 @@ impl<B, S> LlmService<B, S>
 where
     S: BranchStore,
 {
-    fn move_branch_head(&self, branch: &str, current_head: &str, next_head: &str) -> Result<()> {
+    async fn move_branch_head(
+        &self,
+        branch: &str,
+        current_head: &str,
+        next_head: &str,
+    ) -> Result<()> {
         if current_head == next_head {
             return Ok(());
         }
 
         self.store
             .set_branch_head(branch, current_head, next_head)
+            .await
             .context(MemorySnafu)
     }
 }
@@ -5505,6 +5515,7 @@ mod tests {
                 .unwrap();
             store
                 .set_branch_head("main", &session_head, &tool_result_id)
+                .await
                 .unwrap();
         }
 
@@ -7345,6 +7356,7 @@ mod tests {
             .unwrap();
         store
             .set_branch_head("base", &base_session.anchor_id, &review_anchor_id)
+            .await
             .unwrap();
 
         let pr = service.open_pull_request("main", "base").await.unwrap();
@@ -7441,6 +7453,7 @@ mod tests {
             .unwrap();
         store
             .set_branch_head("base", &base_session.anchor_id, &base_feedback_id)
+            .await
             .unwrap();
 
         let feedback = service
@@ -7502,6 +7515,7 @@ mod tests {
             .unwrap();
         store
             .set_branch_head("base", &base_session.anchor_id, &newer_feedback_id)
+            .await
             .unwrap();
         service.open_pull_request("main", "base").await.unwrap();
 

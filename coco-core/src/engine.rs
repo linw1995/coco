@@ -780,7 +780,8 @@ where
         let root_head = self.service.store().get_branch_head(&job.branch)?;
         self.service
             .store()
-            .set_branch_head(&job.branch, &root_head, &response_head)?;
+            .set_branch_head(&job.branch, &root_head, &response_head)
+            .await?;
         let job = self
             .service
             .store()

@@ -296,7 +296,7 @@ async fn graph_snapshot_contains_primary_and_merge_edges() {
         })
         .await
         .unwrap();
-    store.set_branch_head("main", &left, &merged).unwrap();
+    store.set_branch_head("main", &left, &merged).await.unwrap();
     store.fork("draft", &left).await.unwrap();
     let draft = store
         .append(NewNode {
@@ -307,7 +307,7 @@ async fn graph_snapshot_contains_primary_and_merge_edges() {
         })
         .await
         .unwrap();
-    store.set_branch_head("draft", &left, &draft).unwrap();
+    store.set_branch_head("draft", &left, &draft).await.unwrap();
 
     let snapshot = build_graph_snapshot(&store, 7).unwrap();
 
@@ -516,7 +516,10 @@ async fn graph_snapshot_contains_shadow_parent_edges() {
         })
         .await
         .unwrap();
-    store.set_branch_head("main", &session, &prompt).unwrap();
+    store
+        .set_branch_head("main", &session, &prompt)
+        .await
+        .unwrap();
 
     let snapshot = build_graph_snapshot(&store, 8).unwrap();
 
@@ -608,9 +611,11 @@ async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
         .unwrap();
     store
         .set_branch_head("main", &session, &merge_anchor)
+        .await
         .unwrap();
     store
         .set_branch_head("draft", &session, &draft_hidden)
+        .await
         .unwrap();
 
     let snapshot = build_graph_snapshot_with_mode(&store, 11, GraphMode::Anchors).unwrap();
@@ -675,7 +680,10 @@ async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
         })
         .await
         .unwrap();
-    store.set_branch_head("main", &session, &tool_use).unwrap();
+    store
+        .set_branch_head("main", &session, &tool_use)
+        .await
+        .unwrap();
     let ignored_child = store
         .append(NewNode {
             parent: tool_use.clone(),
@@ -889,6 +897,7 @@ async fn node_details_include_nodes_from_same_provider_context() {
         .unwrap();
     store
         .set_branch_head("main", &first_session, &prompt)
+        .await
         .unwrap();
 
     let snapshot = build_graph_snapshot_with_mode(&store, 32, GraphMode::Anchors).unwrap();
@@ -1014,6 +1023,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
         .unwrap();
     store
         .set_branch_head("main", &session, &main_prompt)
+        .await
         .unwrap();
 
     store.fork("review", &shared_prompt).await.unwrap();
@@ -1043,6 +1053,7 @@ async fn provider_context_list_uses_one_head_to_context_start_path() {
         .unwrap();
     store
         .set_branch_head("review", &shared_prompt, &review_prompt)
+        .await
         .unwrap();
 
     let snapshot = build_graph_snapshot_with_mode(&store, 33, GraphMode::Anchors).unwrap();
@@ -1124,6 +1135,7 @@ async fn provider_context_id_stays_stable_when_branch_head_moves() {
         .unwrap();
     store
         .set_branch_head("main", &session, &first_prompt)
+        .await
         .unwrap();
 
     let first_snapshot = build_graph_snapshot_with_mode(&store, 35, GraphMode::Anchors).unwrap();
@@ -1151,6 +1163,7 @@ async fn provider_context_id_stays_stable_when_branch_head_moves() {
         .unwrap();
     store
         .set_branch_head("main", &first_prompt, &next_prompt)
+        .await
         .unwrap();
 
     let next_snapshot = build_graph_snapshot_with_mode(&store, 36, GraphMode::Anchors).unwrap();
@@ -1206,6 +1219,7 @@ async fn provider_context_ids_preserve_unique_branch_names() {
         .unwrap();
     store
         .set_branch_head("draft/review", &session, &slash_prompt)
+        .await
         .unwrap();
 
     store.fork("draft-review", &session).await.unwrap();
@@ -1235,6 +1249,7 @@ async fn provider_context_ids_preserve_unique_branch_names() {
         .unwrap();
     store
         .set_branch_head("draft-review", &session, &dash_prompt)
+        .await
         .unwrap();
 
     let snapshot = build_graph_snapshot_with_mode(&store, 37, GraphMode::Anchors).unwrap();
@@ -1337,6 +1352,7 @@ async fn all_mode_provider_contexts_cover_older_visible_segments() {
         .unwrap();
     store
         .set_branch_head("main", &first_session, &new_prompt)
+        .await
         .unwrap();
 
     let snapshot = build_graph_snapshot_with_mode(&store, 34, GraphMode::All).unwrap();
@@ -1532,6 +1548,7 @@ async fn graph_snapshot_renders_content_for_visible_node_kinds() {
         .unwrap();
     store
         .set_branch_head("main", &empty_prompt_session, &failure)
+        .await
         .unwrap();
 
     let snapshot = build_graph_snapshot(&store, 10).unwrap();

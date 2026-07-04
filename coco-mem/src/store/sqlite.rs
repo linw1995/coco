@@ -743,6 +743,7 @@ impl SqliteStore {
         new_head: &str,
     ) -> Result<()> {
         self.ensure_writable()?;
+        let _write = self.database.inner.write.lock().await;
         let mut connection = self.connect().await?;
         update_branch_head_checked(
             &mut connection,
@@ -4323,13 +4324,13 @@ impl BranchStore for SqliteGraphStore {
         std::future::ready(self.ensure_read_only())
     }
 
-    fn set_branch_head(
-        &self,
-        _name: &str,
-        _expected_old_head: &str,
-        _new_head: &str,
-    ) -> Result<()> {
-        self.ensure_read_only()
+    fn set_branch_head<'a>(
+        &'a self,
+        _name: &'a str,
+        _expected_old_head: &'a str,
+        _new_head: &'a str,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        std::future::ready(self.ensure_read_only())
     }
 }
 
@@ -4425,8 +4426,14 @@ impl BranchStore for SqliteStore {
             .expect("SQLite store task should not panic")
     }
 
-    fn set_branch_head(&self, name: &str, expected_old_head: &str, new_head: &str) -> Result<()> {
-        self.block_on(self.set_branch_head_in_sqlite(name, expected_old_head, new_head))
+    async fn set_branch_head<'a>(
+        &'a self,
+        name: &'a str,
+        expected_old_head: &'a str,
+        new_head: &'a str,
+    ) -> Result<()> {
+        self.set_branch_head_in_sqlite(name, expected_old_head, new_head)
+            .await
     }
 }
 
@@ -5805,7 +5812,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.fork("main", &first).await.unwrap(), first);
-        store.set_branch_head("main", &first, &second).unwrap();
+        store
+            .set_branch_head("main", &first, &second)
+            .await
+            .unwrap();
         assert_eq!(store.get_branch_head("main").unwrap(), second);
 
         let reopened = SqliteStore::open(&path).await.unwrap();
@@ -5871,7 +5881,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_branch_head("main", &session, &text).unwrap();
+        store
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         store
             .set_session_state(
                 "main",

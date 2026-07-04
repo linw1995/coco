@@ -90,15 +90,16 @@ where
         self.notify_if_ok(self.inner.delete_branch(name).await)
     }
 
-    fn set_branch_head(
-        &self,
-        name: &str,
-        expected_old_head: &str,
-        new_head: &str,
+    async fn set_branch_head<'a>(
+        &'a self,
+        name: &'a str,
+        expected_old_head: &'a str,
+        new_head: &'a str,
     ) -> StoreResult<()> {
         self.notify_if_ok(
             self.inner
-                .set_branch_head(name, expected_old_head, new_head),
+                .set_branch_head(name, expected_old_head, new_head)
+                .await,
         )
     }
 }

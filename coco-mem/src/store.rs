@@ -59,12 +59,12 @@ pub trait BranchStore {
     ) -> impl Future<Output = StoreResult<()>> + Send + 'a;
 
     /// Moves a branch head when the expected current head matches.
-    fn set_branch_head(
-        &self,
-        name: &str,
-        expected_old_head: &str,
-        new_head: &str,
-    ) -> StoreResult<()>;
+    fn set_branch_head<'a>(
+        &'a self,
+        name: &'a str,
+        expected_old_head: &'a str,
+        new_head: &'a str,
+    ) -> impl Future<Output = StoreResult<()>> + Send + 'a;
 }
 
 /// Branch workflow session state storage API.
@@ -356,17 +356,19 @@ impl BranchStore for PersistentStore {
         }
     }
 
-    fn set_branch_head(
-        &self,
-        name: &str,
-        expected_old_head: &str,
-        new_head: &str,
+    async fn set_branch_head<'a>(
+        &'a self,
+        name: &'a str,
+        expected_old_head: &'a str,
+        new_head: &'a str,
     ) -> StoreResult<()> {
-        delegate_persistent_store!(
-            self,
-            store,
-            store.set_branch_head(name, expected_old_head, new_head)
-        )
+        match self {
+            Self::Sqlite(store) => {
+                store
+                    .set_branch_head(name, expected_old_head, new_head)
+                    .await
+            }
+        }
     }
 }
 

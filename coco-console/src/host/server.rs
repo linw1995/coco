@@ -1261,7 +1261,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_branch_head("main", &root, &first).unwrap();
+        store.set_branch_head("main", &root, &first).await.unwrap();
         let viewport = GraphViewportRequest::default();
         let state = app_state(store.clone(), publisher.clone());
         let snapshot = state.cache.current_snapshot(GraphMode::All).await;
@@ -1289,7 +1289,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_branch_head("main", &first, &next).unwrap();
+        store.set_branch_head("main", &first, &next).await.unwrap();
 
         let response = timeout(Duration::from_secs(1), task)
             .await
@@ -1334,7 +1334,10 @@ mod tests {
             parse_query(&query),
         ));
 
-        store.set_branch_head("main", &first, &second).unwrap();
+        store
+            .set_branch_head("main", &first, &second)
+            .await
+            .unwrap();
 
         let response = timeout(Duration::from_secs(1), task)
             .await
@@ -1704,7 +1707,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &root, &text).unwrap();
+        writer.set_branch_head("main", &root, &text).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
@@ -1745,7 +1748,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &root, &text).unwrap();
+        writer.set_branch_head("main", &root, &text).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
@@ -1953,7 +1956,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
             test_store().await,
@@ -2029,7 +2035,7 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &root, &text).unwrap();
+        writer.set_branch_head("main", &root, &text).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
@@ -2093,7 +2099,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
@@ -2161,7 +2170,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
@@ -2173,7 +2185,10 @@ mod tests {
             .unwrap(),
         };
         let initial = state.cache.current_snapshot(GraphMode::Anchors).await;
-        writer.set_branch_head("main", &prompt, &session).unwrap();
+        writer
+            .set_branch_head("main", &prompt, &session)
+            .await
+            .unwrap();
         publisher.mark_changed();
         state
             .cache
@@ -2285,7 +2300,10 @@ mod tests {
             })
             .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
             test_store().await,

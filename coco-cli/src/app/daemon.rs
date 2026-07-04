@@ -2344,7 +2344,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_branch_head("main", &root, &node).unwrap();
+        store.set_branch_head("main", &root, &node).await.unwrap();
         let llm = Arc::new(LlmService::new(
             store.clone(),
             BlockingOnceBackend::default(),
@@ -3105,7 +3105,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_branch_head("main", &base, &failure).unwrap();
+        store
+            .set_branch_head("main", &base, &failure)
+            .await
+            .unwrap();
 
         assert!(super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
     }

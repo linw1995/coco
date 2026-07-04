@@ -900,6 +900,7 @@ async fn llm_engine_retries_job_from_before_failure_node() {
         .unwrap();
     store
         .set_branch_head("main", &current_head, &failure_id)
+        .await
         .unwrap();
 
     let recovered = engine.drive_job(&job.job_id).await.unwrap();
@@ -976,6 +977,7 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
         .unwrap();
     store
         .set_branch_head("main", &current_head, &failure_id)
+        .await
         .unwrap();
 
     let snapshot = engine.drive_job(&job.job_id).await.unwrap();
@@ -1425,6 +1427,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
     let job = job.values().next().unwrap().clone();
     store
         .set_branch_head("main", &original_head, &job.base)
+        .await
         .unwrap();
     let tool_use_id = store
         .append(NewNode {
@@ -1444,6 +1447,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
         .unwrap();
     store
         .set_branch_head("main", &job.base, &tool_use_id)
+        .await
         .unwrap();
     let tool_result_id = store
         .append(NewNode {
@@ -1462,6 +1466,7 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
         .unwrap();
     store
         .set_branch_head("main", &tool_use_id, &tool_result_id)
+        .await
         .unwrap();
 
     let resumed_backend = FakeBackend::with_responses(&[("main", &[Ok("recovered")])]);

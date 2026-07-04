@@ -635,7 +635,10 @@ where
         .unwrap();
     store.fork("main", &child_id).await.unwrap();
 
-    store.set_branch_head("main", &child_id, &next_id).unwrap();
+    store
+        .set_branch_head("main", &child_id, &next_id)
+        .await
+        .unwrap();
     let state = store.get_session_state("main").await.unwrap();
 
     assert_eq!(store.get_branch_head("main").unwrap(), next_id);
@@ -773,6 +776,7 @@ where
         .unwrap();
     store
         .set_branch_head("main", &root_id, &feedback_id)
+        .await
         .unwrap();
 
     let state = store.get_session_state("main").await.unwrap();
@@ -926,6 +930,7 @@ where
         .unwrap();
     store
         .set_branch_head("base", &base_anchor_id, &next_base_anchor_id)
+        .await
         .unwrap();
     let state = store
         .set_session_state(
@@ -984,6 +989,7 @@ where
         .unwrap();
     store
         .set_branch_head("base", &base_anchor_id, &next_base_anchor_id)
+        .await
         .unwrap();
     let state = store
         .set_session_state(
@@ -1238,6 +1244,7 @@ where
         .unwrap();
     store
         .set_branch_head("draft", &root_id, &draft_node)
+        .await
         .unwrap();
     store.delete_branch("draft").await.unwrap();
 
@@ -1300,6 +1307,7 @@ where
 
     let err = store
         .set_branch_head("main", &root_id, &next_id)
+        .await
         .unwrap_err();
 
     assert!(matches!(
