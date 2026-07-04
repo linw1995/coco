@@ -864,12 +864,6 @@ impl SqliteStore {
         Ok(item)
     }
 
-    async fn dequeue_message_in_sqlite(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
-        self.ensure_writable()?;
-        let mut connection = self.connect().await?;
-        dequeue_message_queue_item(&mut connection, &self.database_path, queue).await
-    }
-
     async fn peek_message_in_sqlite(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
         let mut connection = self.connect().await?;
         Ok(
@@ -4584,7 +4578,9 @@ impl MessageQueueStore for SqliteStore {
     }
 
     async fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
-        self.dequeue_message_in_sqlite(queue).await
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        dequeue_message_queue_item(&mut connection, &self.database_path, queue).await
     }
 
     async fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
