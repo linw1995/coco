@@ -1270,7 +1270,10 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_RECHECK_INTERVAL));
         }
 
-        if active_job_is_waiting_for_recovery(&self.store, &active_job).context(StoreSnafu)? {
+        if active_job_is_waiting_for_recovery(&self.store, &active_job)
+            .await
+            .context(StoreSnafu)?
+        {
             tracing::debug!(
                 message_id = %item.message_id,
                 queue = %self.queue,
@@ -1669,7 +1672,7 @@ fn shortest_wait(current: Option<Duration>, candidate: Duration) -> Duration {
     current.map_or(candidate, |current| current.min(candidate))
 }
 
-fn active_job_is_waiting_for_recovery(
+async fn active_job_is_waiting_for_recovery(
     store: &impl Store,
     active_job: &coco_mem::Job,
 ) -> std::result::Result<bool, StoreError> {
@@ -1692,7 +1695,8 @@ fn active_job_is_waiting_for_recovery(
     }
 
     Ok(store
-        .list_children(&last_node.id)?
+        .list_children(&last_node.id)
+        .await?
         .into_iter()
         .any(|child| matches!(child.kind, Kind::Failure(_))))
 }
@@ -2836,6 +2840,7 @@ mod tests {
         );
         let failure_count = store
             .list_children(&active_job.base)
+            .await
             .unwrap()
             .into_iter()
             .filter(|node| matches!(node.kind, Kind::Failure(_)))
@@ -3091,7 +3096,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
+        assert!(
+            super::active_job_is_waiting_for_recovery(&store, &active_job)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3114,7 +3123,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
+        assert!(
+            super::active_job_is_waiting_for_recovery(&store, &active_job)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3124,7 +3137,11 @@ mod tests {
         let base = store.get_branch_head("main").await.unwrap();
         let active_job = store.submit_job("main", &base).await.unwrap();
 
-        assert!(!super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
+        assert!(
+            !super::active_job_is_waiting_for_recovery(&store, &active_job)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

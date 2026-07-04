@@ -86,19 +86,26 @@ impl NodeStore for DeepChainStore {
         })
     }
 
-    fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
-        Ok(self
-            .children
-            .get(node_id)
-            .into_iter()
-            .flatten()
-            .map(|child_id| {
-                self.nodes
-                    .get(child_id)
-                    .unwrap_or_else(|| panic!("child node {child_id:?} should exist"))
-                    .clone()
-            })
-            .collect())
+    fn list_children<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Ok(self
+                .children
+                .get(node_id)
+                .into_iter()
+                .flatten()
+                .map(|child_id| {
+                    self.nodes
+                        .get(child_id)
+                        .unwrap_or_else(|| panic!("child node {child_id:?} should exist"))
+                        .clone()
+                })
+                .collect())
+        })
     }
 }
 

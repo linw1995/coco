@@ -72,8 +72,11 @@ where
         Box::pin(async move { self.inner.get_node(id).await })
     }
 
-    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>> {
-        self.inner.list_children(node_id)
+    fn list_children<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.inner.list_children(node_id).await })
     }
 }
 

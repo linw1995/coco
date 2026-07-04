@@ -40,7 +40,10 @@ pub trait NodeStore {
     ) -> Pin<Box<dyn Future<Output = StoreResult<Node>> + Send + 'a>>;
 
     /// Returns all direct children for a node, including merge-parent edges.
-    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>>;
+    fn list_children<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<Vec<Node>>> + Send + 'a>>;
 }
 
 /// Branch reference storage API.
@@ -349,8 +352,15 @@ impl NodeStore for PersistentStore {
         })
     }
 
-    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>> {
-        delegate_persistent_store!(self, store, store.list_children(node_id))
+    fn list_children<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = StoreResult<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move {
+            match self {
+                Self::Sqlite(store) => store.list_children(node_id).await,
+            }
+        })
     }
 }
 

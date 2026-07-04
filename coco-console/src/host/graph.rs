@@ -622,15 +622,15 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
         if node.is_root() {
             return Ok(());
         }
-        self.enqueue_traversal_targets(&node)?;
+        self.enqueue_traversal_targets(&node).await?;
         self.record_if_visible(node);
         Ok(())
     }
 
-    fn enqueue_traversal_targets(&mut self, node: &Node) -> Result<()> {
+    async fn enqueue_traversal_targets(&mut self, node: &Node) -> Result<()> {
         self.enqueue_primary_parent(node);
         self.enqueue_merge_parents(node);
-        self.enqueue_skill_invocation_subtrees(node)
+        self.enqueue_skill_invocation_subtrees(node).await
     }
 
     fn enqueue_primary_parent(&mut self, node: &Node) {
@@ -648,7 +648,7 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
         }
     }
 
-    fn enqueue_skill_invocation_subtrees(&mut self, node: &Node) -> Result<()> {
+    async fn enqueue_skill_invocation_subtrees(&mut self, node: &Node) -> Result<()> {
         if node.kind.as_tool_uses().is_none() {
             return Ok(());
         }
@@ -658,6 +658,7 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
             self.scope_node_ids,
             &mut self.pending,
         )
+        .await
     }
 
     fn record_if_visible(&mut self, node: Node) {
@@ -991,14 +992,14 @@ pub(crate) async fn visible_skill_invocation_subtree_nodes(
 }
 
 pub(crate) fn visible_skill_invocation_subtree_nodes_with_lookup(
-    store: &impl NodeStore,
     mode: GraphMode,
     parent_id: &str,
     mut get_node: impl FnMut(&str) -> Result<Node>,
+    mut get_children: impl FnMut(&str) -> Result<Vec<Node>>,
 ) -> Result<Vec<Node>> {
     let mut nodes = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut pending = skill_invocation_children(store, parent_id)?;
+    let mut pending = skill_invocation_children_with_lookup(parent_id, &mut get_children)?;
     pending.reverse();
     let mut visited = BTreeSet::new();
 
@@ -1007,7 +1008,7 @@ pub(crate) fn visible_skill_invocation_subtree_nodes_with_lookup(
             continue;
         }
         let node = get_node(&node_id)?;
-        let mut children = child_ids(store, &node.id)?;
+        let mut children = child_ids_with_lookup(&node.id, &mut get_children)?;
         children.reverse();
         pending.extend(children);
         push_initial_lane_node(mode, node, &mut seen, &mut nodes);
@@ -1023,7 +1024,7 @@ async fn push_initial_skill_invocation_subtrees(
     seen: &mut BTreeSet<String>,
     nodes: &mut Vec<Node>,
 ) -> Result<()> {
-    let mut pending = skill_invocation_children(store, parent_id)?;
+    let mut pending = skill_invocation_children(store, parent_id).await?;
     pending.reverse();
     let mut visited = BTreeSet::new();
 
@@ -1032,7 +1033,7 @@ async fn push_initial_skill_invocation_subtrees(
             continue;
         }
         let node = store.get_node(&node_id).await.context(StoreSnafu)?;
-        let mut children = child_ids(store, &node.id)?;
+        let mut children = child_ids(store, &node.id).await?;
         children.reverse();
         pending.extend(children);
         push_initial_lane_node(mode, node, seen, nodes);
@@ -1051,27 +1052,38 @@ fn push_initial_lane_node(
     }
 }
 
-fn collect_visible_skill_invocation_subtrees(
+async fn collect_visible_skill_invocation_subtrees(
     store: &impl NodeStore,
     parent_id: &str,
     scope_node_ids: &mut BTreeSet<String>,
     pending: &mut Vec<String>,
 ) -> Result<()> {
-    let mut descendants = skill_invocation_children(store, parent_id)?;
+    let mut descendants = skill_invocation_children(store, parent_id).await?;
     let mut visited = BTreeSet::new();
 
     while let Some(node_id) = next_unvisited_descendant(&mut descendants, &mut visited) {
         push_scoped_graph_node(scope_node_ids, pending, node_id.clone());
-        descendants.extend(child_ids(store, &node_id)?);
+        descendants.extend(child_ids(store, &node_id).await?);
     }
 
     Ok(())
 }
 
-fn skill_invocation_children(store: &impl NodeStore, parent_id: &str) -> Result<Vec<String>> {
+async fn skill_invocation_children(store: &impl NodeStore, parent_id: &str) -> Result<Vec<String>> {
     Ok(store
         .list_children(parent_id)
+        .await
         .context(StoreSnafu)?
+        .into_iter()
+        .filter_map(skill_invocation_child_id)
+        .collect())
+}
+
+fn skill_invocation_children_with_lookup(
+    parent_id: &str,
+    get_children: &mut impl FnMut(&str) -> Result<Vec<Node>>,
+) -> Result<Vec<String>> {
+    Ok(get_children(parent_id)?
         .into_iter()
         .filter_map(skill_invocation_child_id)
         .collect())
@@ -1096,10 +1108,21 @@ fn next_unvisited_descendant(
     None
 }
 
-fn child_ids(store: &impl NodeStore, node_id: &str) -> Result<Vec<String>> {
+async fn child_ids(store: &impl NodeStore, node_id: &str) -> Result<Vec<String>> {
     Ok(store
         .list_children(node_id)
+        .await
         .context(StoreSnafu)?
+        .into_iter()
+        .map(|child| child.id)
+        .collect())
+}
+
+fn child_ids_with_lookup(
+    node_id: &str,
+    get_children: &mut impl FnMut(&str) -> Result<Vec<Node>>,
+) -> Result<Vec<String>> {
+    Ok(get_children(node_id)?
         .into_iter()
         .map(|child| child.id)
         .collect())

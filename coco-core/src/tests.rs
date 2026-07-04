@@ -1559,7 +1559,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
     ));
     assert!(store.list_jobs().await.unwrap().is_empty());
 
-    let children = store.list_children(&invocation_id).unwrap();
+    let children = store.list_children(&invocation_id).await.unwrap();
     let child_session_anchor = children
         .iter()
         .find_map(|node| match &node.kind {
@@ -1582,7 +1582,10 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
             .prompt
             .contains("Additional task from caller:")
     );
-    let child_session_children = store.list_children(&child_session_anchor.0.id).unwrap();
+    let child_session_children = store
+        .list_children(&child_session_anchor.0.id)
+        .await
+        .unwrap();
     assert!(!child_session_children.iter().any(|node| matches!(
         &node.kind,
         Kind::Anchor(anchor) if anchor.as_prompt().is_some()
@@ -1633,7 +1636,7 @@ async fn llm_engine_materializes_store_skill_scripts() {
         .await
         .unwrap();
 
-    let children = store.list_children(&invocation_id).unwrap();
+    let children = store.list_children(&invocation_id).await.unwrap();
     let child_session_anchor = children
         .iter()
         .find_map(|node| match &node.kind {

@@ -193,7 +193,7 @@ where
 
     let stored = store.get_node(&child_id).await.unwrap();
     assert_eq!(stored.parent, session_id);
-    let children = store.list_children(&stored.parent).unwrap();
+    let children = store.list_children(&stored.parent).await.unwrap();
     assert!(children.iter().any(|node| node.id == child_id));
 }
 
@@ -233,6 +233,7 @@ where
     assert!(
         store
             .list_children(&session_id)
+            .await
             .unwrap()
             .iter()
             .any(|node| node.id == anchor_id)
@@ -240,6 +241,7 @@ where
     assert!(
         store
             .list_children(&merge_parent_id)
+            .await
             .unwrap()
             .iter()
             .any(|node| node.id == anchor_id)
@@ -268,6 +270,7 @@ where
     assert!(
         store
             .list_children(&merge_parent_id)
+            .await
             .unwrap()
             .iter()
             .any(|node| node.id == anchor_id)
@@ -416,6 +419,7 @@ where
     assert!(
         store
             .list_children(&right_leaf)
+            .await
             .unwrap()
             .iter()
             .any(|node| node.id == merge_id)
@@ -463,7 +467,7 @@ where
         .await
         .unwrap();
 
-    let nodes = store.list_children(&session_id).unwrap();
+    let nodes = store.list_children(&session_id).await.unwrap();
     let ids = nodes.into_iter().map(|node| node.id).collect::<Vec<_>>();
 
     assert_eq!(ids, vec![left_id, right_id]);
@@ -484,7 +488,7 @@ where
         .await
         .unwrap();
 
-    let children = store.list_children(&leaf_id).unwrap();
+    let children = store.list_children(&leaf_id).await.unwrap();
 
     assert!(children.is_empty());
 }
@@ -496,7 +500,7 @@ where
     let store = F::create().await;
     let missing_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    let err = store.list_children(missing_id).unwrap_err();
+    let err = store.list_children(missing_id).await.unwrap_err();
 
     assert!(matches!(err, Error::NotFound { id } if id == missing_id));
 }

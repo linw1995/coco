@@ -90,6 +90,7 @@ impl MaterializationSourceSnapshot {
                 .context(crate::error::StoreSnafu)?;
             let node_children = store
                 .list_children(&node_id)
+                .await
                 .context(crate::error::StoreSnafu)?;
             pending.extend(node_children.iter().map(|child| child.id.clone()));
             children.insert(node_id, node_children);
@@ -120,6 +121,15 @@ impl MaterializationSourceSnapshot {
             .get(&id)
             .cloned()
             .ok_or(coco_mem::StoreError::NotFound { id })
+    }
+
+    fn children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
+        self.nodes
+            .get(node_id)
+            .ok_or_else(|| coco_mem::StoreError::NotFound {
+                id: node_id.to_owned(),
+            })?;
+        Ok(self.children.get(node_id).cloned().unwrap_or_default())
     }
 
     fn resolve_ref_id(&self, reference: &str) -> coco_mem::StoreResult<String> {
@@ -209,13 +219,11 @@ impl NodeStore for MaterializationSourceSnapshot {
         Box::pin(async move { self.node(id) })
     }
 
-    fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
-        self.nodes
-            .get(node_id)
-            .ok_or_else(|| coco_mem::StoreError::NotFound {
-                id: node_id.to_owned(),
-            })?;
-        Ok(self.children.get(node_id).cloned().unwrap_or_default())
+    fn list_children<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.children(node_id) })
     }
 }
 
@@ -3040,9 +3048,12 @@ impl ConsoleGraphSnapshotStore {
         }
         let subtrees = visible_skill_invocation_linear_subtrees(
             source_id,
-            visible_skill_invocation_subtree_nodes_with_lookup(store, mode, source_id, |id| {
-                store.node(id).context(crate::error::StoreSnafu)
-            })?,
+            visible_skill_invocation_subtree_nodes_with_lookup(
+                mode,
+                source_id,
+                |id| store.node(id).context(crate::error::StoreSnafu),
+                |id| store.children(id).context(crate::error::StoreSnafu),
+            )?,
         );
         let Some(subtrees) = subtrees else {
             return Ok(SkillSubtreeAppend::Unsupported);
@@ -6082,19 +6093,23 @@ mod tests {
             Box::pin(std::future::ready(result))
         }
 
-        fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
-            if node_id == self.root.id {
+        fn list_children<'a>(
+            &'a self,
+            node_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = coco_mem::StoreResult<Vec<Node>>> + Send + 'a>> {
+            let result = if node_id == self.root.id {
                 if !self.advanced.replace(true) {
                     *self.branch_head.borrow_mut() = self.new_head_id.clone();
                 }
-                return Ok(vec![self.old_head.clone()]);
-            }
-            if node_id == self.old_head.id {
-                return Ok(Vec::new());
-            }
-            Err(coco_mem::StoreError::NotFound {
-                id: node_id.to_owned(),
-            })
+                Ok(vec![self.old_head.clone()])
+            } else if node_id == self.old_head.id {
+                Ok(Vec::new())
+            } else {
+                Err(coco_mem::StoreError::NotFound {
+                    id: node_id.to_owned(),
+                })
+            };
+            Box::pin(std::future::ready(result))
         }
     }
 

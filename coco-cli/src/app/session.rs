@@ -996,7 +996,8 @@ async fn collect_visible_graph_nodes(
                 &node.id,
                 scope_node_ids,
                 &mut pending,
-            )?;
+            )
+            .await?;
         }
 
         if is_visible_graph_node(&node, mode) {
@@ -1076,7 +1077,7 @@ fn is_visible_graph_node(node: &Node, mode: SessionGraphMode) -> bool {
     }
 }
 
-fn collect_visible_skill_invocation_subtrees(
+async fn collect_visible_skill_invocation_subtrees(
     store: &impl NodeStore,
     parent_id: &str,
     scope_node_ids: &mut BTreeSet<String>,
@@ -1084,6 +1085,7 @@ fn collect_visible_skill_invocation_subtrees(
 ) -> Result<()> {
     let mut descendants = store
         .list_children(parent_id)
+        .await
         .context(StoreSnafu)?
         .into_iter()
         .filter_map(|child| match child.kind {
@@ -1099,7 +1101,7 @@ fn collect_visible_skill_invocation_subtrees(
         }
 
         push_scoped_graph_node(scope_node_ids, pending, node_id.clone());
-        for child in store.list_children(&node_id).context(StoreSnafu)? {
+        for child in store.list_children(&node_id).await.context(StoreSnafu)? {
             descendants.push(child.id);
         }
     }
@@ -1115,6 +1117,7 @@ async fn render_session_show(
     let node = resolve_show_reference(store, reference).await?;
     let children = store
         .list_children(&node.id)
+        .await
         .context(StoreSnafu)?
         .into_iter()
         .map(|node| node.id)

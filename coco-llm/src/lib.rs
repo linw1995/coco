@@ -3318,11 +3318,11 @@ fn resolve_skill_source_tool_use<'a>(
     }
 }
 
-fn newest_skill_response_descendant(
+async fn newest_skill_response_descendant(
     trace_node_store: &TraceNodeStore,
     invocation_node_id: &str,
 ) -> std::result::Result<Option<coco_mem::Node>, BackendError> {
-    let mut stack = trace_node_store.list_children(invocation_node_id)?;
+    let mut stack = trace_node_store.list_children(invocation_node_id).await?;
     let mut visited = HashSet::new();
     let mut response = None::<coco_mem::Node>;
 
@@ -3338,18 +3338,18 @@ fn newest_skill_response_descendant(
         {
             response = Some(node.clone());
         }
-        stack.extend(trace_node_store.list_children(&node.id)?);
+        stack.extend(trace_node_store.list_children(&node.id).await?);
     }
 
     Ok(response)
 }
 
-fn has_fanned_in_skill_result(
+async fn has_fanned_in_skill_result(
     trace_node_store: &TraceNodeStore,
     tool_result_node_id: &str,
     response_node_id: &str,
 ) -> std::result::Result<bool, BackendError> {
-    let mut stack = trace_node_store.list_children(tool_result_node_id)?;
+    let mut stack = trace_node_store.list_children(tool_result_node_id).await?;
     let mut visited = HashSet::new();
 
     while let Some(node) = stack.pop() {
@@ -3365,7 +3365,7 @@ fn has_fanned_in_skill_result(
         {
             return Ok(true);
         }
-        stack.extend(trace_node_store.list_children(&node.id)?);
+        stack.extend(trace_node_store.list_children(&node.id).await?);
     }
 
     Ok(false)
@@ -3391,14 +3391,15 @@ async fn append_skill_results_after_tool_result(
         let Some(source_tool_use) = resolve_skill_source_tool_use(&ancestry, tool_result) else {
             continue;
         };
-        for child in trace_node_store.list_children(&source_tool_use.id)? {
+        for child in trace_node_store.list_children(&source_tool_use.id).await? {
             let Kind::Anchor(anchor) = &child.kind else {
                 continue;
             };
             let Some(invocation) = anchor.as_skill_invocation() else {
                 continue;
             };
-            let Some(response) = newest_skill_response_descendant(trace_node_store, &child.id)?
+            let Some(response) =
+                newest_skill_response_descendant(trace_node_store, &child.id).await?
             else {
                 continue;
             };
@@ -3406,7 +3407,8 @@ async fn append_skill_results_after_tool_result(
                 continue;
             };
             if !fanned_in.insert(response.id.clone())
-                || has_fanned_in_skill_result(trace_node_store, tool_result_node_id, &response.id)?
+                || has_fanned_in_skill_result(trace_node_store, tool_result_node_id, &response.id)
+                    .await?
             {
                 continue;
             }
@@ -5346,7 +5348,7 @@ mod tests {
 
         let staged_nodes = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                let nodes = tool_result_nodes(&store, &initial_head);
+                let nodes = tool_result_nodes(&store, &initial_head).await;
                 if !nodes.is_empty() {
                     return nodes;
                 }
@@ -5368,7 +5370,7 @@ mod tests {
         let result = prompt.await.unwrap().unwrap();
         assert_eq!(result.text, "done");
 
-        let final_result_nodes = tool_result_nodes(&store, &initial_head);
+        let final_result_nodes = tool_result_nodes(&store, &initial_head).await;
         assert_eq!(final_result_nodes.len(), 2);
     }
 
@@ -5622,15 +5624,17 @@ mod tests {
             .and_then(|metadata| metadata.call_id.as_deref())
     }
 
-    fn collect_descendants(store: &SqliteStore, node_id: &str) -> Vec<coco_mem::Node> {
+    async fn collect_descendants(store: &SqliteStore, node_id: &str) -> Vec<coco_mem::Node> {
         let mut descendants = Vec::new();
         let mut stack = store
             .list_children(node_id)
+            .await
             .expect("children should be listed");
         while let Some(node) = stack.pop() {
             stack.extend(
                 store
                     .list_children(&node.id)
+                    .await
                     .expect("children should be listed"),
             );
             descendants.push(node);
@@ -5638,8 +5642,9 @@ mod tests {
         descendants
     }
 
-    fn tool_result_nodes(store: &SqliteStore, root_id: &str) -> Vec<coco_mem::Node> {
+    async fn tool_result_nodes(store: &SqliteStore, root_id: &str) -> Vec<coco_mem::Node> {
         collect_descendants(store, root_id)
+            .await
             .into_iter()
             .filter(|node| matches!(node.kind, Kind::ToolResult(_)))
             .collect()

@@ -4305,8 +4305,11 @@ impl NodeStore for SqliteGraphStore {
         Box::pin(async move { self.get_node_by_prefix_or_branch(id).await })
     }
 
-    fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
-        self.block_on(self.list_children_in_sqlite(node_id))
+    fn list_children<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.list_children_in_sqlite(node_id).await })
     }
 }
 
@@ -4407,8 +4410,11 @@ impl NodeStore for SqliteStore {
         Box::pin(async move { self.get_node_in_sqlite(id).await })
     }
 
-    fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
-        self.block_on(self.list_children_in_sqlite(node_id))
+    fn list_children<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Node>>> + Send + 'a>> {
+        Box::pin(async move { self.list_children_in_sqlite(node_id).await })
     }
 }
 
@@ -5205,6 +5211,7 @@ mod tests {
 
         let mut children = store
             .list_children(&store.root_id())
+            .await
             .unwrap()
             .into_iter()
             .map(|node| node.id)
@@ -5214,7 +5221,11 @@ mod tests {
         assert_eq!(children, node_ids);
         let reopened = SqliteStore::open_read_only(&path).await.unwrap();
         assert_eq!(
-            reopened.list_children(&reopened.root_id()).unwrap().len(),
+            reopened
+                .list_children(&reopened.root_id())
+                .await
+                .unwrap()
+                .len(),
             8
         );
     }
@@ -5521,7 +5532,10 @@ mod tests {
             graph_store.get_node("graph-child").await.unwrap().id,
             child_id.clone()
         );
-        assert_eq!(graph_store.list_children(&root_id).unwrap()[0].id, child_id);
+        assert_eq!(
+            graph_store.list_children(&root_id).await.unwrap()[0].id,
+            child_id
+        );
         assert_eq!(graph_store.ancestry(&child_id).unwrap().len(), 2);
         assert!(matches!(
             graph_store
@@ -5558,7 +5572,7 @@ mod tests {
 
         assert!(matches!(err, crate::StoreError::StoreReadOnly { .. }));
         let reopened = SqliteStore::open_read_only(&path).await.unwrap();
-        assert!(reopened.list_children(&root_id).unwrap().is_empty());
+        assert!(reopened.list_children(&root_id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -5736,13 +5750,16 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(store.list_children(&root_id).unwrap()[0].id, child_id);
+        assert_eq!(store.list_children(&root_id).await.unwrap()[0].id, child_id);
 
         let reopened = SqliteStore::open(&path).await.unwrap();
         let child = reopened.get_node(&child_id).await.unwrap();
 
         assert_eq!(child.parent, root_id);
-        assert_eq!(reopened.list_children(&root_id).unwrap()[0].id, child_id);
+        assert_eq!(
+            reopened.list_children(&root_id).await.unwrap()[0].id,
+            child_id
+        );
     }
 
     #[tokio::test]

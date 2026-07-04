@@ -5717,7 +5717,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
     assert_eq!(output["skill_name"], "fast-rust");
     assert_eq!(output["text"], "delegated output");
 
-    let children = store.list_children(&parent_tool_use).unwrap();
+    let children = store.list_children(&parent_tool_use).await.unwrap();
     let invocation_node = children
         .iter()
         .find_map(|node| match &node.kind {
@@ -5736,7 +5736,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
         }
     );
 
-    let invocation_children = store.list_children(&invocation_node.0.id).unwrap();
+    let invocation_children = store.list_children(&invocation_node.0.id).await.unwrap();
     let child_session_anchor = invocation_children
         .iter()
         .find_map(|node| match &node.kind {
@@ -5876,7 +5876,7 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
     assert_eq!(output["text"], "delegated output");
 
     let invocation_node_id = output["invocation_node_id"].as_str().unwrap();
-    let invocation_children = store.list_children(invocation_node_id).unwrap();
+    let invocation_children = store.list_children(invocation_node_id).await.unwrap();
     let child_session = invocation_children
         .iter()
         .find_map(|node| match &node.kind {
