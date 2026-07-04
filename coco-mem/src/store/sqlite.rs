@@ -4584,14 +4584,7 @@ impl MessageQueueStore for SqliteStore {
     }
 
     async fn dequeue_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
-        let store = self.clone();
-        let queue = queue.to_owned();
-        self.database
-            .inner
-            .runtime
-            .spawn(async move { store.dequeue_message_in_sqlite(&queue).await })
-            .await
-            .expect("SQLite store task should not panic")
+        self.dequeue_message_in_sqlite(queue).await
     }
 
     async fn peek_message(&self, queue: &str) -> Result<Option<MessageQueueItem>> {
