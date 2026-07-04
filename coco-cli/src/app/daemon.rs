@@ -120,20 +120,7 @@ where
     let console_config = daemon_console_config(&command, console_publisher.as_ref());
 
     ensure_initial_session(shared_store, llm, provider_profiles).await?;
-    let console = match console_config {
-        Some(config) => Some(
-            start_console_server_with_graph_store_path(
-                config,
-                shared_store.clone(),
-                console_publisher.expect("console publisher should exist when console is enabled"),
-                console_graph_store_path,
-            )
-            .await
-            .context(ConsoleSnafu)?,
-        ),
-        None => None,
-    };
-    let server = start_daemon_server(
+    let mut server = start_daemon_server(
         &socket_path,
         shared_store,
         llm,
@@ -141,9 +128,32 @@ where
         &shared_engine,
         DaemonServerOptions {
             channel_configs,
-            console,
+            console: None,
         },
     )?;
+    if let Some(config) = console_config {
+        let console = match start_console_server_with_graph_store_path(
+            config,
+            shared_store.clone(),
+            console_publisher.expect("console publisher should exist when console is enabled"),
+            console_graph_store_path,
+        )
+        .await
+        {
+            Ok(console) => console,
+            Err(source) => {
+                if let Err(error) = server.shutdown().await {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to shut down daemon after console startup failure"
+                    );
+                }
+                return Err(source).context(ConsoleSnafu);
+            }
+        };
+        tracing::info!(addr = %console.addr(), "coco console listening");
+        server.console = Some(console);
+    }
     spawn_resume_incomplete_jobs(shared_engine);
     server.wait().await?;
     Ok(None)
