@@ -411,14 +411,20 @@ impl SqliteDatabase {
         T: Send + 'static,
         E: Send + 'static,
         F: FnOnce(&mut SqliteConnection) -> std::result::Result<T, E> + Send + 'static,
-        P: FnOnce(StoreError) -> E + Send,
-        M: FnOnce(diesel::result::Error) -> E + Send,
+        P: FnOnce(StoreError) -> E + Send + 'static,
+        M: FnOnce(diesel::result::Error) -> E + Send + 'static,
     {
-        let result = self.block_on(self.with_sync_connection_in_sqlite(
-            operation,
-            map_pool_error,
-            map_connection_error,
-        ));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let database = self.clone();
+        self.inner.runtime.spawn(async move {
+            let result = database
+                .with_sync_connection_in_sqlite(operation, map_pool_error, map_connection_error)
+                .await;
+            let _ = sender.send(result);
+        });
+        let result = receiver
+            .recv()
+            .expect("SQLite store worker task should not panic");
         match result {
             Ok(result) => result,
             Err(error) => Err(error),
@@ -454,14 +460,6 @@ impl SqliteDatabase {
     #[cfg(test)]
     fn shared_pool(&self) -> &AsyncSqlitePool<AsyncSqliteConnection> {
         &self.inner.pool
-    }
-
-    fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: Future + Send,
-        F::Output: Send,
-    {
-        block_on_sqlite_runtime_with(self.inner.runtime, future)
     }
 
     async fn request_wal_journal_mode(&self) -> Result<()> {
@@ -1284,22 +1282,6 @@ fn sqlite_runtime() -> Result<&'static Runtime> {
     Ok(SQLITE_RUNTIME
         .get()
         .expect("SQLite runtime should be initialized"))
-}
-
-fn block_on_sqlite_runtime_with<F>(runtime: &'static Runtime, future: F) -> F::Output
-where
-    F: Future + Send,
-    F::Output: Send,
-{
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::scope(|scope| {
-            scope
-                .spawn(|| runtime.block_on(future))
-                .join()
-                .expect("SQLite store worker thread should not panic")
-        });
-    }
-    runtime.block_on(future)
 }
 
 fn prepare_store_directory(path: &Path) -> Result<()> {
