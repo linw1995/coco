@@ -1836,13 +1836,27 @@ where
                 Ok(response_node_id)
             }
             None => {
+                let nodes = backend_step_node_contents_with_skill_results(
+                    run.resolved.trace_node_store.as_deref(),
+                    run.retry_from_node_id,
+                    run.steps,
+                )
+                .await
+                .context(BackendSnafu {
+                    context: Box::new(BackendFailureContext {
+                        branch: run.resolved.branch.clone(),
+                        execution_id: run.execution_id.to_owned(),
+                        error_node_id: run.retry_from_node_id.to_owned(),
+                        retry_from_node_id: run.retry_from_node_id.to_owned(),
+                    }),
+                })?;
                 let response_node_id = self
                     .store
                     .append_nodes_and_set_branch_head(
                         &run.resolved.branch,
                         run.original_head,
                         run.retry_from_node_id,
-                        backend_step_node_contents(run.steps),
+                        nodes,
                     )
                     .await
                     .context(MemorySnafu)?;
@@ -1901,7 +1915,20 @@ where
         run: FailedBackendRunPersistence<'_>,
     ) -> Result<String> {
         if run.head.is_none() {
-            let mut nodes = backend_step_node_contents(run.steps);
+            let mut nodes = backend_step_node_contents_with_skill_results(
+                run.resolved.trace_node_store.as_deref(),
+                run.retry_from_node_id,
+                run.steps,
+            )
+            .await
+            .context(BackendSnafu {
+                context: Box::new(BackendFailureContext {
+                    branch: run.resolved.branch.clone(),
+                    execution_id: run.execution_id.to_owned(),
+                    error_node_id: run.retry_from_node_id.to_owned(),
+                    retry_from_node_id: run.retry_from_node_id.to_owned(),
+                }),
+            })?;
             nodes.push(failure_node_content(run.execution_id, run.message));
             return self
                 .store
@@ -3223,6 +3250,135 @@ fn backend_step_node_contents(steps: &[BackendStep]) -> Vec<NewNodeContent> {
             kind,
         })
         .collect()
+}
+
+async fn backend_step_node_contents_with_skill_results(
+    trace_node_store: Option<&TraceNodeStore>,
+    parent: &str,
+    steps: &[BackendStep],
+) -> std::result::Result<Vec<NewNodeContent>, BackendError> {
+    let Some(trace_node_store) = trace_node_store else {
+        return Ok(backend_step_node_contents(steps));
+    };
+
+    let mut ancestry = trace_node_store.ancestry(parent).await?;
+    let mut head = parent.to_owned();
+    let mut contents = Vec::new();
+    let virtual_created_at = ancestry
+        .first()
+        .expect("parent ancestry should include at least the parent node")
+        .created_at;
+
+    for step in steps {
+        for (role, metadata, kind) in
+            persisted_nodes_from_backend_events(&step.events, &step.execution)
+        {
+            let kind = normalize_kind_for_primary_parent(kind, &head);
+            let node = coco_mem::Node {
+                id: format!("virtual-{}", contents.len()),
+                parent: head.clone(),
+                created_at: virtual_created_at,
+                role: role.clone(),
+                metadata: metadata.clone(),
+                kind: kind.clone(),
+            };
+            head = node.id.clone();
+            ancestry.insert(0, node);
+            contents.push(NewNodeContent {
+                role,
+                metadata,
+                kind: kind.clone(),
+            });
+
+            if matches!(kind, Kind::ToolResult(_)) {
+                let skill_results = skill_result_node_contents_after_tool_result(
+                    trace_node_store,
+                    &ancestry,
+                    &head,
+                )
+                .await?;
+                for content in skill_results {
+                    let node = coco_mem::Node {
+                        id: format!("virtual-{}", contents.len()),
+                        parent: head.clone(),
+                        created_at: virtual_created_at,
+                        role: content.role.clone(),
+                        metadata: content.metadata.clone(),
+                        kind: content.kind.clone(),
+                    };
+                    head = node.id.clone();
+                    ancestry.insert(0, node);
+                    contents.push(content);
+                }
+            }
+        }
+    }
+
+    Ok(contents)
+}
+
+async fn skill_result_node_contents_after_tool_result(
+    trace_node_store: &TraceNodeStore,
+    ancestry: &[coco_mem::Node],
+    head: &str,
+) -> std::result::Result<Vec<NewNodeContent>, BackendError> {
+    let Some(tool_result_node) = ancestry.first() else {
+        return Ok(vec![]);
+    };
+    let Kind::ToolResult(tool_results) = &tool_result_node.kind else {
+        return Ok(vec![]);
+    };
+
+    let mut contents = Vec::new();
+    let mut fanned_in = HashSet::new();
+    for tool_result in tool_results.items() {
+        if !is_terminal_unified_exec_output(&tool_result.output) {
+            continue;
+        }
+        let Some(source_tool_use) = resolve_skill_source_tool_use(ancestry, tool_result) else {
+            continue;
+        };
+        let children = match trace_node_store.list_children(&source_tool_use.id).await {
+            Ok(children) => children,
+            Err(coco_mem::StoreError::NotFound { .. }) => continue,
+            Err(source) => return Err(source.into()),
+        };
+        for child in children {
+            let Kind::Anchor(anchor) = &child.kind else {
+                continue;
+            };
+            let Some(invocation) = anchor.as_skill_invocation() else {
+                continue;
+            };
+            let Some(response) =
+                newest_skill_response_descendant(trace_node_store, &child.id).await?
+            else {
+                continue;
+            };
+            let Kind::Text(output) = &response.kind else {
+                continue;
+            };
+            if !fanned_in.insert(response.id.clone()) {
+                continue;
+            }
+            let kind = normalize_kind_for_primary_parent(
+                Kind::Anchor(Anchor::skill_result(
+                    vec![MergeParent::merge(response.id.clone())],
+                    SkillResultAnchor {
+                        skill_name: invocation.skill_name.clone(),
+                        output: output.clone(),
+                    },
+                )),
+                head,
+            );
+            contents.push(NewNodeContent {
+                role: Role::System,
+                metadata: None,
+                kind,
+            });
+        }
+    }
+    Ok(contents)
 }
 
 fn failure_node_content(execution_id: &str, message: &str) -> NewNodeContent {
@@ -8634,6 +8790,74 @@ mod tests {
         assert_eq!(result.output, "delegated done");
         assert_eq!(anchor.merge_parent_node_ids(), [response_id.as_str()]);
         assert_eq!(trace.head_id().await.unwrap(), skill_result.id);
+    }
+
+    #[tokio::test]
+    async fn headless_backend_run_preserves_skill_result_fan_in() {
+        let store = test_store().await;
+        let backend = FakeBackend::with_completions(&[(
+            "main",
+            &[Ok(BackendRun::succeeded_with_steps(
+                "done",
+                vec![BackendStep {
+                    execution: ExecutionMetadata::new("execution-step-2".to_owned()),
+                    events: vec![
+                        backend_event(
+                            BackendEventPayload::ToolResult(ToolResult {
+                                id: "tool-call-1".to_owned(),
+                                output: "Process exited with code 0\nexit_status: 0\nstdout:\ndelegated done\nstderr:\n".to_owned(),
+                            }),
+                            Some("execution-step-2"),
+                            Some("call-1"),
+                        ),
+                        BackendEventPayload::AssistantText("done".to_owned()).into(),
+                    ],
+                }],
+            ))],
+        )]);
+        let service = LlmService::new(store.clone(), backend);
+        let session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let trace = test_trace_appender(store.clone(), &session.anchor_id);
+        let trace_store = test_trace_store(store.clone());
+        let execution = ExecutionMetadata::new("execution-step-1".to_owned());
+        let appended = append_backend_event_nodes(
+            &trace,
+            Some(trace_store.as_ref()),
+            &execution,
+            &[BackendEventPayload::ToolUse(ToolUse {
+                id: "tool-call-1".to_owned(),
+                name: "exec_command".to_owned(),
+                input: serde_json::json!({"cmd": "coco skill run fast-rust"}),
+            })
+            .into()],
+        )
+        .await
+        .unwrap();
+        let tool_use_id = appended[0].0.clone();
+        store
+            .set_branch_head("main", &session.anchor_id, &tool_use_id)
+            .await
+            .unwrap();
+        let (_invocation_id, response_id) =
+            append_skill_invocation_fixture(&store, &tool_use_id, "fast-rust", "delegated done")
+                .await;
+
+        let completed = service.run(request("main")).await.unwrap();
+
+        let assistant = store.get_node(&completed.response_node_id).await.unwrap();
+        let skill_result = store.get_node(&assistant.parent).await.unwrap();
+        let tool_result = store.get_node(&skill_result.parent).await.unwrap();
+        assert!(matches!(tool_result.kind, Kind::ToolResult(_)));
+        let Kind::Anchor(anchor) = &skill_result.kind else {
+            panic!("expected skill result anchor");
+        };
+        let result = anchor.as_skill_result().unwrap();
+        assert_eq!(result.skill_name, "fast-rust");
+        assert_eq!(result.output, "delegated done");
+        assert_eq!(anchor.merge_parent_node_ids(), [response_id.as_str()]);
     }
 
     #[tokio::test]
