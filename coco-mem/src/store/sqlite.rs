@@ -2757,6 +2757,7 @@ async fn append_nodes_and_set_branch_head_in_transaction(
     branch: &str,
     expected_old_head: &str,
     parent: &str,
+    new_head: Option<&str>,
     nodes: Vec<NewNodeContent>,
 ) -> std::result::Result<String, SqliteTransactionError> {
     let actual = load_branch_head(connection, path, branch)
@@ -2794,8 +2795,14 @@ async fn append_nodes_and_set_branch_head_in_transaction(
         head = node.id;
     }
 
-    update_branch_head_checked_in_transaction(connection, path, branch, expected_old_head, &head)
-        .await?;
+    update_branch_head_checked_in_transaction(
+        connection,
+        path,
+        branch,
+        expected_old_head,
+        new_head.unwrap_or(&head),
+    )
+    .await?;
     Ok(head)
 }
 
@@ -3775,6 +3782,17 @@ impl BranchStore for SqliteGraphStore {
     ) -> Result<String> {
         self.ensure_read_only()
     }
+
+    async fn append_nodes_and_set_branch_head_to(
+        &self,
+        _name: &str,
+        _expected_old_head: &str,
+        _parent: &str,
+        _new_head: &str,
+        _nodes: Vec<NewNodeContent>,
+    ) -> Result<String> {
+        self.ensure_read_only()
+    }
 }
 
 #[async_trait]
@@ -3918,6 +3936,35 @@ impl BranchStore for SqliteStore {
                     name,
                     expected_old_head,
                     parent,
+                    None,
+                    nodes,
+                )
+                .await
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))
+    }
+
+    async fn append_nodes_and_set_branch_head_to(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        new_head: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> Result<String> {
+        self.ensure_writable()?;
+        let _write = self.database.inner.write.lock().await;
+        let mut connection = self.connect().await?;
+        connection
+            .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
+                append_nodes_and_set_branch_head_in_transaction(
+                    connection,
+                    &self.database_path,
+                    name,
+                    expected_old_head,
+                    parent,
+                    Some(new_head),
                     nodes,
                 )
                 .await

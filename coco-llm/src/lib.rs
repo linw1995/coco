@@ -1587,6 +1587,16 @@ struct SuccessfulBackendRunPersistence<'a> {
     steps: &'a [BackendStep],
 }
 
+struct FailedBackendRunPersistence<'a> {
+    resolved: &'a ResolvedCompletionRequest,
+    original_head: &'a str,
+    retry_from_node_id: &'a str,
+    execution_id: &'a str,
+    head: Option<&'a str>,
+    message: &'a str,
+    steps: &'a [BackendStep],
+}
+
 impl<B, S> LlmService<B, S>
 where
     B: CompletionBackend,
@@ -1853,16 +1863,15 @@ where
         } = prepared;
         let (execution_id, steps) = normalize_backend_steps(steps, None);
         let error_node_id = self
-            .persist_failed_backend_run(
-                &resolved,
-                &retry_from_node_id,
-                &execution_id,
-                head,
-                &message,
-                &steps,
-            )
-            .await?;
-        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)
+            .persist_failed_backend_run(FailedBackendRunPersistence {
+                resolved: &resolved,
+                original_head: &original_head,
+                retry_from_node_id: &retry_from_node_id,
+                execution_id: &execution_id,
+                head: head.as_deref(),
+                message: &message,
+                steps: &steps,
+            })
             .await?;
         tracing::warn!(
             branch = %resolved.branch,
@@ -1886,37 +1895,46 @@ where
 
     async fn persist_failed_backend_run(
         &self,
-        resolved: &ResolvedCompletionRequest,
-        retry_from_node_id: &str,
-        execution_id: &str,
-        head: Option<String>,
-        message: &str,
-        steps: &[BackendStep],
+        run: FailedBackendRunPersistence<'_>,
     ) -> Result<String> {
-        let trace_node_appender = resolved
+        if run.head.is_none() {
+            let mut nodes = backend_step_node_contents(run.steps);
+            nodes.push(failure_node_content(run.execution_id, run.message));
+            return self
+                .store
+                .append_nodes_and_set_branch_head_to(
+                    &run.resolved.branch,
+                    run.original_head,
+                    run.retry_from_node_id,
+                    run.retry_from_node_id,
+                    nodes,
+                )
+                .await
+                .context(MemorySnafu);
+        }
+        let trace_node_appender = run
+            .resolved
             .trace_node_appender
             .as_ref()
             .expect("completion runs should always persist through a trace node appender");
-        if head.is_none() {
-            self.persist_backend_steps_with_trace_node_appender(
-                &resolved.branch,
-                retry_from_node_id,
-                trace_node_appender,
-                resolved.trace_node_store.as_deref(),
-                steps,
-            )
-            .await?;
-        }
-        self.append_failure_with_trace_node_appender(
-            &resolved.branch,
-            retry_from_node_id,
-            trace_node_appender,
-            execution_id,
-            message,
+        let trace_parent_id = trace_node_appender.head_id().await.context(BackendSnafu {
+            context: Box::new(BackendFailureContext {
+                branch: run.resolved.branch.clone(),
+                execution_id: run.execution_id.to_owned(),
+                error_node_id: run.retry_from_node_id.to_owned(),
+                retry_from_node_id: run.retry_from_node_id.to_owned(),
+            }),
+        })?;
+        self.append_failure_and_reset_branch(
+            run.resolved,
+            run.original_head,
+            run.retry_from_node_id,
+            &trace_parent_id,
+            run.execution_id,
+            run.message,
         )
         .await
     }
-
     async fn finish_backend_error(
         &self,
         prepared: PreparedCompletionRun,
@@ -1930,9 +1948,13 @@ where
         } = prepared;
         let execution_id = format!("execution-{}", nanoid::nanoid!());
         let error_node_id = self
-            .persist_backend_error(&resolved, &retry_from_node_id, &execution_id, &source)
-            .await?;
-        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)
+            .persist_backend_error(
+                &resolved,
+                &original_head,
+                &retry_from_node_id,
+                &execution_id,
+                &source,
+            )
             .await?;
         tracing::error!(
             branch = %resolved.branch,
@@ -1956,6 +1978,7 @@ where
     async fn persist_backend_error(
         &self,
         resolved: &ResolvedCompletionRequest,
+        original_head: &str,
         retry_from_node_id: &str,
         execution_id: &str,
         source: &BackendError,
@@ -1964,14 +1987,52 @@ where
             .trace_node_appender
             .as_ref()
             .expect("completion runs should always persist through a trace node appender");
-        self.append_failure_with_trace_node_appender(
-            &resolved.branch,
+        let trace_parent_id = trace_node_appender.head_id().await.context(BackendSnafu {
+            context: Box::new(BackendFailureContext {
+                branch: resolved.branch.clone(),
+                execution_id: execution_id.to_owned(),
+                error_node_id: retry_from_node_id.to_owned(),
+                retry_from_node_id: retry_from_node_id.to_owned(),
+            }),
+        })?;
+        self.append_failure_and_reset_branch(
+            resolved,
+            original_head,
             retry_from_node_id,
-            trace_node_appender,
+            &trace_parent_id,
             execution_id,
             &source.to_string(),
         )
         .await
+    }
+
+    async fn append_failure_and_reset_branch(
+        &self,
+        resolved: &ResolvedCompletionRequest,
+        original_head: &str,
+        retry_from_node_id: &str,
+        parent: &str,
+        execution_id: &str,
+        message: &str,
+    ) -> Result<String> {
+        self.store
+            .append_nodes_and_set_branch_head_to(
+                &resolved.branch,
+                original_head,
+                parent,
+                retry_from_node_id,
+                vec![failure_node_content(execution_id, message)],
+            )
+            .await
+            .map_err(BackendError::from)
+            .context(BackendSnafu {
+                context: Box::new(BackendFailureContext {
+                    branch: resolved.branch.clone(),
+                    execution_id: execution_id.to_owned(),
+                    error_node_id: retry_from_node_id.to_owned(),
+                    retry_from_node_id: retry_from_node_id.to_owned(),
+                }),
+            })
     }
 }
 
@@ -2153,66 +2214,6 @@ where
             })
             .await
             .context(MemorySnafu)
-    }
-
-    async fn persist_backend_steps_with_trace_node_appender(
-        &self,
-        branch: &str,
-        retry_from_node_id: &str,
-        trace_node_appender: &TraceNodeAppenderHandle,
-        trace_node_store: Option<&TraceNodeStore>,
-        steps: &[BackendStep],
-    ) -> Result<String> {
-        let mut head_id = retry_from_node_id.to_owned();
-        for step in steps {
-            if step.events.is_empty() {
-                continue;
-            }
-            head_id = append_backend_events(
-                trace_node_appender,
-                trace_node_store,
-                &step.execution,
-                &step.events,
-            )
-            .await
-            .context(BackendSnafu {
-                context: Box::new(BackendFailureContext {
-                    branch: branch.to_owned(),
-                    execution_id: step.execution.execution_id.clone(),
-                    error_node_id: retry_from_node_id.to_owned(),
-                    retry_from_node_id: retry_from_node_id.to_owned(),
-                }),
-            })?;
-        }
-
-        Ok(head_id)
-    }
-
-    async fn append_failure_with_trace_node_appender(
-        &self,
-        branch: &str,
-        retry_from_node_id: &str,
-        trace_node_appender: &TraceNodeAppenderHandle,
-        execution_id: &str,
-        message: &str,
-    ) -> Result<String> {
-        trace_node_appender
-            .append(
-                Role::System,
-                BackendMetadata::builder()
-                    .execution(&ExecutionMetadata::new(execution_id.to_owned()))
-                    .build(),
-                Kind::Failure(message.to_owned()),
-            )
-            .await
-            .context(BackendSnafu {
-                context: Box::new(BackendFailureContext {
-                    branch: branch.to_owned(),
-                    execution_id: execution_id.to_owned(),
-                    error_node_id: retry_from_node_id.to_owned(),
-                    retry_from_node_id: retry_from_node_id.to_owned(),
-                }),
-            })
     }
 
     async fn validate_terminal_text_with_trace_node_appender(
@@ -3235,6 +3236,16 @@ fn backend_step_node_contents(steps: &[BackendStep]) -> Vec<NewNodeContent> {
         .collect()
 }
 
+fn failure_node_content(execution_id: &str, message: &str) -> NewNodeContent {
+    NewNodeContent {
+        role: Role::System,
+        metadata: BackendMetadata::builder()
+            .execution(&ExecutionMetadata::new(execution_id.to_owned()))
+            .build(),
+        kind: Kind::Failure(message.to_owned()),
+    }
+}
+
 fn normalize_kind_for_primary_parent(kind: Kind, primary_parent: &str) -> Kind {
     let Kind::Anchor(mut anchor) = kind else {
         return kind;
@@ -3489,6 +3500,7 @@ async fn append_backend_event_nodes(
     Ok(appended)
 }
 
+#[cfg(test)]
 async fn append_backend_events(
     trace_node_appender: &TraceNodeAppenderHandle,
     trace_node_store: Option<&TraceNodeStore>,

@@ -112,6 +112,27 @@ where
                 .await,
         )
     }
+
+    async fn append_nodes_and_set_branch_head_to(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        new_head: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<String> {
+        self.notify_if_ok(
+            self.inner
+                .append_nodes_and_set_branch_head_to(
+                    name,
+                    expected_old_head,
+                    parent,
+                    new_head,
+                    nodes,
+                )
+                .await,
+        )
+    }
 }
 
 #[async_trait]

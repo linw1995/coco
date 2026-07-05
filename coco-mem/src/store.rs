@@ -67,6 +67,16 @@ pub trait BranchStore {
         parent: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String>;
+
+    /// Appends nodes after `parent` and moves a branch head to `new_head` in the same operation.
+    async fn append_nodes_and_set_branch_head_to(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        new_head: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<String>;
 }
 
 /// Branch workflow session state storage API.

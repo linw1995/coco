@@ -837,6 +837,42 @@ where
     );
 }
 
+async fn assert_append_nodes_and_set_branch_head_to_rolls_back_on_head_failure<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create().await;
+    let root_id = store.root_id();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
+    let children_before = store.list_children(&session_id).await.unwrap();
+
+    let err = store
+        .append_nodes_and_set_branch_head_to(
+            "main",
+            &session_id,
+            &session_id,
+            "missing",
+            vec![NewNodeContent {
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text("partial".to_owned()),
+            }],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::NotFound { id } if id == "missing"));
+    assert_eq!(store.get_branch_head("main").await.unwrap(), session_id);
+    assert_eq!(
+        store.list_children(&session_id).await.unwrap(),
+        children_before
+    );
+}
+
 async fn assert_set_session_state_accepts_merged_anchor_on_target_branch<F>()
 where
     F: TestStoreFactory,
@@ -2595,6 +2631,11 @@ macro_rules! define_common_store_tests {
             #[tokio::test]
             async fn append_nodes_and_set_branch_head_rolls_back_on_append_failure() {
                 assert_append_nodes_and_set_branch_head_rolls_back_on_append_failure::<$factory>().await;
+            }
+
+            #[tokio::test]
+            async fn append_nodes_and_set_branch_head_to_rolls_back_on_head_failure() {
+                assert_append_nodes_and_set_branch_head_to_rolls_back_on_head_failure::<$factory>().await;
             }
 
             #[tokio::test]
