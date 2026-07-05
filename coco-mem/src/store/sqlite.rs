@@ -22,8 +22,8 @@ use snafu::{IntoError, prelude::*};
 use tokio::runtime::Runtime;
 
 use super::{
-    BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore, ProcessShareableStore,
-    SessionStore, SkillStore,
+    BranchAppendSessionState, BranchStore, JobStore, MessageQueueStore, NodeStore, PresetStore,
+    ProcessShareableStore, SessionStore, SkillStore,
 };
 use crate::StoreResult as Result;
 use crate::error::{
@@ -2426,31 +2426,41 @@ async fn update_session_state(
 ) -> Result<SessionState> {
     connection
         .immediate_transaction::<SessionState, SqliteTransactionError, _>(async |connection| {
-            let current = load_session_state(connection, path, branch)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            if let Some(expected) = expected
-                && current != *expected
-            {
-                return Err(SqliteTransactionError::Operation(
-                    SessionStateMovedSnafu {
-                        name: branch.to_owned(),
-                        expected: format!("{expected:?}"),
-                        actual: format!("{current:?}"),
-                    }
-                    .build(),
-                ));
-            }
-            validate_session_state(connection, path, &next)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            persist_session_state(connection, path, branch, &next)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            Ok(next)
+            update_session_state_in_transaction(connection, path, branch, expected, next).await
         })
         .await
         .map_err(|error| error.into_store_error(path))
+}
+
+async fn update_session_state_in_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    expected: Option<&SessionState>,
+    next: SessionState,
+) -> std::result::Result<SessionState, SqliteTransactionError> {
+    let current = load_session_state(connection, path, branch)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    if let Some(expected) = expected
+        && current != *expected
+    {
+        return Err(SqliteTransactionError::Operation(
+            SessionStateMovedSnafu {
+                name: branch.to_owned(),
+                expected: format!("{expected:?}"),
+                actual: format!("{current:?}"),
+            }
+            .build(),
+        ));
+    }
+    validate_session_state(connection, path, &next)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    persist_session_state(connection, path, branch, &next)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    Ok(next)
 }
 
 async fn load_session_chain(
@@ -2801,6 +2811,33 @@ async fn append_nodes_and_set_branch_head_in_transaction(
         branch,
         expected_old_head,
         new_head.unwrap_or(&head),
+    )
+    .await?;
+    Ok(head)
+}
+
+async fn append_nodes_and_set_branch_head_with_session_state_in_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    update: BranchAppendSessionState,
+) -> std::result::Result<String, SqliteTransactionError> {
+    let head = append_nodes_and_set_branch_head_in_transaction(
+        connection,
+        path,
+        &update.branch,
+        &update.expected_old_head,
+        &update.parent,
+        update.new_head.as_deref(),
+        update.nodes,
+    )
+    .await?;
+    let next_session = update.next_session.into_session_state(&head);
+    update_session_state_in_transaction(
+        connection,
+        path,
+        &update.session_branch,
+        update.expected_session.as_ref(),
+        next_session,
     )
     .await?;
     Ok(head)
@@ -3793,6 +3830,13 @@ impl BranchStore for SqliteGraphStore {
     ) -> Result<String> {
         self.ensure_read_only()
     }
+
+    async fn append_nodes_and_set_branch_head_with_session_state(
+        &self,
+        _update: BranchAppendSessionState,
+    ) -> Result<String> {
+        self.ensure_read_only()
+    }
 }
 
 #[async_trait]
@@ -3966,6 +4010,26 @@ impl BranchStore for SqliteStore {
                     parent,
                     Some(new_head),
                     nodes,
+                )
+                .await
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))
+    }
+
+    async fn append_nodes_and_set_branch_head_with_session_state(
+        &self,
+        update: BranchAppendSessionState,
+    ) -> Result<String> {
+        self.ensure_writable()?;
+        let _write = self.database.inner.write.lock().await;
+        let mut connection = self.connect().await?;
+        connection
+            .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
+                append_nodes_and_set_branch_head_with_session_state_in_transaction(
+                    connection,
+                    &self.database_path,
+                    update,
                 )
                 .await
             })

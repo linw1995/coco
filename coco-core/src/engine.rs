@@ -729,7 +729,10 @@ where
             if queue_recovery_event {
                 self.enqueue_backend_failure_recovery_event(job, backend_source, context)
                     .await?;
-            } else {
+            } else if self
+                .backend_failure_recovery_event_is_queued(job, backend_source, context)
+                .await?
+            {
                 tracing::warn!(
                     job_id = %job.job_id,
                     branch = %job.branch,
@@ -740,10 +743,39 @@ where
                     error = %backend_source,
                     "suppressed duplicate backend failure recovery request while retrying failed job"
                 );
+            } else {
+                tracing::warn!(
+                    job_id = %job.job_id,
+                    branch = %job.branch,
+                    work_branch = %job.work_branch,
+                    execution_id = %context.execution_id,
+                    error_node_id = %context.error_node_id,
+                    retry_from_node_id = %context.retry_from_node_id,
+                    error = %backend_source,
+                    "re-queueing missing backend failure recovery request while retrying failed job"
+                );
+                self.enqueue_backend_failure_recovery_event(job, backend_source, context)
+                    .await?;
             }
             return Ok(JobRunOutcome::RecoveryQueued);
         }
         Err(source.into())
+    }
+
+    async fn backend_failure_recovery_event_is_queued(
+        &self,
+        job: &Job,
+        source: &BackendError,
+        context: &BackendFailureContext,
+    ) -> std::result::Result<bool, EngineError> {
+        let event = backend_failure_recovery_event(job, source, context);
+        Ok(self
+            .service
+            .store()
+            .list_queue_messages(SYSTEM_EVENT_QUEUE)
+            .await?
+            .into_iter()
+            .any(|item| item.payload["dedupe_key"] == event.dedupe_key))
     }
 
     async fn enqueue_backend_failure_recovery_event(

@@ -16,11 +16,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+#[cfg(test)]
+use coco_mem::PauseReason;
 use coco_mem::{
-    Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MergeParent,
-    NewNode, NewNodeContent, NodeMetadata, NodeStore, PauseReason, PromptAnchor, PromptAttachment,
-    ProviderMetadata, Role, SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord,
-    SkillResultAnchor, SkillStore, SqliteStore, StoreError, Tool, ToolResult, ToolUse,
+    Anchor, AnchorPayload, BackendMetadata, BranchAppendSessionState, BranchSessionStateUpdate,
+    BranchStore, ExecutionMetadata, Kind, MergeParent, NewNode, NewNodeContent, NodeMetadata,
+    NodeStore, PromptAnchor, PromptAttachment, ProviderMetadata, Role, SessionAnchor, SessionRole,
+    SessionState, SessionStore, SkillRecord, SkillResultAnchor, SkillStore, SqliteStore,
+    StoreError, Tool, ToolResult, ToolUse,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -2120,33 +2123,6 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + BranchStore,
-{
-    async fn append_prompt_anchor_to_branch(
-        &self,
-        branch: &str,
-        prompt: &str,
-        merge_parents: &[MergeParent],
-    ) -> Result<String> {
-        let original_head = self
-            .store
-            .get_branch_head(branch)
-            .await
-            .context(MemorySnafu)?;
-        let anchor_id = self
-            .append_prompt_anchor_to_parent(&original_head, prompt, &[], merge_parents)
-            .await?;
-        self.store
-            .set_branch_head(branch, &original_head, &anchor_id)
-            .await
-            .context(MemorySnafu)?;
-
-        Ok(anchor_id)
-    }
-}
-
-impl<B, S> LlmService<B, S>
-where
     S: NodeStore,
 {
     async fn append_prompt_anchor_to_parent_with_session_patch(
@@ -2287,21 +2263,26 @@ where
             .get_branch_head(branch)
             .await
             .context(MemorySnafu)?;
+        let target_head_id = self
+            .store
+            .get_branch_head(&resolved_target_branch)
+            .await
+            .context(MemorySnafu)?;
         let merge_parents = vec![MergeParent::merge(source_head_id.clone())];
         let merged_anchor_id = self
-            .append_prompt_anchor_to_branch(&resolved_target_branch, prompt, &merge_parents)
-            .await?;
-        self.store
-            .set_session_state(
-                branch,
-                None,
-                SessionState::Paused {
+            .store
+            .append_nodes_and_set_branch_head_with_session_state(BranchAppendSessionState {
+                branch: resolved_target_branch.clone(),
+                expected_old_head: target_head_id.clone(),
+                parent: target_head_id,
+                new_head: None,
+                nodes: vec![prompt_anchor_node_content(prompt, &merge_parents)],
+                session_branch: branch.to_owned(),
+                expected_session: None,
+                next_session: BranchSessionStateUpdate::PausedMergedToAppendedHead {
                     target_branch: resolved_target_branch.clone(),
-                    reason: PauseReason::Merged {
-                        merged_anchor_id: merged_anchor_id.clone(),
-                    },
                 },
-            )
+            })
             .await
             .context(MemorySnafu)?;
 
@@ -2360,18 +2341,26 @@ where
         }
 
         let merge_parents = vec![MergeParent::merge(source_anchor_id.clone())];
+        let branch_head_id = self
+            .store
+            .get_branch_head(branch)
+            .await
+            .context(MemorySnafu)?;
         let feedback_anchor_id = self
-            .append_prompt_anchor_to_branch(branch, prompt, &merge_parents)
-            .await?;
-        self.store
-            .set_session_state(
-                branch,
-                None,
-                SessionState::Attached {
+            .store
+            .append_nodes_and_set_branch_head_with_session_state(BranchAppendSessionState {
+                branch: branch.to_owned(),
+                expected_old_head: branch_head_id.clone(),
+                parent: branch_head_id,
+                new_head: None,
+                nodes: vec![prompt_anchor_node_content(prompt, &merge_parents)],
+                session_branch: branch.to_owned(),
+                expected_session: None,
+                next_session: BranchSessionStateUpdate::Set(SessionState::Attached {
                     target_branch: target_branch.clone(),
                     base_head_id: source_anchor_id.clone(),
-                },
-            )
+                }),
+            })
             .await
             .context(MemorySnafu)?;
 
@@ -3243,6 +3232,20 @@ fn failure_node_content(execution_id: &str, message: &str) -> NewNodeContent {
             .execution(&ExecutionMetadata::new(execution_id.to_owned()))
             .build(),
         kind: Kind::Failure(message.to_owned()),
+    }
+}
+
+fn prompt_anchor_node_content(prompt: &str, merge_parents: &[MergeParent]) -> NewNodeContent {
+    NewNodeContent {
+        role: Role::System,
+        metadata: None,
+        kind: Kind::Anchor(Anchor::prompt(
+            merge_parents.to_vec(),
+            PromptAnchor {
+                prompt: prompt.to_owned(),
+                attachments: vec![],
+            },
+        )),
     }
 }
 

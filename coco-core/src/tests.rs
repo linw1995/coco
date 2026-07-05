@@ -953,7 +953,7 @@ async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session(
 }
 
 #[tokio::test]
-async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_event() {
+async fn llm_engine_retrying_failure_node_requeues_missing_recovery_event() {
     let store = test_store().await;
     let backend = FakeBackend::with_responses(&[(
         "main",
@@ -983,12 +983,67 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
     let snapshot = engine.drive_job(&job.job_id).await.unwrap();
 
     assert_eq!(snapshot.status, JobStatus::Running);
-    assert!(
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload["data"]["retry_from_node_id"], job.base);
+}
+
+#[tokio::test]
+async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_event() {
+    let store = test_store().await;
+    let backend = FakeBackend::with_responses(&[(
+        "main",
+        &[Err(BackendError::Failed {
+            message: "backend still failed".to_owned(),
+        })],
+    )]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+    let current_head = store.get_branch_head("main").await.unwrap();
+    let failure_id = store
+        .append(NewNode {
+            parent: job.base.clone(),
+            role: Role::System,
+            metadata: BackendMetadata::builder().build(),
+            kind: Kind::Failure("transient backend outage".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .set_branch_head("main", &current_head, &failure_id)
+        .await
+        .unwrap();
+    let dedupe_key = format!(
+        "llm.backend_failure:{}:{}:{}",
+        job.job_id, job.work_branch, job.base
+    );
+    store
+        .enqueue_message(
+            SYSTEM_EVENT_QUEUE,
+            serde_json::json!({
+                "type": "llm.backend_failure.recovery_requested",
+                "version": 1,
+                "dedupe_key": dedupe_key,
+                "data": {
+                    "retry_from_node_id": job.base,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    let snapshot = engine.drive_job(&job.job_id).await.unwrap();
+
+    assert_eq!(snapshot.status, JobStatus::Running);
+    assert_eq!(
         store
             .list_queue_messages(SYSTEM_EVENT_QUEUE)
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        1
     );
 }
 

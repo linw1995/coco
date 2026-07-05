@@ -17,6 +17,38 @@ use crate::{
     SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
+#[derive(Debug, Clone)]
+pub struct BranchAppendSessionState {
+    pub branch: String,
+    pub expected_old_head: String,
+    pub parent: String,
+    pub new_head: Option<String>,
+    pub nodes: Vec<NewNodeContent>,
+    pub session_branch: String,
+    pub expected_session: Option<SessionState>,
+    pub next_session: BranchSessionStateUpdate,
+}
+
+#[derive(Debug, Clone)]
+pub enum BranchSessionStateUpdate {
+    Set(SessionState),
+    PausedMergedToAppendedHead { target_branch: String },
+}
+
+impl BranchSessionStateUpdate {
+    pub fn into_session_state(self, appended_head: &str) -> SessionState {
+        match self {
+            Self::Set(state) => state,
+            Self::PausedMergedToAppendedHead { target_branch } => SessionState::Paused {
+                target_branch,
+                reason: crate::PauseReason::Merged {
+                    merged_anchor_id: appended_head.to_owned(),
+                },
+            },
+        }
+    }
+}
+
 /// Node graph storage API used by CoCo services.
 #[async_trait]
 pub trait NodeStore {
@@ -76,6 +108,12 @@ pub trait BranchStore {
         parent: &str,
         new_head: &str,
         nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<String>;
+
+    /// Appends nodes, moves a branch head, and updates session state in the same operation.
+    async fn append_nodes_and_set_branch_head_with_session_state(
+        &self,
+        update: BranchAppendSessionState,
     ) -> StoreResult<String>;
 }
 

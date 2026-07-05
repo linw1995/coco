@@ -7,8 +7,8 @@ mod types;
 
 pub use error::{StoreError, StoreResult};
 pub use store::{
-    BranchStore, JobStore, MessageQueueStore, NodeStore, PersistentStore, PresetStore,
-    ProcessShareableStore, SessionStore, SkillStore, SqliteDatabase, SqliteGraphStore, SqliteStore,
-    Store,
+    BranchAppendSessionState, BranchSessionStateUpdate, BranchStore, JobStore, MessageQueueStore,
+    NodeStore, PersistentStore, PresetStore, ProcessShareableStore, SessionStore, SkillStore,
+    SqliteDatabase, SqliteGraphStore, SqliteStore, Store,
 };
 pub use types::*;

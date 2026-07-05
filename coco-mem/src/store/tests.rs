@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use super::sqlite::SqliteStore;
 use crate::{
-    Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueItem,
-    MessageQueueStore, NewNode, NewNodeContent, NodeStore, PauseReason, Preset, PresetStore,
-    PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore,
-    SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError as Error,
+    Anchor, BranchAppendSessionState, BranchSessionStateUpdate, BranchStore, JobStatus, JobStore,
+    Kind, MergeParent, MessageQueueItem, MessageQueueStore, NewNode, NewNodeContent, NodeStore,
+    PauseReason, Preset, PresetStore, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch,
+    SessionRole, SessionState, SessionStore, SkillScript, SkillStore, SkillUpdatePatch,
+    SkillVersionSpec, StoreError as Error,
 };
 use serde_json::json;
 
@@ -870,6 +871,52 @@ where
     assert_eq!(
         store.list_children(&session_id).await.unwrap(),
         children_before
+    );
+}
+
+async fn assert_append_nodes_and_set_branch_head_with_session_state_rolls_back_on_state_failure<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create().await;
+    let root_id = store.root_id();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
+    let children_before = store.list_children(&session_id).await.unwrap();
+
+    let err = store
+        .append_nodes_and_set_branch_head_with_session_state(BranchAppendSessionState {
+            branch: "main".to_owned(),
+            expected_old_head: session_id.clone(),
+            parent: session_id.clone(),
+            new_head: None,
+            nodes: vec![NewNodeContent {
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text("partial".to_owned()),
+            }],
+            session_branch: "main".to_owned(),
+            expected_session: None,
+            next_session: BranchSessionStateUpdate::Set(SessionState::Attached {
+                target_branch: "missing".to_owned(),
+                base_head_id: session_id.clone(),
+            }),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::BranchNotFound { name } if name == "missing"));
+    assert_eq!(store.get_branch_head("main").await.unwrap(), session_id);
+    assert_eq!(
+        store.list_children(&session_id).await.unwrap(),
+        children_before
+    );
+    assert_eq!(
+        store.get_session_state("main").await.unwrap(),
+        SessionState::Active
     );
 }
 
@@ -2636,6 +2683,11 @@ macro_rules! define_common_store_tests {
             #[tokio::test]
             async fn append_nodes_and_set_branch_head_to_rolls_back_on_head_failure() {
                 assert_append_nodes_and_set_branch_head_to_rolls_back_on_head_failure::<$factory>().await;
+            }
+
+            #[tokio::test]
+            async fn append_nodes_and_set_branch_head_with_session_state_rolls_back_on_state_failure() {
+                assert_append_nodes_and_set_branch_head_with_session_state_rolls_back_on_state_failure::<$factory>().await;
             }
 
             #[tokio::test]

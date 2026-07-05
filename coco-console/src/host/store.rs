@@ -3,8 +3,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use coco_mem::{
-    BranchStore, Job, JobStatus, JobStore, MergeParent, MessageQueueItem, MessageQueueStore,
-    NewNode, NewNodeContent, Node, NodeStore, Preset, PresetRecord, PresetStore,
+    BranchAppendSessionState, BranchStore, Job, JobStatus, JobStore, MergeParent, MessageQueueItem,
+    MessageQueueStore, NewNode, NewNodeContent, Node, NodeStore, Preset, PresetRecord, PresetStore,
     ProcessShareableStore, PromptAnchor, SessionAnchorPatch, SessionRole, SessionState,
     SessionStore, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
@@ -130,6 +130,17 @@ where
                     new_head,
                     nodes,
                 )
+                .await,
+        )
+    }
+
+    async fn append_nodes_and_set_branch_head_with_session_state(
+        &self,
+        update: BranchAppendSessionState,
+    ) -> StoreResult<String> {
+        self.notify_if_ok(
+            self.inner
+                .append_nodes_and_set_branch_head_with_session_state(update)
                 .await,
         )
     }
